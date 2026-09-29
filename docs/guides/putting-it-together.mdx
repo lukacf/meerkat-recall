@@ -1,5 +1,5 @@
 ---
-title: "From a Source to Verified Knowledge"
+title: "From a Source to Evidence-Backed Claims"
 description: "Ingest one technical note, follow its processing, and trace a graph claim back to its evidence."
 icon: "puzzle-piece"
 ---
@@ -13,7 +13,9 @@ adds a second source and investigates what changed.
 ## Before you start
 
 You need a configured Elephant server with semantic ingestion ready, `curl`,
-and `jq`. Follow the [quickstart](/quickstart) first. The isolated `demo-wiki`
+and `jq`. For the final evidence lookup, install Node.js 22.19 or newer and
+define the `elephant_mcp` helper from [terminal MCP setup](/mcp/overview#try-calls-from-a-terminal).
+Follow the [quickstart](/quickstart) first. The isolated `demo-wiki`
 server demonstrates stored views; it does not supply a semantic extractor for
 this tutorial. Extraction uses the configured model provider and incurs its
 normal usage costs.
@@ -98,13 +100,14 @@ elephant_http "$BASE_URL/v1/sources/$SOURCE_ID" | jq
 | Observation | Meaning | Next action |
 |---|---|---|
 | `pending` or `running` extraction | Work is queued or executing | Check again after the worker has had time to progress |
-| `completed` extraction | Relevant extraction work has completed | Inspect assertions and graph records |
+| `completed` extraction | Tracked work is terminal without a failed item; this can include cancellation | Inspect assertions and graph records |
 | `failed` extraction | A relevant work item failed | Inspect the work item and worker error before retrying |
 | `not_triggered` extraction | No extraction work or assertions are recorded | Check the source mode, lifecycle, and readiness |
 | Source `graph_ready` | The source reached graph ingestion | Verify the resulting evidence and entities |
 | Source `skipped` or `rejected` | Processing stopped intentionally | Read the source's ingest decision |
 
-The document summary also reports `revision`, `nodes_count`, `chunks`, and
+See the [state definitions](/api/documents#extraction-state) when interpreting
+a terminal result. The document summary also reports `revision`, `nodes_count`, `chunks`, and
 `extraction_guidance`. Check `extraction_guidance.skill_id`, `purpose`, and
 `resolution_trace` when extraction is looking for the wrong kind of knowledge.
 The number of chunks, assertions, and entities depends on the actual output.
@@ -190,17 +193,18 @@ Fetch a selected assertion by its complete returned ID at
 elephant_http "$BASE_URL/v1/docs/$DOC_ID" | jq
 ```
 
-For the immutable evidence quote, connect an MCP client to the default `/mcp` endpoint with
-the same principal and call `get_provenance` with the actual relationship ID
-from the context response:
+For the immutable evidence quote, keep the same `TOKEN` and use the default
+`/mcp` endpoint. Copy the complete relationship ID from the context response
+into `RELATIONSHIP_ID`, then use the helper from the prerequisites:
 
-```json
-{
-  "id": "<returned relationship ID>"
-}
+```bash
+export MCP_URL="$BASE_URL/mcp"
+elephant_mcp --method tools/call --tool-name get_provenance \
+  --tool-args-json "$(jq -cn --arg id "$RELATIONSHIP_ID" '{id:$id}')"
 ```
 
-The result's `data.chain` links assertions, spans, revision metadata, documents,
+Inside Inspector's `result.content`, the tool's JSON text contains
+`data.chain`, linking assertions, spans, revision metadata, documents,
 and available quotes. Compare the returned quote with the claimed dependency.
 Treat evidence positions as UTF-8 byte offsets in that revision, not character
 positions in a later edit. The current document text is a useful reading view,

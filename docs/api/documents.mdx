@@ -331,7 +331,11 @@ curl -X POST http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66a
 
 `GET /v1/docs/{id}/chunks`
 
-Returns the structural nodes (chunks) for a document. Chunks are created by the pipeline during the rendering and chunking phase.
+Returns structural nodes for the document's selected revision. `revision`
+identifies immutable evidence; `span.start` and `span.end` are UTF-8 byte
+offsets into that revision. A node's `text` is optional, commonly used for
+summaries, so do not assume every node includes its excerpt inline. The
+example below omits common record fields.
 
 <ParamField path="id" type="string" required>
   Document record ID.
@@ -346,11 +350,13 @@ curl http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6/chun
 ```json Response
 [
   {
-    "id": "doc_node:1c0d6c6f-...",
-    "revision_id": "doc_revision:aaa...",
-    "content": "Alice met Bob on 2026-02-02...",
-    "node_type": "paragraph",
-    "position": 0
+    "id": "doc_node:1c0d6c6f-91ca-4b83-834a-1e077296bc5b",
+    "revision": "doc_revision:7427e72c-404a-4c1d-a2dc-c0a4b5c0d5ef",
+    "role": "paragraph",
+    "span": {"start": 0, "end": 42},
+    "node_key": "paragraph-0",
+    "position": 0,
+    "depth": 1
   }
 ]
 ```
@@ -376,19 +382,39 @@ curl http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6/pipe
 
 ```json Response
 {
-  "doc_id": "doc:3fa85f64-...",
+  "doc_id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6",
   "chunks": {
     "total": 5,
-    "embedded": 5,
-    "pending": 0,
-    "status": "complete"
+    "embedded": 5
   },
-  "extraction_state": "complete",
+  "revision": "doc_revision:7427e72c-404a-4c1d-a2dc-c0a4b5c0d5ef",
+  "nodes_count": 8,
+  "extraction_state": "completed",
   "assertions_count": 12,
-  "work_items": {
-    "render": "done",
-    "extract": "done"
-  }
+  "entities_created": 4
 }
 ```
 </CodeGroup>
+
+Counts above are illustrative. `revision` is omitted until a current revision
+exists. The optional `extraction_guidance` object describes how the purpose and
+extraction skill were resolved. Embedding progress is independent of the
+extraction state: compare `chunks.embedded` with `chunks.total`.
+
+### Extraction state
+
+`extraction_state` summarizes relevant work for the document and its current
+revision. When work items have different states, `failed` takes precedence over
+`running`, which takes precedence over `pending`.
+
+| Value | Meaning | What to do next |
+|-------|---------|-----------------|
+| `pending` | Relevant work is pending or runnable. | Check again after the workers have had time to process it. |
+| `running` | Relevant work is running. | Wait for a terminal outcome. |
+| `failed` | At least one relevant work item failed. | [Inspect the failure and retry eligible work](/pipeline/work-queue#inspect-and-retry-failed-work). |
+| `completed` | Relevant work is terminal with no failed item, or assertions exist without tracked work. | Inspect the resulting assertions and evidence. Cancelled work also falls into this state, so it does not prove successful extraction. |
+| `not_triggered` | No relevant work or assertions were found. | Check the ingestion mode, runtime readiness, and work queue if extraction was expected. |
+
+The response does not include individual work items. Use the
+[work queue](/pipeline/work-queue) for stage details. Neither a `completed`
+state nor an assertion count proves that the extracted claims are true.

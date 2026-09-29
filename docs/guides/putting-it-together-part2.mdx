@@ -4,8 +4,8 @@ description: "Add a second source, inspect the resulting claims, and distinguish
 icon: "scale-balanced"
 ---
 
-Continue from [From a Source to Verified Knowledge](/guides/putting-it-together).
-Keep its `BASE_URL`, `elephant_http` helper, source/document receipts, and the
+Continue from [From a Source to Evidence-Backed Claims](/guides/putting-it-together).
+Keep its `BASE_URL`, `elephant_http` and `elephant_mcp` helpers, source/document receipts, and the
 actual Cedar API entity ID. This tutorial uses the Full MCP profile for truth
 inspection alongside the REST ingestion calls.
 
@@ -52,8 +52,14 @@ retraction of an older claim.
 
 ## 2. Compare claims before comparing winners
 
-Connect an MCP client to `/mcp/full` with the same principal and space. Examples
-below are tool arguments, not JSON-RPC envelopes. Replace every angle-bracket
+Select `/mcp/full` with the same principal and space:
+
+```bash
+export MCP_URL="$BASE_URL/mcp/full"
+elephant_mcp --method tools/list
+```
+
+Examples below are tool arguments, not JSON-RPC envelopes. Replace every angle-bracket
 placeholder with an ID or predicate returned by your server.
 
 Call `search_assertions` for the known component:
@@ -64,6 +70,17 @@ Call `search_assertions` for the known component:
   "limit": 50
 }
 ```
+
+With the terminal helper, the same call uses your saved `ENTITY_ID`:
+
+```bash
+elephant_mcp --method tools/call --tool-name search_assertions \
+  --tool-args-json "$(jq -cn --arg id "$ENTITY_ID" '{entity_id:$id,limit:50}')"
+```
+
+Use this pattern for each named tool below, passing its argument object to
+`--tool-args-json`. See [MCP setup](/mcp/overview#try-calls-from-a-terminal)
+if you are continuing in a new shell.
 
 Compare each assertion's value, source provenance, evidence revision, and
 resolution status. `entity_id` selects resolved subject/object links and is

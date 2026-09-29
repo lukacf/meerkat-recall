@@ -8,22 +8,44 @@ Choose the credential-free demo to explore existing evidence and projections.
 Choose the persistent stack to submit new evidence and run model extraction.
 The HTTP examples below require `curl` and `jq`.
 
+## Get the source
+
+Both routes start from a checkout. With Git installed, run:
+
+```bash
+git clone https://github.com/lukacf/elephant.git
+cd elephant
+```
+
+Run the remaining commands from this directory.
+
 ## Try the demo first
 
 The Living Wiki demo needs Rust 1.94 or newer, but no database service or model
 credentials:
 
 ```bash
-git clone https://github.com/lukacf/elephant.git
-cd elephant
 ./scripts/repo-cargo run -p elephant-bin --no-default-features -- demo-wiki
 ```
 
-Open the [context inspector](http://localhost:3000/inspect/knowledge-views) or
-[evidence browser](http://localhost:3000/evidence). This credential-free build
-leaves the article wiki at `/wiki` empty. The [full demo](/architecture/living-wiki#runnable-projection-demo)
-uses a configured model to write articles. The first source build can take
-several minutes. Stop the demo before starting another server on the same port.
+The first source build can take several minutes. Once the server starts:
+
+1. Open the `Editorial context projection` URL printed in the terminal, or find
+   **Elephant Living Wiki architecture** in the
+   [context inspector](http://localhost:3000/inspect/knowledge-views).
+2. Read the projected context and its **Compilation receipt**. The receipt
+   records what was compiled; it is not a judgment that every claim is true.
+3. Open the [evidence browser](http://localhost:3000/evidence) and read the
+   architecture source. Its **Technical details** link opens the inspector.
+
+You have completed the demo when you have inspected a projection, its receipt,
+and the source evidence. Stop it with **Ctrl-C**. Demo data is held in memory
+and disappears when the process stops.
+
+This credential-free build leaves the article wiki at `/wiki` empty. The
+[full demo](/architecture/living-wiki#runnable-projection-demo) uses a configured
+model to write articles. Continue below if you want to ingest your own evidence;
+stop the demo first so port 3000 is available.
 
 ## Start a persistent local stack
 
@@ -93,8 +115,22 @@ curl -fsS "http://localhost:3000/v1/docs/$doc_id/pipeline-status" \
 ```
 
 The MCP equivalent is `get_doc_pipeline_status` with `{"id":"doc:YOUR_ID"}`,
-available on `/mcp/full` to authorized callers. Inspect failures instead of
-assuming that every accepted document has generated graph records.
+available on `/mcp/full` to authorized callers.
+
+Check `extraction_state` before moving on:
+
+- For `pending` or `running`, repeat the status request after the workers have
+  had time to process the document.
+- For `failed`, [inspect and resolve the failed work](/pipeline/work-queue#inspect-and-retry-failed-work)
+  before retrying it.
+- For `not_triggered`, check readiness and the work queue if the state persists
+  after ingestion was accepted.
+- For `completed`, inspect `assertions_count` and the results below. This state
+  describes tracked work, so it does not guarantee useful or correct claims.
+
+See the [state definitions](/api/documents#extraction-state) for the exact
+meaning of each value. For semantic search, also check that `chunks.embedded`
+has caught up with `chunks.total`; extraction and embedding finish separately.
 
 The source-first flow stages metadata, renders immutable document evidence,
 plans extraction, validates and commits artifacts, and emits outbox events for

@@ -30,6 +30,47 @@ For remote connections, configure `MCP_ALLOWED_HOSTS`; browser clients may also
 need `MCP_ALLOWED_ORIGINS`. These are transport protections, separate from data
 authorization. See [deployment](/operations/deployment).
 
+### Try calls from a terminal
+
+The [MCP Inspector CLI](https://github.com/modelcontextprotocol/inspector/blob/main/clients/cli/README.md)
+handles initialization and tool calls. Install Node.js 22.19 or newer, then
+define this helper. It uses the same `TOKEN` as the HTTP examples; leave it
+unset only for local `SKIP_AUTH` development.
+
+```bash
+export MCP_URL="http://127.0.0.1:3000/mcp"
+
+elephant_mcp() {
+  if [ -n "${TOKEN:-}" ]; then
+    npx --yes @modelcontextprotocol/inspector@2.8.0 \
+      --cli "$MCP_URL" \
+      --transport http --stored-auth-only --format json \
+      --header "Authorization: Bearer $TOKEN" "$@"
+  else
+    npx --yes @modelcontextprotocol/inspector@2.8.0 \
+      --cli "$MCP_URL" \
+      --transport http --stored-auth-only --format json "$@"
+  fi
+}
+
+elephant_mcp --method tools/list
+elephant_mcp --method tools/call \
+  --tool-name get_runtime_status
+```
+
+Check the returned status before ingesting. Inspector wraps the MCP response
+in `result`; inspect its error/content fields as described below. To call a
+tool with an argument object, use `--tool-args-json`:
+
+```bash
+elephant_mcp --method tools/call --tool-name search_all \
+  --tool-args-json '{"query":"Project Cedar","limit":5}'
+```
+
+Change `MCP_URL` to the desired profile endpoint, then list its tools again.
+These commands connect directly to your Elephant server; they do not require
+an Inspector web session.
+
 ## Choose a profile
 
 A profile limits the available operations. It does not grant permission to

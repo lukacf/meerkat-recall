@@ -66,8 +66,15 @@ heading anchors, JSON examples, and MCP tool/profile coverage against Rust
 source. Use Markdown links/images in `.md` files and quoted `href`/`src` strings
 in MDX components so link targets can be checked. CI runs the same check. This
 does not validate live API schemas or Mintlify's component registry. To inspect
-layout, run the Mintlify preview from `docs/` and follow the quickstart and
-changed pages in a browser.
+layout, use Node.js 22 and run the pinned Mintlify preview:
+
+```bash
+cd docs
+npx mint@4.2.813 dev --port 3333
+```
+
+Open `http://localhost:3333` and follow the quickstart and changed pages in a
+browser. Check diagrams, Steps/Tabs, table widths, and direct heading links.
 
 Write concepts to explain the model, guides to complete a task, and references
 to describe exact contracts. Guides should state prerequisites, distinguish

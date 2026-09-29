@@ -1,0 +1,182 @@
+---
+title: "Assertions"
+description: "Query and manage assertions extracted from documents in the Elephant knowledge pipeline."
+icon: "check-double"
+---
+
+## Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/v1/assertions/search` | Search assertions with filters |
+| POST | `/v1/assertions` | Create manual assertion |
+| GET | `/v1/assertions/{id}` | Get assertion by ID |
+| PATCH | `/v1/assertions/{id}/resolution` | Update resolution status |
+
+Assertions are knowledge claims extracted from documents by the pipeline. Each assertion has a subject, predicate, object triple and a resolution status that tracks whether it has been verified and promoted into the knowledge graph.
+
+---
+
+## Search Assertions
+
+`POST /v1/assertions/search`
+
+Search assertions with optional filters on status, source, and predicate.
+
+<ParamField body="status" type="string">
+  Filter by resolution status. One of: `pending`, `resolved`, `partial`, `abstained`, `failed`, `superseded`.
+</ParamField>
+
+<ParamField body="source_id" type="string">
+  Filter by source record ID.
+</ParamField>
+
+<ParamField body="predicate" type="string">
+  Filter by predicate string (e.g., `works_at`).
+</ParamField>
+
+<ParamField body="include_deleted" type="boolean" default="false">
+  Include soft-deleted assertions.
+</ParamField>
+
+<ParamField body="limit" type="integer" default="50">
+  Maximum results to return.
+</ParamField>
+
+<ParamField body="cursor" type="string">
+  Pagination cursor from a previous response.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X POST http://localhost:3000/v1/assertions/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "pending", "limit": 10}'
+```
+
+```json Response
+{
+  "results": [
+    {
+      "id": "assertion:550e8400-...",
+      "space_id": "default",
+      "subject_text": "Alex Chen",
+      "predicate_raw": "works_at",
+      "object_text": "NeuralFlow",
+      "resolution_status": "pending",
+      "created_at": "2026-01-20T09:00:00Z"
+    }
+  ],
+  "cursor": null,
+  "has_more": false,
+  "total": 1
+}
+```
+</CodeGroup>
+
+---
+
+## Create Assertion
+
+`POST /v1/assertions` accepts a complete `Assertion` record and returns `201`
+with the stored record. It does not generate evidence or queue extraction from
+a three-field claim. Prefer [document ingestion](/api/documents) when adding
+new source material.
+
+The JSON body must include the [common record fields](/api/entities#entity-wire-format)
+(`id`, `space_id`, `created_at`, `updated_at`, `created_by`, `provenance`, and
+`security`) plus these assertion fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `subject_text` | string | Raw subject mention |
+| `predicate_raw` | string | Predicate text |
+| `object_text` | string, optional | Object mention for an entity claim |
+| `object_literal` | JSON, optional | Literal value for an attribute claim |
+| `evidence` | object | Real document evidence span |
+| `observed_at` | timestamp | When the source was observed |
+| `asserted_at` | timestamp | When the claim was produced |
+| `assertion_key` | string | Stable deduplication key |
+
+`evidence` requires `revision` (a document revision record ID), `start`, `end`,
+and `quote_hash`; `node` is optional. Supply verified offsets and a hash of the
+actual source quote. Do not invent provenance to satisfy this schema.
+
+Optional fields include `predicate_id`, `source_event_time`, `resolution_status`
+(default `pending`), `subject_entity`, `object_entity`, `confidence`, and resolution
+metadata. Returned search/get examples below are abbreviated; full records
+include all required fields.
+
+---
+
+## Get Assertion
+
+`GET /v1/assertions/{id}`
+
+Retrieve a single assertion by its ID.
+
+<ParamField path="id" type="string" required>
+  Assertion record ID (e.g., `assertion:550e8400-...`).
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/assertions/assertion:550e8400-e29b-41d4-a716-446655440000 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "id": "assertion:550e8400-...",
+  "subject_text": "Alex Chen",
+  "predicate_raw": "works_at",
+  "object_text": "NeuralFlow",
+  "resolution_status": "resolved",
+  "subject_entity": "entity:aaa...",
+  "object_entity": "entity:bbb..."
+}
+```
+</CodeGroup>
+
+---
+
+## Update Resolution Status
+
+`PATCH /v1/assertions/{id}/resolution`
+
+Update the resolution status of an existing assertion. Changing this field alone does not resolve entity references, generate evidence, or perform truth adjudication.
+
+<ParamField path="id" type="string" required>
+  Assertion record ID.
+</ParamField>
+
+<ParamField body="status" type="string" required>
+  New resolution status. One of: `pending`, `resolved`, `partial`, `abstained`, `failed`, `superseded`.
+</ParamField>
+
+<ParamField body="rationale" type="string">
+  Optional rationale for the status change.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X PATCH http://localhost:3000/v1/assertions/assertion:550e8400-.../resolution \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "status": "resolved",
+    "rationale": "Confirmed via official company records"
+  }'
+```
+
+```json Response
+{
+  "id": "assertion:550e8400-...",
+  "resolution_status": "resolved",
+  "retry_state": {
+    "abstention_reason": "Confirmed via official company records"
+  }
+}
+```
+</CodeGroup>

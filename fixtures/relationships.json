@@ -1,0 +1,129 @@
+{
+  "relationships": [
+    {
+      "id": "rel:seed-rel-001",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "from": "entity:seed-entity-001",
+      "to": "entity:seed-entity-002",
+      "rel_type": "sibling",
+      "description": "Alice is Bob's older sister",
+      "weight": 1.0,
+      "properties": {
+        "relationship_type": "older_sibling",
+        "years_apart": 2
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-rel-sibling-001"
+    },
+    {
+      "id": "rel:seed-rel-002",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "from": "entity:seed-entity-001",
+      "to": "entity:seed-entity-004",
+      "rel_type": "attends",
+      "description": "Alice attends Sunnydale Elementary",
+      "weight": 1.0,
+      "properties": {
+        "grade": "2nd",
+        "start_year": 2024
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 0,
+        "labels": [],
+        "handling": []
+      },
+      "idempotency_key": "seed-rel-school-001"
+    },
+    {
+      "id": "rel:seed-rel-003",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "from": "entity:seed-entity-003",
+      "to": "entity:seed-entity-001",
+      "rel_type": "teaches",
+      "description": "Mrs. Martinez teaches Alice",
+      "weight": 1.0,
+      "properties": {
+        "subject": "2nd Grade",
+        "year": 2025
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 0,
+        "labels": [],
+        "handling": []
+      },
+      "idempotency_key": "seed-rel-teacher-001"
+    },
+    {
+      "id": "rel:seed-rel-004",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "from": "entity:seed-entity-003",
+      "to": "entity:seed-entity-004",
+      "rel_type": "works_at",
+      "description": "Mrs. Martinez works at Sunnydale Elementary",
+      "weight": 1.0,
+      "properties": {
+        "position": "Teacher",
+        "department": "2nd Grade"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 0,
+        "labels": [],
+        "handling": []
+      },
+      "idempotency_key": "seed-rel-workplace-001"
+    },
+    {
+      "id": "rel:seed-rel-005",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "from": "entity:seed-entity-001",
+      "to": "entity:seed-entity-005",
+      "rel_type": "owns",
+      "description": "Alice is one of Buddy's owners",
+      "weight": 0.5,
+      "properties": {
+        "role": "primary_caretaker"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-rel-pet-001"
+    },
+    {
+      "id": "rel:seed-rel-006",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "from": "entity:seed-entity-002",
+      "to": "entity:seed-entity-005",
+      "rel_type": "plays_with",
+      "description": "Bob plays with Buddy",
+      "weight": 0.8,
+      "properties": {
+        "frequency": "daily",
+        "activities": ["fetch", "chase"]
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-rel-pet-002"
+    }
+  ]
+}

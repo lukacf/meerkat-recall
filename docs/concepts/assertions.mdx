@@ -1,0 +1,121 @@
+---
+title: "Assertions"
+description: "The evidence layer: extracted claims that link subjects to predicates and objects"
+icon: "file-certificate"
+---
+
+Assertions are the raw, unresolved claims that Elephant's extraction pipeline produces from ingested documents. Each assertion captures a single factual claim -- a subject, a predicate, and an object -- along with evidence pointing back to the source text.
+
+Assertions sit between document ingestion and the knowledge graph. They are **not** entities or relationships themselves; they are _candidates_ that the resolution pipeline evaluates, resolves to entities, and ultimately promotes into relationships or attributes.
+
+## Key Concepts
+
+**Subject-Predicate-Object triple.** Every assertion expresses a claim in the form "subject has predicate with object." The subject and object start as raw mention strings (`subject_text`, `object_text`) and are resolved to entity references during the resolution stage.
+
+**Evidence-backed.** Each assertion carries an `EvidenceSpan` that pinpoints the exact byte range in the source document revision, ensuring full provenance traceability.
+
+**Idempotent.** The `assertion_key` field is a deterministic deduplication key. Re-extracting the same document produces assertions with the same keys, preventing duplicates.
+
+## Assertion Struct
+
+A simplified view of the core fields:
+
+<CodeGroup>
+```rust Assertion
+struct Assertion {
+    base: BaseFields,
+
+    // Raw extraction output
+    subject_text: String,
+    predicate_raw: String,
+    predicate_id: Option<String>,    // canonical, if known
+    object_text: Option<String>,     // entity-to-entity claims
+    object_literal: Option<Value>,   // entity-to-literal claims
+
+    // Evidence
+    evidence: EvidenceSpan,
+    confidence: f32,                 // extraction confidence, 0.0-1.0
+
+    // Timestamps
+    source_event_time: Option<DateTime<Utc>>,
+    observed_at: DateTime<Utc>,
+    asserted_at: DateTime<Utc>,
+
+    // Deduplication
+    assertion_key: String,
+
+    // Resolution outcome
+    resolution_status: ResolutionStatus,
+    resolution_method: Option<String>,
+    resolution_confidence: Option<f32>,
+    subject_entity: Option<Link<Entity>>,
+    object_entity: Option<Link<Entity>>,
+
+    // Classification metadata
+    subject_entity_type: Option<String>,
+    object_entity_type: Option<String>,
+    significance: Option<String>,    // "skip", "low", "medium", "high"
+    lifecycle_tier: String,          // "active" or "archived"
+}
+```
+</CodeGroup>
+
+## Resolution Status
+
+Every assertion tracks its resolution progress through the `ResolutionStatus` enum:
+
+| Status | Description |
+|---|---|
+| `pending` | Not yet attempted. Default for newly extracted assertions. |
+| `resolved` | Successfully resolved -- both subject and object mapped to entities. |
+| `partial` | One side resolved (subject or object), but not both. |
+| `abstained` | Resolution declined due to ambiguity or low confidence. |
+| `failed` | Resolution failed after maximum retry attempts. |
+| `superseded` | Replaced by a newer assertion from document reprocessing. |
+
+<Accordion title="Resolution retry behavior">
+Assertions track retry state via `AssertionRetryState`:
+- `resolution_attempts` -- number of attempts so far
+- `last_resolution_at` -- timestamp of the most recent attempt
+- `abstention_reason` -- human-readable explanation when the resolver abstains
+
+The pipeline retries `pending` and `failed` assertions up to a configurable maximum. After exhausting retries, the status moves to `failed`.
+</Accordion>
+
+## Evidence Spans
+
+Each assertion includes an `EvidenceSpan` that links back to the source document:
+
+| Field | Type | Description |
+|---|---|---|
+| `revision` | `Link<DocRevision>` | The document revision containing the evidence |
+| `node` | `Option<Link<DocNode>>` | The specific chunk within the revision |
+| `start` | `u32` | Start byte offset in the revision text |
+| `end` | `u32` | End byte offset in the revision text |
+| `quote_hash` | `String` | Integrity hash of the quoted text |
+
+The `quote_hash` ensures evidence integrity without storing the raw quote on the assertion itself. To retrieve the original text, read the source revision at the given byte offsets.
+
+## Confidence Scores
+
+Assertions carry two distinct confidence values:
+
+1. **Extraction confidence** (`confidence`) -- how confident the extraction LLM is that the claim exists in the source text. Range: 0.0 to 1.0.
+2. **Resolution confidence** (`resolution_confidence`) -- how confident the resolver is in its entity mapping. Only populated after resolution.
+
+## Assertion Keys
+
+The `assertion_key` is a deterministic string computed from the assertion's content (subject, predicate, object, and evidence location). It serves as an idempotency key: if a document is re-extracted, assertions with matching keys are deduplicated rather than duplicated.
+
+## Lifecycle Tiers
+
+Assertions use a two-tier lifecycle:
+
+- **`active`** -- default tier for all new assertions. Included in standard queries and pipeline processing.
+- **`archived`** -- resolved assertions older than a configurable threshold. Excluded from default queries but retained for audit trails and provenance tracing.
+
+## See Also
+
+- [Truth Maintenance](/concepts/truth-maintenance) -- how resolved assertions feed into truth slots
+- [Predicates](/concepts/predicates) -- the canonical vocabulary assertions reference
+- [Security](/concepts/security) -- the security envelope carried on every assertion record

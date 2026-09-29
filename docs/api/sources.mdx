@@ -1,0 +1,100 @@
+---
+title: "Sources"
+description: "Source-first ingestion, provenance records, and source lifecycle operations."
+icon: "database"
+---
+
+## Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/v1/sources/ingest` | Stage a source and enqueue its workflow |
+| POST | `/v1/sources/search` | Search source records |
+| POST | `/v1/sources` | Create a raw source record |
+| GET | `/v1/sources/{id}` | Get source |
+| PUT | `/v1/sources/{id}` | Replace source |
+| DELETE | `/v1/sources/{id}` | Soft delete source |
+| POST | `/v1/sources/{id}/restore` | Restore source |
+
+## Ingest a source
+
+Use the normalized ingest endpoint to generate base fields, stage supplied
+content, and enqueue source-first processing:
+
+```bash
+curl -f -X POST http://localhost:3000/v1/sources/ingest \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "Project Cedar meeting",
+    "source_type": "manual",
+    "title": "Project Cedar meeting",
+    "text": "Alice and Bob discussed the launch plan.",
+    "collection": "meeting-notes",
+    "ingest_mode": "graph"
+  }'
+```
+
+`name` is required. Optional inputs include `uri`, `source_type`, `title`, `text`,
+`media`, `collection`, `metadata`, `rendition_key`, `extraction_skill`, `extraction_purpose`, `extraction_domain`,
+`ingest_mode`, and `sync`. Supported source types are `email`, `calendar`, `web`,
+`drive`, `chat`, `device_frame`, `device_video`, `transcript`, and `manual`.
+
+A request with staged document content defaults to `graph` mode; a source without
+it defaults to `metadata`. Other ingest modes are `skip` and `retrieval`. A URI
+is provenance metadata, not a promise that this endpoint will fetch and render
+arbitrary web content. Supply content for retrieval/graph ingestion.
+
+<Warning>
+  `sync` must be omitted or `false`. Synchronous ingest is rejected. A `201`
+  response confirms staging and enqueueing, not completed extraction.
+</Warning>
+
+The response contains `source_id`, `lifecycle_status`, `current_ingest_mode`,
+`work_item_id`, and optional `doc_id`. Follow work and runtime status as described
+in [System](/api/system). See [Documents](/api/documents) for media inputs.
+
+## Raw source record format
+
+`POST /v1/sources` creates a record without scheduling the source-first workflow.
+It accepts the complete `Source` type, including flattened base fields:
+
+```json source.json
+{
+  "id": "source:550e8400-e29b-41d4-a716-446655440000",
+  "space_id": "default",
+  "created_at": "2026-01-15T10:30:00Z",
+  "updated_at": "2026-01-15T10:30:00Z",
+  "created_by": "example-client",
+  "provenance": {},
+  "security": {"policy_id":"default","level":0},
+  "type": "web",
+  "hash": "replace-with-the-source-content-hash",
+  "external_id": "example-report",
+  "uri": "https://example.com/report"
+}
+```
+
+Here the field is `type`, not the ingest endpoint's `source_type`. Use fresh IDs,
+actual timestamps and content hashes, the correct space, and your policy's labels.
+Additional fields include `path`, `parent`, `range`, `timestamp`, `author`,
+`channel`, `metadata`, and lifecycle information.
+
+## Search and lifecycle
+
+```bash
+curl -f -X POST http://localhost:3000/v1/sources/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"Project Cedar","limit":10}'
+```
+
+Search accepts `query`, `include_deleted` (default `false`), `limit` (default `50`),
+and `cursor`. It returns full source records under `results`, plus `cursor`,
+`has_more`, and `total`, filtered by the caller's authorization.
+
+`GET` by ID returns the full source and accepts `include_deleted=true`. To update,
+read the record, modify its intended fields, and send the complete JSON to
+`PUT /v1/sources/{id}`. Keep the ID consistent with the path. This is replacement,
+not a partial patch. `DELETE` soft deletes and returns `204`; `POST` to the
+`/restore` route restores and returns the record.

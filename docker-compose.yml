@@ -1,0 +1,85 @@
+# Local development only. Database credentials and SKIP_AUTH are for loopback use.
+# Production requires explicit credentials, TLS and authenticated clients.
+
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:v2.4.1
+    container_name: elephant-surrealdb
+    user: "0:0"
+    command:
+      - start
+      - --log=info
+      - --user=root
+      - --pass=root
+      - --query-timeout=${SURREAL_QUERY_TIMEOUT:-30s}
+      - file:/data/database.db
+    volumes:
+      - surrealdb_data:/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "/surreal", "is-ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  elephant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    pull_policy: build
+    container_name: elephant
+    depends_on:
+      - surrealdb
+    environment:
+      - RUST_LOG=info
+      - ELEPHANT_HOST=0.0.0.0
+      - ELEPHANT_PORT=3000
+      - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-}
+      - MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS:-}
+      - SKIP_AUTH=${SKIP_AUTH:-true}
+      - JWT_SECRET
+      - JWT_ALGORITHM
+      - JWT_ISSUER
+      - JWT_AUDIENCE
+      - SURREALDB_URL=ws://surrealdb:8000
+      - SURREALDB_NAMESPACE=elephant
+      - SURREALDB_DATABASE=${SURREALDB_DATABASE:-test}
+      - SURREALDB_USER=root
+      - SURREALDB_PASS=root
+      # Worker configuration (pipeline runs inside the same container by default)
+      - PIPELINE_EMBED_ENABLED=true
+      - PIPELINE_PROMOTE_ENABLED=true
+      - PIPELINE_EMBED_POLL_INTERVAL=5
+      - PIPELINE_PROMOTE_POLL_INTERVAL=5
+      - PIPELINE_BUDGET_DAILY_ITEMS_GRAPH=10000
+      - PIPELINE_MAX_CONCURRENT=8
+      - PIPELINE_EMBED_PROVIDER=openai
+      - PIPELINE_EMBED_MODEL=text-embedding-3-large
+      - PIPELINE_EMBED_DIMS=3072
+      - OPENAI_API_KEY
+      - ANTHROPIC_API_KEY
+      # Agentic extractor config - use 127.0.0.1 for Docker internal networking
+      - PIPELINE_AGENTIC_MCP_URL=http://127.0.0.1:3000/mcp/agent
+      - PIPELINE_AGENTIC_MODEL=claude-opus-4-6
+      - PIPELINE_FORCE_DEFAULT_EXTRACTOR=${PIPELINE_FORCE_DEFAULT_EXTRACTOR:-false}
+      - PIPELINE_MAINTENANCE_POLL_INTERVAL=30
+      - PIPELINE_MAINTENANCE_MCP_URL=http://127.0.0.1:3000/mcp/maintenance
+      - PIPELINE_SKILLS_DIR=/skills
+    volumes:
+      - ./skills:/skills:ro
+    ports:
+      - "127.0.0.1:${ELEPHANT_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  surrealdb_data:
+    driver: local

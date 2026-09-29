@@ -1,0 +1,1438 @@
+[
+  {
+    "id": "dup_age_exact",
+    "description": "Two sources assert the identical integer age. Production short-circuits exact duplicates before the LLM; this verifies the prompt corroborates anyway.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "age",
+      "slot_type": "attribute",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "integer",
+            "value": 35
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2024-05-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:hr-profile"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "integer",
+            "value": 35
+          },
+          "confidence": 0.85,
+          "evidence_count": 1,
+          "timestamp": "2024-05-03T09:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:intro-email"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "corroborate",
+      "superseded_ids": [],
+      "equivalence_partition": [
+        [
+          "c1",
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "one"
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "corroborate",
+      "exact-duplicate"
+    ]
+  },
+  {
+    "id": "dup_employer_exact",
+    "description": "Two sources assert the identical works_at entity reference. Second exact-duplicate check for the prompt.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "works_at",
+      "slot_type": "rel",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:king",
+            "display": "King"
+          },
+          "confidence": 0.92,
+          "evidence_count": 3,
+          "timestamp": "2024-04-10T08:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:linkedin"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:king",
+            "display": "King"
+          },
+          "confidence": 0.88,
+          "evidence_count": 1,
+          "timestamp": "2024-04-12T10:30:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:email-signature"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "corroborate",
+      "superseded_ids": [],
+      "equivalence_partition": [
+        [
+          "c1",
+          "c2"
+        ]
+      ]
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "corroborate",
+      "exact-duplicate",
+      "rel"
+    ]
+  },
+  {
+    "id": "fmt_city_nyc",
+    "description": "Formatting equivalence: NYC vs New York City are the same place, so the claims corroborate.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "lives_in",
+      "slot_type": "attribute",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "string",
+            "value": "NYC"
+          },
+          "confidence": 0.85,
+          "evidence_count": 1,
+          "timestamp": "2024-05-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:chat-log"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "string",
+            "value": "New York City"
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2024-05-02T15:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:bio-page"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "corroborate",
+      "superseded_ids": [],
+      "equivalence_partition": [
+        [
+          "c1",
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "one"
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "corroborate",
+      "formatting-equivalence"
+    ]
+  },
+  {
+    "id": "fmt_age_int_vs_string",
+    "description": "Formatting equivalence: integer 35 vs string \"35\" state the same age.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "age",
+      "slot_type": "attribute",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "integer",
+            "value": 35
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2024-05-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:hr-profile"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "string",
+            "value": "35"
+          },
+          "confidence": 0.8,
+          "evidence_count": 1,
+          "timestamp": "2024-05-04T09:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:interview-notes"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "corroborate",
+      "superseded_ids": [],
+      "equivalence_partition": [
+        [
+          "c1",
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "one"
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "corroborate",
+      "formatting-equivalence"
+    ]
+  },
+  {
+    "id": "fmt_date_iso_vs_text",
+    "description": "Formatting equivalence: ISO date 2024-01-01 vs the string \"January 1st 2024\" state the same founding date.",
+    "input": {
+      "subject_display": "Acme Corp",
+      "predicate_id": "founded_on",
+      "slot_type": "attribute",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "date",
+            "value": "2024-01-01"
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2024-03-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:registry-filing"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "string",
+            "value": "January 1st 2024"
+          },
+          "confidence": 0.85,
+          "evidence_count": 1,
+          "timestamp": "2024-03-05T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:press-release"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "corroborate",
+      "superseded_ids": [],
+      "equivalence_partition": [
+        [
+          "c1",
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "one"
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "corroborate",
+      "formatting-equivalence",
+      "date"
+    ]
+  },
+  {
+    "id": "contradiction_age",
+    "description": "Hard contradiction on the same day: age 35 (well-evidenced) vs 47 (weak). A person has one age, so one claim is simply wrong.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "age",
+      "slot_type": "attribute",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "integer",
+            "value": 35
+          },
+          "confidence": 0.92,
+          "evidence_count": 3,
+          "timestamp": "2024-05-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:hr-profile",
+            "source:id-scan"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "integer",
+            "value": 47
+          },
+          "confidence": 0.7,
+          "evidence_count": 1,
+          "timestamp": "2024-05-01T14:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:forwarded-rumor"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "single_winner",
+      "winner_id": "c1",
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "one"
+    },
+    "acceptable_alternatives": [
+      {
+        "decision": "needs_review"
+      }
+    ],
+    "tags": [
+      "contradiction",
+      "single-valued-proposal"
+    ]
+  },
+  {
+    "id": "contradiction_capital",
+    "description": "Hard contradiction: France's capital claimed as Paris (strong) vs Lyon (weak). Exercises the capital_of-style cardinality-one proposal.",
+    "input": {
+      "subject_display": "France",
+      "predicate_id": "has_capital",
+      "slot_type": "attribute",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "string",
+            "value": "Paris"
+          },
+          "confidence": 0.95,
+          "evidence_count": 5,
+          "timestamp": "2024-02-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:atlas",
+            "source:encyclopedia"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "string",
+            "value": "Lyon"
+          },
+          "confidence": 0.6,
+          "evidence_count": 1,
+          "timestamp": "2024-02-02T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:quiz-answer"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "single_winner",
+      "winner_id": "c1",
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "one"
+    },
+    "acceptable_alternatives": [
+      {
+        "decision": "needs_review"
+      }
+    ],
+    "tags": [
+      "contradiction",
+      "single-valued-proposal"
+    ]
+  },
+  {
+    "id": "supersede_employer_2024",
+    "description": "Temporal supersession: works_at King evidenced in 2020, then a 2024 document states Alice joined Blizzard in 2024. King was true and is now superseded with a 2024 window end.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "works_at",
+      "slot_type": "rel",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:king",
+            "display": "King"
+          },
+          "confidence": 0.9,
+          "evidence_count": 3,
+          "timestamp": "2020-03-15T00:00:00Z",
+          "time_basis": "source_event_time",
+          "sources": [
+            "source:hr-2020"
+          ],
+          "evidence_notes": [
+            "\"Alice Smith works_at King\" (stated fact time 2020-03-15)"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:blizzard",
+            "display": "Blizzard"
+          },
+          "confidence": 0.88,
+          "evidence_count": 1,
+          "timestamp": "2024-02-01T00:00:00Z",
+          "time_basis": "source_event_time",
+          "sources": [
+            "source:news-2024"
+          ],
+          "evidence_notes": [
+            "\"Alice Smith left King and joined Blizzard\" (stated fact time 2024-02-01)"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "supersede",
+      "winner_id": "c2",
+      "superseded_ids": [
+        "c1"
+      ],
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "one",
+      "superseded_year_by_claim": {
+        "c1": 2024
+      }
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "supersede",
+      "temporal",
+      "rel"
+    ]
+  },
+  {
+    "id": "supersede_residence_2023",
+    "description": "Temporal supersession: lived in London per a 2019 profile, then a document states she moved to Stockholm in August 2023.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "lives_in",
+      "slot_type": "attribute",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "string",
+            "value": "London"
+          },
+          "confidence": 0.85,
+          "evidence_count": 2,
+          "timestamp": "2019-06-01T00:00:00Z",
+          "time_basis": "source_event_time",
+          "sources": [
+            "source:profile-2019"
+          ],
+          "evidence_notes": [
+            "\"Alice Smith lives_in London\" (stated fact time 2019-06-01)"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "string",
+            "value": "Stockholm"
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2023-08-01T00:00:00Z",
+          "time_basis": "source_event_time",
+          "sources": [
+            "source:relocation-email"
+          ],
+          "evidence_notes": [
+            "\"Alice Smith moved to Stockholm\" (stated fact time 2023-08-01)"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "supersede",
+      "winner_id": "c2",
+      "superseded_ids": [
+        "c1"
+      ],
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "one",
+      "superseded_year_by_claim": {
+        "c1": 2023
+      }
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "supersede",
+      "temporal"
+    ]
+  },
+  {
+    "id": "coexist_hobbies",
+    "description": "Multi-valued coexistence: reading and cycling are both legitimate hobbies at the same time.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "has_hobby",
+      "slot_type": "attribute",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "string",
+            "value": "reading"
+          },
+          "confidence": 0.85,
+          "evidence_count": 2,
+          "timestamp": "2024-05-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:bio-page"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "string",
+            "value": "cycling"
+          },
+          "confidence": 0.8,
+          "evidence_count": 1,
+          "timestamp": "2024-05-02T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:strava-mention"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "coexist",
+      "superseded_ids": [],
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "many"
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "coexist",
+      "multi-valued"
+    ]
+  },
+  {
+    "id": "coexist_board_member",
+    "description": "Multi-valued coexistence: board membership of two different organizations at once.",
+    "input": {
+      "subject_display": "Jane Doe",
+      "predicate_id": "board_member_of",
+      "slot_type": "rel",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:acme",
+            "display": "Acme Corp"
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2024-01-15T00:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:annual-report-acme"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:globex",
+            "display": "Globex"
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2024-02-20T00:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:annual-report-globex"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "coexist",
+      "superseded_ids": [],
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "many"
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "coexist",
+      "multi-valued",
+      "rel"
+    ]
+  },
+  {
+    "id": "coexist_languages",
+    "description": "Multi-valued coexistence with three claims: a person speaks several languages.",
+    "input": {
+      "subject_display": "Luka Novak",
+      "predicate_id": "speaks_language",
+      "slot_type": "attribute",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "string",
+            "value": "Swedish"
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2024-03-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:cv"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "string",
+            "value": "English"
+          },
+          "confidence": 0.95,
+          "evidence_count": 3,
+          "timestamp": "2024-03-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:cv"
+          ]
+        },
+        {
+          "claim_id": "c3",
+          "value": {
+            "kind": "string",
+            "value": "Croatian"
+          },
+          "confidence": 0.85,
+          "evidence_count": 1,
+          "timestamp": "2024-03-02T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:interview-notes"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "coexist",
+      "superseded_ids": [],
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ],
+        [
+          "c3"
+        ]
+      ],
+      "proposed_cardinality": "many"
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "coexist",
+      "multi-valued",
+      "three-claims"
+    ]
+  },
+  {
+    "id": "proposal_birth_year_single",
+    "description": "Contradictory birth years; a birth year is definitionally single-valued, so the proposal must be cardinality one.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "birth_year",
+      "slot_type": "attribute",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "integer",
+            "value": 1989
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2024-04-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:id-scan"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "integer",
+            "value": 1990
+          },
+          "confidence": 0.65,
+          "evidence_count": 1,
+          "timestamp": "2024-04-02T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:party-invite"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "single_winner",
+      "winner_id": "c1",
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "one"
+    },
+    "acceptable_alternatives": [
+      {
+        "decision": "needs_review"
+      }
+    ],
+    "tags": [
+      "contradiction",
+      "single-valued-proposal"
+    ]
+  },
+  {
+    "id": "ambiguous_birthplace",
+    "description": "Genuinely ambiguous: two contradictory birthplaces with identical confidence, evidence, and timestamps and no dates. NeedsReview is the expected answer; picking a winner is also acceptable.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "born_in",
+      "slot_type": "attribute",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "string",
+            "value": "Zagreb"
+          },
+          "confidence": 0.8,
+          "evidence_count": 1,
+          "timestamp": "2024-05-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:bio-a"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "string",
+            "value": "Split"
+          },
+          "confidence": 0.8,
+          "evidence_count": 1,
+          "timestamp": "2024-05-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:bio-b"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "needs_review",
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "one"
+    },
+    "acceptable_alternatives": [
+      {
+        "decision": "single_winner"
+      }
+    ],
+    "tags": [
+      "ambiguous",
+      "needs-review"
+    ]
+  },
+  {
+    "id": "event_dedup_q3",
+    "description": "Event dedup: \"Q3 planning\" and \"Q3 planning meeting\" at the same time with the same participants are the same event.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "attends_event",
+      "slot_type": "event",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "event",
+            "title": "Q3 planning",
+            "time_start": "2024-07-10T09:00:00Z",
+            "participants": [
+              "Alice Smith",
+              "Bob Jones"
+            ],
+            "status": "scheduled"
+          },
+          "confidence": 0.9,
+          "evidence_count": 1,
+          "timestamp": "2024-07-01T08:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:calendar-invite"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "event",
+            "title": "Q3 planning meeting",
+            "time_start": "2024-07-10T09:00:00Z",
+            "participants": [
+              "Alice Smith",
+              "Bob Jones"
+            ],
+            "status": "scheduled"
+          },
+          "confidence": 0.85,
+          "evidence_count": 1,
+          "timestamp": "2024-07-02T10:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:email-thread"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "corroborate",
+      "superseded_ids": [],
+      "equivalence_partition": [
+        [
+          "c1",
+          "c2"
+        ]
+      ]
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "corroborate",
+      "event",
+      "dedup"
+    ]
+  },
+  {
+    "id": "event_distinct_standup_retro",
+    "description": "Event distinction: a 09:00 standup and a 14:00 retrospective on the same day with the same participants are different events and coexist.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "attends_event",
+      "slot_type": "event",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "event",
+            "title": "Morning standup",
+            "time_start": "2024-07-10T09:00:00Z",
+            "participants": [
+              "Alice Smith",
+              "Bob Jones"
+            ],
+            "status": "scheduled"
+          },
+          "confidence": 0.9,
+          "evidence_count": 1,
+          "timestamp": "2024-07-08T08:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:calendar-invite"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "event",
+            "title": "Sprint retrospective",
+            "time_start": "2024-07-10T14:00:00Z",
+            "participants": [
+              "Alice Smith",
+              "Bob Jones"
+            ],
+            "status": "scheduled"
+          },
+          "confidence": 0.9,
+          "evidence_count": 1,
+          "timestamp": "2024-07-08T08:05:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:calendar-invite"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "coexist",
+      "superseded_ids": [],
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "many"
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "coexist",
+      "event",
+      "distinct"
+    ]
+  },
+  {
+    "id": "configured_one_age",
+    "description": "Registered semantics (cardinality one, state over time): age 35 in 2023 vs 36 in mid-2024. The newer value supersedes under the configured semantics; no proposal is required.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "age",
+      "slot_type": "attribute",
+      "semantics": {
+        "cardinality": "one",
+        "temporal_model": "state_over_time",
+        "conflict_policy": "supersede_by_recency"
+      },
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "integer",
+            "value": 35
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2023-04-10T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:profile-2023"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "integer",
+            "value": 36
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2024-06-20T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:profile-2024"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "supersede",
+      "winner_id": "c2",
+      "superseded_ids": [
+        "c1"
+      ],
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ]
+      ]
+    },
+    "acceptable_alternatives": [
+      {
+        "decision": "single_winner",
+        "winner_id": "c2"
+      }
+    ],
+    "tags": [
+      "configured-semantics",
+      "supersede",
+      "temporal"
+    ]
+  },
+  {
+    "id": "configured_one_ceo",
+    "description": "Registered semantics (cardinality one): Jane Doe was CEO per a 2021 report; a 2025 press release states John Roe was appointed CEO on 2025-01-15.",
+    "input": {
+      "subject_display": "Acme Corp",
+      "predicate_id": "has_ceo",
+      "slot_type": "rel",
+      "semantics": {
+        "cardinality": "one",
+        "temporal_model": "state_over_time",
+        "conflict_policy": "supersede_by_recency"
+      },
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:jane-doe",
+            "display": "Jane Doe"
+          },
+          "confidence": 0.9,
+          "evidence_count": 3,
+          "timestamp": "2021-01-10T00:00:00Z",
+          "time_basis": "document_date (2021 annual report)",
+          "sources": [
+            "source:annual-report-2021"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:john-roe",
+            "display": "John Roe"
+          },
+          "confidence": 0.92,
+          "evidence_count": 2,
+          "timestamp": "2025-01-15T00:00:00Z",
+          "time_basis": "event_date (press release: John Roe appointed CEO on 2025-01-15)",
+          "sources": [
+            "source:press-release-2025"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "supersede",
+      "winner_id": "c2",
+      "superseded_ids": [
+        "c1"
+      ],
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ]
+      ],
+      "superseded_year_by_claim": {
+        "c1": 2025
+      }
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "configured-semantics",
+      "supersede",
+      "temporal",
+      "rel"
+    ]
+  },
+  {
+    "id": "mixed_majority_age",
+    "description": "Mixed equivalence and conflict: integer 35 and string \"35\" agree, integer 47 conflicts. The equivalent pair should win over the outlier.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "age",
+      "slot_type": "attribute",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "integer",
+            "value": 35
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2024-05-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:hr-profile"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "string",
+            "value": "35"
+          },
+          "confidence": 0.8,
+          "evidence_count": 1,
+          "timestamp": "2024-05-02T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:interview-notes"
+          ]
+        },
+        {
+          "claim_id": "c3",
+          "value": {
+            "kind": "integer",
+            "value": 47
+          },
+          "confidence": 0.75,
+          "evidence_count": 1,
+          "timestamp": "2024-05-03T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:forwarded-rumor"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "single_winner",
+      "winner_id": "c1",
+      "equivalence_partition": [
+        [
+          "c1",
+          "c2"
+        ],
+        [
+          "c3"
+        ]
+      ],
+      "proposed_cardinality": "one"
+    },
+    "acceptable_alternatives": [
+      {
+        "decision": "single_winner",
+        "winner_id": "c2",
+        "equivalence_partition": [
+          [
+            "c1",
+            "c2"
+          ],
+          [
+            "c3"
+          ]
+        ]
+      },
+      {
+        "decision": "needs_review"
+      }
+    ],
+    "tags": [
+      "contradiction",
+      "formatting-equivalence",
+      "three-claims"
+    ]
+  },
+  {
+    "id": "rel_set_teams_coexist",
+    "description": "rel_set slot: membership in the Platform Team and the Data Guild are both true at once for a multi-team engineer.",
+    "input": {
+      "subject_display": "Alice Smith",
+      "predicate_id": "member_of",
+      "slot_type": "rel_set",
+      "claims": [
+        {
+          "claim_id": "c1",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:platform-team",
+            "display": "Platform Team"
+          },
+          "confidence": 0.9,
+          "evidence_count": 2,
+          "timestamp": "2024-05-01T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:org-chart"
+          ]
+        },
+        {
+          "claim_id": "c2",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:data-guild",
+            "display": "Data Guild"
+          },
+          "confidence": 0.85,
+          "evidence_count": 1,
+          "timestamp": "2024-05-06T12:00:00Z",
+          "time_basis": "asserted_at",
+          "sources": [
+            "source:guild-roster"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "coexist",
+      "superseded_ids": [],
+      "equivalence_partition": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ]
+      ],
+      "proposed_cardinality": "many"
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "coexist",
+      "rel_set",
+      "multi-valued"
+    ]
+  },
+  {
+    "id": "supersede_ingest_timestamp_trap",
+    "description": "Run-5 regression: the stale claim (King) carries only an ingestion-time timestamp (2026, record_created_at basis) that is NEWER than the current claim's fact time (2024). The evidence narrative says Alice left King and joined Blizzard in 2024. The adjudicator must not let ingestion recency beat fact-time evidence.",
+    "input": {
+      "subject_display": "Alice Andersson",
+      "predicate_id": "works_at",
+      "slot_type": "rel_set",
+      "claims": [
+        {
+          "claim_id": "k1",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:king",
+            "display": "King"
+          },
+          "confidence": 0.9,
+          "evidence_count": 1,
+          "timestamp": "2026-07-02T00:00:00Z",
+          "time_basis": "record_created_at",
+          "sources": [
+            "assertion:doc-a"
+          ],
+          "evidence_notes": [
+            "\"Alice Andersson works_at King\" (statement date unknown)"
+          ]
+        },
+        {
+          "claim_id": "k2",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:blizzard",
+            "display": "Blizzard Entertainment"
+          },
+          "confidence": 0.88,
+          "evidence_count": 2,
+          "timestamp": "2024-01-01T00:00:00Z",
+          "time_basis": "source_event_time",
+          "sources": [
+            "assertion:doc-b"
+          ],
+          "evidence_notes": [
+            "\"Alice Andersson works_at Blizzard Entertainment\" (stated fact time 2024-01-01)",
+            "\"Alice Andersson previously_worked_at King\" (stated fact time 2024-01-01)"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "supersede",
+      "winner_id": "k2",
+      "superseded_ids": [
+        "k1"
+      ],
+      "equivalence_partition": [
+        [
+          "k1"
+        ],
+        [
+          "k2"
+        ]
+      ],
+      "proposed_cardinality": "one",
+      "superseded_year_by_claim": {
+        "k1": 2024
+      }
+    },
+    "acceptable_alternatives": [],
+    "tags": [
+      "supersede",
+      "temporal",
+      "rel_set",
+      "ingest-trap",
+      "regression"
+    ]
+  },
+  {
+    "id": "supersede_basis_rule_no_evidence",
+    "description": "Basis-rule isolation: same ingest-timestamp trap but WITHOUT evidence notes. The observed_at/record_created_at basis alone must not make King 'more recent'; the only fact-dated claim is Blizzard 2024. King must never win.",
+    "input": {
+      "subject_display": "Alice Andersson",
+      "predicate_id": "works_at",
+      "slot_type": "rel_set",
+      "claims": [
+        {
+          "claim_id": "k1",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:king",
+            "display": "King"
+          },
+          "confidence": 0.9,
+          "evidence_count": 1,
+          "timestamp": "2026-07-02T00:00:00Z",
+          "time_basis": "record_created_at",
+          "sources": [
+            "assertion:doc-a"
+          ]
+        },
+        {
+          "claim_id": "k2",
+          "value": {
+            "kind": "entity_ref",
+            "id": "entity:blizzard",
+            "display": "Blizzard Entertainment"
+          },
+          "confidence": 0.88,
+          "evidence_count": 1,
+          "timestamp": "2024-01-01T00:00:00Z",
+          "time_basis": "source_event_time",
+          "sources": [
+            "assertion:doc-b"
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "decision": "supersede",
+      "winner_id": "k2",
+      "superseded_ids": [
+        "k1"
+      ],
+      "equivalence_partition": [
+        [
+          "k1"
+        ],
+        [
+          "k2"
+        ]
+      ],
+      "proposed_cardinality": "one"
+    },
+    "acceptable_alternatives": [
+      {
+        "decision": "single_winner",
+        "winner_id": "k2"
+      },
+      {
+        "decision": "needs_review"
+      },
+      {
+        "decision": "coexist"
+      }
+    ],
+    "tags": [
+      "supersede",
+      "temporal",
+      "rel_set",
+      "ingest-trap",
+      "basis-rule",
+      "regression"
+    ]
+  }
+]

@@ -1,0 +1,137 @@
+---
+title: Quickstart
+description: Start a local Elephant server, verify readiness, ingest a synthetic document, and inspect the result.
+icon: rocket
+---
+
+## Try the demo first
+
+The Living Wiki demo needs Rust 1.94 or newer, but no database service or model
+credentials:
+
+```bash
+git clone https://github.com/lukacf/elephant.git
+cd elephant
+./scripts/repo-cargo run -p elephant-bin --no-default-features -- demo-wiki
+```
+
+Open the [context inspector](http://localhost:3000/inspect/knowledge-views) or
+[evidence browser](http://localhost:3000/evidence). This credential-free build
+leaves the article wiki at `/wiki` empty. The [full demo](/architecture/living-wiki#runnable-projection-demo)
+uses a configured model to write articles. The first source build can take
+several minutes. Stop the demo before starting another server on the same port.
+
+## Start a persistent local stack
+
+Install Docker with Compose, then copy `.env.example` to `.env`. The default
+Compose configuration uses OpenAI embeddings and an Anthropic extraction
+model. Set `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` in `.env` before starting;
+model calls can incur charges.
+
+```bash
+cp .env.example .env
+# Edit .env with your provider credentials.
+docker compose up -d surrealdb
+docker compose run --rm elephant elephant migrate
+docker compose up -d elephant
+```
+
+Migrations must run against the same namespace and database as the server.
+Running the migration inside the Compose service uses that service's settings.
+Elephant runs managed workers in the server process by default.
+
+<Warning>
+Compose is a local development configuration with authentication bypass.
+Before exposing an instance, configure authentication and network access as
+described in [Deployment](/operations/deployment).
+</Warning>
+
+## Check readiness
+
+```bash
+curl -fsS http://localhost:3000/v1/runtime/status | jq
+```
+
+Wait for `semantic_ingest_ready` to be `true`. If it remains false, inspect
+`issues`, provider configuration, and service logs. `GET /v1/health` checks
+service health; it does not substitute for semantic readiness.
+
+For MCP, connect using Streamable HTTP at `http://localhost:3000/mcp` and call
+`get_runtime_status` with `{}`. Ingest tools are hidden until the runtime is
+ready. See [MCP profiles](/mcp/overview) for tool availability.
+
+## Ingest synthetic evidence
+
+The following example is fictional. With local development authentication,
+`X-Space-Id` selects the space. When authentication is enabled, send a Bearer
+token whose `space_id` and permissions authorize the request instead.
+
+```bash
+curl -fsS http://localhost:3000/v1/docs/ingest \
+  -H 'Content-Type: application/json' \
+  -H 'X-Space-Id: default' \
+  -d '{
+    "title": "Example project meeting",
+    "text": "On 2026-01-15, Alice and Bob met to discuss Project Cedar. Alice owns the test plan. Bob will review the results."
+  }' | tee /tmp/elephant-ingest.json | jq
+```
+
+The response includes `doc_id`, `source_id`, and `work_item_id`. Acceptance
+means the work was queued, not that extraction has finished. To use MCP,
+call `ingest_doc_simple` with the same `title` and `text`.
+
+## Track processing
+
+```bash
+doc_id=$(jq -r '.doc_id' /tmp/elephant-ingest.json)
+curl -fsS "http://localhost:3000/v1/docs/$doc_id/pipeline-status" \
+  -H 'X-Space-Id: default' | jq
+```
+
+The MCP equivalent is `get_doc_pipeline_status` with `{"id":"doc:YOUR_ID"}`,
+available on `/mcp/full` to authorized callers. Inspect failures instead of
+assuming that every accepted document has generated graph records.
+
+The source-first flow stages metadata, renders immutable document evidence,
+plans extraction, validates and commits artifacts, and emits outbox events for
+truth maintenance. The exact runtime stages are documented in the
+[Pipeline overview](/pipeline/overview).
+
+## Search and inspect
+
+Use `k` to request semantic document search; without it, this REST route uses
+its lexical search path. Semantic search can fall back to lexical retrieval
+when embeddings are unavailable.
+
+```bash
+curl -fsS http://localhost:3000/v1/docs/search \
+  -H 'Content-Type: application/json' \
+  -H 'X-Space-Id: default' \
+  -d '{"query":"test plan","k":5,"limit":5}' | jq
+
+curl -fsS http://localhost:3000/v1/entities/search \
+  -H 'Content-Type: application/json' \
+  -H 'X-Space-Id: default' \
+  -d '{"query":"Alice","limit":10}' | jq
+```
+
+On the default MCP profile, use `search_all` for discovery and `get_entity`
+for returned entity IDs. Extraction is model-driven, so inspect the assertions
+and evidence rather than assuming exact entity names or relationship counts.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Ingesting data" icon="file-import" href="/guides/ingesting-data">
+    Work with files, sources, URLs, and media-backed evidence.
+  </Card>
+  <Card title="Security" icon="shield-halved" href="/concepts/security">
+    Configure space isolation, scopes, clearances, and subject restrictions.
+  </Card>
+  <Card title="HTTP API" icon="code" href="/api/overview">
+    Integrate application code with the REST surface.
+  </Card>
+  <Card title="MCP tools" icon="wrench" href="/mcp/tools">
+    Inspect the available schemas and agent workflows.
+  </Card>
+</CardGroup>

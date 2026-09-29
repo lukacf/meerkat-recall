@@ -1,0 +1,1770 @@
+---
+title: "Tool Reference"
+description: "Complete reference for all Elephant MCP tools organized by category"
+icon: "wrench"
+---
+
+# MCP Tool Reference
+
+This page summarizes the MCP tools by category. Fetch `tools/list` from the
+chosen endpoint for the exact current schema, profile visibility, and runtime
+readiness gates. The four runtime-control tools are added by the managed API
+runtime rather than the core dispatcher. Local file helper tools are identified
+separately. Examples use fictional people and organizations.
+
+**Profile legend:** D = Default, A = Agent, M = Maintenance, P = Pipeline, F = Full
+
+---
+
+<Accordion title="Documents and local ingestion">
+
+### search_docs
+**Profiles:** A, M, F
+
+Search documents using semantic search, with lexical fallback when embeddings are unavailable.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `query` | string | yes | -- | Search query text |
+| `k` | integer | no | 10 | Number of results to return (max 100) |
+| `filters.collection` | string | no | -- | Filter by collection |
+| `filters.include_deleted` | boolean | no | false | Include soft-deleted documents |
+
+```json
+{ "query": "Alex Chen", "k": 10, "filters": { "collection": "notes" } }
+```
+
+---
+
+### ingest_doc
+**Profiles:** D, F
+
+Ingest a new document for processing using the full document-shaped body. Elephant stages a source-backed document and enqueues the source-first pipeline. Prefer `ingest_doc_simple` when you only need title, text/media, collection, and metadata.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `doc.title` | string | yes | Document title |
+| `doc.text` | string | yes | Document text content |
+| `doc.metadata` | object | no | Arbitrary metadata (e.g., collection, tags) |
+| `doc.source` | string | no | Source record ID |
+| `doc.rendition_key` | string | no | Idempotency key (auto-generated if omitted) |
+
+```json
+{
+  "doc": {
+    "title": "Meeting notes",
+    "text": "Alice met Bob on 2026-02-02 to discuss Project Elephant."
+  }
+}
+```
+
+---
+
+### ingest_doc_simple
+**Profiles:** D, F
+
+Simplified document ingestion with title, optional text, optional media, and optional metadata. All base fields are auto-generated.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `title` | string | yes | Document title |
+| `text` | string | no | Document text content or sidecar text for media-backed docs |
+| `media` | object[] | no | Typed image/video inputs; required when `text` is omitted |
+| `collection` | string | no | Collection name for organization |
+| `metadata` | object | no | Optional metadata object |
+
+```json
+{ "title": "Test Doc", "text": "Alex Chen founded NeuralFlow", "collection": "demo" }
+```
+
+---
+
+### batch_ingest_docs
+**Profiles:** F
+
+Batch ingest multiple documents and return a job ID for progress tracking.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `docs` | array | yes | Array of normalized document ingest objects. Each item requires `title` and either non-empty `text` or at least one `media` attachment. |
+
+```json
+{
+  "docs": [
+    { "title": "Daily standup", "text": "Status: shipped schema fixes." },
+    {
+      "title": "Observed frame",
+      "text": "Observed suspicious activity in the console",
+      "media": [
+        { "kind": "image", "media_type": "image/jpeg", "path": "/ingest/frame.jpg" }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+### get_doc
+**Profiles:** A, M, F
+
+Get a document by ID.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Document ID |
+
+```json
+{ "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6" }
+```
+
+---
+
+### list_doc_chunks
+**Profiles:** A, M, F
+
+List all structural nodes (chunks) for a document.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Document ID |
+
+```json
+{ "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6" }
+```
+
+---
+
+### get_doc_chunk
+**Profiles:** A, M, F
+
+Get a document node (chunk) by ID.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Document node ID |
+
+```json
+{ "id": "doc_node:1c0d6c6f-5e3b-4e7d-9c5c-8c4a8f3b7f2a" }
+```
+
+---
+
+### delete_doc
+**Profiles:** F
+
+Soft delete a document.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Document ID |
+
+```json
+{ "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6" }
+```
+
+---
+
+### restore_doc
+**Profiles:** F
+
+Restore a soft-deleted document.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Document ID |
+
+```json
+{ "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6" }
+```
+
+---
+
+### extract_doc
+**Profiles:** M, F
+
+Manually replay render/build/extraction preparation for an existing document.
+This is a maintenance helper for already-ingested docs, not a primary ingest path.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Document ID |
+
+```json
+{ "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6" }
+```
+
+---
+
+### get_doc_pipeline_status
+**Profiles:** F
+
+Get document pipeline status including chunks, revisions, nodes, and extraction progress.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Document ID |
+
+```json
+{ "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6" }
+```
+
+---
+
+### list_doc_collections
+**Profiles:** F
+
+List all document collections in the current space.
+
+```json
+{}
+```
+
+---
+
+### restamp_attribution
+**Profiles:** F
+
+Compatibility operation for application attribution metadata. Supply at least
+one selector (`doc_ids`, `session_id`, or `source_uri_prefix`) and the required
+`angel_protectees` array. Selectors are unioned; matching documents receive the
+exact replacement list, then derived entity attribution is recomputed from
+assertion-linked documents. An empty list clears per-subject attribution.
+These metadata fields are not a replacement for ABAC security envelopes.
+
+```json
+{ "doc_ids": ["doc:550e8400-e29b-41d4-a716-446655440000"], "angel_protectees": ["example-subject"] }
+```
+
+Recomputation follows assertion evidence. Attribution introduced only by a
+later deduplicated promotion without an evidence row is not reconstructed and
+may be removed. Inspect the result before relying on the corrected metadata.
+
+---
+
+### ingest_file
+**Profiles:** F
+
+Read a path on the Elephant server and ingest its text or media content.
+Explicitly mount intended files into a container; the supplied Compose file
+does not provide an `/ingest` mount. The similarly named local-helper tool
+reads client-side UTF-8 text and has a separate schema.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | File path on disk |
+| `source_type` | string | no | Content type hint (auto-detected from extension) |
+
+```json
+{ "path": "/ingest/doc.md" }
+```
+
+---
+
+### ingest_directory
+**Profiles:** F
+
+Ingest server-visible files in a directory matching a glob pattern. The
+local-helper variant instead reads client-side UTF-8 text; do not confuse the
+two filesystem boundaries.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | Directory path on disk |
+| `pattern` | string | no | Glob pattern (default: `**/*`) |
+| `source_type` | string | no | Content type hint for all files |
+
+```json
+{ "path": "/path/to/docs", "pattern": "*.md" }
+```
+
+---
+
+### ingest_url
+**Profiles:** F
+
+Fetch a URL and ingest its content. Text, image, and video URLs are normalized into the same source-first pipeline.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `url` | string | yes | HTTP/HTTPS URL to fetch |
+| `source_type` | string | no | Content type hint (overrides response header) |
+
+```json
+{ "url": "https://example.com/doc.txt" }
+```
+
+</Accordion>
+
+<Accordion title="Entities (8 tools)">
+
+### search_entities
+**Profiles:** D, A, M, F
+
+Search for entities by query and filters.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `query` | string | no | -- | Free-text search query |
+| `filters.entity_type` | string | no | -- | Filter by entity type |
+| `filters.include_deleted` | boolean | no | false | Include soft-deleted entities |
+| `limit` | integer | no | 50 | Max results (max 100) |
+| `cursor` | string | no | -- | Pagination cursor |
+
+```json
+{ "query": "Alex Chen", "filters": { "entity_type": "person" }, "limit": 10 }
+```
+
+---
+
+### get_entity
+**Profiles:** D, A, M, F
+
+Get a single entity by ID.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Entity ID |
+
+```json
+{ "id": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479" }
+```
+
+---
+
+### get_entity_with_relations
+**Profiles:** D, F
+
+Get an entity with its outgoing and incoming relationships.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Entity ID |
+
+```json
+{ "id": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479" }
+```
+
+---
+
+### create_entity_simple
+**Profiles:** F
+
+Create an entity with only type and display name. All base fields are auto-generated.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `entity_type` | string | yes | Entity type (e.g., person, org, topic) |
+| `display_name` | string | yes | Primary display name |
+| `summary` | string | no | Brief summary |
+
+```json
+{ "entity_type": "person", "display_name": "Alex Chen", "summary": "Founder of NeuralFlow" }
+```
+
+---
+
+### update_entity
+**Profiles:** M, F
+
+Update an entity's fields.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Entity ID |
+| `fields` | object | yes | Fields to update |
+
+```json
+{ "id": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479", "fields": { "summary": "Founder of NeuralFlow" } }
+```
+
+---
+
+### delete_entity
+**Profiles:** F
+
+Soft delete an entity.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Entity ID |
+
+```json
+{ "id": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479" }
+```
+
+---
+
+### restore_entity
+**Profiles:** F
+
+Restore a soft-deleted entity.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Entity ID |
+
+```json
+{ "id": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479" }
+```
+
+---
+
+### batch_entities
+**Profiles:** F
+
+Batch create or update entities.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `items` | array | yes | Array of entity objects (each requires `type` and `display_name`) |
+
+```json
+{
+  "items": [
+    { "type": "person", "display_name": "Alex Chen", "summary": "Security researcher" }
+  ]
+}
+```
+
+</Accordion>
+
+<Accordion title="Living Wiki and source freshness (8 tools)">
+
+### create_wiki_from_graph
+**Profiles:** M, F
+
+Plan, write, and independently verify wiki articles from the graph. Requires
+an explicit `manage:wiki` scope with unrestricted subject scope; wildcard
+operation permission is insufficient. The caller delegates service authority
+across the selected space, including its security envelopes.
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `max_articles` | `0` | Exhaustive automatic curation, or an explicit cap up to 2000 |
+| `article_max_hops` | `1` | Context graph hops, 1-4 |
+| `article_max_members` | `250` | Governed members per context, 1-250 |
+| `publish` | `true` | Publish only articles that pass evidence and freshness gates |
+| `manage` | `true` | Register recurring reconciliation; requires `publish=true` |
+| `refresh_interval_minutes` | `360` | Managed reconciliation interval, 5-10080 |
+| `writer_model`, `verifier_model` | configured models | Optional model overrides |
+
+A draft-only invocation must disable management explicitly:
+
+```json
+{ "publish": false, "manage": false, "max_articles": 10 }
+```
+
+### compile_wiki_article
+**Profiles:** M, F
+
+Compile one governed definition with separate writer and verifier calls.
+Requires the same explicit `manage:wiki` service authority. `definition_id` is
+required; `publish` defaults to false. Optional `writer_model` and
+`verifier_model` override configured models. Publication also requires an
+approved context plan and a clean freshness/quality receipt.
+
+```json
+{ "definition_id": "knowledge_view_definition:550e8400-e29b-41d4-a716-446655440000", "publish": false }
+```
+
+### stop_managed_wiki
+**Profiles:** M, F
+
+Call with `{}` to revoke the space's recurring wiki authority and cancel queued
+jobs. Requires explicit `manage:wiki` and unrestricted subject scope. An
+already running publication may finish, but cannot schedule a successor.
+Published articles and immutable history remain available. A later explicit
+managed creation grants a new registration.
+
+---
+
+### get_knowledge_view
+**Profiles:** D, A, M, F
+
+Get or lazily refresh a cited, immutable Living Wiki projection rooted at
+exactly one entity, source, or governed graph-view definition. Factual Markdown is backed by a statement-level
+support ledger. The result includes the stable view, current revision,
+dependencies, citations, freshness, and validation receipts.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `entity_id` | string | one root required | -- | Canonical entity ID |
+| `source_id` | string | one root required | -- | Canonical source ID |
+| `definition_id` | string | one root required | -- | Governed topic, community, or query definition ID |
+| `freshness` | string | no | `prefer_fresh` | `allow_stale`, `prefer_fresh`, or `required` |
+| `limit` | integer | no | 25 | Maximum records per projection section (max 100) |
+
+```json
+{ "entity_id": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479", "freshness": "required" }
+```
+
+---
+
+### rebuild_knowledge_view
+**Profiles:** M, F
+
+Force publication of a new immutable revision for exactly one entity, source,
+or governed graph-view definition
+root. This requires write authorization for the selected root record.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `entity_id` | string | one root required | -- | Canonical entity ID |
+| `source_id` | string | one root required | -- | Canonical source ID |
+| `definition_id` | string | one root required | -- | Governed topic, community, or query definition ID |
+| `limit` | integer | no | 25 | Maximum records per projection section (max 100) |
+
+```json
+{ "source_id": "source:f47ac10b-58cc-4372-a567-0e02b2c3d479", "limit": 25 }
+```
+
+---
+
+### materialize_knowledge_views
+**Profiles:** M, F
+
+Compile existing Elephant data into Living Wiki pages without first naming
+individual roots. The tool scans bounded, ID-ordered pages of entities,
+sources, and graph-view definitions. It applies record-level ABAC, continues
+past isolated compilation failures, and returns independent cursors for each
+record kind. Repeating a page reuses revisions whose dependency receipts are
+unchanged.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `include_entities` | boolean | no | `true` | Materialize canonical entity roots |
+| `include_sources` | boolean | no | `true` | Materialize canonical source roots |
+| `include_definitions` | boolean | no | `true` | Materialize governed topic, community, and query definitions |
+| `entity_cursor` | string | no | -- | Entity cursor returned by the previous call |
+| `source_cursor` | string | no | -- | Source cursor returned by the previous call |
+| `definition_cursor` | string | no | -- | Definition cursor returned by the previous call |
+| `limit_per_kind` | integer | no | 10 | Maximum roots per included kind (max 100) |
+| `view_limit` | integer | no | 25 | Maximum related records per compiled page section (max 100) |
+| `concurrency` | integer | no | 4 | Maximum roots compiled concurrently within one kind (max 8) |
+
+```json
+{
+  "include_entities": true,
+  "include_sources": true,
+  "include_definitions": true,
+  "limit_per_kind": 10,
+  "view_limit": 25,
+  "concurrency": 4
+}
+```
+
+---
+
+### get_knowledge_view_definition
+**Profiles:** D, A, M, F
+
+Read the typed, bounded selector behind a topic, community, or saved-query
+projection.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `definition_id` | string | yes | -- | `knowledge_view_definition` ID |
+
+---
+
+### upsert_knowledge_view_definition
+**Profiles:** M, F
+
+Create or update a governed graph-view definition. Selectors are tagged typed
+objects, never raw SurrealQL. Supported selectors are bounded topic traversal,
+bounded seeded community traversal, and a safe entity query with optional
+entity-type, name/alias, and exact approved-attribute filters.
+
+```json
+{
+  "title": "Rust concepts",
+  "selector": {
+    "type": "topic",
+    "topic": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "relation_types": ["includes_concept"],
+    "max_hops": 2,
+    "max_members": 100
+  }
+}
+```
+
+---
+
+### get_source_watch
+**Profiles:** D, A, M, F
+
+Read the recurring refresh policy and recent immutable observation receipts for
+a source without performing network work.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `source_id` | string | yes | -- | Canonical source ID |
+| `check_limit` | integer | no | 10 | Maximum recent receipts (max 100) |
+
+```json
+{ "source_id": "source:f47ac10b-58cc-4372-a567-0e02b2c3d479", "check_limit": 10 }
+```
+
+---
+
+### configure_source_watch
+**Profiles:** M, F
+
+Create, enable, pause, or reschedule a guarded textual web-source watch. The
+minimum interval is 60 seconds and the maximum is 31 days.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `source_id` | string | yes | -- | Canonical web source ID |
+| `interval_seconds` | integer | yes | -- | Normal interval between checks |
+| `enabled` | boolean | no | true | Enable or pause the watch |
+
+```json
+{ "source_id": "source:f47ac10b-58cc-4372-a567-0e02b2c3d479", "interval_seconds": 3600, "enabled": true }
+```
+
+---
+
+### check_source_watch
+**Profiles:** M, F
+
+Enqueue or reopen the source's idempotent refresh work item for immediate leased
+execution. A changed textual representation is staged through source-first
+re-ingest and canonical triage. Use `get_source_watch` to inspect the immutable
+receipt after the work item completes.
+
+```json
+{ "source_id": "source:f47ac10b-58cc-4372-a567-0e02b2c3d479" }
+```
+
+</Accordion>
+
+<Accordion title="Relationships (6 tools)">
+
+### relate_entities
+**Profiles:** F
+
+Create a relationship between two entities. Optionally creates an evidence assertion. `weight` becomes confidence. The current handler accepts but does not persist `description`, `properties`, `valid_from`, or `valid_to`; use `update_relationship` for stored fields such as `validity_window`.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from_id` | string | yes | -- | Source entity ID |
+| `to_id` | string | yes | -- | Target entity ID |
+| `rel_type` | string | yes | -- | Relationship type (e.g., `works_at`, `knows`) |
+| `weight` | number | no | -- | Relationship strength (0.0 to 1.0) |
+| `valid_from` | string | no | -- | When the relationship became valid (ISO 8601) |
+| `valid_to` | string | no | -- | When the relationship ended (ISO 8601) |
+| `description` | string | no | -- | Description of the relationship |
+| `properties` | object | no | -- | Additional properties |
+| `evidence_text` | string | no | -- | Evidence quote supporting the relationship |
+| `evidence_source` | string | no | -- | Evidence source record ID |
+| `space_id` | string | no | current | Space/tenant ID |
+
+```json
+{
+  "from_id": "entity:550e8400-e29b-41d4-a716-446655440000",
+  "to_id": "entity:550e8400-e29b-41d4-a716-446655440001",
+  "rel_type": "works_at",
+  "weight": 0.9
+}
+```
+
+---
+
+### upsert_relationship
+**Profiles:** F
+
+Create or update a relationship based on from/to/type composite key. `fields` is merged into the serialized record when a match exists; the creation path currently ignores it. Use `update_relationship` for explicit field changes after creation.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `from_id` | string | yes | Source entity ID |
+| `to_id` | string | yes | Target entity ID |
+| `rel_type` | string | yes | Relationship type |
+| `fields` | object | no | Fields to set/update |
+
+```json
+{
+  "from_id": "entity:550e8400-e29b-41d4-a716-446655440000",
+  "to_id": "entity:550e8400-e29b-41d4-a716-446655440001",
+  "rel_type": "works_at"
+}
+```
+
+---
+
+### update_relationship
+**Profiles:** F
+
+Update a relationship's serialized record fields by ID, such as `confidence`, `status`, or `validity_window`. See the [record format](/api/relationships).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Relationship ID |
+| `fields` | object | yes | Fields to update |
+
+```json
+{ "id": "rel:550e8400-e29b-41d4-a716-446655440000", "fields": { "confidence": 0.9 } }
+```
+
+---
+
+### delete_relationship
+**Profiles:** F
+
+Soft delete a relationship.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Relationship ID |
+
+```json
+{ "id": "rel:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+---
+
+### restore_relationship
+**Profiles:** F
+
+Restore a soft-deleted relationship.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Relationship ID |
+
+```json
+{ "id": "rel:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+---
+
+### batch_relationships
+**Profiles:** F
+
+Batch create relationships.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `items` | array | yes | Array of relationship objects (each requires `from_id`, `to_id`, `rel_type`) |
+
+```json
+{
+  "items": [
+    {
+      "from_id": "entity:550e8400-e29b-41d4-a716-446655440000",
+      "to_id": "entity:550e8400-e29b-41d4-a716-446655440001",
+      "rel_type": "works_at",
+      "weight": 0.9
+    }
+  ]
+}
+```
+
+</Accordion>
+
+<Accordion title="Assertions (3 tools)">
+
+### list_assertions
+**Profiles:** A, M, F
+
+List assertions with optional filtering by status, source, or predicate.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `status` | string | no | -- | Filter: `pending`, `resolved`, `partial`, `abstained`, `failed`, `superseded` |
+| `source_id` | string | no | -- | Filter by source ID |
+| `predicate` | string | no | -- | Filter by predicate (raw string) |
+| `limit` | integer | no | 50 | Max results (max 100) |
+| `cursor` | string | no | -- | Pagination cursor |
+
+```json
+{ "status": "pending", "limit": 10 }
+```
+
+---
+
+### get_assertion
+**Profiles:** A, M, F
+
+Get a single assertion by ID with related source and predicate info.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Assertion ID |
+
+```json
+{ "id": "assertion:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+---
+
+### search_assertions
+**Profiles:** A, M, F
+
+Search assertions by text query across subject, predicate, and object fields.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `query` | string | yes | -- | Free-text search query |
+| `status` | string | no | -- | Filter by resolution status |
+| `limit` | integer | no | 50 | Max results (max 100) |
+
+```json
+{ "query": "works at", "limit": 10 }
+```
+
+</Accordion>
+
+<Accordion title="Sources">
+
+### ingest_source
+**Profiles:** D, F
+
+Create a source, optionally stage text or media on it, and enqueue source-first
+ingestion. `source` must be a complete [Source record](/api/sources#raw-source-record-format), including base fields, `type`, and `hash`. Use `ingest_source_simple` to generate these fields. Optional staged-document fields include
+`title`, `text`, `media`, `collection`, `metadata`, and `rendition_key`.
+`ingest_mode` accepts `skip`, `metadata`, `retrieval`, or `graph`.
+
+```json
+{
+  "source": {
+    "id": "source:550e8400-e29b-41d4-a716-446655440000",
+    "space_id": "default",
+    "created_at": "2026-01-15T10:30:00Z",
+    "updated_at": "2026-01-15T10:30:00Z",
+    "created_by": "example-client",
+    "provenance": {},
+    "security": {
+      "policy_id": "default",
+      "level": 0
+    },
+    "type": "manual",
+    "hash": "replace-with-the-source-content-hash",
+    "external_id": "example:meeting-1"
+  },
+  "title": "Example meeting",
+  "text": "Alice owns the test plan for Project Cedar.",
+  "ingest_mode": "graph"
+}
+```
+
+### ingest_source_simple
+**Profiles:** D, F
+
+The simplified form requires `name` and accepts optional `uri`, `source_type`,
+and the staged-document and ingest-mode fields above.
+
+```json
+{
+  "name": "Example meeting",
+  "source_type": "manual",
+  "text": "Alice owns the test plan for Project Cedar.",
+  "ingest_mode": "graph"
+}
+```
+
+### batch_ingest_sources
+**Profiles:** D, F
+
+Accepts required `items`, an array of `ingest_source` input objects such as the
+complete example above. Every item requires its own full `source` record. Inspect
+each item's result; queue acceptance is not completed semantic extraction.
+
+### search_sources
+**Profiles:** F
+
+Search for sources by query and filters.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `query` | string | no | -- | Free-text search query |
+| `filters.include_deleted` | boolean | no | false | Include soft-deleted sources |
+| `limit` | integer | no | 50 | Max results (max 100) |
+| `cursor` | string | no | -- | Pagination cursor |
+
+```json
+{ "query": "feed", "filters": { "include_deleted": false }, "limit": 10 }
+```
+
+---
+
+### get_source
+**Profiles:** A, M, F
+
+Get a single source by ID.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Source ID |
+
+```json
+{ "id": "source:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+---
+
+### create_source
+**Profiles:** F
+
+Create a new source record.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source` | object | yes | Source record to create |
+
+```json
+{
+  "source": {
+    "id": "source:550e8400-e29b-41d4-a716-446655440000",
+    "space_id": "default",
+    "created_at": "2026-01-15T10:30:00Z",
+    "updated_at": "2026-01-15T10:30:00Z",
+    "created_by": "example-client",
+    "provenance": {},
+    "security": {
+      "policy_id": "default",
+      "level": 0
+    },
+    "type": "manual",
+    "hash": "replace-with-the-source-content-hash",
+    "external_id": "example:meeting-1"
+  }
+}
+```
+
+---
+
+### create_source_simple
+**Profiles:** F
+
+Create a source with only a name. Hash and base fields are auto-generated.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | Human-readable name |
+| `uri` | string | no | URI for the source |
+| `source_type` | string | no | Source type (e.g., web, email, manual) |
+
+```json
+{ "name": "My Feed", "uri": "https://example.com/feed.xml" }
+```
+
+---
+
+### update_source
+**Profiles:** F
+
+Update a source's fields.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Source ID |
+| `fields` | object | yes | Fields to update |
+
+```json
+{ "id": "source:550e8400-e29b-41d4-a716-446655440000", "fields": { "uri": "https://example.com" } }
+```
+
+---
+
+### delete_source
+**Profiles:** F
+
+Soft delete a source.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Source ID |
+
+```json
+{ "id": "source:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+---
+
+### restore_source
+**Profiles:** F
+
+Restore a soft-deleted source.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Source ID |
+
+```json
+{ "id": "source:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+</Accordion>
+
+<Accordion title="Search (1 tool)">
+
+### search_all
+**Profiles:** D, A, M, F
+
+Search across entities, documents, sources, and relationships in a single query. Results are grouped by type.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `query` | string | yes | -- | Search query text |
+| `limit` | integer | no | 10 | Max results per type (max 100) |
+| `include_deleted` | boolean | no | false | Include soft-deleted records |
+| `include` | array | no | all | Restrict to specific types: `entities`, `docs`, `sources`, `relationships` |
+
+```json
+{ "query": "Alex Chen Acme", "limit": 10, "include": ["entities", "docs", "relationships"] }
+```
+
+</Accordion>
+
+<Accordion title="Identity (4 tools)">
+
+### get_entity_context_bundle
+**Profiles:** D, A, M, F
+
+Get a comprehensive context bundle for an entity, including relationships and statistics.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | string | yes | -- | Entity ID |
+| `window` | integer | no | 30 | Time window in days for context |
+| `limit` | integer | no | 10 | Maximum items per section |
+
+```json
+{ "id": "entity:550e8400-e29b-41d4-a716-446655440000", "window": 30, "limit": 10 }
+```
+
+---
+
+### propose_identity_candidate
+**Profiles:** M, F
+
+Propose two entities as potential duplicates for identity resolution.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `candidate.entity_a` | string | yes | First entity ID |
+| `candidate.entity_b` | string | yes | Second entity ID |
+| `candidate.confidence` | number | yes | Confidence in match (0.0 to 1.0) |
+| `candidate.evidence` | string | no | Evidence or reasoning |
+| `candidate.signal_type` | string | no | How the match was detected |
+
+```json
+{
+  "candidate": {
+    "entity_a": "entity:550e8400-e29b-41d4-a716-446655440000",
+    "entity_b": "entity:550e8400-e29b-41d4-a716-446655440001",
+    "confidence": 0.92,
+    "evidence": "Same name + email",
+    "signal_type": "heuristic"
+  }
+}
+```
+
+---
+
+### list_identity_candidates
+**Profiles:** M, F
+
+List pending entity merge candidates.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `filters.status` | string | no | -- | Filter: `pending`, `approved`, `rejected` |
+| `filters.min_confidence` | number | no | -- | Minimum confidence (0.0 to 1.0) |
+| `filters.entity_id` | string | no | -- | Filter by entity involvement |
+| `limit` | integer | no | 50 | Max results (max 100) |
+
+```json
+{ "filters": { "status": "pending", "min_confidence": 0.85 }, "limit": 50 }
+```
+
+---
+
+### merge_entities
+**Profiles:** M, F
+
+Merge two entities into one. The survivor entity absorbs the merged entity's relationships.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `entity_a` | string | yes | -- | First entity ID |
+| `entity_b` | string | yes | -- | Second entity ID |
+| `strategy` | string | no | `prefer_newer` | Merge strategy: `prefer_newer`, `prefer_older`, `prefer_a`, `prefer_b` |
+
+```json
+{
+  "entity_a": "entity:550e8400-e29b-41d4-a716-446655440000",
+  "entity_b": "entity:550e8400-e29b-41d4-a716-446655440001",
+  "strategy": "prefer_newer"
+}
+```
+
+</Accordion>
+
+<Accordion title="Predicates (6 tools)">
+
+### list_predicates
+**Profiles:** D, A, M, F
+
+List predicate definitions with optional alias mappings.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `status` | string | no | -- | Filter: `active`, `deprecated` |
+| `include_aliases` | boolean | no | true | Include alias mappings in output |
+| `limit` | integer | no | 50 | Max results (max 100) |
+| `cursor` | string | no | -- | Pagination cursor |
+
+```json
+{ "status": "active", "include_aliases": true, "limit": 50 }
+```
+
+---
+
+### get_predicate
+**Profiles:** A, M, F
+
+Get a single predicate by its predicate_id with optional alias mappings.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `predicate_id` | string | yes | -- | The predicate identifier (e.g., `works_at`) |
+| `include_aliases` | boolean | no | true | Include alias mappings |
+
+```json
+{ "predicate_id": "works_at", "include_aliases": true }
+```
+
+---
+
+### register_predicate
+**Profiles:** M, F
+
+Register a new predicate in the predicate registry.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `predicate_id` | string | yes | Unique predicate identifier (e.g., `works_at`) |
+| `description` | string | no | Description of the predicate's semantics |
+
+```json
+{ "predicate_id": "works_at", "description": "Subject works for or is employed by object" }
+```
+
+---
+
+### propose_predicate_alias
+**Profiles:** M, F
+
+Propose a new alias mapping for a predicate.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `alias_name` | string | yes | -- | The alias name to propose |
+| `canonical_predicate_id` | string | yes | -- | The canonical predicate ID this alias maps to |
+| `confidence` | number | no | 0.8 | Confidence score for the alias (0.0 to 1.0) |
+
+```json
+{ "alias_name": "employed_by", "canonical_predicate_id": "works_at", "confidence": 0.9 }
+```
+
+---
+
+### validate_predicate_proposal
+**Profiles:** F
+
+Validate a predicate proposal work artifact.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `proposal_id` | string | yes | The work_artifact ID of the proposal to validate |
+
+```json
+{ "proposal_id": "work_artifact:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+---
+
+### approve_predicate_proposal
+**Profiles:** M, F
+
+Approve a predicate alias proposal from a work artifact, creating an active alias.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `proposal_id` | string | yes | -- | The work_artifact ID of the proposal to approve |
+| `confidence` | number | no | 0.95 | Override confidence score for the created alias |
+
+```json
+{ "proposal_id": "work_artifact:550e8400-e29b-41d4-a716-446655440000", "confidence": 0.95 }
+```
+
+</Accordion>
+
+<Accordion title="Events (5 tools)">
+
+### add_timeline_event
+**Profiles:** D, M, F
+
+Create a timeline event with explicit evidence references. Elephant requires at least one `assertion_refs` or `source_refs` item, so this tool stays provenance-safe instead of creating bare events.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `title` | string | yes | -- | Event title |
+| `summary` | string | no | -- | Optional event summary |
+| `subject_ids` | array | no | `[]` | Related entity IDs |
+| `assertion_refs` | array | no | `[]` | Assertion evidence references |
+| `source_refs` | array | no | `[]` | Source evidence references |
+| `time_start` | string | no | -- | Event start time (`date-time`) |
+| `time_end` | string | no | -- | Event end time (`date-time`) |
+| `time_precision` | string | no | `unknown` | One of `exact`, `minute`, `hour`, `day`, `month`, `year`, `unknown` |
+| `confidence` | number | no | event default | Event confidence override |
+| `time_confidence` | number | no | event default | Temporal confidence override |
+| `status` | string | no | `approved` | One of `candidate`, `approved`, `superseded`, `rejected` |
+| `metadata` | object | no | -- | Arbitrary event metadata |
+
+```json
+{
+  "title": "Quarterly planning",
+  "source_refs": ["source:550e8400-e29b-41d4-a716-446655440000"],
+  "time_start": "2026-04-06T09:00:00Z",
+  "time_precision": "minute"
+}
+```
+
+---
+
+### search_events
+**Profiles:** D, A, M, F
+
+Search domain timeline events in the caller's space.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `query` | string | no | -- | Search query |
+| `limit` | integer | no | 50 | Max results (max 100) |
+| `cursor` | string | no | -- | Pagination cursor |
+| `include_deleted` | boolean | no | false | Include deleted events |
+| `include_candidates` | boolean | no | false | Include candidate-status events |
+| `statuses` | array | no | -- | Filter by status: `candidate`, `approved`, `superseded`, `rejected` |
+| `entity_ids` | array | no | -- | Filter by entity involvement |
+| `mode` | string | no | -- | Match mode: `any` or `all` |
+
+```json
+{ "query": "launch", "limit": 10, "include_candidates": false }
+```
+
+---
+
+### get_event
+**Profiles:** D, A, M, F
+
+Get a single domain event by ID.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | string | yes | -- | Event ID |
+| `include_deleted` | boolean | no | false | Include deleted events |
+
+```json
+{ "id": "event:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+---
+
+### list_recent_events
+**Profiles:** D, A, M, F
+
+List recent domain events for the caller's space, ordered by recency.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `limit` | integer | no | 20 | Max results (max 200) |
+| `include_candidates` | boolean | no | false | Include candidate-status events |
+
+```json
+{ "limit": 20, "include_candidates": false }
+```
+
+---
+
+### list_upcoming_events
+**Profiles:** D, A, M, F
+
+List upcoming domain events within a time window.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `days` | integer | no | 7 | Look-ahead window in days (1-365) |
+| `include_candidates` | boolean | no | false | Include candidate-status events |
+
+```json
+{ "days": 14, "include_candidates": false }
+```
+
+</Accordion>
+
+<Accordion title="Truth Slots (2 tools)">
+
+### list_truth_slots
+**Profiles:** A, M, F
+
+List truth slots with filtering by subject entity and predicate.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `subject_entity_id` | string | no | -- | Filter by subject entity ID |
+| `predicate_id` | string | no | -- | Filter by predicate ID |
+| `stale_only` | boolean | no | false | Filter for stale slots only |
+| `limit` | integer | no | 50 | Max results (max 100) |
+| `cursor` | string | no | -- | Pagination cursor |
+
+```json
+{ "subject_entity_id": "entity:550e8400-e29b-41d4-a716-446655440000", "predicate_id": "works_at", "limit": 25 }
+```
+
+---
+
+### get_truth_slot_history
+**Profiles:** F
+
+Get all assertions competing for a truth slot, including conflict group information.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Truth slot ID |
+
+```json
+{ "id": "truth_slot:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+</Accordion>
+
+<Accordion title="Work Items (5 tools)">
+
+### list_work_items
+**Profiles:** P, F
+
+List work queue items with filtering by kind, status, or age.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `kind` | string | no | -- | Filter by kind (e.g., `extract`, `embed`, `promote`) |
+| `status` | string | no | -- | Filter: `pending`, `runnable`, `running`, `done`, `failed`, `cancelled` |
+| `min_age_secs` | integer | no | -- | Filter by minimum age in seconds |
+| `limit` | integer | no | 50 | Max results (max 100) |
+| `cursor` | string | no | -- | Pagination cursor |
+
+```json
+{ "status": "failed", "limit": 20 }
+```
+
+---
+
+### list_pending_work_items
+**Profiles:** P, F
+
+List work items that are pending or runnable (ready to be claimed).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `kind` | string | no | -- | Filter by kind |
+| `limit` | integer | no | 50 | Max results (max 100) |
+
+```json
+{ "kind": "extract", "limit": 50 }
+```
+
+---
+
+### claim_work_item
+**Profiles:** P, F
+
+Claim a runnable work item with a lease for processing.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | string | yes | -- | Work item ID |
+| `worker_id` | string | yes | -- | Identifier of the claiming worker |
+| `lease_duration_secs` | integer | no | 300 | Lease duration in seconds |
+
+```json
+{ "id": "work_item:550e8400-e29b-41d4-a716-446655440000", "worker_id": "worker-1", "lease_duration_secs": 300 }
+```
+
+---
+
+### complete_work_item
+**Profiles:** P, F
+
+Mark a work item as completed (success or failure).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | string | yes | -- | Work item ID |
+| `success` | boolean | no | true | Whether the work item succeeded |
+| `error` | string | no | -- | Error message if failed |
+
+```json
+{ "id": "work_item:550e8400-e29b-41d4-a716-446655440000", "success": true }
+```
+
+---
+
+### retry_work_item
+**Profiles:** P, F
+
+Retry a failed work item by resetting its status to runnable.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Work item ID |
+
+```json
+{ "id": "work_item:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+</Accordion>
+
+<Accordion title="Spaces (4 tools)">
+
+### create_space
+**Profiles:** F
+
+Create a space config record for a new space.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | Space ID/name |
+| `config.embedding_provider` | string | no | Embedding provider (e.g., `fastembed`, `openai`) |
+| `config.embedding_model` | string | no | Embedding model identifier |
+| `config.embedding_dims` | integer | no | Embedding vector dimensions |
+
+```json
+{ "name": "default", "config": { "embedding_provider": "fastembed", "embedding_model": "bge-small-en-v1.5", "embedding_dims": 384 } }
+```
+
+---
+
+### list_spaces
+**Profiles:** D, F
+
+List spaces (space_config records).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `limit` | integer | no | 50 | Max results (max 1000) |
+| `cursor` | string | no | -- | Pagination cursor (space_config record ID) |
+
+```json
+{ "limit": 50 }
+```
+
+---
+
+### get_space
+**Profiles:** D, F
+
+Get space configuration by space_id.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `space_id` | string | yes | Space ID |
+
+```json
+{ "space_id": "default" }
+```
+
+---
+
+### update_space
+**Profiles:** F
+
+Update space configuration.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `space_id` | string | yes | Space ID |
+| `config.embedding_provider` | string | no | Embedding provider |
+| `config.embedding_model` | string | no | Embedding model |
+| `config.embedding_dims` | integer | no | Embedding dimensions |
+
+```json
+{ "space_id": "default", "config": { "embedding_provider": "openai" } }
+```
+
+</Accordion>
+
+<Accordion title="Reprocess (2 tools)">
+
+### create_reprocess_job
+**Profiles:** F
+
+Create a reprocessing job to backfill or re-extract sources. Automatically enqueues a work item for execution.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | string | yes | -- | Job name |
+| `reason` | string | no | -- | Reason for reprocessing |
+| `selection_criteria.source_types` | array | no | -- | Source types to include |
+| `selection_criteria.date_from` | string | no | -- | Date range start (YYYY-MM-DD) |
+| `selection_criteria.date_to` | string | no | -- | Date range end (YYYY-MM-DD) |
+| `selection_criteria.extractor_version_before` | string | no | -- | Extractor version threshold |
+| `selection_criteria.predicate_ids` | array | no | -- | Specific predicate IDs |
+| `target_stages` | array | yes | -- | Stages such as `re-render`, `rebuild-doc-tree`, `re-extract`, `recommit-artifacts`, and `re-maintain` |
+| `priority` | integer | no | 0 | Priority (higher runs first) |
+| `budget_limit_euros` | number | no | -- | Budget limit in euros |
+| `max_sources_per_day` | integer | no | -- | Rate limit |
+
+```json
+{
+  "name": "Backfill extraction",
+  "selection_criteria": { "source_types": ["web"], "date_from": "2026-01-01" },
+  "target_stages": ["re-extract"],
+  "priority": 1
+}
+```
+
+---
+
+### get_reprocess_job_progress
+**Profiles:** F
+
+Get reprocessing job status and progress.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Reprocess job ID |
+
+```json
+{ "id": "reprocess_job:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+</Accordion>
+
+<Accordion title="System (13 tools, capability-gated)">
+
+### get_runtime_status
+**Profiles:** D, A, M, F
+
+Get managed-runtime readiness, bootstrap status, and semantic ingest availability.
+
+```json
+{}
+```
+
+<Note>
+  This tool is always available on MCP, including bootstrap mode before storage is configured.
+</Note>
+
+---
+
+### initialize_runtime
+**Profiles:** D, M, F (bootstrap mode only)
+
+Initialize Elephant from bootstrap mode and persist `.elephant/elephant_config.toml`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `runtime_mode` | string | no | `local_memory`, `shared_memory`, `read_only`, or `maintenance` |
+| `ingest_enabled` | boolean | no | Whether semantic ingest should be enabled |
+| `backend` | string | no | `elephant-db` or `surreal-db` |
+| `snapshot_path` | string | no | Embedded snapshot path |
+| `surreal_url` | string | no | SurrealDB URL |
+| `surreal_namespace` | string | no | Surreal namespace |
+| `surreal_database` | string | no | Surreal database |
+| `extractor_provider` | string | no | Semantic extractor provider |
+| `extractor_required` | boolean | no | Require a real extractor for ingest |
+| `extractor_mcp_url` | string | no | Agentic extractor MCP endpoint |
+| `extractor_model` | string | no | Agentic extractor model |
+
+```json
+{
+  "runtime_mode": "local_memory",
+  "backend": "elephant-db",
+  "ingest_enabled": true,
+  "extractor_provider": "meerkat-agentic",
+  "extractor_required": true
+}
+```
+
+---
+
+### get_runtime_config
+**Profiles:** D, M, F (configured admin-capable runtimes)
+
+Return the effective runtime configuration with secrets redacted.
+
+```json
+{}
+```
+
+---
+
+### configure_runtime
+**Profiles:** D, M, F (configured admin-capable runtimes)
+
+Patch the persisted runtime configuration and apply it live.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `runtime_mode` | string | no | `local_memory`, `shared_memory`, `read_only`, or `maintenance` |
+| `ingest_enabled` | boolean | no | Whether semantic ingest should be enabled |
+| `backend` | string | no | `elephant-db` or `surreal-db` |
+| `snapshot_path` | string | no | Embedded snapshot path |
+| `surreal_url` | string | no | SurrealDB URL |
+| `surreal_namespace` | string | no | Surreal namespace |
+| `surreal_database` | string | no | Surreal database |
+| `extractor_provider` | string | no | Semantic extractor provider |
+| `extractor_required` | boolean | no | Require a real extractor for ingest |
+| `extractor_mcp_url` | string | no | Agentic extractor MCP endpoint |
+| `extractor_model` | string | no | Agentic extractor model |
+
+```json
+{
+  "ingest_enabled": false,
+  "runtime_mode": "read_only"
+}
+```
+
+---
+
+### get_health
+**Profiles:** D, A, M, F
+
+Get lightweight system health status, including the active backend and storage state.
+
+```json
+{}
+```
+
+---
+
+### get_capabilities
+**Profiles:** A, M, F
+
+Get system capabilities and available tools.
+
+```json
+{}
+```
+
+---
+
+### get_provenance
+**Profiles:** D
+
+Get provenance chain for a record, tracing its origin through sources and pipeline steps.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Record ID (any type) |
+
+```json
+{ "id": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479" }
+```
+
+---
+
+### get_tool_schema
+**Profiles:** F
+
+Return the full JSON schema for a tool, including required fields and examples.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `tool_name` | string | yes | Tool name to inspect |
+
+```json
+{ "tool_name": "ingest_doc" }
+```
+
+---
+
+### get_job_status
+**Profiles:** F
+
+Get the status and progress payload for a job (work item).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `job_id` | string | yes | Job/work item ID |
+
+```json
+{ "job_id": "work_item:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+---
+
+### export_snapshot
+**Profiles:** M, F
+
+Export the live embedded store to a host path.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | Host filesystem path for the snapshot |
+
+```json
+{ "path": "/tmp/elephant.json" }
+```
+
+<Note>
+  This tool only appears when Elephant is running `ELEPHANT_DB=elephant-db` and the caller qualifies for global snapshot administration.
+</Note>
+
+---
+
+### import_snapshot
+**Profiles:** M, F
+
+Replace the live embedded store from a host snapshot.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | Host filesystem path to import |
+
+```json
+{ "path": "/tmp/elephant.json" }
+```
+
+<Warning>
+  Snapshot import is a whole-store administrative operation. It is only available on embedded deployments and only to callers that qualify for global snapshot administration.
+</Warning>
+
+---
+
+### revert_audit
+**Profiles:** F
+
+Revert changes from an audit log entry.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `audit_id` | string | yes | Audit log entry ID to revert |
+
+```json
+{ "audit_id": "audit_log:550e8400-e29b-41d4-a716-446655440000" }
+```
+
+---
+
+### stream_events
+**Profiles:** F
+
+Stream system events from a cursor position.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `space_id` | string | no | `default` | Space ID to stream from |
+| `cursor` | string | no | -- | Cursor position (sequence number) |
+| `limit` | integer | no | 100 | Max events to return (max 1000) |
+
+```json
+{ "space_id": "default", "cursor": "0", "limit": 100 }
+```
+
+</Accordion>

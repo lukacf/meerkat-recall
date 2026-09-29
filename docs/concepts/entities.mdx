@@ -1,0 +1,114 @@
+---
+title: "Entities"
+description: "Core knowledge graph nodes representing people, organizations, locations, and any domain concept."
+icon: "circle-nodes"
+---
+
+Entities are the primary nodes in Elephant's knowledge graph. Every person, organization, location, or concept that the system tracks is an entity. Entities are connected to each other through [relationships](/concepts/relationships) and annotated with [attributes](/concepts/relationships#attributes).
+
+## Entity types
+
+Entity types are **freeform strings**, normalized to lowercase. Any domain-appropriate type is valid -- extraction skills define which types to use for each space.
+
+Common built-in conventions:
+
+| Type        | Usage                                    |
+|-------------|------------------------------------------|
+| `person`    | Individual people                        |
+| `org`       | Companies, teams, institutions           |
+| `location`  | Physical places, addresses, regions      |
+| `topic`     | Subjects, themes, areas of interest      |
+| `device`    | Hardware devices, phones, computers      |
+| `platform`  | Software platforms, services, apps       |
+| `concept`   | Abstract ideas, theories, frameworks     |
+| `group`     | Informal groupings, families, circles    |
+
+<Note>
+Types are not restricted to this list. A space with `skill: "extraction/fiction"` might produce types like `character`, `magical_creature`, or `artifact`. The type system is intentionally open-ended.
+</Note>
+
+## Entity struct
+
+<CodeGroup>
+```rust Entity
+struct Entity {
+    base: BaseFields,
+    entity_type: EntityType,
+    display_name: String,
+    aliases: Vec<String>,
+    summary: Option<String>,
+    handles: Vec<Handle>,
+    identity_keys: Vec<String>,
+    risk_level: Option<f64>,
+    trust_level: Option<f64>,
+    known_safe: bool,
+    first_seen: Option<DateTime<Utc>>,
+    last_seen: Option<DateTime<Utc>>,
+    status: EntityStatus,
+    redirect_to: Option<Link<Entity>>,
+    metadata: serde_json::Value,
+}
+```
+</CodeGroup>
+
+### Field reference
+
+<Accordion title="Core fields">
+| Field           | Type               | Description                                                |
+|-----------------|--------------------|------------------------------------------------------------|
+| `entity_type`   | `EntityType`       | Freeform type string, normalized to lowercase.             |
+| `display_name`  | `String`           | Primary human-readable name.                               |
+| `aliases`       | `Vec<String>`      | Alternative names. Duplicates and display_name matches are rejected on insert. |
+| `summary`       | `Option<String>`   | Brief description of the entity.                           |
+| `metadata`      | `JSON`             | Arbitrary key-value data. Defaults to `{}`.                |
+</Accordion>
+
+<Accordion title="Identity fields">
+| Field           | Type               | Description                                                |
+|-----------------|--------------------|------------------------------------------------------------|
+| `handles`       | `Vec<Handle>`      | Platform-specific usernames (see Handle below).            |
+| `identity_keys` | `Vec<String>`      | Stable keys used for identity resolution and deduplication. Cached from the `entity_identity_key` table. |
+</Accordion>
+
+<Accordion title="Scoring and observation">
+| Field         | Type             | Description                                    |
+|---------------|------------------|------------------------------------------------|
+| `risk_level`  | `Option<f64>`    | Computed risk score (0.0 to 1.0).              |
+| `trust_level` | `Option<f64>`    | Computed trust score (0.0 to 1.0).             |
+| `known_safe`  | `bool`           | User-set flag marking entity as trusted.       |
+| `first_seen`  | `Option<DateTime>` | Timestamp of first observation.              |
+| `last_seen`   | `Option<DateTime>` | Timestamp of most recent observation.        |
+</Accordion>
+
+## Handles
+
+A handle represents a username or identifier on a specific platform.
+
+```rust
+struct Handle {
+    platform: String,       // e.g. "twitter", "github"
+    username: String,       // username on that platform
+    confidence: Option<f64>,
+    verified: bool,
+    first_seen: Option<DateTime<Utc>>,
+    last_seen: Option<DateTime<Utc>>,
+    evidence: Vec<RecordId>,
+}
+```
+
+Handles are deduplicated by the `(platform, username)` pair -- adding a duplicate is a no-op.
+
+## Entity status
+
+| Status   | Description                                                                 |
+|----------|-----------------------------------------------------------------------------|
+| `active` | Default. The entity is live and participates in queries and graph traversal. |
+| `merged` | The entity has been merged into another. `redirect_to` points to the surviving entity. Merged entities are excluded from search results. |
+
+When two entities are identified as duplicates, Elephant's identity resolution workflow merges them. The loser's status becomes `merged`, and its `redirect_to` field links to the winner. All relationships and attributes are transferred to the survivor.
+
+## See also
+
+- [Relationships](/concepts/relationships) -- how entities connect to each other
+- [Documents](/concepts/documents) -- source material that produces entities
+- [Spaces](/concepts/spaces) -- tenant isolation for entities

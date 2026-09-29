@@ -1,0 +1,27 @@
+[package]
+name = "elephant-outbox"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Event outbox and streaming for Elephant"
+
+[dependencies]
+elephant-types = { path = "../types" }
+elephant-storage = { path = "../storage" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+surrealdb = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+rstest = { workspace = true }
+
+[lints]
+workspace = true

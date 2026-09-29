@@ -1,0 +1,46 @@
+[package]
+name = "elephant-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "MCP tool definitions and dispatcher for Elephant"
+
+[dependencies]
+elephant-types = { path = "../types" }
+elephant-storage = { path = "../storage" }
+elephant-policy = { path = "../policy" }
+elephant-identity = { path = "../identity" }
+elephant-knowledge-views = { path = "../knowledge-views" }
+elephant-extensions = { path = "../extensions" }
+elephant-embeddings = { path = "../embeddings" }
+elephant-pipeline = { path = "../pipeline" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+walkdir = { workspace = true }
+globset = "0.4"
+zip = "2.2"
+pdf-extract = "0.12.1"
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+rstest = { workspace = true }
+serial_test = "3.2"
+
+[features]
+fastembed = ["elephant-embeddings/fastembed"]
+meerkat-extraction = ["elephant-pipeline/meerkat-extraction"]
+
+[lints]
+workspace = true

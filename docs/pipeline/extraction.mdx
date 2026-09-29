@@ -1,0 +1,147 @@
+---
+title: "Extraction"
+description: "How Elephant selects extraction skills and transforms documents into structured assertions."
+icon: "microscope"
+---
+
+The extraction system transforms document nodes into structured assertions (subject-predicate-object triples). It uses a skill resolution cascade to determine **what** to extract and an LLM-based extractor to perform the actual extraction.
+
+## Skill Resolution Cascade
+
+When a document enters the extraction pipeline, the system resolves two pieces of guidance: a **purpose** (what the space cares about) and a **skill** (domain-specific extraction instructions). Each is resolved by checking sources in priority order -- the first non-empty value wins.
+
+### Purpose Resolution
+
+| Priority | Source | Config Key |
+|----------|--------|------------|
+| 1 | Space config | `space_config.purpose` |
+| 2 | Document metadata | `doc.metadata.extraction_purpose` or `doc.metadata.purpose` |
+| 3 | Source metadata | `source.metadata.extraction_purpose` or `source.metadata.purpose` |
+| 4 | Environment default | `PIPELINE_DEFAULT_EXTRACTION_PURPOSE` |
+
+### Skill Resolution
+
+| Priority | Source | Config Key |
+|----------|--------|------------|
+| 1 | Space config | `space_config.skill` |
+| 2 | Document metadata | `doc.metadata.extraction_skill` or `doc.metadata.skill_id` |
+| 3 | Source metadata | `source.metadata.extraction_skill` or `source.metadata.skill_id` |
+| 4 | Document domain mapping | `doc.metadata.domain` mapped to a built-in skill |
+| 5 | Source domain mapping | `source.metadata.domain` mapped to a built-in skill |
+| 6 | Source type env map | `PIPELINE_SKILL_BY_SOURCE_TYPE_JSON` (JSON map, e.g. `{"email":"extraction/custom-email","*":"extraction/technical-docs"}`) |
+| 7 | Source type default | Built-in default skill for the source type |
+| 8 | Environment default | `PIPELINE_DEFAULT_EXTRACTION_SKILL` |
+
+The skill resolution also performs **filesystem fuzzy matching**: skill IDs are normalized and matched against `SKILL.md` files in the skills directory (`PIPELINE_SKILLS_DIR`, default `./skills`).
+
+<Note>
+  The resolution trace is recorded in the extraction plan artifact and exposed via the `get_doc_pipeline_status` MCP endpoint for debugging which skill was selected and why.
+</Note>
+
+The most common way to configure extraction is to set `purpose` and `skill` on the [SpaceConfig](/concepts/spaces#extraction-skill-routing) - this applies to all documents ingested into that space without requiring per-document metadata.
+
+### Built-in skills
+
+Elephant ships with domain-neutral extraction skills in the `skills/extraction/` directory. Each is a `SKILL.md` file containing markdown guidance that gets injected into the LLM prompt. App-specific domains, including email/chat semantics, should provide their own skill directory and select it through metadata, space config, or `PIPELINE_SKILL_BY_SOURCE_TYPE_JSON`.
+
+<Accordion title="extraction/fiction - novels, stories, narratives">
+  **Entity types:** person, location, device, group, topic
+
+  **Focus:** Character relationships that persist across the narrative - who knows whom, who rules what, family ties, group memberships. Skips momentary actions (Alice picked up a bottle) in favor of durable state (Alice is the protagonist).
+
+  **Key predicates:** `knows`, `related_to`, `parent_of`, `lives_in`, `rules_over`, `possesses`, `member_of`, `leads`, `has_role`, `has_trait`
+</Accordion>
+
+<Accordion title="extraction/technical-docs - architecture docs, specs, runbooks">
+  **Entity types:** component, platform, concept, data_model, group
+
+  **Focus:** Component relationships, technology choices, architectural patterns, data model relationships, and design decisions. Targets the architecture-diagram level, not implementation code.
+
+  **Key predicates:** `depends_on`, `part_of`, `communicates_with`, `uses`, `implements`, `stores_in`, `chosen_over`, `replaces`
+</Accordion>
+
+You can create custom skills by adding a new `SKILL.md` file under `skills/your-domain/`. The skill ID is the directory path relative to the skills root (e.g., `your-domain` or `extraction/your-domain`).
+
+## Extraction Context
+
+The extractor receives an `ExtractionContext` containing everything it needs:
+
+| Field | Description |
+|-------|-------------|
+| `node_text` | The text content of the document node being extracted |
+| `purpose` | Space purpose from the skill resolution cascade |
+| `skill_body` | Domain extraction instructions loaded from `SKILL.md` |
+| `known_entities` | Entities already identified from earlier chunks of the same document |
+| `budget` | Token and wall-time limits for this extraction |
+| `doc_id` | Document ID for tool-based text access (agentic extractor only) |
+
+## Extractors
+
+### Agentic Extractor (Meerkat-based)
+
+The primary extractor, enabled via the `meerkat-extraction` feature flag. It uses [Meerkat](https://github.com/lukacf/meerkat) - a modular LLM agent harness - to orchestrate extraction as a structured conversation with tool access.
+
+- **Model:** configurable via `PIPELINE_AGENTIC_MODEL` (default: `gpt-5.2`)
+- **Structured output:** Meerkat's `OutputSchema::new(schema).strict()` with `structured_output_retries(2)` guarantees the LLM response is valid JSON matching the assertion schema - no manual parsing or retry logic needed
+- **Tool access:** the LLM can call tools during extraction via Meerkat's tool dispatch system - `ReadTextRangeDispatcher` for evidence verification, `ElephantToolBridge` for querying existing entities and predicates
+- **Budget enforcement:** Meerkat enforces per-request token and wall-time budgets (default 500K tokens, 600s), preventing runaway extraction costs
+- **Streaming:** extraction results stream back through Meerkat's event system, allowing progress tracking
+
+The agentic extractor can resolve ambiguities by querying the knowledge graph during extraction, reducing duplicate entity creation.
+
+### Non-Active Fallbacks
+
+Elephant no longer uses a rule-based semantic fallback in the active runtime. If the real extractor is unavailable, semantic ingest is hidden and extraction work fails loudly with an explicit runtime/work-item error.
+
+Any non-LLM extraction helpers that remain in the codebase are test-only or legacy compatibility scaffolding, not part of the supported product path.
+
+## RawAssertion Output
+
+Each extractor produces a list of `RawAssertion` records -- pre-resolution claims with mention strings:
+
+```rust
+pub struct RawAssertion {
+    pub subject_text: String,          // "Alice"
+    pub predicate_text: String,        // "works at"
+    pub object_text: Option<String>,   // "Acme Corp" (entity-to-entity)
+    pub object_literal: Option<Literal>, // or a typed literal value
+    pub evidence_span: EvidenceSpan,   // byte offsets into source text
+    pub confidence: f64,               // 0.0 to 1.0
+    pub source_event_time: Option<DateTime<Utc>>,
+    pub subject_entity_id: Option<String>,  // existing entity if found
+    pub object_entity_id: Option<String>,
+    pub significance: Option<String>,  // "skip", "low", "medium", "high"
+}
+```
+
+<Warning>
+  Assertions with `significance: "skip"` are recorded in the evidence layer but do not produce rels or attributes. This allows the extractor to note observations without polluting the knowledge graph.
+</Warning>
+
+## Artifact Commit Boundary
+
+After extraction, Elephant does not write graph rows directly from raw assertions. Instead:
+
+1. `extract_assertions` stages `knowledge_candidates`
+2. `validate_artifacts` validates those candidates
+3. `commit_artifacts` performs canonical writes
+
+That commit phase is what creates assertions, relationships, attributes, and events:
+
+<Steps>
+  <Step title="Resolve Subject Entity">
+    Look up by `subject_entity_id` (if the LLM found a match) or by identity key (lowercased display name). Identity-key reuse is type-guarded: all matches are fetched and the incoming type (normalized first) must be compatible with the candidate's -- `topic` is the unknown bucket and acts as a wildcard, upgrading to the specific incoming type on reuse. Ambiguous or type-incompatible matches route to an LLM disambiguator (`PIPELINE_PROMOTION_DISAMBIGUATION_MODEL`, active when `ANTHROPIC_API_KEY` is set); without one, incompatible types create a new entity rather than risking a false merge. Create if nothing matches.
+  </Step>
+  <Step title="Resolve Object Entity">
+    Same process for entity-to-entity assertions. Skipped for literal-valued assertions.
+  </Step>
+  <Step title="Create Assertion Record">
+    Always created in the evidence layer with the full evidence span and confidence score.
+  </Step>
+  <Step title="Create Rel or Attribute">
+    If significance is not "skip": creates a `rel` (entity-to-entity) or `attribute` (entity-to-literal) record.
+  </Step>
+  <Step title="Write Outbox Event">
+    A batched outbox event is written with the created/updated record references. Truth maintenance picks this up asynchronously.
+  </Step>
+</Steps>

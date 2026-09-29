@@ -1,0 +1,446 @@
+---
+title: "Living Wiki"
+description: "Graph-native, cited, freshness-aware knowledge projections"
+---
+
+# Living Wiki
+
+Elephant's Living Wiki is the human-readable semantic projection of canonical
+knowledge. It does not create evidence and its output must never be re-ingested
+as a source. A source record, an entity row, and a compiled projection are not
+automatically wiki articles. Publication requires editorial selection,
+semantic organization, and statement-local support.
+
+The implementation has three deliberately separate surfaces:
+
+1. **Wiki** answers "what does Elephant know?" with curated articles.
+2. **Evidence** answers "why does Elephant believe this?" with source content,
+   quotations, dates, and provenance.
+3. **Inspector** answers "what did Elephant's machinery do?" with record IDs,
+   revision IDs, hashes, compiler receipts, dependency inventories, and ingest
+   state.
+
+The graph is canonical memory. The wiki is one disposable, rebuildable view of
+it. Technical metadata must not become the article merely because it is easy
+to render.
+
+Surface and editorial state are explicit stored fields, not inferred from a
+record's shape. Entity and graph-selection compilers assign `inspector`, and
+source compilers assign `evidence`. Only the distinct `article` kind may be
+assigned to `wiki`, and only an LLM editorial compiler may create that kind.
+The renderer additionally requires explicit `published` state. Topic,
+community, and query projections cannot become wiki articles by changing a
+flag.
+
+## Research basis and Elephant adaptation
+
+[Karpathy's original LLM Wiki idea file](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
+separates immutable raw sources, an LLM-maintained wiki, and an evolving schema.
+Its central useful move is compilation: integrate each source into durable,
+interlinked pages so later questions do not reconstruct the same synthesis from
+raw chunks. It also calls out ingest, query, and lint loops, filing useful query
+results back into the wiki, contradiction detection, source references, and a
+human-browsable graph.
+
+The later [Retrieval as Reasoning paper](https://arxiv.org/abs/2605.25480)
+sharpens the pattern into three properties: compilability, composability, and
+evolvability. It adds progressive link traversal plus a persistent error book,
+and reports that structural validation, source-grounded verification, and
+cross-page consistency checks are all needed because unsupported facts,
+malformed references, dangling links, and contradictions recur in generated
+wikis.
+
+Elephant adopts the compounding read model but changes the authority boundary:
+
+- the canonical graph and immutable source evidence remain authoritative; wiki
+  Markdown is a rendering and can never become evidence by being re-ingested
+- graph edges replace fragile text-only backlinks, while stable views and
+  immutable revisions provide human and agent-readable pages
+- dependency and selector-trigger indexes turn graph/source changes into dirty
+  projections without scanning every page
+- truth slots, claim freshness, source watches, conflicts, and validation
+  receipts make lint and maintenance continuous rather than occasional
+- MCP exposes direct page reads and compositional graph traversal to agents
+- the required LLM editorial compiler must pass statement-local evidence
+  entailment; fluent uncited prose is a publication failure
+
+## Wiki article model
+
+Everything with a durable identity can exist as a graph entity, but existence
+does not imply article prominence. The article planner must select subjects
+using context-dependent relevance, importance, graph centrality, recency, and
+human editorial guidance. Peripheral entities can have very short pages whose
+main purpose is to explain why they occur in this particular knowledge space.
+
+An LLM writes each page from a bounded editorial context containing graph
+facts, narrative observations, first-class events, current truth, relevant
+history, and source excerpts. It selects stable semantic sections according to
+the subject and available knowledge. A person might have Family, School, Work,
+Interests, Current matters, and Timeline. A device might have Owner,
+Configuration, Integrations, Problems, and History. These are not
+database-table dumps. The LLM's editorial job is to synthesize, choose, and
+organize the knowledge that helps a reader understand the subject. A
+deterministic traversal can prepare its context, but cannot supply article
+prose.
+
+Events remain first-class graph records and supply chronology. Current truth is
+presented before superseded history. Conflicts become plain-language notices
+with evidence links. Source documents normally support articles rather than
+becoming articles themselves.
+
+## Authority boundary
+
+The authority chain is one-way:
+
+`source -> doc revision -> evidence span -> assertion -> graph and truth state -> knowledge view revision`
+
+A stable `knowledge_view` record provides identity, security scope, current
+state, and a pointer to an immutable `knowledge_view_revision`. Each revision
+contains:
+
+- structured blocks and rendered Markdown
+- a statement-level support ledger
+- citations to graph records, assertions, sources, and immutable evidence spans
+- the complete dependency inventory used by the compiler
+- claim and projection freshness metadata
+- deterministic validation and compiler receipts
+- a pointer to the superseded revision
+
+## No filler prose
+
+Factual prose is not an unstructured model completion. Every claim-bearing
+passage is a `KnowledgeStatement` with:
+
+- the exact text published in the page
+- a derivation mode: direct, synthesized, or verbatim quote
+- citation IDs supporting that exact statement
+- a verification mode: deterministic typed-record rendering or evidence
+  entailment verification
+
+The factual block Markdown must be exactly reproducible from its statement
+ledger. Publication fails when a factual block contains text outside that
+ledger, a statement has no citations, a citation is not a declared dependency,
+or a verbatim quotation lacks an immutable evidence span. This makes
+"citations nearby" insufficient: the support contract is statement-local.
+
+The deterministic compilers emit no boilerplate for missing summaries. Sparse
+knowledge therefore remains terse instead of receiving invented or
+vacancy-filling prose. Source evidence can add bounded verbatim excerpts from
+selected immutable revisions, with exact byte offsets and quote hashes, but
+those excerpts belong on the evidence surface. A model-based editorial
+compiler must pass the evidence-entailment gate before its prose can be
+published. Model fluency alone is never a publication signal.
+
+The editorial compiler also rejects type-only leads and implementation-facing
+filler such as claims that a subject is central to an editorial context,
+inventory, or graph. Rejected drafts enter the same bounded LLM repair loop as
+unsupported claims. A page must communicate concrete supported knowledge, not
+merely produce grammatical text.
+
+Identity metadata alone is not enough to publish an article. The lead must cite
+a concrete canonical summary, governed relationship, event, assertion, or
+source passage. Candidates with neither a summary nor a governed connection are
+excluded before planning, and evidence-scarcity boilerplate is rejected rather
+than presented as an article.
+
+Generated prose is disposable. It is never canonical memory, never feeds back
+as evidence, and is regenerated when its dependency or quality receipt changes.
+
+## Graph quality as a publication gate
+
+A living wiki makes graph defects directly visible to people. Publication must
+therefore consume categorized graph-quality findings, not reduce them to a
+single opaque score. At minimum the receipt must represent:
+
+- non-durable or disconnected entities
+- duplicate labels and possible duplicate identities
+- alias hygiene findings
+- missing, uncontrolled, inactive, self-referential, or otherwise invalid
+  relationship predicates
+- unsupported, stale, superseded, or conflicting claims
+
+Each finding has an affected-record set and a publication action: omit the
+claim, keep the article in draft, or publish a semantic warning. Possible
+duplicate people are article-blocking because a biography can otherwise merge
+two people. Invalid predicate edges are claim-blocking because rendering them
+turns graph noise into authoritative-looking prose.
+
+Application-specific graph audits may supply additional classifications.
+Elephant owns the generic typed issue and publication-receipt mechanism;
+application policy must not become untyped canonical graph truth.
+
+## Freshness and change propagation
+
+Canonical event, relationship, and attribute promotion now creates or updates
+one deterministic freshness record per claim. View revisions summarize the
+minimum claim score, stale truth slots, unresolved conflicts, unsupported
+claims, expired claim reviews, and the next review deadline. A passed review
+deadline degrades the projection even when no graph record changed.
+
+Publication atomically materializes one current reverse-dependency edge per
+revision dependency. Outbox changes use the `(space_id, dependency_record)`
+index to resolve only affected views, then move each stable view to `dirty`.
+The immutable revision retains the historical full dependency receipt while
+the reverse index is replaced on every publication. The next normal read can
+recompile a dirty view. Reads choose one of three policies:
+
+- `allow_stale`: return an existing revision without rebuilding
+- `prefer_fresh`: rebuild when needed, but return the last authorized revision
+  with a warning if refresh fails
+- `required`: fail rather than return a revision that could not be refreshed
+
+Forced maintenance rebuilds always publish a new immutable revision.
+Unchanged reads take the hot path: a current revision with the active compiler
+version and an unexpired freshness receipt returns before graph traversal. The
+reverse-dependency index is therefore the cache-coherence authority; canonical
+changes mark only their dependent views dirty, and dirty views cannot use this
+fast path.
+
+Web sources can additionally carry a `source_watch`. It holds the mutable
+schedule, HTTP validators, last observed hash, retry state, and next deadline.
+Every attempt appends an immutable `source_watch_check` receipt with the final
+validated URL, validators, content hash, byte count, outcome, and any bounded
+error. The maintenance timer only enqueues due checks; network retrieval runs
+as a leased `refresh_source_watch` work item with normal work-run and retry
+visibility.
+
+Remote retrieval accepts only HTTP and HTTPS, rejects embedded credentials and
+non-public destinations, revalidates every bounded redirect, pins validated DNS
+resolution into the request client, enforces timeouts, and streams through an
+explicit size limit. A textual change updates the existing source and document
+through the source-first re-ingest contract, marks dependent views dirty, and
+reopens canonical triage. ETag/Last-Modified and hash-unchanged observations do
+not create spurious source revisions. Non-text media and non-web connectors are
+recorded as unsupported until their source-specific refresh adapters exist.
+
+## Security
+
+Compilation is exact-envelope, not union-envelope. The root entity's complete
+security object is fingerprinted into the stable view key. Only dependencies
+with that exact security envelope can contribute to the revision. MCP checks
+authorization before compilation and again on the resulting view and revision.
+This prevents a low-clearance projection from leaking the existence or labels
+of higher-clearance records.
+
+## MCP surface
+
+- `get_knowledge_view` accepts exactly one `entity_id`, `source_id`, or
+  `definition_id` and is available in the Default, Agent, Maintenance, and Full
+  profiles.
+- `rebuild_knowledge_view` is available in Maintenance and Full profiles and
+  requires write authorization for the selected root.
+- `materialize_knowledge_views` scans bounded, resumable pages of existing
+  entities, sources, and definitions. It applies record-level ABAC, isolates
+  per-root failures, returns an independent cursor for each root kind, and
+  writes only derived projection records. It does not promote raw entity or
+  source projections into the wiki. Within a root kind it uses explicitly
+  bounded concurrency over graph-read indexes, so graph-scale databases do not
+  turn one MCP call into an unbounded serial traversal.
+- `get_knowledge_view_definition` reads the governed typed selector.
+- `upsert_knowledge_view_definition` creates or updates a bounded topic,
+  seeded-community, or safe saved-query selector and its explicit
+  draft/published/hidden context-plan state. `published` makes a context
+  eligible for the LLM editorial compiler; it does not expose the
+  deterministic projection in the wiki. Raw database queries are not accepted.
+- `compile_wiki_article` runs a Meerkat-backed structured-output writer over
+  the bounded context, then runs a separate structured-output verifier over
+  every statement and its citations. The verifier independently requires both
+  evidence entailment and relevance to the named article subject, so an
+  off-topic fact cannot pass merely because shared source material supports
+  it. Drafts and publications are immutable, dependency-hashed article
+  revisions. Publishing requires an approved context plan and a clean
+  freshness receipt.
+- `get_source_watch` reads the schedule and immutable checks without network
+  work. It is available in every read-capable profile.
+- `configure_source_watch` and `check_source_watch` require source write
+  authorization and are available in Maintenance and Full profiles. Manual
+  checks enqueue the same leased, idempotent work item as scheduled checks.
+- `get_entity_context_bundle` exposes attributes, truth slots, events,
+  assertions, and freshness in addition to graph relationships, with ABAC and
+  time-window filtering applied to each record family.
+
+The authenticated REST surface exposes `GET /v1/knowledge-views` and
+`GET /v1/knowledge-views/{id}` over all stored projections. The human surfaces
+are separate:
+
+- `GET /wiki` and `GET /wiki/{id}` expose only article-eligible semantic views
+- `GET /evidence` and `GET /evidence/{id}` expose source evidence
+- `GET /inspect/knowledge-views` and its detail route expose every projection
+  and technical receipt
+
+All three apply record-level ABAC, escape stored content, disable browser
+caching, and share the same canonical authority path. Evidence detail reads
+also run the idempotent source compiler, so a stale compiler receipt is
+refreshed before the source is rendered. Wiki reads never synthesize or publish
+an article implicitly.
+
+## Runnable projection demo
+
+Run a fully isolated example using Elephant's normal Meerkat LLM runtime:
+
+```bash
+./scripts/repo-cargo run -p elephant-bin -- demo-wiki
+```
+
+The command loads this architecture document as a real source, creates an
+immutable document revision, derives assertions with byte-addressed evidence
+spans, promotes supported relationships and an attribute into a small graph,
+compiles entity, source, and topic context projections, asks an LLM curator to
+choose a small interlinked article set, asks the configured writer LLM to write
+each semantic article, independently verifies every article statement, and
+starts the normal routes in local development mode. Open
+[http://localhost:3000/wiki](http://localhost:3000/wiki) for the resulting
+article,
+[http://localhost:3000/inspect/knowledge-views](http://localhost:3000/inspect/knowledge-views)
+for deterministic projections and
+[http://localhost:3000/evidence](http://localhost:3000/evidence) for source
+material. `ELEPHANT_WIKI_WRITER_MODEL` and `ELEPHANT_WIKI_VERIFIER_MODEL`
+override the normal model selection. The default build requires credentials
+for the selected provider. A `--no-default-features` build still demonstrates
+the evidence and inspector surfaces but deliberately leaves `/wiki` empty.
+Use `--port 3100` when port 3000 is in use. The demo is an isolated in-memory
+store and disappears when the process stops.
+
+## Graph-derived editorial contexts
+
+Topic, community, and saved-query context projections are rooted in a first-class
+`knowledge_view_definition`. Topic and community selectors traverse only
+approved relationships within explicit hop and member bounds. Saved queries
+use a typed entity filter AST with optional type, name/alias, and exact
+approved-attribute predicates. Every selected member states why it matched and
+cites the member plus the relationship or attribute claims used for selection.
+
+Current dependencies include table-trigger keys in addition to concrete record
+IDs. Outbox invalidation adds the corresponding key for each changed record,
+so a newly created relationship, entity, or attribute can dirty a projection
+even though that new record could not have appeared in its previous revision.
+Explicit member or scan bounds are disclosed in the revision and degrade its
+freshness state when they truncate selection.
+
+## Active scope and explicit gaps
+
+Elephant has an explicit LLM article planner, LLM information architect,
+article writer, and statement-level verifier. `create_wiki_from_graph` scans
+the complete caller-authorized semantic graph with no configurable prefix or
+record ceiling. It isolates exact security envelopes and reads entities,
+relationships, assertions, attributes, first-class events, truth slots, and
+predicate governance to exhaustion.
+
+Every eligible entity is assigned exactly once to a bounded graph-neighborhood
+planning shard of at most 30 entities. The old global top-60 reduction is not
+part of the active path. The LLM planner must account for every entity, normally
+with one article per semantic subject. With the default `max_articles: 0`, the
+automatic budget is the complete eligible population, bounded at 2,000. An
+entity may be synthesized into another page only when Elephant identified the
+two records as a possible person-identity duplicate and the planner explicitly
+records the consolidation. The full plan must retain at least 70 percent as
+many pages as eligible subjects. A separate LLM organizer sees the complete
+planned corpus, infers the space purpose, selects the defining featured pages,
+and designs semantic reader lenses. Exhaustive placement is then performed by
+bounded 30-article LLM assignment calls against that fixed taxonomy. Elephant
+validates that every selected article appears exactly once before compiling any
+page. These are disposable navigation, not graph assertions or a pre-created
+folder tree.
+
+Elephant fills omitted article links from governed direct graph edges and
+resolved source-evidence co-mentions among selected subjects. It creates topic
+definitions for single subjects and seeded-community definitions for an
+explicitly consolidated identity cluster. Possible duplicates are never
+silently deleted. Every reader link must pass graph-or-evidence validation;
+shared security subjects alone never create navigation. The result reports
+complete scan counts, bounded planning partitions, possible duplicate-person
+groups, relationship and attribute rows
+withheld by predicate governance, eligible and planner candidate counts,
+selected and verified articles, failures, and hidden articles. Entity planning
+also carries earliest and latest semantic evidence times, so decade-old source
+volume does not masquerade as present relevance.
+
+Published creation is managed by default. It durably enqueues
+`reconcile_living_wiki`. A periodic run always performs the complete bounded
+scan, but a stable graph fingerprint reuses the current wiki without any LLM
+calls. Entity, relationship, assertion, attribute, event, predicate, truth-slot,
+or merge outbox changes debounce an earlier reconciliation and force it past
+the periodic cache decision. Historical outbox replay from before the managed
+chain is ignored. Older queued runs are cancelled, running work is not
+interrupted, and only one wiki reconciliation executes per space. A changed
+run replans, recompiles, hides pages no longer successfully retained, preserves
+immutable history, and schedules its successor. If any selected article fails,
+the fingerprint is not cached and a later run retries. No entity IDs, article
+definitions, navigation sections, or prose are seeded by the command or worker.
+Article compilation is independently bounded by
+`ELEPHANT_WIKI_ARTICLE_CONCURRENCY` from 1 through 32. Writer and verifier
+transport failures use bounded exponential backoff, while unsupported prose
+still fails closed. This permits large graphs to use provider and host capacity
+without weakening the evidence or verification contract.
+
+For each planned entity, the editorial compiler also retrieves a bounded set of
+resolved assertions that mention it and validates their immutable evidence
+spans. These source passages are available to the writer and verifier even when
+the extracted predicate has not passed graph governance. They remain source
+evidence rather than canonical relationships, and their assertion, revision,
+and source records become explicit article dependencies. This lets a wiki
+synthesize real document content without laundering predicate-quality defects
+into graph facts.
+
+The verifier evaluates relevance as a private-wiki contract, not a general
+encyclopedia contract. A supported family trip, preference, purchase, message,
+decision, project, or event can fully explain why a peripheral place, product,
+organization, or concept occurs in this knowledge space. Sparse evidence may
+produce one short, concrete local-relevance fact; the verifier must not demand
+invented background or synthesis that the catalog cannot support. Entailment,
+temporal framing, citation resolution, and rejection of unrelated co-mentions
+remain fail-closed.
+
+Resolved assertions also provide bounded entity co-mention counts to the
+planner and the automatic navigation augmenter. These may create related-article
+navigation between selected subjects, but they do not assert a relationship
+type. The plan validator accepts a link only when a governed graph edge or
+resolved source-evidence co-mention supports that navigation. When a legacy
+assertion's quote hash no longer matches, the
+compiler validates the recorded byte offsets against the immutable revision,
+derives a new citation span hash from those exact bytes, and records a warning.
+It does not mutate or trust the stale assertion hash.
+
+Legacy inline-promotion assertions can carry an empty assertion-level
+span and a `derived:` hash while linking to the real `doc_node`. For those
+records, the compiler resolves the node, verifies that it belongs to the same
+revision and policy, uses the node's revision byte span, and records both the
+node and revision as dependencies. This is the supported bridge from derived
+assertions back to quotable source text.
+
+Source evidence may carry a stricter envelope than the semantic entity. The
+article inherits the restrictive join: maximum sensitivity level, unioned
+labels and handling caveats, and unioned subject scope. Evidence under a
+different named policy schema is not mixed. A semantic record under the
+placeholder `default` policy may be promoted into the first named source policy;
+after promotion, all further named evidence must use that same policy. This
+prevents source-backed synthesis from laundering protected material into a less
+restricted entity page while allowing a named source policy to
+govern pages for older default-policy entities.
+
+Planning includes only relationships and attributes whose registered predicates
+are active, have semantics, and are in explicit `Configured` governance state.
+Review-pending predicates remain in canonical memory and quality workflows but
+cannot enter the LLM editorial context. Article neighborhoods default to one
+graph hop and permit up to 250 governed members; both bounds are explicit MCP
+inputs so a highly connected entity does not silently publish a truncated view.
+
+Only that compiler can create `article` projections for `/wiki`; deterministic
+graph projections remain editorial inputs under the inspector surface. The
+following remain implementation gaps, not implicit features:
+
+- connector-specific refresh adapters beyond textual HTTP/HTTPS web sources
+- a first-class persisted interchange record for external domain-specific
+  graph-quality audits; active generic publication gating already withholds
+  likely duplicate people and non-configured predicates and reports categorized
+  counts, but application-specific audit taxonomies are not canonical
+  Elephant graph truth
+- human approval queues for plans in deployments that require approval beyond
+  the explicit `publish` request
+- article-local inline entity links inside prose; first-class related-article
+  navigation is already stored on definitions and rendered only for published,
+  authorized target articles
+- arbitrary model-selected quote retrieval beyond the exact evidence spans in
+  the bounded context; those supplied quote bytes are hash-verified before the
+  writer or verifier sees them
+- predicate-specific freshness policy configuration and backfill

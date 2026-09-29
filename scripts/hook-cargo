@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/.." && git rev-parse --show-toplevel)"
+git_common_dir="$(cd "${repo_root}" && git rev-parse --path-format=absolute --git-common-dir)"
+worktree_root="$(cd "${repo_root}" && git rev-parse --path-format=absolute --show-toplevel)"
+mode="${ELEPHANT_HOOK_RUNNER_MODE:-auto}"
+image_tag="${ELEPHANT_HOOK_DOCKER_IMAGE:-elephant-rust-hooks:1.94-noble-r2}"
+subcommand="${1:-}"
+
+if [[ -z "${RUST_LANE_ID:-}" ]]; then
+  case "${subcommand}" in
+    clippy)
+      export RUST_LANE_ID="hook-clippy"
+      ;;
+    check)
+      export RUST_LANE_ID="hook-check"
+      ;;
+    test|nextest)
+      export RUST_LANE_ID="hook-test"
+      ;;
+    fmt)
+      export RUST_LANE_ID="hook-fmt"
+      ;;
+  esac
+fi
+
+docker_available() {
+  command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
+hash_path() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum | cut -c1-10
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | cut -c1-10
+  elif command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$1" | openssl dgst -sha256 | awk '{print substr($NF, 1, 10)}'
+  else
+    python3 - "$1" <<'PY'
+import hashlib
+import sys
+
+print(hashlib.sha256(sys.argv[1].encode("utf-8")).hexdigest()[:10])
+PY
+  fi
+}
+
+repo_cache_root() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    printf '%s' "${HOME}/Library/Caches/elephant-hook-runner"
+  else
+    printf '%s' "${XDG_CACHE_HOME:-${HOME}/.cache}/elephant-hook-runner"
+  fi
+}
+
+probe_cache_dir="$(repo_cache_root)"
+probe_cache_file="${probe_cache_dir}/native-runner-$(hash_path "${repo_root}")-$(uname -s)-$(uname -m).status"
+
+read_cached_probe() {
+  [[ -f "${probe_cache_file}" ]] || return 1
+  python3 - "${probe_cache_file}" <<'PY'
+import os
+import sys
+import time
+
+path = sys.argv[1]
+age_seconds = time.time() - os.path.getmtime(path)
+if age_seconds > 6 * 60 * 60:
+    sys.exit(1)
+with open(path, "r", encoding="utf-8") as fh:
+    print(fh.read().strip())
+PY
+}
+
+write_probe_cache() {
+  mkdir -p "${probe_cache_dir}"
+  printf '%s\n' "$1" > "${probe_cache_file}"
+}
+
+probe_local_binary_runner() {
+  if [[ "${mode}" == "local" ]]; then
+    return 0
+  fi
+
+  if [[ "${mode}" == "docker" ]]; then
+    return 1
+  fi
+
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    case "${subcommand}" in
+      test|nextest)
+        if docker_available; then
+          return 1
+        fi
+        ;;
+    esac
+  fi
+
+  if [[ -z "${ELEPHANT_HOOK_REFRESH_PROBE:-}" ]]; then
+    if cached="$(read_cached_probe 2>/dev/null)"; then
+      if [[ "${cached}" == "ok" ]]; then
+        return 0
+      fi
+    fi
+  fi
+
+  local probe_dir probe_src probe_bin
+  probe_dir="${probe_cache_dir}/probe-$(hash_path "${repo_root}")"
+  mkdir -p "${probe_dir}"
+  probe_src="${probe_dir}/probe.rs"
+  probe_bin="${probe_dir}/probe-bin"
+
+  printf '%s\n' 'fn main() { println!("ok"); }' > "${probe_src}"
+  if ! command -v rustc >/dev/null 2>&1; then
+    return 1
+  fi
+
+  rustc "${probe_src}" -o "${probe_bin}" >/dev/null 2>&1 || {
+    return 1
+  }
+
+  if python3 - "${probe_bin}" <<'PY'
+import subprocess
+import sys
+
+binary = sys.argv[1]
+try:
+    completed = subprocess.run(
+        [binary],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+except Exception:
+    sys.exit(1)
+sys.exit(0 if completed.returncode == 0 and completed.stdout.strip() == "ok" else 1)
+PY
+  then
+    write_probe_cache ok
+    return 0
+  fi
+
+  return 1
+}
+
+ensure_docker_image() {
+  docker image inspect "${image_tag}" >/dev/null 2>&1 && return 0
+  docker build -f "${repo_root}/Dockerfile.hooks" -t "${image_tag}" "${repo_root}"
+}
+
+run_in_docker() {
+  local host_cache runner_home
+  if ! docker_available; then
+    echo "Docker hook runner requested, but Docker is not available." >&2
+    return 1
+  fi
+  host_cache="$(repo_cache_root)"
+  runner_home="${host_cache}/container-home"
+  mkdir -p "${runner_home}"
+  ensure_docker_image
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/home/elephant \
+    -e RUST_LANE_ID="${RUST_LANE_ID:-}" \
+    -e CARGO_TERM_COLOR=always \
+    -e CARGO_BUILD_JOBS="${ELEPHANT_HOOK_DOCKER_BUILD_JOBS:-1}" \
+    -e CARGO_INCREMENTAL=0 \
+    -e REPO_CARGO_REPO_ROOT=/workspace \
+    -e REPO_CARGO_WORKSPACE_ROOT=/workspace/. \
+    -e REPO_CARGO_GIT_COMMON_DIR="${git_common_dir}" \
+    -e REPO_CARGO_WORKTREE_ROOT="${worktree_root}" \
+    -v "${runner_home}:/home/elephant" \
+    -v "${repo_root}:/workspace" \
+    -w /workspace \
+    "${image_tag}" \
+    ./scripts/repo-cargo "$@"
+}
+
+cd "${repo_root}"
+
+if probe_local_binary_runner; then
+  exec ./scripts/repo-cargo "$@"
+fi
+
+if [[ "${mode}" == "docker" ]]; then
+  echo "Local probe bypassed because ELEPHANT_HOOK_RUNNER_MODE=docker; using Docker hook runner." >&2
+  run_in_docker "$@"
+  exit $?
+fi
+
+if ! docker_available; then
+  echo "Local compiled binaries did not pass the hook probe, and Docker is unavailable; running the hook locally." >&2
+  exec ./scripts/repo-cargo "$@"
+fi
+
+echo "Local compiled binaries are not launching cleanly; using Docker hook runner." >&2
+run_in_docker "$@"

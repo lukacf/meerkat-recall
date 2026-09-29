@@ -1,0 +1,58 @@
+---
+title: Introduction
+description: Elephant is a unified knowledge system that brings graph, document, and vector retrieval into one coherent model with strict provenance and security.
+icon: elephant
+---
+
+## What is Elephant?
+
+Elephant is a unified knowledge system for AI-native applications. It is not a database -- it is a **knowledge layer** that combines entities, relationships, documents, and vector search into a single coherent model, with provenance tracking and access control built in from the ground up.
+
+Feed Elephant documents, and it will extract structured knowledge automatically: entities and their relationships, assertions backed by evidence spans, and truth-maintained answers that track conflicts over time.
+
+## Key Capabilities
+
+**Entity and relationship graph.** Store people, organizations, places, devices, and concepts as first-class entities. Connect them with typed, weighted relationships that carry evidence and provenance.
+
+**Document ingestion pipeline.** Ingest text from any source. Elephant renders documents into immutable revisions, chunks them for retrieval, generates embeddings, and extracts structured assertions -- all automatically.
+
+**LLM-powered extraction.** A multi-stage pipeline uses large language models to extract entities, relationships, and attributes from unstructured text. Extraction produces assertions linked to evidence spans in the source document.
+
+**Truth maintenance.** When multiple sources make claims about the same thing, Elephant tracks every assertion in a truth slot. Agreeing sources corroborate each other; genuinely conflicting values are adjudicated by an LLM that reads the competing claims, with configurable deterministic policies as the fallback. You always see the current best answer and the full history of competing claims.
+
+**Identity resolution.** Elephant automatically links extracted mentions to existing entities or creates new ones. When ambiguity arises, it flags candidates for review rather than guessing.
+
+**Security and access control.** Every record is scoped to a space, and ABAC-based policies enforce access at the data layer. Redaction is applied before results leave the system.
+
+**Dual interfaces.** Elephant exposes both an HTTP API for application integration and an MCP (Model Context Protocol) interface for AI agent tooling.
+
+## Built on
+
+**[SurrealDB](https://surrealdb.com)** - the default persistent backend. Elephant uses SurrealDB when you want durable storage, SurrealQL-backed graph/document search, and the mature operational path.
+
+**`elephant-db`** - Elephant's embedded in-memory kernel for lightweight local/runtime use. It provides typed records, graph traversal, vector search, and JSON snapshot import/export without requiring an external database process.
+
+**[Meerkat](https://github.com/lukacf/meerkat)** - a modular LLM agent harness built in Rust. Elephant's extraction pipeline uses Meerkat to orchestrate LLM calls with structured output guarantees, tool access, and budget enforcement. Elephant serves MCP through the Rust `rmcp` transport.
+
+## Explore the Documentation
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get Elephant running locally with Docker and ingest your first document using the local development stack.
+  </Card>
+  <Card title="Core Concepts" icon="shapes" href="/concepts/entities">
+    Understand spaces, entities, relationships, documents, assertions, truth slots, and predicates.
+  </Card>
+  <Card title="Guides" icon="book-open" href="/guides/ingesting-data">
+    Step-by-step walkthroughs for common workflows: ingesting data, searching, and building knowledge graphs.
+  </Card>
+  <Card title="HTTP API" icon="code" href="/api/overview">
+    Full reference for the REST API covering entities, documents, relationships, assertions, and more.
+  </Card>
+  <Card title="MCP Tools" icon="wrench" href="/mcp/overview">
+    Use Elephant as an AI agent tool surface via the Model Context Protocol.
+  </Card>
+  <Card title="Pipeline" icon="diagram-project" href="/pipeline/overview">
+    Learn how evidence flows through source-first ingest, staged artifact commit, extraction, and truth maintenance.
+  </Card>
+</CardGroup>

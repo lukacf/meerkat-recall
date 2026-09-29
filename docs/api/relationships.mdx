@@ -1,0 +1,100 @@
+---
+title: "Relationships"
+description: "REST relationship records, search, and lifecycle operations."
+icon: "link"
+---
+
+## Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/v1/relationships/search` | Search relationships |
+| POST | `/v1/relationships` | Create relationship |
+| POST | `/v1/relationships/upsert` | Create or replace by supplied ID |
+| POST | `/v1/relationships/batch` | Batch create/update |
+| GET | `/v1/relationships/{id}` | Get relationship |
+| PUT | `/v1/relationships/{id}` | Replace relationship |
+| DELETE | `/v1/relationships/{id}` | Soft delete relationship |
+| POST | `/v1/relationships/{id}/restore` | Restore relationship |
+
+## Relationship wire format
+
+REST writes accept a complete `Rel` record. The endpoints are string record IDs
+under `in` (subject) and `out` (object); the predicate is `rel_type`. These field
+names differ from the convenience [MCP `relate_entities` tool](/mcp/tools).
+
+The source and target entities must already exist in the caller's space. Use a
+fresh relationship ID and timestamps, and labels appropriate to your policy.
+
+```json relationship.json
+{
+  "id": "rel:550e8400-e29b-41d4-a716-446655440002",
+  "space_id": "default",
+  "created_at": "2026-01-15T10:30:00Z",
+  "updated_at": "2026-01-15T10:30:00Z",
+  "created_by": "example-client",
+  "provenance": {},
+  "security": {"policy_id": "default", "level": 0},
+  "in": "entity:550e8400-e29b-41d4-a716-446655440000",
+  "out": "entity:550e8400-e29b-41d4-a716-446655440001",
+  "rel_type": "works_at",
+  "confidence": 0.95,
+  "status": "candidate",
+  "evidence": []
+}
+```
+
+Optional fields include `validity_window`, `temporal_audit`, `subjects`, and
+`subjects_state`. Relationship status values are `candidate`, `approved`,
+`superseded`, and `disputed`. REST does not translate top-level `weight`,
+`description`, or `evidence_text` into these record fields.
+
+## Create, read, update, and delete
+
+Save the example as `relationship.json`, after creating the referenced entities:
+
+```bash
+curl -f -X POST http://localhost:3000/v1/relationships \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data-binary @relationship.json
+```
+
+Creation returns `201` and the full stored relationship. `GET` by ID returns the
+same record shape and accepts `include_deleted=true`. The caller's principal
+controls space and record access.
+
+To update, read the existing record, change its fields, and send the complete
+record to `PUT /v1/relationships/{id}`. Keep the body ID consistent with the path.
+This is a replacement, not a partial patch. Write authorization applies to both
+the old and replacement record.
+
+`DELETE` soft deletes the relationship and returns `204`. `POST` to its `/restore`
+route restores it and returns the record.
+
+## Upsert and batch
+
+`POST /v1/relationships/upsert` accepts the same full record and creates or updates
+by its supplied ID. The supplied `space_id` must match the principal's space.
+
+`POST /v1/relationships/batch` accepts `{"items": [...]}` containing full records.
+The response has `succeeded` records and `failed` entries with an original `index`
+and `error`. Each item is processed independently. Although the shared request
+schema accepts `atomic`, transactional batches are not implemented.
+
+## Search
+
+```bash
+curl -f -X POST http://localhost:3000/v1/relationships/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"rel_type":"works_at","limit":10}'
+```
+
+The search accepts `rel_type`, `include_deleted` (default `false`), `limit`
+(default `50`), and `cursor`. Results are authorized within the caller's space.
+The response contains `results` (full relationship records), `cursor`, `has_more`,
+and `total`. Pass the returned cursor unchanged when requesting another page.
+
+To find relationships attached to a specific entity, use
+[`GET /v1/entities/{id}/with-relations`](/api/entities).

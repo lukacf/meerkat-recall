@@ -1,0 +1,38 @@
+[package]
+name = "elephant-e2e"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# These are E2E tests, so we want all the heavy dependencies available by default
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+surrealdb = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Internal crates
+elephant-types = { path = "../../crates/types" }
+elephant-storage = { path = "../../crates/storage", features = ["test-utils"] }
+elephant-embeddings = { path = "../../crates/embeddings" }
+elephant-mcp = { path = "../../crates/mcp" }
+elephant-policy = { path = "../../crates/policy" }
+elephant-identity = { path = "../../crates/identity" }
+elephant-migrations = { path = "../../crates/migrations" }
+elephant-api = { path = "../../bin/elephant-api" }
+elephant-outbox = { path = "../../crates/outbox" }
+elephant-pipeline = { path = "../../crates/pipeline", features = ["meerkat-extraction"] }
+elephant-pipeline-bin = { path = "../../bin/elephant-pipeline", features = ["test-utils"] }
+meerkat = { workspace = true }
+meerkat-core = { workspace = true }
+sha2 = { workspace = true }

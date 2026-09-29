@@ -1,0 +1,201 @@
+---
+title: "Searching"
+description: "How to search documents, entities, and relationships using text, vector similarity, and unified search."
+icon: "magnifying-glass"
+---
+
+Elephant supports text search, vector similarity search, and a unified search that spans all record types. This guide covers each approach. Examples use fictional data. HTTP examples
+assume local `SKIP_AUTH` development; authenticated instances require an
+`Authorization: Bearer <token>` header. MCP tool availability depends on the
+[endpoint profile](/mcp/overview).
+
+## Vector similarity search
+
+Search documents using embedding-based similarity. The query is embedded using the space's configured model and matched against document chunk vectors.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "query": "quarterly revenue projections",
+      "k": 5
+    }
+    ```
+    Tool: `search_docs`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s -X POST http://localhost:3000/v1/docs/search \
+      -H "content-type: application/json" \
+      -d '{
+        "space_id": "default",
+        "query": "quarterly revenue projections",
+        "k": 5,
+        "limit": 5
+      }'
+    ```
+  </Tab>
+</Tabs>
+
+Semantic results are ranked using the configured embedding model. The REST
+route enters semantic mode only when both `query` and `k` are present. If
+embeddings are unavailable, the supported fallback is lexical search.
+
+## Filter by collection
+
+Organize documents into collections via metadata and filter searches to a specific collection.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "query": "security incident",
+      "k": 10,
+      "filters": {
+        "collection": "incident-reports"
+      }
+    }
+    ```
+    Tool: `search_docs`
+  </Tab>
+  <Tab title="REST limitation">
+    The REST document search request does not accept a collection filter.
+    Use MCP `search_docs` for a collection-restricted search. A `filters`
+    object sent to the REST route is not applied.
+  </Tab>
+</Tabs>
+
+To see all available collections, use the `list_doc_collections` tool with an empty input (`{}`).
+
+## Search entities
+
+Find entities by name, type, or free-text query. Filter by `entity_type` to narrow results.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "query": "Alex Chen",
+      "filters": { "entity_type": "person" },
+      "limit": 10
+    }
+    ```
+    Tool: `search_entities`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s -X POST http://localhost:3000/v1/entities/search \
+      -H "content-type: application/json" \
+      -d '{
+        "query": "Alex Chen",
+        "space_id": "default",
+        "entity_type": "person",
+        "limit": 10
+      }'
+    ```
+  </Tab>
+</Tabs>
+
+## Unified search with search_all
+
+Search across entities, documents, sources, and relationships in a single call. Use the `include` array to restrict which record types are searched.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "query": "Acme Corp funding",
+      "limit": 10,
+      "include": ["entities", "docs", "relationships"]
+    }
+    ```
+    Tool: `search_all`
+  </Tab>
+  <Tab title="REST alternatives">
+    There is no `/v1/search` REST route. Call the individual document, entity,
+    source, and relationship search routes or use MCP `search_all`.
+  </Tab>
+</Tabs>
+
+The tool envelope's `data` contains separate buckets for each requested type.
+For example, a no-match result can contain:
+
+```json
+{
+  "entities": { "items": [], "has_more": false },
+  "docs": { "items": [], "has_more": false },
+  "relationships": { "items": [], "has_more": false }
+}
+```
+
+<Note>
+  If you omit the `include` parameter, all four types (entities, docs, sources, relationships) are searched.
+</Note>
+
+## Search assertions
+
+Search extracted assertions by text across subject, predicate, and object fields.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "query": "works at",
+      "status": "resolved",
+      "limit": 10
+    }
+    ```
+    Tool: `search_assertions`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s -X POST http://localhost:3000/v1/assertions/search \
+      -H "content-type: application/json" \
+      -d '{ "query": "works at", "status": "resolved", "limit": 10 }'
+    ```
+  </Tab>
+</Tabs>
+
+## Entity context bundles
+
+Get a comprehensive view of an entity including all its relationships and summary statistics. This is useful for building entity profiles or providing context to an LLM.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "id": "entity:550e8400-e29b-41d4-a716-446655440000",
+      "window": 30,
+      "limit": 10
+    }
+    ```
+    Tool: `get_entity_context_bundle`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s "http://localhost:3000/v1/entities/entity:550e8400.../context?window_days=30&event_limit=10"
+    ```
+  </Tab>
+</Tabs>
+
+The bundle returns:
+
+| Field | Description |
+|---|---|
+| `entity` | The entity record |
+| `outgoing_relations` | Relationships where this entity is the subject |
+| `incoming_relations` | Relationships where this entity is the object |
+| `recent_events` (REST) / `events` (MCP) | Authorized timeline context |
+| `stats` (MCP) | Counts and the effective time window |
+
+<Accordion title="Advanced: include deleted records">
+  For MCP `search_docs` and `search_entities`, set
+  `filters.include_deleted: true`; `search_all` uses top-level
+  `include_deleted: true`. REST search routes use top-level `include_deleted`. This is useful for audit trails.
+</Accordion>
+
+## Next steps
+
+- [Building graphs](/guides/building-graphs) -- Create entities and relationships
+- [Truth slots](/guides/truth-slots) -- Inspect how assertions compete for ground truth
+- [Event streaming](/guides/event-streaming) -- Monitor system and domain events

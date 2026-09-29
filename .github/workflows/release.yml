@@ -1,0 +1,221 @@
+name: Build release candidates
+
+# Build candidates explicitly, then promote verified artifacts as described in
+# docs/operations/deployment.mdx. Creating a tag must not publish another binary.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  # Do not bind macOS release binaries to a runner's Homebrew installation.
+  LZMA_API_STATIC: "1"
+
+jobs:
+  release-validate:
+    name: Validate release state
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free hosted runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /usr/local/share/boost /usr/share/swift \
+            /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h / /mnt
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
+
+      - name: Resolve repository Cargo paths
+        id: cargo-paths
+        shell: bash
+        run: |
+          ./scripts/repo-cargo --print-env > "$RUNNER_TEMP/elephant-cargo-env"
+          sed -n '/^CARGO_HOME=/p; /^CARGO_TARGET_DIR=/p' \
+            "$RUNNER_TEMP/elephant-cargo-env" >> "$GITHUB_ENV"
+          target_dir="$(sed -n 's/^CARGO_TARGET_DIR=//p' "$RUNNER_TEMP/elephant-cargo-env")"
+          python3 - "$target_dir" <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import sys
+          print(f"target={os.path.relpath(sys.argv[1], os.environ['GITHUB_WORKSPACE'])}")
+          PY
+
+      - name: Cache Cargo workspace
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: release-validate-wrapper-v1
+          workspaces: ". -> ${{ steps.cargo-paths.outputs.target }}"
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Run release smoke preflight
+        run: make ci-smoke
+
+  build-binaries:
+    name: Build ${{ matrix.target }} candidate
+    needs: [release-validate]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc 2.35 remains compatible with Debian 12 (glibc 2.36).
+          - runs-on: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runs-on: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free hosted Linux runner disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /usr/local/share/boost /usr/share/swift \
+            /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h / /mnt
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+
+      - name: Verify native target and resolve Cargo paths
+        id: cargo-paths
+        shell: bash
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          host_target="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$host_target" = "$EXPECTED_TARGET"
+          ./scripts/repo-cargo --print-env > "$RUNNER_TEMP/elephant-cargo-env"
+          sed -n '/^CARGO_HOME=/p; /^CARGO_TARGET_DIR=/p' \
+            "$RUNNER_TEMP/elephant-cargo-env" >> "$GITHUB_ENV"
+          target_dir="$(sed -n 's/^CARGO_TARGET_DIR=//p' "$RUNNER_TEMP/elephant-cargo-env")"
+          python3 - "$target_dir" <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import sys
+          print(f"target={os.path.relpath(sys.argv[1], os.environ['GITHUB_WORKSPACE'])}")
+          PY
+
+      - name: Cache Cargo workspace
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: release-deploy-${{ matrix.target }}-wrapper-v1
+          workspaces: ". -> ${{ steps.cargo-paths.outputs.target }}"
+
+      - name: Add Linux build swap
+        if: runner.os == 'Linux'
+        run: |
+          sudo fallocate -l 10G /mnt/elephant-build.swap
+          sudo chmod 600 /mnt/elephant-build.swap
+          sudo mkswap /mnt/elephant-build.swap
+          sudo swapon /mnt/elephant-build.swap
+
+      - name: Build and smoke test RocksDB binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/repo-cargo build --locked --profile deploy -p elephant-bin --features rocksdb
+          "$CARGO_TARGET_DIR/deploy/elephant" --help
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            ldd "$CARGO_TARGET_DIR/deploy/elephant"
+          else
+            otool -L "$CARGO_TARGET_DIR/deploy/elephant"
+          fi
+
+      - name: Package binary, licenses and provenance
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          ./scripts/repo-cargo metadata --locked --no-deps --format-version 1 \
+            > "$RUNNER_TEMP/elephant-metadata.json"
+          python3 <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          import tarfile
+
+          metadata = json.loads(pathlib.Path(os.environ["RUNNER_TEMP"], "elephant-metadata.json").read_text())
+          package = next(p for p in metadata["packages"] if p["name"] == "elephant-bin")
+          version = package["version"]
+          target = os.environ["TARGET"]
+          stem = f"elephant-{version}-{target}"
+          dist = pathlib.Path("dist")
+          dist.mkdir()
+          bundle = pathlib.Path(os.environ["RUNNER_TEMP"], stem)
+          bundle.mkdir()
+          binary = bundle / "elephant"
+          shutil.copyfile(pathlib.Path(os.environ["CARGO_TARGET_DIR"], "deploy", "elephant"), binary)
+          binary.chmod(0o755)
+          for name in ("LICENSE", "LICENSE-MIT", "LICENSE-APACHE"):
+              shutil.copyfile(name, bundle / name)
+          provenance = {
+              "version": version,
+              "target": target,
+              "license": package["license"],
+              "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "source_tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(),
+              "workflow_run": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "workflow_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "build_command": "./scripts/repo-cargo build --locked --profile deploy -p elephant-bin --features rocksdb",
+              "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
+              "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+          }
+          (bundle / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+          archive = dist / f"{stem}.tar.gz"
+          with tarfile.open(archive, "w:gz") as tar:
+              for entry in sorted(bundle.iterdir()):
+                  tar.add(entry, arcname=entry.name)
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          (dist / f"{stem}.sha256").write_text(f"{digest}  {archive.name}\n")
+          PY
+
+      - name: Attest archive build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Upload candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: elephant-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Report build disk usage
+        if: always()
+        shell: bash
+        run: |
+          df -h /
+          if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+            du -sh "$CARGO_HOME" "$CARGO_TARGET_DIR" || true
+          fi

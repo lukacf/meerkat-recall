@@ -1,0 +1,157 @@
+---
+title: "Security"
+description: "Attribute-Based Access Control (ABAC) model for every record in Elephant"
+icon: "shield-halved"
+---
+
+Elephant enforces Attribute-Based Access Control (ABAC) on every record. Access decisions are computed at query time by comparing the caller's principal claims against the record's security envelope. Authenticated request handlers evaluate these attributes. Explicit local
+development bypass disables ABAC; direct repository access by Rust library
+callers requires authorization at the integration boundary.
+
+## Security Envelope
+
+Every record in Elephant carries a `Security` block in its base fields:
+
+<CodeGroup>
+```rust Security
+struct Security {
+    policy_id: String,      // identifies the policy schema
+    level: i32,             // ordered integer sensitivity (0..n)
+    labels: Vec<String>,    // compartment tags
+    handling: Vec<String>,  // caveats
+}
+```
+</CodeGroup>
+
+| Field | Example | Purpose |
+|---|---|---|
+| `policy_id` | `"tenant_policy_v1"` | Selects which policy schema governs this record |
+| `level` | `2` | Numeric sensitivity level; higher means more restricted |
+| `labels` | `["comp:alerts", "vis:team"]` | Compartment tags that partition access |
+| `handling` | `["handling:trusted_context"]` | Caveats that impose additional constraints |
+
+## Principal Claims
+
+Every API request carries a principal (typically from a JWT token) with the following claims:
+
+<CodeGroup>
+```rust Principal
+struct Principal {
+    space_id: String,
+    scopes: HashSet<String>,
+    clearances: Vec<Clearance>,
+    subject_allowlist: Option<HashSet<RecordId>>,
+    purpose: HashSet<String>,
+}
+```
+</CodeGroup>
+
+### Clearances
+
+Each principal holds one or more `Clearance` entries, one per policy schema:
+
+<CodeGroup>
+```rust Clearance
+struct Clearance {
+    policy_id: String,
+    max_level: i32,
+    labels: HashSet<String>,
+    handling_allow: HashSet<String>,
+}
+```
+</CodeGroup>
+
+A clearance grants access to records under its `policy_id` up to `max_level`, for the listed labels and handling caveats.
+
+## Access Evaluation Rules
+
+Access is granted only if **all** of the following hold. If any rule fails, the request is denied.
+
+<Steps>
+  <Step title="Space match">
+    The principal's `space_id` must equal the record's `space_id`.
+  </Step>
+  <Step title="Scope check">
+    The required operation scope (e.g., `read:entity`, `write:relationship`) must be present in the principal's `scopes`.
+  </Step>
+  <Step title="Policy clearance">
+    A clearance must exist in the principal's `clearances` array matching the record's `policy_id`.
+  </Step>
+  <Step title="Level check">
+    The record's `level` must be less than or equal to the clearance's `max_level`.
+  </Step>
+  <Step title="Label subset">
+    Every label on the record must be present in the clearance's `labels` set. Formally: `record.labels` is a subset of `clearance.labels`.
+  </Step>
+  <Step title="Handling subset">
+    Every handling caveat on the record must be present in the clearance's `handling_allow` set.
+  </Step>
+  <Step title="Subject allowlist">
+    If the principal has a `subject_allowlist`, then: the record's `subjects_state` must be `complete` (unless `handling:subjectless_ok` is present), subjects must be non-empty, and every subject entity must appear in the allowlist.
+  </Step>
+  <Step title="Purpose check">
+    If the engine requires specific purposes, the principal's `purpose` set must include them.
+  </Step>
+</Steps>
+
+<Warning>
+The evaluation is **deny by default**. A principal with no clearances, no scopes, or a mismatched space will be denied access to every record.
+</Warning>
+
+## Subject State
+
+Records track whether their subject associations are fully populated:
+
+| State | Meaning |
+|---|---|
+| `complete` | All relevant subject entities are known |
+| `partial` | Some subject entities are unknown |
+| `unknown` | Subject inference has not been performed |
+
+When a principal has a `subject_allowlist` and the record's `subjects_state` is not `complete`, access is denied unless the record carries the `handling:subjectless_ok` caveat.
+
+## Redaction
+
+When a principal has access to a record but lacks scope for specific fields, the response is wrapped in a `RedactionEnvelope`:
+
+<CodeGroup>
+```rust RedactionEnvelope
+struct RedactionEnvelope<T> {
+    data: T,
+    redactions: Vec<String>,  // redacted field paths
+}
+```
+</CodeGroup>
+
+For example, a principal with `read:entity` but without `read:doc:raw` will see document metadata but the `doc.text` field will be redacted. The `redactions` array lists which field paths were removed.
+
+Redaction rules map scopes to field paths:
+
+| Required Scope | Redacted Fields |
+|---|---|
+| `read:doc:raw` | `doc.text` |
+| `read:source:raw` | `source.path` |
+
+## Development Mode
+
+<Warning>
+Development mode bypasses all security checks and must never be used in production.
+</Warning>
+
+Setting the `SKIP_AUTH=true` environment variable injects a default principal:
+
+| Field | Value |
+|---|---|
+| `subject` | `"dev-user"` |
+| `space_id` | `X-Space-Id` header, or `"default"` when absent |
+| `scopes` | `["*"]` |
+| `bypass_abac` | `true` |
+
+This bypasses ABAC evaluation within the selected development space. It does
+not make data in every space part of the same request.
+
+## See Also
+
+- [Assertions](/concepts/assertions) -- how security envelopes propagate to extracted claims
+- [Truth Maintenance](/concepts/truth-maintenance) -- how security hashes partition truth slots
+- [Predicates](/concepts/predicates) -- security on predicate registry entries

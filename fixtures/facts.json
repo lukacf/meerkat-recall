@@ -1,0 +1,141 @@
+{
+  "facts": [
+    {
+      "id": "fact:seed-fact-001",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "fact_type": "relationship",
+      "canonical_text": "Alice is a student at Sunnydale Elementary School",
+      "structured_data": {
+        "subject": "entity:seed-entity-001",
+        "predicate": "attends",
+        "object": "entity:seed-entity-004",
+        "role": "student"
+      },
+      "status": "promoted",
+      "confidence": 0.95,
+      "source_doc": "doc:seed-doc-001",
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 0,
+        "labels": [],
+        "handling": []
+      },
+      "idempotency_key": "seed-fact-student-001"
+    },
+    {
+      "id": "fact:seed-fact-002",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "fact_type": "relationship",
+      "canonical_text": "Carol Martinez is Alice's teacher",
+      "structured_data": {
+        "subject": "entity:seed-entity-003",
+        "predicate": "teaches",
+        "object": "entity:seed-entity-001",
+        "subject_name": "Carol Martinez",
+        "object_name": "Alice"
+      },
+      "status": "promoted",
+      "confidence": 0.92,
+      "source_doc": "doc:seed-doc-001",
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 0,
+        "labels": [],
+        "handling": []
+      },
+      "idempotency_key": "seed-fact-teacher-001"
+    },
+    {
+      "id": "fact:seed-fact-003",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "fact_type": "attribute",
+      "canonical_text": "Alice's favorite activity is playing soccer",
+      "structured_data": {
+        "entity": "entity:seed-entity-001",
+        "attribute": "favorite_activity",
+        "value": "soccer"
+      },
+      "status": "candidate",
+      "confidence": 0.78,
+      "source_doc": "doc:seed-doc-002",
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-fact-activity-001"
+    },
+    {
+      "id": "fact:seed-fact-004",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "fact_type": "relationship",
+      "canonical_text": "Alice and Bob are siblings",
+      "structured_data": {
+        "subject": "entity:seed-entity-001",
+        "predicate": "sibling_of",
+        "object": "entity:seed-entity-002",
+        "bidirectional": true
+      },
+      "status": "promoted",
+      "confidence": 0.99,
+      "source_doc": "doc:seed-doc-002",
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-fact-sibling-001"
+    },
+    {
+      "id": "fact:seed-fact-005",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "fact_type": "ownership",
+      "canonical_text": "Buddy is the Johnson family's pet dog",
+      "structured_data": {
+        "pet": "entity:seed-entity-005",
+        "owners": ["entity:seed-entity-001", "entity:seed-entity-002"],
+        "pet_type": "dog"
+      },
+      "status": "promoted",
+      "confidence": 0.97,
+      "source_doc": "doc:seed-doc-003",
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-fact-pet-001"
+    },
+    {
+      "id": "fact:seed-fact-006",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "fact_type": "attribute",
+      "canonical_text": "Bob loves dinosaurs",
+      "structured_data": {
+        "entity": "entity:seed-entity-002",
+        "attribute": "interest",
+        "value": "dinosaurs",
+        "intensity": "loves"
+      },
+      "status": "candidate",
+      "confidence": 0.85,
+      "source_doc": null,
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-fact-interest-001"
+    }
+  ]
+}

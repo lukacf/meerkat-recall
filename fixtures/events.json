@@ -1,0 +1,99 @@
+{
+  "events": [
+    {
+      "id": "event:seed-event-001",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "title": "Alice's Soccer Practice",
+      "description": "Weekly soccer practice at the community field",
+      "datetime_start": "2026-01-20T16:00:00Z",
+      "datetime_end": "2026-01-20T17:30:00Z",
+      "location": "Community Soccer Field",
+      "entities": ["entity:seed-entity-001"],
+      "tags": ["sports", "recurring", "after-school"],
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-soccer-001"
+    },
+    {
+      "id": "event:seed-event-002",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "title": "School Science Fair",
+      "description": "Annual science fair - Alice presenting volcano project",
+      "datetime_start": "2026-02-15T09:00:00Z",
+      "datetime_end": "2026-02-15T14:00:00Z",
+      "location": "Sunnydale Elementary School Gymnasium",
+      "entities": ["entity:seed-entity-001", "entity:seed-entity-004"],
+      "tags": ["school", "science", "presentation"],
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 0,
+        "labels": [],
+        "handling": []
+      },
+      "idempotency_key": "seed-science-fair-001"
+    },
+    {
+      "id": "event:seed-event-003",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "title": "Bob's Dinosaur Museum Trip",
+      "description": "Class field trip to natural history museum",
+      "datetime_start": "2026-01-25T10:00:00Z",
+      "datetime_end": "2026-01-25T15:00:00Z",
+      "location": "Natural History Museum",
+      "entities": ["entity:seed-entity-002"],
+      "tags": ["field-trip", "educational", "pre-k"],
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-museum-001"
+    },
+    {
+      "id": "event:seed-event-004",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "title": "Family Game Night",
+      "description": "Weekly family game night - board games and pizza",
+      "datetime_start": "2026-01-17T18:00:00Z",
+      "datetime_end": "2026-01-17T20:30:00Z",
+      "location": "Home",
+      "entities": ["entity:seed-entity-001", "entity:seed-entity-002"],
+      "tags": ["family", "recurring", "evening"],
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-game-night-001"
+    },
+    {
+      "id": "event:seed-event-005",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "title": "Buddy's Vet Appointment",
+      "description": "Annual checkup and vaccinations",
+      "datetime_start": "2026-02-01T14:00:00Z",
+      "datetime_end": "2026-02-01T15:00:00Z",
+      "location": "Happy Paws Veterinary Clinic",
+      "entities": ["entity:seed-entity-005"],
+      "tags": ["pet", "health", "appointment"],
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-vet-001"
+    }
+  ]
+}

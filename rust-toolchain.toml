@@ -1,0 +1,23 @@
+# Rust toolchain configuration for Elephant
+# Rustup automatically uses this version when entering the directory
+#
+# This ensures consistent builds across all developer machines and CI
+
+[toolchain]
+# Pin to specific stable version (matches rust-version in Cargo.toml)
+channel = "1.94.0"
+
+# Required components for development and CI
+components = [
+    "rustfmt",   # Code formatting
+    "clippy",    # Linting
+    "rust-src",  # Source code for rust-analyzer
+]
+
+# Cross-compilation targets (uncomment as needed)
+# targets = [
+#     "x86_64-unknown-linux-gnu",
+#     "x86_64-unknown-linux-musl",
+#     "x86_64-apple-darwin",
+#     "aarch64-apple-darwin",
+# ]

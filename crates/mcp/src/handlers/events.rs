@@ -1,0 +1,1099 @@
+#![allow(missing_docs, clippy::too_many_lines, clippy::cognitive_complexity)]
+//! Domain event MCP handlers.
+//!
+//! Implements:
+//! - `search_events`
+//! - `get_event`
+//! - `list_recent_events`
+//! - `list_upcoming_events`
+//! - `add_timeline_event`
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::str::FromStr;
+
+use elephant_storage::{
+    parse_id, AssertionRepository, EntityRepository, EventRepository, Repository, SearchCriteria,
+    SourceRepository, StorageClient,
+};
+use elephant_types::ids::TableName;
+use elephant_types::records::assertion::Assertion;
+use elephant_types::records::base::BaseFields;
+use elephant_types::records::entity::Entity;
+use elephant_types::records::source::Source;
+use elephant_types::records::{Event, EventStatus, TimePrecision};
+use elephant_types::{Link, RecordId};
+
+use crate::coercion::coerce_params;
+use crate::error::{McpError, McpResult};
+use crate::profile::ToolProfile;
+use crate::tools::ToolResponse;
+
+use super::{ToolContext, ToolHandler};
+
+const fn default_limit() -> usize {
+    50
+}
+
+const fn default_recent_limit() -> usize {
+    20
+}
+
+const fn default_days() -> u32 {
+    7
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchEventsInput {
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub include_deleted: bool,
+    #[serde(default)]
+    pub include_candidates: bool,
+    #[serde(default)]
+    pub statuses: Option<Vec<String>>,
+    #[serde(default)]
+    pub entity_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchEventsOutput {
+    pub items: Vec<Event>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetEventInput {
+    pub id: String,
+    #[serde(default)]
+    pub include_deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListRecentEventsInput {
+    #[serde(default = "default_recent_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub include_candidates: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListUpcomingEventsInput {
+    #[serde(default = "default_days")]
+    pub days: u32,
+    #[serde(default)]
+    pub include_candidates: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListEventsOutput {
+    pub items: Vec<Event>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddTimelineEventInput {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub subject_ids: Vec<String>,
+    #[serde(default)]
+    pub assertion_refs: Vec<String>,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_start: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_end: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_precision: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub time_confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+fn parse_statuses(statuses: &[String]) -> Result<Vec<EventStatus>, McpError> {
+    statuses
+        .iter()
+        .map(|status| {
+            EventStatus::from_str(status).map_err(|e| McpError::InvalidParameters(e.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn search_status_filter(input: &SearchEventsInput) -> Result<Option<Vec<EventStatus>>, McpError> {
+    if let Some(statuses) = input.statuses.as_ref() {
+        return Ok(Some(parse_statuses(statuses)?));
+    }
+
+    if input.include_candidates {
+        Ok(None)
+    } else {
+        Ok(Some(vec![
+            EventStatus::Approved,
+            EventStatus::Superseded,
+            EventStatus::Rejected,
+        ]))
+    }
+}
+
+fn authorized_events(ctx: &ToolContext, events: Vec<Event>) -> Vec<Event> {
+    events
+        .into_iter()
+        .filter(|event| {
+            ctx.authz
+                .authorize_record_read(&ctx.principal, event, "read:event")
+                .is_ok()
+        })
+        .collect()
+}
+
+fn tool_error_value(message: impl Into<String>) -> McpResult<Value> {
+    let response: ToolResponse<()> = ToolResponse::error(message.into());
+    serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+}
+
+fn expected_tool_error(err: McpError) -> McpResult<Value> {
+    match err {
+        McpError::InvalidParameters(message) | McpError::ExecutionError(message) => {
+            tool_error_value(message)
+        }
+        err => Err(err),
+    }
+}
+
+async fn resolve_assertion_links(
+    ctx: &ToolContext,
+    ids: &[String],
+) -> McpResult<Vec<Link<Assertion>>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Err(reason) =
+        crate::authz::authorize_preflight_scope(&ctx.authz, &ctx.principal, "read:assertion")
+    {
+        return Err(McpError::ExecutionError(reason));
+    }
+
+    let repo = AssertionRepository::new(ctx.storage.clone());
+    let space_id = ctx.principal.space_id.clone();
+    let mut links = Vec::with_capacity(ids.len());
+
+    for id in ids {
+        let record_id = parse_id(id, TableName::Assertion)
+            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
+        let Some(assertion) = repo
+            .get(&space_id, &record_id)
+            .await
+            .map_err(|e| McpError::ExecutionError(e.to_string()))?
+        else {
+            return Err(McpError::InvalidParameters(format!(
+                "assertion reference not found in caller space: {id}"
+            )));
+        };
+        if let Err(reason) =
+            ctx.authz
+                .authorize_record_read(&ctx.principal, &assertion, "read:assertion")
+        {
+            return Err(McpError::ExecutionError(format!("Access denied: {reason}")));
+        }
+        links.push(Link::new(record_id));
+    }
+
+    Ok(links)
+}
+
+async fn resolve_source_links(ctx: &ToolContext, ids: &[String]) -> McpResult<Vec<Link<Source>>> {
+    let repo = SourceRepository::new(ctx.storage.clone());
+    let space_id = ctx.principal.space_id.clone();
+    let mut links = Vec::with_capacity(ids.len());
+
+    for id in ids {
+        let record_id = parse_id(id, TableName::Source)
+            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
+        let Some(source) = repo
+            .get(&space_id, &record_id)
+            .await
+            .map_err(|e| McpError::ExecutionError(e.to_string()))?
+        else {
+            return Err(McpError::InvalidParameters(format!(
+                "source reference not found in caller space: {id}"
+            )));
+        };
+        if let Err(reason) = ctx
+            .authz
+            .authorize_record_read(&ctx.principal, &source, "read:source")
+        {
+            return Err(McpError::ExecutionError(format!("Access denied: {reason}")));
+        }
+        links.push(Link::new(record_id));
+    }
+
+    Ok(links)
+}
+
+async fn resolve_subject_links(ctx: &ToolContext, ids: &[String]) -> McpResult<Vec<Link<Entity>>> {
+    let repo = EntityRepository::new(ctx.storage.clone());
+    let space_id = ctx.principal.space_id.clone();
+    let mut links = Vec::with_capacity(ids.len());
+
+    for id in ids {
+        let record_id = parse_id(id, TableName::Entity)
+            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
+        let Some(entity) = repo
+            .get(&space_id, &record_id)
+            .await
+            .map_err(|e| McpError::ExecutionError(e.to_string()))?
+        else {
+            return Err(McpError::InvalidParameters(format!(
+                "subject entity not found in caller space: {id}"
+            )));
+        };
+        if let Err(reason) = ctx
+            .authz
+            .authorize_record_read(&ctx.principal, &entity, "read:entity")
+        {
+            return Err(McpError::ExecutionError(format!("Access denied: {reason}")));
+        }
+        links.push(Link::new(record_id));
+    }
+
+    Ok(links)
+}
+
+fn parse_time_precision(input: Option<&str>) -> McpResult<TimePrecision> {
+    input.map_or(Ok(TimePrecision::Unknown), |value| {
+        TimePrecision::from_str(value).map_err(|e| McpError::InvalidParameters(e.to_string()))
+    })
+}
+
+fn parse_event_status(input: Option<&str>) -> McpResult<EventStatus> {
+    input.map_or(Ok(EventStatus::Approved), |value| {
+        EventStatus::from_str(value).map_err(|e| McpError::InvalidParameters(e.to_string()))
+    })
+}
+
+pub struct AddTimelineEventHandler {
+    repo: EventRepository,
+}
+
+impl AddTimelineEventHandler {
+    #[must_use]
+    pub const fn new(storage: StorageClient) -> Self {
+        Self {
+            repo: EventRepository::new(storage),
+        }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for AddTimelineEventHandler {
+    fn name(&self) -> &'static str {
+        "add_timeline_event"
+    }
+
+    fn description(&self) -> &'static str {
+        concat!(
+            "Create a domain timeline event backed by explicit evidence references.\n\n",
+            "At least one `assertion_refs` or `source_refs` item is required.\n\n",
+            "Example:\n",
+            r#"{ "title": "Quarterly planning", "source_refs": ["source:550e8400-e29b-41d4-a716-446655440000"] }"#,
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["title"],
+            "properties": {
+                "title": { "type": "string" },
+                "summary": { "type": "string" },
+                "subject_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "default": []
+                },
+                "assertion_refs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "default": []
+                },
+                "source_refs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "default": []
+                },
+                "time_start": { "type": "string", "format": "date-time" },
+                "time_end": { "type": "string", "format": "date-time" },
+                "time_precision": {
+                    "type": "string",
+                    "enum": ["exact", "minute", "hour", "day", "month", "year", "unknown"]
+                },
+                "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                "time_confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                "status": {
+                    "type": "string",
+                    "enum": ["candidate", "approved", "superseded", "rejected"]
+                },
+                "metadata": {
+                    "type": "object",
+                    "required": [],
+                    "additionalProperties": true
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let params = coerce_params(params, &self.input_schema());
+        let input: AddTimelineEventInput = serde_json::from_value(params)
+            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
+
+        let space_id = ctx.principal.space_id.clone();
+        if space_id.is_empty() {
+            return tool_error_value("Access denied: missing space_id");
+        }
+
+        if input.assertion_refs.is_empty() && input.source_refs.is_empty() {
+            return tool_error_value(
+                "At least one assertion_refs or source_refs evidence reference is required",
+            );
+        }
+
+        let assertion_refs = match resolve_assertion_links(ctx, &input.assertion_refs).await {
+            Ok(value) => value,
+            Err(err) => return expected_tool_error(err),
+        };
+        let source_refs = match resolve_source_links(ctx, &input.source_refs).await {
+            Ok(value) => value,
+            Err(err) => return expected_tool_error(err),
+        };
+        let subject_ids = match resolve_subject_links(ctx, &input.subject_ids).await {
+            Ok(value) => value,
+            Err(err) => return expected_tool_error(err),
+        };
+        let time_precision = parse_time_precision(input.time_precision.as_deref())?;
+        let status = parse_event_status(input.status.as_deref())?;
+
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::Event),
+            space_id,
+            "mcp_tool".to_string(),
+        );
+        base.subjects = subject_ids;
+        base.provenance.sources = source_refs.iter().map(|link| link.id().clone()).collect();
+
+        let mut event = Event::new(base, input.title, assertion_refs, source_refs)
+            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
+        event.summary = input.summary;
+        event.status = status;
+        event.time_start = input.time_start;
+        event.time_end = input.time_end;
+        event.time_precision = time_precision;
+        if let Some(confidence) = input.confidence {
+            event.confidence = confidence;
+        }
+        if let Some(time_confidence) = input.time_confidence {
+            event.time_confidence = time_confidence;
+        }
+        if let Some(metadata) = input.metadata {
+            event.metadata = metadata;
+        }
+
+        if let Err(reason) = ctx
+            .authz
+            .authorize_record_write(&ctx.principal, &event, "write:event")
+        {
+            return tool_error_value(format!("Access denied: {reason}"));
+        }
+
+        let created = self
+            .repo
+            .create(event)
+            .await
+            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+        let response = ToolResponse::success(created);
+        serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+    }
+}
+
+pub struct SearchEventsHandler {
+    repo: EventRepository,
+}
+
+impl SearchEventsHandler {
+    #[must_use]
+    pub const fn new(storage: StorageClient) -> Self {
+        Self {
+            repo: EventRepository::new(storage),
+        }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for SearchEventsHandler {
+    fn name(&self) -> &'static str {
+        "search_events"
+    }
+
+    fn description(&self) -> &'static str {
+        concat!(
+            "Search domain timeline events in the caller's space.\n\n",
+            "Example:\n",
+            r#"{ "query": "launch", "limit": 10, "include_candidates": false }"#,
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": [],
+            "properties": {
+                "query": { "type": "string" },
+                "limit": { "type": "integer", "default": 50, "maximum": 100 },
+                "cursor": { "type": "string" },
+                "include_deleted": { "type": "boolean", "default": false },
+                "include_candidates": { "type": "boolean", "default": false },
+                "statuses": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["candidate", "approved", "superseded", "rejected"]
+                    }
+                },
+                "entity_ids": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["any", "all"]
+                }
+            }
+        })
+    }
+
+    fn profile(&self) -> ToolProfile {
+        ToolProfile::Agent
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let params = coerce_params(params, &self.input_schema());
+        let input: SearchEventsInput = serde_json::from_value(params)
+            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
+
+        let space_id = ctx.principal.space_id.clone();
+        if space_id.is_empty() {
+            let response: ToolResponse<()> = ToolResponse::error("Access denied: missing space_id");
+            return serde_json::to_value(response)
+                .map_err(|e| McpError::ExecutionError(e.to_string()));
+        }
+
+        let cursor = if let Some(cursor) = input.cursor.as_ref() {
+            Some(
+                parse_id(cursor, TableName::Event)
+                    .map_err(|e| McpError::InvalidParameters(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        let mut criteria = SearchCriteria::new()
+            .with_space_id(space_id)
+            .with_limit(input.limit + 1);
+        let statuses = search_status_filter(&input)?;
+
+        if let Some(query) = input.query {
+            criteria = criteria.with_query(query);
+        }
+        if input.include_deleted {
+            criteria = criteria.include_deleted();
+        }
+        if let Some(cursor) = cursor {
+            criteria = criteria.with_cursor(cursor.to_string());
+        }
+        if let Some(entity_ids) = input.entity_ids {
+            criteria = criteria.with_entities(entity_ids);
+        }
+        if let Some(mode) = input.mode {
+            criteria = criteria.with_mode(mode);
+        }
+
+        let search = self
+            .repo
+            .search_filtered(&criteria, statuses.as_deref())
+            .await
+            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+
+        let mut authorized = authorized_events(ctx, search.results);
+        let total = authorized.len();
+        let has_more = total > input.limit;
+        if has_more {
+            authorized.truncate(input.limit);
+        }
+        let next_cursor = if has_more {
+            authorized.last().map(|event| event.base.id.to_string())
+        } else {
+            None
+        };
+
+        let output = SearchEventsOutput {
+            total,
+            items: authorized,
+            next_cursor,
+            has_more,
+        };
+        let response = ToolResponse::success(output);
+        serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+    }
+}
+
+pub struct GetEventHandler {
+    repo: EventRepository,
+}
+
+impl GetEventHandler {
+    #[must_use]
+    pub const fn new(storage: StorageClient) -> Self {
+        Self {
+            repo: EventRepository::new(storage),
+        }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for GetEventHandler {
+    fn name(&self) -> &'static str {
+        "get_event"
+    }
+
+    fn description(&self) -> &'static str {
+        concat!(
+            "Get a single domain event by id.\n\n",
+            "Example:\n",
+            r#"{ "id": "event:550e8400-e29b-41d4-a716-446655440000" }"#,
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": { "type": "string" },
+                "include_deleted": { "type": "boolean", "default": false }
+            }
+        })
+    }
+
+    fn profile(&self) -> ToolProfile {
+        ToolProfile::Agent
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let params = coerce_params(params, &self.input_schema());
+        let input: GetEventInput = serde_json::from_value(params)
+            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
+
+        let space_id = ctx.principal.space_id.clone();
+        if space_id.is_empty() {
+            let response: ToolResponse<()> = ToolResponse::error("Access denied: missing space_id");
+            return serde_json::to_value(response)
+                .map_err(|e| McpError::ExecutionError(e.to_string()));
+        }
+
+        let id = parse_id(&input.id, TableName::Event)
+            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
+        let event = if input.include_deleted {
+            self.repo
+                .get_with_deleted(&space_id, &id)
+                .await
+                .map_err(|e| McpError::ExecutionError(e.to_string()))?
+        } else {
+            self.repo
+                .get(&space_id, &id)
+                .await
+                .map_err(|e| McpError::ExecutionError(e.to_string()))?
+        };
+
+        let Some(event) = event else {
+            let response: ToolResponse<()> =
+                ToolResponse::error(format!("event not found: {}", input.id));
+            return serde_json::to_value(response)
+                .map_err(|e| McpError::ExecutionError(e.to_string()));
+        };
+
+        if let Err(reason) = ctx
+            .authz
+            .authorize_record_read(&ctx.principal, &event, "read:event")
+        {
+            let response: ToolResponse<()> =
+                ToolResponse::error(format!("Access denied: {reason}"));
+            return serde_json::to_value(response)
+                .map_err(|e| McpError::ExecutionError(e.to_string()));
+        }
+
+        let response = ToolResponse::success(event);
+        serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+    }
+}
+
+pub struct ListRecentEventsHandler {
+    repo: EventRepository,
+}
+
+impl ListRecentEventsHandler {
+    #[must_use]
+    pub const fn new(storage: StorageClient) -> Self {
+        Self {
+            repo: EventRepository::new(storage),
+        }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ListRecentEventsHandler {
+    fn name(&self) -> &'static str {
+        "list_recent_events"
+    }
+
+    fn description(&self) -> &'static str {
+        concat!(
+            "List recent domain events for the caller's space.\n\n",
+            "Example:\n",
+            r#"{ "limit": 20, "include_candidates": false }"#,
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": [],
+            "properties": {
+                "limit": { "type": "integer", "default": 20, "maximum": 200 },
+                "include_candidates": { "type": "boolean", "default": false }
+            }
+        })
+    }
+
+    fn profile(&self) -> ToolProfile {
+        ToolProfile::Agent
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let params = coerce_params(params, &self.input_schema());
+        let input: ListRecentEventsInput = serde_json::from_value(params)
+            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
+
+        let space_id = ctx.principal.space_id.clone();
+        if space_id.is_empty() {
+            let response: ToolResponse<()> = ToolResponse::error("Access denied: missing space_id");
+            return serde_json::to_value(response)
+                .map_err(|e| McpError::ExecutionError(e.to_string()));
+        }
+
+        let mut events = self
+            .repo
+            .get_recent(&space_id, input.limit)
+            .await
+            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+        if !input.include_candidates {
+            events.retain(|event| event.status != EventStatus::Candidate);
+        }
+        let output = ListEventsOutput {
+            items: authorized_events(ctx, events),
+        };
+        let response = ToolResponse::success(output);
+        serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+    }
+}
+
+pub struct ListUpcomingEventsHandler {
+    repo: EventRepository,
+}
+
+impl ListUpcomingEventsHandler {
+    #[must_use]
+    pub const fn new(storage: StorageClient) -> Self {
+        Self {
+            repo: EventRepository::new(storage),
+        }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ListUpcomingEventsHandler {
+    fn name(&self) -> &'static str {
+        "list_upcoming_events"
+    }
+
+    fn description(&self) -> &'static str {
+        concat!(
+            "List upcoming domain events within a time window.\n\n",
+            "Example:\n",
+            r#"{ "days": 14, "include_candidates": false }"#,
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": [],
+            "properties": {
+                "days": { "type": "integer", "default": 7, "minimum": 1, "maximum": 365 },
+                "include_candidates": { "type": "boolean", "default": false }
+            }
+        })
+    }
+
+    fn profile(&self) -> ToolProfile {
+        ToolProfile::Agent
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let params = coerce_params(params, &self.input_schema());
+        let input: ListUpcomingEventsInput = serde_json::from_value(params)
+            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
+
+        let space_id = ctx.principal.space_id.clone();
+        if space_id.is_empty() {
+            let response: ToolResponse<()> = ToolResponse::error("Access denied: missing space_id");
+            return serde_json::to_value(response)
+                .map_err(|e| McpError::ExecutionError(e.to_string()));
+        }
+
+        let mut events = self
+            .repo
+            .get_upcoming(&space_id, input.days)
+            .await
+            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+        if !input.include_candidates {
+            events.retain(|event| event.status != EventStatus::Candidate);
+        }
+        let output = ListEventsOutput {
+            items: authorized_events(ctx, events),
+        };
+        let response = ToolResponse::success(output);
+        serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::too_many_lines
+    )]
+
+    use super::*;
+    use elephant_policy::{Clearance, Principal};
+    use elephant_types::records::assertion::{
+        Assertion, AssertionRetryState, EvidenceSpan, ResolutionStatus,
+    };
+    use elephant_types::records::base::Security;
+    use elephant_types::records::source::{Source, SourceType};
+    use std::collections::HashSet;
+
+    fn make_test_principal(space_id: &str, scopes: &[&str]) -> Principal {
+        Principal {
+            space_id: space_id.to_string(),
+            scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+            clearances: vec![Clearance {
+                policy_id: "default".to_string(),
+                max_level: 10,
+                labels: HashSet::new(),
+                handling_allow: HashSet::new(),
+            }],
+            subject_allowlist: None,
+            purpose: HashSet::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_timeline_event_requires_evidence_refs() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        let ctx = ToolContext::new(
+            storage.clone(),
+            make_test_principal("default", &["write:event"]),
+        );
+        let handler = AddTimelineEventHandler::new(storage);
+
+        let response = handler
+            .execute(&ctx, json!({ "title": "Bare event" }))
+            .await
+            .expect("response");
+        let decoded: ToolResponse<()> = serde_json::from_value(response).expect("decode");
+        assert!(!decoded.ok);
+        assert!(decoded.error.unwrap_or_default().contains("evidence"));
+    }
+
+    #[tokio::test]
+    async fn test_add_timeline_event_creates_event_from_source_ref() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        let source_repo = SourceRepository::new(storage.clone());
+        let source = Source::new(
+            BaseFields::new(
+                RecordId::new_v4(TableName::Source),
+                "default".to_string(),
+                "tester".to_string(),
+            ),
+            SourceType::Manual,
+            "sha256:test".to_string(),
+        );
+        let source = source_repo.create(source).await.expect("create source");
+
+        let ctx = ToolContext::new(
+            storage.clone(),
+            make_test_principal("default", &["write:event", "read:source"]),
+        );
+        let handler = AddTimelineEventHandler::new(storage.clone());
+
+        let response = handler
+            .execute(
+                &ctx,
+                json!({
+                    "title": "Quarterly planning",
+                    "source_refs": [source.base.id.to_string()],
+                    "status": "approved"
+                }),
+            )
+            .await
+            .expect("response");
+        let decoded: ToolResponse<Event> = serde_json::from_value(response).expect("decode");
+        assert!(decoded.ok);
+        let event = decoded.data.expect("event");
+        assert_eq!(event.title, "Quarterly planning");
+        assert_eq!(event.status, EventStatus::Approved);
+        assert_eq!(event.source_refs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_timeline_event_rejects_missing_source_ref() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        let ctx = ToolContext::new(
+            storage.clone(),
+            make_test_principal("default", &["write:event", "read:source"]),
+        );
+        let handler = AddTimelineEventHandler::new(storage);
+
+        let response = handler
+            .execute(
+                &ctx,
+                json!({
+                    "title": "Missing evidence",
+                    "source_refs": ["source:550e8400-e29b-41d4-a716-446655440000"]
+                }),
+            )
+            .await
+            .expect("response");
+        let decoded: ToolResponse<()> = serde_json::from_value(response).expect("decode");
+        assert!(!decoded.ok);
+        assert!(decoded.error.unwrap_or_default().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_add_timeline_event_rejects_missing_subject_entity() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        let source_repo = SourceRepository::new(storage.clone());
+        let source = Source::new(
+            BaseFields::new(
+                RecordId::new_v4(TableName::Source),
+                "default".to_string(),
+                "tester".to_string(),
+            ),
+            SourceType::Manual,
+            "sha256:test".to_string(),
+        );
+        let source = source_repo.create(source).await.expect("create source");
+
+        let ctx = ToolContext::new(
+            storage.clone(),
+            make_test_principal("default", &["write:event", "read:source", "read:entity"]),
+        );
+        let handler = AddTimelineEventHandler::new(storage);
+
+        let response = handler
+            .execute(
+                &ctx,
+                json!({
+                    "title": "Quarterly planning",
+                    "source_refs": [source.base.id.to_string()],
+                    "subject_ids": ["entity:550e8400-e29b-41d4-a716-446655440000"]
+                }),
+            )
+            .await
+            .expect("response");
+        let decoded: ToolResponse<()> = serde_json::from_value(response).expect("decode");
+        assert!(!decoded.ok);
+        let error = decoded.error.unwrap_or_default();
+        assert!(
+            error.contains("subject") || error.contains("entity") || error.contains("not found"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_timeline_event_creates_event_from_assertion_ref() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        let repo = AssertionRepository::new(storage.clone());
+        let assertion = Assertion {
+            base: BaseFields::new(
+                RecordId::new_v4(TableName::Assertion),
+                "default".to_string(),
+                "tester".to_string(),
+            ),
+            subject_text: "Alice".to_string(),
+            predicate_raw: "met".to_string(),
+            predicate_id: None,
+            object_text: Some("Bob".to_string()),
+            object_literal: None,
+            evidence: EvidenceSpan {
+                revision: Link::new(RecordId::new_v4(TableName::DocRevision)),
+                node: None,
+                start: 0,
+                end: 10,
+                quote_hash: "hash".to_string(),
+            },
+            source_event_time: None,
+            observed_at: chrono::Utc::now(),
+            asserted_at: chrono::Utc::now(),
+            assertion_key: "assertion:alice-met-bob".to_string(),
+            resolution_status: ResolutionStatus::Pending,
+            resolution_method: None,
+            resolution_confidence: None,
+            retry_state: AssertionRetryState::default(),
+            subject_entity: None,
+            object_entity: None,
+            confidence: 1.0,
+            subject_entity_type: None,
+            object_entity_type: None,
+            significance: None,
+            lifecycle_tier: "active".to_string(),
+        };
+        let assertion = repo.create(assertion).await.expect("create assertion");
+
+        let ctx = ToolContext::new(
+            storage.clone(),
+            make_test_principal("default", &["write:event", "read:assertion"]),
+        );
+        let handler = AddTimelineEventHandler::new(storage);
+
+        let response = handler
+            .execute(
+                &ctx,
+                json!({
+                    "title": "Alice met Bob",
+                    "assertion_refs": [assertion.base.id.to_string()],
+                    "time_precision": "unknown"
+                }),
+            )
+            .await
+            .expect("response");
+        let decoded: ToolResponse<Event> = serde_json::from_value(response).expect("decode");
+        assert!(decoded.ok);
+        let event = decoded.data.expect("event");
+        assert_eq!(event.assertion_refs.len(), 1);
+        assert_eq!(event.time_precision, TimePrecision::Unknown);
+    }
+
+    #[tokio::test]
+    async fn test_add_timeline_event_rejects_assertion_ref_without_record_clearance() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        let repo = AssertionRepository::new(storage.clone());
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::Assertion),
+            "default".to_string(),
+            "tester".to_string(),
+        );
+        base.security = Security {
+            policy_id: "default".to_string(),
+            level: 5,
+            labels: Vec::new(),
+            handling: Vec::new(),
+        };
+        let assertion = Assertion {
+            base,
+            subject_text: "Alice".to_string(),
+            predicate_raw: "met".to_string(),
+            predicate_id: None,
+            object_text: Some("Bob".to_string()),
+            object_literal: None,
+            evidence: EvidenceSpan {
+                revision: Link::new(RecordId::new_v4(TableName::DocRevision)),
+                node: None,
+                start: 0,
+                end: 10,
+                quote_hash: "hash".to_string(),
+            },
+            source_event_time: None,
+            observed_at: chrono::Utc::now(),
+            asserted_at: chrono::Utc::now(),
+            assertion_key: "assertion:alice-met-bob-secure".to_string(),
+            resolution_status: ResolutionStatus::Pending,
+            resolution_method: None,
+            resolution_confidence: None,
+            retry_state: AssertionRetryState::default(),
+            subject_entity: None,
+            object_entity: None,
+            confidence: 1.0,
+            subject_entity_type: None,
+            object_entity_type: None,
+            significance: None,
+            lifecycle_tier: "active".to_string(),
+        };
+        let assertion = repo.create(assertion).await.expect("create assertion");
+
+        let ctx = ToolContext::new(
+            storage.clone(),
+            Principal {
+                space_id: "default".to_string(),
+                scopes: ["write:event", "read:assertion"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                clearances: vec![Clearance {
+                    policy_id: "default".to_string(),
+                    max_level: 0,
+                    labels: HashSet::new(),
+                    handling_allow: HashSet::new(),
+                }],
+                subject_allowlist: None,
+                purpose: HashSet::new(),
+            },
+        );
+        let handler = AddTimelineEventHandler::new(storage);
+
+        let response = handler
+            .execute(
+                &ctx,
+                json!({
+                    "title": "Alice met Bob",
+                    "assertion_refs": [assertion.base.id.to_string()],
+                }),
+            )
+            .await
+            .expect("response");
+        let decoded: ToolResponse<()> = serde_json::from_value(response).expect("decode");
+        assert!(!decoded.ok);
+        assert!(decoded.error.unwrap_or_default().contains("Access denied"));
+    }
+}

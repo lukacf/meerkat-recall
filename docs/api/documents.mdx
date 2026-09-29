@@ -1,0 +1,384 @@
+---
+title: "Documents"
+description: "Ingest, search, and manage documents in the Elephant knowledge pipeline."
+icon: "file-lines"
+---
+
+## Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/v1/docs/search` | Search documents (text + vector) |
+| POST | `/v1/docs/ingest` | Ingest a new document |
+| POST | `/v1/docs/batch` | Batch create/update documents |
+| GET | `/v1/docs/collections` | List distinct collections |
+| GET | `/v1/docs/{id}` | Get document by ID |
+| PUT | `/v1/docs/{id}` | Update document |
+| DELETE | `/v1/docs/{id}` | Soft delete document |
+| POST | `/v1/docs/{id}/restore` | Restore soft-deleted document |
+| GET | `/v1/docs/{id}/chunks` | Get document chunks (structural nodes) |
+| GET | `/v1/docs/{id}/pipeline-status` | Get document pipeline status |
+
+---
+
+## Search Documents
+
+`POST /v1/docs/search`
+
+Search documents using text matching or vector similarity. When a `query` is provided with `k`, the endpoint performs semantic vector search against document chunk embeddings.
+
+<ParamField body="query" type="string">
+  Free-text search query. Used for both keyword and vector similarity search.
+</ParamField>
+
+<ParamField body="k" type="integer">
+  Number of top-k similarity results for vector search. When set, enables semantic search mode.
+</ParamField>
+
+<ParamField body="include_deleted" type="boolean" default="false">
+  Include soft-deleted documents in results.
+</ParamField>
+
+<ParamField body="limit" type="integer" default="50">
+  Maximum results to return.
+</ParamField>
+
+<ParamField body="cursor" type="string">
+  Pagination cursor from a previous response.
+</ParamField>
+
+<CodeGroup>
+```bash Keyword Search
+curl -X POST http://localhost:3000/v1/docs/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "incident report", "limit": 10}'
+```
+
+```bash Vector Search
+curl -X POST http://localhost:3000/v1/docs/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "suspicious network activity", "k": 5}'
+```
+
+```json Response
+{
+  "results": [
+    {
+      "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6",
+      "space_id": "default",
+      "title": "Incident Report Q1",
+      "text": "Observed suspicious domain...",
+      "rendition_key": "abc123",
+      "created_at": "2026-01-20T09:00:00Z"
+    }
+  ],
+  "cursor": null,
+  "has_more": false,
+  "total": 1
+}
+```
+</CodeGroup>
+
+---
+
+## Ingest Document
+
+`POST /v1/docs/ingest`
+
+Ingest a new document into the processing pipeline. Elephant stages a source-backed document and enqueues source-first work so the pipeline can triage, render, chunk, embed, and extract knowledge from it.
+
+<ParamField body="title" type="string" required>
+  Document title.
+</ParamField>
+
+<ParamField body="text" type="string">
+  Document text content or sidecar text for media-backed ingest. Required unless `media` is present.
+</ParamField>
+
+<ParamField body="media" type="object[]">
+  Optional typed image/video inputs. Each item must include `kind`, `media_type`, and exactly one of `inline_base64`, `path`, or `uri`.
+</ParamField>
+
+<ParamField body="metadata" type="object">
+  Arbitrary metadata (e.g., `{"collection": "notes", "tags": ["security"]}`).
+</ParamField>
+
+<ParamField body="collection" type="string">
+  Optional collection override for organizing documents.
+</ParamField>
+
+<ParamField body="rendition_key" type="string">
+  Optional explicit rendition key for idempotent ingest.
+</ParamField>
+
+<ParamField body="sync" type="boolean" default="false">
+  Must be omitted or false. `true` is rejected; use the asynchronous work item flow.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X POST http://localhost:3000/v1/docs/ingest \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Meeting Notes",
+    "text": "Alice met Bob on 2026-02-02 to discuss Project Elephant.",
+    "collection": "meeting-notes"
+  }'
+```
+
+```json Response (201)
+{
+  "doc_id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "source_id": "source:550e8400-e29b-41d4-a716-446655440000",
+  "lifecycle_status": "discovered",
+  "current_ingest_mode": null,
+  "work_item_id": "work_item:1f47da04-fb31-4e49-bbec-c0cd7fb08c9f",
+  "enqueued": true
+}
+```
+</CodeGroup>
+
+---
+
+## Batch Documents
+
+`POST /v1/docs/batch`
+
+Create or update multiple documents in a single request. Each document is staged into the source-first pipeline for triage, rendering, chunking, embedding, and extraction.
+
+<ParamField body="items" type="object[]" required>
+  Array of normalized document ingest inputs. Each item uses the same public fields as `POST /v1/docs/ingest`.
+</ParamField>
+
+<ParamField body="atomic" type="boolean" default="false">
+  Accepted by the shared request schema but not implemented as a transaction. Items can succeed or fail independently; do not rely on rollback.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X POST http://localhost:3000/v1/docs/batch \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": [
+      {"title": "Doc A", "text": "Content of document A."},
+      {
+        "title": "Frame B",
+        "text": "Observed terminal window",
+        "media": [
+          {"kind": "image", "media_type": "image/jpeg", "uri": "https://example.com/frame-b.jpg"}
+        ]
+      }
+    ]
+  }'
+```
+
+```json Response
+{
+  "succeeded": [
+    {"id": "doc:aaa...", "title": "Doc A", "source": "source:aaa..."},
+    {"id": "doc:bbb...", "title": "Doc B", "source": "source:bbb..."}
+  ],
+  "failed": []
+}
+```
+</CodeGroup>
+
+---
+
+## Get Collections
+
+`GET /v1/docs/collections`
+
+Returns a list of distinct document collection names within the caller's space.
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/docs/collections \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+["meeting-notes", "incident-reports", "research"]
+```
+</CodeGroup>
+
+---
+
+## Get Document
+
+`GET /v1/docs/{id}`
+
+Retrieve a single document by its ID.
+
+<ParamField path="id" type="string" required>
+  Document record ID (e.g., `doc:3fa85f64-...`).
+</ParamField>
+
+<ParamField query="include_deleted" type="boolean" default="false">
+  If true, return even if the document was soft-deleted.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "space_id": "default",
+  "title": "Meeting Notes",
+  "text": "Alice met Bob on 2026-02-02...",
+  "rendition_key": "f8a9b2c1",
+  "created_at": "2026-02-02T15:00:00Z",
+  "updated_at": "2026-02-02T15:00:00Z"
+}
+```
+</CodeGroup>
+
+---
+
+## Update Document
+
+`PUT /v1/docs/{id}`
+
+Replace a document's fields. The document must exist and the caller must have write authorization.
+
+<ParamField path="id" type="string" required>
+  Document record ID.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X PUT http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6 \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Meeting Notes (Updated)",
+    "text": "Alice met Bob and Carol on 2026-02-02."
+  }'
+```
+</CodeGroup>
+
+---
+
+## Delete Document
+
+`DELETE /v1/docs/{id}`
+
+<Warning>
+  Soft deletes the document. The record remains in the database with a `deleted_at` timestamp. Use the restore endpoint to undo.
+</Warning>
+
+Returns `204 No Content` on success.
+
+<ParamField path="id" type="string" required>
+  Document record ID.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X DELETE http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6 \
+  -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+---
+
+## Restore Document
+
+`POST /v1/docs/{id}/restore`
+
+Restore a soft-deleted document.
+
+<ParamField path="id" type="string" required>
+  Document record ID.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X POST http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6/restore \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "title": "Meeting Notes",
+  "deleted_at": null
+}
+```
+</CodeGroup>
+
+---
+
+## Get Document Chunks
+
+`GET /v1/docs/{id}/chunks`
+
+Returns the structural nodes (chunks) for a document. Chunks are created by the pipeline during the rendering and chunking phase.
+
+<ParamField path="id" type="string" required>
+  Document record ID.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6/chunks \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+[
+  {
+    "id": "doc_node:1c0d6c6f-...",
+    "revision_id": "doc_revision:aaa...",
+    "content": "Alice met Bob on 2026-02-02...",
+    "node_type": "paragraph",
+    "position": 0
+  }
+]
+```
+</CodeGroup>
+
+---
+
+## Get Document Pipeline Status
+
+`GET /v1/docs/{id}/pipeline-status`
+
+Returns the processing status of a document across the active document pipeline: rendering, doc-tree construction, embedding, extraction, and staged artifact validation/commit.
+
+<ParamField path="id" type="string" required>
+  Document record ID.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6/pipeline-status \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "doc_id": "doc:3fa85f64-...",
+  "chunks": {
+    "total": 5,
+    "embedded": 5,
+    "pending": 0,
+    "status": "complete"
+  },
+  "extraction_state": "complete",
+  "assertions_count": 12,
+  "work_items": {
+    "render": "done",
+    "extract": "done"
+  }
+}
+```
+</CodeGroup>

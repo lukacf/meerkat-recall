@@ -1,0 +1,443 @@
+---
+title: "MCP Workflows"
+description: "Step-by-step guides for common Elephant MCP workflows"
+icon: "route"
+---
+
+# MCP Workflows
+
+This page walks through four canonical workflows that demonstrate how to chain MCP tools together effectively. Each workflow shows the exact JSON payloads you would send as tool calls.
+
+---
+
+## 1. Read Workflow
+
+**Goal:** Find an entity, explore its relationships, and get full context.
+
+This is the most common workflow for LLMs that need to answer questions about the knowledge graph.
+
+<Steps>
+
+### Search for the entity
+
+Start broad with `search_all` to find entities matching your query. This searches across entities, documents, sources, and relationships simultaneously.
+
+```json
+{
+  "tool": "search_all",
+  "input": {
+    "query": "Alex Chen",
+    "limit": 5,
+    "include": ["entities"]
+  }
+}
+```
+
+The response includes an `entities` bucket with matching results. Identify the entity ID from the results.
+
+### Get the entity details
+
+Once you have the entity ID, fetch it directly.
+
+```json
+{
+  "tool": "get_entity",
+  "input": {
+    "id": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479"
+  }
+}
+```
+
+This returns the entity's type, display name, summary, and metadata.
+
+### Get the full context bundle
+
+For a comprehensive view including relationships and statistics, use the context bundle.
+
+```json
+{
+  "tool": "get_entity_context_bundle",
+  "input": {
+    "id": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "window": 30,
+    "limit": 10
+  }
+}
+```
+
+The context bundle returns:
+- The entity itself
+- Outgoing relationships (e.g., "Alex Chen works_at Acme Corp")
+- Incoming relationships (e.g., "NeuralFlow founded_by Alex Chen")
+- Statistics (total relationship count)
+
+### Drill into related entities
+
+Follow relationship targets to explore the graph further.
+
+```json
+{
+  "tool": "get_entity_with_relations",
+  "input": {
+    "id": "entity:550e8400-e29b-41d4-a716-446655440001"
+  }
+}
+```
+
+### Check timeline events
+
+See what events involve this entity.
+
+```json
+{
+  "tool": "search_events",
+  "input": {
+    "entity_ids": ["entity:f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    "limit": 10
+  }
+}
+```
+
+</Steps>
+
+<Note>
+The read workflow uses only Agent-profile tools, so it works with any profile (Default, Agent, Maintenance, or Full).
+</Note>
+
+---
+
+## 2. Write Workflow
+
+**Goal:** Create entities, establish relationships, and ingest supporting documents.
+
+This workflow requires the Full profile since it involves entity creation and relationship writes.
+
+<Steps>
+
+### Create entities
+
+Create the entities that will form the nodes of your knowledge subgraph.
+
+```json
+{
+  "tool": "create_entity_simple",
+  "input": {
+    "entity_type": "person",
+    "display_name": "Alex Chen",
+    "summary": "Founder and CEO of NeuralFlow"
+  }
+}
+```
+
+Save the returned entity ID (e.g., `entity:aaa-111`).
+
+```json
+{
+  "tool": "create_entity_simple",
+  "input": {
+    "entity_type": "org",
+    "display_name": "NeuralFlow",
+    "summary": "AI research company focused on neural architecture search"
+  }
+}
+```
+
+Save this entity ID too (e.g., `entity:bbb-222`).
+
+### Create relationships
+
+Link the entities together with typed relationships.
+
+```json
+{
+  "tool": "relate_entities",
+  "input": {
+    "from_id": "entity:aaa-111",
+    "to_id": "entity:bbb-222",
+    "rel_type": "founded",
+    "weight": 0.95,
+    "evidence_text": "Alex Chen founded NeuralFlow in 2024.",
+    "evidence_source": "doc:ccc-333"
+  }
+}
+```
+
+For batch creation of multiple relationships:
+
+```json
+{
+  "tool": "batch_relationships",
+  "input": {
+    "items": [
+      { "from_id": "entity:aaa-111", "to_id": "entity:bbb-222", "rel_type": "founded", "weight": 0.95 },
+      { "from_id": "entity:aaa-111", "to_id": "entity:bbb-222", "rel_type": "ceo_of", "weight": 0.9 }
+    ]
+  }
+}
+```
+
+### Ingest a supporting document
+
+Ingest a document that provides evidence for the relationships. The pipeline will automatically extract additional assertions.
+
+```json
+{
+  "tool": "ingest_doc_simple",
+  "input": {
+    "title": "NeuralFlow Company Profile",
+    "text": "NeuralFlow was founded in 2024 by Alex Chen, a former researcher at DeepMind. The company focuses on neural architecture search and has raised $50M in Series A funding.",
+    "collection": "company_profiles"
+  }
+}
+```
+
+### Verify pipeline processing
+
+Check that the document is being processed through the extraction pipeline.
+
+```json
+{
+  "tool": "get_doc_pipeline_status",
+  "input": {
+    "id": "doc:ddd-444"
+  }
+}
+```
+
+</Steps>
+
+---
+
+## 3. Identity Workflow
+
+**Goal:** Find duplicate entities, propose them as merge candidates, and merge them.
+
+This workflow requires the Maintenance profile at minimum.
+
+<Steps>
+
+### Search for potential duplicates
+
+Search for entities that might be duplicates. Look for similar names, types, or attributes.
+
+```json
+{
+  "tool": "search_entities",
+  "input": {
+    "query": "Alex Chen",
+    "filters": { "entity_type": "person" },
+    "limit": 20
+  }
+}
+```
+
+Review the results. If you find two entities that appear to be the same person (e.g., "Alex Chen" and "A. Chen"), proceed to propose a merge.
+
+### Get context for both candidates
+
+Before proposing a merge, inspect both entities to confirm they are duplicates.
+
+```json
+{
+  "tool": "get_entity_context_bundle",
+  "input": {
+    "id": "entity:aaa-111",
+    "limit": 10
+  }
+}
+```
+
+```json
+{
+  "tool": "get_entity_context_bundle",
+  "input": {
+    "id": "entity:bbb-222",
+    "limit": 10
+  }
+}
+```
+
+Compare their relationships, metadata, and summaries.
+
+### Propose the identity candidate
+
+Submit a merge proposal with your confidence score and evidence.
+
+```json
+{
+  "tool": "propose_identity_candidate",
+  "input": {
+    "candidate": {
+      "entity_a": "entity:aaa-111",
+      "entity_b": "entity:bbb-222",
+      "confidence": 0.92,
+      "evidence": "Same person: matching name 'Alex Chen', both associated with NeuralFlow, overlapping relationship graph",
+      "signal_type": "manual_review"
+    }
+  }
+}
+```
+
+### Review pending candidates
+
+List all pending merge candidates to review the queue.
+
+```json
+{
+  "tool": "list_identity_candidates",
+  "input": {
+    "filters": { "status": "pending", "min_confidence": 0.85 },
+    "limit": 20
+  }
+}
+```
+
+### Merge the entities
+
+Once confirmed, merge the two entities. The merge strategy determines which entity survives.
+
+```json
+{
+  "tool": "merge_entities",
+  "input": {
+    "entity_a": "entity:aaa-111",
+    "entity_b": "entity:bbb-222",
+    "strategy": "prefer_newer"
+  }
+}
+```
+
+The response includes:
+- `survivor`: the entity that absorbed the other
+- `merged_id`: the entity that was soft-deleted
+- `relations_updated`: how many relationships were repointed to the survivor
+
+### Verify the merge
+
+Confirm the survivor entity has the combined relationships.
+
+```json
+{
+  "tool": "get_entity_with_relations",
+  "input": {
+    "id": "entity:aaa-111"
+  }
+}
+```
+
+</Steps>
+
+---
+
+## 4. Predicate Governance Workflow
+
+**Goal:** Register new predicates, propose aliases, and approve them through the governance pipeline.
+
+This workflow ensures consistent predicate naming across the knowledge graph. It requires the Maintenance profile at minimum.
+
+<Steps>
+
+### Check existing predicates
+
+Before registering a new predicate, check what already exists to avoid duplicates.
+
+```json
+{
+  "tool": "list_predicates",
+  "input": {
+    "status": "active",
+    "include_aliases": true,
+    "limit": 100
+  }
+}
+```
+
+### Register a new predicate
+
+If the predicate does not exist, register it with a clear semantic description.
+
+```json
+{
+  "tool": "register_predicate",
+  "input": {
+    "predicate_id": "works_at",
+    "description": "Subject works for or is employed by object"
+  }
+}
+```
+
+### Propose an alias
+
+Extraction LLMs may use different phrasings for the same predicate. Propose an alias to map them.
+
+```json
+{
+  "tool": "propose_predicate_alias",
+  "input": {
+    "alias_name": "employed_by",
+    "canonical_predicate_id": "works_at",
+    "confidence": 0.9
+  }
+}
+```
+
+This creates a work artifact (proposal) that needs validation and approval.
+
+### Validate the proposal
+
+Check that the proposal is well-formed and does not conflict with existing predicates.
+
+```json
+{
+  "tool": "validate_predicate_proposal",
+  "input": {
+    "proposal_id": "work_artifact:eee-555"
+  }
+}
+```
+
+### Approve the proposal
+
+If validation passes, approve the alias to make it active. Future extractions using "employed_by" will be normalized to "works_at".
+
+```json
+{
+  "tool": "approve_predicate_proposal",
+  "input": {
+    "proposal_id": "work_artifact:eee-555",
+    "confidence": 0.95
+  }
+}
+```
+
+### Verify the alias is active
+
+Confirm the alias appears in the predicate's alias list.
+
+```json
+{
+  "tool": "get_predicate",
+  "input": {
+    "predicate_id": "works_at",
+    "include_aliases": true
+  }
+}
+```
+
+The response should now include `employed_by` in the alias mappings.
+
+</Steps>
+
+---
+
+## Tips for Chaining Tools
+
+**Start broad, then narrow down.** Use `search_all` first, then drill into specific entities or documents with `get_entity` or `get_doc`.
+
+**Use context bundles for rich views.** `get_entity_context_bundle` returns more information than `get_entity` alone -- including relationships and statistics.
+
+**Check pipeline status after ingestion.** After calling `ingest_doc` or `ingest_doc_simple`, use `get_doc_pipeline_status` to monitor extraction progress.
+
+**Use batch tools for bulk operations.** `batch_entities`, `batch_relationships`, and `batch_ingest_docs` are significantly more efficient than calling individual tools in a loop.
+
+**Respect profile boundaries.** If you are operating as an Agent profile, stick to read-only tools. Attempting to call a write tool will result in a "tool not found" error.

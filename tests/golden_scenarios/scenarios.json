@@ -1,0 +1,820 @@
+{
+  "scenarios": [
+    {
+      "id": "gs01_celestial_briefing",
+      "name": "Triangulated Briefing Bootstrap",
+      "complexity": 1,
+      "query": "triangulated incident bootstrap",
+      "min_assertions": 8,
+      "min_events": 2,
+      "ingestions": [
+        {
+          "dataset": "nasa_apod",
+          "note": "Bootstrap memo A (2026-03-03T08:30:00Z): triangulated incident bootstrap opened; Alex Rivera listed as A. Rivera in attendee feed; briefing target set to 09:10Z."
+        },
+        {
+          "dataset": "usgs_all_day",
+          "note": "Bootstrap memo B (2026-03-03T08:42:00Z): same bootstrap thread claims the same briefing actually started at 08:40Z and references Rivera without first name."
+        },
+        {
+          "dataset": "weather_ca",
+          "note": "Bootstrap memo C (2026-03-03T08:55:00Z): weather bulletin reopens timeline and partially reverses memo B; urgent items remain but ownership is reassigned to Morgan Lee."
+        }
+      ]
+    },
+    {
+      "id": "gs02_regulatory_flash",
+      "name": "Regulatory Alias Flashpoint",
+      "complexity": 2,
+      "query": "regulatory alias flashpoint",
+      "min_assertions": 10,
+      "min_events": 2,
+      "ingestions": [
+        {
+          "dataset": "sec_press_releases",
+          "note": "Flashpoint v1 (2026-03-04T13:00:00Z): regulatory alias flashpoint opened; compliance owner recorded as Priya Shah and as P. Shah in parallel tracker."
+        },
+        {
+          "dataset": "federal_register_latest",
+          "note": "Flashpoint v2 (2026-03-04T13:25:00Z): policy stream supersedes v1 sequencing and shifts deadline earlier by one hour while retaining same action IDs."
+        },
+        {
+          "dataset": "bls_latest_rss",
+          "note": "Flashpoint v3 (2026-03-04T13:50:00Z): labor signal contradicts prioritization; now marks previously urgent item as informational and introduces an exception path."
+        }
+      ]
+    },
+    {
+      "id": "gs03_seismic_weather_pair",
+      "name": "Seismic-Weather Split-Brain",
+      "complexity": 3,
+      "query": "split-brain incident corridor",
+      "min_assertions": 12,
+      "min_events": 3,
+      "ingestions": [
+        {
+          "dataset": "usgs_all_day",
+          "note": "Split-brain feed 1 (2026-03-05T06:20:00Z): corridor alert created with quake-cluster-alpha as primary trigger."
+        },
+        {
+          "dataset": "weather_ca",
+          "note": "Split-brain feed 2 (2026-03-05T06:28:00Z): same corridor now claims weather-alert-9 is primary and quake cluster is secondary."
+        },
+        {
+          "dataset": "open_meteo_sf",
+          "note": "Split-brain feed 3 (2026-03-05T06:36:00Z): forecast rollup introduces intermediate decision state 'defer-and-stage' not present in feeds 1-2."
+        },
+        {
+          "dataset": "weather_fl",
+          "note": "Split-brain feed 4 (2026-03-05T06:52:00Z): remote region alert links to same incident code but inverted severity band, forcing dual-track handling."
+        }
+      ]
+    },
+    {
+      "id": "gs04_forecast_conflict_wave",
+      "name": "Forecast Conflict Wave With Rollbacks",
+      "complexity": 4,
+      "query": "forecast rollback wave",
+      "min_assertions": 14,
+      "min_events": 3,
+      "ingestions": [
+        {
+          "dataset": "open_meteo_sf",
+          "note": "Rollback wave A (2026-03-06T08:00:00Z): shift-A outdoor approval issued for full window."
+        },
+        {
+          "dataset": "weather_ca",
+          "note": "Rollback wave B (2026-03-06T08:17:00Z): emergency bulletin cancels shift-A and starts indoor protocol."
+        },
+        {
+          "dataset": "open_meteo_sf",
+          "note": "Rollback wave C (2026-03-06T08:41:00Z): partial restore to hybrid protocol with same incident ID but new operating band."
+        },
+        {
+          "dataset": "weather_ca",
+          "note": "Rollback wave D (2026-03-06T09:05:00Z): second bulletin reverts to strict indoor, superseding C while keeping C as fallback branch."
+        }
+      ]
+    },
+    {
+      "id": "gs05_tech_signal_triangle",
+      "name": "Tech Signal Triangle With Recursive Corrections",
+      "complexity": 5,
+      "query": "recursive release correction",
+      "min_assertions": 16,
+      "min_events": 4,
+      "ingestions": [
+        {
+          "dataset": "github_events",
+          "note": "Triangle note 1 (2026-03-07T12:00:00Z): recursive release correction opened on repo churn spike."
+        },
+        {
+          "dataset": "hn_ai_stories",
+          "note": "Triangle note 2 (2026-03-07T12:11:00Z): external narrative says churn is expected and non-blocking."
+        },
+        {
+          "dataset": "stackoverflow_activity",
+          "note": "Triangle note 3 (2026-03-07T12:24:00Z): support load suggests churn is blocking onboarding despite note 2."
+        },
+        {
+          "dataset": "github_events",
+          "note": "Triangle note 4 (2026-03-07T12:36:00Z): duplicate commit stream repeats event IDs with altered actor handles; marks two earlier conclusions as stale."
+        },
+        {
+          "dataset": "hn_ai_stories",
+          "note": "Triangle note 5 (2026-03-07T12:49:00Z): summary feed references same launch under codename Orion, introducing alias collision."
+        }
+      ]
+    },
+    {
+      "id": "gs06_research_claim_chain",
+      "name": "Research Claim Chain With Counterfactual Branch",
+      "complexity": 6,
+      "query": "counterfactual replication branch",
+      "min_assertions": 18,
+      "min_events": 4,
+      "ingestions": [
+        {
+          "dataset": "openalex_ml",
+          "note": "Chain node A (2026-03-08T09:00:00Z): replication workshop plan anchored to citation cluster set alpha."
+        },
+        {
+          "dataset": "crossref_climate",
+          "note": "Chain node B (2026-03-08T09:16:00Z): climate cluster added and causes criterion drift in scoring rubric."
+        },
+        {
+          "dataset": "arxiv_ml",
+          "note": "Chain node C (2026-03-08T09:31:00Z): preprint claims invalidate two assumptions in A while strengthening one in B."
+        },
+        {
+          "dataset": "openalex_ml",
+          "note": "Chain node D (2026-03-08T09:44:00Z): second retrieval reintroduces paper aliases with abbreviated author names, stressing dedup."
+        },
+        {
+          "dataset": "crossref_climate",
+          "note": "Chain node E (2026-03-08T09:58:00Z): introduces counterfactual branch 'if policy lag exceeds 30d' with different action priorities."
+        }
+      ]
+    },
+    {
+      "id": "gs07_market_feedback_loop",
+      "name": "Market Feedback Loop With Identity Drift",
+      "complexity": 7,
+      "query": "identity drift market loop",
+      "min_assertions": 20,
+      "min_events": 5,
+      "ingestions": [
+        {
+          "dataset": "coingecko_top",
+          "note": "Loop signal 1 (2026-03-09T07:00:00Z): volatility triggers war-room mode for identity drift market loop."
+        },
+        {
+          "dataset": "github_events",
+          "note": "Loop signal 2 (2026-03-09T07:10:00Z): delivery trend claims volatility narrative is overstated."
+        },
+        {
+          "dataset": "hn_ai_stories",
+          "note": "Loop signal 3 (2026-03-09T07:21:00Z): external reporting supports signal 1 and conflicts with signal 2."
+        },
+        {
+          "dataset": "stackoverflow_activity",
+          "note": "Loop signal 4 (2026-03-09T07:33:00Z): support demand spikes under both narratives, creating ambiguous causality."
+        },
+        {
+          "dataset": "coingecko_top",
+          "note": "Loop signal 5 (2026-03-09T07:47:00Z): second market snapshot renames two assets and keeps same ranks, testing alias merges."
+        },
+        {
+          "dataset": "github_events",
+          "note": "Loop signal 6 (2026-03-09T08:02:00Z): repeated repositories appear with actor handle variants and timestamp jitter."
+        }
+      ]
+    },
+    {
+      "id": "gs08_recall_compliance_chain",
+      "name": "Recall Compliance Chain With Interleaved Severity",
+      "complexity": 8,
+      "query": "interleaved recall severity",
+      "min_assertions": 22,
+      "min_events": 5,
+      "ingestions": [
+        {
+          "dataset": "fda_drug_enforcement",
+          "note": "Recall chain 1 (2026-03-10T08:30:00Z): response meeting opened for drug recalls and severity set to high."
+        },
+        {
+          "dataset": "nhtsa_tesla_recalls",
+          "note": "Recall chain 2 (2026-03-10T08:44:00Z): automotive recalls merged into same queue with medium severity override."
+        },
+        {
+          "dataset": "fda_device_enforcement",
+          "note": "Recall chain 3 (2026-03-10T09:01:00Z): device recalls mark three items critical and supersede severity mapping in chain 2."
+        },
+        {
+          "dataset": "sec_press_releases",
+          "note": "Recall chain 4 (2026-03-10T09:18:00Z): disclosure timing collides with recall triage deadlines."
+        },
+        {
+          "dataset": "fda_drug_enforcement",
+          "note": "Recall chain 5 (2026-03-10T09:31:00Z): duplicate recall IDs reappear with alternate firm spellings."
+        },
+        {
+          "dataset": "nhtsa_tesla_recalls",
+          "note": "Recall chain 6 (2026-03-10T09:46:00Z): vehicle campaign numbers overlap with previously closed tickets, reopening two threads."
+        }
+      ]
+    },
+    {
+      "id": "gs09_macro_fx_link",
+      "name": "Macro-FX Link With Temporal Reindex",
+      "complexity": 9,
+      "query": "temporal reindex planning loop",
+      "min_assertions": 24,
+      "min_events": 6,
+      "ingestions": [
+        {
+          "dataset": "worldbank_us_pop",
+          "note": "Macro link A (2026-03-11T09:00:00Z): baseline population profile loaded for temporal reindex planning loop."
+        },
+        {
+          "dataset": "worldbank_in_gdp",
+          "note": "Macro link B (2026-03-11T09:12:00Z): GDP trend modifies baseline assumptions and introduces lag window."
+        },
+        {
+          "dataset": "ecb_daily",
+          "note": "Macro link C (2026-03-11T09:25:00Z): FX rates invert two earlier risk rankings."
+        },
+        {
+          "dataset": "coingecko_top",
+          "note": "Macro link D (2026-03-11T09:40:00Z): crypto market snapshot amplifies currency sensitivity and creates duplicate symbol ambiguity."
+        },
+        {
+          "dataset": "worldbank_in_gdp",
+          "note": "Macro link E (2026-03-11T09:56:00Z): second GDP ingest reissues values with null gaps; previous interpolation is now contested."
+        },
+        {
+          "dataset": "ecb_daily",
+          "note": "Macro link F (2026-03-11T10:08:00Z): same date feed re-read to test idempotence and evidence duplication handling."
+        },
+        {
+          "dataset": "sec_press_releases",
+          "note": "Macro link G (2026-03-11T10:22:00Z): enforcement bulletin introduces compliance branch with tighter cutoff."
+        }
+      ]
+    },
+    {
+      "id": "gs10_regulation_labor_blend",
+      "name": "Regulation-Labor Blend With Forked Agendas",
+      "complexity": 10,
+      "query": "forked policy agenda",
+      "min_assertions": 26,
+      "min_events": 6,
+      "ingestions": [
+        {
+          "dataset": "federal_register_latest",
+          "note": "Blend track 1 (2026-03-12T08:00:00Z): forked policy agenda starts from fresh register entries."
+        },
+        {
+          "dataset": "bls_latest_rss",
+          "note": "Blend track 2 (2026-03-12T08:13:00Z): labor feed disputes priority ordering from track 1."
+        },
+        {
+          "dataset": "sec_press_releases",
+          "note": "Blend track 3 (2026-03-12T08:27:00Z): legal deadlines force compressed decision window."
+        },
+        {
+          "dataset": "un_rss",
+          "note": "Blend track 4 (2026-03-12T08:41:00Z): international context adds competing obligations."
+        },
+        {
+          "dataset": "federal_register_latest",
+          "note": "Blend track 5 (2026-03-12T08:55:00Z): re-fetch introduces revised wording for one rule; old and new titles both remain referenced."
+        },
+        {
+          "dataset": "bls_latest_rss",
+          "note": "Blend track 6 (2026-03-12T09:08:00Z): indicator revision changes trend direction and invalidates one scenario branch."
+        },
+        {
+          "dataset": "sec_press_releases",
+          "note": "Blend track 7 (2026-03-12T09:22:00Z): enforcement sequence re-ordered, creating timeline inversion with track 3."
+        }
+      ]
+    },
+    {
+      "id": "gs11_space_ops_timeline",
+      "name": "Space Ops Timeline With Mixed-Cadence Signals",
+      "complexity": 11,
+      "query": "mixed cadence launch council",
+      "min_assertions": 28,
+      "min_events": 7,
+      "ingestions": [
+        {
+          "dataset": "spacex_launches",
+          "note": "Launch council 1 (2026-03-13T06:00:00Z): mixed cadence launch council opened from mission outcomes."
+        },
+        {
+          "dataset": "nasa_news_feed",
+          "note": "Launch council 2 (2026-03-13T06:11:00Z): NASA release stream adds dependency chain not present in council 1."
+        },
+        {
+          "dataset": "nasa_apod",
+          "note": "Launch council 3 (2026-03-13T06:23:00Z): public narrative introduces alternate mission alias."
+        },
+        {
+          "dataset": "open_meteo_nyc",
+          "note": "Launch council 4 (2026-03-13T06:35:00Z): weather assumptions conflict with nominal launch corridor."
+        },
+        {
+          "dataset": "weather_ca",
+          "note": "Launch council 5 (2026-03-13T06:49:00Z): separate alert stream escalates resource contention."
+        },
+        {
+          "dataset": "usgs_all_week",
+          "note": "Launch council 6 (2026-03-13T07:03:00Z): seismic context modifies logistics sequencing."
+        },
+        {
+          "dataset": "nasa_news_feed",
+          "note": "Launch council 7 (2026-03-13T07:18:00Z): follow-up release corrects prior headline wording while retaining same topic IDs."
+        },
+        {
+          "dataset": "spacex_launches",
+          "note": "Launch council 8 (2026-03-13T07:31:00Z): second mission snapshot adds retroactive detail to one previously sparse event."
+        }
+      ]
+    },
+    {
+      "id": "gs12_global_news_crossfire",
+      "name": "Global News Crossfire With Chronology Rewrites",
+      "complexity": 12,
+      "query": "chronology rewrite desk",
+      "min_assertions": 30,
+      "min_events": 7,
+      "ingestions": [
+        {
+          "dataset": "bbc_world_rss",
+          "note": "Crossfire feed A (2026-03-14T08:00:00Z): chronology rewrite desk initiated with BBC ordering as baseline."
+        },
+        {
+          "dataset": "nytimes_world_rss",
+          "note": "Crossfire feed B (2026-03-14T08:10:00Z): NYT ordering inverts two key timestamps from feed A."
+        },
+        {
+          "dataset": "un_rss",
+          "note": "Crossfire feed C (2026-03-14T08:22:00Z): UN notes partially support both A and B and adds third sequence branch."
+        },
+        {
+          "dataset": "sec_press_releases",
+          "note": "Crossfire feed D (2026-03-14T08:35:00Z): legal timeline intersects all three chronology branches."
+        },
+        {
+          "dataset": "bbc_world_rss",
+          "note": "Crossfire feed E (2026-03-14T08:47:00Z): repeat BBC pull changes one headline actor name spelling."
+        },
+        {
+          "dataset": "nytimes_world_rss",
+          "note": "Crossfire feed F (2026-03-14T08:58:00Z): repeat NYT pull adds follow-up that supersedes B in one sub-thread."
+        },
+        {
+          "dataset": "federal_register_latest",
+          "note": "Crossfire feed G (2026-03-14T09:11:00Z): regulatory update introduces compliance cutoff that prunes one chronology branch."
+        },
+        {
+          "dataset": "bls_latest_rss",
+          "note": "Crossfire feed H (2026-03-14T09:24:00Z): labor update reopens previously pruned branch under exception clause."
+        }
+      ]
+    },
+    {
+      "id": "gs13_urban_incident_overlay",
+      "name": "Urban Incident Overlay With Jurisdiction Drift",
+      "complexity": 13,
+      "query": "jurisdiction drift overlay",
+      "min_assertions": 32,
+      "min_events": 8,
+      "ingestions": [
+        {
+          "dataset": "nyc_311",
+          "note": "Overlay 1 (2026-03-15T07:00:00Z): jurisdiction drift overlay activated from complaint surge."
+        },
+        {
+          "dataset": "weather_fl",
+          "note": "Overlay 2 (2026-03-15T07:09:00Z): external weather stream introduces out-of-region dependency claims."
+        },
+        {
+          "dataset": "usgs_all_day",
+          "note": "Overlay 3 (2026-03-15T07:21:00Z): seismic feed tags same incident family with alternative region code."
+        },
+        {
+          "dataset": "federal_register_latest",
+          "note": "Overlay 4 (2026-03-15T07:34:00Z): regulatory constraints enforce jurisdiction split."
+        },
+        {
+          "dataset": "sec_press_releases",
+          "note": "Overlay 5 (2026-03-15T07:45:00Z): enforcement notice merges two previously split jurisdictions."
+        },
+        {
+          "dataset": "nyc_311",
+          "note": "Overlay 6 (2026-03-15T07:57:00Z): duplicate complaint clusters appear with near-identical descriptors and shifted timestamps."
+        },
+        {
+          "dataset": "weather_ca",
+          "note": "Overlay 7 (2026-03-15T08:08:00Z): west-coast warning linked to same command code, creating cross-coast collision."
+        },
+        {
+          "dataset": "usgs_all_week",
+          "note": "Overlay 8 (2026-03-15T08:20:00Z): historical quake context supersedes two recent priority tags."
+        },
+        {
+          "dataset": "bls_latest_rss",
+          "note": "Overlay 9 (2026-03-15T08:34:00Z): staffing trend adds capacity constraint that reorders actions again."
+        }
+      ]
+    },
+    {
+      "id": "gs14_dedup_pressure",
+      "name": "Dedup Pressure With Alias Storm",
+      "complexity": 14,
+      "query": "alias storm reconciliation",
+      "min_assertions": 34,
+      "min_events": 8,
+      "ingestions": [
+        {
+          "dataset": "usgs_all_day",
+          "note": "Alias storm A (2026-03-16T08:00:00Z): quake-cluster-alpha opened with canonical naming."
+        },
+        {
+          "dataset": "usgs_all_day",
+          "note": "Alias storm B (2026-03-16T08:04:00Z): same incidents reintroduced under abbreviated place labels."
+        },
+        {
+          "dataset": "usgs_all_week",
+          "note": "Alias storm C (2026-03-16T08:12:00Z): historical feed reframes alpha as part of chain-gamma."
+        },
+        {
+          "dataset": "weather_ca",
+          "note": "Alias storm D (2026-03-16T08:20:00Z): weather bulletin claims causality opposite to chain-gamma framing."
+        },
+        {
+          "dataset": "weather_fl",
+          "note": "Alias storm E (2026-03-16T08:31:00Z): separate stream attaches same codes to distant region."
+        },
+        {
+          "dataset": "usgs_all_day",
+          "note": "Alias storm F (2026-03-16T08:43:00Z): third day-feed pull adds duplicate event IDs with updated magnitude fields."
+        },
+        {
+          "dataset": "weather_ca",
+          "note": "Alias storm G (2026-03-16T08:55:00Z): bulletin correction retracts one alert but keeps same headline text."
+        },
+        {
+          "dataset": "open_meteo_sf",
+          "note": "Alias storm H (2026-03-16T09:08:00Z): forecast trend inserted as tie-breaker signal."
+        },
+        {
+          "dataset": "open_meteo_nyc",
+          "note": "Alias storm I (2026-03-16T09:20:00Z): secondary forecast creates mirrored tie-breaker with opposite direction."
+        }
+      ]
+    },
+    {
+      "id": "gs15_temporal_supersession",
+      "name": "Temporal Supersession With Ping-Pong State",
+      "complexity": 15,
+      "query": "ping-pong supersession board",
+      "min_assertions": 36,
+      "min_events": 9,
+      "ingestions": [
+        {
+          "dataset": "open_meteo_sf",
+          "note": "Supersession ping 1 (2026-03-17T07:00:00Z): board approves outdoor path through 18:00Z."
+        },
+        {
+          "dataset": "weather_ca",
+          "note": "Supersession pong 2 (2026-03-17T07:08:00Z): emergency update revokes outdoor path immediately."
+        },
+        {
+          "dataset": "open_meteo_nyc",
+          "note": "Supersession ping 3 (2026-03-17T07:17:00Z): alternate corridor proposes conditional restore."
+        },
+        {
+          "dataset": "weather_fl",
+          "note": "Supersession pong 4 (2026-03-17T07:26:00Z): remote emergency diverts capacity and cancels conditional restore."
+        },
+        {
+          "dataset": "open_meteo_sf",
+          "note": "Supersession ping 5 (2026-03-17T07:36:00Z): model refresh reinstates hybrid state."
+        },
+        {
+          "dataset": "weather_ca",
+          "note": "Supersession pong 6 (2026-03-17T07:47:00Z): second bulletin returns strict indoor and flags ping 5 as superseded."
+        },
+        {
+          "dataset": "open_meteo_sf",
+          "note": "Supersession ping 7 (2026-03-17T07:58:00Z): final forecast moderates restrictions for late window only."
+        },
+        {
+          "dataset": "weather_ca",
+          "note": "Supersession pong 8 (2026-03-17T08:10:00Z): late-window moderation denied due high-risk segment."
+        },
+        {
+          "dataset": "open_meteo_nyc",
+          "note": "Supersession ping 9 (2026-03-17T08:21:00Z): independent model says risk drops after 20:00Z, reopening closed branch."
+        },
+        {
+          "dataset": "weather_fl",
+          "note": "Supersession pong 10 (2026-03-17T08:33:00Z): external alert consumes reserves and shuts reopened branch."
+        }
+      ]
+    },
+    {
+      "id": "gs16_recall_market_regulatory",
+      "name": "Recall-Market-Regulatory Mesh With Cascading Overrides",
+      "complexity": 16,
+      "query": "cascading override mesh",
+      "min_assertions": 38,
+      "min_events": 9,
+      "ingestions": [
+        {
+          "dataset": "fda_drug_enforcement",
+          "note": "Mesh step 1 (2026-03-18T08:00:00Z): cascade starts from pharmaceutical recall critical set."
+        },
+        {
+          "dataset": "fda_device_enforcement",
+          "note": "Mesh step 2 (2026-03-18T08:09:00Z): device recalls override criticality for two shared vendors."
+        },
+        {
+          "dataset": "nhtsa_tesla_recalls",
+          "note": "Mesh step 3 (2026-03-18T08:20:00Z): transport recalls add cross-sector dependencies with same supplier aliases."
+        },
+        {
+          "dataset": "sec_press_releases",
+          "note": "Mesh step 4 (2026-03-18T08:31:00Z): disclosure obligation shifts ranking toward legal exposure."
+        },
+        {
+          "dataset": "coingecko_top",
+          "note": "Mesh step 5 (2026-03-18T08:43:00Z): market reaction contradicts legal-risk weighting."
+        },
+        {
+          "dataset": "federal_register_latest",
+          "note": "Mesh step 6 (2026-03-18T08:54:00Z): policy update introduces temporary waiver path."
+        },
+        {
+          "dataset": "bls_latest_rss",
+          "note": "Mesh step 7 (2026-03-18T09:05:00Z): staffing signal removes waiver feasibility in one region."
+        },
+        {
+          "dataset": "fda_drug_enforcement",
+          "note": "Mesh step 8 (2026-03-18T09:16:00Z): duplicate recall notices with alternate product wording cause entity drift."
+        },
+        {
+          "dataset": "sec_press_releases",
+          "note": "Mesh step 9 (2026-03-18T09:27:00Z): amended release reorders enforcement timeline."
+        },
+        {
+          "dataset": "coingecko_top",
+          "note": "Mesh step 10 (2026-03-18T09:39:00Z): second market pull partially validates amended timeline."
+        }
+      ]
+    },
+    {
+      "id": "gs17_research_policy_market_spiral",
+      "name": "Research-Policy-Market Spiral With Nested Revisions",
+      "complexity": 17,
+      "query": "nested revision spiral",
+      "min_assertions": 40,
+      "min_events": 10,
+      "ingestions": [
+        {
+          "dataset": "openalex_ml",
+          "note": "Spiral node 1 (2026-03-19T07:00:00Z): strategic draft anchored to citation map v1."
+        },
+        {
+          "dataset": "crossref_climate",
+          "note": "Spiral node 2 (2026-03-19T07:08:00Z): climate corpus inserts policy-lag constraint."
+        },
+        {
+          "dataset": "arxiv_ml",
+          "note": "Spiral node 3 (2026-03-19T07:17:00Z): preprints contradict two assumptions in node 1."
+        },
+        {
+          "dataset": "federal_register_latest",
+          "note": "Spiral node 4 (2026-03-19T07:26:00Z): new rules demand branch split by jurisdiction."
+        },
+        {
+          "dataset": "sec_press_releases",
+          "note": "Spiral node 5 (2026-03-19T07:36:00Z): enforcement path shortens implementation runway."
+        },
+        {
+          "dataset": "coingecko_top",
+          "note": "Spiral node 6 (2026-03-19T07:47:00Z): market shock flips confidence ordering."
+        },
+        {
+          "dataset": "worldbank_in_gdp",
+          "note": "Spiral node 7 (2026-03-19T07:58:00Z): macro trend weakens market-shock interpretation."
+        },
+        {
+          "dataset": "ecb_daily",
+          "note": "Spiral node 8 (2026-03-19T08:09:00Z): FX signal strengthens node 6 again and weakens node 7."
+        },
+        {
+          "dataset": "openalex_ml",
+          "note": "Spiral node 9 (2026-03-19T08:20:00Z): second citation pull introduces author alias variants."
+        },
+        {
+          "dataset": "crossref_climate",
+          "note": "Spiral node 10 (2026-03-19T08:31:00Z): second crossref pull deprecates one previously high-confidence source."
+        },
+        {
+          "dataset": "arxiv_ml",
+          "note": "Spiral node 11 (2026-03-19T08:43:00Z): updated preprint list reasserts contested hypothesis with altered naming."
+        }
+      ]
+    },
+    {
+      "id": "gs18_multi_region_collision",
+      "name": "Multi-Region Collision With Cross-Domain Entanglement",
+      "complexity": 18,
+      "query": "cross-domain collision fusion",
+      "min_assertions": 44,
+      "min_events": 10,
+      "ingestions": [
+        {
+          "dataset": "weather_ca",
+          "note": "Collision feed 1 (2026-03-20T06:00:00Z): west stream establishes base urgency map."
+        },
+        {
+          "dataset": "weather_fl",
+          "note": "Collision feed 2 (2026-03-20T06:07:00Z): east stream introduces conflicting urgency labels for shared code set."
+        },
+        {
+          "dataset": "usgs_all_day",
+          "note": "Collision feed 3 (2026-03-20T06:15:00Z): seismic events linked to both urgency maps with inconsistent precedence."
+        },
+        {
+          "dataset": "usgs_all_week",
+          "note": "Collision feed 4 (2026-03-20T06:24:00Z): historical context supersedes two day-feed assumptions."
+        },
+        {
+          "dataset": "bbc_world_rss",
+          "note": "Collision feed 5 (2026-03-20T06:34:00Z): media timeline reframes causality."
+        },
+        {
+          "dataset": "nytimes_world_rss",
+          "note": "Collision feed 6 (2026-03-20T06:44:00Z): alternate media ordering reverses feed 5 chronology."
+        },
+        {
+          "dataset": "un_rss",
+          "note": "Collision feed 7 (2026-03-20T06:54:00Z): multilateral update partially validates both competing chronologies."
+        },
+        {
+          "dataset": "federal_register_latest",
+          "note": "Collision feed 8 (2026-03-20T07:05:00Z): policy deadline truncates one chronology branch."
+        },
+        {
+          "dataset": "sec_press_releases",
+          "note": "Collision feed 9 (2026-03-20T07:16:00Z): enforcement release restores truncated branch under exception."
+        },
+        {
+          "dataset": "open_meteo_sf",
+          "note": "Collision feed 10 (2026-03-20T07:27:00Z): forecast trend used as deterministic tie-breaker candidate."
+        },
+        {
+          "dataset": "open_meteo_nyc",
+          "note": "Collision feed 11 (2026-03-20T07:38:00Z): mirrored forecast suggests opposite tie-breaker result."
+        },
+        {
+          "dataset": "coingecko_top",
+          "note": "Collision feed 12 (2026-03-20T07:50:00Z): market volatility correlates with both tie-breakers, increasing ambiguity."
+        }
+      ]
+    },
+    {
+      "id": "gs19_high_noise_war_room",
+      "name": "High-Noise War Room With Recursive Backfills",
+      "complexity": 19,
+      "query": "recursive backfill war room",
+      "min_assertions": 48,
+      "min_events": 11,
+      "ingestions": [
+        {
+          "dataset": "github_events",
+          "note": "War room stream 1 (2026-03-21T07:00:00Z): recursive backfill war room initiated on repo activity burst."
+        },
+        {
+          "dataset": "hn_ai_stories",
+          "note": "War room stream 2 (2026-03-21T07:06:00Z): external trend claims opposite direction."
+        },
+        {
+          "dataset": "stackoverflow_activity",
+          "note": "War room stream 3 (2026-03-21T07:13:00Z): support load contradicts stream 2 and partially aligns with stream 1."
+        },
+        {
+          "dataset": "coingecko_top",
+          "note": "War room stream 4 (2026-03-21T07:21:00Z): market view disputes all prior narratives."
+        },
+        {
+          "dataset": "bbc_world_rss",
+          "note": "War room stream 5 (2026-03-21T07:30:00Z): geopolitical context introduces same-name entity collisions."
+        },
+        {
+          "dataset": "nytimes_world_rss",
+          "note": "War room stream 6 (2026-03-21T07:39:00Z): chronology reversed for stream 5 entities."
+        },
+        {
+          "dataset": "un_rss",
+          "note": "War room stream 7 (2026-03-21T07:49:00Z): multilateral update supports both versions in different subregions."
+        },
+        {
+          "dataset": "federal_register_latest",
+          "note": "War room stream 8 (2026-03-21T07:58:00Z): compliance deadline invalidates one subregion interpretation."
+        },
+        {
+          "dataset": "sec_press_releases",
+          "note": "War room stream 9 (2026-03-21T08:08:00Z): enforcement exception reinstates invalidated interpretation."
+        },
+        {
+          "dataset": "github_events",
+          "note": "War room stream 10 (2026-03-21T08:18:00Z): second repo pull replays events with actor alias variants."
+        },
+        {
+          "dataset": "hn_ai_stories",
+          "note": "War room stream 11 (2026-03-21T08:28:00Z): second story pull retracts one headline and amends another."
+        },
+        {
+          "dataset": "stackoverflow_activity",
+          "note": "War room stream 12 (2026-03-21T08:39:00Z): repeated questions now include duplicates with edited titles."
+        },
+        {
+          "dataset": "coingecko_top",
+          "note": "War room stream 13 (2026-03-21T08:50:00Z): second market snapshot inverts two 24h deltas."
+        }
+      ]
+    },
+    {
+      "id": "gs20_max_convolution",
+      "name": "Max Convolution Hypergraph",
+      "complexity": 20,
+      "query": "max convolution hypergraph",
+      "min_assertions": 52,
+      "min_events": 12,
+      "ingestions": [
+        {
+          "dataset": "spacex_launches",
+          "note": "Hypergraph feed 1 (2026-03-22T06:00:00Z): max convolution hypergraph started on launch outcome lattice."
+        },
+        {
+          "dataset": "nasa_news_feed",
+          "note": "Hypergraph feed 2 (2026-03-22T06:06:00Z): NASA feed adds dependency edge set delta-A."
+        },
+        {
+          "dataset": "usgs_all_week",
+          "note": "Hypergraph feed 3 (2026-03-22T06:13:00Z): seismic context reweights logistics edges."
+        },
+        {
+          "dataset": "weather_ca",
+          "note": "Hypergraph feed 4 (2026-03-22T06:21:00Z): weather severity negates one logistics branch from feed 3."
+        },
+        {
+          "dataset": "fda_drug_enforcement",
+          "note": "Hypergraph feed 5 (2026-03-22T06:30:00Z): healthcare recalls inject high-priority entity cluster."
+        },
+        {
+          "dataset": "federal_register_latest",
+          "note": "Hypergraph feed 6 (2026-03-22T06:38:00Z): rule update supersedes two action windows."
+        },
+        {
+          "dataset": "worldbank_in_gdp",
+          "note": "Hypergraph feed 7 (2026-03-22T06:46:00Z): macro trend shifts capacity envelope."
+        },
+        {
+          "dataset": "sec_press_releases",
+          "note": "Hypergraph feed 8 (2026-03-22T06:54:00Z): enforcement path compresses remaining slack."
+        },
+        {
+          "dataset": "coingecko_top",
+          "note": "Hypergraph feed 9 (2026-03-22T07:02:00Z): market shock invalidates two prior confidence weights."
+        },
+        {
+          "dataset": "bbc_world_rss",
+          "note": "Hypergraph feed 10 (2026-03-22T07:11:00Z): media chronology introduces alternate causal ordering."
+        },
+        {
+          "dataset": "nytimes_world_rss",
+          "note": "Hypergraph feed 11 (2026-03-22T07:19:00Z): second chronology inverts feed 10 sequence for shared entities."
+        },
+        {
+          "dataset": "un_rss",
+          "note": "Hypergraph feed 12 (2026-03-22T07:28:00Z): multilateral stream reconciles only a subset of conflicting edges."
+        },
+        {
+          "dataset": "openalex_ml",
+          "note": "Hypergraph feed 13 (2026-03-22T07:37:00Z): research evidence adds explanatory hypothesis branch."
+        },
+        {
+          "dataset": "arxiv_ml",
+          "note": "Hypergraph feed 14 (2026-03-22T07:46:00Z): preprint evidence contests branch from feed 13 with alias-heavy terminology."
+        }
+      ]
+    }
+  ]
+}

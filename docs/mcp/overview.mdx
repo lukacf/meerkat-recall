@@ -1,0 +1,232 @@
+---
+title: "MCP Overview"
+description: "How Elephant exposes its knowledge graph through the Model Context Protocol"
+icon: "plug"
+---
+
+# MCP Overview
+
+Elephant exposes its entire knowledge graph -- entities, relationships, documents, assertions, and more -- through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io). MCP is a standardized interface that lets LLMs and AI agents call structured tools over JSON-RPC, making Elephant a first-class knowledge backend for any MCP-compatible client.
+
+Elephant’s default MCP endpoint is also the primary runtime-control surface. A fresh checkout with no runtime config can start in **bootstrap mode**, where MCP exposes runtime status and initialization/configuration tools before storage and semantic ingest are ready. If you start Elephant with runtime env vars such as `ELEPHANT_DB` or `SURREALDB_URL`, it is already in configured mode and will not expose bootstrap-only initialization tools.
+
+## What MCP provides
+
+Through MCP, callers can:
+
+- **Inspect runtime readiness** and bootstrap/configure Elephant from the default MCP endpoint
+- **Ingest** source-backed text and typed media inputs and trigger the extraction pipeline; file and URL helper capabilities vary by profile and runtime
+- **Search** across entities, documents, sources, and relationships with a single query
+- **Navigate** the knowledge graph by following entity relationships and context bundles
+- **Read** freshness-aware, statement-cited Living Wiki entity projections
+- **Inspect** provenance, assertions, truth slots, and timeline events
+- **Manage** predicates, identity resolution, and space configuration
+- **Operate** work queues, reprocessing jobs, and system health
+
+Every tool enforces ABAC (Attribute-Based Access Control) policies, so data access is scoped to the caller's principal and clearance level.
+
+<Note>
+`get_runtime_status` is always available, including bootstrap mode. Clients should check `semantic_ingest_ready` before attempting `ingest_doc*` or `ingest_source*`. When semantic ingest is not ready, Elephant hides ingest tools instead of exposing a degraded doc-store-only mode.
+</Note>
+
+## Tool Profiles
+
+Not every caller needs every tool. The HTTP server exposes four endpoint profiles. The Rust dispatcher also defines
+an internal pipeline profile. These profiles control which MCP tools are available. Counts below are static maxima, before authorization, backend, and runtime readiness filtering; runtime-control tools are added separately:
+
+| Profile | Tools | Purpose |
+|---------|-------|---------|
+| **Default** (`/mcp`) | 23 static + runtime tools | End-user LLMs that need bootstrap/readiness, ingest, search, navigate, inspect, Living Wiki views, and provenance-backed timeline events |
+| **Agent** (`/mcp/agent`) | 24 static + runtime status | Read-only tools for extraction agents (pipeline LLM workers) |
+| **Maintenance** (`/mcp/maintenance`) | 43 | Agent tools plus LLM wiki planning and article compilation, Living Wiki materialization and rebuilds, source freshness controls, maintenance writes, and embedded snapshot operations when the caller qualifies |
+| **Full** (`/mcp/full`) | 91 | All tools, for operators and admin interfaces |
+| **Pipeline** | 5 | Work queue tools for pipeline workers |
+
+### Default Profile (23 tools + runtime tools)
+
+The default profile is designed for external LLMs connected via Meerkat agents or similar MCP clients. It provides a curated set of tools for the ingest-search-navigate-inspect loop, plus runtime status/bootstrap tools that make the MCP endpoint self-describing:
+
+- **Runtime:** `get_runtime_status` (always), plus `initialize_runtime` in bootstrap mode and `get_runtime_config` / `configure_runtime` on configured admin-capable runtimes
+- **Ingest:** `ingest_doc`, `ingest_doc_simple`, `ingest_source`, `ingest_source_simple`, `batch_ingest_sources`
+- **Timeline write:** `add_timeline_event`
+- **Discover:** `search_all`
+- **Navigate:** `get_entity`, `get_entity_context_bundle`, `get_entity_with_relations`, `search_entities`, `search_events`
+- **Living Wiki:** `get_knowledge_view`, `get_knowledge_view_definition`, `get_source_watch`
+- **Inspect:** `get_provenance`, `get_event`, `list_recent_events`, `list_upcoming_events`
+- **Browse:** `list_spaces`, `get_space`, `list_predicates`
+- **System:** `get_health`
+
+When Elephant is not yet `semantic_ingest_ready`, ingest tools are hidden. Direct write tools such as `add_timeline_event` still remain available in configured write-capable modes for explicit system/operator annotations.
+
+<Note>
+The default profile does not expose filesystem ingestion. `/mcp/full` has
+server-side `ingest_file` and `ingest_directory` tools for paths visible to the
+server. The separate `elephant-local-helper` offers similarly named stdio tools
+for reading UTF-8 text on the client machine. Restrict server permissions and
+mounts to the intended ingestion files.
+</Note>
+
+### Agent Profile (24 tools + runtime status)
+
+The agent profile is for extraction pipeline workers -- LLM agents that read the knowledge graph to resolve entities and disambiguate references. These agents may only use ABAC-filtered read-only tools:
+
+- Entity reads: `search_entities`, `get_entity`, `get_entity_context_bundle`
+- Predicate reads: `list_predicates`, `get_predicate`
+- Document reads: `search_docs`, `get_doc`, `list_doc_chunks`, `get_doc_chunk`
+- Source reads: `get_source`, `get_source_watch`
+- Assertion reads: `list_assertions`, `get_assertion`, `search_assertions`
+- Truth slot reads: `list_truth_slots`
+- Event reads: `search_events`, `get_event`, `list_recent_events`, `list_upcoming_events`
+- Unified search: `search_all`
+- System: `get_health`, `get_capabilities`, `get_runtime_status`
+- Living Wiki: `get_knowledge_view`, `get_knowledge_view_definition`
+
+### Maintenance Profile (43 tools)
+
+`stop_managed_wiki` revokes recurring wiki publication under an explicit
+`manage:wiki` service grant. Published revisions remain available.
+
+The maintenance profile extends the agent profile with write operations for identity resolution and predicate governance:
+
+- All 24 agent tools
+- Living Wiki planning, compilation, materialization, and rebuild: `create_wiki_from_graph`, `compile_wiki_article`, `materialize_knowledge_views`, `rebuild_knowledge_view`, `upsert_knowledge_view_definition`
+- Source freshness: `configure_source_watch`, `check_source_watch`
+- Event writes: `add_timeline_event`
+- Embedded snapshots: `export_snapshot`, `import_snapshot` when Elephant is running `elephant-db` and the caller is a global principal
+- Identity resolution: `propose_identity_candidate`, `list_identity_candidates`, `merge_entities`
+- Predicate management: `register_predicate`, `propose_predicate_alias`, `approve_predicate_proposal`
+- Entity writes: `update_entity`
+
+### Internal Pipeline Profile (5 tools)
+
+The internal pipeline profile classifies background queue tools; there is no
+`/mcp/pipeline` HTTP endpoint. Authorized operators use `/mcp/full`:
+
+- `claim_work_item`, `complete_work_item`, `list_work_items`, `list_pending_work_items`, `retry_work_item`
+
+### Full Profile (all tools)
+
+The full profile includes every registered tool the current principal is allowed to see. Use this for admin dashboards, operator CLIs, and development.
+
+## MCP vs REST API
+
+Elephant provides both an MCP interface and a REST API. Choose based on your use case:
+
+| Concern | MCP | REST API |
+|---------|-----|----------|
+| **Caller** | LLMs and AI agents | Application code, scripts, dashboards |
+| **Protocol** | JSON-RPC over Streamable HTTP | HTTP with JSON payloads |
+| **Auth** | Principal-based ABAC via tool context | Token-based, mapped to ABAC principal |
+| **Tool discovery** | `tools/list` returns available tools and their schemas | Endpoint reference in these docs |
+| **Batch operations** | `batch_entities`, `batch_ingest_docs`, `batch_relationships` | Equivalent REST batch endpoints |
+| **Streaming** | `stream_events` returns a bounded event batch | SSE endpoint at `/v1/events/sse` |
+
+For LLM integrations, MCP is strongly preferred -- it provides typed tool schemas that LLMs can invoke directly without prompt engineering.
+
+## Connection Setup
+
+Start Elephant as an independent HTTP server, then configure your MCP client
+with a Streamable HTTP server URL:
+
+```text
+http://localhost:3000/mcp
+```
+
+`elephant serve` does not implement a stdio MCP transport. Only the optional
+`elephant-local-helper` uses stdio. Client-specific configuration syntax varies;
+use the client's HTTP MCP configuration rather than launching `elephant serve`
+as a stdio tool.
+
+Send `Authorization: Bearer <token>` when authentication is enabled. The token
+must select the intended space and carry the required scopes and clearances.
+Development `SKIP_AUTH` callers may use `X-Space-Id`; it is not a substitute for
+authenticated space authorization.
+
+The server validates `Host` to prevent DNS rebinding. Configure
+`MCP_ALLOWED_HOSTS` for remote hostnames. `MCP_ALLOWED_ORIGINS` optionally limits
+browser origins by scheme, host, and effective port. See
+[Deployment](/operations/deployment) for these settings.
+
+On first connection, call `get_runtime_status`. Use `initialize_runtime` only
+when the server reports bootstrap mode and the caller qualifies. Obtain its
+current argument schema through `tools/list`; explicit runtime environment
+configuration selects configured mode instead.
+
+If Elephant's own `/mcp/agent` endpoint is the extractor target, startup may
+briefly report `extractor_ready=false` before the listener binds. Elephant
+retries after bind. Wait for `semantic_ingest_ready=true` before ingestion.
+
+### Programmatic (Rust)
+
+Library callers construct an `elephant_policy::Principal` from their trusted
+authentication context and pass it with a configured storage client to a
+dispatcher. These functions do not authenticate the caller for you:
+
+```rust
+use elephant_mcp::create_default_dispatcher;
+use elephant_policy::Principal;
+use elephant_storage::StorageClient;
+use serde_json::json;
+
+async fn search(
+    storage: StorageClient,
+    principal: Principal,
+) -> elephant_mcp::McpResult<serde_json::Value> {
+    let dispatcher = create_default_dispatcher(storage, principal);
+    dispatcher.execute("search_all", json!({
+        "query": "Project Cedar",
+        "limit": 10
+    })).await
+}
+```
+
+Other constructors include `create_agent_dispatcher`,
+`create_maintenance_dispatcher`, and `create_dispatcher` for the full profile.
+
+## Response Envelope
+
+Successful handler responses use an Elephant envelope inside the MCP tool result.
+Protocol, dispatch, and validation failures can also be MCP errors:
+
+```json
+{
+  "ok": true,
+  "data": {},
+  "error": null,
+  "details": null
+}
+```
+
+On failure:
+
+```json
+{
+  "ok": false,
+  "data": null,
+  "error": "Entity not found: entity:abc123",
+  "details": null
+}
+```
+
+## Bootstrap and Readiness
+
+Elephant can start before storage is configured. In that state:
+
+- `get_runtime_status` works
+- bootstrap/configuration tools may be available
+- ingest tools are hidden
+- no semantic extraction fallback exists
+
+This means a client can reliably distinguish:
+
+- Elephant unreachable
+- Elephant reachable but unconfigured
+- configured but storage/workers/extractor not ready
+- fully semantic-ingest ready
+
+Use `semantic_ingest_ready` as the gate for evidence ingestion.
+
+## Next Steps
+
+- [Tool Reference](/mcp/tools) -- complete reference for the MCP tool surface
+- [Workflows](/mcp/workflows) -- step-by-step guides for common MCP workflows

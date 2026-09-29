@@ -1,0 +1,84 @@
+{
+  "sources": [
+    {
+      "id": "source:seed-source-001",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "source_type": "document",
+      "name": "School Reports Collection",
+      "uri": "file:///school/",
+      "description": "Collection of school-related documents and reports",
+      "metadata": {
+        "category": "education",
+        "format": "markdown"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 0,
+        "labels": [],
+        "handling": []
+      },
+      "idempotency_key": "seed-source-school-001"
+    },
+    {
+      "id": "source:seed-source-002",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "source_type": "document",
+      "name": "Family Organization Files",
+      "uri": "file:///home/organization/",
+      "description": "Household organization documents including schedules and chores",
+      "metadata": {
+        "category": "household",
+        "format": "markdown"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": ["handling:parent_visible"]
+      },
+      "idempotency_key": "seed-source-org-001"
+    },
+    {
+      "id": "source:seed-source-003",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "source_type": "document",
+      "name": "Pet Records",
+      "uri": "file:///home/pets/",
+      "description": "Pet-related documents including adoption papers and vet records",
+      "metadata": {
+        "category": "pets",
+        "format": "pdf"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 2,
+        "labels": ["comp:confidant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-source-pet-001"
+    },
+    {
+      "id": "source:seed-source-004",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "source_type": "api",
+      "name": "Calendar Integration",
+      "uri": "https://calendar.example.com/api/family_demo",
+      "description": "External calendar integration for family events",
+      "metadata": {
+        "provider": "example_calendar",
+        "sync_frequency": "hourly"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-source-calendar-001"
+    }
+  ]
+}

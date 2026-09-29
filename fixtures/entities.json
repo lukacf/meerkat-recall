@@ -1,0 +1,106 @@
+{
+  "entities": [
+    {
+      "id": "entity:seed-entity-001",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "entity_type": "person",
+      "canonical_name": "Alice Johnson",
+      "aliases": ["Ali", "AJ"],
+      "birth_date": "2018-05-15",
+      "traits": {
+        "personality": ["curious", "friendly"],
+        "interests": ["reading", "soccer", "science"]
+      },
+      "properties": {
+        "grade": "2nd",
+        "school": "Sunnydale Elementary"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      }
+    },
+    {
+      "id": "entity:seed-entity-002",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "entity_type": "person",
+      "canonical_name": "Bob Johnson",
+      "aliases": ["Bobby"],
+      "birth_date": "2020-08-22",
+      "traits": {
+        "personality": ["energetic", "playful"],
+        "interests": ["dinosaurs", "building blocks"]
+      },
+      "properties": {
+        "grade": "Pre-K"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      }
+    },
+    {
+      "id": "entity:seed-entity-003",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "entity_type": "person",
+      "canonical_name": "Carol Martinez",
+      "aliases": [],
+      "properties": {
+        "role": "Teacher",
+        "subject": "2nd Grade"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 0,
+        "labels": [],
+        "handling": []
+      }
+    },
+    {
+      "id": "entity:seed-entity-004",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "entity_type": "place",
+      "canonical_name": "Sunnydale Elementary School",
+      "aliases": ["school", "Sunnydale"],
+      "properties": {
+        "address": "123 Education Lane",
+        "type": "elementary_school"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 0,
+        "labels": [],
+        "handling": []
+      }
+    },
+    {
+      "id": "entity:seed-entity-005",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "entity_type": "pet",
+      "canonical_name": "Buddy",
+      "aliases": ["good boy"],
+      "traits": {
+        "breed": "Golden Retriever",
+        "personality": ["loyal", "playful"]
+      },
+      "properties": {
+        "age_years": 3
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": []
+      }
+    }
+  ]
+}

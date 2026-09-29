@@ -1,0 +1,31 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:${PATH}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    clang \
+    cmake \
+    curl \
+    git \
+    libsqlite3-dev \
+    libssl-dev \
+    pkg-config \
+    protobuf-compiler \
+    python3 \
+    python3-venv \
+    python3-pip \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+       sh -s -- -y --profile minimal --default-toolchain 1.94.0 \
+    && rustup component add rustfmt clippy \
+    && cargo install cargo-deny --locked \
+    && cargo install cargo-audit --locked \
+    && cargo install cargo-nextest --locked \
+    && chmod -R a+rwx /usr/local/cargo /usr/local/rustup \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace

@@ -1,0 +1,51 @@
+[package]
+name = "elephant-bin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Unified Elephant command line interface"
+publish = false
+
+[[bin]]
+name = "elephant"
+path = "src/main.rs"
+
+[dependencies]
+elephant = { path = "../../crates/elephant" }
+elephant-api = { path = "../elephant-api" }
+elephant-migrations = { path = "../../crates/migrations" }
+elephant-pipeline-bin = { path = "../elephant-pipeline", package = "elephant-pipeline-bin" }
+elephant-storage = { path = "../../crates/storage" }
+elephant-types = { path = "../../crates/types" }
+elephant-embeddings = { path = "../../crates/embeddings" }
+elephant-knowledge-views = { path = "../../crates/knowledge-views" }
+elephant-pipeline = { path = "../../crates/pipeline" }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+walkdir = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tower = { workspace = true }
+
+[features]
+rocksdb = ["elephant-storage/rocksdb"]
+default = ["meerkat-extraction"]
+meerkat-extraction = ["elephant-api/meerkat-extraction", "elephant-pipeline-bin/meerkat-extraction", "elephant-pipeline/meerkat-extraction", "elephant/meerkat-extraction"]
+fastembed = ["elephant-api/fastembed", "elephant-pipeline-bin/fastembed", "elephant/fastembed"]
+
+[lints]
+workspace = true

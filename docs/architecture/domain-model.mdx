@@ -1,0 +1,525 @@
+---
+title: "Domain Model"
+description: "Complete reference for Elephant's record types, ID system, and base fields"
+icon: "diagram-project"
+---
+
+## RecordId System
+
+Every record in Elephant is identified by a `RecordId` -- a typed Elephant record identifier with the format `table:uuid` (for example, `entity:550e8400-e29b-41d4-a716-446655440000`).
+
+```rust
+pub struct RecordId {
+    pub table: TableName,
+    pub id: Uuid,
+}
+```
+
+New IDs are created with `RecordId::new_v4(table)` (random) or `RecordId::new_v7(table)` (time-ordered). The `table` component is drawn from the `TableName` enum, which lists every core table in the system.
+
+### TableName Enum
+
+| Table Name | Variant | Description |
+|---|---|---|
+| `entity` | `Entity` | People, orgs, apps, topics -- the graph nodes |
+| `rel` | `Rel` | Entity-to-entity relationships |
+| `attribute` | `Attribute` | Entity-to-literal claims |
+| `doc` | `Doc` | Ingested documents |
+| `doc_revision` | `DocRevision` | Immutable rendered text snapshots |
+| `doc_node` | `DocNode` | Structural chunks within a revision |
+| `doc_chunk` | `DocChunk` | Legacy document chunks; active code uses `doc_node` |
+| `chunk_embedding` | `ChunkEmbedding` | Vector embeddings for document nodes |
+| `assertion` | `Assertion` | Raw extracted claims (unresolved) |
+| `truth_slot` | `TruthSlot` | Current best answer for a claim slot |
+| `conflict_group` | `ConflictGroup` | Competing claims grouped for resolution |
+| `source` | `Source` | Provenance records (email, web, file, etc.) |
+| `work_item` | `WorkItem` | Durable work queue items |
+| `work_edge` | `WorkEdge` | DAG dependencies between work items |
+| `work_run` | `WorkRun` | Individual execution attempts |
+| `work_artifact` | `WorkArtifact` | Staged outputs from work runs |
+| `work_deadletter` | `WorkDeadletter` | Failed items for operator review |
+| `predicate_registry` | `PredicateRegistry` | Canonical predicate vocabulary |
+| `predicate_alias` | `PredicateAlias` | Alias mappings for predicates |
+| `space_config` | `SpaceConfig` | Per-space embedding and extraction config |
+| `system_event` | `SystemEvent` | Outbox events with monotonic sequence |
+| `event` | `Event` | Domain timeline events |
+| `audit_log` | `AuditLog` | Immutable audit trail |
+| `entity_identity_key` | `EntityIdentityKey` | Stable identity keys for entities |
+| `identity_candidate` | `IdentityCandidate` | Proposed entity merge candidates |
+| `entity_merge` | `EntityMerge` | Entity merge lineage |
+| `rel_evidence` | `RelEvidence` | Evidence linking rels to sources |
+| `id_map` | `IdMap` | Legacy ID mappings |
+| `ingest_decision` | `IngestDecision` | Deduplication decisions during ingest |
+| `cost_ledger_daily` | `CostLedgerDaily` | Daily cost tracking |
+| `freshness` | `Freshness` | Freshness scores for staleness detection |
+| `reprocess_job` | `ReprocessJob` | Backfill and re-extraction jobs |
+
+### Link\<T\>
+
+`Link<T>` is a typed foreign-key reference to another record. The generic parameter `T` indicates the expected target type for compile-time safety, while the underlying storage is a `RecordId`.
+
+```rust
+pub struct Link<T> {
+    pub id: RecordId,
+    // PhantomData<T> for type safety
+}
+```
+
+Use `link.id()` to read the underlying `RecordId`, or `link.into_id()` to consume it.
+
+---
+
+## BaseFields
+
+Every core record embeds `BaseFields`, which carries identity, multi-tenancy, timestamps, provenance, security, and subject scoping.
+
+```rust
+pub struct BaseFields {
+    pub id: RecordId,
+    pub space_id: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub created_by: String,
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub provenance: Provenance,
+    pub security: Security,
+    pub subjects: Vec<Link<Entity>>,
+    pub subjects_state: SubjectsState,
+}
+```
+
+| Field | Purpose |
+|---|---|
+| `id` | Unique `RecordId` for this record. |
+| `space_id` | Multi-tenant scope, such as a workspace, project, or organization. |
+| `created_at` / `updated_at` | Lifecycle timestamps. |
+| `created_by` | Agent or service that created the record. |
+| `deleted_at` | Soft-delete marker. `None` when active. |
+| `provenance` | Source chain, extractor metadata, and work run linkage. |
+| `security` | ABAC labels: `policy_id`, `level`, `labels`, `handling`. |
+| `subjects` | Entity links for subject-scoped access control. |
+| `subjects_state` | Whether subjects are `complete`, `partial`, or `unknown`. |
+
+<Note>
+  Soft-delete is the default removal strategy. Records are never physically
+  purged unless an explicit purge operation is invoked. The `deleted_at` field
+  gates visibility across all queries.
+</Note>
+
+### Provenance
+
+```rust
+pub struct Provenance {
+    pub sources: Vec<RecordId>,
+    pub extractor: Option<Extractor>,
+    pub work_run_id: Option<RecordId>,
+    pub run_id: Option<String>,
+    pub prompt_id: Option<String>,
+    pub config_id: Option<String>,
+    pub chain: Vec<ProvenanceStep>,
+}
+```
+
+### Security (ABAC Envelope)
+
+```rust
+pub struct Security {
+    pub policy_id: String,
+    pub level: i32,
+    pub labels: Vec<String>,
+    pub handling: Vec<String>,
+}
+```
+
+---
+
+## Knowledge Graph Records
+
+### Entity
+
+Core nodes in the knowledge graph. Entity types are freeform lowercase strings (e.g., `person`, `org`, `topic`, `app`).
+
+```rust
+pub struct Entity {
+    pub base: BaseFields,
+    pub entity_type: EntityType,       // freeform string, e.g. "person"
+    pub display_name: String,
+    pub aliases: Vec<String>,
+    pub summary: Option<String>,
+    pub handles: Vec<Handle>,
+    pub identity_keys: Vec<String>,
+    pub risk_level: Option<f64>,
+    pub trust_level: Option<f64>,
+    pub known_safe: bool,
+    pub first_seen: Option<DateTime<Utc>>,
+    pub last_seen: Option<DateTime<Utc>>,
+    pub status: EntityStatus,          // Active | Merged
+    pub redirect_to: Option<Link<Entity>>,
+    pub metadata: Value,
+}
+```
+
+When an entity is merged, `status` becomes `Merged` and `redirect_to` points to the surviving entity.
+
+### Rel
+
+Entity-to-entity relationships. The `subject` ("from") and `object` ("to") are both entity links.
+
+```rust
+pub struct Rel {
+    pub base: BaseFields,
+    pub subject: Link<Entity>,         // "in" side
+    pub object: Link<Entity>,          // "out" side
+    pub rel_type: String,              // canonical predicate
+    pub status: ClaimStatus,           // Candidate | Approved | Superseded | Disputed
+    pub confidence: f32,
+    pub validity_window: Option<ValidityWindow>,
+    pub evidence: Vec<EvidenceRef>,
+    pub temporal_audit: Option<TemporalAudit>,
+}
+```
+
+`ClaimStatus` tracks the lifecycle from initial candidate through promotion to approved status. `ValidityWindow` models temporal claims with optional start/end bounds.
+
+### Attribute
+
+Entity-to-literal claims. Like `Rel`, but the object is a typed `Literal` value rather than an entity.
+
+```rust
+pub struct Attribute {
+    pub base: BaseFields,
+    pub subject: Link<Entity>,
+    pub attr_type: String,             // canonical predicate
+    pub value: Literal,                // String | Integer | Float | Boolean | Date | DateTime | Duration | Json
+    pub status: ClaimStatus,
+    pub confidence: f32,
+    pub validity_window: Option<ValidityWindow>,
+    pub evidence: Vec<EvidenceRef>,
+    pub temporal_audit: Option<TemporalAudit>,
+}
+```
+
+---
+
+## Document Pipeline Records
+
+### Doc
+
+Top-level source-backed document record ingested into Elephant. For media-backed ingest, `text` is the renderer-owned canonical searchable projection rather than the raw caller payload.
+
+```rust
+pub struct Doc {
+    pub base: BaseFields,
+    pub title: String,
+    pub text: String,
+    pub sidecar_text: Option<String>,
+    pub source: Option<Link<Source>>,
+    pub media_attachments: Vec<DocMediaAttachment>,
+    pub rendition_key: String,
+    pub metadata: Value,
+}
+```
+
+### DocRevision
+
+Immutable normalized text snapshot produced by a renderer plugin. For multimodal docs, the revision also carries the authoritative render manifest that maps spans back to attachments and time ranges. If rendering improves, a new revision is created and the old one is superseded.
+
+```rust
+pub struct DocRevision {
+    pub base: BaseFields,
+    pub doc: Link<Doc>,
+    pub text: String,
+    pub text_hash: String,
+    pub manifest: Option<RenderManifest>,
+    pub renderer: RendererMetadata,
+    pub supersedes: Option<Link<DocRevision>>,
+    pub status: RevisionStatus,        // Active | Superseded | Failed
+    pub rendered_at: DateTime<Utc>,
+}
+```
+
+### DocNode
+
+Structural nodes over a revision -- paragraphs, sections, chunks, summaries, etc.
+
+```rust
+pub struct DocNode {
+    pub base: BaseFields,
+    pub revision: Link<DocRevision>,
+    pub role: NodeRole,                // Document | Section | Paragraph | Chunk | Summary | ...
+    pub span: TextSpan,               // { start: u32, end: u32 }
+    pub node_key: String,
+    pub text: Option<String>,
+    pub parent: Option<Link<DocNode>>,
+    pub position: i32,
+    pub depth: i32,
+    pub embedding_model: Option<String>,
+    pub collection: Option<String>,
+}
+```
+
+---
+
+## Extraction and Truth Maintenance
+
+### Assertion
+
+Raw claims extracted from documents by the LLM extraction pipeline. Assertions carry unresolved mention strings; staged artifact validation/commit then resolves or creates graph records while later truth-maintenance work reconciles conflicts.
+
+```rust
+pub struct Assertion {
+    pub base: BaseFields,
+    pub subject_text: String,
+    pub predicate_raw: String,
+    pub predicate_id: Option<String>,
+    pub object_text: Option<String>,
+    pub object_literal: Option<Value>,
+    pub evidence: EvidenceSpan,
+    pub source_event_time: Option<DateTime<Utc>>,
+    pub observed_at: DateTime<Utc>,
+    pub asserted_at: DateTime<Utc>,
+    pub assertion_key: String,
+    pub resolution_status: ResolutionStatus,  // Pending | Resolved | Partial | Abstained | Failed | Superseded
+    pub resolution_method: Option<String>,
+    pub resolution_confidence: Option<f32>,
+    pub retry_state: AssertionRetryState,
+    pub subject_entity: Option<Link<Entity>>,
+    pub object_entity: Option<Link<Entity>>,
+    pub confidence: f32,
+    pub subject_entity_type: Option<String>,
+    pub object_entity_type: Option<String>,
+    pub significance: Option<String>,
+    pub lifecycle_tier: String,        // "active" | "archived"
+}
+```
+
+### TruthSlot
+
+The computed "current truth" for a claim slot. Stores the winning value(s) after conflict resolution across competing assertions.
+
+```rust
+pub struct TruthSlot {
+    pub base: BaseFields,
+    pub slot_key: String,
+    pub slot_type: String,             // "rel" | "attribute" | "event" | "rel_set"
+    pub subject_entity: String,
+    pub predicate_id: String,
+    pub current_values: Vec<CurrentValue>,
+    pub conflict_group: Option<Link<ConflictGroup>>,
+    pub confidence: f32,
+    pub rationale: Option<String>,
+    pub semantics_version: u32,
+    pub alias_version: u32,
+    pub stale: bool,
+    pub stale_reason: Option<String>,
+    pub computed_at: DateTime<Utc>,
+    pub security_hash: String,
+}
+```
+
+---
+
+## Source Provenance
+
+### Source
+
+Tracks where data came from -- emails, web pages, chat messages, device captures, manual entries, etc.
+
+```rust
+pub struct Source {
+    pub base: BaseFields,
+    pub type_: SourceType,             // Email | Calendar | Web | Drive | Chat | DeviceFrame | DeviceVideo | Transcript | Manual
+    pub external_id: Option<String>,
+    pub uri: Option<String>,
+    pub path: Option<String>,
+    pub parent: Option<Link<Source>>,
+    pub range: Option<SourceRange>,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub author: Option<String>,
+    pub channel: Option<String>,
+    pub hash: String,
+    pub metadata: Value,
+}
+```
+
+---
+
+## Work Scheduler Records
+
+The durable work scheduler uses a DAG-based queue with lease-based execution. Each pipeline stage produces `WorkItem` records that are claimed, executed, and produce artifacts.
+
+### WorkItem
+
+```rust
+pub struct WorkItem {
+    pub base: BaseFields,
+    pub kind: String,                  // e.g. "render_doc", "plan_extraction", "extract_assertions", "validate_artifacts", "commit_artifacts"
+    pub payload: Value,
+    pub status: WorkItemStatus,        // Pending | Runnable | Running | Done | Failed | Cancelled
+    pub priority: i32,
+    pub idempotency_key: String,
+    pub attempts: u32,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub leased_by: Option<String>,
+    pub run_after: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+```
+
+### WorkRun
+
+A single execution attempt of a work item.
+
+```rust
+pub struct WorkRun {
+    pub base: BaseFields,
+    pub work_item: Link<WorkItem>,
+    pub attempt: u32,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub success: bool,
+    pub error: Option<String>,
+    pub metrics: WorkRunMetrics,
+    pub worker_id: String,
+    pub worker_version: String,
+    pub model_version: Option<String>,
+    pub prompt_id: Option<String>,
+    pub config_hash: Option<String>,
+}
+```
+
+### WorkArtifact
+
+Staged output produced by a work run. Goes through validation before being committed to canonical tables.
+
+```rust
+pub struct WorkArtifact {
+    pub base: BaseFields,
+    pub work_run: Link<WorkRun>,
+    pub artifact_type: String,         // e.g. "assertion_batch", "resolution_patch"
+    pub data: Value,
+    pub status: ArtifactStatus,        // Draft | Validated | Committing | Committed | Rejected
+    pub validation_errors: Option<Vec<String>>,
+    pub validated_at: Option<DateTime<Utc>>,
+    pub committed_at: Option<DateTime<Utc>>,
+}
+```
+
+---
+
+## Configuration and Governance
+
+### SpaceConfig
+
+Per-space configuration controlling embedding provider selection and extraction behavior.
+
+```rust
+pub struct SpaceConfig {
+    pub base: BaseFields,
+    pub embedding_provider: String,    // "fastembed" | "openai" | "fake"
+    pub embedding_model: String,
+    pub embedding_dims: i32,
+    pub purpose: Option<String>,       // injected into extraction prompts
+    pub skill: Option<String>,         // extraction skill ID
+}
+```
+
+### PredicateRegistry
+
+Canonical predicate definitions with semantic configuration that drives truth maintenance behavior.
+
+```rust
+pub struct PredicateRegistry {
+    pub base: BaseFields,
+    pub predicate_id: String,
+    pub description: Option<String>,
+    pub status: String,                // "active" | "deprecated"
+    pub semantics: Option<PredicateSemantics>,
+    pub semantics_status: SemanticsStatus,
+    pub first_seen_at: Option<DateTime<Utc>>,
+    pub usage_count: u64,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+```
+
+`PredicateSemantics` controls temporal model, cardinality, conflict policy, recency basis, promotion thresholds, and alias confidence thresholds.
+
+### PredicateAlias
+
+Maps raw extraction strings to canonical predicates with confidence-scored aliases.
+
+```rust
+pub struct PredicateAlias {
+    pub base: BaseFields,
+    pub alias: String,
+    pub alias_type: AliasType,         // RawString | PluginCode | SchemaField
+    pub source_plugin: Option<String>,
+    pub confidence: f32,
+    pub status: AliasStatus,           // Proposed | Active | Deprecated
+    pub scope: AliasScope,             // Global | PluginOnly | SourceType
+    pub predicate_id: String,
+    pub confidence_version: u32,
+    pub usage_count: u64,
+}
+```
+
+---
+
+## System Records
+
+### Event
+
+First-class domain timeline events with temporal precision and evidence links.
+
+```rust
+pub struct Event {
+    pub base: BaseFields,
+    pub title: String,
+    pub summary: Option<String>,
+    pub status: EventStatus,           // Candidate | Approved | Superseded | Rejected
+    pub time_start: Option<DateTime<Utc>>,
+    pub time_end: Option<DateTime<Utc>>,
+    pub time_precision: TimePrecision, // Exact | Minute | Hour | Day | Month | Year | Unknown
+    pub confidence: f32,
+    pub time_confidence: f32,
+    pub assertion_refs: Vec<Link<Assertion>>,
+    pub source_refs: Vec<Link<Source>>,
+    pub metadata: Value,
+}
+```
+
+### SystemEvent
+
+Outbox events for reliable change-data streaming. Each carries a monotonic sequence number.
+
+```rust
+pub struct SystemEvent {
+    pub base: BaseFields,
+    pub seq: i64,
+    pub event_type: String,
+    pub payload: Value,
+}
+```
+
+### AuditLog
+
+Immutable audit trail recording every mutation with before/after snapshots.
+
+```rust
+pub struct AuditLog {
+    pub base: BaseFields,
+    pub action: AuditAction,           // Create | Update | Delete | Restore | Purge | Promote | Merge
+    pub actor: String,
+    pub record: RecordId,
+    pub before: Option<Value>,
+    pub after: Option<Value>,
+    pub timestamp: DateTime<Utc>,
+    pub reason: Option<String>,
+}
+```
+
+<Note>
+  All struct definitions above are simplified for documentation purposes.
+  Derive macros, `impl` blocks, and serde attributes are omitted.
+  See the actual source in `crates/types/src/records/` for the full definitions.
+</Note>

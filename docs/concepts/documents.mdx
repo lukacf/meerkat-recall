@@ -1,0 +1,160 @@
+---
+title: "Documents"
+description: "The Doc, DocRevision, and DocNode hierarchy that powers ingestion, chunking, and embedding."
+icon: "file-lines"
+---
+
+Documents are the raw material of the knowledge graph. Text, images, and videos enter Elephant as a `Doc`, get normalized into immutable `DocRevision` snapshots, and are then split into structural `DocNode` chunks for embedding and extraction.
+
+## Document hierarchy
+
+```
+Doc                          -- source-backed ingest record with title, media refs, and canonical searchable text
+  DocRevision                -- immutable rendered snapshot with normalized text + multimodal manifest
+    DocNode (document)       -- root structural node
+      DocNode (section)      -- heading/container
+        DocNode (paragraph)  -- text block
+        DocNode (chunk)      -- retrieval-optimized segment
+        DocNode (summary)    -- generated summary
+```
+
+Each level links to its parent, forming a tree rooted at the `Doc`.
+
+## Doc
+
+The top-level record created when text or media is ingested.
+
+<CodeGroup>
+```rust Doc
+struct Doc {
+    base: BaseFields,
+    title: String,
+    text: String,
+    sidecar_text: Option<String>,
+    source: Option<Link<Source>>,
+    media_attachments: Vec<DocMediaAttachment>,
+    rendition_key: String,
+    metadata: serde_json::Value,
+}
+```
+</CodeGroup>
+
+| Field           | Type                 | Description                                                      |
+|-----------------|----------------------|------------------------------------------------------------------|
+| `title`         | `String`             | Human-readable document title.                                   |
+| `text`          | `String`             | Canonical searchable projection owned by the renderer.           |
+| `sidecar_text`  | `Option<String>`     | Caller-supplied text preserved alongside media-backed ingest.    |
+| `source`        | `Option<Link<Source>>` | Link to the provenance `Source` record (email, web page, etc.). |
+| `media_attachments` | `Vec<DocMediaAttachment>` | Typed image/video attachments or managed asset references. |
+| `rendition_key` | `String`             | Idempotency key. Re-ingesting a document with the same key updates the existing record rather than creating a duplicate. |
+| `metadata`      | `JSON`               | Arbitrary key-value metadata (e.g. `collection`, tags). Defaults to `{}`. |
+
+### Collections
+
+Documents can be grouped into collections via the `metadata.collection` field. Collections are logical groupings used for scoped search and retrieval -- for example, `"notes"`, `"emails"`, or `"research"`.
+
+## DocRevision
+
+An immutable snapshot of normalized text produced by a renderer plugin. For media-backed docs, the revision also carries the authoritative multimodal manifest that maps rendered text spans back to attachments and time ranges. If the renderer improves, a new revision is created and the old one is superseded.
+
+<CodeGroup>
+```rust DocRevision
+struct DocRevision {
+    base: BaseFields,
+    doc: Link<Doc>,
+    text: String,
+    text_hash: String,
+    manifest: Option<RenderManifest>,
+    renderer: RendererMetadata,
+    supersedes: Option<Link<DocRevision>>,
+    status: RevisionStatus,
+    rendered_at: DateTime<Utc>,
+}
+```
+</CodeGroup>
+
+| Field         | Type                       | Description                                               |
+|---------------|----------------------------|-----------------------------------------------------------|
+| `doc`         | `Link<Doc>`                | Parent document this revision belongs to.                 |
+| `text`        | `String`                   | Normalized text content (ABAC-gated).                     |
+| `text_hash`   | `String`                   | SHA hash for integrity verification.                      |
+| `manifest`    | `Option<RenderManifest>`   | Authoritative multimodal provenance for rendered spans.   |
+| `renderer`    | `RendererMetadata`         | Name, version, and config hash of the renderer plugin.    |
+| `supersedes`  | `Option<Link<DocRevision>>` | Previous revision this one replaces (if any).            |
+| `status`      | `RevisionStatus`           | `active`, `superseded`, or `failed`.                      |
+| `rendered_at` | `DateTime<Utc>`            | When the rendering occurred.                              |
+
+## DocNode
+
+Structural nodes over a revision. Nodes form a tree with span offsets into the revision text.
+
+<CodeGroup>
+```rust DocNode
+struct DocNode {
+    base: BaseFields,
+    revision: Link<DocRevision>,
+    role: NodeRole,
+    span: TextSpan,
+    node_key: String,
+    text: Option<String>,
+    parent: Option<Link<DocNode>>,
+    position: i32,
+    depth: i32,
+    embedding_model: Option<String>,
+    collection: Option<String>,
+}
+```
+</CodeGroup>
+
+### Node roles
+
+| Role         | Description                                      |
+|--------------|--------------------------------------------------|
+| `document`   | Root node of the document tree.                  |
+| `section`    | Section heading or container.                    |
+| `paragraph`  | Paragraph-level text block.                      |
+| `span`       | Inline span within a paragraph.                  |
+| `chunk`      | Retrieval-optimized segment for vector search.   |
+| `summary`    | Generated summary (has its own `text` field).    |
+| `list`       | List container (ordered or unordered).           |
+| `table`      | Table container.                                 |
+| `table_cell` | Individual cell within a table.                  |
+
+The `span` field contains byte offsets (`start`, `end`) into the parent revision's text, allowing precise extraction of the node's content without duplication.
+
+<Note>
+`chunk` nodes are the primary targets for embedding. The `embedding_model` field is populated after the embedding pipeline processes the node. The `collection` field groups nodes for scoped vector search.
+</Note>
+
+## Ingestion flow
+
+1. **Ingest** -- A source-first request is submitted via the API or MCP (`ingest_doc_simple`, `ingest_source`, `ingest_url`, `ingest_file`). A source-backed `Doc` is staged with a `rendition_key` for idempotency.
+2. **Render** -- The renderer normalizes raw text and/or media into a `DocRevision` with canonical text and multimodal provenance.
+3. **Chunk** -- The chunker splits the revision text into `DocNode` records (paragraphs, chunks, sections).
+4. **Embed** -- The embedding worker reads the space's `SpaceConfig` and generates vectors for each `chunk` node.
+5. **Extract** -- The extraction pipeline reads node text plus revision-declared multimodal provenance and stages candidate assertions about entities, relationships, attributes, and events.
+6. **Validate and commit artifacts** -- Candidate artifacts are validated, then committed as assertions, `rel` records, `attribute` records, events, and outbox entries for truth maintenance.
+
+## Source linking
+
+Documents optionally link to a `Source` record that tracks provenance -- where the content came from.
+
+| Source type    | Description               |
+|----------------|---------------------------|
+| `email`        | Email message             |
+| `calendar`     | Calendar event            |
+| `web`          | Web page or URL           |
+| `drive`        | Cloud storage document    |
+| `chat`         | Chat/messaging content    |
+| `device_frame` | Device screen capture     |
+| `device_video` | Device video capture      |
+| `transcript`   | Audio/video transcript    |
+| `manual`       | Manually entered content  |
+
+Sources carry a `hash` field for content deduplication and optional fields for `uri`, `path`, `author`, `channel`, and `timestamp`.
+
+## See also
+
+- [Entities](/concepts/entities) -- extracted from document content
+- [Relationships](/concepts/relationships) -- claims derived from documents
+- [Spaces](/concepts/spaces) -- embedding configuration per space

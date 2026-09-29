@@ -1,0 +1,29 @@
+# Development mode: Only runs SurrealDB
+# Run API and pipeline locally with cargo for fast iteration
+
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:v2.4.1
+    container_name: elephant-surrealdb-dev
+    user: "0:0"
+    command:
+      - start
+      - --log=info
+      - --user=root
+      - --pass=root
+      - file:/data/database.db
+    volumes:
+      - surrealdb_data_dev:/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "/surreal", "is-ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  surrealdb_data_dev:
+    driver: local

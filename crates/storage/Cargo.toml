@@ -1,0 +1,35 @@
+[package]
+name = "elephant-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "SurrealDB storage layer for Elephant"
+
+[dependencies]
+elephant-types = { path = "../types" }
+elephant-db = { path = "../elephant-db" }
+elephant-embeddings = { path = "../embeddings" }
+surrealdb = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+num-traits = "0.2"
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+rstest = { workspace = true }
+
+[features]
+# Embedded persistent RocksDB engine (rocksdb:// URLs). Off by default —
+# pulls the C++ librocksdb build; deploy builds enable it explicitly.
+rocksdb = ["surrealdb/kv-rocksdb"]
+test-utils = []
+
+[lints]
+workspace = true

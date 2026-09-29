@@ -1,0 +1,255 @@
+---
+title: "SurrealDB Patterns"
+description: "Four critical patterns to avoid integration hell with SurrealDB's native Rust driver"
+icon: "database"
+---
+
+## Overview
+
+SurrealDB's native Rust driver has specific serialization behaviors that can cause subtle, hard-to-debug data corruption or deserialization failures. These four patterns are mandatory for all database-boundary code in Elephant.
+
+## Pattern 1: No `#[serde(flatten)]` at the DB Boundary
+
+SurrealDB's native driver does not round-trip `#[serde(flatten)]` correctly. Flattened fields may be silently dropped or mangled during serialization/deserialization.
+
+**Solution**: Use separate "DB proxy" structs for storage representation, then convert to domain models via `TryFrom`.
+
+<Tabs>
+  <Tab title="WRONG">
+    ```rust
+    // DO NOT do this -- flatten breaks with SurrealDB driver
+    #[derive(Serialize, Deserialize)]
+    struct Entity {
+        id: RecordId,
+        display_name: String,
+        #[serde(flatten)]
+        base: BaseFields,  // <-- fields silently lost on round-trip
+    }
+    ```
+  </Tab>
+  <Tab title="CORRECT">
+    ```rust
+    // Storage proxy -- no flatten, all fields explicit
+    #[derive(Deserialize)]
+    struct EntityDb {
+        id: RecordId,
+        space_id: String,
+        display_name: String,
+        entity_type: String,
+        created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    }
+
+    // Convert to domain model
+    impl TryFrom<EntityDb> for Entity {
+        type Error = StorageError;
+
+        fn try_from(db: EntityDb) -> Result<Self, Self::Error> {
+            Ok(Entity {
+                id: db.id,
+                space_id: db.space_id,
+                display_name: db.display_name,
+                entity_type: db.entity_type,
+                created_at: db.created_at,
+                updated_at: db.updated_at,
+            })
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Pattern 2: No `serde_json::Value` in Custom Deserializers
+
+Using `serde_json::Value` as an intermediate representation in custom deserializers silently coerces SurrealDB's native types (e.g., `RecordId`, `Datetime`) into their JSON representations, losing type information.
+
+**Solution**: Implement manual `Visitor` types that handle both string and structured forms directly.
+
+<Tabs>
+  <Tab title="WRONG">
+    ```rust
+    // DO NOT do this -- Value intermediate drops native SurrealDB types
+    impl<'de> Deserialize<'de> for MyStatus {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let value = serde_json::Value::deserialize(deserializer)?;
+            match value.as_str() {
+                Some("active") => Ok(MyStatus::Active),
+                Some("deleted") => Ok(MyStatus::Deleted),
+                _ => Err(de::Error::custom("unknown status")),
+            }
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="CORRECT">
+    ```rust
+    // Manual Visitor -- handles both string and enum shapes natively
+    impl<'de> Deserialize<'de> for MyStatus {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            struct StatusVisitor;
+
+            impl<'de> Visitor<'de> for StatusVisitor {
+                type Value = MyStatus;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a status string: 'active' or 'deleted'")
+                }
+
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                    match v {
+                        "active" => Ok(MyStatus::Active),
+                        "deleted" => Ok(MyStatus::Deleted),
+                        other => Err(E::custom(format!("unknown status: {other}"))),
+                    }
+                }
+
+                // Also handle the case where SurrealDB sends an enum variant
+                fn visit_map<A: de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Self::Value, A::Error> {
+                    // Handle {"Active": null} shape from SurrealDB
+                    if let Some(key) = map.next_key::<String>()? {
+                        let _: de::IgnoredAny = map.next_value()?;
+                        return self.visit_str(&key);
+                    }
+                    Err(de::Error::custom("empty map for status"))
+                }
+            }
+
+            deserializer.deserialize_any(StatusVisitor)
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Pattern 3: No Silent Defaults for Required Fields
+
+Using `.unwrap_or_else(Utc::now)` or similar fallbacks when a required field is missing from the database hides data integrity issues. A missing `created_at` is a sign of corrupt data, not something to paper over.
+
+**Solution**: Use `TryFrom` conversions with explicit `StorageError::DataIntegrityError` for mandatory fields.
+
+<Tabs>
+  <Tab title="WRONG">
+    ```rust
+    // DO NOT do this -- hides data corruption
+    impl From<EntityDb> for Entity {
+        fn from(db: EntityDb) -> Self {
+            Entity {
+                id: db.id,
+                created_at: db.created_at.unwrap_or_else(Utc::now),  // <-- silent fallback
+                updated_at: db.updated_at.unwrap_or_else(Utc::now),  // <-- hides missing data
+                space_id: db.space_id.unwrap_or_default(),            // <-- empty string is wrong
+            }
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="CORRECT">
+    ```rust
+    // TryFrom with explicit errors -- surfaces data integrity issues
+    impl TryFrom<EntityDb> for Entity {
+        type Error = StorageError;
+
+        fn try_from(db: EntityDb) -> Result<Self, Self::Error> {
+            let created_at = db.created_at.ok_or_else(|| {
+                StorageError::DataIntegrityError {
+                    table: "entity".into(),
+                    id: db.id.to_string(),
+                    field: "created_at".into(),
+                    reason: "mandatory field missing".into(),
+                }
+            })?;
+
+            let space_id = if db.space_id.is_empty() {
+                return Err(StorageError::DataIntegrityError {
+                    table: "entity".into(),
+                    id: db.id.to_string(),
+                    field: "space_id".into(),
+                    reason: "space_id must not be empty".into(),
+                });
+            } else {
+                db.space_id
+            };
+
+            Ok(Entity {
+                id: db.id,
+                created_at,
+                space_id,
+            })
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Pattern 4: No `time::format` in SurrealQL Projections
+
+Using `time::format()` in SurrealQL projections converts native datetime values to strings before they reach the Rust driver. The driver then cannot deserialize them back to `DateTime<Utc>` because it receives a string instead of a native datetime object.
+
+**Solution**: Return raw native types in SurrealQL queries and perform validation/formatting on the Rust side after deserialization.
+
+<Tabs>
+  <Tab title="WRONG">
+    ```sql
+    -- DO NOT do this -- converts native datetime to string
+    SELECT
+        id,
+        display_name,
+        time::format(created_at, "%Y-%m-%dT%H:%M:%SZ") AS created_at
+    FROM entity
+    WHERE space_id = $space_id;
+    ```
+  </Tab>
+  <Tab title="CORRECT">
+    ```sql
+    -- Return raw native types -- let Rust handle formatting
+    SELECT
+        id,
+        display_name,
+        created_at,
+        updated_at
+    FROM entity
+    WHERE space_id = $space_id;
+    ```
+
+    Then validate on the Rust side:
+
+    ```rust
+    #[derive(Deserialize)]
+    struct EntityDb {
+        id: RecordId,
+        display_name: String,
+        created_at: DateTime<Utc>,  // driver deserializes native datetime
+        updated_at: DateTime<Utc>,
+    }
+
+    // Format only when needed for API responses
+    impl EntityDb {
+        fn to_api_response(&self) -> EntityResponse {
+            EntityResponse {
+                id: self.id.to_string(),
+                display_name: self.display_name.clone(),
+                created_at: self.created_at.to_rfc3339(),
+            }
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Summary
+
+| # | Rule | Consequence of Violation |
+|---|------|--------------------------|
+| 1 | No `#[serde(flatten)]` at DB boundary | Fields silently dropped on round-trip |
+| 2 | No `serde_json::Value` intermediate | Native SurrealDB types coerced to JSON, losing type info |
+| 3 | No silent defaults for required fields | Data corruption hidden; bugs surface far from root cause |
+| 4 | No `time::format` in SurrealQL projections | Deserialization fails; `DateTime<Utc>` receives string instead of native type |

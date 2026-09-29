@@ -1,0 +1,51 @@
+# Cargo workspace configuration for Elephant
+
+[build]
+# Use all available CPU cores for parallel compilation
+# (omit jobs to use default which is number of logical CPUs)
+
+# Enable incremental compilation for faster rebuilds
+incremental = true
+
+[profile.dev]
+# Faster compilation in development
+debug = 1
+opt-level = 0
+
+[profile.test]
+# Keep debug info in tests for better backtraces
+debug = 2
+
+[alias]
+# Useful shortcuts for development
+t = "test --workspace"
+c = "clippy --workspace --all-targets --all-features -- -D warnings"
+f = "fmt --all"
+b = "build --workspace"
+r = "run"
+doc = "doc --workspace --no-deps"
+xtask = "run -p xtask --"
+
+# Integration tests only
+integration = "test --workspace -- --ignored"
+
+# Deterministic E2E gate. Paid live LLM scenarios are explicitly opt-in.
+test-e2e = "test --workspace --all-features -- --ignored --skip live_llm --skip real_llm --skip real_example --skip calibrate_"
+test-e2e-live = "test -p elephant-e2e live_llm -- --ignored --nocapture --test-threads=1"
+
+# Run specific test binary
+test-api = "test --package elephant-api"
+test-pipeline = "test --package elephant-pipeline"
+test-storage = "test --package elephant-storage"
+
+[env]
+# Default environment variables for local development
+RUST_BACKTRACE = { value = "1", force = false }
+RUST_LOG = { value = "info,elephant=debug", force = false }
+
+# Note: lld linker settings removed - not universally available
+# To enable lld on systems that have it installed:
+# [target.'cfg(target_os = "macos")']
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+# [target.'cfg(target_os = "linux")']
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]

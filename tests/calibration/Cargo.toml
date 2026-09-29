@@ -1,0 +1,23 @@
+[package]
+name = "elephant-calibration"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Internal crates
+elephant-types = { path = "../../crates/types" }
+elephant-pipeline = { path = "../../crates/pipeline", features = ["meerkat-extraction"] }
+
+[lints]
+workspace = true

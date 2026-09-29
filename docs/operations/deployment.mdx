@@ -1,0 +1,388 @@
+---
+title: "Deployment"
+description: "Docker Compose setup, deployment modes, environment variable reference, and migrations"
+icon: "rocket"
+---
+
+## Architecture Overview
+
+Elephant can run against either `surreal-db` (default) or embedded `elephant-db`.
+The default Docker deployment starts `elephant serve` and `surrealdb`; standalone workers are optional:
+
+| Service | Binary | Default Port | Description |
+|---------|--------|--------------|-------------|
+| `elephant` | `elephant serve` | 3000 | HTTP API server (Axum), MCP endpoints, and managed workers |
+| `elephant-worker` | `elephant worker` | N/A | Optional standalone background workers |
+| `surrealdb` | SurrealDB v2.4.1 | 8000 | Default persistent backend |
+
+The API owns the managed runtime by default, including background worker loops. The pipeline can also run as a separate advanced worker deployment.
+
+## Release binaries
+
+The **Build release candidates** workflow is started manually for a selected
+commit or ref. It validates the source, then builds native Linux x86-64 and
+macOS ARM64 binaries with the `rocksdb` feature and default Meerkat extraction
+support. Builds use Rust 1.94.0, the repository Cargo wrapper, `--locked`, and the
+`deploy` profile. Linux uses Ubuntu 22.04 for compatibility with Debian 12.
+
+Each candidate archive contains `elephant`, both license texts, and
+`provenance.json` with the source commit/tree, build command, workflow run, and
+binary SHA256. Its adjacent checksum file names the archive without directory
+prefixes. The workflow attests its archives and uploads candidates; it does not
+publish a GitHub release. Creating a version tag does not start another build.
+
+To promote a release:
+
+1. Select the reviewed source commit and confirm its CI checks passed. Verify
+   that the proposed `vX.Y.Z` tag matches the workspace package version.
+2. Download successful build artifacts, verify archive checksums and inspect
+   their bundled provenance. Smoke test `elephant --help` on each target host.
+   Keep the binary checksum, build source, and release source in the release
+   record. If promoting an existing build from another commit, verify identical
+   source trees or document and review the exact build-excluded differences.
+3. Create the version tag at the reviewed release commit. Create a draft GitHub
+   release with the verified archives, a flat `checksums.sha256` manifest, and
+   release notes listing the actual supported platforms. Verify the uploaded
+   bytes before publishing the draft. A locally prepared provenance file is
+   descriptive evidence and is not a GitHub build attestation.
+4. Before production activation, rehearse migrations on a consistent database
+   backup and retain the previous executable and matching data/configuration
+   for rollback. Verify health and representative application requests after
+   activation.
+
+For builds promoted outside the candidate workflow, record their actual build
+commands and validation rather than claiming workflow attestations. Publishing
+release binaries does not publish Rust crates or the local-helper npm package.
+
+## Deployment Modes
+
+<Tabs>
+  <Tab title="Managed workers (default)">
+    The default `docker compose up` runs `elephant serve` with managed workers in the same container. Storage is still SurrealDB by default.
+
+    ```bash
+    docker compose up -d
+    ```
+  </Tab>
+  <Tab title="Separate workers">
+    Custom deployments can run `elephant serve --server-only` and
+    `elephant worker` as separate services against the same SurrealDB namespace
+    and database. Configure the worker's extractor and maintenance MCP URLs to
+    reach the API service, and supply an authenticated MCP token when needed.
+
+    The supplied Compose file uses managed workers and does not include a
+    separate-worker profile. Embedded `elephant-db` cannot share its in-memory
+    state between processes.
+  </Tab>
+  <Tab title="Manual (Development)">
+    For local development without Docker:
+
+    ```bash
+    # 1. Start SurrealDB
+    docker compose up -d surrealdb
+
+    # 2. Use one explicit database configuration for migrations and runtime
+    export SURREALDB_URL=ws://localhost:8000
+    export SURREALDB_NAMESPACE=elephant
+    export SURREALDB_DATABASE=main
+    export SURREALDB_USER=root
+    export SURREALDB_PASS=root
+    export SKIP_AUTH=true  # Local development only
+    export ELEPHANT_HOST=127.0.0.1
+    ./scripts/repo-cargo run -p elephant-bin -- migrate
+
+    # 3. Start API server
+    ./scripts/repo-cargo run -p elephant-bin -- serve --server-only
+
+    # 4. (Optional) Start pipeline worker separately
+    ./scripts/repo-cargo run -p elephant-bin -- worker
+
+    # 5. (Optional) Run fully embedded mode instead of SurrealDB
+    ELEPHANT_DB=elephant-db ./scripts/repo-cargo run -p elephant-bin -- serve
+    ```
+  </Tab>
+</Tabs>
+
+## Setup
+
+<Steps>
+  <Step title="Prerequisites">
+    Install Docker and Docker Compose. SurrealDB v2.4.1 is pulled automatically.
+  </Step>
+  <Step title="Configure environment">
+    Copy `.env.example` to `.env` and set required variables:
+
+    ```bash
+    cp .env.example .env
+    ```
+
+    At minimum, set `OPENAI_API_KEY` (if using OpenAI embeddings) and `ANTHROPIC_API_KEY` (for extraction).
+  </Step>
+  <Step title="Start the database and apply schema">
+    ```bash
+    docker compose up -d surrealdb
+    docker compose run --rm elephant elephant migrate
+    ```
+
+    This applies schema using the same service configuration as the server.
+    For existing data, first rehearse against a consistent backup. Migrations
+    are forward-only; rollback requires the matching database backup.
+  </Step>
+  <Step title="Start Elephant">
+    ```bash
+    docker compose up -d elephant
+    ```
+  </Step>
+  <Step title="Verify health">
+    ```bash
+    # API health
+    curl http://localhost:3000/v1/health
+
+    # SurrealDB health
+    curl http://localhost:8000/health
+    ```
+  </Step>
+</Steps>
+
+## Environment Variable Reference
+
+The tables describe binary defaults unless a Compose override is stated.
+Compose reads its `.env` file for substitution; running the binary directly
+does not automatically source that file. Set variables in the environment
+actually inherited by the process or use the managed runtime configuration.
+
+
+### Core (API Server)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ELEPHANT_HOST` | `0.0.0.0` | Server bind address |
+| `ELEPHANT_PORT` | `3000` | Server bind port |
+| `ELEPHANT_DB` | `surreal-db` | Storage backend: `surreal-db` or `elephant-db` |
+| `ELEPHANT_DB_SNAPSHOT_LOAD` | _(none)_ | Snapshot file to load at startup in embedded mode |
+| `RUST_LOG` | `info` | Log level filter (see [Observability](/operations/observability)) |
+
+### Authentication
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JWT_SECRET` | _(required with authentication)_ | Random secret with at least 32 bytes for HS256 token validation |
+| `JWT_ALGORITHM` | `HS256` | Only HS256 is supported by the current shared-secret decoder |
+| `JWT_ISSUER` | _(none)_ | Required token issuer (optional) |
+| `JWT_AUDIENCE` | _(none)_ | Required token audience (optional) |
+| `SKIP_AUTH` | `false` | Skip authentication entirely |
+
+<Warning>
+  Use `SKIP_AUTH=true` only for isolated local development. With authentication
+  enabled, startup rejects a missing/development/short secret or an unsupported
+  algorithm. Generate a random secret, pass it through your secret manager,
+  and do not commit it.
+</Warning>
+
+### SurrealDB Connection
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SURREALDB_URL` | `ws://localhost:8000` | Database WebSocket URL |
+| `SURREALDB_NAMESPACE` | `elephant` | Database namespace |
+| `SURREALDB_DATABASE` | `test` for API/worker; `main` for migration CLI | Set explicitly and identically for all processes; `.env.example` uses `main` |
+| `SURREALDB_USER` | `root` | Database username |
+| `SURREALDB_PASS` | `root` | Local development database password; configure your own credentials for deployment |
+| `SURREALDB_QUERY_TIMEOUT_SECS` | `30` | Embedded SurrealDB engine query deadline, positive integer seconds (1-86400) |
+| `SURREALDB_TRANSACTION_TIMEOUT_SECS` | `30` | Embedded transaction limit; the shorter of this and query timeout bounds the query batch |
+| `SURREAL_QUERY_TIMEOUT` | `30s` in Compose | Remote SurrealDB server query deadline; not an Elephant client-side limit |
+
+<Note>
+  `SURREALDB_*` variables only apply when `ELEPHANT_DB=surreal-db`. In Docker Compose, the SurrealDB URL is `ws://surrealdb:8000`; for local development, use `ws://localhost:8000`.
+</Note>
+
+Embedded SurrealDB deadline changes require a process restart. SurrealDB 2.6.5
+does not enforce its transaction option independently, so Elephant applies the
+shorter configured limit as its engine query-batch deadline. Remote connections
+do not apply these client options to the server. See the
+[capacity and retention guide](https://github.com/lukacf/elephant/blob/main/docs/work-queue-capacity.md)
+for cancellation and archival details.
+
+### MCP transport
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MCP_ALLOWED_HOSTS` | loopback hosts | Comma-separated remote hostnames or `host:port` values; loopback remains allowed |
+| `MCP_ALLOWED_ORIGINS` | unrestricted by this optional origin filter | Comma-separated exact browser origins; scheme, host, and effective port must match |
+| `MCP_BEARER_TOKEN` | _(none)_ | Bearer token for pipeline calls to authenticated Elephant MCP endpoints |
+
+Requests without an `Origin` header remain accepted. The opaque `null` origin
+requires an explicit entry. Host/origin checks do not replace JWT or ABAC.
+For example, use `MCP_ALLOWED_HOSTS=elephant.example.com` behind a reverse proxy
+and forward the corresponding host header.
+
+### Embedded snapshots
+
+Snapshot import/export is available only when `ELEPHANT_DB=elephant-db`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ELEPHANT_SNAPSHOT_DIR` | _(none)_ | Optional base directory used to constrain snapshot import/export paths |
+
+Operational helpers:
+
+```bash
+elephant snapshot export /tmp/elephant.json
+elephant snapshot import /tmp/elephant.json
+```
+
+### Pipeline: Embed Worker
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PIPELINE_EMBED_ENABLED` | `true` | Enable the embedding worker |
+| `PIPELINE_EMBED_POLL_INTERVAL` | `5` | Poll interval in seconds |
+| `PIPELINE_EMBED_BATCH_SIZE` | `100` | Batch size for embedding requests |
+| `PIPELINE_EMBED_PROVIDER` | `fake` | Provider: `fake`, `openai`, or `fastembed` |
+| `PIPELINE_EMBED_MODEL` | `text-embedding-3-large` | Embedding model name |
+| `PIPELINE_EMBED_DIMS` | `3072` | Embedding vector dimensions |
+
+<Accordion title="Embedding provider details">
+  - **`fake`**: Returns zero vectors. Use for testing only.
+  - **`openai`**: Uses the OpenAI embeddings API. Requires `OPENAI_API_KEY`.
+  - **`fastembed`**: Local ONNX-based embeddings via FastEmbed. No API key needed but requires the `fastembed` feature flag at compile time.
+</Accordion>
+
+### Pipeline: Retention Worker
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PIPELINE_RETENTION_ENABLED` | `true` | Enable the retention worker |
+| `PIPELINE_RETENTION_POLL_INTERVAL` | `3600` | Poll interval in seconds (default: 1 hour) |
+| `PIPELINE_RETENTION_DAYS` | `30` | Age cutoff for legacy cleanup and terminal work archival |
+| `PIPELINE_WORK_HISTORY_POLL_INTERVAL` | `60` | Independent work-history archival cadence in seconds (1-86400) |
+| `PIPELINE_WORK_HISTORY_BATCH_SIZE` | `1000` | Maximum jobs and completed attempts archived per pass (1-1000) |
+
+### Pipeline: Work Queue
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PIPELINE_WORK_QUEUE_ENABLED` | `true` | Enable the work queue processor |
+| `PIPELINE_WORK_QUEUE_POLL_INTERVAL` | `5` | Poll interval in seconds |
+| `PIPELINE_WORK_QUEUE_LEASE_SECS` | `300` | Lease duration for claimed work items (seconds) |
+| `PIPELINE_WORK_QUEUE_BATCH_SIZE` | `100` | Max items fetched per poll |
+| `PIPELINE_WORK_QUEUE_WORKER_ID` | _(auto)_ | Worker identifier override |
+| `PIPELINE_MAX_CONCURRENT` | `8` | Max concurrent work items processed in parallel |
+| `PIPELINE_MAX_EXTRACT_CONCURRENT` | `4` | Max concurrent assertion extraction work items |
+| `PIPELINE_WORK_ITEM_TIMEOUT_SECS` | `420` | Claimed work-item lifecycle timeout |
+
+### Pipeline: Transient Retry
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PIPELINE_WORK_TRANSIENT_RETRY_MAX_ATTEMPTS` | `3` | Max retry attempts for transient failures |
+| `PIPELINE_WORK_TRANSIENT_RETRY_BASE_DELAY_SECS` | `10` | Base delay for exponential backoff (seconds) |
+| `PIPELINE_WORK_TRANSIENT_RETRY_MAX_DELAY_SECS` | `120` | Maximum backoff delay cap (seconds) |
+
+### Pipeline: Resolution / Disambiguation
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PIPELINE_RESOLUTION_DISAMBIGUATION_ENABLED` | `true` | Enable LLM disambiguation for multiple entity candidates |
+| `PIPELINE_RESOLUTION_DISAMBIGUATION_MODEL` | `claude-3-5-sonnet` | Compatibility-path model default; configure a model available to your provider |
+| `PIPELINE_RESOLUTION_DISAMBIGUATION_MAX_TOKENS` | `800` | Max tokens per disambiguation call |
+| `PIPELINE_RESOLUTION_DISAMBIGUATION_TIMEOUT_SECS` | `15` | Wall time limit for disambiguation (seconds) |
+| `PIPELINE_PROMOTION_DISAMBIGUATION_MODEL` | `claude-sonnet-4-5` | LLM model for entity-reuse disambiguation at promotion (active when `ANTHROPIC_API_KEY` is set; without a key, type-incompatible matches create a new entity instead of merging) |
+
+### Pipeline: Summarization
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PIPELINE_SUMMARIZER_MODEL` | `claude-sonnet-4-5` | LLM model for doc-tree section summaries; failure falls back to truncation with a logged warning |
+
+### Pipeline: Truth Maintenance
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PIPELINE_TRUTH_MAINTENANCE_ENABLED` | `true` | Enable truth maintenance worker |
+| `PIPELINE_TRUTH_MAINTENANCE_POLL_INTERVAL` | `5` | Poll interval in seconds |
+| `PIPELINE_TRUTH_MAINTENANCE_BATCH_SIZE` | `100` | Max events per batch |
+| `PIPELINE_TM_MODEL` | `claude-sonnet-4-5` | LLM model for conflict adjudication. Adjudication is active only when `ANTHROPIC_API_KEY` is set; without a key, TM falls back to deterministic conflict policies and never supersedes without configured semantics |
+
+### Pipeline: Maintenance (Identity Resolution)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PIPELINE_MAINTENANCE_ENABLED` | `true` | Enable maintenance worker |
+| `PIPELINE_MAINTENANCE_POLL_INTERVAL` | `300` | Poll interval in seconds (default: 5 minutes) |
+| `PIPELINE_MAINTENANCE_MCP_URL` | `http://127.0.0.1:3000/mcp/maintenance` | MCP URL for maintenance agent |
+| `PIPELINE_MAINTENANCE_MODEL` | `gpt-5.2` | LLM model for maintenance decisions |
+| `PIPELINE_MAINTENANCE_AUTO_MERGE_THRESHOLD` | `0.9` | Confidence threshold for auto-merging entities |
+| `PIPELINE_MAINTENANCE_MAX_CANDIDATES` | `50` | Max candidate pairs per sweep |
+
+### Pipeline: Agentic Extraction
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PIPELINE_AGENTIC_MCP_URL` | `http://127.0.0.1:3000/mcp/agent` | MCP URL for the agentic extractor |
+| `PIPELINE_AGENTIC_MODEL` | `gpt-5.6-sol` | Binary model default; Compose overrides with `claude-opus-4-6` |
+| `PIPELINE_SKILLS_DIR` | `./skills` | Extraction skill directory; Compose mounts and selects `/skills` |
+
+### Living Wiki Editorial Models
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ELEPHANT_WIKI_WRITER_MODEL` | `PIPELINE_AGENTIC_MODEL`, then `gpt-5.6-sol` | Meerkat model used to write structured, citation-bearing wiki articles |
+| `ELEPHANT_WIKI_VERIFIER_MODEL` | writer model | Meerkat model used in a separate call to verify every article statement for evidence entailment and subject relevance |
+| `ELEPHANT_WIKI_MAX_OUTPUT_TOKENS` | `32000` | Maximum output tokens for one wiki model call, clamped to 4000-64000 so evidence-rich core articles can complete their structured response |
+| `ELEPHANT_WIKI_STRUCTURED_OUTPUT_RETRIES` | `5` | In-session schema-repair retries, clamped to 1-8, before a malformed structured response is returned to the outer editorial loop |
+| `ELEPHANT_WIKI_MAX_CONTEXT_CHARS` | `400000` | Maximum serialized evidence catalog supplied to one article writer/verifier, clamped to 50000-1000000 so evidence-rich core pages do not fail at the earlier 200000-character ceiling |
+| `ELEPHANT_WIKI_MAX_EDITORIAL_ATTEMPTS` | `6` | Bounded writer-verifier attempts per article, clamped to 1-12; structured-output failures receive an explicit format-recovery prompt before retry |
+| `ELEPHANT_WIKI_PLANNER_CONCURRENCY` | `4` | Concurrent bounded full-graph planning shards, clamped to 1-8 |
+| `ELEPHANT_WIKI_ARTICLE_CONCURRENCY` | `4` | Concurrent article writer and verifier jobs inside one serialized reconciliation, clamped to 1-32 |
+| `ELEPHANT_WIKI_CHANGE_DEBOUNCE_SECS` | `300` | Delay used to coalesce canonical graph changes before managed wiki reconciliation, clamped to 30-3600 seconds |
+| `ELEPHANT_KNOWLEDGE_VIEW_EVENT_POLL_SECS` | `5` | Independent outbox polling interval for projection invalidation and Living Wiki change scheduling, clamped to 1-300 seconds |
+
+### Pipeline: Budget Control
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PIPELINE_BUDGET_DAILY_ITEMS_GRAPH` | `10000` | Daily budget limit for graph-mode items |
+
+### API Keys
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENAI_API_KEY` | _(none)_ | OpenAI API key (required for `openai` embed provider) |
+| `ANTHROPIC_API_KEY` | _(none)_ | Required for Compose's Anthropic extractor; also enables truth-maintenance adjudication, promotion disambiguation, and doc-tree summarization |
+
+## Migrations
+
+Elephant uses SurrealQL migrations managed by `elephant migrate`:
+
+```bash
+# Use the same database environment as the running server.
+# With Compose, inherit it from the elephant service:
+docker compose run --rm elephant elephant migrate
+```
+
+<Warning>
+  Migrations are forward-only. There is no automatic rollback. To revert, restore from a database backup and re-run migrations against the restored database.
+</Warning>
+
+## Docker Compose Reference
+
+The `docker-compose.yml` defines two services:
+
+- **`surrealdb`** -- SurrealDB v2.4.1 with file-based persistence (`surrealdb_data` volume). Health check via `/surreal is-ready`.
+- **`elephant`** -- API server with managed pipeline workers. Health check via `GET /v1/health`.
+
+The local ports bind to loopback. The skills directory is mounted read-only at
+`/skills` in the Elephant container. Configure a separate production deployment
+with database credentials, TLS, JWT authentication, and restricted network
+access; publishing the development ports is not a production configuration.
+
+## Stopping and Cleanup
+
+```bash
+# Stop services (preserves data)
+docker compose down
+
+# Stop and remove all data volumes
+docker compose down -v
+```

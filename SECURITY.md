@@ -1,0 +1,51 @@
+# Security Policy
+
+Elephant handles provenance, authorization, and tenant isolation data, so please
+report vulnerabilities privately first.
+
+## Supported Versions
+
+Security fixes are prepared against `main` and the latest tagged release. During
+the pre-1.0 period, older releases may receive fixes when the patch is small and
+the affected surface is still active.
+
+## Reporting A Vulnerability
+
+Use [GitHub private vulnerability reporting](https://github.com/lukacf/elephant/security/advisories/new)
+when the repository has it enabled. Before public launch, maintainers must enable
+that channel and verify that an external reporter can reach it. While it is
+unavailable, request a private contact route without including vulnerability
+details in a public issue.
+
+Please include:
+
+- affected commit or release tag
+- the vulnerable endpoint, MCP tool, crate, or workflow
+- reproduction steps
+- expected impact
+- any suggested mitigation
+
+We aim to acknowledge reports within seven days and will coordinate disclosure
+timing with the reporter when a fix is needed.
+
+## Sensitive Data
+
+Do not include real API keys, bearer tokens, database credentials, customer data,
+or private documents in issues, pull requests, fixtures, logs, screenshots, or
+test artifacts.
+
+## Deployment defaults
+
+Authenticated servers require `JWT_SECRET` with at least 32 random bytes and
+`JWT_ALGORITHM=HS256`. Startup rejects missing or short secrets. Setting
+`SKIP_AUTH=true` explicitly bypasses authentication and ABAC for local development.
+The Compose examples bind published ports to loopback and use development
+database credentials; they require a separate production configuration.
+
+## Repository checks
+
+CI scans reachable Git history with the built-in Gitleaks rules. Its narrow
+allowlist covers synthetic assertion idempotency keys only. Use a manual privacy
+review as well: names, household data, incident narratives and private project
+paths are often not credentials and are not detected by a secret scanner.
+Source archive exclusions do not hide files from Git history or GitHub PRs.

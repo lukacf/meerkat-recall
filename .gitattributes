@@ -1,0 +1,23 @@
+# Keep generated/local development artifacts out of source archives.
+/.agents export-ignore
+/.claude export-ignore
+/.codemob-mcp export-ignore
+/.codex export-ignore
+/.codex-command-logs export-ignore
+/.elephant export-ignore
+/.elephant-snapshots export-ignore
+/.mcp-the-force export-ignore
+/.playwright-mcp export-ignore
+/.rct export-ignore
+/.rct-old export-ignore
+/.tmp export-ignore
+/docs/.internal export-ignore
+
+# Root-level debug artifacts from local release and docs work.
+/Elephant_Presentation.pptx export-ignore
+/nohup.out export-ignore
+/pit-full-check.png export-ignore
+/putting-it-together-full.png export-ignore
+/*.octoshift.log export-ignore
+/*.octoshift.verbose.log export-ignore
+/test-ingest.md export-ignore

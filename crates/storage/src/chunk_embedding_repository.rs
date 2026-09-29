@@ -1,0 +1,1143 @@
+//! `NodeEmbedding` repository implementation for `SurrealDB`.
+
+use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
+
+use elephant_embeddings::{level_bucket, PartitionKey, PartitionManager};
+use elephant_types::records::entity::Entity;
+use elephant_types::records::{DocNode, NodeEmbedding};
+use elephant_types::{Link, RecordId};
+
+use crate::client::StorageClient;
+use crate::error::{StorageError, StorageResult};
+use crate::repository::Repository;
+use crate::require::required_field;
+
+/// `NodeEmbedding` repository for `SurrealDB`.
+#[derive(Clone, Debug)]
+pub struct NodeEmbeddingRepository {
+    client: StorageClient,
+    partition_manager: PartitionManager,
+}
+
+impl NodeEmbeddingRepository {
+    /// Creates a new chunk embedding repository.
+    #[must_use]
+    pub const fn new(client: StorageClient, partition_manager: PartitionManager) -> Self {
+        Self {
+            client,
+            partition_manager,
+        }
+    }
+
+    fn validate_embedding_batch(
+        space_id: &str,
+        node_ids: &[RecordId],
+        model: &str,
+        embeddings: &[NodeEmbedding],
+    ) -> StorageResult<()> {
+        if node_ids.len() != embeddings.len() {
+            return Err(StorageError::QueryError(format!(
+                "Embedding batch length mismatch: {} node ids for {} embeddings",
+                node_ids.len(),
+                embeddings.len()
+            )));
+        }
+
+        for (node_id, embedding) in node_ids.iter().zip(embeddings) {
+            if embedding.node.id() != node_id {
+                return Err(StorageError::QueryError(format!(
+                    "Embedding batch mismatch: node id {} does not match embedding node {}",
+                    node_id,
+                    embedding.node.id()
+                )));
+            }
+            if embedding.base.space_id != space_id {
+                return Err(StorageError::QueryError(format!(
+                    "Embedding batch space mismatch: expected `{space_id}` but embedding {} targets `{}`",
+                    embedding.node.id(),
+                    embedding.base.space_id
+                )));
+            }
+            if embedding.model != model {
+                return Err(StorageError::QueryError(format!(
+                    "Embedding batch model mismatch: expected `{model}` but embedding {} targets `{}`",
+                    embedding.node.id(),
+                    embedding.model
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Stores an embedding in the appropriate partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if partition creation, query execution, or deserialization fails.
+    pub async fn store_embedding(&self, embedding: NodeEmbedding) -> StorageResult<NodeEmbedding> {
+        let mut stored = self.store_embeddings_bulk(vec![embedding]).await?;
+        stored.pop().ok_or_else(|| {
+            StorageError::QueryError(
+                "Bulk embedding store returned no records for a single input".to_string(),
+            )
+        })
+    }
+
+    /// Stores multiple embeddings while preserving the requested order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if partition creation, query execution, or deserialization fails.
+    #[allow(clippy::too_many_lines)]
+    pub async fn store_embeddings_bulk(
+        &self,
+        embeddings: Vec<NodeEmbedding>,
+    ) -> StorageResult<Vec<NodeEmbedding>> {
+        if embeddings.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if let Some(store) = self.client.embedded_store() {
+            return store
+                .mutate(|mutation| {
+                    let now = Utc::now();
+                    let mut stored = Vec::with_capacity(embeddings.len());
+                    for mut embedding in embeddings {
+                        embedding.base.id = embedding.node.id().clone();
+                        embedding.base.updated_at = now;
+                        if mutation
+                            .get::<NodeEmbedding>(
+                                &embedding.base.space_id,
+                                &embedding.base.id,
+                                true,
+                            )?
+                            .is_some()
+                        {
+                            stored.push(mutation.replace(embedding)?);
+                        } else {
+                            stored.push(mutation.create(embedding)?);
+                        }
+                    }
+                    Ok(stored)
+                })
+                .await;
+        }
+
+        let now = Utc::now();
+        let mut stored = Vec::with_capacity(embeddings.len());
+        let mut ensured_partitions = HashSet::new();
+
+        for mut embedding in embeddings {
+            let vector_norm = embedding
+                .vector
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            let key = PartitionKey::new(
+                embedding.base.security.policy_id.clone(),
+                level_bucket(embedding.base.security.level),
+                embedding.model.clone(),
+                embedding.vector.len(),
+            )
+            .map_err(|e| StorageError::QueryError(e.to_string()))?;
+
+            let table_name = key.table_name();
+            if ensured_partitions.insert(table_name.clone()) {
+                self.partition_manager
+                    .ensure_partition(&key, {
+                        let client = self.client.clone();
+                        move |ddl| async move {
+                            client
+                                .query(&ddl)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        }
+                    })
+                    .await
+                    .map_err(|e| StorageError::QueryError(e.to_string()))?;
+            }
+
+            let embedding_id = surrealdb::sql::Thing::from((
+                table_name,
+                surrealdb::sql::Id::Uuid(embedding.node.id().id().into()),
+            ));
+
+            embedding.base.updated_at = now;
+
+            // Checked: a failed UPSERT (write conflict, dims/type error) must
+            // surface instead of the embedding being reported as stored while
+            // the vector was never persisted.
+            self.client
+                .query_bind_checked(
+                    "UPSERT $id SET
+                            space_id = $space_id,
+                            created_at = $created_at,
+                            updated_at = $updated_at,
+                            created_by = $created_by,
+                            deleted_at = $deleted_at,
+                            security = $security,
+                            provenance = $provenance,
+                            subjects = $subjects,
+                            subjects_state = $subjects_state,
+                            node = $node,
+                            model = $model,
+                            dims = type::int($dims),
+                            vector_norm = $vector_norm,
+                            vector = $vector;
+                        SELECT * FROM $id",
+                    crate::bindings! {
+                        "id" => embedding_id,
+                        "space_id" => embedding.base.space_id.clone(),
+                        "created_at" => crate::surreal::datetime_from_chrono(embedding.base.created_at),
+                        "updated_at" => crate::surreal::datetime_from_chrono(now),
+                        "created_by" => embedding.base.created_by.clone(),
+                        "deleted_at" => embedding.base.deleted_at.map_or(surrealdb::sql::Value::None, |value| {
+                            surrealdb::sql::Value::from(crate::surreal::datetime_from_chrono(value))
+                        }),
+                        "security" => crate::surreal::security_to_value(&embedding.base.security),
+                        "provenance" => crate::surreal::provenance_to_value(&embedding.base.provenance)?,
+                        "subjects" => crate::surreal::things_from_links(embedding.base.subjects.clone()),
+                        "subjects_state" => crate::surreal::enum_to_surreal(&embedding.base.subjects_state)?,
+                        "node" => crate::surreal::thing_from_record_id(embedding.node.id()),
+                        "model" => embedding.model.clone(),
+                        "dims" => embedding.dims,
+                        "vector_norm" => f64::from(vector_norm),
+                        "vector" => surrealdb::sql::Value::Array(surrealdb::sql::Array::from(embedding.vector.clone())),
+                    },
+                )
+                .await?;
+
+            // Only reached when the checked UPSERT succeeded. Avoid
+            // deserializing the stored embedding record here; the driver has
+            // issues parsing some Surreal values for embedding partitions.
+            stored.push(embedding);
+        }
+
+        Ok(stored)
+    }
+
+    /// Stores embeddings and marks the corresponding nodes as embedded in one
+    /// logical write path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any node is missing/deleted, partition creation
+    /// fails, or either backend cannot commit the combined write.
+    #[allow(clippy::too_many_lines)]
+    pub async fn store_embeddings_and_mark_nodes(
+        &self,
+        space_id: &str,
+        node_ids: &[RecordId],
+        model: &str,
+        updated_at: DateTime<Utc>,
+        embeddings: Vec<NodeEmbedding>,
+    ) -> StorageResult<()> {
+        if embeddings.is_empty() {
+            return Ok(());
+        }
+
+        Self::validate_embedding_batch(space_id, node_ids, model, &embeddings)?;
+
+        if let Some(store) = self.client.embedded_store() {
+            let space_id = space_id.to_string();
+            let node_ids = node_ids.to_vec();
+            let model = model.to_string();
+            return store
+                .mutate(|mutation| {
+                    for (node_id, mut embedding) in node_ids.into_iter().zip(embeddings) {
+                        let Some(mut node) = mutation.get::<DocNode>(&space_id, &node_id, true)?
+                        else {
+                            return Err(StorageError::NotFound(format!(
+                                "DocNode not found in space: {node_id}"
+                            )));
+                        };
+                        if node.base.deleted_at.is_some() {
+                            return Err(StorageError::NotFound(format!(
+                                "DocNode is deleted: {node_id}"
+                            )));
+                        }
+
+                        node.embedding_model = Some(model.clone());
+                        node.base.updated_at = updated_at;
+                        let _ = mutation.replace(node)?;
+
+                        embedding.base.id = embedding.node.id().clone();
+                        embedding.base.updated_at = updated_at;
+                        if mutation
+                            .get::<NodeEmbedding>(
+                                &embedding.base.space_id,
+                                &embedding.base.id,
+                                true,
+                            )?
+                            .is_some()
+                        {
+                            let _ = mutation.replace(embedding)?;
+                        } else {
+                            let _ = mutation.create(embedding)?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await;
+        }
+
+        let mut ensured_partitions = HashSet::new();
+        let mut prepared = Vec::with_capacity(embeddings.len());
+
+        for mut embedding in embeddings {
+            let vector_norm = embedding
+                .vector
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            let key = PartitionKey::new(
+                embedding.base.security.policy_id.clone(),
+                level_bucket(embedding.base.security.level),
+                embedding.model.clone(),
+                embedding.vector.len(),
+            )
+            .map_err(|e| StorageError::QueryError(e.to_string()))?;
+
+            let table_name = key.table_name();
+            if ensured_partitions.insert(table_name.clone()) {
+                self.partition_manager
+                    .ensure_partition(&key, {
+                        let client = self.client.clone();
+                        move |ddl| async move {
+                            client
+                                .query(&ddl)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        }
+                    })
+                    .await
+                    .map_err(|e| StorageError::QueryError(e.to_string()))?;
+            }
+
+            let embedding_id = surrealdb::sql::Thing::from((
+                table_name,
+                surrealdb::sql::Id::Uuid(embedding.node.id().id().into()),
+            ));
+            embedding.base.id = embedding.node.id().clone();
+            embedding.base.updated_at = updated_at;
+            prepared.push((embedding, embedding_id, f64::from(vector_norm)));
+        }
+
+        let mut sql = String::from("BEGIN TRANSACTION;\n");
+        let mut bindings = BTreeMap::<String, surrealdb::sql::Value>::new();
+        bindings.insert(
+            "space_id".to_string(),
+            surrealdb::sql::Value::from(space_id.to_string()),
+        );
+        bindings.insert(
+            "model".to_string(),
+            surrealdb::sql::Value::from(model.to_string()),
+        );
+        bindings.insert(
+            "updated_at".to_string(),
+            surrealdb::sql::Value::from(crate::surreal::datetime_from_chrono(updated_at)),
+        );
+
+        for (idx, (node_id, (embedding, embedding_id, vector_norm))) in
+            node_ids.iter().zip(prepared.into_iter()).enumerate()
+        {
+            let prefix = format!("embedding_{idx}");
+            let node_id_key = format!("node_id_{idx}");
+            let updated_key = format!("updated_node_{idx}");
+            let _ = writeln!(
+                sql,
+                "LET ${updated_key} = (UPDATE ONLY ${node_id_key} MERGE {{ embedding_model: $model, updated_at: $updated_at }} RETURN AFTER);"
+            );
+            let _ = writeln!(
+                sql,
+                "IF ${updated_key} = NONE OR ${updated_key}.space_id != $space_id OR ${updated_key}.deleted_at != NONE {{ THROW 'DocNode not found in space: {node_id}'; }};"
+            );
+            let _ = writeln!(
+                sql,
+                "UPSERT ${prefix}_id SET
+                        space_id = ${prefix}_space_id,
+                        created_at = ${prefix}_created_at,
+                        updated_at = $updated_at,
+                        created_by = ${prefix}_created_by,
+                        deleted_at = ${prefix}_deleted_at,
+                        security = ${prefix}_security,
+                        provenance = ${prefix}_provenance,
+                        subjects = ${prefix}_subjects,
+                        subjects_state = ${prefix}_subjects_state,
+                        node = ${prefix}_node,
+                        model = ${prefix}_model,
+                        dims = type::int(${prefix}_dims),
+                        vector_norm = ${prefix}_vector_norm,
+                        vector = ${prefix}_vector;"
+            );
+
+            bindings.insert(
+                node_id_key,
+                surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(node_id)),
+            );
+            bindings.insert(format!("{prefix}_id"), embedding_id.into());
+            bindings.insert(
+                format!("{prefix}_space_id"),
+                surrealdb::sql::Value::from(embedding.base.space_id.clone()),
+            );
+            bindings.insert(
+                format!("{prefix}_created_at"),
+                surrealdb::sql::Value::from(crate::surreal::datetime_from_chrono(
+                    embedding.base.created_at,
+                )),
+            );
+            bindings.insert(
+                format!("{prefix}_created_by"),
+                surrealdb::sql::Value::from(embedding.base.created_by.clone()),
+            );
+            bindings.insert(
+                format!("{prefix}_deleted_at"),
+                embedding
+                    .base
+                    .deleted_at
+                    .map_or(surrealdb::sql::Value::None, |value| {
+                        surrealdb::sql::Value::from(crate::surreal::datetime_from_chrono(value))
+                    }),
+            );
+            bindings.insert(
+                format!("{prefix}_security"),
+                crate::surreal::security_to_value(&embedding.base.security),
+            );
+            bindings.insert(
+                format!("{prefix}_provenance"),
+                crate::surreal::provenance_to_value(&embedding.base.provenance)?,
+            );
+            bindings.insert(
+                format!("{prefix}_subjects"),
+                surrealdb::sql::Value::Array(crate::surreal::things_from_links(
+                    embedding.base.subjects.clone(),
+                )),
+            );
+            bindings.insert(
+                format!("{prefix}_subjects_state"),
+                crate::surreal::enum_to_surreal(&embedding.base.subjects_state)?,
+            );
+            bindings.insert(
+                format!("{prefix}_node"),
+                surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(
+                    embedding.node.id(),
+                )),
+            );
+            bindings.insert(
+                format!("{prefix}_model"),
+                surrealdb::sql::Value::from(embedding.model.clone()),
+            );
+            bindings.insert(
+                format!("{prefix}_dims"),
+                surrealdb::sql::Value::from(embedding.dims),
+            );
+            bindings.insert(
+                format!("{prefix}_vector_norm"),
+                surrealdb::sql::Value::from(vector_norm),
+            );
+            bindings.insert(
+                format!("{prefix}_vector"),
+                surrealdb::sql::Value::Array(surrealdb::sql::Array::from(embedding.vector.clone())),
+            );
+        }
+
+        sql.push_str("COMMIT TRANSACTION;");
+        // Checked + retried: the explicit BEGIN..COMMIT batch is atomic, so a
+        // retryable conflict means nothing was committed and replaying the
+        // whole transaction is safe.
+        let _response = self
+            .client
+            .query_bind_checked(&sql, bindings)
+            .await
+            .map_err(|e| match e {
+                StorageError::QueryError(msg) => {
+                    StorageError::QueryError(format!("DocNode embedding transaction failed: {msg}"))
+                }
+                other => other,
+            })?;
+        Ok(())
+    }
+
+    /// Searches a specific embedding partition using vector similarity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or deserialization fails.
+    pub async fn search_partition(
+        &self,
+        key: &PartitionKey,
+        space_id: &str,
+        vector: &[f32],
+        limit: usize,
+        collection: Option<&str>,
+        include_deleted: bool,
+    ) -> StorageResult<Vec<NodeEmbeddingVectorHit>> {
+        if let Some(store) = self.client.embedded_store() {
+            return store
+                .search_node_embeddings(
+                    &key.table_name(),
+                    space_id,
+                    vector,
+                    limit,
+                    collection,
+                    include_deleted,
+                )
+                .await
+                .map(|hits| {
+                    hits.into_iter()
+                        .map(|hit| NodeEmbeddingVectorHit {
+                            node_id: hit.node_id,
+                            doc_id: hit.doc_id,
+                            score: hit.score,
+                        })
+                        .collect()
+                });
+        }
+
+        let table = key.table_name();
+
+        let mut conditions = Vec::new();
+        conditions.push("space_id = $space_id".to_string());
+        if !include_deleted {
+            conditions.push("deleted_at IS NONE".to_string());
+        }
+        if collection.is_some() {
+            conditions.push("node.collection = $collection".to_string());
+        }
+        conditions.push("vector_norm > 0".to_string());
+
+        let where_clause = format!("WHERE {}", conditions.join(" AND "));
+
+        let query = format!(
+            "SELECT node, vector::similarity::cosine(vector, $vector) AS score \
+             FROM {table} {where_clause} ORDER BY score DESC LIMIT {limit}"
+        );
+
+        let mut response = self
+            .client
+            .query_bind(
+                &query,
+                crate::bindings! {
+                    "space_id" => space_id,
+                    "collection" => collection.map_or(surrealdb::sql::Value::None, |value| surrealdb::sql::Value::from(value.to_string())),
+                    "vector" => surrealdb::sql::Value::Array(surrealdb::sql::Array::from(vector.to_vec()))
+                },
+            )
+            .await?;
+
+        let hits: Vec<NodeEmbeddingVectorNodeHitDb> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse embedding hits: {e}"))
+        })?;
+
+        let node_ids = hits
+            .iter()
+            .map(|hit| crate::surreal::record_id_from_thing(&hit.node))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| StorageError::QueryError(e.to_string()))?;
+        let doc_ids_by_node = self.resolve_doc_ids_for_nodes(&node_ids).await?;
+
+        let mut resolved = Vec::with_capacity(hits.len());
+        for hit in hits {
+            if !hit.score.is_finite() {
+                continue;
+            }
+            let node_hit = NodeEmbeddingVectorNodeHit::try_from(hit)?;
+            let Some(doc_id) = doc_ids_by_node.get(&node_hit.node_id).cloned() else {
+                continue;
+            };
+            resolved.push(NodeEmbeddingVectorHit {
+                node_id: node_hit.node_id,
+                doc_id,
+                score: node_hit.score,
+            });
+        }
+
+        Ok(resolved)
+    }
+
+    async fn resolve_doc_ids_for_nodes(
+        &self,
+        node_ids: &[RecordId],
+    ) -> StorageResult<std::collections::HashMap<RecordId, RecordId>> {
+        if node_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let mut node_response = self
+            .client
+            .query_bind(
+                "SELECT id, revision FROM doc_node WHERE id INSIDE $ids",
+                crate::bindings! {
+                    "ids" => surrealdb::sql::Value::Array(surrealdb::sql::Array::from(
+                        node_ids
+                            .iter()
+                            .map(crate::surreal::thing_from_record_id)
+                            .map(surrealdb::sql::Value::from)
+                            .collect::<Vec<_>>(),
+                    )),
+                },
+            )
+            .await?;
+
+        let node_rows: Vec<NodeRevisionLookupDb> = node_response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse doc_node revision lookup: {e}"))
+        })?;
+
+        let mut revision_by_node = std::collections::HashMap::with_capacity(node_rows.len());
+        let mut revision_things = Vec::with_capacity(node_rows.len());
+        for row in node_rows {
+            let node_id = crate::surreal::record_id_from_thing(&row.id)
+                .map_err(|e| StorageError::QueryError(e.to_string()))?;
+            let Some(revision) = row.revision else {
+                continue;
+            };
+            let revision_id = crate::surreal::record_id_from_thing(&revision)
+                .map_err(|e| StorageError::QueryError(e.to_string()))?;
+            revision_things.push(revision);
+            let _ = revision_by_node.insert(node_id, revision_id);
+        }
+
+        if revision_things.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let mut revision_response = self
+            .client
+            .query_bind(
+                "SELECT id, doc FROM doc_revision WHERE id INSIDE $ids",
+                crate::bindings! {
+                    "ids" => surrealdb::sql::Value::Array(surrealdb::sql::Array::from(
+                        revision_things
+                            .into_iter()
+                            .map(surrealdb::sql::Value::from)
+                            .collect::<Vec<_>>(),
+                    )),
+                },
+            )
+            .await?;
+
+        let revision_rows: Vec<RevisionDocLookupDb> = revision_response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse doc_revision doc lookup: {e}"))
+        })?;
+        let mut doc_by_revision = std::collections::HashMap::with_capacity(revision_rows.len());
+        for row in revision_rows {
+            let revision_id = crate::surreal::record_id_from_thing(&row.id)
+                .map_err(|e| StorageError::QueryError(e.to_string()))?;
+            let Some(doc) = row.doc else {
+                continue;
+            };
+            let doc_id = crate::surreal::record_id_from_thing(&doc)
+                .map_err(|e| StorageError::QueryError(e.to_string()))?;
+            let _ = doc_by_revision.insert(revision_id, doc_id);
+        }
+
+        let mut docs_by_node = std::collections::HashMap::with_capacity(revision_by_node.len());
+        for (node_id, revision_id) in revision_by_node {
+            if let Some(doc_id) = doc_by_revision.get(&revision_id) {
+                let _ = docs_by_node.insert(node_id, doc_id.clone());
+            }
+        }
+
+        Ok(docs_by_node)
+    }
+}
+
+/// Vector search hit from a chunk embedding partition.
+#[derive(Debug, Clone)]
+pub struct NodeEmbeddingVectorHit {
+    /// Chunk record ID.
+    pub node_id: RecordId,
+    /// Parent document ID.
+    pub doc_id: RecordId,
+    /// Similarity score (higher is closer for cosine similarity).
+    pub score: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct NodeEmbeddingVectorNodeHitDb {
+    node: surrealdb::sql::Thing,
+    score: f64,
+}
+
+struct NodeEmbeddingVectorNodeHit {
+    node_id: RecordId,
+    score: f64,
+}
+
+impl TryFrom<NodeEmbeddingVectorNodeHitDb> for NodeEmbeddingVectorNodeHit {
+    type Error = StorageError;
+
+    fn try_from(db: NodeEmbeddingVectorNodeHitDb) -> Result<Self, Self::Error> {
+        Ok(Self {
+            node_id: crate::surreal::record_id_from_thing(&db.node)
+                .map_err(|e| StorageError::QueryError(e.to_string()))?,
+            score: db.score,
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct NodeRevisionLookupDb {
+    id: surrealdb::sql::Thing,
+    revision: Option<surrealdb::sql::Thing>,
+}
+
+#[derive(serde::Deserialize)]
+struct RevisionDocLookupDb {
+    id: surrealdb::sql::Thing,
+    doc: Option<surrealdb::sql::Thing>,
+}
+
+/// Database-only proxy for `NodeEmbedding` to avoid flatten/native enum issues.
+#[derive(Deserialize)]
+struct NodeEmbeddingDb {
+    id: surrealdb::sql::Thing,
+    space_id: Option<String>,
+    created_at: Option<chrono::DateTime<Utc>>,
+    updated_at: Option<chrono::DateTime<Utc>>,
+    created_by: Option<String>,
+    deleted_at: Option<chrono::DateTime<Utc>>,
+    provenance: Option<elephant_types::records::base::Provenance>,
+    security: Option<elephant_types::records::base::Security>,
+    subjects: Option<Vec<Link<Entity>>>,
+    subjects_state: Option<elephant_types::records::base::SubjectsState>,
+    node: Option<surrealdb::sql::Thing>,
+    model: Option<String>,
+    dims: Option<f64>,
+    vector: Option<Vec<f32>>,
+}
+
+impl TryFrom<NodeEmbeddingDb> for NodeEmbedding {
+    type Error = StorageError;
+
+    fn try_from(db: NodeEmbeddingDb) -> Result<Self, Self::Error> {
+        Ok(Self {
+            base: elephant_types::records::base::BaseFields {
+                id: crate::surreal::record_id_from_thing(&db.id)
+                    .map_err(|e| StorageError::QueryError(e.to_string()))?,
+                space_id: required_field(db.space_id, "space_id")?,
+                created_at: db
+                    .created_at
+                    .ok_or_else(|| StorageError::QueryError("Missing created_at".to_string()))?,
+                updated_at: db
+                    .updated_at
+                    .ok_or_else(|| StorageError::QueryError("Missing updated_at".to_string()))?,
+                created_by: required_field(db.created_by, "created_by")?,
+                deleted_at: db.deleted_at,
+                provenance: required_field(db.provenance, "provenance")?,
+                security: required_field(db.security, "security")?,
+                subjects: required_field(db.subjects, "subjects")?,
+                subjects_state: required_field(db.subjects_state, "subjects_state")?,
+            },
+            node: Link::new(
+                crate::surreal::record_id_from_thing(
+                    &db.node
+                        .ok_or_else(|| StorageError::QueryError("Missing node link".to_string()))?,
+                )
+                .map_err(|e| StorageError::QueryError(e.to_string()))?,
+            ),
+            model: required_field(db.model, "model")?,
+            dims: {
+                let value = required_field(db.dims, "dims")?;
+                let rounded = value.round();
+                if (value - rounded).abs() > f64::EPSILON
+                    || rounded < f64::from(i32::MIN)
+                    || rounded > f64::from(i32::MAX)
+                {
+                    return Err(StorageError::QueryError(format!(
+                        "Invalid dims value: {value}"
+                    )));
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    rounded as i32
+                }
+            },
+            vector: required_field(db.vector, "vector")?,
+        })
+    }
+}
+
+#[async_trait]
+impl Repository<NodeEmbedding> for NodeEmbeddingRepository {
+    async fn create(&self, record: NodeEmbedding) -> StorageResult<NodeEmbedding> {
+        self.store_embedding(record).await
+    }
+
+    async fn get(&self, _space_id: &str, _id: &RecordId) -> StorageResult<Option<NodeEmbedding>> {
+        Err(StorageError::QueryError(
+            "Direct retrieval from NodeEmbeddingRepository requires partition context".to_string(),
+        ))
+    }
+
+    async fn update(
+        &self,
+        _space_id: &str,
+        _id: &RecordId,
+        _record: NodeEmbedding,
+    ) -> StorageResult<NodeEmbedding> {
+        Err(StorageError::QueryError(
+            "Update not supported for embeddings".to_string(),
+        ))
+    }
+
+    async fn delete(&self, _space_id: &str, _id: &RecordId) -> StorageResult<()> {
+        Err(StorageError::QueryError(
+            "Delete not supported for embeddings".to_string(),
+        ))
+    }
+
+    async fn list(
+        &self,
+        _space_id: &str,
+        _limit: usize,
+        _cursor: Option<&RecordId>,
+    ) -> StorageResult<Vec<NodeEmbedding>> {
+        Err(StorageError::QueryError(
+            "List not supported for embeddings".to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::mixed_attributes_style,
+        clippy::similar_names,
+        clippy::type_complexity,
+        clippy::float_cmp,
+        clippy::const_is_empty,
+        clippy::expect_used,
+        clippy::panic,
+        unused_imports,
+        dead_code,
+        clippy::too_many_lines,
+        clippy::cognitive_complexity
+    )]
+    use super::*;
+
+    use crate::doc_node_repository::DocNodeRepository;
+    use crate::doc_revision_repository::DocRevisionRepository;
+    use crate::repository::Repository;
+    use elephant_embeddings::{PartitionKey, PartitionManager};
+    use elephant_types::records::base::BaseFields;
+    use elephant_types::records::doc_node::{NodeRole, TextSpan};
+    use elephant_types::records::doc_revision::{DocRevision, RendererMetadata, RevisionStatus};
+    use elephant_types::{RecordId, TableName};
+
+    fn make_test_revision(space_id: &str) -> DocRevision {
+        DocRevision {
+            base: BaseFields::new(
+                RecordId::new_v4(TableName::DocRevision),
+                space_id.to_string(),
+                "tester".to_string(),
+            ),
+            doc: Link::new(RecordId::new_v4(TableName::Doc)),
+            text: "hello world".to_string(),
+            text_hash: "hash".to_string(),
+            renderer: RendererMetadata {
+                name: "test-renderer".to_string(),
+                version: "1.0.0".to_string(),
+                config_hash: None,
+            },
+            manifest: None,
+            supersedes: None,
+            status: RevisionStatus::Active,
+            rendered_at: Utc::now(),
+        }
+    }
+
+    fn make_test_node(space_id: &str, revision_id: &RecordId, key: &str) -> DocNode {
+        DocNode {
+            base: BaseFields::new(
+                RecordId::new_v4(TableName::DocNode),
+                space_id.to_string(),
+                "tester".to_string(),
+            ),
+            revision: Link::new(revision_id.clone()),
+            role: NodeRole::Chunk,
+            span: TextSpan::new(0, 5),
+            node_key: key.to_string(),
+            text: Some("hello".to_string()),
+            parent: None,
+            position: 0,
+            depth: 0,
+            embedding_model: None,
+            collection: None,
+        }
+    }
+
+    fn make_test_embedding(space_id: &str, node_id: &RecordId) -> NodeEmbedding {
+        NodeEmbedding {
+            base: BaseFields::new(
+                RecordId::new_v4(TableName::DocNode),
+                space_id.to_string(),
+                "tester".to_string(),
+            ),
+            node: Link::new(node_id.clone()),
+            model: "test-model".to_string(),
+            dims: 3,
+            vector: vec![1.0, 0.0, 0.0],
+        }
+    }
+
+    async fn exercise_partition_vector_search(client: StorageClient) {
+        let revision_repo = DocRevisionRepository::new(client.clone());
+        let node_repo = DocNodeRepository::new(client.clone());
+        let repo = NodeEmbeddingRepository::new(client, PartitionManager::new());
+        let key = PartitionKey::new(
+            "default".to_string(),
+            "L0".to_string(),
+            "test-model".to_string(),
+            3,
+        )
+        .expect("partition key");
+        let query = [0.9_f32, 0.1, 0.0];
+        let fixtures = [
+            (
+                "space",
+                "alpha",
+                [1.0, 0.0, 0.0],
+                "default",
+                "test-model",
+                false,
+            ),
+            (
+                "space",
+                "beta",
+                [0.0, 1.0, 0.0],
+                "default",
+                "test-model",
+                false,
+            ),
+            (
+                "other-space",
+                "alpha",
+                query,
+                "default",
+                "test-model",
+                false,
+            ),
+            ("space", "alpha", query, "other-policy", "test-model", false),
+            ("space", "alpha", query, "default", "other-model", false),
+            ("space", "alpha", query, "default", "test-model", true),
+        ];
+        let mut expected = Vec::new();
+        for (space, collection, vector, policy, model, deleted) in fixtures {
+            // Use the actual write path so vector_norm and revision-to-doc
+            // resolution match records produced by the embedding pipeline.
+            let revision = revision_repo
+                .create(make_test_revision(space))
+                .await
+                .expect("create revision");
+            let mut node = make_test_node(space, &revision.base.id, "vector-node");
+            node.collection = Some(collection.to_string());
+            let node = node_repo.create(node).await.expect("create node");
+            let mut embedding = make_test_embedding(space, &node.base.id);
+            embedding.vector = vector.to_vec();
+            embedding.base.security.policy_id = policy.to_string();
+            embedding.model = model.to_string();
+            if deleted {
+                embedding.base.soft_delete();
+            }
+            repo.store_embedding(embedding)
+                .await
+                .expect("store embedding");
+            expected.push((node.base.id, revision.doc.id().clone()));
+        }
+
+        let hits = repo
+            .search_partition(&key, "space", &query, 1, None, false)
+            .await
+            .expect("nearest search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            (&hits[0].node_id, &hits[0].doc_id),
+            (&expected[0].0, &expected[0].1)
+        );
+        assert!((hits[0].score - 0.993_883_7).abs() < 0.000_001);
+
+        let hits = repo
+            .search_partition(&key, "space", &query, 10, None, false)
+            .await
+            .expect("isolated search");
+        assert_eq!(
+            hits.len(),
+            2,
+            "other spaces, partitions, and deleted rows are excluded"
+        );
+        assert_eq!(hits[0].node_id, expected[0].0);
+        assert_eq!(hits[1].node_id, expected[1].0);
+        assert!(hits[0].score > hits[1].score);
+
+        let hits = repo
+            .search_partition(&key, "space", &query, 10, Some("beta"), false)
+            .await
+            .expect("collection search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            (&hits[0].node_id, &hits[0].doc_id),
+            (&expected[1].0, &expected[1].1)
+        );
+
+        let hits = repo
+            .search_partition(&key, "space", &query, 10, None, true)
+            .await
+            .expect("search including deleted embeddings");
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].node_id, expected[5].0);
+        assert!((hits[0].score - 1.0).abs() < 0.000_001);
+    }
+
+    #[tokio::test]
+    async fn test_partition_vector_search_in_surreal_memory() {
+        exercise_partition_vector_search(
+            StorageClient::new_memory()
+                .await
+                .expect("SurrealDB memory client"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_partition_vector_search_in_embedded_memory() {
+        exercise_partition_vector_search(
+            StorageClient::new_embedded()
+                .await
+                .expect("embedded client"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_store_embeddings_and_mark_nodes_rejects_mismatched_node_ids() {
+        let client = crate::StorageClient::new_embedded()
+            .await
+            .expect("embedded client");
+        let revision_repo = DocRevisionRepository::new(client.clone());
+        let node_repo = DocNodeRepository::new(client.clone());
+        let repo = NodeEmbeddingRepository::new(client, PartitionManager::new());
+
+        let revision = revision_repo
+            .create(make_test_revision("default"))
+            .await
+            .expect("create revision");
+        let first = node_repo
+            .create(make_test_node("default", &revision.base.id, "n1"))
+            .await
+            .expect("create first node");
+        let second = node_repo
+            .create(make_test_node("default", &revision.base.id, "n2"))
+            .await
+            .expect("create second node");
+
+        let err = repo
+            .store_embeddings_and_mark_nodes(
+                "default",
+                std::slice::from_ref(&first.base.id),
+                "test-model",
+                Utc::now(),
+                vec![make_test_embedding("default", &second.base.id)],
+            )
+            .await
+            .expect_err("mismatched batch should fail");
+        assert!(err.to_string().contains("Embedding batch mismatch"));
+
+        let first_after = node_repo
+            .get("default", &first.base.id)
+            .await
+            .expect("load first node")
+            .expect("first node exists");
+        assert!(first_after.embedding_model.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_store_embeddings_and_mark_nodes_rejects_space_mismatch() {
+        let client = crate::StorageClient::new_embedded()
+            .await
+            .expect("embedded client");
+        let revision_repo = DocRevisionRepository::new(client.clone());
+        let node_repo = DocNodeRepository::new(client.clone());
+        let repo = NodeEmbeddingRepository::new(client, PartitionManager::new());
+
+        let revision = revision_repo
+            .create(make_test_revision("default"))
+            .await
+            .expect("create revision");
+        let node = node_repo
+            .create(make_test_node("default", &revision.base.id, "n1"))
+            .await
+            .expect("create node");
+
+        let err = repo
+            .store_embeddings_and_mark_nodes(
+                "default",
+                std::slice::from_ref(&node.base.id),
+                "test-model",
+                Utc::now(),
+                vec![make_test_embedding("other-space", &node.base.id)],
+            )
+            .await
+            .expect_err("space-mismatched batch should fail");
+        assert!(err.to_string().contains("space mismatch"));
+
+        let node_after = node_repo
+            .get("default", &node.base.id)
+            .await
+            .expect("load node")
+            .expect("node exists");
+        assert!(node_after.embedding_model.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_store_embeddings_and_mark_nodes_rejects_model_mismatch() {
+        let client = crate::StorageClient::new_embedded()
+            .await
+            .expect("embedded client");
+        let revision_repo = DocRevisionRepository::new(client.clone());
+        let node_repo = DocNodeRepository::new(client.clone());
+        let repo = NodeEmbeddingRepository::new(client, PartitionManager::new());
+
+        let revision = revision_repo
+            .create(make_test_revision("default"))
+            .await
+            .expect("create revision");
+        let node = node_repo
+            .create(make_test_node("default", &revision.base.id, "n1"))
+            .await
+            .expect("create node");
+
+        let mut embedding = make_test_embedding("default", &node.base.id);
+        embedding.model = "other-model".to_string();
+
+        let err = repo
+            .store_embeddings_and_mark_nodes(
+                "default",
+                std::slice::from_ref(&node.base.id),
+                "test-model",
+                Utc::now(),
+                vec![embedding],
+            )
+            .await
+            .expect_err("model-mismatched batch should fail");
+        assert!(err.to_string().contains("model mismatch"));
+
+        let node_after = node_repo
+            .get("default", &node.base.id)
+            .await
+            .expect("load node")
+            .expect("node exists");
+        assert!(node_after.embedding_model.is_none());
+    }
+}

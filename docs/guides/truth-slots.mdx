@@ -1,0 +1,145 @@
+---
+title: "Truth Slots"
+description: "How to inspect current truth, investigate assertion conflicts, and filter for stale knowledge."
+icon: "scale-balanced"
+---
+
+Truth slots represent Elephant's current belief about a specific claim -- for example, "where does Alex Chen work?" When multiple assertions compete for the same slot, the truth maintenance system resolves conflicts using configurable policies.
+
+## List truth slots
+
+Query truth slots filtered by subject entity, predicate, or staleness.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "subject_entity_id": "entity:550e8400-e29b-41d4-a716-446655440000",
+      "predicate_id": "works_at",
+      "limit": 25
+    }
+    ```
+    Tool: `list_truth_slots`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s "http://localhost:3000/v1/truth-slots?limit=25"
+    ```
+  </Tab>
+</Tabs>
+
+MCP `list_truth_slots` returns summaries containing `slot`, `conflict_count`, and `has_conflict`. The underlying slot has the fields below. REST returns full slots in `results`, with `total` and `cursor`, without the MCP summary fields:
+
+| Field | Description |
+|---|---|
+| `slot_key` | Unique key identifying the subject + predicate combination |
+| `subject_entity` | The entity this truth is about |
+| `predicate_id` | The predicate (e.g., `works_at`, `located_in`) |
+| `current_values` | The currently accepted value(s) with claim IDs |
+| `stale` | Whether the slot needs re-evaluation |
+| `conflict_count` | Number of competing assertions |
+| `has_conflict` | Whether an unresolved conflict exists |
+
+## Filter for stale slots
+
+Stale slots indicate knowledge that may be outdated. Set `stale_only: true` to find them.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "stale_only": true,
+      "limit": 50
+    }
+    ```
+    Tool: `list_truth_slots`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s "http://localhost:3000/v1/truth-slots?stale_only=true&limit=50"
+    ```
+  </Tab>
+</Tabs>
+
+## Investigate conflicts
+
+When a truth slot has competing assertions, use `get_truth_slot_history` to see all assertions that have claimed this slot.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "id": "truth_slot:550e8400-e29b-41d4-a716-446655440000"
+    }
+    ```
+    Tool: `get_truth_slot_history`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s "http://localhost:3000/v1/truth-slots/truth_slot:550e8400.../history"
+    ```
+  </Tab>
+</Tabs>
+
+The MCP history response contains:
+
+| Field | Description |
+|---|---|
+| `slot` | The truth slot record |
+| `conflict_group` | The conflict group if one exists, including all `claim_ids` |
+| `assertions` | Full assertion records for each competing claim |
+
+REST history returns `slot` and an optional `conflict_group`; it does not return the `assertions` array. All reads use the authenticated space. Add a bearer token when authentication is enabled.
+
+## How assertion competition works
+
+When the extraction pipeline processes a document, it produces assertions -- structured claims like "Alex Chen works_at NeuralFlow." Each assertion includes:
+
+1. **Subject and predicate** -- determines which truth slot it targets
+2. **Evidence span** -- links back to the source document chunk
+3. **Confidence score** -- the extraction LLM's certainty
+4. **Observed timestamp** -- when the claim was recorded
+
+Multiple assertions targeting the same truth slot are compared by value. Assertions that agree **corroborate**: their evidence merges into a single winning claim and no conflict is recorded. Genuinely divergent values form a conflict group, which is resolved by an LLM adjudicator that sees the actual values (when `ANTHROPIC_API_KEY` is set) and can corroborate, pick a single winner, let values coexist, supersede with extracted validity dates, or flag for review.
+
+Deployments without an API key fall back to the predicate's deterministic conflict policy:
+
+| Policy | Behavior |
+|---|---|
+| `AllowParallel` | Multiple values coexist (e.g., a person can have multiple roles) |
+| `SupersedeByRecency` | The newest assertion wins |
+| `SplitByContext` | Values are partitioned by context (e.g., role at different companies) |
+| `RequireMoreEvidence` | Flagged for manual review |
+
+## Inspect a single assertion
+
+Drill into an individual assertion to see its evidence, resolution status, and linked entities.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "id": "assertion:550e8400-e29b-41d4-a716-446655440000"
+    }
+    ```
+    Tool: `get_assertion`
+  </Tab>
+</Tabs>
+
+<Accordion title="Advanced: pagination">
+  Both `list_truth_slots` and `list_assertions` support cursor-based pagination. Pass the `cursor` value from the previous response's `next_cursor` field to fetch the next page.
+
+  ```json
+  {
+    "predicate_id": "works_at",
+    "limit": 25,
+    "cursor": "550e8400-e29b-41d4-a716-446655440000"
+  }
+  ```
+</Accordion>
+
+## Next steps
+
+- [Ingesting data](/guides/ingesting-data) -- Feed documents into the extraction pipeline
+- [Building graphs](/guides/building-graphs) -- Create entities and relationships manually
+- [Event streaming](/guides/event-streaming) -- Monitor extraction and resolution events

@@ -1,0 +1,378 @@
+---
+title: "Putting It All Together - Part 1"
+description: "Four worked examples: from source evidence to entities, relationships, and events"
+icon: "puzzle-piece"
+---
+
+<Note>
+The scenarios and output snippets below are illustrative, using fictional
+people, organizations, and device data. Exact model output and timing depend
+on configuration and evidence; these examples are not production acceptance
+results.
+</Note>
+
+You've read about [spaces](/concepts/spaces), [entities](/concepts/entities), [relationships](/concepts/relationships), [documents](/concepts/documents), [assertions](/concepts/assertions), [events](/concepts/events), [truth maintenance](/concepts/truth-maintenance), [predicates](/concepts/predicates), and [security](/concepts/security). This guide ties every concept together by tracing four very different evidence sources through Elephant's pipeline - from raw input to fully connected knowledge graph.
+
+Each section introduces one concept at a time and shows what it produces across all four domains.
+
+---
+
+## The source evidence
+
+<Tabs>
+  <Tab title="Email">
+    ```text
+    From: Bob Martinez <bob@example.com>
+    To: team@acme.com
+    Date: March 15, 2026
+
+    Hi team - I met with Dr. Kim at City Dental yesterday to finalize the
+    corporate wellness partnership. We agreed on Phase 1 pricing ($45/employee)
+    and scheduled the launch for April 1, 2026. Alice from Legal reviewed
+    the contract and flagged a liability clause we need to renegotiate.
+    ```
+  </Tab>
+  <Tab title="IoT">
+    ```text
+    [2026-03-15 07:02:01] motion_sensor_hallway: motion detected
+    [2026-03-15 07:02:03] thermostat_main: occupancy mode activated, target 21°C
+    [2026-03-15 07:02:05] smart_lock_front: unlocked by user "Sam" (fingerprint)
+    [2026-03-15 07:15:00] leak_sensor_kitchen: ALERT water detected under sink
+    [2026-03-15 07:15:02] smart_valve_main: automatic shutoff triggered
+    [2026-03-15 07:16:00] notification_hub: alert sent to Sam, plumber scheduled
+    ```
+  </Tab>
+  <Tab title="Fiction">
+    We ingest the complete novel - all 12 chapters, ~27,000 words - as a single document:
+    ```bash
+    jq -n --rawfile text alice.txt \
+      '{title: "Alice in Wonderland", text: $text, metadata: {author: "Lewis Carroll", year: 1865, domain: "fiction"}, collection: "literature"}' \
+      | curl -fsS http://localhost:3000/v1/docs/ingest \
+          -H 'Content-Type: application/json' --data-binary @-
+    ```
+    Elephant stages a source-backed document, renders the canonical searchable projection, chunks it into semantic segments for retrieval, selects the **fiction extraction skill** from metadata such as `domain: "fiction"`, and builds a knowledge graph spanning the entire narrative.
+  </Tab>
+  <Tab title="Codebase">
+    We ingest the Elephant project itself - source files, documentation, configuration, and git history - using a custom **codebase extraction skill**. The goal isn't to index individual variables or function signatures, but to build a knowledge graph of the project's architecture, design decisions, component relationships, and evolution over time.
+
+    ```bash
+    # Send reviewed project documentation as JSON without shell interpolation.
+    jq -n --rawfile text README.md \
+      '{title: "Elephant README", text: $text, metadata: {domain: "codebase"}, collection: "elephant-codebase"}' \
+      | curl -fsS http://localhost:3000/v1/docs/ingest \
+          -H 'Content-Type: application/json' --data-binary @-
+    ```
+
+    Review source files and history for credentials and private data before
+    sending them to a model-backed service.
+
+    In practice, you'd also ingest key source files (module-level `mod.rs` files, trait definitions, handler registrations) and PR descriptions. A custom extraction skill can focus on architecture instead of syntax.
+  </Tab>
+</Tabs>
+
+---
+
+## Step 1: Documents - storing the source material
+
+When you [ingest](/guides/ingesting-data) each evidence item, Elephant stages a source-backed **Document**, creates immutable **DocRevisions** as the pipeline renders and refines the canonical projection, then chunks that projection into **DocNodes** for vector search and embedding. Entity extraction is a separate step driven by the chosen extraction skill, not by storage-shaped input.
+
+<Tabs>
+  <Tab title="Email">
+    | Record | Value |
+    |--------|-------|
+    | **Doc** | title: "Corporate Wellness Partnership Update" |
+    | **Source** | type: `email`, author: "bob@example.com", timestamp: 2026-03-15 |
+    | **DocRevision** | Full email body (immutable snapshot) |
+    | **DocNodes** | 1 chunk (short email) |
+
+    The Source record captures *where* the content came from - in this case, an email with a known author and date.
+  </Tab>
+  <Tab title="IoT">
+    | Record | Value |
+    |--------|-------|
+    | **Doc** | title: "Home Assistant Log - March 15, 2026" |
+    | **Source** | type: `device_frame`, uri: "hass://logs/2026-03-15" |
+    | **DocRevision** | Full log text |
+    | **DocNodes** | 2 chunks (split at the alert boundary) |
+
+    Device logs may produce multiple chunks for embedding. The chunker recognizes the shift from routine events to the alert sequence. Extraction follows the configured evidence-unit plan and model budgets.
+  </Tab>
+  <Tab title="Fiction">
+    | Record | Value |
+    |--------|-------|
+    | **Doc** | title: "Alice's Adventures in Wonderland" |
+    | **Source** | type: `manual`, collection: "literature" |
+    | **DocRevision** | Full novel text (~27,000 words, immutable snapshot) |
+    | **DocNodes** | **34 chunks** - the chunker splits by chapter and paragraph structure |
+
+    A full book produces many chunks - these are used for **vector search** (each chunk gets its own embedding). Entity extraction is separate: the LLM reads the full document text and extracts the complete knowledge graph in one pass. The `collection: "literature"` lets you scope searches to fiction only.
+  </Tab>
+  <Tab title="Codebase">
+    | Record | Value |
+    |--------|-------|
+    | **Doc** | title: "Elephant AGENTS.md", "Elephant Cargo.toml (workspace)", "Elephant Git History" |
+    | **Source** | type: `manual`, collection: "elephant-codebase" |
+    | **DocRevision** | Each file ingested as its own immutable revision |
+    | **DocNodes** | AGENTS.md: 3 chunks, Cargo.toml: 1 chunk, git log: 8 chunks (split by time period) |
+
+    Each file type contributes different knowledge: Cargo.toml reveals the dependency graph, AGENTS.md reveals project rules and patterns, and the git log reveals who did what and when. Provenance tracks which *file* each claim came from.
+  </Tab>
+</Tabs>
+
+<Note>
+Every DocRevision is immutable. If the source evidence or rendered projection is updated later, Elephant creates a *new* revision and re-extracts - the old evidence chain remains intact. For a codebase, this means you can track how the architecture *was* described at any point in time.
+</Note>
+
+---
+
+## Step 2: Skill routing - choosing how to extract
+
+Before extraction begins, the pipeline selects an **[extraction skill](/pipeline/extraction)** that tells the LLM *what to look for*. The skill is chosen through a [cascade](/pipeline/extraction): space config → document metadata → source metadata → domain mapping → source type → environment defaults.
+
+<Tabs>
+  <Tab title="Email">
+    | Resolution step | Result |
+    |----------------|--------|
+    | App/source metadata | `extraction_skill` → maps to an app-supplied skill such as **`extraction/custom-email`** |
+
+    Elephant does not ship a universal email skill. Email semantics vary by product, so the app or operator should provide the skill and purpose that define which people, organizations, commitments, and topics matter.
+  </Tab>
+  <Tab title="IoT">
+    | Resolution step | Result |
+    |----------------|--------|
+    | Source type | `device_frame` → maps to **`extraction/technical-docs`** skill |
+
+    The technical-docs skill focuses on: component relationships, technology interactions, data flows, and operational state. It recognizes device-to-device relationships and cause-effect chains.
+  </Tab>
+  <Tab title="Fiction">
+    | Resolution step | Result |
+    |----------------|--------|
+    | Doc metadata | `domain: "fiction"` → maps to **`extraction/fiction`** skill |
+
+    The fiction skill tells the LLM to focus on: character relationships, attributes and roles, location relationships, group memberships, object ownership, and transformations. It knows to extract *durable* relationships (who knows whom) rather than momentary actions (Alice picked up a bottle).
+  </Tab>
+  <Tab title="Codebase">
+    | Resolution step | Result |
+    |----------------|--------|
+    | Doc metadata | `domain: "codebase"` → maps to **`extraction/codebase`** (custom skill) |
+
+    The codebase skill is a custom skill you'd create at `skills/extraction/codebase/SKILL.md`. It tells the LLM to focus on:
+
+    - **Entity types:** `component` (crates, binaries), `concept` (design patterns, architectural decisions), `person` (contributors), `platform` (external deps like SurrealDB, Axum), `interface` (API endpoints, MCP tools)
+    - **Key predicates:** `depends_on`, `uses`, `authored_by`, `implements`, `exposes`, `superseded_by`, `introduced_in`, `enforces`
+    - **What to skip:** Individual variables, function signatures, import statements, formatting details. The skill focuses on architecture-diagram-level knowledge, not syntax.
+    - **Special guidance for git logs:** Extract authorship events, major refactors, feature introductions, and removals. Treat each commit as a potential event with the author as participant.
+  </Tab>
+</Tabs>
+
+Each skill provides different entity types, predicates, and extraction rules - so the same LLM produces very different knowledge graphs depending on the domain.
+
+---
+
+## Step 3: Entities - identifying who and what
+
+The extraction LLM reads the full document text and identifies **Entities** - the people, organizations, places, devices, and concepts mentioned.
+
+<Tabs>
+  <Tab title="Email">
+    | Entity | Type | Notes |
+    |--------|------|-------|
+    | **Bob Martinez** | `person` | Resolved from "Bob Martinez", "bob@example.com" |
+    | **Dr. Kim** | `person` | New entity - no prior match |
+    | **Alice** | `person` | Resolved to existing "Alice" in Legal dept |
+    | **Acme Corp** | `org` | Resolved from "acme.com" domain |
+    | **City Dental** | `org` | New entity |
+    | **Legal** | `group` | Resolved to existing department entity |
+
+    Notice that "Alice from Legal" resolves to an *existing* entity - Elephant's identity resolution matched the mention to a known person rather than creating a duplicate.
+  </Tab>
+  <Tab title="IoT">
+    | Entity | Type | Notes |
+    |--------|------|-------|
+    | **motion_sensor_hallway** | `device` | Device identifier from log |
+    | **thermostat_main** | `device` | |
+    | **smart_lock_front** | `device` | |
+    | **leak_sensor_kitchen** | `device` | |
+    | **smart_valve_main** | `device` | |
+    | **Sam** | `person` | Resolved from fingerprint unlock event |
+    | **Kitchen** | `location` | Extracted from "leak_sensor_kitchen" |
+
+    IoT data produces `device` entities. The extractor infers the `location` entity from device naming conventions.
+  </Tab>
+  <Tab title="Fiction">
+    Across all 12 chapters, the pipeline extracts dozens of entities:
+
+    | Entity | Type | Notes |
+    |--------|------|-------|
+    | **Alice** | `person` | Protagonist |
+    | **White Rabbit** | `person` | Ch. 1, 4, 12 - fiction uses `person` for sentient characters |
+    | **Cheshire Cat** | `person` | Ch. 6, 8 |
+    | **Queen of Hearts** | `person` | Ch. 8-12 |
+    | **Mad Hatter** | `person` | Ch. 7, 11 |
+    | **March Hare** | `person` | Ch. 7 |
+    | **Duchess** | `person` | Ch. 6, 9 |
+    | **Wonderland** | `location` | The overarching setting |
+    | **Courtroom** | `location` | Ch. 11-12 |
+
+    The extraction plan selects bounded evidence units. Entity resolution can connect coreferences - "she", "Alice", and "the girl" all map to the same entity.
+  </Tab>
+  <Tab title="Codebase">
+    Across the ingested files, the pipeline extracts entities at the *architectural* level:
+
+    | Entity | Type | Source file |
+    |--------|------|------------|
+    | **elephant-api** | `component` | Cargo.toml |
+    | **elephant-pipeline** | `component` | Cargo.toml |
+    | **elephant-storage** | `component` | Cargo.toml |
+    | **elephant-mcp** | `component` | Cargo.toml |
+    | **elephant-policy** | `component` | Cargo.toml |
+    | **ABAC** | `concept` | AGENTS.md |
+    | **Truth Maintenance** | `concept` | AGENTS.md |
+    | **SurrealDB** | `platform` | Cargo.toml |
+    | **Axum** | `platform` | Cargo.toml |
+    | **Meerkat** | `platform` | Cargo.toml |
+    | **Sam Rivera** | `person` | Git log |
+
+    The codebase skill knows not to create entities for individual Rust structs or functions - those are implementation details, not architectural knowledge.
+  </Tab>
+</Tabs>
+
+Each entity gets **identity keys** (email, device ID, character name, crate name) so that future mentions of the same person, device, or component resolve to the same entity, not a duplicate.
+
+---
+
+## Step 4: Relationships & Attributes - connecting the graph
+
+Once entities exist, the pipeline creates **Rels** (entity-to-entity connections) and **Attributes** (entity-to-literal values). Both are typed with a [predicate](/concepts/predicates) from the registry.
+
+<Tabs>
+  <Tab title="Email">
+    **Rels:**
+    | From | Predicate | To | Status |
+    |------|-----------|-----|--------|
+    | Bob Martinez | `works_at` | Acme Corp | approved |
+    | Bob Martinez | `met_with` | Dr. Kim | approved |
+    | Alice | `member_of` | Legal | approved |
+    | Acme Corp | `partners_with` | City Dental | candidate |
+
+    **Attributes:**
+    | Entity | Predicate | Value |
+    |--------|-----------|-------|
+    | Partnership | `pricing` | "$45/employee" |
+    | Partnership | `launch_date` | "2026-04-01" |
+
+    The partnership relationship starts as `candidate` because it's a new claim - truth maintenance will promote it if uncontested.
+  </Tab>
+  <Tab title="IoT">
+    **Rels:**
+    | From | Predicate | To |
+    |------|-----------|-----|
+    | smart_lock_front | `unlocked_by` | Sam |
+    | leak_sensor_kitchen | `located_in` | Kitchen |
+    | smart_valve_main | `triggered_by` | leak_sensor_kitchen |
+
+    **Attributes:**
+    | Entity | Predicate | Value |
+    |--------|-----------|-------|
+    | thermostat_main | `target_temperature` | 21 |
+    | leak_sensor_kitchen | `alert_level` | "critical" |
+
+    IoT relationships capture device interactions and cause-effect chains.
+  </Tab>
+  <Tab title="Fiction">
+    **Rels (selected from ~40+ extracted):**
+    | From | Predicate | To |
+    |------|-----------|-----|
+    | Alice | `followed` | White Rabbit |
+    | Alice | `encountered` | Cheshire Cat |
+    | Queen of Hearts | `rules` | Wonderland |
+    | Duchess | `owns` | Cheshire Cat |
+    | Mad Hatter | `knows` | March Hare |
+
+    **Attributes:**
+    | Entity | Predicate | Value |
+    |--------|-----------|-------|
+    | Alice | `role` | "protagonist" |
+    | Queen of Hearts | `catchphrase` | "Off with her head!" |
+    | Cheshire Cat | `trait` | "can disappear, leaving only its grin" |
+
+    The fiction [extraction skill](/pipeline/extraction) focuses on **durable relationships** rather than momentary actions.
+  </Tab>
+  <Tab title="Codebase">
+    **Rels - the architecture graph:**
+    | From | Predicate | To | Source file |
+    |------|-----------|-----|------------|
+    | elephant-api | `depends_on` | elephant-storage | Cargo.toml |
+    | elephant-api | `depends_on` | elephant-policy | Cargo.toml |
+    | elephant-storage | `uses` | SurrealDB | Cargo.toml |
+    | elephant-pipeline | `uses` | Meerkat | Cargo.toml |
+    | elephant-policy | `implements` | ABAC | AGENTS.md |
+    | Sam Rivera | `authored` | elephant-storage | Git log |
+
+    **Attributes:**
+    | Entity | Predicate | Value |
+    |--------|-----------|-------|
+    | elephant-api | `port` | 3000 |
+    | SurrealDB | `version` | "2.4.1" |
+
+    The `depends_on` relationships from Cargo.toml give you a queryable dependency graph. The `implements` relationships connect code to concepts.
+  </Tab>
+</Tabs>
+
+<Note>
+Every Rel and Attribute carries a `weight` (0.0-1.0), optional `valid_from`/`valid_to` timestamps, and evidence links back to the assertion that produced it. Extraction-generated graph records retain their evidence links.
+</Note>
+
+---
+
+## Step 5: Events - capturing what happened when
+
+Claims with temporal information become **Events** - first-class timeline entries with time ranges, precision markers, and participant links.
+
+<Tabs>
+  <Tab title="Email">
+    | Event | When | Precision | Participants |
+    |-------|------|-----------|-------------|
+    | "Meeting with Dr. Kim" | March 14, 2026 | `day` | Bob, Dr. Kim |
+    | "Wellness program launch" | April 1, 2026 | `day` | Acme Corp, City Dental |
+
+    "Yesterday" in the email resolves to March 14 based on the email's date header. Both events get `day` precision - we know the date but not the exact time.
+  </Tab>
+  <Tab title="IoT">
+    | Event | When | Precision | Participants |
+    |-------|------|-----------|-------------|
+    | "Sam arrives home" | 2026-03-15 07:02:05 | `exact` | Sam, smart_lock_front |
+    | "Water leak detected" | 2026-03-15 07:15:00 | `exact` | leak_sensor_kitchen, Kitchen |
+    | "Emergency shutoff" | 2026-03-15 07:15:02 | `exact` | smart_valve_main |
+
+    IoT logs produce `exact` precision - every event has a millisecond-level timestamp. The events form a causal chain visible on the timeline.
+  </Tab>
+  <Tab title="Fiction">
+    | Event | Precision | Participants | Chapter |
+    |-------|-----------|-------------|---------|
+    | "Alice falls down the rabbit-hole" | `unknown` | Alice, White Rabbit | 1 |
+    | "Mad tea-party" | `unknown` | Alice, Mad Hatter, March Hare | 7 |
+    | "Croquet match" | `unknown` | Alice, Queen of Hearts | 8 |
+    | "Trial of the Knave" | `unknown` | Alice, King of Hearts, Queen | 11 |
+
+    Fiction events have `unknown` time precision - no calendar dates. Events can still be ordered by their position in the text (via evidence span offsets).
+  </Tab>
+  <Tab title="Codebase">
+    Git history is a goldmine of events - every commit with architectural significance becomes a timeline entry:
+
+    | Event | When | Precision | Participants |
+    |-------|------|-----------|-------------|
+    | "Foundation runtime layout" | 2026-01-15 | `day` | Sam Rivera |
+    | "Complete MCP tool registration" | 2026-01-16 | `day` | Sam Rivera |
+    | "Add ABAC authorization" | 2026-01-16 | `day` | Sam Rivera |
+    | "Move graph writes behind artifact commit" | 2026-02-06 | `day` | Sam Rivera |
+    | "Wire outbox into truth maintenance" | 2026-02-26 | `day` | Sam Rivera |
+    | "Migrate docs to Mintlify" | 2026-03-02 | `day` | Sam Rivera |
+
+    Git dates give `day` precision. The codebase skill extracts *significant* commits only - not every typo fix.
+  </Tab>
+</Tabs>
+
+Events are distinct from relationships. "Bob met Dr. Kim" is both a Rel (`met_with`) connecting two entities *and* an Event anchored to March 14. The Rel answers "who knows whom?", the Event answers "when did they meet?". For a codebase, "Sam moved graph writes behind artifact commit" is both a Rel (`authored`) and an Event (dated Feb 6, 2026).
+
+**Next:** [Part 2 - Assertions, Truth Maintenance, Security, and The Complete Picture](/guides/putting-it-together-part2)

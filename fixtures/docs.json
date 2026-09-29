@@ -1,0 +1,65 @@
+{
+  "docs": [
+    {
+      "id": "doc:seed-doc-001",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "title": "Alice's Science Fair Project Report",
+      "content": "My Volcano Project\n\nFor the science fair, I made a volcano that really erupts! Here is how I did it:\n\nMaterials:\n- Baking soda\n- Vinegar\n- Dish soap\n- Food coloring\n- Clay to make the volcano shape\n\nHow it works:\nWhen you mix baking soda and vinegar, it makes a chemical reaction called an acid-base reaction. This creates carbon dioxide gas which makes bubbles. The dish soap makes the bubbles last longer and look more like lava!\n\nConclusion:\nI learned that chemistry can be really fun and messy. My little brother Bob loved watching the eruptions. My teacher Mrs. Martinez said I did a great job explaining the science.",
+      "collection": "school_projects",
+      "source_uri": "file:///school/science-fair/volcano-report.md",
+      "metadata": {
+        "grade": "A",
+        "subject": "Science",
+        "teacher": "Carol Martinez"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 0,
+        "labels": [],
+        "handling": []
+      },
+      "idempotency_key": "seed-doc-volcano-001"
+    },
+    {
+      "id": "doc:seed-doc-002",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "title": "Family Chore Schedule",
+      "content": "Weekly Chore Schedule\n\nAlice (Age 7):\n- Monday: Set dinner table\n- Wednesday: Feed Buddy breakfast\n- Friday: Put away toys in living room\n- Saturday: Help with laundry (fold small items)\n\nBob (Age 5):\n- Daily: Put dirty clothes in hamper\n- Tuesday: Help water plants with supervision\n- Thursday: Pick up books after story time\n- Saturday: Help sort recyclables\n\nReward System:\n- Complete all weekly chores = 1 sticker\n- 5 stickers = Special activity choice\n- 10 stickers = Toy store visit\n\nNotes:\n- Always help with a smile!\n- Ask if you need help with any task",
+      "collection": "family_organization",
+      "source_uri": "file:///home/organization/chores.md",
+      "metadata": {
+        "category": "household",
+        "created_by": "parent"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 1,
+        "labels": ["vis:family_relevant"],
+        "handling": ["handling:parent_visible"]
+      },
+      "idempotency_key": "seed-doc-chores-001"
+    },
+    {
+      "id": "doc:seed-doc-003",
+      "space_id": "family_demo",
+      "agent_id": "seed_loader",
+      "title": "Buddy's Adoption Papers",
+      "content": "Pet Adoption Certificate\n\nAdoption Date: January 15, 2023\n\nPet Information:\nName: Buddy\nBreed: Golden Retriever\nAge at Adoption: 8 months\nColor: Golden\nMicrochip ID: 985112345678901\n\nHealth Status:\n- Neutered: Yes\n- Vaccinations: Up to date\n- Special needs: None\n\nAdopted By: Johnson Family\nAdoption Agency: Happy Tails Rescue\n\nEmergency Vet: Happy Paws Veterinary Clinic\nPhone: (555) 123-4567",
+      "collection": "pet_records",
+      "source_uri": "file:///home/pets/buddy-adoption.pdf",
+      "metadata": {
+        "document_type": "legal",
+        "category": "pet"
+      },
+      "security": {
+        "policy_id": "angel_family_v1",
+        "level": 2,
+        "labels": ["comp:confidant"],
+        "handling": []
+      },
+      "idempotency_key": "seed-doc-adoption-001"
+    }
+  ]
+}

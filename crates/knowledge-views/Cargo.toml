@@ -1,0 +1,24 @@
+[package]
+name = "elephant-knowledge-views"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Graph-native derived knowledge projections for Elephant"
+
+[dependencies]
+chrono = { workspace = true }
+elephant-storage = { path = "../storage" }
+elephant-types = { path = "../types" }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+elephant-migrations = { path = "../migrations" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

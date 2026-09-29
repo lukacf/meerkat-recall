@@ -1,0 +1,166 @@
+---
+title: "API Overview"
+description: "Base URL, authentication, versioning, response format, pagination, and error handling for the Elephant HTTP API."
+icon: "book"
+---
+
+## Base URL
+
+All API endpoints are served by `elephant serve` (Axum, default port 3000):
+
+```
+http://localhost:3000
+```
+
+In production deployments, place the API behind a TLS-terminating reverse proxy so that clients connect over `https://`.
+
+## API Versioning
+
+The primary REST routes use `/v1/`. Compatibility routes also exist under
+`/api/v1/`; browser pages and MCP have separate paths. This pre-1.0 project does
+not promise a fixed deprecation window.
+
+## Authentication
+
+Elephant uses **JWT Bearer tokens** for authentication. Include the token in the `Authorization` header of every request:
+
+```
+Authorization: Bearer <your-jwt-token>
+```
+
+The JWT must contain the following claims:
+
+| Claim | Description |
+|---|---|
+| `sub` | Principal subject identifier |
+| `exp` | Expiration time as a Unix timestamp in seconds |
+| `space_id` | Tenant space the token is scoped to |
+| `scopes` | Array of permission scopes (e.g., `read:entity`, `write:doc`) |
+| `clearances` | ABAC policy clearances for the principal |
+
+<Note>
+  In development mode, set the environment variable `SKIP_AUTH=true` to bypass JWT validation entirely. Never use this in production.
+</Note>
+
+## Response Format
+
+Most REST data responses return JSON; SSE and no-content responses are exceptions. The HTTP status code indicates the outcome:
+
+| Status | Meaning |
+|---|---|
+| `200 OK` | Request succeeded |
+| `201 Created` | Resource created successfully |
+| `204 No Content` | Deletion succeeded (no response body) |
+| `400 Bad Request` | Invalid input or validation error |
+| `401 Unauthorized` | Missing, invalid, or expired authentication token |
+| `403 Forbidden` | Authorization denied |
+| `404 Not Found` | Resource does not exist |
+| `409 Conflict` | Resource already exists |
+| `500 Internal Server Error` | Unexpected server failure |
+| `503 Service Unavailable` | Health check failed (dependencies down) |
+
+## Error Responses
+
+Resource handlers use a structured JSON error body:
+
+```json
+{
+  "code": "VALIDATION_ERROR",
+  "message": "Human-readable description of the problem",
+  "details": null
+}
+```
+
+<ResponseField name="code" type="string" required>
+  Machine-readable error code. One of: `VALIDATION_ERROR`, `NOT_FOUND`, `ACCESS_DENIED`, `CONFLICT`, `INTERNAL_ERROR`.
+</ResponseField>
+
+<ResponseField name="message" type="string" required>
+  Human-readable error description.
+</ResponseField>
+
+<ResponseField name="details" type="object">
+  Optional structured details for the error.
+</ResponseField>
+
+Authentication errors instead use `{"error":"missing_token","message":"..."}`
+with HTTP 401 or 403. Malformed HTTP/JSON input can fail before a resource
+handler runs, so clients should check status and content type before decoding.
+
+## Cursor-Based Pagination
+
+Many list and search endpoints use cursor-based pagination; consult the
+individual endpoint for its exact response and limits. Pass the `cursor` value from a previous response to fetch the next page.
+
+**Request parameters:**
+
+<ParamField body="limit" type="integer" default="50">
+  Maximum number of results to return. Defaults and clamps vary by endpoint.
+</ParamField>
+
+<ParamField body="cursor" type="string">
+  Opaque pagination cursor from a previous response.
+</ParamField>
+
+**Common search response fields (not universal to every list endpoint):**
+
+<ResponseField name="results" type="array" required>
+  Array of result objects.
+</ResponseField>
+
+<ResponseField name="cursor" type="string">
+  Cursor for the next page. `null` when no more results exist.
+</ResponseField>
+
+<ResponseField name="has_more" type="boolean" required>
+  Whether additional pages are available beyond the current result set.
+</ResponseField>
+
+<ResponseField name="total" type="integer" required>
+  Total count of authorized results in the current scan.
+</ResponseField>
+
+**Example pagination flow:**
+
+<CodeGroup>
+```bash First Page
+curl -s http://localhost:3000/v1/entities/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"limit": 10}'
+```
+
+```bash Next Page
+curl -s http://localhost:3000/v1/entities/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"limit": 10, "cursor": "entity:01234567-..."}'
+```
+</CodeGroup>
+
+## Record IDs
+
+Record IDs use a table prefix and an identifier, often a UUID. Treat the
+identifier as opaque. The prefix indicates the table:
+
+| Prefix | Resource |
+|---|---|
+| `entity:` | Entity |
+| `rel:` | Relationship |
+| `doc:` | Document |
+| `source:` | Source |
+| `assertion:` | Assertion |
+| `work_item:` | Work Item |
+| `truth_slot:` | Truth Slot |
+| `predicate_registry:` | Predicate |
+| `predicate_alias:` | Predicate Alias |
+| `audit_log:` | Audit Log Entry |
+
+When referencing a record by ID in path parameters, use the full prefixed form (e.g., `entity:550e8400-e29b-41d4-a716-446655440000`).
+
+## Space Isolation
+
+Elephant is multi-tenant. Every request is scoped to the `space_id` from the JWT token. Policy clearances do not grant access to another space. Search endpoints that
+accept an explicit `space_id` reject a mismatch with the token's space. In
+local `SKIP_AUTH` mode, `X-Space-Id` selects the development principal's space
+(default `default`).

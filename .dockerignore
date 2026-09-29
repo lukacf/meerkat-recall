@@ -1,0 +1,53 @@
+# Build artifacts
+target/
+debug/
+release/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Documentation
+docs/*
+!docs/architecture/
+docs/architecture/*
+!docs/architecture/living-wiki.mdx
+*.md
+!README.md
+
+# Test files
+# (included so workspace members under tests/ can build)
+
+# CI/CD
+.github/
+
+# Development
+.agents/
+.claude/
+.codemob-mcp/
+.codex/
+.codex-command-logs/
+.elephant/
+.elephant-snapshots/
+.mcp-the-force/
+.playwright-mcp/
+.rct/
+.rct-old/
+.tmp/
+.env
+.env.*
+!.env.example
+*.log
+*.pptx
+pit-full-check.png
+putting-it-together-full.png
+
+# OS
+.DS_Store
+Thumbs.db

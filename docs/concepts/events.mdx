@@ -1,0 +1,118 @@
+---
+title: "Events"
+description: "First-class domain events that capture what happened, when, and to whom"
+icon: "calendar"
+---
+
+Events are first-class domain records in Elephant's knowledge graph. They represent things that happened - meetings, launches, incidents, decisions - with temporal precision and linked participants.
+
+<Note>
+Events are distinct from `SystemEvent` records used for internal pipeline messaging. Domain events are user-facing timeline entries; system events are infrastructure plumbing.
+</Note>
+
+## Event structure
+
+Every event has a title, optional time range, participant links, and evidence references back to the assertions and sources that produced it.
+
+```rust
+pub struct Event {
+    pub base: BaseFields,        // includes subjects (participants)
+    pub title: String,
+    pub summary: Option<String>,
+    pub status: EventStatus,
+    pub time_start: Option<DateTime<Utc>>,
+    pub time_end: Option<DateTime<Utc>>,
+    pub time_precision: TimePrecision,
+    pub confidence: f32,
+    pub time_confidence: f32,
+    pub assertion_refs: Vec<Link<Assertion>>,
+    pub source_refs: Vec<Link<Source>>,
+    pub metadata: Value,
+}
+```
+
+Participants are stored in `base.subjects` - the same ABAC-aware subject list used by all records. This means event visibility follows the same security model as entities and relationships.
+
+## Event status lifecycle
+
+| Status | Description |
+|--------|-------------|
+| `candidate` | Proposed by extraction pipeline, pending review or promotion |
+| `approved` | Confirmed event shown in primary timeline surfaces |
+| `superseded` | Replaced by newer or better evidence |
+| `rejected` | Low-confidence or invalidated by truth maintenance |
+
+Events start as `candidate` when extracted from documents. The truth maintenance pipeline can promote them to `approved` or reject them based on confidence and conflicting evidence.
+
+## Time precision
+
+Extracted events often have imprecise timestamps. The `time_precision` field captures how much we know:
+
+| Precision | Meaning | Example |
+|-----------|---------|---------|
+| `exact` | Full timestamp known | `2026-01-15T14:30:00Z` |
+| `minute` | Rounded to minute | `2026-01-15T14:30:00Z` |
+| `hour` | Rounded to hour | `2026-01-15T14:00:00Z` |
+| `day` | Only date known | `2026-01-15T00:00:00Z` |
+| `month` | Only year-month known | `2026-01-01T00:00:00Z` |
+| `year` | Only year known | `2026-01-01T00:00:00Z` |
+| `unknown` | No temporal info (default) | - |
+
+The `time_confidence` field (0.0-1.0) separately captures how confident we are in the time values, independent of the event's overall `confidence`.
+
+## Evidence linking
+
+Events link back to their evidence through two reference lists:
+
+- **`assertion_refs`** - the assertions that produced this event (e.g., "Alice met Bob on Jan 15" extracted from a meeting transcript)
+- **`source_refs`** - the sources that contributed evidence (e.g., the calendar entry, the email thread)
+
+This provenance chain lets you trace any timeline entry back to its documentary evidence.
+
+## Querying events
+
+<Tabs>
+  <Tab title="MCP">
+    Search events by text:
+    ```json
+    { "query": "product launch", "limit": 10 }
+    ```
+
+    List recent events:
+    ```json
+    { "limit": 20, "include_candidates": false }
+    ```
+
+    List upcoming events within a time window:
+    ```json
+    { "days": 14, "include_candidates": false }
+    ```
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    # Search events
+    curl -s http://localhost:3000/v1/timeline/search \
+      -H "content-type: application/json" \
+      -d '{"query": "product launch", "limit": 10}'
+
+    # List recent events
+    curl -s http://localhost:3000/v1/timeline/recent?limit=20
+    ```
+  </Tab>
+</Tabs>
+
+## Participants
+
+Event participants are entities referenced in `base.subjects`. When the extraction pipeline identifies an event like "Alice and Bob met on Tuesday", it:
+
+1. Resolves "Alice" and "Bob" to entity records
+2. Creates the event with both entity IDs in `base.subjects`
+3. Links the source assertion in `assertion_refs`
+
+This means you can query events by participant using the standard entity-based filtering.
+
+## See also
+
+- [Assertions](/concepts/assertions) - the evidence layer that produces events
+- [Truth Maintenance](/concepts/truth-maintenance) - how events are promoted or rejected
+- [Event Streaming guide](/guides/event-streaming) - consuming events via the API

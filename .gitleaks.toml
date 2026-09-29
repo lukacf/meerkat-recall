@@ -1,0 +1,14 @@
+title = "Elephant secret scanning"
+
+# A custom config replaces defaults unless it explicitly extends them.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic assertion idempotency keys used by regression tests"
+condition = "AND"
+paths = ['''^crates/(storage|pipeline)/''']
+regexTarget = "match"
+regexes = [
+  '''assertion_key[:,]\s+"(unique_key_abc123|different_key_xyz789|test_key_one|test_key_two)"''',
+]

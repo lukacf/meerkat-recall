@@ -1,0 +1,178 @@
+{
+  "datasets": [
+    {
+      "id": "nasa_apod",
+      "name": "NASA Astronomy Picture of the Day",
+      "kind": "json",
+      "url": "https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY"
+    },
+    {
+      "id": "usgs_all_day",
+      "name": "USGS Earthquakes (All Day)",
+      "kind": "json",
+      "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson"
+    },
+    {
+      "id": "usgs_all_week",
+      "name": "USGS Earthquakes (All Week)",
+      "kind": "json",
+      "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_week.geojson"
+    },
+    {
+      "id": "weather_ca",
+      "name": "NOAA Active Alerts (California)",
+      "kind": "json",
+      "url": "https://api.weather.gov/alerts/active?area=CA"
+    },
+    {
+      "id": "weather_fl",
+      "name": "NOAA Active Alerts (Florida)",
+      "kind": "json",
+      "url": "https://api.weather.gov/alerts/active?area=FL"
+    },
+    {
+      "id": "open_meteo_sf",
+      "name": "Open-Meteo Forecast (San Francisco)",
+      "kind": "json",
+      "url": "https://api.open-meteo.com/v1/forecast?latitude=37.77&longitude=-122.42&hourly=temperature_2m&forecast_days=2"
+    },
+    {
+      "id": "open_meteo_nyc",
+      "name": "Open-Meteo Forecast (New York City)",
+      "kind": "json",
+      "url": "https://api.open-meteo.com/v1/forecast?latitude=40.71&longitude=-74.01&hourly=temperature_2m&forecast_days=2"
+    },
+    {
+      "id": "github_events",
+      "name": "GitHub Public Events",
+      "kind": "json",
+      "url": "https://api.github.com/events"
+    },
+    {
+      "id": "hn_ai_stories",
+      "name": "Hacker News AI Stories (Algolia)",
+      "kind": "json",
+      "url": "https://hn.algolia.com/api/v1/search_by_date?query=ai&tags=story"
+    },
+    {
+      "id": "stackoverflow_activity",
+      "name": "Stack Overflow Active Questions",
+      "kind": "json",
+      "url": "https://api.stackexchange.com/2.3/questions?order=desc&sort=activity&site=stackoverflow&pagesize=20"
+    },
+    {
+      "id": "openalex_ml",
+      "name": "OpenAlex Works (Machine Learning)",
+      "kind": "json",
+      "url": "https://api.openalex.org/works?search=machine%20learning&per-page=20"
+    },
+    {
+      "id": "crossref_climate",
+      "name": "Crossref Works (Climate Change)",
+      "kind": "json",
+      "url": "https://api.crossref.org/works?query=climate%20change&rows=20"
+    },
+    {
+      "id": "arxiv_ml",
+      "name": "arXiv API (Machine Learning)",
+      "kind": "xml",
+      "url": "https://export.arxiv.org/api/query?search_query=all:machine+learning&start=0&max_results=15"
+    },
+    {
+      "id": "worldbank_us_pop",
+      "name": "World Bank Population (United States)",
+      "kind": "json",
+      "url": "https://api.worldbank.org/v2/country/US/indicator/SP.POP.TOTL?format=json"
+    },
+    {
+      "id": "worldbank_in_gdp",
+      "name": "World Bank GDP (India)",
+      "kind": "json",
+      "url": "https://api.worldbank.org/v2/country/IN/indicator/NY.GDP.MKTP.CD?format=json"
+    },
+    {
+      "id": "fda_drug_enforcement",
+      "name": "OpenFDA Drug Enforcement",
+      "kind": "json",
+      "url": "https://api.fda.gov/drug/enforcement.json?limit=20"
+    },
+    {
+      "id": "fda_device_enforcement",
+      "name": "OpenFDA Device Enforcement",
+      "kind": "json",
+      "url": "https://api.fda.gov/device/enforcement.json?limit=20"
+    },
+    {
+      "id": "nhtsa_tesla_recalls",
+      "name": "NHTSA Tesla Model 3 Recalls",
+      "kind": "json",
+      "url": "https://api.nhtsa.gov/recalls/recallsByVehicle?make=Tesla&model=Model%203&modelYear=2023"
+    },
+    {
+      "id": "ecb_daily",
+      "name": "ECB Daily FX Reference Rates",
+      "kind": "xml",
+      "url": "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+    },
+    {
+      "id": "federal_register_latest",
+      "name": "Federal Register Latest Documents",
+      "kind": "json",
+      "url": "https://www.federalregister.gov/api/v1/documents.json?per_page=20&order=newest"
+    },
+    {
+      "id": "bbc_world_rss",
+      "name": "BBC World RSS",
+      "kind": "xml",
+      "url": "https://feeds.bbci.co.uk/news/world/rss.xml"
+    },
+    {
+      "id": "nytimes_world_rss",
+      "name": "NYTimes World RSS",
+      "kind": "xml",
+      "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"
+    },
+    {
+      "id": "un_rss",
+      "name": "United Nations RSS",
+      "kind": "xml",
+      "url": "https://www.un.org/en/rss.xml"
+    },
+    {
+      "id": "bls_latest_rss",
+      "name": "BLS Latest RSS",
+      "kind": "xml",
+      "url": "https://www.bls.gov/feed/bls_latest.rss"
+    },
+    {
+      "id": "sec_press_releases",
+      "name": "SEC Press Releases RSS",
+      "kind": "xml",
+      "url": "https://www.sec.gov/news/pressreleases.rss"
+    },
+    {
+      "id": "spacex_launches",
+      "name": "SpaceX Past Launches",
+      "kind": "json",
+      "url": "https://api.spacexdata.com/v5/launches/past"
+    },
+    {
+      "id": "coingecko_top",
+      "name": "CoinGecko Top Markets",
+      "kind": "json",
+      "url": "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=20&page=1&sparkline=false"
+    },
+    {
+      "id": "nyc_311",
+      "name": "NYC 311 Recent Service Requests",
+      "kind": "json",
+      "url": "https://data.cityofnewyork.us/resource/erm2-nwe9.json?$limit=20"
+    },
+    {
+      "id": "nasa_news_feed",
+      "name": "NASA News Releases Feed",
+      "kind": "xml",
+      "url": "https://www.nasa.gov/news-release/feed/"
+    }
+  ]
+}

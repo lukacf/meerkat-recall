@@ -1,0 +1,124 @@
+---
+title: "E2E Scenarios"
+description: "Scenario test map, what each scenario verifies, and how to run them"
+icon: "flask-vial"
+---
+
+## Overview
+
+Elephant uses system-level scenario tests to root out integration issues. Each scenario specifies the environment, principal, and explicit invariants that must hold.
+
+Scenarios are organized into groups:
+- **S1.x** -- Baseline CRUD (entity/relationship lifecycle)
+- **S2.x** -- Integration Hell (merge, rollback, redaction)
+- **S3.x** -- Extension readiness
+- **S4.x** -- Assertion pipeline (extraction, truth maintenance, budget)
+- **S5.x** -- MCP and API integration (document ingestion, search, tools)
+- **M1-M10** -- Cross-cutting concerns (isolation, startup, queues, truth)
+
+## Running Scenarios
+
+<CodeGroup>
+```bash All scenarios
+./scripts/repo-cargo test -p elephant-scenarios -- --nocapture
+```
+
+```bash Full E2E suite
+./scripts/repo-cargo test-e2e
+```
+
+```bash List scenario names
+./scripts/repo-cargo test -p elephant-scenarios -- --list
+```
+</CodeGroup>
+
+<Note>
+  The scenario harness uses SurrealDB's `kv-mem` backend. Some test lanes elsewhere in the workspace require live services or credentials. `test-e2e` excludes named live-LLM tests; the broader `integration` alias runs all ignored tests and can invoke paid providers. Inspect the selected tests before opting in.
+</Note>
+
+## S1.x -- Baseline CRUD
+
+| Scenario | Name | Verifies |
+|----------|------|----------|
+| S1.1 | Entity Lifecycle | Soft-delete filtering; deleted entities return 404; `include_deleted` flag restores visibility |
+| S1.2 | Relationship Traversal | Relationships to deleted entities are hidden in context queries |
+| S1.4 | Identity Key SoT | Canonical uniqueness of identity keys; upsert resolves to existing entity |
+| S1.8 | Audit Inheritance | Audit log entries inherit security labels from their parent entity |
+
+## S2.x -- Integration Hell
+
+| Scenario | Name | Verifies |
+|----------|------|----------|
+| S2.1 | Zombie Key | Merged entity keys stay ACTIVE and point to survivor; upsert resolves correctly |
+| S2.2 | Amnesia Merge | Deep metadata merge (combine strategy) preserves all nested fields |
+| S2.4 | Partial Success | Transactional rollback on failpoint; neither relationship nor approved attribute persists |
+| S2.5 | Masked Truth | Redaction envelope hides text field while returning 200 with redaction markers |
+
+## S3.x -- Extension Readiness
+
+| Scenario | Name | Verifies |
+|----------|------|----------|
+| S3.1 | Manifest Repointing | Entity merge rewrites extension table owner fields and array references |
+
+## S4.x -- Assertion Pipeline
+
+| Scenario | Name | Verifies |
+|----------|------|----------|
+| S4.1 | Progressive Triage | Mode selection: skip (duplicate), metadata (low-value), retrieval (text), graph (entities) |
+| S4.2 | Assertion Lifecycle | End-to-end: extraction from doc_revision, resolution, canonical commit |
+| S4.3 | Predicate Governance | Predicate proposed state, alias creation, approval workflow |
+| S4.4 | Truth Maintenance | Conflicting claims detected via truth_slot grouping; resolution strategies applied |
+| S4.5 | Budget Enforcement | Daily budget limits; over-budget rejection; mode downgrade from graph to retrieval |
+| S4.6 | Temporal Supersession | Validity windows; newer claims supersede older; expired claims excluded |
+| S4.7 | Abstention Retry | Ambiguous resolution triggers Abstained; exponential backoff; max attempts to Failed |
+| S4.8 | Staged Commit | Work artifacts written first; atomic commit to canonical tables; retry on failure |
+| S4.9 | Freshness Sweep | Freshness decay; sweep recalculation; demotion below threshold |
+| S4.10 | Reprocessing | Reprocess job with selection criteria; old revisions superseded; budget pacing |
+| S4.11 | Massive Document | Documents with >100 nodes trigger partitioning; cross-partition links maintained |
+| S4.12 | Implicit Now | Claims without explicit time default to extraction time; TimeRefinement handling |
+| S4.13 | Outbox Triggered | NewAssertion triggers slot allocation; ConflictDetected triggers resolution |
+| S4.14 | ABAC Inheritance | Derived artifacts inherit max security level; labels union across chain |
+
+## S5.x -- MCP and API Integration
+
+| Scenario | Name | Verifies |
+|----------|------|----------|
+| S5.1 | Ingest Doc Simple | Basic document ingestion via MCP creates doc and source records |
+| S5.2 | Create Entity Simple | Entity creation via MCP with auto-generated base fields |
+| S5.3 | Type Coercion | MCP handles type coercion for record IDs and dates |
+| S5.4 | Extraction Pipeline | Full extraction pipeline triggered after document ingestion |
+| S5.5 | Manual Extraction | Manual extraction trigger via MCP `extract_doc` |
+| S5.6 | Pipeline Status | `get_doc_pipeline_status` returns accurate chunk/revision/extraction progress |
+| S5.7 | Search All | Cross-entity search across entities, docs, sources, and relationships |
+| S5.8 | File Ingestion | File ingestion from local filesystem |
+| S5.9 | Tool Introspection | `get_tool_schema` and `get_capabilities` return valid schemas |
+| S5.10 | Relationship Evidence | Relationships carry evidence_text and evidence_source |
+| S5.11 | Space Management | Space creation, update, and listing |
+| S5.12 | Batch Progress | Batch ingestion returns job_id with progress tracking |
+| S5.13 | Alice in Wonderland | Complex document with multiple entities and relationships extracted |
+| S5.14 | Events Timeline | Domain events created with correct timestamps and entity links |
+| S5.19 | Truth Adjudication | Identical claims corroborate (evidence merged, duplicate soft-deleted); adjudicator supersedes conflicting employer rels with verdict dates (not ingest time); proposed semantics persist as LlmProposed; deterministic FakeAdjudicator tier plus `#[ignore]` real-LLM tier |
+
+## M1-M10 -- Cross-Cutting Concerns
+
+| Scenario | Name | Verifies |
+|----------|------|----------|
+| M1 | Tenant Isolation | Space-level data isolation; cross-space reads return 404/403 |
+| M2 | Startup Ordering | Fresh DB + migrations + API start yields healthy `/v1/health` |
+| M4 | Cursor Stability | ABAC-filtered pagination returns only authorized records with correct totals |
+| M6 | Outbox Monotonicity | Event sequence numbers are monotonic; no duplicates; cursor resumption works |
+| M7 | Space Embedding Policy | Per-space embedding provider and model configuration |
+| M8 | Assertion Pipeline | M8.1: Doc produces assertions; M8.2: Resolution to entities; M8.3: relationships/attributes; M8.4: Partial resolution tracked |
+| M9 | Truth Maintenance | M9.1: Conflict groups; M9.2: Truth slots; M9.3: Resolution updates; M9.4: Staleness tracking; M9.5: AllowParallel |
+| M10 | Work Queue | M10.1: Item creation; M10.2: Lease acquisition; M10.3: Retry backoff; M10.4: Work runs; M10.5: Dead letter; M10.6: Idempotency |
+
+## Test Principals
+
+Scenarios use predefined principals for ABAC testing:
+
+| Principal | Scopes | Max Level | Labels |
+|-----------|--------|-----------|--------|
+| `P_sys` | `["*"]` | 10 | `["*"]` |
+| `P_admin` | `["read:*", "write:*"]` | 2 | `["vis:team"]` |
+| `P_member` | `["read:entity", "read:relationship"]` | 1 | `["vis:private"]` |
+| `P_anon` | `[]` | 0 | _(none)_ |

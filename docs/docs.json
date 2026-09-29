@@ -1,0 +1,139 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "Elephant",
+  "description": "A unified knowledge system with entity management, document pipelines, and truth maintenance",
+  "theme": "maple",
+  "colors": {
+    "primary": "#4B8BBE",
+    "light": "#6BA3D6",
+    "dark": "#3A6F9A"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/lukacf/elephant"
+      }
+    ]
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core concepts",
+            "pages": [
+              "concepts/spaces",
+              "concepts/entities",
+              "concepts/relationships",
+              "concepts/documents",
+              "concepts/assertions",
+              "concepts/events",
+              "concepts/truth-maintenance",
+              "concepts/predicates",
+              "concepts/security"
+            ]
+          },
+          {
+            "group": "By example",
+            "pages": [
+              "guides/putting-it-together",
+              "guides/putting-it-together-part2"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/ingesting-data",
+              "guides/searching",
+              "guides/building-graphs",
+              "guides/truth-slots",
+              "guides/event-streaming"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API & MCP",
+        "groups": [
+          {
+            "group": "HTTP API",
+            "pages": [
+              "api/overview",
+              "api/entities",
+              "api/documents",
+              "api/relationships",
+              "api/assertions",
+              "api/sources",
+              "api/predicates",
+              "api/system"
+            ]
+          },
+          {
+            "group": "MCP",
+            "pages": [
+              "mcp/overview",
+              "mcp/tools",
+              "mcp/workflows"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Pipeline & Architecture",
+        "groups": [
+          {
+            "group": "Pipeline",
+            "pages": [
+              "pipeline/overview",
+              "pipeline/extraction",
+              "pipeline/truth-maintenance",
+              "pipeline/work-queue"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/domain-model",
+              "architecture/living-wiki"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Developer Reference",
+        "groups": [
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/deployment",
+              "operations/observability"
+            ]
+          },
+          {
+            "group": "Contributing",
+            "pages": [
+              "operations/development",
+              "operations/scenarios",
+              "operations/surrealdb-patterns"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/lukacf/elephant"
+    }
+  }
+}

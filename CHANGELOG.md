@@ -16,7 +16,7 @@ does not by itself establish a published release.
   database execution deadlines to address growing-queue saturation.
 - Direct budget-record reads and indexed daily ledger aggregation prevent
   budget checks from scanning the complete accounting history.
-- Meerkat 0.8.45, current MCP/PDF dependencies, and stricter API authorization
+- Meerkat 0.8.47, current MCP/PDF dependencies, and stricter API authorization
   and ingestion error handling.
 - Dual licensing under MIT OR Apache-2.0.
 

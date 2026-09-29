@@ -51,14 +51,14 @@ rust-version = "1.94.0"
 
 [workspace.dependencies]
 # Meerkat - keep the facade and direct family dependencies on one release.
-meerkat = { version = "=0.8.45", default-features = false, features = ["anthropic", "openai", "gemini", "memory-store", "mcp", "session-compaction", "comms"] }
-meerkat-core = { version = "=0.8.45" }
-meerkat-mcp = { version = "=0.8.45" }
-meerkat-runtime = { version = "=0.8.45" }
-meerkat-skills = { version = "=0.8.45", default-features = false }
+meerkat = { version = "=0.8.47", default-features = false, features = ["anthropic", "openai", "gemini", "memory-store", "mcp", "session-compaction", "comms"] }
+meerkat-core = { version = "=0.8.47" }
+meerkat-mcp = { version = "=0.8.47" }
+meerkat-runtime = { version = "=0.8.47" }
+meerkat-skills = { version = "=0.8.47", default-features = false }
 # Test-only: pins the model-catalog regression test (gpt-5.6-sol resolution),
 # the reason this port exists. Version-unified with the meerkat facade above.
-meerkat-models = { version = "=0.8.45" }
+meerkat-models = { version = "=0.8.47" }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }

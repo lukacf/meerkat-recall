@@ -1,220 +1,90 @@
 ---
-title: "Architecture Overview"
-description: "Runtime topology, workspace layout, and crate responsibilities for the Elephant knowledge system"
-icon: "sitemap"
+title: Architecture Overview
+description: How the API, managed workers, policy layer, storage, and model runtime cooperate.
+icon: sitemap
 ---
 
-## Technology Foundations
+Elephant has two related responsibilities: serve authorized knowledge reads and
+writes, and process evidence into derived knowledge. The public `elephant`
+command assembles these into a managed runtime.
 
-Elephant is built on three key technologies:
+## Default runtime
 
-**[SurrealDB](https://surrealdb.com)** is the default persistent backend. It combines document storage, graph traversals, and vector search in one engine, and Elephant's Surreal-backed path still uses the strict [SurrealDB boundary patterns](/operations/surrealdb-patterns) documented for this repo.
-
-**`elephant-db`** is Elephant's embedded in-memory backend. It is a typed Rust kernel with graph traversal, lexical/vector search, and JSON snapshot import/export. It powers lightweight local deployments and the WASM-oriented embedded path. It is volatile unless you explicitly load/export snapshots; use SurrealDB for durable production and long-running local field tests.
-
-**[Meerkat](https://github.com/lukacf/meerkat)** is a modular LLM agent harness built in Rust. It powers extraction, truth-maintenance adjudication, and wiki editorial model calls:
-
-- **Extraction pipeline** - Meerkat orchestrates LLM calls for entity/relationship extraction with structured output guarantees (`OutputSchema::strict()`), automatic retries, tool access for context-aware extraction, and per-request budget enforcement. See [Extraction](/pipeline/extraction).
-The MCP server uses the Rust `rmcp` transport. Current static dispatcher counts
-are 23 Default, 24 Agent, 43 Maintenance, and 91 Full; runtime tools and
-readiness/authorization filters affect `tools/list`. See [MCP](/mcp/overview).
-
-## Runtime Topology
-
-Elephant runs through one public command, `elephant`, over either `surreal-db` or embedded `elephant-db`, deployable from a single Docker Compose stack up to a horizontally scaled cluster.
+`elephant serve` runs HTTP, MCP, and managed workers in one process. Workers and
+request handlers share the configured storage backend.
 
 ```mermaid
-graph TD
-    Client["Client (MCP / HTTP)"]
-
-    subgraph Elephant
-        API["elephant serve<br/>(Axum + MCP, port 3000)"]
-        Pipeline["elephant worker<br/>(Advanced Background Workers)"]
+flowchart TD
+    Client["Application or agent"] --> API["HTTP and MCP handlers"]
+    subgraph Runtime["elephant serve"]
+        API --> Policy["Principal, space, and policy checks"]
+        Policy --> Repos["Storage repositories"]
+        Workers["Managed pipeline workers"] --> Repos
+        Workers --> Models["Meerkat model execution"]
+        Workers --> Views["Knowledge view materialization"]
+        Views --> Repos
     end
-
-    Storage["Storage Backend<br/>(surreal-db or elephant-db)"]
-
-    Client -->|"HTTP / MCP"| API
-    API -->|"Read/Write"| Storage
-    Pipeline -->|"Read/Write"| Storage
+    Repos --> Store["SurrealDB or embedded ElephantDB"]
 ```
 
-### Deployment Modes
+The API accepts an ingest and records work. Workers then render evidence, plan
+extraction, validate and commit artifacts, and process truth-maintenance events.
+The [pipeline overview](/pipeline/overview) describes that sequence; the
+[domain model](/architecture/domain-model) describes the records it produces.
 
-| Mode | Description |
-|---|---|
-| **Single-process** | `elephant serve` runs API + workers together. This is the natural embedded `elephant-db` mode and the simplest local runtime. |
-| **Single-node container** | Default Docker Compose runs `elephant serve` plus a `surrealdb` container. The supplied Compose file runs managed workers; custom deployments may run `elephant worker` separately. |
-| **Clustered** | `elephant serve --server-only` horizontally scaled behind a load balancer. SurrealDB cluster. `elephant worker` scaled independently. |
+## Boundaries that matter
 
-## Public Command Surface
+| Boundary | Responsibility | Consequence for callers |
+| --- | --- | --- |
+| Authentication and policy | Resolve a principal, enforce space isolation, scopes, clearances, and redaction | A record's existence does not imply that every caller can retrieve it |
+| API and MCP | Validate requests and expose operations through distinct protocols | Use each surface's request and response contract |
+| Pipeline | Lease work, stage outputs, validate artifacts, commit results, and schedule dependent work | Ingest acceptance and processing completion are separate observations |
+| Model execution | Use Meerkat for extraction, truth adjudication, and wiki editorial calls | Model readiness and credentials are part of semantic ingest readiness |
+| Storage repositories | Provide the application's typed storage contract over the selected backend | Backend capabilities and persistence still differ |
+| Knowledge views | Build derived, cited projections and track their freshness | A view is a projection of authorized evidence, not a new source of evidence |
 
-Elephant ships one public binary, `elephant`, built from the Cargo workspace.
+Meerkat provides model execution. Elephant owns the knowledge schema, policies,
+pipeline scheduling, artifact validation, and storage. The MCP server uses the
+Rust `rmcp` transport. See [MCP profiles](/mcp/overview) for the tool surface;
+tool visibility also depends on runtime readiness and authorization.
 
-| Command | Role |
-|---|---|
-| `elephant serve` | HTTP API, MCP protocol handlers, ABAC enforcement, and managed workers. |
-| `elephant serve --server-only` | HTTP/MCP server without managed workers. |
-| `elephant worker` | Background workers for active work kinds such as `render_doc`, `plan_extraction`, `extract_assertions`, truth maintenance, freshness, and reprocessing. |
-| `elephant migrate` | SurrealDB migrations. |
-| `elephant snapshot export/import` | Live embedded ElephantDB snapshot operations through the running API. |
-| `elephant status` | Health and runtime status. |
-| `elephant demo-wiki` | Isolated in-memory Living Wiki demo. |
-| `elephant data-migrate` | One-time embedded snapshot to SurrealDB migration. |
+## Choose a process and storage layout
 
-## Workspace Layout
+| Layout | How it runs | Operational boundary |
+| --- | --- | --- |
+| Managed server with SurrealDB | `elephant serve` plus a persistent SurrealDB backend | Default Compose layout; apply migrations before serving |
+| Managed embedded server | `elephant serve` with `ELEPHANT_DB=elephant-db` | API and workers share one in-memory store; snapshots provide explicit recovery points |
+| Separate worker with SurrealDB | `elephant serve --server-only` and `elephant worker` against the same database | Advanced configuration; check readiness and coordinate schema and worker configuration |
 
-```
-elephant/
-  bin/
-    elephant/
-    elephant-api/
-    elephant-pipeline/
-  crates/
-    elephant/
-    elephant-db/
-    types/
-    storage/
-    policy/
-    identity/
-    pipeline/
-    embeddings/
-    mcp/
-    outbox/
-    extensions/
-    migrations/
-  tests/
-    scenarios/
-    e2e/
-    dev_readiness/
-  xtask/
-```
+`elephant worker` rejects the embedded ElephantDB backend: a separate process
+would own a different in-memory store. The supplied configuration does not
+establish a tested multi-node scaling or high-availability contract. Treat
+such a topology as deployment work requiring its own acceptance tests.
 
-### Crate Dependency Graph
+Embedded snapshots do not provide continuous durability. `serve` can export on
+Ctrl-C when a snapshot save/load path is configured and autosave is enabled;
+that does not protect against a crash or forced termination. See
+[deployment](/operations/deployment) and the [CLI reference](/cli/overview).
 
-```mermaid
-graph BT
-    types["types"]
-    elephant_db["elephant-db"]
-    storage["storage"]
-    policy["policy"]
-    identity["identity"]
-    outbox["outbox"]
-    embeddings["embeddings"]
-    pipeline["pipeline"]
-    mcp["mcp"]
-    extensions["extensions"]
-    migrations["migrations"]
+## Find the implementation
 
-    elephant_db --> types
-    storage --> types
-    storage --> elephant_db
-    policy --> types
-    identity --> types
-    outbox --> types
-    embeddings --> types
-    embeddings --> elephant_db
-    extensions --> types
-    migrations --> types
-    mcp --> types
-    mcp --> storage
-    mcp --> policy
-    pipeline --> types
-    pipeline --> storage
-    pipeline --> embeddings
-    pipeline --> identity
-```
+The workspace separates domain contracts from runtime assembly. Start with the
+smallest owner of the behavior you need to change.
 
-## Crate Responsibilities
+| Area | Location | Owns |
+| --- | --- | --- |
+| Public command | `bin/elephant` | Server, worker, status, snapshot, migration, and demo commands |
+| Server assembly | `bin/elephant-api` | Axum routes, authentication, MCP transport, runtime configuration |
+| Worker assembly | `bin/elephant-pipeline` | Worker registration and execution environment |
+| Domain | `crates/types` | Records, IDs, request/response types, validation |
+| Storage | `crates/storage`, `crates/elephant-db`, `crates/migrations` | Repositories, embedded kernel, SurrealDB schema |
+| Authorization | `crates/policy` | ABAC decisions, subject restrictions, redaction |
+| Identity | `crates/identity` | Identity keys and entity merge behavior |
+| Processing | `crates/pipeline`, `crates/outbox`, `crates/embeddings` | Evidence processing, change events, vector providers |
+| Agent tools | `crates/mcp` | Tool schemas, profiles, handlers |
+| Derived views | `crates/knowledge-views` | Context projections, materialization, citation and freshness behavior |
+| Library entry point | `crates/elephant` | Rust library API |
 
-<Accordion title="types" icon="cube">
-  Domain types for all records (`Entity`, `Rel`, `Attribute`, `Doc`, `Assertion`, etc.),
-  the `RecordId` system with `TableName` enum covering 30+ tables,
-  `Link<T>` typed foreign-key references, `BaseFields` shared across all records,
-  request/response DTOs, and validation logic.
-  No runtime dependencies on the database or network.
-</Accordion>
-
-<Accordion title="elephant-db" icon="database">
-  Embedded in-memory graph/vector storage kernel used for lightweight local deployments,
-  tests, snapshots, and the WASM-oriented path. It is not a SurrealQL replacement
-  and it does not persist automatically across process restarts; configure a
-  snapshot path and export before shutdown if you need continuity.
-  storage dispatch keeps the embedded path behind the same repository contracts as
-  the Surreal-backed path.
-</Accordion>
-
-<Accordion title="storage" icon="database">
-  Backend-agnostic repository layer used by both `surreal-db` and embedded `elephant-db`.
-  The Surreal path uses DB proxy structs (no `#[serde(flatten)]` at the database boundary)
-  with `TryFrom` conversion to domain types. The embedded path dispatches into the typed in-memory kernel.
-  Provides CRUD for every record type plus specialized query methods for search, pagination, graph traversal, snapshots, and maintenance.
-</Accordion>
-
-<Accordion title="policy" icon="shield-halved">
-  Attribute-Based Access Control (ABAC) engine. Evaluates `SecurityEnvelope` labels
-  on every record against the caller's clearance. Handles field-level redaction and
-  subject-scoped filtering. Every API response passes through this layer.
-</Accordion>
-
-<Accordion title="identity" icon="fingerprint">
-  Identity key generation and entity merge strategy. Generates stable identity keys
-  from entity attributes and handles the merge workflow when two entities are
-  determined to be the same real-world object, including redirect pointers and
-  lineage tracking.
-</Accordion>
-
-<Accordion title="pipeline" icon="gears">
-  Background workers implementing the active ingestion-to-graph path:
-  **triage_source**, **ingest_metadata**, **validate_artifacts**, **commit_artifacts**,
-  **upgrade_ingest_mode**, **render_doc**, **build_doc_tree**, **plan_extraction**,
-  **extract_assertions**, **truth maintenance**, **freshness**, and **reprocessing**.
-  Uses a durable work scheduler with lease-based execution and outbox-triggered truth maintenance.
-</Accordion>
-
-<Accordion title="embeddings" icon="vector-square">
-  Vector embedding provider abstraction. Supports multiple backends including
-  FastEmbed (local), OpenAI, and a fake provider for testing. Configured per-space
-  via `SpaceConfig` records.
-</Accordion>
-
-<Accordion title="mcp" icon="plug">
-  Model Context Protocol handlers and tool registry. Exposes Elephant operations
-  as MCP tools (search, ingest, entity management, relationship CRUD, identity
-  resolution, context bundles, work queue management). Maps MCP requests to
-  storage and policy layers.
-</Accordion>
-
-<Accordion title="outbox" icon="envelope">
-  Event outbox for reliable messaging. Writes `SystemEvent` records with monotonic
-  sequence numbers. Supports cursor-based streaming for consumers that need
-  at-least-once delivery of change events.
-</Accordion>
-
-<Accordion title="extensions" icon="puzzle-piece">
-  Extension manifest parsing and reference handling. Manages extension contracts
-  for plugins that extend Elephant's extraction and processing capabilities.
-</Accordion>
-
-<Accordion title="migrations" icon="database">
-  SurrealQL migration runner. Manages schema evolution for all 30+ tables
-  with versioned migration files applied by `elephant migrate`.
-</Accordion>
-
-## Build Configuration
-
-The workspace uses Rust edition 2021 with strict lints:
-
-| Lint | Level |
-|---|---|
-| `unsafe_code` | **forbid** |
-| `unwrap_used`, `expect_used`, `panic`, `todo` | warn |
-| Clippy `pedantic` + `nursery` | warn |
-
-Default members (fast `cargo test`) include the lighter core crates. Heavier crates (`pipeline`, `api`, `embeddings`, `benchmarks`, `e2e`, `scenarios`) are exercised through the staged Makefile/CI lanes and the `repo-cargo` / `hook-cargo` wrappers.
-
-<Note>
-  SurrealDB integration tests use the `kv-mem` in-memory backend so they run
-  without an external database process. See the [Domain Model](/architecture/domain-model)
-  page for the complete record type reference.
-</Note>
+For contribution setup and checks, use [development](/operations/development).
+For database boundary invariants, use [SurrealDB patterns](/operations/surrealdb-patterns).
+For the projection architecture, use [Living Wiki](/architecture/living-wiki).

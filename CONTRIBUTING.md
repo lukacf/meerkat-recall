@@ -54,6 +54,27 @@ scaffolds clearly marked as non-active.
 - Use `docs/non-active-catalog.md` for removed legacy behavior and planned
   scaffolds that are not dispatched by the runtime.
 
+Validate the documentation site with Node.js 22 or newer:
+
+```bash
+npm ci --prefix scripts/docs --ignore-scripts
+make docs-check
+```
+
+This compiles MDX and checks page titles, navigation coverage, local links and
+heading anchors, JSON examples, and MCP tool/profile coverage against Rust
+source. Use Markdown links/images in `.md` files and quoted `href`/`src` strings
+in MDX components so link targets can be checked. CI runs the same check. This
+does not validate live API schemas or Mintlify's component registry. To inspect
+layout, run the Mintlify preview from `docs/` and follow the quickstart and
+changed pages in a browser.
+
+Write concepts to explain the model, guides to complete a task, and references
+to describe exact contracts. Guides should state prerequisites, distinguish
+example IDs from returned IDs, show how to verify the outcome, and explain the
+next diagnostic step when work fails. Keep examples fictional and use ASCII
+hyphens.
+
 ## Code Style
 
 - Follow the existing crate/module patterns before adding new abstractions.

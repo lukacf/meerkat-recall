@@ -63,7 +63,14 @@ For **rel sets** (all objects of one subject-predicate pair):
 subject_entity_id::__rel_set__::predicate_id::security_hash
 ```
 
-The `security_hash` is a deterministic SHA-256 of the security envelope (policy ID, level, and sorted labels), ensuring that claims at different security levels occupy separate truth slots. A consequence, by design: contradictions between claims in different security envelopes are never detected -- TM does not join data across ABAC boundaries.
+Attributes with a context bucket insert that bucket before the security hash.
+Treat slot keys as server-generated identifiers rather than constructing them
+in a client.
+
+The `security_hash` is a deterministic SHA-256 of the security envelope (policy
+ID, level, sorted labels, and sorted handling tags). Claims in different
+envelopes occupy separate truth slots, so this comparison does not detect
+contradictions across those boundaries.
 
 ### Cross-object conflicts
 
@@ -100,7 +107,7 @@ Without an adjudicator (or when adjudication fails), the predicate's conflict po
 |--------|----------|
 | `AllowParallel` | Both claims coexist. The truth slot shows all values with confidence ranking. This is the default. |
 | `SupersedeByRecency` | The newer timestamp wins. The older claim gets its validity window closed. |
-| `SplitByContext` | Role-dependent truths do not conflict. Claims are partitioned by context. |
+| `SplitByContext` | Partitions claims by supplied context. The current relationship/attribute adapter supplies no context, so configuring this policy alone does not infer role-specific groups. |
 | `RequireMoreEvidence` | No automatic resolution. The conflict is flagged for human review. |
 
 <Note>
@@ -114,7 +121,7 @@ When the TM system detects divergent values, it gathers the competing rels or at
 1. **Loads all claims** for the slot, including their rendered values.
 2. **Checks the memo**: if the claim-set hash matches the group's `adjudicated_claim_set_hash`, the previous verdict stands and no LLM call is made.
 3. **Adjudicates** (LLM) or **applies the conflict policy** (fallback) to rank or partition the claims.
-4. **Updates claim statuses**: winners get `ClaimStatus::Active`, superseded claims get `ClaimStatus::Superseded`, corroborated duplicates are merged and soft-deleted.
+4. **Updates claim statuses**: accepted rel/attribute claims get `ClaimStatus::Approved` (`approved` on the wire), superseded claims get `ClaimStatus::Superseded`, and corroborated duplicates are merged and soft-deleted. A `needs_review` outcome does not declare a winner.
 5. **Writes the truth slot** with the current value(s), a confidence score, and the rationale.
 
 ## Recompute
@@ -126,7 +133,7 @@ The `tm_recompute` work kind refreshes stale truth slots. A slot becomes stale w
 - Predicate semantics change (including newly learned `llm_proposed` semantics)
 - A freshness sweep flags the slot for recomputation
 
-Recompute re-partitions the current claims for each slot. It **never calls the LLM inline**: single-value-group slots are committed deterministically within the recompute loop, while multi-value-group slots get their conflict group upserted and a `tm_resolve_slot` work item enqueued per group. This keeps every work item within the 300-second lease.
+Recompute re-partitions the current claims for each slot. It **never calls the LLM inline**: single-value-group slots are committed deterministically within the recompute loop, while multi-value-group slots get their conflict group upserted and a `tm_resolve_slot` work item enqueued per group. This separates model latency from recomputation; it does not guarantee a fixed completion time under every workload.
 
 <Warning>
   Recompute can change the winning value of a truth slot if claims have been added or removed since the last resolution. This is by design -- truth slots are derived state, not source of truth. The reverse does not hold: re-corroborating an already-superseded value does not reopen adjudication while the conflict group's claim set is unchanged.

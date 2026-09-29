@@ -1,244 +1,172 @@
 ---
-title: "Putting It All Together - Part 2"
-description: "Four worked examples continued: assertions, truth maintenance, security, and the complete picture"
-icon: "puzzle-piece"
+title: "Follow Updates and Conflicting Claims"
+description: "Add a second source, inspect the resulting claims, and distinguish current truth from evidence history."
+icon: "scale-balanced"
 ---
 
-<Note>
-The scenarios and output snippets below are illustrative, using fictional
-people, organizations, and device data. Exact model output and timing depend
-on configuration and evidence; these examples are not production acceptance
-results.
-</Note>
+Continue from [From a Source to Verified Knowledge](/guides/putting-it-together).
+Keep its `BASE_URL`, `elephant_http` helper, source/document receipts, and the
+actual Cedar API entity ID. This tutorial uses the Full MCP profile for truth
+inspection alongside the REST ingestion calls.
 
-Continuing from [Part 1](/guides/putting-it-together), where we traced four source evidence examples through documents, skill routing, entities, relationships, and events. Now we follow the same examples through the evidence layer, conflict resolution, and security.
+The first note said Cedar API depends on Cedar Storage. A second note says the
+API now uses Cedar Cache for reads while retaining Cedar Storage for writes.
+That additional value may describe coexistence rather than a contradiction.
+The job is to inspect the evidence and predicate semantics before deciding.
 
----
+## 1. Add the new evidence
 
-## Step 6: Assertions - the evidence underneath
+Keep the first note intact. Submit this as a distinct source with a distinct
+rendition key so both pieces of evidence remain inspectable:
 
-Every entity, relationship, and event above traces back to one or more **Assertions** - the raw extracted claims with evidence spans pointing to exact character offsets in the rendered evidence projection.
+```bash
+cat > cedar-update.json <<'JSON'
+{
+  "name": "Cedar architecture update",
+  "uri": "https://docs.example.com/cedar/architecture/v2",
+  "source_type": "web",
+  "title": "Cedar read path update",
+  "text": "Cedar API now depends on Cedar Cache for reads. Cedar API still depends on Cedar Storage for writes. Cedar Cache uses Redis. This note adds the cache and does not remove the storage dependency.",
+  "collection": "cedar-tutorial",
+  "rendition_key": "cedar-architecture-v2",
+  "ingest_mode": "graph",
+  "extraction_skill": "extraction/technical-docs",
+  "extraction_purpose": "Identify named software components and explicitly stated dependencies. Preserve the distinction between reads and writes."
+}
+JSON
 
-<Tabs>
-  <Tab title="Email">
-    ```json
-    {
-      "subject_text": "Bob Martinez",
-      "predicate_text": "met_with",
-      "object_text": "Dr. Kim",
-      "confidence": 0.95,
-      "evidence_span": {
-        "start": 52,
-        "end": 108,
-        "quote": "I met with Dr. Kim at City Dental yesterday"
-      }
-    }
-    ```
-    The `evidence_span` lets anyone verify the claim by looking at characters 52-108 in the rendered projection of the source email.
-  </Tab>
-  <Tab title="IoT">
-    ```json
-    {
-      "subject_text": "leak_sensor_kitchen",
-      "predicate_text": "detected",
-      "object_literal": "water",
-      "confidence": 1.0,
-      "evidence_span": {
-        "start": 220,
-        "end": 279,
-        "quote": "leak_sensor_kitchen: ALERT water detected under sink"
-      }
-    }
-    ```
-    IoT assertions often have `confidence: 1.0` - the sensor either fired or it didn't. There's no interpretation ambiguity.
-  </Tab>
-  <Tab title="Fiction">
-    The pipeline produces hundreds of assertions across the full novel. Here's one from Chapter 6:
-    ```json
-    {
-      "subject_text": "the Duchess",
-      "predicate_text": "owns",
-      "object_text": "Cheshire Cat",
-      "confidence": 0.85,
-      "evidence_span": {
-        "start": 14209,
-        "end": 14283,
-        "quote": "It's a Cheshire cat, said the Duchess, and that's why."
-      }
-    }
-    ```
-    The evidence span points to a specific offset in the full 27,000-word text - `start: 14209` is deep into Chapter 6. This is why Elephant uses character offsets rather than page numbers: they're precise across any rendering of the text.
-  </Tab>
-  <Tab title="Codebase">
-    Codebase assertions come from different file types, and their provenance is especially powerful:
-    ```json
-    {
-      "subject_text": "elephant-api",
-      "predicate_text": "depends_on",
-      "object_text": "elephant-storage",
-      "confidence": 1.0,
-      "evidence_span": {
-        "start": 892,
-        "end": 941,
-        "quote": "elephant-storage = { path = \"../../crates/storage\" }"
-      }
-    }
-    ```
-    This assertion has `confidence: 1.0` - a Cargo.toml dependency declaration is unambiguous, like a sensor reading. Compare with an assertion from AGENTS.md (`confidence: 0.9`) where the LLM is interpreting natural language. The provenance chain lets you ask: *"Why does Elephant think policy implements ABAC? Because AGENTS.md says so, at this exact line."*
-  </Tab>
-</Tabs>
+elephant_http "$BASE_URL/v1/sources/ingest" \
+  -H 'Content-Type: application/json' \
+  --data-binary @cedar-update.json > cedar-update-ingest.json
+jq . cedar-update-ingest.json
 
-<Note>
-Sources and immutable evidence revisions ground extracted assertions. Canonical
-graph records and truth slots preserve evidence links and are updated through
-validated commits and truth maintenance. Explicit operator writes also exist;
-not every graph row is produced by extraction.
-</Note>
+export UPDATE_SOURCE_ID=$(jq -er '.source_id' cedar-update-ingest.json)
+export UPDATE_DOC_ID=$(jq -er '.doc_id' cedar-update-ingest.json)
 
----
-
-## Step 7: Truth Maintenance - when sources disagree
-
-Now imagine new information arrives that conflicts with what we extracted earlier. (If the new source simply *repeats* an existing value, that is corroboration, not a conflict - the evidence merges into the existing claim. Truth maintenance only opens a conflict when the values genuinely diverge.)
-
-<Tabs>
-  <Tab title="Email">
-    | Old assertion | New assertion | Policy | Result |
-    |--------------|---------------|--------|--------|
-    | launch date = April 1 (email 1) | launch date = April 15 (email 2) | `SupersedeByRecency` | April 1 → `superseded`, April 15 → `approved` |
-
-    A second email says the wellness launch has been pushed to April 15. Both assertions land in the same **Truth Slot** (keyed by subject + predicate). With a configured supersession policy and supporting evidence, adjudication
-    can select the newer claim and mark the older value `superseded`. The April 1 event updates its status; a new April 15 event is created. Both assertions remain - you can always query the slot history.
-  </Tab>
-  <Tab title="IoT">
-    | Old assertion | New assertion | Policy | Result |
-    |--------------|---------------|--------|--------|
-    | water detected under sink | all clear, no water | `SupersedeByRecency` | leak alert → `superseded` |
-
-    A second sensor reading conflicts with the earlier alert. The "all clear" wins, but the historical event record persists: "there was a leak at 07:15, resolved by 07:45." This is crucial for IoT - you need the incident history even after resolution.
-  </Tab>
-  <Tab title="Fiction">
-    | Source | Claim | Policy | Result |
-    |--------|-------|--------|--------|
-    | Novel | Cheshire Cat trait = "grinning" | `AllowParallel` | Both survive |
-    | Literary essay | Cheshire Cat trait = "represents absurdity" | `AllowParallel` | Both survive |
-    | Novel | Queen role = "antagonist" | `AllowParallel` | Both survive |
-    | Literary essay | Queen role = "parody of authority" | `AllowParallel` | Both survive |
-
-    Ingesting a literary analysis essay adds new assertions about existing entities. Under `AllowParallel`, both interpretations coexist - the right policy for fiction. Business data would use `SupersedeByRecency` to pick one winner. Each assertion tracks its source.
-  </Tab>
-  <Tab title="Codebase">
-    | Old assertion | New assertion | Policy | Result |
-    |--------------|---------------|--------|--------|
-    | elephant-pipeline `depends_on` elephant-storage (Jan Cargo.toml) | no direct dependency (Feb Cargo.toml) | `SupersedeByRecency` | old dep → `superseded`, `valid_to: 2026-02-06` |
-
-    Re-ingesting after a refactor produces competing assertions. The old dependency becomes historical - you can query "What did elephant-pipeline depend on in January?" and get the old answer with full provenance. The graph records **how the architecture evolved**, traced to specific commits.
-  </Tab>
-</Tabs>
-
-<Note>
-When `ANTHROPIC_API_KEY` is set, these decisions are made by an LLM adjudicator that sees the actual claim values - it can extract validity dates from the text itself ("pushed to April 15") rather than relying on ingest timestamps. The named policies apply as the deterministic fallback for keyless deployments, and as the semantics the adjudicator learns and records per predicate.
-</Note>
-
----
-
-## Step 8: Security - who sees what
-
-All of the above is scoped by [spaces and security](/concepts/security). Each record carries a **SecurityEnvelope** controlling visibility.
-
-<Tabs>
-  <Tab title="Email">
-    | Property | Value |
-    |----------|-------|
-    | **Space** | `acme-corp` |
-    | **Labels** | `internal`, `hr` |
-    | **Effect** | Only principals with matching clearance see records |
-
-    The pricing attribute ("$45/employee") might carry an additional `confidential` label restricting it to HR and Legal.
-  </Tab>
-  <Tab title="IoT">
-    | Property | Value |
-    |----------|-------|
-    | **Space** | `sam-home` |
-    | **Labels** | `personal`, `iot` |
-    | **Effect** | Only Sam's principal (or authorized home automation agents) can access |
-
-    Guest users might see "someone arrived" but not "Sam arrived" - ABAC-based redaction hides the identity.
-  </Tab>
-  <Tab title="Fiction">
-    | Property | Value |
-    |----------|-------|
-    | **Space** | `library` |
-    | **Labels** | none (public domain) |
-    | **Effect** | Any principal in the space can read |
-
-    The literary analysis essay might carry the analyst's institution label (`academic`), restricting that interpretation to authorized readers even though the source novel is public domain.
-  </Tab>
-  <Tab title="Codebase">
-    | Property | Value |
-    |----------|-------|
-    | **Space** | `elephant-dev` |
-    | **Labels** | `engineering` |
-    | **Effect** | AI coding assistants with `engineering` clearance can query the full architecture graph |
-
-    Security-sensitive knowledge might carry `security` + `engineering` labels. Open-source docs could live in a separate `elephant-public` space with no labels.
-  </Tab>
-</Tabs>
-
----
-
-## The complete picture
-
-Here's how every concept connects - from source evidence to queryable knowledge:
-
-```mermaid
-graph TD
-    SRC["Source"]
-    DOC["Document"]
-    CHK["DocNodes"]
-    VEC["Vectors"]
-    SKILL["Extraction Skill"]
-    ASN["Assertions"]
-    ENT["Entities"]
-    REL["Rels"]
-    ATT["Attributes"]
-    EVT["Events"]
-    TS["Truth Slots"]
-    PRED["Predicates"]
-    SEC["Security"]
-
-    SRC --> DOC
-    DOC --> CHK
-    CHK --> VEC
-    DOC -->|"canonical projection"| SKILL
-    SKILL -->|"LLM one-shot"| ASN
-    ASN --> ENT
-    ASN --> REL
-    ASN --> ATT
-    ASN --> EVT
-    REL --> TS
-    ATT --> TS
-    REL -.->|"typed by"| PRED
-    ATT -.->|"typed by"| PRED
-    SEC -.->|"enforced on"| ENT
-    SEC -.->|"enforced on"| REL
-    SEC -.->|"enforced on"| DOC
-    SEC -.->|"enforced on"| EVT
+elephant_http "$BASE_URL/v1/docs/$UPDATE_DOC_ID/pipeline-status" | jq
 ```
 
-Notice the two parallel paths from Document: chunks go to **vector embedding** for search, while the canonical rendered projection goes to **LLM extraction** (guided by a skill) for knowledge graph construction.
+Follow the lifecycle as in Part 1. Do not interpret a newly queued source as an
+already updated graph. Likewise, absence from a new document is not an explicit
+retraction of an older claim.
 
-| Concept | What it answers | Where to learn more |
-|---------|-----------------|---------------------|
-| **Source** | Where did the data come from? | [Documents](/concepts/documents#source-linking) |
-| **Document** | What's the canonical rendered projection? | [Documents](/concepts/documents) |
-| **DocNode** | How is it chunked for search? | [Documents](/concepts/documents#document-nodes-chunks) |
-| **Extraction Skill** | What should the LLM look for? | [Extraction](/pipeline/extraction) |
-| **Assertion** | What claims were extracted, with what evidence? | [Assertions](/concepts/assertions) |
-| **Entity** | Who or what is mentioned? | [Entities](/concepts/entities) |
-| **Rel** | How are two entities connected? | [Relationships](/concepts/relationships) |
-| **Attribute** | What literal values describe an entity? | [Relationships](/concepts/relationships#attributes) |
-| **Event** | What happened, and when? | [Events](/concepts/events) |
-| **Truth Slot** | Which competing claim wins? | [Truth Maintenance](/concepts/truth-maintenance) |
-| **Predicate** | What's the canonical vocabulary? | [Predicates](/concepts/predicates) |
-| **Security** | Who can see this record? | [Security](/concepts/security) |
+## 2. Compare claims before comparing winners
+
+Connect an MCP client to `/mcp/full` with the same principal and space. Examples
+below are tool arguments, not JSON-RPC envelopes. Replace every angle-bracket
+placeholder with an ID or predicate returned by your server.
+
+Call `search_assertions` for the known component:
+
+```json
+{
+  "entity_id": "<Cedar API entity ID>",
+  "limit": 50
+}
+```
+
+Compare each assertion's value, source provenance, evidence revision, and
+resolution status. `entity_id` selects resolved subject/object links and is
+preferable to a broad text scan when the entity is known. Use a text query if
+you are investigating unresolved mentions that have no entity link yet.
+
+Questions to answer from the returned evidence:
+
+- Did the second note resolve Cedar API to the same entity as the first?
+- Are the storage and cache dependencies both present?
+- Does the claimed purpose of each dependency agree with the note?
+- Which predicate IDs were assigned, and are those predicates governed?
+
+If the component was duplicated, follow the [identity workflow](/mcp/workflows#review-an-identity-merge)
+before treating the two entity histories as one.
+
+## 3. Inspect predicate semantics and truth slots
+
+Use `get_predicate` with the actual predicate ID from an assertion or relationship:
+
+```json
+{
+  "predicate_id": "<returned predicate ID>",
+  "include_aliases": true
+}
+```
+
+Then call `list_truth_slots`:
+
+```json
+{
+  "subject_entity_id": "<Cedar API entity ID>",
+  "predicate_id": "<returned predicate ID>",
+  "limit": 25
+}
+```
+
+The response's `data.items` contains slot fields directly, plus
+`conflict_count` and `has_conflict`; there is no nested `slot` object in this
+list response. Inspect each item's `current_values`, `stale`, and security
+envelope. A slot groups claims according to its slot type, predicate,
+and security context; it is not a universal winner for every statement about
+that entity.
+
+| Observation | Interpretation |
+|---|---|
+| Repeated claims with the same value | Can corroborate the value by combining evidence |
+| Several objects under a configured many-valued predicate | May coexist without a cross-object conflict |
+| Different values for a single-valued or unknown-semantics predicate | Can form a conflict group for adjudication |
+| `stale: true` | The current slot needs recomputation |
+| `needs_review` adjudication | Evidence was insufficient for an automatic decision |
+
+Inspect the actual conflict group with `get_truth_slot_history`, passing the
+returned slot `id`:
+
+```json
+{
+  "id": "<returned truth slot ID>"
+}
+```
+
+This tool is available on `/mcp/full`. Its history includes the slot, an optional
+conflict group, and any assertion records the handler can resolve and authorize
+from the claim references. For the full set of entity claims, keep using
+`search_assertions`; do not treat the history array as an exhaustive audit log.
+
+## 4. Explain the result with evidence
+
+Elephant's LLM adjudicator can select a winner, allow coexistence, supersede a
+value with temporal context, or request review. When no adjudicator is
+configured, deterministic predicate policies provide the fallback. Unknown
+semantics do not justify automatically replacing one value with another.
+
+For the Cedar example, the text explicitly says the storage dependency remains.
+A useful answer should preserve that qualification and cite the source. If the
+extracted graph says the API abandoned storage, the pipeline has completed but
+the interpretation is wrong. Inspect the assertion and extraction guidance;
+do not repair that by merely changing an assertion's status to `resolved`.
+
+The following are separate checks:
+
+| Check | What it establishes |
+|---|---|
+| Ingestion receipt | Input was staged and work enqueued |
+| Completed extraction | Relevant work reached completion |
+| Governed current values | Elephant's current decision under predicate semantics |
+| Verified evidence | The source actually supports the claimed statement |
+
+## 5. Keep security and history in the explanation
+
+All reads are restricted to the caller's space and authorization. Claims in
+different security envelopes do not share a truth-maintenance conflict group.
+A caller's missing result can therefore reflect visibility rather than missing
+storage or a globally resolved conflict.
+
+Source revisions preserve what was observed. Truth maintenance describes which
+values are currently accepted. A derived [Living Wiki](/architecture/living-wiki)
+page adds a publication layer with its own evidence and freshness checks.
+Publishing a wiki is a separate operation and requires its explicit service
+authority; ingestion alone does not promise that a new article exists.
+
+## Next steps
+
+- [Truth slots](/guides/truth-slots) explains slot fields and stale-state inspection.
+- [MCP workflows](/mcp/workflows) covers evidence retrieval, identity review, and predicate governance.
+- [Event streaming](/guides/event-streaming) explains how an application follows committed changes.

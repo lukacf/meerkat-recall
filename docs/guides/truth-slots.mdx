@@ -4,7 +4,16 @@ description: "How to inspect current truth, investigate assertion conflicts, and
 icon: "scale-balanced"
 ---
 
-Truth slots represent Elephant's current belief about a specific claim -- for example, "where does Alex Chen work?" When multiple assertions compete for the same slot, the truth maintenance system resolves conflicts using configurable policies.
+A truth slot records the currently accepted value or values for a governed
+claim within a security envelope. Use this guide when a graph value looks
+outdated, two sources appear to disagree, or your application needs to explain
+why a value is current.
+
+The complete MCP investigation uses `/mcp/full`: `list_truth_slots` is also
+available on Agent and Maintenance, but `get_truth_slot_history` is Full-only.
+Keep the same principal and space throughout. Replace example IDs with actual
+returned IDs. HTTP examples assume local `SKIP_AUTH` development; add a bearer
+token when authentication is enabled.
 
 ## List truth slots
 
@@ -28,21 +37,26 @@ Query truth slots filtered by subject entity, predicate, or staleness.
   </Tab>
 </Tabs>
 
-MCP `list_truth_slots` returns summaries containing `slot`, `conflict_count`, and `has_conflict`. The underlying slot has the fields below. REST returns full slots in `results`, with `total` and `cursor`, without the MCP summary fields:
+MCP `list_truth_slots` returns `data.items`. Each item contains the slot fields
+directly, plus `conflict_count` and `has_conflict`; the list response has no
+nested `slot` field. REST returns full slots in `results`, with `total` and
+`cursor`, without the MCP summary fields:
 
 | Field | Description |
 |---|---|
-| `slot_key` | Unique key identifying the subject + predicate combination |
+| `slot_key` | Key for the slot type, claim identity, and security envelope |
 | `subject_entity` | The entity this truth is about |
 | `predicate_id` | The predicate (e.g., `works_at`, `located_in`) |
 | `current_values` | The currently accepted value(s) with claim IDs |
 | `stale` | Whether the slot needs re-evaluation |
-| `conflict_count` | Number of competing assertions |
+| `conflict_count` | Claim count in the associated conflict group |
 | `has_conflict` | Whether an unresolved conflict exists |
 
 ## Filter for stale slots
 
-Stale slots indicate knowledge that may be outdated. Set `stale_only: true` to find them.
+Stale means the slot needs recomputation after its inputs changed. It does not
+by itself establish that the current value is false. Set `stale_only: true` to
+find slots awaiting evaluation.
 
 <Tabs>
   <Tab title="MCP Tool">
@@ -63,7 +77,9 @@ Stale slots indicate knowledge that may be outdated. Set `stale_only: true` to f
 
 ## Investigate conflicts
 
-When a truth slot has competing assertions, use `get_truth_slot_history` to see all assertions that have claimed this slot.
+Use `get_truth_slot_history` with a returned slot ID to inspect its conflict
+group and available assertion references. This response is an inspection view,
+not an exhaustive immutable history of every past decision.
 
 <Tabs>
   <Tab title="MCP Tool">
@@ -76,40 +92,51 @@ When a truth slot has competing assertions, use `get_truth_slot_history` to see 
   </Tab>
   <Tab title="curl">
     ```bash
-    curl -s "http://localhost:3000/v1/truth-slots/truth_slot:550e8400.../history"
+    curl -s "http://localhost:3000/v1/truth-slots/$SLOT_ID/history"
     ```
   </Tab>
 </Tabs>
 
+Set `SLOT_ID` to the complete returned ID for the HTTP example.
 The MCP history response contains:
 
 | Field | Description |
 |---|---|
 | `slot` | The truth slot record |
 | `conflict_group` | The conflict group if one exists, including all `claim_ids` |
-| `assertions` | Full assertion records for each competing claim |
+| `assertions` | Assertion references the handler could resolve and authorize |
 
 REST history returns `slot` and an optional `conflict_group`; it does not return the `assertions` array. All reads use the authenticated space. Add a bearer token when authentication is enabled.
 
-## How assertion competition works
+## Interpret the result
 
-When the extraction pipeline processes a document, it produces assertions -- structured claims like "Alex Chen works_at NeuralFlow." Each assertion includes:
+First inspect the predicate's semantics with `get_predicate`. Equal values can
+corroborate each other. Different values can coexist when the predicate permits
+multiple values, or form a conflict when it does not. Claims in different
+security envelopes are isolated and do not adjudicate against one another.
 
-1. **Subject and predicate** -- determines which truth slot it targets
-2. **Evidence span** -- links back to the source document chunk
-3. **Confidence score** -- the extraction LLM's certainty
-4. **Observed timestamp** -- when the claim was recorded
+An LLM adjudicator, when configured, can corroborate, select a winner, allow
+coexistence, supersede a value with validity dates, or request review. Without
+an adjudicator, configured deterministic policies provide the fallback. Unknown
+semantics do not justify automatically superseding a value.
 
-Multiple assertions targeting the same truth slot are compared by value. Assertions that agree **corroborate**: their evidence merges into a single winning claim and no conflict is recorded. Genuinely divergent values form a conflict group, which is resolved by an LLM adjudicator that sees the actual values (when `ANTHROPIC_API_KEY` is set) and can corroborate, pick a single winner, let values coexist, supersede with extracted validity dates, or flag for review.
-
-Deployments without an API key fall back to the predicate's deterministic conflict policy:
-
-| Policy | Behavior |
+| Observation | Next question |
 |---|---|
-| `AllowParallel` | Multiple values coexist (e.g., a person can have multiple roles) |
-| `SupersedeByRecency` | The newest assertion wins |
-| `SplitByContext` | Values are partitioned by context (e.g., role at different companies) |
-| `RequireMoreEvidence` | Flagged for manual review |
+| Several current values | Does the predicate allow coexistence? |
+| A superseded claim | Which evidence supports the replacement and its time window? |
+| `has_conflict: true` | What values actually differ, and is adjudication pending? |
+| `stale: true` | Did input changes enqueue recomputation, and is the worker progressing? |
+| Empty history assertions | Are the claim references graph records rather than assertion IDs, or are reads restricted? |
+
+Use `search_assertions` with the known `entity_id` to inspect the entity's
+resolved claims independently of the history helper. Follow each relevant
+claim to its source before presenting a winner as fact. A confidence score is
+part of the extraction or adjudication output, not an independent probability
+that the claim is true.
+
+See [Truth maintenance](/concepts/truth-maintenance) for the slot model and
+[Follow updates and conflicting claims](/guides/putting-it-together-part2) for a
+worked investigation.
 
 ## Inspect a single assertion
 

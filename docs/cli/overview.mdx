@@ -1,0 +1,115 @@
+---
+title: CLI Reference
+description: Run Elephant, inspect a server, and manage migrations and embedded snapshots.
+icon: terminal
+---
+
+Elephant ships one public command, `elephant`. From a source checkout, use
+`./scripts/repo-cargo run -p elephant-bin -- <command>`. Run
+`elephant --help` or `elephant <command> --help` for the installed version's
+command syntax.
+
+## Commands
+
+| Command | Purpose | Uses |
+| --- | --- | --- |
+| `serve` | Start HTTP, MCP, and managed workers | Local runtime and provider configuration |
+| `serve --server-only` | Start HTTP and MCP without managed workers | Local runtime configuration |
+| `worker` | Run a standalone pipeline worker | Shared SurrealDB configuration; rejects ElephantDB |
+| `migrate` | Apply SurrealDB schema migrations | Local SurrealDB configuration |
+| `status [--json]` | Read health and managed runtime status | Running server API |
+| `snapshot export <path>` | Export the live embedded store | Running server API; path is on the server |
+| `snapshot import <path>` | Import into the live embedded store | Running server API; path is on the server |
+| `data-migrate --snapshot <path>` | Copy an embedded snapshot into an empty SurrealDB target | Local snapshot and target database |
+| `demo-wiki [--port <port>]` | Run an isolated Living Wiki demonstration | Embedded demo runtime; default port 3000 |
+
+See [deployment](/operations/deployment) for environment settings and
+[quickstart](/quickstart) for a credential-free demo or persistent local stack.
+The demo's article generation requires model configuration and a build with
+the relevant features; the no-default-features demo exposes evidence and
+context projections without generated articles.
+
+## Target a running server
+
+The `status` and `snapshot` commands accept two global options:
+
+| Option | Environment fallback | Default |
+| --- | --- | --- |
+| `--api-url <url>` | `ELEPHANT_API_URL` | HTTP URL built from `ELEPHANT_HOST` and `ELEPHANT_PORT`, otherwise `http://127.0.0.1:3000` |
+| `--token <token>` | `ELEPHANT_API_BEARER_TOKEN` | No token |
+
+An explicit option takes precedence over the corresponding environment
+variable. A wildcard bind host (`0.0.0.0` or `::`) is translated to a loopback
+address when constructing a default client URL. These options do not change
+where `serve` listens or where `migrate` writes.
+
+```bash
+# Set ELEPHANT_API_BEARER_TOKEN in your environment for an authenticated server.
+elephant --api-url http://127.0.0.1:3000 status --json
+```
+
+The JSON output contains `health` and `runtime`. `runtime` can be `null` when
+its request fails. A successful CLI exit does **not** by itself prove that the
+server is healthy or ingest-ready: inspect those fields.
+
+```bash
+elephant status --json > /tmp/elephant-status.json
+jq -e '.health.status == "healthy" and .runtime.semantic_ingest_ready == true' \
+  /tmp/elephant-status.json
+```
+
+## Apply schema migrations
+
+```bash
+elephant migrate
+```
+
+Configure the same SurrealDB URL, namespace, and database used by the server.
+`--extension-dir <directory>` (short form `-e`) additionally applies `.surql`
+files from a local directory. It is a database schema operation, separate from
+running queued document processing.
+
+## Export and import embedded snapshots
+
+```bash
+elephant snapshot export /backups/elephant.snapshot.json
+```
+
+The path is resolved by the **server process**. It must be writable by that
+process; this command does not download a file to the CLI machine. Snapshot
+operations require an embedded ElephantDB runtime and the relevant system
+permissions. See [snapshot API](/api/system) for the operation contract.
+
+```bash
+elephant snapshot import /backups/elephant.snapshot.json
+```
+
+Import changes the live store. Preserve a recovery copy and verify the intended
+server and snapshot before importing. Do not treat an in-memory store or a
+successful export as a continuously durable database.
+
+For graceful `serve` shutdown, `ELEPHANT_DB_SNAPSHOT_SAVE` selects an autosave
+path, falling back to `ELEPHANT_DB_SNAPSHOT_LOAD` when set. The Ctrl-C handler
+attempts export unless `ELEPHANT_DB_SNAPSHOT_AUTOSAVE` is disabled (`0`,
+`false`, `FALSE`, `off`, or `OFF`). Forced termination cannot rely on that path.
+
+## Migrate a snapshot to SurrealDB
+
+`data-migrate` reads a snapshot from the CLI machine and copies typed records
+into a SurrealDB target that you have independently verified is **fresh and
+empty**. Its built-in check only rejects a target when it successfully detects
+existing documents; it does not prove that other tables are empty, and query
+failure does not stop the migration. This operation is separate from the live
+snapshot API.
+
+| Option | Required | Fallback |
+| --- | --- | --- |
+| `--snapshot <path>` | Yes | None |
+| `--url <url>` | Unless environment set | `SURREALDB_URL` |
+| `--namespace <name>` | No | `SURREALDB_NS`, then `elephant` |
+| `--database <name>` | No | `SURREALDB_DATABASE`, then `elephant` |
+| `--report <path>` | No | No report file |
+
+Use an isolated empty target and preserve the source snapshot. Verify row
+counts and representative evidence, graph, and policy reads before pointing an
+application at the destination. A completed copy is not an application cutover.

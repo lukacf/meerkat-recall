@@ -3,13 +3,21 @@ title: "Living Wiki"
 description: "Graph-native, cited, freshness-aware knowledge projections"
 ---
 
-# Living Wiki
-
 Elephant's Living Wiki is the human-readable semantic projection of canonical
 knowledge. It does not create evidence and its output must never be re-ingested
 as a source. A source record, an entity row, and a compiled projection are not
 automatically wiki articles. Publication requires editorial selection,
 semantic organization, and statement-local support.
+
+Use this page to understand the projection and publication contract. To try it,
+jump to the [runnable demo](#runnable-projection-demo). To call it from an agent,
+use the [MCP surface](#mcp-surface) and [tool reference](/mcp/tools).
+
+| Reader question | Surface | What to inspect |
+| --- | --- | --- |
+| What does Elephant know about a subject? | `/wiki` | Published articles and their citations |
+| What did the original material say? | `/evidence` | Sources, immutable excerpts, and provenance |
+| How was a projection constructed? | `/inspect/knowledge-views` | Dependencies, revisions, freshness, and validation receipts |
 
 The implementation has three deliberately separate surfaces:
 
@@ -317,7 +325,7 @@ even though that new record could not have appeared in its previous revision.
 Explicit member or scan bounds are disclosed in the revision and degrade its
 freshness state when they truncate selection.
 
-## Active scope and explicit gaps
+## Article planning and managed publication
 
 Elephant has an explicit LLM article planner, LLM information architect,
 article writer, and statement-level verifier. `create_wiki_from_graph` scans
@@ -355,6 +363,8 @@ selected and verified articles, failures, and hidden articles. Entity planning
 also carries earliest and latest semantic evidence times, so decade-old source
 volume does not masquerade as present relevance.
 
+### Recurring publication
+
 Published creation is managed by default. It durably enqueues
 `reconcile_living_wiki`. A periodic run always performs the complete bounded
 scan, but a stable graph fingerprint reuses the current wiki without any LLM
@@ -372,6 +382,8 @@ Article compilation is independently bounded by
 transport failures use bounded exponential backoff, while unsupported prose
 still fails closed. This permits large graphs to use provider and host capacity
 without weakening the evidence or verification contract.
+
+### Evidence available to the writer
 
 For each planned entity, the editorial compiler also retrieves a bounded set of
 resolved assertions that mention it and validates their immutable evidence
@@ -408,6 +420,8 @@ revision and policy, uses the node's revision byte span, and records both the
 node and revision as dependencies. This is the supported bridge from derived
 assertions back to quotable source text.
 
+### Publication security and governance
+
 Source evidence may carry a stricter envelope than the semantic entity. The
 article inherits the restrictive join: maximum sensitivity level, unioned
 labels and handling caveats, and unioned subject scope. Evidence under a
@@ -424,6 +438,8 @@ Review-pending predicates remain in canonical memory and quality workflows but
 cannot enter the LLM editorial context. Article neighborhoods default to one
 graph hop and permit up to 250 governed members; both bounds are explicit MCP
 inputs so a highly connected entity does not silently publish a truncated view.
+
+## Current limits
 
 Only that compiler can create `article` projections for `/wiki`; deterministic
 graph projections remain editorial inputs under the inspector surface. The

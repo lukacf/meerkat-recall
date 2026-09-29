@@ -1,258 +1,236 @@
 ---
 title: "Ingesting Data"
-description: "How to create sources, ingest documents, track pipeline progress, and perform batch ingestion."
+description: "Choose an input path, submit evidence, track source-first processing, and recover from partial failures."
 icon: "upload"
 ---
 
-Elephant processes evidence through the active source-first pipeline path: ingest source, stage/commit metadata artifacts, upgrade ingest depth, render, build the doc tree, plan extraction, extract assertions, validate/commit graph artifacts, and run truth maintenance. This guide walks through the supported ingestion methods.
+Ingestion turns supplied evidence into a source, an immutable rendered
+revision, and, when requested, extracted graph claims. It is asynchronous:
+a successful submission establishes that input was staged and work was queued.
+Use the returned IDs to inspect the result.
 
-<Note>
-  Start with `get_runtime_status` (or `GET /v1/runtime/status`) and only ingest when `semantic_ingest_ready` is `true`. Elephant no longer exposes a degraded doc-store-only ingest mode.
-</Note>
+For a complete runnable example with saved receipts, follow
+[From a Source to Verified Knowledge](/guides/putting-it-together).
 
-## Ingest a document (simple)
+## Choose an input path
 
-The fastest way to get a document into Elephant. Base fields like `id`, `space_id`, and timestamps are auto-generated.
+| What you have | Use | Important distinction |
+|---|---|---|
+| Text and a title | `ingest_doc_simple` or `POST /v1/docs/ingest` | Creates a source-backed document |
+| Known provenance plus supplied content | `ingest_source_simple` or `POST /v1/sources/ingest` | Lets you name the origin and choose ingest depth |
+| A URL to fetch | MCP `ingest_url` on `/mcp/full` | Source ingest's `uri` field alone does not fetch content |
+| UTF-8 files on the client computer | Optional `elephant-local-helper` | Reads client files and sends text |
+| Media on the server or inline attachments | Server ingestion with `media` | Paths must be accessible to the server |
+| Several independent documents | `batch_ingest_docs` or `POST /v1/docs/batch` | Inspect each item for staging failure |
+
+## Check readiness and access
+
+Call `get_runtime_status` or `GET /v1/runtime/status` first. Ingest only when
+`semantic_ingest_ready` is `true`. If not, inspect `issues` and the individual
+storage, worker, and extractor readiness fields. There is no degraded semantic
+ingestion mode that silently substitutes rule-based extraction.
+
+The MCP examples below are arguments for the named tool. Use `/mcp/full` to
+follow every ingest and inspection step; the default profile exposes convenient
+ingest tools but omits document pipeline status and some other inspection tools.
+Availability also depends on the principal and current runtime.
+
+HTTP examples assume explicit loopback development with `SKIP_AUTH`. On an
+authenticated server, add `-H "Authorization: Bearer $TOKEN"` to each request.
+The principal selects the space and must be allowed to write the source and
+document. Extraction uses your configured model provider.
+
+## Ingest a text document
 
 <Tabs>
-  <Tab title="MCP Tool">
+  <Tab title="MCP">
+    Call `ingest_doc_simple`:
+
     ```json
     {
-      "title": "Q4 Planning Notes",
-      "text": "Alice proposed moving the launch date to March. Bob agreed.",
-      "collection": "meetings"
+      "title": "Cedar architecture",
+      "text": "Cedar API depends on Cedar Storage.",
+      "collection": "architecture-notes",
+      "extraction_skill": "extraction/technical-docs"
     }
     ```
-    Tool: `ingest_doc_simple`
+
+    Save the returned document ID and source link from the response's `data`.
   </Tab>
-  <Tab title="curl">
+  <Tab title="REST">
     ```bash
-    curl -s -X POST http://localhost:3000/v1/docs/ingest \
-      -H "content-type: application/json" \
+    curl -fsS http://127.0.0.1:3000/v1/docs/ingest \
+      -H 'Content-Type: application/json' \
       -d '{
-        "title": "Q4 Planning Notes",
-        "text": "Alice proposed moving the launch date to March. Bob agreed.",
-        "rendition_key": "q4-planning-001"
+        "title": "Cedar architecture",
+        "text": "Cedar API depends on Cedar Storage.",
+        "collection": "architecture-notes",
+        "rendition_key": "cedar-architecture-v1",
+        "extraction_skill": "extraction/technical-docs"
       }'
     ```
+
+    Save `doc_id`, `source_id`, and `work_item_id` from the response.
+    `sync: true` is rejected; follow the asynchronous status flow.
   </Tab>
 </Tabs>
 
-## Ingest a document (full control)
+The convenience inputs generate base fields. Use `metadata` for application
+context and `extraction_purpose`, `extraction_skill`, or `extraction_domain` for
+extraction hints. Space configuration takes priority over those hints; inspect
+resolved guidance when the result differs from your intent.
 
-Use the REST document ingest endpoint when you need to set metadata, attach media, or control the rendition key for idempotency.
+## Ingest a named source
 
-<Tabs>
-  <Tab title="curl">
-    ```bash
-    curl -s -X POST http://localhost:3000/v1/docs/ingest \
-      -H "content-type: application/json" \
-      -d '{
-        "title": "Meeting notes",
-        "text": "Alice met Bob on 2026-02-02 to discuss Project Elephant.",
-        "rendition_key": "meeting-2026-02-02",
-        "metadata": { "collection": "meetings" }
-      }'
-    ```
-  </Tab>
-</Tabs>
-
-<Note>
-  The `rendition_key` provides idempotency. If you re-ingest a document with the same key, the pipeline will not duplicate work items.
-</Note>
-
-## Ingest a source first
-
-Sources track the origin of information. Use source-first ingest when you want Elephant to own both provenance and later document materialization.
-
-<Tabs>
-  <Tab title="MCP Tool">
-    ```json
-    {
-      "name": "Engineering Wiki",
-      "uri": "https://docs.example.com/engineering",
-      "source_type": "web",
-      "ingest_mode": "metadata"
-    }
-    ```
-    Tool: `ingest_source_simple`
-  </Tab>
-  <Tab title="curl">
-    ```bash
-    curl -s -X POST http://localhost:3000/v1/sources/ingest \
-      -H "content-type: application/json" \
-      -d '{
-        "name": "Engineering Wiki",
-        "uri": "https://docs.example.com/engineering",
-        "source_type": "web",
-        "ingest_mode": "metadata"
-      }'
-    ```
-  </Tab>
-</Tabs>
-
-The URI-only example records source metadata. It does not fetch the page. To request retrieval or graph ingestion, supply staged document content in the same source-first request:
+Use the source-first endpoint when the origin of the content is meaningful to
+your application. This example stages the supplied text for graph extraction:
 
 ```bash
-curl -s -X POST http://localhost:3000/v1/sources/ingest \
-  -H "content-type: application/json" \
+curl -fsS http://127.0.0.1:3000/v1/sources/ingest \
+  -H 'Content-Type: application/json' \
   -d '{
-    "name": "Observed frame",
-    "uri": "example://session/123/frame/1",
-    "source_type": "device_frame",
-    "title": "Frame 1",
-    "text": "Operator reviewing deployment dashboard",
-    "media": [
-      { "kind": "image", "media_type": "image/jpeg", "path": "/ingest/frame.jpg" }
-    ],
+    "name": "Cedar architecture note",
+    "uri": "https://docs.example.com/cedar/architecture",
+    "source_type": "web",
+    "title": "Cedar architecture",
+    "text": "Cedar API depends on Cedar Storage.",
+    "collection": "architecture-notes",
     "ingest_mode": "graph"
   }'
 ```
 
-## Track pipeline progress
+The same argument fields are accepted by MCP `ingest_source_simple`. The result
+contains source lifecycle information and, when content was staged, a `doc_id`.
 
-After ingestion, the source/document moves through rendering, doc-tree construction, embedding, extraction, and staged artifact commit. Check progress with `get_doc_pipeline_status`.
-
-<Tabs>
-  <Tab title="MCP Tool">
-    ```json
-    {
-      "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6"
-    }
-    ```
-    Tool: `get_doc_pipeline_status`
-  </Tab>
-  <Tab title="curl">
-    ```bash
-    curl -s "http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6/pipeline-status"
-    ```
-  </Tab>
-</Tabs>
-
-The response includes:
-
-| Field | Description |
+| Ingest mode | Requested depth |
 |---|---|
-| `chunks.total` | Number of document nodes created |
-| `chunks.embedded` | Nodes with embeddings generated |
-| `extraction_state` | One of `not_triggered`, `in_progress`, `complete`, `failed` |
-| `assertions_count` | Number of extracted assertions |
-| `entities_created` | Distinct entities referenced by assertions |
+| `metadata` | Record and normalize source metadata |
+| `retrieval` | Materialize supplied evidence for retrieval |
+| `graph` | Continue through extraction and validated graph commit |
+| `skip` | Record the source decision without deeper processing |
 
-## Batch ingest
+With supplied content the default is `graph`; without it the default is
+`metadata`. For a metadata-only source, omit `title`, `text`, media, and other
+staged-document fields. A URI is provenance metadata, so supply actual content
+when asking for retrieval or graph ingestion.
 
-Ingest multiple documents in a single call. Each document is processed independently; failures do not block other documents.
+## Track the result
 
-<Tabs>
-  <Tab title="MCP Tool">
-    ```json
-    {
-      "docs": [
-        {
-          "title": "Daily standup",
-          "text": "Status: shipped schema fixes; next up: search_all."
-        },
-        {
-          "title": "Incident report",
-          "text": "Observed suspicious domain in logs; created an entity and linked evidence."
-        }
-      ]
-    }
-    ```
-    Tool: `batch_ingest_docs`
-  </Tab>
-  <Tab title="curl">
-    ```bash
-    curl -s -X POST http://localhost:3000/v1/docs/batch \
-      -H "content-type: application/json" \
-      -d '{
-        "items": [
-          { "title": "Daily standup", "text": "Shipped schema fixes." },
-          {
-            "title": "Observed frame",
-            "text": "Operator was reviewing the dashboard",
-            "media": [
-              { "kind": "image", "media_type": "image/jpeg", "path": "/ingest/frame.jpg" }
-            ]
-          }
-        ]
-      }'
-    ```
-  </Tab>
-</Tabs>
+Pass the returned document ID to `get_doc_pipeline_status`:
 
-The response contains `succeeded` and `failed` arrays so you can retry individual failures.
+```json
+{
+  "id": "<returned document ID>"
+}
+```
 
-## Ingest from a URL
+The REST equivalent is `GET /v1/docs/{id}/pipeline-status`.
 
-Fetch a remote URL and ingest its content. Elephant auto-detects content type from the HTTP response header and normalizes text, image, and video URLs into the same source-first pipeline.
+| Field | What to inspect |
+|---|---|
+| `extraction_state` | `pending`, `running`, `completed`, `failed`, or `not_triggered` |
+| `revision` | The selected evidence revision, when available |
+| `chunks.total`, `chunks.embedded` | Structural and embedding progress |
+| `assertions_count` | Extracted assertion count |
+| `entities_created` | Distinct resolved entities counted from assertions |
+| `extraction_guidance` | Resolved purpose, skill, and resolution trace |
 
-<Tabs>
-  <Tab title="MCP Tool">
-    ```json
-    {
-      "url": "https://example.com/report.txt"
-    }
-    ```
-    Tool: `ingest_url`
-  </Tab>
-  <Tab title="REST">
-    Use `POST /v1/sources/ingest` with a web `source_type`, URI, and ingest mode,
-    as shown above. There is no `/v1/docs/ingest-url` REST route.
-  </Tab>
-</Tabs>
+Read the source with `get_source` or `GET /v1/sources/{id}` as well. Its
+`lifecycle_status`, `current_ingest_mode`, and ingest decision explain whether
+processing reached the requested depth or stopped as skipped or rejected.
+Work-item failures are reported separately. Document status summarizes processing; it does not certify the meaning
+of the generated claims. Inspect assertions and their evidence next.
 
-## Ingest from a local file
+## Retry deliberately
 
-The optional `elephant-local-helper` reads UTF-8 text files on the client
-computer and sends their content to Elephant. Its `ingest_file` and
-`ingest_directory` tools are separate from server-side file and media tools.
-The server cannot read arbitrary client paths.
+Save submission receipts before starting further work. If a connection drops
+after the server accepted an ingest request, blindly resubmitting a convenience
+request can create another document. Those inputs normally generate fresh IDs.
 
-<Tabs>
-  <Tab title="MCP Tool">
-    ```json
-    {
-      "path": "/path/to/report.md",
-      "source_type": "text/markdown"
-    }
-    ```
-    Tool: `ingest_file`
-  </Tab>
-</Tabs>
+`rendition_key` participates in document processing identity; it is not a global
+idempotency key for every normalized HTTP submission. Sending the same key
+with newly generated document IDs does not guarantee one document or one work
+item. Integrations that require stable updates should retain source/document
+identity and use the appropriate complete-record ingestion contract after
+checking the persisted result.
 
-<Warning>
-  For server-side file/media paths, explicitly mount an allowed directory into
-  the container and use paths visible there. The supplied Compose file does not
-  create an `/ingest` mount. The local helper reads client-side paths and is
-  intended for text, not binary PDF/image/video decoding.
-</Warning>
+For failed work, inspect its error and fix the input or runtime cause before
+using an authorized work-item retry. A status check should never itself submit
+another copy of the source.
 
-## Ingest an entire directory
+## Batch documents
 
-Recursively ingest all files matching a glob pattern.
+Use REST for normalized document inputs:
 
-<Tabs>
-  <Tab title="MCP Tool">
-    ```json
-    {
-      "path": "/path/to/docs",
-      "pattern": "**/*.md"
-    }
-    ```
-    Tool: `ingest_directory`
-  </Tab>
-</Tabs>
+```bash
+curl -fsS http://127.0.0.1:3000/v1/docs/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "items": [
+      {"title":"Cedar API","text":"Cedar API depends on Cedar Storage."},
+      {"title":"Cedar Worker","text":"Cedar Worker processes queued jobs."}
+    ]
+  }'
+```
 
-<Accordion title="Content type hints">
-  The local helper records `source_type` as metadata and reads files as UTF-8.
-  Use `text/markdown` or `text/plain` for text. For PDF, DOCX, image, and video
-  processing, use the appropriate server ingestion schema and supply content
-  through a supported server-visible path, URL, or media payload.
-</Accordion>
+MCP `batch_ingest_docs` takes a `docs` array. It normalizes omitted base fields
+and returns `succeeded`, `failed`, and a `job_id`. REST returns `succeeded` and
+`failed`. Inspect failures by their input index and retain the successful
+receipts; retrying the entire batch can duplicate successful inputs.
 
-## Next steps
+These are staging results. The MCP batch job can be marked done while each
+source's extraction is still queued. Inspect each document's pipeline state to
+establish processing completion. Request-shape validation can reject the whole
+request before item-level processing starts.
 
-- [Searching](/guides/searching) -- Find your ingested documents with text and vector search
-- [Building graphs](/guides/building-graphs) -- Create entities and relationships manually
-- [Truth slots](/guides/truth-slots) -- Inspect extracted assertions and truth maintenance
+## Fetch a URL
+
+On `/mcp/full`, call `ingest_url`:
+
+```json
+{
+  "url": "https://example.com/report.txt"
+}
+```
+
+The server fetches the URL and handles the supported content according to its
+response type. There is no equivalent REST fetch-URL route. REST clients fetch
+the content themselves and submit it using document or source ingest, retaining
+the original URI as provenance.
+
+## Files and media
+
+The optional `elephant-local-helper` provides client-side `ingest_file` and
+`ingest_directory` tools. It reads UTF-8 text; it is not a binary PDF, image, or
+video decoder. For example, its `ingest_file` accepts:
+
+```json
+{
+  "path": "/path/to/report.md",
+  "source_type": "text/markdown"
+}
+```
+
+The Full profile also has server-side tools with those names. Confirm which
+server owns the tool: a path on your laptop is not necessarily a path on the
+Elephant host. Mount intended server files explicitly; the supplied Compose
+file does not create an `/ingest` mount.
+
+For image/video content, use the `media` inputs in the
+[document API](/api/documents). Ordered attachments belong to one document and
+are rendered together. Text submitted alongside media provides sidecar context;
+the rendered projection becomes the canonical searchable evidence.
+
+## Troubleshooting
+
+| Symptom | Next check |
+|---|---|
+| Ingest tools are absent | Runtime readiness and endpoint profile |
+| Source is accepted but no document exists | Requested mode and whether content was supplied |
+| Extraction stays pending | Worker readiness, queued work, and lease/error state |
+| Extraction uses an unexpected skill | `extraction_guidance.resolution_trace` and space overrides |
+| Search cannot find the new document | Caller authorization, processing state, collection, and search mode |
+| Batch says done but graph is empty | Per-document status and source lifecycle |
+
+Continue with [Searching](/guides/searching) to retrieve evidence or
+[Truth slots](/guides/truth-slots) to inspect how committed claims are reconciled.

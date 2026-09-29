@@ -1,136 +1,117 @@
 ---
-title: "Relationships"
-description: "Entity-to-entity relations (Rel) and entity-to-literal attributes with evidence tracking and temporal validity."
+title: "Relationships and attributes"
+description: "Represent evidence-backed claims between entities or from an entity to a typed value."
 icon: "diagram-project"
 ---
 
-Elephant stores two kinds of claims about entities: **Rels** link one entity to another, and **Attributes** link an entity to a literal value. Both carry evidence, confidence scores, and temporal validity windows.
+A relationship connects two entities. An attribute connects an entity to a
+literal value. Both are claims with a predicate, status, confidence, evidence,
+and an optional validity window.
 
-## Rel (entity-to-entity)
+In the [running example](/concepts/overview):
 
-A `Rel` is a directed edge between two entities, representing a resolved claim from the extraction pipeline.
-
-<CodeGroup>
-```rust Rel
-struct Rel {
-    base: BaseFields,
-    subject: Link<Entity>,    // the "from" entity
-    object: Link<Entity>,     // the "to" entity
-    rel_type: String,         // canonical predicate (e.g. "works_at")
-    status: ClaimStatus,
-    confidence: f32,
-    validity_window: Option<ValidityWindow>,
-    evidence: Vec<EvidenceRef>,
-    temporal_audit: Option<TemporalAudit>,
-}
+```mermaid
+flowchart LR
+    M["Mara: person"] -->|"works_at relationship"| N["Northstar Labs: org"]
+    M -->|"job_title attribute"| T["Research engineer: string"]
 ```
-</CodeGroup>
 
-### Field reference
+Use the relationship when the object has an identity of its own. Use the
+attribute when the object is a value you want to read or compare.
 
-| Field              | Type                    | Description                                                    |
-|--------------------|-------------------------|----------------------------------------------------------------|
-| `subject`          | `Link<Entity>`          | Source entity (the "from" side of the relationship).            |
-| `object`           | `Link<Entity>`          | Target entity (the "to" side of the relationship).             |
-| `rel_type`         | `String`                | Canonical predicate from the predicate registry (e.g. `"works_at"`, `"knows"`, `"located_in"`). |
-| `status`           | `ClaimStatus`           | Lifecycle status of this claim (see below).                    |
-| `confidence`       | `f32`                   | Extraction confidence from 0.0 to 1.0.                         |
-| `validity_window`  | `Option<ValidityWindow>` | When this relationship is/was true.                            |
-| `evidence`         | `Vec<EvidenceRef>`      | Links back to source assertions and document spans.            |
-| `temporal_audit`   | `Option<TemporalAudit>` | Audit trail for temporal reasoning decisions.                  |
+## Relationships
 
-## Attribute (entity-to-literal)
+The canonical entity-to-entity record is named `Rel` in Rust and `rel` in
+storage. Its essential fields are `subject`, `object`, and `rel_type`.
 
-An `Attribute` links an entity to a typed literal value rather than another entity.
+A relationship is directed: `Mara works_at Northstar Labs` does not mean
+`Northstar Labs works_at Mara`. Query incoming edges when starting from the
+organization, or outgoing edges when starting from the person. Do not create
+an inverse claim merely to support reverse traversal.
 
-<CodeGroup>
-```rust Attribute
-struct Attribute {
-    base: BaseFields,
-    subject: Link<Entity>,
-    attr_type: String,        // canonical predicate (e.g. "date_of_birth")
-    value: Literal,
-    status: ClaimStatus,
-    confidence: f32,
-    validity_window: Option<ValidityWindow>,
-    evidence: Vec<EvidenceRef>,
-    temporal_audit: Option<TemporalAudit>,
-}
+`rel_type` holds the canonical [predicate](/concepts/predicates). Predicate
+semantics determine whether two objects can coexist and how temporal changes
+should be handled.
+
+## Attributes
+
+An `Attribute` uses `subject`, `attr_type`, and a typed `value`. The serialized
+value has a type tag:
+
+```json
+{ "type": "string", "value": "Research engineer" }
 ```
-</CodeGroup>
 
-### Literal types
+| Literal tag | Value shape | Example |
+|-------------|-------------|---------|
+| `string` | String | `"Research engineer"` |
+| `integer` | Integer | `42` |
+| `float` | Number | `3.14` |
+| `boolean` | Boolean | `true` |
+| `date` | ISO 8601 date string | `"2026-03-01"` |
+| `date_time` | ISO 8601 timestamp string | `"2026-03-01T09:00:00Z"` |
+| `duration` | ISO 8601 duration string | `"P1Y"` |
+| `json` | JSON value | `{"category": "research"}` |
 
-| Variant    | Rust type            | Example                        |
-|------------|----------------------|--------------------------------|
-| `string`   | `String`             | `"CEO"`                        |
-| `integer`  | `i64`                | `42`                           |
-| `float`    | `f64`                | `3.14`                         |
-| `boolean`  | `bool`               | `true`                         |
-| `date`     | `String` (ISO 8601)  | `"1990-05-15"`                 |
-| `datetime` | `String` (ISO 8601)  | `"2024-01-01T12:00:00Z"`      |
-| `duration` | `String` (ISO 8601)  | `"P1Y2M3D"`                   |
-| `json`     | `serde_json::Value`  | `{"key": "value"}`            |
+The serialized `DateTime` variant uses `date_time`. A date-shaped string tagged
+`string` remains a string claim; it does not gain date semantics from its
+appearance.
 
-Literals are serialized with a tagged format: `{"type": "string", "value": "CEO"}`.
+## A committed claim can still be a candidate
 
-## Claim status
+Artifact commit persists canonical graph records. Truth maintenance then
+evaluates supported claims for current answers. These are separate milestones.
 
-Both Rels and Attributes follow the same lifecycle:
+| Status | Interpretation |
+|--------|----------------|
+| `candidate` | Persisted claim awaiting validation as a current answer |
+| `approved` | Accepted claim under the applicable truth decision |
+| `superseded` | Replaced by another claim |
+| `disputed` | Conflict remains to be resolved |
 
-| Status       | Description                                                                    |
-|--------------|--------------------------------------------------------------------------------|
-| `candidate`  | Default. Resolved from extraction but not yet validated through the artifact commit boundary. |
-| `approved`   | Validated and committed as a canonical graph record.                           |
-| `superseded` | Replaced by newer evidence. The superseding claim links back via evidence.     |
-| `disputed`   | Conflicting evidence exists. Requires manual or automated resolution.          |
-
-<Note>
-New claims from the extraction pipeline start as `candidate`. Artifact validation and commit create canonical graph records, then truth maintenance evaluates them against existing truth slots and either marks them `approved` or records conflicts as `disputed`.
-</Note>
+Extraction promotion creates candidate relationships and attributes. Do not
+interpret a successful ingest response, a stored row, or a high confidence
+score as equivalent to an approved current answer. Read the relevant
+[truth slot](/concepts/truth-maintenance) when your application needs that answer.
 
 ## Validity windows
 
-Relationships and attributes can be time-bounded to represent claims that are only true during a specific period.
+A validity window describes when the claim applies in the world. It is
+separate from when Elephant stored the row.
 
-```rust
-struct ValidityWindow {
-    start: Option<DateTime<Utc>>,  // None = unknown/unbounded
-    end: Option<DateTime<Utc>>,    // None = ongoing/current
-}
-```
+| `start` | `end` | Interpretation |
+|---------|-------|----------------|
+| Absent | Absent | No known bounds |
+| Present | Absent | Known start, no recorded end |
+| Present | Present | Bounded interval |
+| Absent | Present | Known end, unknown start |
 
-| Pattern        | Start   | End     | Meaning                               |
-|----------------|---------|---------|---------------------------------------|
-| Unbounded      | `None`  | `None`  | Always true (or unknown timeframe).   |
-| Ongoing        | set     | `None`  | Started at a known time, still active.|
-| Closed         | set     | set     | True only during the given range.     |
+The interval includes its start and excludes its end. For example, a claim
+ending at `2026-06-01T00:00:00Z` no longer applies at that instant. An absent end
+means no end is recorded; it is not independent proof that the claim is still
+true today.
 
-Example: "Alice works_at Acme" with `start: 2023-01-15, end: None` means she currently works there since January 2023.
+Truth maintenance can close a superseded claim's window. Corroborating a claim
+with another source adds support without inventing an end date.
 
-## Evidence tracking
+## Evidence and confidence
 
-Every Rel and Attribute stores an `evidence` list linking back to the raw assertions and source document spans that support the claim.
+`evidence` is a list of `EvidenceRef` values, each pointing to an assertion
+and an immutable source span. The reference also stores the `time_basis` and
+`time_value` used for recency: source event time, observation time, or assertion
+time.
 
-```rust
-struct EvidenceRef {
-    assertion: Link<Assertion>,   // raw extraction assertion
-    span: EvidenceSpan,           // text span in the source document
-    time_basis: TimeBasis,        // which timestamp was used for recency
-    time_value: DateTime<Utc>,    // the actual timestamp value
-}
-```
+Several documents can support the same value. Truth maintenance can merge
+that evidence into one winning claim. A competing value remains inspectable
+through the conflict and its evidence, even when another value is selected.
 
-The `time_basis` field records which timestamp drove recency determination:
+Direct graph-write surfaces can create records without extracted document
+spans. If your application needs documentary provenance, ingest the source or
+supply real evidence through the supported contract; do not manufacture a
+citation for a manual claim.
 
-| Basis               | Description                                    |
-|---------------------|------------------------------------------------|
-| `source_event_time` | When the described event actually happened.     |
-| `observed_at`       | When the document was ingested.                 |
-| `asserted_at`       | When the extraction pipeline ran.               |
+## Next steps
 
-## See also
-
-- [Entities](/concepts/entities) -- the nodes that relationships connect
-- [Documents](/concepts/documents) -- source material that produces claims
-- [Spaces](/concepts/spaces) -- tenant isolation for all records
+- [Building graphs](/guides/building-graphs) shows the write workflow.
+- [Relationships API](/api/relationships) documents relationship operations.
+- [Truth slots guide](/guides/truth-slots) shows how to read current answers.

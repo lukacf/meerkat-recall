@@ -4,7 +4,14 @@ description: "How to create entities, relate them, attach evidence, and resolve 
 icon: "diagram-project"
 ---
 
-Elephant's knowledge graph is built from entities (nodes) and relationships (edges). You can create them manually or let the extraction pipeline build them from documents.
+Use direct graph writes when your application already knows the entities and
+relationships it intends to record. For claims learned from documents, prefer
+[ingestion](/guides/ingesting-data) so the pipeline can retain immutable evidence.
+
+These MCP creation examples require `/mcp/full` and the appropriate write
+scopes. Identity maintenance is also available on `/mcp/maintenance`. HTTP
+examples assume local `SKIP_AUTH` development; add a bearer token on an
+authenticated server. Replace sample IDs with complete IDs from your responses.
 
 ## Create an entity
 
@@ -25,6 +32,8 @@ Use `create_entity_simple` for a quick entity with auto-generated base fields.
     For REST creation, send the complete entity record described in [Entities](/api/entities), including base fields and `type`.
   </Tab>
 </Tabs>
+
+Save the returned ID before creating relationships.
 
 Common entity types include `person`, `org`, `topic`, `location`, and `domain`. You can use any string as a type.
 
@@ -72,27 +81,18 @@ Connect two entities with a typed, weighted relationship using `relate_entities`
 
 The `weight` field (0.0 to 1.0) becomes the record's confidence. The current convenience creation handler accepts but does not persist `description`, `properties`, `valid_from`, or `valid_to`. For a validity window, update the stored relationship's `validity_window` field explicitly.
 
-## Attach evidence to a relationship
+## Understand manual evidence limits
 
-Provide `evidence_text` and optionally `evidence_source` to create a backing assertion that links the relationship to its source material.
+`relate_entities` accepts `evidence_text` and `evidence_source` and creates a
+manual assertion, but this convenience path does not validate the text against
+an existing document revision. It records a span starting at byte zero; a
+`doc:` ID is not resolved into that document's revision and can leave the
+assertion pointing at a generated revision ID with no stored evidence.
 
-<Tabs>
-  <Tab title="MCP Tool">
-    ```json
-    {
-      "from_id": "entity:550e8400-e29b-41d4-a716-446655440000",
-      "to_id": "entity:550e8400-e29b-41d4-a716-446655440001",
-      "rel_type": "works_at",
-      "weight": 0.9,
-      "evidence_text": "Alex Chen joined NeuralFlow as CTO in January 2024.",
-      "evidence_source": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6"
-    }
-    ```
-    Tool: `relate_entities`
-  </Tab>
-</Tabs>
-
-This creates an assertion record alongside the relationship, preserving the evidence chain back to the original document.
+Use [source ingestion](/guides/ingesting-data) for a relationship that must be
+traceable to verified source material. For a direct operator assertion, retain
+its manual origin and do not describe the supplied string as a verified
+citation merely because the write succeeded.
 
 ## Upsert a relationship
 
@@ -115,7 +115,8 @@ For subsequent field changes, use `update_relationship` with serialized record f
 
 ## View an entity with its relationships
 
-Retrieve an entity along with all its incoming and outgoing relationships.
+Retrieve an entity with its incoming and outgoing relationships. For the HTTP
+example, set `ENTITY_ID` to the complete entity ID saved from creation.
 
 <Tabs>
   <Tab title="MCP Tool">
@@ -128,7 +129,7 @@ Retrieve an entity along with all its incoming and outgoing relationships.
   </Tab>
   <Tab title="curl">
     ```bash
-    curl -s "http://localhost:3000/v1/entities/entity:550e8400.../with-relations"
+    curl -s "http://localhost:3000/v1/entities/$ENTITY_ID/with-relations"
     ```
   </Tab>
 </Tabs>
@@ -199,7 +200,9 @@ Merge two entities into one. The `strategy` controls which entity's fields take 
 </Tabs>
 
 <Warning>
-  Merging is irreversible. The losing entity becomes a tombstone, and all its relationships are transferred to the survivor.
+  Merging rewrites graph references and soft-deletes the losing entity. Review
+  identity evidence and choose the survivor before executing the merge. There
+  is no dedicated unmerge tool.
 </Warning>
 
 Available strategies:
@@ -210,6 +213,10 @@ Available strategies:
 | `prefer_older` | The older entity's fields win |
 | `prefer_a` | Entity A's fields always win |
 | `prefer_b` | Entity B's fields always win |
+
+After a successful MCP merge, read `data.survivor.id` and fetch that entity
+again to verify its relationships. With `prefer_newer`, do not assume that
+entity A survived.
 
 The REST merge endpoint instead accepts `keep_a`, `keep_b`, or `combine` (create a new combined entity). See [identity resolution](/api/system#identity-resolution).
 

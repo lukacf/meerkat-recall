@@ -1,8 +1,27 @@
 ---
 title: "Domain Model"
-description: "Complete reference for Elephant's record types, ID system, and base fields"
+description: "Record families, shared fields, and the Rust types behind Elephant's evidence and knowledge graph"
 icon: "diagram-project"
 ---
+
+Use this page to locate a record and understand its relationships to other
+records. Start with the [knowledge model](/concepts/overview) for the conceptual
+explanation, or the [HTTP reference](/api/overview) for request bodies and
+response envelopes.
+
+| Reader question | Record family |
+| --- | --- |
+| Where did this information come from? | `Source`, `Doc`, `DocRevision`, `DocNode`, `Assertion` |
+| Which thing and which claim does it describe? | `Entity`, `Rel`, `Attribute`, `Event` |
+| How were competing claims reconciled? | `ConflictGroup`, `TruthSlot`, `PredicateRegistry` |
+| Why did processing stop or retry? | `WorkItem`, `WorkRun`, `WorkArtifact` |
+| Which compiled view is the reader seeing? | `KnowledgeView`, `KnowledgeViewRevision`, `KnowledgeViewDefinition` |
+| What access and provenance apply? | `BaseFields`, `Security`, `Provenance` |
+
+The Rust excerpts below omit serialization annotations and selected supporting
+fields. They are not request templates: API JSON generally flattens `BaseFields`
+into the record, serializes links as record ID strings, and uses snake-case enum
+values. Use the corresponding endpoint schema when constructing a request.
 
 ## RecordId System
 
@@ -25,17 +44,20 @@ New IDs are created with `RecordId::new_v4(table)` (random) or `RecordId::new_v7
 | `rel` | `Rel` | Entity-to-entity relationships |
 | `attribute` | `Attribute` | Entity-to-literal claims |
 | `doc` | `Doc` | Ingested documents |
+| `media_asset` | `MediaAsset` | Managed media bytes and metadata |
 | `doc_revision` | `DocRevision` | Immutable rendered text snapshots |
 | `doc_node` | `DocNode` | Structural chunks within a revision |
 | `doc_chunk` | `DocChunk` | Legacy document chunks; active code uses `doc_node` |
 | `chunk_embedding` | `ChunkEmbedding` | Vector embeddings for document nodes |
-| `assertion` | `Assertion` | Raw extracted claims (unresolved) |
-| `truth_slot` | `TruthSlot` | Current best answer for a claim slot |
+| `assertion` | `Assertion` | Evidence-bearing claims with resolution state and preserved mention strings |
+| `truth_slot` | `TruthSlot` | Derived current claim selection for a slot |
 | `conflict_group` | `ConflictGroup` | Competing claims grouped for resolution |
 | `source` | `Source` | Provenance records (email, web, file, etc.) |
 | `work_item` | `WorkItem` | Durable work queue items |
+| `work_item_archive` | `WorkItemArchive` | Cold terminal work history |
 | `work_edge` | `WorkEdge` | DAG dependencies between work items |
 | `work_run` | `WorkRun` | Individual execution attempts |
+| `work_run_archive` | `WorkRunArchive` | Cold completed execution history |
 | `work_artifact` | `WorkArtifact` | Staged outputs from work runs |
 | `work_deadletter` | `WorkDeadletter` | Failed items for operator review |
 | `predicate_registry` | `PredicateRegistry` | Canonical predicate vocabulary |
@@ -53,6 +75,16 @@ New IDs are created with `RecordId::new_v4(table)` (random) or `RecordId::new_v7
 | `cost_ledger_daily` | `CostLedgerDaily` | Daily cost tracking |
 | `freshness` | `Freshness` | Freshness scores for staleness detection |
 | `reprocess_job` | `ReprocessJob` | Backfill and re-extraction jobs |
+| `knowledge_view` | `KnowledgeView` | Stable identity and lifecycle for a derived view |
+| `knowledge_view_revision` | `KnowledgeViewRevision` | Immutable compiled view revision |
+| `knowledge_view_definition` | `KnowledgeViewDefinition` | Governed typed definition of a graph-derived view |
+| `knowledge_view_dependency` | `KnowledgeViewDependency` | Reverse dependency used for view invalidation |
+| `source_watch` | `SourceWatch` | Durable refresh policy for a remote source |
+| `source_watch_check` | `SourceWatchCheck` | Receipt for one remote source observation |
+
+The derived view and watch records are described in
+[Living Wiki architecture](/architecture/living-wiki). Cold work history keeps
+the original public IDs; see [work queue history](/pipeline/work-queue#indexed-queue-and-historical-work).
 
 ### Link\<T\>
 
@@ -101,9 +133,11 @@ pub struct BaseFields {
 | `subjects_state` | Whether subjects are `complete`, `partial`, or `unknown`. |
 
 <Note>
-  Soft-delete is the default removal strategy. Records are never physically
-  purged unless an explicit purge operation is invoked. The `deleted_at` field
-  gates visibility across all queries.
+  Soft-delete marks a record without removing its stored representation.
+  Ordinary reads filter deleted records; explicit history, recovery, or
+  `include_deleted` reads may expose them when authorized. Retention and purge
+  are separate operations. Do not use a soft-delete marker as a data-erasure
+  guarantee.
 </Note>
 
 ### Provenance
@@ -264,7 +298,11 @@ pub struct DocNode {
 
 ### Assertion
 
-Raw claims extracted from documents by the LLM extraction pipeline. Assertions carry unresolved mention strings; staged artifact validation/commit then resolves or creates graph records while later truth-maintenance work reconciles conflicts.
+Evidence-bearing claims extracted from documents by the LLM extraction pipeline.
+Assertions preserve the original mention strings alongside their resolution
+status and optional resolved entity links. Staged artifact validation/commit
+resolves or creates graph records; later truth maintenance reconciles competing
+graph claims. A `resolved` assertion is not a guarantee that its claim is true.
 
 ```rust
 pub struct Assertion {
@@ -295,7 +333,11 @@ pub struct Assertion {
 
 ### TruthSlot
 
-The computed "current truth" for a claim slot. Stores the winning value(s) after conflict resolution across competing assertions.
+The derived current selection for a claim slot. Each `current_values` entry
+references a graph claim by `claim_id`, with its confidence, status, and evidence.
+It does not contain the literal value itself. Read that claim to obtain its
+value. A slot can have several accepted values, be stale, or require more
+evidence; it is not an independent source of evidence.
 
 ```rust
 pub struct TruthSlot {
@@ -396,7 +438,7 @@ Staged output produced by a work run. Goes through validation before being commi
 pub struct WorkArtifact {
     pub base: BaseFields,
     pub work_run: Link<WorkRun>,
-    pub artifact_type: String,         // e.g. "assertion_batch", "resolution_patch"
+    pub artifact_type: String,         // e.g. "knowledge_candidates", "commit_bundle"
     pub data: Value,
     pub status: ArtifactStatus,        // Draft | Validated | Committing | Committed | Rejected
     pub validation_errors: Option<Vec<String>>,
@@ -503,7 +545,10 @@ pub struct SystemEvent {
 
 ### AuditLog
 
-Immutable audit trail recording every mutation with before/after snapshots.
+Audit entries record supported mutations with optional before/after snapshots.
+The record type alone does not guarantee that every internal mutation emits an
+entry. Consult the mutation handler and [audit revert contract](/api/system#audit-revert)
+when building an administrative recovery workflow.
 
 ```rust
 pub struct AuditLog {

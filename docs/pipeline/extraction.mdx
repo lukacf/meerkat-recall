@@ -24,13 +24,20 @@ When a document enters the extraction pipeline, the system resolves two pieces o
 | Priority | Source | Config Key |
 |----------|--------|------------|
 | 1 | Space config | `space_config.skill` |
-| 2 | Document metadata | `doc.metadata.extraction_skill` or `doc.metadata.skill_id` |
-| 3 | Source metadata | `source.metadata.extraction_skill` or `source.metadata.skill_id` |
-| 4 | Document domain mapping | `doc.metadata.domain` mapped to a built-in skill |
-| 5 | Source domain mapping | `source.metadata.domain` mapped to a built-in skill |
+| 2 | Document metadata | First populated `extraction_skill`, `extraction_skill_id`, `skill`, or `skill_id` |
+| 3 | Source metadata | Same skill fields as document metadata |
+| 4 | Document domain mapping | First populated `extraction_domain`, `domain`, `genre`, or `content_domain`, mapped to a built-in skill |
+| 5 | Source domain mapping | Same domain fields as document metadata |
 | 6 | Source type env map | `PIPELINE_SKILL_BY_SOURCE_TYPE_JSON` (JSON map, e.g. `{"email":"extraction/custom-email","*":"extraction/technical-docs"}`) |
 | 7 | Source type default | Built-in default skill for the source type |
 | 8 | Environment default | `PIPELINE_DEFAULT_EXTRACTION_SKILL` |
+
+All current source types default to `extraction/technical-docs`. In the normal
+source-backed path, that fallback is reached before
+`PIPELINE_DEFAULT_EXTRACTION_SKILL`. To change the default for source-backed
+ingest, use an explicit space skill or `PIPELINE_SKILL_BY_SOURCE_TYPE_JSON`
+(including its `"*"` fallback); setting only the last environment default does
+not override the source-type choice.
 
 The skill resolution also performs **filesystem fuzzy matching**: skill IDs are normalized and matched against `SKILL.md` files in the skills directory (`PIPELINE_SKILLS_DIR`, default `./skills`).
 
@@ -81,11 +88,11 @@ The extractor receives an `ExtractionContext` containing everything it needs:
 
 The primary extractor, enabled via the `meerkat-extraction` feature flag. It uses [Meerkat](https://github.com/lukacf/meerkat) - a modular LLM agent harness - to orchestrate extraction as a structured conversation with tool access.
 
-- **Model:** configurable via `PIPELINE_AGENTIC_MODEL` (default: `gpt-5.2`)
-- **Structured output:** Meerkat's `OutputSchema::new(schema).strict()` with `structured_output_retries(2)` guarantees the LLM response is valid JSON matching the assertion schema - no manual parsing or retry logic needed
-- **Tool access:** the LLM can call tools during extraction via Meerkat's tool dispatch system - `ReadTextRangeDispatcher` for evidence verification, `ElephantToolBridge` for querying existing entities and predicates
-- **Budget enforcement:** Meerkat enforces per-request token and wall-time budgets (default 500K tokens, 600s), preventing runaway extraction costs
-- **Streaming:** extraction results stream back through Meerkat's event system, allowing progress tracking
+- **Model:** configurable via `PIPELINE_AGENTIC_MODEL` (binary default: `gpt-5.6-sol`; Docker Compose selects `claude-opus-4-6`). Supply credentials for the selected provider.
+- **Structured output:** Meerkat receives a strict assertion schema and a bounded schema-repair retry count. Elephant parses and validates the result before staging candidates. Invalid output or an incomplete run can still fail the work item; a schema is not a guarantee of factual correctness.
+- **Tool access:** the normal agentic path provides `ReadTextRangeDispatcher` for text-span checks and `ElephantToolBridge` for querying existing entities and predicates. Large text spans use a direct structured extraction path without those tools. An empty result from the agentic path can also trigger one direct structured retry.
+- **Budget enforcement:** the extractor uses the lower token and duration limits from its configuration and extraction context (defaults: 500,000 tokens and 600 seconds). The worker's lifecycle timeout is a separate bound; see [work queue configuration](/operations/deployment#pipeline-work-queue).
+- **Progress:** the extraction call returns a completed result to the worker. Inspect document pipeline status and work-run logs for stage progress; this is not a public stream of partially committed assertions.
 
 The agentic extractor can resolve ambiguities by querying the knowledge graph during extraction, reducing duplicate entity creation.
 
@@ -97,7 +104,7 @@ Any non-LLM extraction helpers that remain in the codebase are test-only or lega
 
 ## RawAssertion Output
 
-Each extractor produces a list of `RawAssertion` records -- pre-resolution claims with mention strings:
+Each extractor produces a list of `RawAssertion` records - pre-resolution claims with mention strings. This excerpt shows the main claim fields; the type also carries quote, entity-type, and event-lineage hints:
 
 ```rust
 pub struct RawAssertion {
@@ -145,3 +152,20 @@ That commit phase is what creates assertions, relationships, attributes, and eve
     A batched outbox event is written with the created/updated record references. Truth maintenance picks this up asynchronously.
   </Step>
 </Steps>
+
+## Diagnose an extraction failure
+
+Use `get_doc_pipeline_status` on `/mcp/full` with the returned document ID, then
+inspect failed work items in the same space. Separate these cases before retrying:
+
+| Observation | Check next |
+| --- | --- |
+| No extraction was triggered | Requested ingest mode and runtime semantic readiness |
+| Plan selects an unexpected skill | Resolution trace, space configuration, and the worker's skills directory |
+| Provider or model error | Credentials and model selection in the worker process |
+| Budget or timeout error | Selected node size, extractor limits, and worker lifecycle timeout |
+| Extraction completes with few claims | Source text, selected nodes, and skill instructions; claim counts are model-dependent |
+| Candidates fail validation | Recorded validation errors and evidence spans; retrying the same invalid payload alone does not correct them |
+
+See [ingesting data](/guides/ingesting-data) for a source-to-graph procedure and
+[work queue recovery](/pipeline/work-queue#inspect-and-retry-failed-work) for retry semantics.

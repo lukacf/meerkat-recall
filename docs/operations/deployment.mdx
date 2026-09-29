@@ -4,6 +4,12 @@ description: "Docker Compose setup, deployment modes, environment variable refer
 icon: "rocket"
 ---
 
+The supplied Compose file is a loopback development deployment. It uses local
+database credentials and defaults to `SKIP_AUTH=true`. Use the setup below to
+evaluate Elephant; build a production service configuration with explicit
+credentials, authentication, TLS, storage, and rollback procedures before
+serving remote callers.
+
 ## Architecture Overview
 
 Elephant can run against either `surreal-db` (default) or embedded `elephant-db`.
@@ -116,7 +122,11 @@ release binaries does not publish Rust crates or the local-helper npm package.
     cp .env.example .env
     ```
 
-    At minimum, set `OPENAI_API_KEY` (if using OpenAI embeddings) and `ANTHROPIC_API_KEY` (for extraction).
+    The supplied Compose file selects OpenAI embeddings and an Anthropic
+    extractor, so this setup needs both `OPENAI_API_KEY` and
+    `ANTHROPIC_API_KEY`. A directly launched binary uses the provider selected
+    by its own model and embedding settings. For a credential-free starting
+    point, use the [local demo](/quickstart).
   </Step>
   <Step title="Start the database and apply schema">
     ```bash
@@ -141,6 +151,11 @@ release binaries does not publish Rust crates or the local-helper npm package.
     # SurrealDB health
     curl http://localhost:8000/health
     ```
+
+    Then inspect `GET /v1/runtime/status`: semantic ingestion needs storage,
+    managed workers, and a real extractor to be ready. Submit and follow one
+    representative document through [the ingest guide](/guides/ingesting-data).
+    HTTP health alone does not establish that the pipeline can process data.
   </Step>
 </Steps>
 
@@ -231,6 +246,11 @@ elephant snapshot export /tmp/elephant.json
 elephant snapshot import /tmp/elephant.json
 ```
 
+Paths are on the server host, not the CLI client's filesystem. Import replaces
+the entire embedded store across all spaces. Follow the authentication and
+whole-store scope requirements in the [snapshot reference](/api/system#embedded-snapshots)
+and keep a verified export before replacing data.
+
 ### Pipeline: Embed Worker
 
 | Variable | Default | Description |
@@ -243,7 +263,7 @@ elephant snapshot import /tmp/elephant.json
 | `PIPELINE_EMBED_DIMS` | `3072` | Embedding vector dimensions |
 
 <Accordion title="Embedding provider details">
-  - **`fake`**: Returns zero vectors. Use for testing only.
+  - **`fake`**: Returns deterministic synthetic vectors derived from the input bytes. Use for tests, not meaningful semantic similarity.
   - **`openai`**: Uses the OpenAI embeddings API. Requires `OPENAI_API_KEY`.
   - **`fastembed`**: Local ONNX-based embeddings via FastEmbed. No API key needed but requires the `fastembed` feature flag at compile time.
 </Accordion>
@@ -311,7 +331,7 @@ elephant snapshot import /tmp/elephant.json
 | `PIPELINE_MAINTENANCE_ENABLED` | `true` | Enable maintenance worker |
 | `PIPELINE_MAINTENANCE_POLL_INTERVAL` | `300` | Poll interval in seconds (default: 5 minutes) |
 | `PIPELINE_MAINTENANCE_MCP_URL` | `http://127.0.0.1:3000/mcp/maintenance` | MCP URL for maintenance agent |
-| `PIPELINE_MAINTENANCE_MODEL` | `gpt-5.2` | LLM model for maintenance decisions |
+| `PIPELINE_MAINTENANCE_MODEL` | `gpt-5.6-sol` | LLM model for maintenance decisions |
 | `PIPELINE_MAINTENANCE_AUTO_MERGE_THRESHOLD` | `0.9` | Confidence threshold for auto-merging entities |
 | `PIPELINE_MAINTENANCE_MAX_CANDIDATES` | `50` | Max candidate pairs per sweep |
 

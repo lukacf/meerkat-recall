@@ -31,6 +31,7 @@
           {
             "group": "Core concepts",
             "pages": [
+              "concepts/overview",
               "concepts/spaces",
               "concepts/entities",
               "concepts/relationships",
@@ -62,7 +63,7 @@
         ]
       },
       {
-        "tab": "API & MCP",
+        "tab": "API, MCP & CLI",
         "groups": [
           {
             "group": "HTTP API",
@@ -83,6 +84,12 @@
               "mcp/overview",
               "mcp/tools",
               "mcp/workflows"
+            ]
+          },
+          {
+            "group": "Command line",
+            "pages": [
+              "cli/overview"
             ]
           }
         ]

@@ -4,6 +4,10 @@ description: Start a local Elephant server, verify readiness, ingest a synthetic
 icon: rocket
 ---
 
+Choose the credential-free demo to explore existing evidence and projections.
+Choose the persistent stack to submit new evidence and run model extraction.
+The HTTP examples below require `curl` and `jq`.
+
 ## Try the demo first
 
 The Living Wiki demo needs Rust 1.94 or newer, but no database service or model
@@ -118,6 +122,12 @@ curl -fsS http://localhost:3000/v1/entities/search \
 On the default MCP profile, use `search_all` for discovery and `get_entity`
 for returned entity IDs. Extraction is model-driven, so inspect the assertions
 and evidence rather than assuming exact entity names or relationship counts.
+
+You have completed this walkthrough when the server is ingest-ready, the
+submitted document has a processing outcome, and you have inspected the
+resulting evidence and search results. For the bigger picture, continue with
+the [knowledge model](/concepts/overview) or the
+[worked example](/guides/putting-it-together).
 
 ## Next steps
 

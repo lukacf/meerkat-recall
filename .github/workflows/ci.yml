@@ -200,6 +200,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: scripts/docs/package-lock.json
+
+      - name: Validate reader documentation
+        run: |
+          npm ci --prefix scripts/docs --ignore-scripts
+          make docs-check
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

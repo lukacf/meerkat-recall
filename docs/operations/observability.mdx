@@ -40,7 +40,7 @@ docker compose logs -f surrealdb
 ```
 
 ```bash Local development
-# Logs go to stderr by default
+# Capture the process logs using your terminal or service supervisor
 RUST_LOG=info,elephant=debug ./scripts/repo-cargo run -p elephant-bin -- serve
 ```
 </CodeGroup>
@@ -120,12 +120,18 @@ These are operational signals to derive from your logs, proxy, runtime status, a
 | Embeddings not generated | Missing API key or wrong provider | Check `OPENAI_API_KEY` is set and `PIPELINE_EMBED_PROVIDER` is correct |
 | Pipeline not processing work items | Workers disabled or SurrealDB connection failed | Verify `PIPELINE_*_ENABLED` flags are `true`; check pipeline logs for connection errors |
 | High memory usage | Large batch sizes or concurrent limit too high | Reduce `PIPELINE_EMBED_BATCH_SIZE` and `PIPELINE_MAX_CONCURRENT` |
-| Work items stuck in `running` | Worker crashed mid-processing; lease not expired | Wait for lease expiry (`PIPELINE_WORK_QUEUE_LEASE_SECS`, default 300s) or manually retry via MCP `retry_work_item` |
+| Work items stuck in `running` | A long-running handler, a crashed worker, or queue contention | Inspect the worker logs and lease timestamp. Expired leases become recoverable after a 60-second grace period and a scheduler pass. `retry_work_item` accepts only `failed` items |
 | Extraction failures | Configured model unavailable or provider rate limited | Verify the extraction model and its provider credentials; inspect provider errors |
-| Entity disambiguation failures | LLM timeout or model unavailable | Check `PIPELINE_RESOLUTION_DISAMBIGUATION_TIMEOUT_SECS`; verify model access |
+| Entity disambiguation failures during artifact commit | LLM timeout or model unavailable | Inspect the promotion error, `PIPELINE_PROMOTION_DISAMBIGUATION_MODEL`, and Anthropic credentials; the `PIPELINE_RESOLUTION_*` settings belong to the compatibility resolution path |
 | SurrealDB "read or write conflict" | Transaction contention under high concurrency | Transient; the pipeline retries automatically up to `PIPELINE_WORK_TRANSIENT_RETRY_MAX_ATTEMPTS` times |
 | Disk space exhaustion | SurrealDB data volume full | Increase capacity or use a reviewed data-retention process. Queue archival reduces active scans but retains audit payloads; it does not guarantee disk reclamation |
-| Pipeline stalled (no progress in 15 min) | Database contention, a growing queue, or failed workers | Inspect runtime flags and work-item status, then follow the [capacity guide](/work-queue-capacity) before restarting the managed service |
+| Pipeline stalled (no progress in 15 min while work is queued) | Database contention, a growing queue, or failed workers | Inspect runtime flags and work-item status, then follow the [capacity guide](https://github.com/lukacf/elephant/blob/main/docs/work-queue-capacity.md) before restarting the managed service |
+
+For an accepted document that is not searchable yet, inspect its
+[pipeline status](/api/documents#get-document-pipeline-status). A healthy API,
+a successful ingest request, and a `done` work item each answer a different
+question. Check the relevant downstream extraction and embedding stages before
+treating a document as ready for your application.
 
 ## Alerting Recommendations
 
@@ -133,7 +139,7 @@ These are operational signals to derive from your logs, proxy, runtime status, a
 |-------|-----------|----------|
 | API unhealthy | `/v1/health` returns non-200 for 60s | Critical |
 | Error rate spike | HTTP 5xx rate > 5% over 5 minutes | High |
-| Pipeline stalled | No work items completed in 15 minutes | Medium |
+| Pipeline stalled | Work remains queued and no work items complete in 15 minutes | Medium |
 | SurrealDB unreachable | Connection failures > 3 consecutive | Critical |
 | Embedding failures | Consecutive embed failures > 10 | High |
 | Work queue backlog | Pending items > 1000 sustained for 30 min | Medium |

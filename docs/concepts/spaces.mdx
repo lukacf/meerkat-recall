@@ -1,159 +1,124 @@
 ---
 title: "Spaces"
-description: "Multi-tenant isolation boundaries with per-space embedding configuration."
+description: "Choose a knowledge boundary and configure its extraction purpose and embedding policy."
 icon: "layer-group"
 ---
 
-Every record in Elephant belongs to exactly one **space**. A space is the top-level isolation boundary -- it scopes entities, relationships, documents, and all derived data so that tenants never leak into each other.
+A space is Elephant's logical knowledge boundary. Records carry a `space_id`,
+and a request principal selects the space whose records it can access. Use
+separate spaces for knowledge that should have separate identities,
+configuration, and authorization context.
 
-## How isolation works
+Within a space, [security envelopes](/concepts/security) provide finer-grained
+visibility. Collections and entity types organize records; they do not replace
+those access controls.
 
-Every record carries a `space_id` field as part of its common record metadata. Queries are always scoped to the caller's space, and cross-space access is forbidden at the storage layer.
+## Decide what belongs together
 
-```
-space_id: "research_lab"   -- all records for the research lab workspace
-space_id: "acme_corp"      -- all records for Acme Corp
-```
+| Use | Suggested boundary |
+|-----|--------------------|
+| Project notes that share people, organizations, and predicates | One space, with collections for retrieval groups |
+| Two tenants with independent access and identities | Separate spaces and principals |
+| Restricted documents inside one team's knowledge | One space with appropriate security envelopes |
+| An isolated fixture corpus | A separate development space |
 
-Spaces are lightweight. Creating one is a single `SpaceConfig` insert; no schema changes are required.
+An entity named "Mara" in two spaces represents two independent records. Using
+the same space name on two independent database instances does not synchronize
+their data.
 
-## SpaceConfig
+## How requests select a space
 
-Each space has a configuration record that controls how embedding and extraction behave.
+Authenticated requests use the token's `space_id`. Where record authorization
+is applied, it checks that this matches the record's space. Supplying a
+different ID in a JSON body or URL does not change the token's authority. The
+administrative REST exceptions described below still require deployment-level
+restriction.
 
-<CodeGroup>
-```rust SpaceConfig
-struct SpaceConfig {
-    base: BaseFields,
-    embedding_provider: String,
-    embedding_model: String,
-    embedding_dims: i32,
-    purpose: Option<String>,
-    skill: Option<String>,
-}
-```
-</CodeGroup>
-
-### Field reference
-
-| Field                | Type            | Description                                                                                  |
-|----------------------|-----------------|----------------------------------------------------------------------------------------------|
-| `embedding_provider` | `String`        | Provider backend: `"fastembed"`, `"openai"`, or `"fake"` (testing).                          |
-| `embedding_model`    | `String`        | Model name within the provider (e.g. `"bge-small-en-v1.5"`, `"text-embedding-3-small"`).     |
-| `embedding_dims`     | `i32`           | Dimensionality of the embedding vectors produced by the model.                               |
-| `purpose`            | `Option<String>` | Free-text description of what this space stores. Injected into extraction prompts to guide the LLM toward domain-relevant entities and relationships. |
-| `skill`              | `Option<String>` | Extraction skill ID (e.g. `"extraction/fiction"`). References a Meerkat skill that customizes the extraction prompt and output schema for this space's domain. |
+For loopback development with `SKIP_AUTH=true`, the HTTP server uses the
+`X-Space-Id` header, or `default` when the header is absent. Keep that header
+consistent across your ingest, search, and status calls.
 
 <Note>
-`purpose` and `skill` are optional. When omitted, the pipeline falls back through document metadata, source metadata, domain inference, and environment defaults before using an unguided extraction prompt. See [extraction skill routing](#extraction-skill-routing) below.
+Storage repositories are lower-level Rust APIs. They do not possess the
+request principal and do not provide a universal authorization layer.
+Applications that call them directly must enforce space and record access at
+their integration boundary. Administrative HTTP routes also need deployment
+access controls; see [security](/concepts/security#authorization-boundaries).
 </Note>
+
+## Configure the space
+
+A `SpaceConfig` record stores embedding settings and extraction guidance.
+
+| Setting | Why it matters |
+|---------|----------------|
+| `embedding_provider` | Selects the embedding implementation available in this build |
+| `embedding_model` | Selects the model used for document-node vectors |
+| `embedding_dims` | Declares the vector dimension expected by that policy |
+| `purpose` | Explains which knowledge is useful to this space |
+| `skill` | Selects domain guidance for extraction |
+
+For project notes, a purpose could be "Track project decisions, ownership,
+and dependencies." The built-in `extraction/technical-docs` skill provides
+related extraction guidance. Fiction-oriented corpora can select
+`extraction/fiction`; applications can supply additional skills.
 
 ## Extraction skill routing
 
-When Elephant extracts knowledge from a document, it selects an **extraction skill** and an optional **purpose** to guide the LLM. The skill determines *what* to look for (entity types, predicates, significance rules); the purpose determines *why* (what's relevant to this space).
+A space-level purpose or skill takes precedence over document and source
+metadata. Use a broad space-level value when every document shares that
+intent. Leave it unset when per-document guidance should make the decision.
+The complete fallback order is documented in
+[extraction skill routing](/pipeline/extraction#skill-resolution-cascade).
 
-Both are resolved through a priority cascade - the first non-empty value wins:
+## Create an isolated development space
 
-**Purpose cascade:**
+This example assumes the server from the [quickstart](/quickstart) is bound to
+loopback with development bypass enabled. It selects the deterministic `fake`
+provider for a configuration example; that provider is not a semantic
+embedding model.
 
-| Priority | Source | Example |
-|----------|--------|---------|
-| 1 | `space_config.purpose` | `"Track product decisions and project relationships"` |
-| 2 | `doc.metadata.extraction_purpose` | `"Extract financial transactions"` |
-| 3 | `source.metadata.extraction_purpose` | `"Extract from regulatory filings"` |
-| 4 | `PIPELINE_DEFAULT_EXTRACTION_PURPOSE` env var | Operator-wide default |
+```bash
+curl --fail-with-body -sS http://127.0.0.1:3000/v1/spaces \
+  -H 'Content-Type: application/json' \
+  -H 'X-Space-Id: project-notes' \
+  -d '{
+    "name": "project-notes",
+    "embedding_provider": "fake",
+    "embedding_model": "default",
+    "embedding_dims": 384,
+    "purpose": "Track project decisions, ownership, and dependencies",
+    "skill": "extraction/technical-docs"
+  }'
+```
 
-**Skill cascade:**
+The response is the created `SpaceConfig`; its `space_id` is `project-notes`.
+Creating it again returns a conflict. Keep using
+`X-Space-Id: project-notes` for subsequent development requests.
 
-| Priority | Source | Example |
-|----------|--------|---------|
-| 1 | `space_config.skill` | `"extraction/fiction"` |
-| 2 | `doc.metadata.extraction_skill` | `"extraction/custom-domain"` |
-| 3 | `source.metadata.extraction_skill` | `"extraction/technical-docs"` |
-| 4 | `doc.metadata.domain` → domain-to-skill mapping | `"fiction"` → `extraction/fiction` |
-| 5 | `source.metadata.domain` → domain-to-skill mapping | `"technical"` → `extraction/technical-docs` |
-| 6 | `PIPELINE_SKILL_BY_SOURCE_TYPE_JSON` env var | `{"email": "extraction/custom-domain"}` |
-| 7 | Source type default | `technical-docs` |
-| 8 | `PIPELINE_DEFAULT_EXTRACTION_SKILL` env var | Operator-wide fallback |
+The MCP [`create_space`](/mcp/tools#create_space) and
+[`update_space`](/mcp/tools#update_space) tools currently expose embedding
+configuration only. The HTTP space configuration surface also accepts
+`purpose` and `skill`. The two request shapes differ: HTTP embedding fields are
+at the top level; MCP uses a `config` object.
 
-Skill IDs are **canonicalized** - aliases like `"fiction"`, `"extraction_fiction"`, and `"extraction/fiction"` all resolve to the same skill directory.
+## Changing embedding policy
 
-### Built-in skills
+Embedding model, vector dimension, and indexed content must agree. Changing a
+space's configuration does not rewrite vectors already stored for its nodes.
 
-Elephant ships with domain-neutral extraction skills in the `skills/` directory:
+Before changing a populated space, plan and verify the supported reprocessing
+path for your deployment, or rebuild a new space from the retained sources.
+The standalone `reembed` work kind is planned and is not an active worker
+command. Do not enqueue it and assume the index will be repaired.
 
-| Skill ID | Domain | Entity types | Key predicates |
-|----------|--------|-------------|----------------|
-| `extraction/fiction` | Novels, stories, narratives | person, location, group, topic | `knows`, `related_to`, `parent_of`, `lives_in`, `rules_over`, `possesses` |
-| `extraction/technical-docs` | Architecture docs, specs, runbooks | component, platform, concept, data_model | `depends_on`, `communicates_with`, `uses`, `implements`, `chosen_over` |
+Provider names describe configured implementations, not a promise that every
+binary contains them. Consult the deployment's build features and provider
+readiness before enabling semantic retrieval.
 
-Each skill is a `SKILL.md` file containing markdown guidance that gets injected into the LLM extraction prompt. App-specific domains such as household email, team chat, or CRM mail should supply their own skills by setting `PIPELINE_SKILLS_DIR`, document metadata, source metadata, or `PIPELINE_SKILL_BY_SOURCE_TYPE_JSON`.
+## Next steps
 
-<Accordion title="How skill and purpose reach the LLM">
-The extraction prompt template has two conditional blocks:
-
-1. **Skill body** - if a skill was resolved, its SKILL.md content (minus YAML frontmatter) is injected as an "Extraction Strategy" section. This tells the LLM which entity types, predicates, and significance criteria to use.
-
-2. **Purpose** - if a purpose was resolved, it's injected as a "Knowledge System Purpose" section. This tells the LLM to only extract assertions relevant to the stated purpose and skip everything else.
-
-If neither is set, the LLM uses its general extraction capabilities without domain-specific guidance.
-</Accordion>
-
-## Embedding policy per space
-
-Different spaces can use different embedding providers and models. This lets you:
-
-- Run local embeddings (`fastembed`) for privacy-sensitive spaces
-- Use OpenAI embeddings for higher-quality retrieval in other spaces
-- Test with a `fake` provider that returns zero vectors
-
-The pipeline reads the space's `SpaceConfig` before embedding any document node, ensuring vectors are always produced by the correct model.
-
-<Warning>
-Changing a space's embedding model after documents have been indexed will make existing vectors incompatible with new ones. Use a reprocessing job through the [work queue](/pipeline/work-queue) to refresh existing document nodes after a model change.
-</Warning>
-
-## Creating a space
-
-<Tabs>
-  <Tab title="MCP">
-    ```json
-    {
-      "name": "research_lab",
-      "config": {
-        "embedding_provider": "fastembed",
-        "embedding_model": "bge-small-en-v1.5",
-        "embedding_dims": 384
-      }
-    }
-    ```
-
-    <Warning>
-    The MCP `create_space` and `update_space` tools do not currently support setting `purpose` and `skill`. Use the HTTP API to configure extraction skill routing.
-    </Warning>
-  </Tab>
-  <Tab title="curl">
-    ```bash
-    curl -X POST http://localhost:3000/v1/spaces \
-      -H "content-type: application/json" \
-      -d '{
-        "name": "research_lab",
-        "embedding_provider": "fastembed",
-        "embedding_model": "bge-small-en-v1.5",
-        "embedding_dims": 384,
-        "purpose": "Track product decisions, project relationships, and durable technical context",
-        "skill": "extraction/technical-docs"
-      }'
-    ```
-  </Tab>
-</Tabs>
-
-The `space_id` is set to the `name` value and used as the scoping key for all records created in that space.
-
-## See also
-
-- [Entities](/concepts/entities) - records scoped by `space_id`
-- [Documents](/concepts/documents) - ingestion and embedding within a space
-- [Relationships](/concepts/relationships) - claims scoped by `space_id`
-- [Extraction pipeline](/pipeline/extraction) - how skills are loaded and used
-- [Putting it together](/guides/putting-it-together) - worked examples showing skill routing in action
+- [Security](/concepts/security) explains record-level visibility within a space.
+- [Documents](/concepts/documents) explains processing depth and searchable content.
+- [Extraction](/pipeline/extraction) documents purpose and skill resolution.
+- [System API](/api/system#spaces) documents space configuration endpoints.

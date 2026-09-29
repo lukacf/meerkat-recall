@@ -4,7 +4,21 @@ description: "Health checks, spaces, work items, truth slots, identity resolutio
 icon: "gear"
 ---
 
-This page covers system-level endpoints for monitoring, administration, and operational tasks.
+Use these routes to inspect runtime state and operate a configured instance.
+Health, ingest readiness, work completion, and claim correctness are separate
+observations. Read the relevant result fields rather than using HTTP success
+alone as a readiness or completion check.
+
+| Task | Section |
+| --- | --- |
+| Check ingest readiness | [Managed runtime status](#managed-runtime-status) |
+| Check dependencies | [Health](#health), [Capabilities](#capabilities) |
+| Save or restore embedded data | [Embedded snapshots](#embedded-snapshots) |
+| Configure a tenant | [Spaces](#spaces) |
+| Diagnose processing | [Work items](#work-items) |
+| Inspect current claims | [Truth slots](#truth-slots) |
+| Review duplicate identities | [Identity resolution](#identity-resolution) |
+| Consume changes | [Events](#events) |
 
 ## Managed Runtime Status
 
@@ -188,17 +202,47 @@ Request body:
 
 ## Spaces
 
-Spaces provide multi-tenant isolation. Each space has its own embedding configuration.
+Space configuration stores embedding policy and optional extraction guidance.
+These routes use space names in their paths, not `space_config:` record IDs.
 
-### Endpoints (via `/v1/spaces/...`)
+<Warning>
+The current REST space configuration handlers authenticate callers but do not
+perform per-record space, scope, or clearance authorization. Restrict these
+administrative routes to trusted operators. Do not expose them as tenant-level
+self-service configuration. MCP space tools apply their own record checks.
+</Warning>
 
-Spaces are managed through the space configuration routes. Key operations include creating spaces, updating embedding configuration, and ingesting documents into specific spaces.
+| Method | Path | Result |
+| --- | --- | --- |
+| GET | `/v1/spaces` | Array of up to 100 space configurations |
+| POST | `/v1/spaces` | Create configuration, returning `201` or `409` if the name exists |
+| GET | `/v1/spaces/{space_id}` | Configuration for the named space, or `404` |
+| PUT | `/v1/spaces/{space_id}` | Update supplied configuration fields |
+
+Creation accepts `name`, `embedding_provider`, `embedding_model`, and
+`embedding_dims`, plus optional `purpose` and `skill`. Updates accept the same
+configuration fields except `name`. Omitted fields retain their previous values;
+null `purpose` or `skill` does not clear an existing value.
+
+```json
+{
+  "name":"cedar-tutorial",
+  "embedding_provider":"openai",
+  "embedding_model":"text-embedding-3-small",
+  "embedding_dims":1536,
+  "purpose":"Extract software components and their explicit dependencies.",
+  "skill":"extraction/technical-docs"
+}
+```
+
+This configuration selects the provider but does not supply its credentials.
+Check [spaces](/concepts/spaces) before changing an existing embedding policy.
 
 ---
 
 ## Work Items
 
-Work items represent pipeline processing tasks (rendering, chunking, embedding, extraction). Use these endpoints to monitor and retry pipeline work.
+Work items represent dispatched tasks such as rendering, extraction, artifact validation/commit, and truth resolution. Use these endpoints to monitor and retry pipeline work.
 
 | Method | Path | Description |
 |---|---|---|
@@ -241,7 +285,7 @@ curl "http://localhost:3000/v1/work-items?status=failed&limit=20" \
   "results": [
     {
       "id": "work_item:550e8400-...",
-      "kind": "extract",
+      "kind": "extract_assertions",
       "status": "failed",
       "attempts": 3,
       "last_error": "LLM provider timeout",
@@ -253,6 +297,12 @@ curl "http://localhost:3000/v1/work-items?status=failed&limit=20" \
 }
 ```
 </CodeGroup>
+
+The current list handler returns `total` for the authorized records in this
+response and always returns `cursor: null`; do not use it as a complete queue
+export. A status-filtered request does not consume `cursor`. `kind` is applied
+when supplied together with `status`. Consult [work queue](/pipeline/work-queue)
+for scheduler behavior and operational diagnosis.
 
 ### Get Work Item
 
@@ -271,6 +321,14 @@ curl http://localhost:3000/v1/work-items/work_item:550e8400-e29b-41d4-a716-44665
 
 ### Retry Work Item
 
+<Warning>
+This REST handler scopes lookups to the authenticated space but currently does
+not check operation scopes or record read/write authorization before changing
+and returning a known failed item. Restrict it to trusted operators entitled
+to all work records in that space. It is not a tenant-level retry permission
+boundary.
+</Warning>
+
 `POST /v1/work-items/{id}/retry`
 
 Reset a failed work item to `runnable` status so the pipeline picks it up again. Only items with `failed` status can be retried.
@@ -288,7 +346,7 @@ curl -X POST http://localhost:3000/v1/work-items/work_item:550e8400-.../retry \
 ```json Response
 {
   "id": "work_item:550e8400-...",
-  "kind": "extract",
+  "kind": "extract_assertions",
   "status": "runnable",
   "attempts": 3
 }
@@ -399,44 +457,26 @@ Identity resolution endpoints manage duplicate detection and entity merging.
 
 `POST /v1/identity/candidates`
 
-Propose two entities as potential duplicates.
+This REST route accepts a complete `IdentityCandidate` record, including the
+[common record fields](/api/entities#entity-wire-format). It returns `201` with
+the stored candidate. It does not accept the MCP convenience proposal shape.
 
-Returns `201 Created` on success.
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `entity_a` | string | Yes | First existing entity ID |
+| `entity_b` | string | Yes | Second existing entity ID |
+| `signals` | JSON | Yes | Signals supporting the identity match |
+| `confidence` | number | Yes | Proposed match confidence |
+| `proposed_by` | string | Yes | Proposer identity |
+| `status` | string | No | `pending` (default), `approved`, or `rejected` |
+| `decided_by` | string | No | Decision-maker identity |
+| `decided_at` | timestamp | No | Decision time |
 
-<ParamField body="entity_a" type="string" required>
-  First entity ID.
-</ParamField>
-
-<ParamField body="entity_b" type="string" required>
-  Second entity ID.
-</ParamField>
-
-<ParamField body="confidence" type="number" required>
-  Confidence that the entities are duplicates (0.0 to 1.0).
-</ParamField>
-
-<ParamField body="evidence" type="string">
-  Evidence or reasoning for the match.
-</ParamField>
-
-<ParamField body="signal_type" type="string">
-  How the match was detected (e.g., `heuristic`, `llm`, `manual`).
-</ParamField>
-
-<CodeGroup>
-```bash Request
-curl -X POST http://localhost:3000/v1/identity/candidates \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "entity_a": "entity:aaa...",
-    "entity_b": "entity:bbb...",
-    "confidence": 0.92,
-    "evidence": "Same name and email address",
-    "signal_type": "heuristic"
-  }'
-```
-</CodeGroup>
+Supply valid IDs, actual timestamps, and the correct provenance/security fields
+alongside these values. For a smaller input that generates base fields, use
+MCP [`propose_identity_candidate`](/mcp/tools#propose_identity_candidate) on
+Maintenance or Full. A candidate records a proposed match; it does not itself
+merge entities or establish their identity.
 
 ### List Identity Candidates
 
@@ -559,7 +599,19 @@ curl "http://localhost:3000/v1/events/stream?limit=50" \
       "id": "system_event:550e8400-...",
       "seq": 42,
       "event_type": "entity.created",
-      "record_id": "entity:aaa...",
+      "payload": {
+        "space_id": "default",
+        "event_type": "entity.created",
+        "actor": "example-client",
+        "run_id": null,
+        "records": [
+          {
+            "id": "entity:550e8400-e29b-41d4-a716-446655440000",
+            "table": "entity",
+            "op": "create"
+          }
+        ]
+      },
       "created_at": "2026-02-01T12:00:00Z"
     }
   ],
@@ -573,7 +625,10 @@ curl "http://localhost:3000/v1/events/stream?limit=50" \
 
 `GET /v1/events/sse`
 
-Opens a Server-Sent Events stream that pushes new events in real time.
+Opens a persistent Server-Sent Events stream. The server polls storage at the
+configured cadence and pushes batches to the connected client. Preserve the
+returned cursor to resume after disconnection. Example events below omit
+common base fields for readability.
 
 <ParamField query="cursor" type="string">
   Base64-encoded cursor to resume from.

@@ -1,187 +1,166 @@
 ---
-title: "Truth Maintenance"
-description: "How Elephant resolves conflicting claims into a single current truth per subject-predicate pair"
+title: "Truth maintenance"
+description: "Turn supported claims into current values while preserving corroboration, conflicts, time, and uncertainty."
 icon: "scale-balanced"
 ---
 
-Truth maintenance is the subsystem that turns multiple competing assertions into a single "current answer" for each subject-predicate pair. When two documents disagree about a claim -- for example, where someone works -- truth maintenance decides which claim wins, and why. Detection is **value-aware**: sources that agree corroborate each other, and only genuinely divergent values become conflicts. Real conflicts are resolved by an **LLM adjudicator** that sees the actual claim values, with deterministic policies as the fallback for deployments without an API key.
+Truth maintenance evaluates committed claims and maintains the current answer
+for a subject and predicate. The answer can be one value, several coexisting
+values, or unresolved uncertainty. The system records the evidence and
+rationale so a reader can inspect how it reached that answer.
 
-## Truth Slots
+Suppose one note says Mara works at Northstar Labs and another says she works
+at Cedar Works. Those claims might describe a job change, concurrent roles,
+or a mistaken identity. Their ingest order alone does not decide which
+interpretation is correct.
 
-A **truth slot** represents the current best answer for a specific subject-predicate combination. It is the query-time view of resolved knowledge.
+## Corroboration and conflict
 
-<CodeGroup>
-```rust TruthSlot
-struct TruthSlot {
-    base: BaseFields,
+Detection first groups claims by exact value equality.
 
-    slot_key: String,          // deterministic key
-    slot_type: String,         // "rel" | "attribute" | "event" | "rel_set"
-    subject_entity: String,    // subject entity ID
-    predicate_id: String,      // canonical predicate
+| Evidence | Interpretation | Processing |
+|----------|----------------|------------|
+| Two sources name the same employer entity | Corroboration | Merge supporting evidence into a winner |
+| Two sources name different employer entities | Possible disagreement | Examine predicate cardinality and the competing values |
+| Different spellings represent the same value | Possible equivalence | A configured adjudicator can identify the equivalence |
 
-    current_values: Vec<CurrentValue>,
-    conflict_group: Option<Link<ConflictGroup>>,
-    confidence: f32,
-    rationale: Option<String>,
+Corroborating duplicates merge their evidence, deduplicated by assertion and
+span, and are soft-deleted as duplicate claim rows. Their validity windows
+are not closed: another source agreeing with a claim does not mean the claim
+stopped being true.
 
-    // Versioning
-    semantics_version: u32,
-    alias_version: u32,
+For relationships, the ordinary slot includes both endpoints. A `rel_set`
+slot additionally compares the different objects for one subject and
+predicate. That cross-object check is used when cardinality is `one` or
+unknown. A predicate explicitly allowing `many` values, or an event-like
+predicate, does not create that form of cross-object conflict.
 
-    // Staleness tracking
-    stale: bool,
-    stale_reason: Option<String>,
-    computed_at: DateTime<Utc>,
-    security_hash: String,
-}
+## Truth slots are materialized answers
+
+A `TruthSlot` contains the current values and the metadata needed to interpret
+them:
+
+| Field | What a reader should use it for |
+|-------|--------------------------------|
+| `current_values` | Claim IDs, confidence, status, and supporting evidence |
+| `conflict_group` | The linked conflict record, when present |
+| `rationale` | Explanation of the recorded decision |
+| `computed_at` | When this answer was computed |
+| `stale`, `stale_reason` | Whether recomputation is required and why |
+| `semantics_version`, `alias_version` | Which vocabulary/policy versions the computation used |
+| `security_hash` | The security partition containing these claims |
+
+A slot's top-ranked value is not automatically an unambiguous fact. Inspect
+the value status, conflict state, rationale, and staleness together.
+
+Slots support attributes, individual relationships, cross-object relationship
+sets, and events. They are partitioned by the security envelope. Claims in
+different envelopes never share a conflict group, even if an administrator
+can read both. This protects isolation and deliberately leaves cross-envelope
+contradictions outside truth maintenance's comparison scope.
+
+## How a decision is made
+
+```mermaid
+flowchart TD
+    G["Graph or event change"] --> D["Detect value groups"]
+    D -->|"One value group"| C["Commit supported value and corroboration"]
+    D -->|"Competing values"| R["Resolve conflict"]
+    R --> L["Configured LLM adjudicator"]
+    R --> F["Deterministic fallback when no verdict is available"]
+    L --> V["Validated verdict"]
+    V --> K["Commit if claim set still matches"]
+    F --> K
+    K --> T["Current values, claim statuses, and rationale"]
+    C --> T
 ```
-</CodeGroup>
 
-### Slot Keys
+The managed runtime wires the adjudicator when the relevant extraction
+feature and Anthropic credentials are available. It receives rendered claim
+values, evidence notes, timestamps, confidence, and known predicate semantics.
+See [pipeline truth maintenance](/pipeline/truth-maintenance) for deployment
+settings and work kinds.
 
-The `slot_key` is a deterministic identifier computed from the claim's components:
+### Adjudicator outcomes
 
-- **For attributes:** `(subject_entity, attr_type, context_bucket?, security_hash)`
-- **For relationships:** `(in, out, rel_type, security_hash)`
-- **For rel sets:** `(subject_entity, __rel_set__, predicate_id, security_hash)` -- a cross-object slot that groups *all* objects a subject has for one predicate, so that "works_at ExampleCo" and "works_at ExampleLabs" can conflict even though they are different edges
+| Verdict | Effect |
+|---------|--------|
+| `corroborate` | Merge evidence into one winner without ending duplicate claims' validity |
+| `single_winner` | Select a winner and supersede competing claims |
+| `coexist` | Approve the values together |
+| `supersede` | Replace older claims, using validated temporal information from the verdict where supplied |
+| `needs_review` | Retain an explicit unresolved decision for review |
 
-Two claims with the same slot key compete for the same truth slot. The `security_hash` ensures that claims with different security envelopes do not silently merge.
+Equivalence groups can merge duplicates of a selected winner. A `coexist`
+verdict currently retains all claims approved rather than merging every
+equivalence group independently.
 
-<Note>
-Because the security hash partitions slots, contradictions between claims in *different* security envelopes are never detected as conflicts. This is deliberate ABAC isolation: truth maintenance never joins data across envelope boundaries.
-</Note>
+If semantics are unknown, the adjudicator must include a semantics proposal.
+That proposal is recorded as `llm_proposed` and cannot overwrite an
+operator's `configured` semantics. See [predicate governance](/concepts/predicates).
 
-### Current Values
+### Deterministic fallback
 
-Each truth slot holds one or more `CurrentValue` entries:
+When there is no adjudicator or the configured provider cannot produce a
+usable verdict, the stored predicate policy provides the fallback:
 
-| Field | Type | Description |
-|---|---|---|
-| `claim_id` | `String` | Record ID of the winning claim |
-| `confidence` | `f32` | Confidence score (0.0-1.0) |
-| `status` | `ClaimStatus` | Status of the claim |
-| `evidence` | `Vec<EvidenceRef>` | Supporting evidence references |
+| Policy | Behavior |
+|--------|----------|
+| `allow_parallel` | Retain multiple values, ranked by confidence and available freshness signals |
+| `supersede_by_recency` | Select the newer claim according to the configured temporal basis |
+| `split_by_context` | Select the highest-confidence claim within each available context bucket |
+| `require_more_evidence` | Keep the conflict for review; meeting an evidence floor does not automatically choose a winner |
 
-A slot may contain multiple current values (a coexist verdict, or the `AllowParallel` fallback policy) ranked by confidence, or a single winner after supersession.
+With no semantics, the general fallback is `allow_parallel`. Do not expect an
+unconfigured deployment to infer which employer replaced the other.
 
-## Corroboration vs Conflict
+The current relationship/attribute adapter supplies no context buckets to
+`split_by_context`, so those claims share the default bucket. Setting that
+policy alone does not infer roles or time periods from prose.
 
-Detection partitions a slot's claims into **value groups** by exact value equality:
+A deterministic fallback gives a defined result during provider absence. Its
+rationale should remain visible so callers can distinguish it from an
+adjudicated decision.
 
-- **One value group, multiple claims -- corroboration.** Two sources asserting the same value agree; that is evidence, not a conflict. The slot commits directly with a `CorroboratedWinner`: evidence references from all members merge into the winner (deduplicated by assertion and span), duplicate rows are soft-deleted, and **no validity window is closed** -- a corroborating duplicate never "stopped being true."
-- **Multiple value groups -- a real conflict.** The divergent claims form a `ConflictGroup` and go to resolution.
+## Evidence changes, stale decisions, and retries
 
-### Cross-object conflicts (rel_set)
+Truth maintenance runs asynchronously after graph commit:
 
-Relationship slot keys include the object, so two different objects for the same subject and predicate occupy different slots. To catch contradictions like "works_at ExampleCo" vs "works_at ExampleLabs", detection also maintains **rel_set** slots per subject-predicate pair. A rel_set conflict group is created when a subject has more than one distinct object for a predicate **and** the predicate's configured cardinality is `One`, or its semantics are unknown. Predicates configured with cardinality `Many` (e.g. "speaks_language") and event-like predicates never produce rel_set conflicts.
+1. Detection creates or updates the slot and any conflict group.
+2. Resolution evaluates the current competing claim set.
+3. Commit writes current values and claim statuses if the live claim set still
+   matches the one that was evaluated.
+4. Registry or alias changes can mark dependent slots stale and enqueue
+   recomputation.
 
-## Conflict Groups
+If the claim set changed during adjudication, the stale commit is skipped and
+the slot is re-detected. A model response cannot overwrite a newer set of
+claims merely because it finished later.
 
-When divergent claims are detected, they are grouped into a `ConflictGroup`:
+Adjudication is memoized using a hash of the claim IDs. An unchanged claim set
+does not call the model again, including after a `needs_review` result or
+re-corroboration of an already-superseded value. Re-running the same work is
+therefore not a way to ask for a different answer. Inspect the claim-set and
+review state when deciding how to resolve it.
 
-<CodeGroup>
-```rust ConflictGroup
-struct ConflictGroup {
-    base: BaseFields,
+Recomputation commits single-value cases directly. Multi-value cases enqueue
+resolution work rather than making an unbounded model call inside the
+recompute sweep.
 
-    slot_key: String,
-    slot_type: String,          // "rel" | "attribute" | "event" | "rel_set"
-    claim_ids: Vec<String>,     // competing claim IDs
+## Read an answer responsibly
 
-    resolved: bool,
-    resolution_rationale: Option<String>,
-    detected_at: DateTime<Utc>,
-    resolved_at: Option<DateTime<Utc>>,
+Use [`list_truth_slots`](/mcp/tools#list_truth_slots) to find an entity's slots
+and [`get_truth_slot_history`](/mcp/tools#get_truth_slot_history) to inspect
+competing assertions and conflict information. Both tools must be available
+in the selected MCP profile and authorized for the caller.
 
-    // Adjudication memoization
-    adjudicated_claim_set_hash: Option<String>,
-    adjudicated_at: Option<DateTime<Utc>>,
-}
-```
-</CodeGroup>
+| Observation | Interpretation |
+|-------------|----------------|
+| Several approved values | The decision permits coexistence; do not silently pick the first as exclusive truth |
+| A disputed value or `needs_review` rationale | The system has preserved uncertainty |
+| `stale: true` | The stored answer predates a relevant change |
+| A superseded claim | Historical evidence remains relevant, but that claim is not the current selection |
+| No slot | Processing, authorization, predicate mapping, or absent evidence may explain it |
 
-A truth slot links to its conflict group via `conflict_group` when unresolved conflicts exist. Once resolved, the group retains the rationale for audit purposes. The `adjudicated_claim_set_hash` memoizes the LLM verdict: as long as the group's claim set is unchanged, the conflict is never re-adjudicated -- including `needs_review` verdicts, and including re-corroboration of an already-superseded value.
-
-## LLM Adjudication
-
-When a real conflict exists and the pipeline has an Anthropic API key, resolution is performed by an LLM adjudicator that sees the rendered claim values, confidences, evidence counts, source timestamps, and any known predicate semantics. It returns a structured verdict (meerkat strict structured output with retries):
-
-| Decision | Effect |
-|---|---|
-| `corroborate` | The claims turn out to agree (e.g. formatting variants). Evidence merges into a winner; duplicates are soft-deleted; no windows close. |
-| `single_winner` | One claim wins; the others are superseded. |
-| `coexist` | All values are valid simultaneously; every claim is approved. |
-| `supersede` | A newer claim replaces older ones. The verdict carries validity dates the LLM read in the values (e.g. "left ExampleCo in 2024"), which take precedence over ingest timestamps when closing validity windows. |
-| `needs_review` | Genuine ambiguity; flagged for human review. |
-
-Verdicts may also include `equivalent_groups` -- claims that are the same value in different formats ("NYC" / "New York City"). Members of an equivalence group merge into their group winner exactly like corroboration.
-
-### Learned predicate semantics
-
-When the conflicted predicate has no registered semantics, the verdict **must** include proposed semantics (cardinality, temporal model, conflict policy). These are persisted to the predicate registry with `semantics_status: llm_proposed`:
-
-- LLM-proposed semantics **never overwrite** operator-`configured` semantics.
-- Later adjudications may revise non-configured semantics (e.g. a coexist verdict downgrades a `One`-cardinality proposal to `Many`).
-- The upsert emits the standard predicate-registry outbox event, marking dependent truth slots stale so they recompute under the learned semantics.
-
-### Deterministic fallback policies
-
-Deployments without `ANTHROPIC_API_KEY` fall back to the predicate's declared `ConflictPolicy` (also used when adjudication fails after retries):
-
-<Accordion title="AllowParallel (default)">
-Both claims coexist in the truth slot. The slot shows all values ranked by confidence. Use this for predicates where multiple answers are valid simultaneously, such as "speaks_language" or "has_skill."
-</Accordion>
-
-<Accordion title="SupersedeByRecency">
-The newer claim wins. The older claim's validity window is closed (its `validity_window.end` is set). Use this for predicates that represent mutable state, such as "works_at" or "lives_in."
-</Accordion>
-
-<Accordion title="SplitByContext">
-Claims with different context buckets (e.g., different roles or time periods) do not conflict. Each context gets its own truth. Use this for role-dependent or context-dependent predicates.
-</Accordion>
-
-<Accordion title="RequireMoreEvidence">
-No automatic resolution. The conflict is flagged for human review. Use this for high-stakes predicates where automated resolution is unacceptable.
-</Accordion>
-
-<Note>
-Keyless deployments never supersede a value unless the predicate has operator-configured semantics that call for it. Cross-object (rel_set) conflicts without an adjudicator resolve as coexist rather than guessing a winner.
-</Note>
-
-## The Truth Maintenance Cycle
-
-<Steps>
-  <Step title="Detect">
-    When a new assertion is resolved to entities and promoted into a relationship or attribute, the system computes its slot key and partitions the slot's claims into value groups. A single value group commits directly (first claim, or corroboration with evidence merge). Multiple value groups create or update a conflict group. Divergent objects for a single-valued predicate are caught via the rel_set slot.
-  </Step>
-  <Step title="Resolve">
-    With an API key, the LLM adjudicator examines the actual claim values and returns a verdict (memoized per claim-set hash -- unchanged claim sets are never re-adjudicated). Without one, the predicate's conflict policy applies: `SupersedeByRecency` compares timestamps, `RequireMoreEvidence` flags the group for review, and so on.
-  </Step>
-  <Step title="Commit">
-    The winning value is written to the truth slot's `current_values`. Superseded claims get their validity windows closed -- preferring dates the adjudicator extracted from the claims over ingest timestamps. Corroborated and equivalent duplicates merge their evidence into the winner and are soft-deleted. If the group's claim set changed between resolution and commit, the commit no-ops with a warning (stale-adjudication guard) and the slot is re-detected.
-  </Step>
-  <Step title="Recompute">
-    When predicate semantics or alias mappings change, affected truth slots are marked `stale = true` with a `stale_reason`. A background job recomputes stale slots using the updated configuration. Recompute never calls the LLM inline: single-value-group slots commit deterministically, while multi-value-group slots enqueue `tm_resolve_slot` work items for adjudication. The `semantics_version` and `alias_version` fields track which versions were used for the current computation.
-  </Step>
-</Steps>
-
-## Staleness
-
-Truth slots track whether they need recomputation:
-
-| Field | Description |
-|---|---|
-| `stale` | Boolean flag indicating the slot needs recomputation |
-| `stale_reason` | Why the slot became stale (e.g., "predicate semantics updated") |
-| `computed_at` | When the slot was last computed |
-| `semantics_version` | Version of predicate semantics used |
-| `alias_version` | Version of alias mappings used |
-
-You can query for stale slots via the `list_truth_slots` API with `stale_only: true`.
-
-## See Also
-
-- [Assertions](/concepts/assertions) -- the evidence layer that feeds truth slots
-- [Predicates](/concepts/predicates) -- predicate semantics that drive conflict policies
-- [Security](/concepts/security) -- how the security hash partitions truth slots
+For request examples and troubleshooting, continue with the
+[truth slots guide](/guides/truth-slots).

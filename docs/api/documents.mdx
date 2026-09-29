@@ -4,6 +4,14 @@ description: "Ingest, search, and manage documents in the Elephant knowledge pip
 icon: "file-lines"
 ---
 
+Document routes enforce record authorization, but the current REST responses
+return the authorized document directly. They do not apply the MCP document
+helper's separate raw-text redaction. Treat permission to these REST reads as
+permission to the returned text and metadata. See [security](/concepts/security).
+
+Response examples are abbreviated to highlight relevant fields; they are not
+complete write request bodies. Use the normalized ingest route for new evidence.
+
 ## Endpoints
 
 | Method | Path | Description |
@@ -110,7 +118,9 @@ Ingest a new document into the processing pipeline. Elephant stages a source-bac
 </ParamField>
 
 <ParamField body="rendition_key" type="string">
-  Optional explicit rendition key for idempotent ingest.
+  Optional rendition label used in source/document processing. Normalized
+  requests generate fresh document/source IDs; repeating this key alone does
+  not guarantee that retried HTTP submissions deduplicate.
 </ParamField>
 
 <ParamField body="sync" type="boolean" default="false">

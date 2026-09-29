@@ -4,6 +4,11 @@ description: "Source-first ingestion, provenance records, and source lifecycle o
 icon: "database"
 ---
 
+Source reads return authorized records, including their URI/path fields. A
+`read:source:raw` distinction is not a universal field-redaction guarantee.
+Classify sensitive source locations in the record security envelope. See
+[security](/concepts/security).
+
 ## Endpoints
 
 | Method | Path | Description |

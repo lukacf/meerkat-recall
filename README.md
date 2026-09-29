@@ -49,7 +49,7 @@ Compose configuration uses development authentication bypass; see
 [deployment and authentication](docs/operations/deployment.mdx) before
 exposing an instance to other users.
 
-Elephant's public command is `elephant`:
+Elephant's public command is `elephant` ([CLI reference](docs/cli/overview.mdx)):
 
 - `serve` runs HTTP, MCP, and managed workers together.
 - `serve --server-only` runs HTTP and MCP without workers.
@@ -74,6 +74,14 @@ operations. `/mcp/agent` is read-only, `/mcp/maintenance` adds maintenance
 operations, and `/mcp/full` exposes the full registered surface subject to
 authorization. Fetch `tools/list` for the current schema and tool availability.
 See the [MCP guide](docs/mcp/overview.mdx).
+
+## Read the documentation
+
+Start with the [knowledge model](docs/concepts/overview.mdx) for the
+relationship between evidence, claims, the graph, and derived views. Follow the
+[worked example](docs/guides/putting-it-together.mdx) to see those concepts in a
+complete task, or use the [HTTP API](docs/api/overview.mdx) and
+[MCP workflows](docs/mcp/workflows.mdx) when building an integration.
 
 ## Storage and data model
 

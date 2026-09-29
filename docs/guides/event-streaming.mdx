@@ -6,6 +6,17 @@ icon: "timeline-arrow"
 
 Elephant emits two categories of events: system events (internal pipeline activity) and domain events (real-world occurrences extracted from documents). This guide covers how to consume both.
 
+System event consumption and timeline queries have different purposes. Use the
+system stream to invalidate a cache or trigger downstream work after committed
+changes. Use timeline queries to answer when something happened in the source
+material. Neither an outbox event nor its delivery establishes that model-backed
+processing has completed.
+
+MCP `stream_events` requires `/mcp/full`; timeline read tools are available on
+all four HTTP profiles. Authenticate every protected HTTP/SSE connection and
+retain the same authorized space when reusing cursors. HTTP examples below
+assume explicit local `SKIP_AUTH` development.
+
 ## Stream system events
 
 System events track internal operations like document ingestion, assertion extraction, and entity creation. Use `stream_events` with a cursor for reliable, ordered consumption.
@@ -76,6 +87,21 @@ System events track internal operations like document ingestion, assertion extra
     `/v1/events/sse` and persist its emitted resume cursor.
   </Step>
 </Steps>
+
+## Receive system events over SSE
+
+REST clients that want a persistent connection can use the SSE endpoint:
+
+```bash
+curl -N -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:3000/v1/events/sse
+```
+
+Read and persist the resume cursor carried by the stream. On reconnect, use the
+endpoint's cursor contract rather than sending an MCP sequence cursor. See
+[System API](/api/system#events) for the exact event transport fields. A network
+connection can end independently of pipeline work, so reconnecting clients
+must tolerate replay and avoid applying the same change twice.
 
 ## List recent domain events
 

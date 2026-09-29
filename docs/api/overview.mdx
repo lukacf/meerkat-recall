@@ -4,6 +4,20 @@ description: "Base URL, authentication, versioning, response format, pagination,
 icon: "book"
 ---
 
+Use the HTTP API from application code and scripts. For a first integration:
+
+1. Start a server with the [quickstart](/quickstart).
+2. Obtain a token for the intended space and operations.
+3. Check runtime readiness before ingestion, then track the returned work.
+4. Handle authorization, pagination, and processing failures explicitly.
+
+| Task | Reference |
+| --- | --- |
+| Ingest and inspect evidence | [Documents](/api/documents), [Sources](/api/sources) |
+| Read or edit the graph | [Entities](/api/entities), [Relationships](/api/relationships) |
+| Inspect claims and vocabulary | [Assertions](/api/assertions), [Predicates](/api/predicates) |
+| Inspect readiness, work, truth, or events | [System](/api/system) |
+
 ## Base URL
 
 All API endpoints are served by `elephant serve` (Axum, default port 3000):
@@ -28,7 +42,10 @@ Elephant uses **JWT Bearer tokens** for authentication. Include the token in the
 Authorization: Bearer <your-jwt-token>
 ```
 
-The JWT must contain the following claims:
+The token's `sub` and `exp` claims identify the principal and expiration.
+Data operations also need an appropriate space, permission scopes, and policy
+clearances. Some fields deserialize with defaults; an omitted permission field
+does not grant access. Configured issuer and audience restrictions also apply.
 
 | Claim | Description |
 |---|---|
@@ -57,7 +74,7 @@ Most REST data responses return JSON; SSE and no-content responses are exception
 | `404 Not Found` | Resource does not exist |
 | `409 Conflict` | Resource already exists |
 | `500 Internal Server Error` | Unexpected server failure |
-| `503 Service Unavailable` | Health check failed (dependencies down) |
+| `503 Service Unavailable` | A required dependency or runtime capability is unavailable |
 
 ## Error Responses
 
@@ -72,7 +89,7 @@ Resource handlers use a structured JSON error body:
 ```
 
 <ResponseField name="code" type="string" required>
-  Machine-readable error code. One of: `VALIDATION_ERROR`, `NOT_FOUND`, `ACCESS_DENIED`, `CONFLICT`, `INTERNAL_ERROR`.
+  Machine-readable error code. Common values include: `VALIDATION_ERROR`, `NOT_FOUND`, `ACCESS_DENIED`, `CONFLICT`, `INTERNAL_ERROR`.
 </ResponseField>
 
 <ResponseField name="message" type="string" required>
@@ -86,6 +103,16 @@ Resource handlers use a structured JSON error body:
 Authentication errors instead use `{"error":"missing_token","message":"..."}`
 with HTTP 401 or 403. Malformed HTTP/JSON input can fail before a resource
 handler runs, so clients should check status and content type before decoding.
+
+## Asynchronous processing
+
+An ingest response can return `doc_id`, `source_id`, and `work_item_id` before
+extraction finishes. Save those IDs. Inspect the document's pipeline status and
+work failures before concluding that graph data should be present. A `201`
+response establishes acceptance or creation according to the endpoint; it does
+not establish the quality or completeness of model extraction.
+
+See [ingesting data](/guides/ingesting-data) for the complete workflow.
 
 ## Cursor-Based Pagination
 
@@ -122,21 +149,25 @@ individual endpoint for its exact response and limits. Pass the `cursor` value f
 
 **Example pagination flow:**
 
-<CodeGroup>
-```bash First Page
-curl -s http://localhost:3000/v1/entities/search \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"limit": 10}'
-```
+These commands require `curl`, `jq`, and a Bearer token in `TOKEN`. Preserve
+filters between pages and send the returned cursor unchanged.
 
-```bash Next Page
-curl -s http://localhost:3000/v1/entities/search \
+```bash
+curl -fsS http://localhost:3000/v1/entities/search \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"limit": 10, "cursor": "entity:01234567-..."}'
+  -d '{"query":"Alice","limit":10}' > /tmp/elephant-page.json
+
+jq '.results' /tmp/elephant-page.json
+if jq -e '.has_more and (.cursor != null)' /tmp/elephant-page.json >/dev/null; then
+  jq '{query:"Alice", limit:10, cursor:.cursor}' /tmp/elephant-page.json \
+    > /tmp/elephant-next-page.json
+  curl -fsS http://localhost:3000/v1/entities/search \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    --data-binary @/tmp/elephant-next-page.json
+fi
 ```
-</CodeGroup>
 
 ## Record IDs
 
@@ -160,7 +191,12 @@ When referencing a record by ID in path parameters, use the full prefixed form (
 
 ## Space Isolation
 
-Elephant is multi-tenant. Every request is scoped to the `space_id` from the JWT token. Policy clearances do not grant access to another space. Search endpoints that
+Data requests use the principal's `space_id` to scope record access. Policy clearances do not grant access to another space. Search endpoints that
 accept an explicit `space_id` reject a mismatch with the token's space. In
 local `SKIP_AUTH` mode, `X-Space-Id` selects the development principal's space
 (default `default`).
+
+The REST space-configuration administration routes have a different boundary:
+they currently authenticate callers without per-record authorization. Restrict
+those routes to trusted operators. See [security boundaries](/concepts/security)
+and [space administration](/api/system#spaces).

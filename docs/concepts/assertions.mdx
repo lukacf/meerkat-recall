@@ -1,121 +1,125 @@
 ---
 title: "Assertions"
-description: "The evidence layer: extracted claims that link subjects to predicates and objects"
+description: "Preserve what a source claims, where it says it, and how that claim maps into the graph."
 icon: "file-certificate"
 ---
 
-Assertions are the raw, unresolved claims that Elephant's extraction pipeline produces from ingested documents. Each assertion captures a single factual claim -- a subject, a predicate, and an object -- along with evidence pointing back to the source text.
+An assertion records a claim extracted from a document and the evidence span
+that supports it. In "Mara joined Northstar Labs in March 2026," an assertion
+can preserve the subject mention `Mara`, the raw predicate, and the object
+mention `Northstar Labs` before and after they are mapped to canonical records.
 
-Assertions sit between document ingestion and the knowledge graph. They are **not** entities or relationships themselves; they are _candidates_ that the resolution pipeline evaluates, resolves to entities, and ultimately promotes into relationships or attributes.
+An assertion answers **what did this source say?** A
+[truth slot](/concepts/truth-maintenance) answers **which supported values are
+current?** Keeping both lets you inspect a disagreement without losing either
+source's claim.
 
-## Key Concepts
+## From extraction to committed evidence
 
-**Subject-Predicate-Object triple.** Every assertion expresses a claim in the form "subject has predicate with object." The subject and object start as raw mention strings (`subject_text`, `object_text`) and are resolved to entity references during the resolution stage.
+The active graph-ingestion path stages model output as `knowledge_candidates`
+artifacts. Validation prepares a typed commit bundle, and `commit_artifacts`
+writes assertions and the corresponding graph or event records. Entity
+resolution and promotion participate in that boundary.
 
-**Evidence-backed.** Each assertion carries an `EvidenceSpan` that pinpoints the exact byte range in the source document revision, ensuring full provenance traceability.
-
-**Idempotent.** The `assertion_key` field is a deterministic deduplication key. Re-extracting the same document produces assertions with the same keys, preventing duplicates.
-
-## Assertion Struct
-
-A simplified view of the core fields:
-
-<CodeGroup>
-```rust Assertion
-struct Assertion {
-    base: BaseFields,
-
-    // Raw extraction output
-    subject_text: String,
-    predicate_raw: String,
-    predicate_id: Option<String>,    // canonical, if known
-    object_text: Option<String>,     // entity-to-entity claims
-    object_literal: Option<Value>,   // entity-to-literal claims
-
-    // Evidence
-    evidence: EvidenceSpan,
-    confidence: f32,                 // extraction confidence, 0.0-1.0
-
-    // Timestamps
-    source_event_time: Option<DateTime<Utc>>,
-    observed_at: DateTime<Utc>,
-    asserted_at: DateTime<Utc>,
-
-    // Deduplication
-    assertion_key: String,
-
-    // Resolution outcome
-    resolution_status: ResolutionStatus,
-    resolution_method: Option<String>,
-    resolution_confidence: Option<f32>,
-    subject_entity: Option<Link<Entity>>,
-    object_entity: Option<Link<Entity>>,
-
-    // Classification metadata
-    subject_entity_type: Option<String>,
-    object_entity_type: Option<String>,
-    significance: Option<String>,    // "skip", "low", "medium", "high"
-    lifecycle_tier: String,          // "active" or "archived"
-}
+```mermaid
+flowchart LR
+    D["Revision and nodes"] --> X["Extract candidate claims"]
+    X --> V["Validate artifacts"]
+    V --> C["Commit bundle"]
+    C --> A["Assertions with evidence"]
+    C --> G["Canonical graph and event records"]
+    G --> T["Truth maintenance"]
 ```
-</CodeGroup>
 
-## Resolution Status
+A successful extraction work item is not, on its own, proof that canonical
+records were committed. Use [document pipeline status](/api/documents#get-document-pipeline-status)
+to follow the artifact and work-item stages. The former separate
+`resolve_assertions` worker is outside the active path.
 
-Every assertion tracks its resolution progress through the `ResolutionStatus` enum:
+## Read the parts of a claim
 
-| Status | Description |
-|---|---|
-| `pending` | Not yet attempted. Default for newly extracted assertions. |
-| `resolved` | Successfully resolved -- both subject and object mapped to entities. |
-| `partial` | One side resolved (subject or object), but not both. |
-| `abstained` | Resolution declined due to ambiguity or low confidence. |
-| `failed` | Resolution failed after maximum retry attempts. |
-| `superseded` | Replaced by a newer assertion from document reprocessing. |
+| Field | Meaning |
+|-------|---------|
+| `subject_text` | The subject mention extracted from the source |
+| `predicate_raw` | The source or extractor's predicate wording |
+| `predicate_id` | Canonical predicate, when known |
+| `object_text` | An entity mention on the object side |
+| `object_literal` | A literal-valued object such as a number or date |
+| `subject_entity`, `object_entity` | Resolved entity references, when applicable |
+| `confidence` | Extraction confidence |
+| `resolution_confidence` | Confidence in mapping mentions to entities |
 
-<Accordion title="Resolution retry behavior">
-Assertions track retry state via `AssertionRetryState`:
-- `resolution_attempts` -- number of attempts so far
-- `last_resolution_at` -- timestamp of the most recent attempt
-- `abstention_reason` -- human-readable explanation when the resolver abstains
+Current inline promotion copies the extraction score into
+`resolution_confidence`; it is not an independently calibrated identity score.
+A literal claim does not need an object entity. A resolved assertion also does
+not imply that its derived relationship is approved or that its value won a
+conflict.
 
-The pipeline retries `pending` and `failed` assertions up to a configurable maximum. After exhausting retries, the status moves to `failed`.
-</Accordion>
+## Follow evidence to immutable text
 
-## Evidence Spans
+Every assertion has an `EvidenceSpan`:
 
-Each assertion includes an `EvidenceSpan` that links back to the source document:
+| Field | Meaning |
+|-------|---------|
+| `revision` | The immutable document revision containing the evidence |
+| `node` | Optional structural node associated with the span |
+| `start`, `end` | Byte offsets into that revision's UTF-8 text |
+| `quote_hash` | Integrity hash used to check the referenced passage |
 
-| Field | Type | Description |
-|---|---|---|
-| `revision` | `Link<DocRevision>` | The document revision containing the evidence |
-| `node` | `Option<Link<DocNode>>` | The specific chunk within the revision |
-| `start` | `u32` | Start byte offset in the revision text |
-| `end` | `u32` | End byte offset in the revision text |
-| `quote_hash` | `String` | Integrity hash of the quoted text |
+Read the cited revision, slice the recorded byte range, and verify its hash
+when interpreting evidence. Do not apply old offsets to a document's newest
+text: a later render can change the text and offsets while the original
+revision remains the evidence authority. Byte offsets also differ from
+character positions for non-ASCII text.
 
-The `quote_hash` ensures evidence integrity without storing the raw quote on the assertion itself. To retrieve the original text, read the source revision at the given byte offsets.
+Media-backed revisions can additionally map those spans to attachments and
+time ranges through their render manifest. See [documents](/concepts/documents).
 
-## Confidence Scores
+## Distinguish the three timestamps
 
-Assertions carry two distinct confidence values:
+| Timestamp | Question | Example |
+|-----------|----------|---------|
+| `source_event_time` | When did the described occurrence happen, if known? | A joining date in March |
+| `observed_at` | When did Elephant observe the source? | The note was ingested in April |
+| `asserted_at` | When was the claim extracted? | The extraction ran later in April |
 
-1. **Extraction confidence** (`confidence`) -- how confident the extraction LLM is that the claim exists in the source text. Range: 0.0 to 1.0.
-2. **Resolution confidence** (`resolution_confidence`) -- how confident the resolver is in its entity mapping. Only populated after resolution.
+A recently ingested source can describe an old event. These fields distinguish
+the intended temporal meanings. Current inline promotion initializes
+`observed_at` and `asserted_at` to the promotion time, so those two fields alone
+do not reconstruct a delayed source's original arrival time. Inspect source
+metadata and the evidence timestamps when that distinction matters.
 
-## Assertion Keys
+## Resolution and retention state
 
-The `assertion_key` is a deterministic string computed from the assertion's content (subject, predicate, object, and evidence location). It serves as an idempotency key: if a document is re-extracted, assertions with matching keys are deduplicated rather than duplicated.
+The record type supports the following resolution states:
 
-## Lifecycle Tiers
+| State | Meaning |
+|-------|---------|
+| `pending` | No recorded resolution outcome |
+| `resolved` | Required entity references were resolved |
+| `partial` | Only part of the mapping is known |
+| `abstained` | Resolution declined an ambiguous or low-confidence mapping |
+| `failed` | Resolution recorded failure |
+| `superseded` | Replaced during reprocessing |
 
-Assertions use a two-tier lifecycle:
+The active inline promotion path writes resolved assertions. These states are
+record semantics, not a promise that each assertion passes through six
+separate worker stages. Retry failures are inspected through the active
+[work queue](/pipeline/work-queue).
 
-- **`active`** -- default tier for all new assertions. Included in standard queries and pipeline processing.
-- **`archived`** -- resolved assertions older than a configurable threshold. Excluded from default queries but retained for audit trails and provenance tracing.
+`assertion_key` makes repeated promotion of the same node and claim
+idempotent. Its current construction includes the document-node ID, raw
+predicate, and a hash of the subject and object. A new revision with different
+nodes can therefore produce new assertion IDs; deduplication is not a promise
+that every paraphrase or re-render collapses into one record.
 
-## See Also
+Assertions also carry `lifecycle_tier`. The `active` tier is used by normal
+processing; archival can retain older resolved evidence for provenance while
+excluding it from normal active queries. The record's tier is distinct from
+its resolution state and from a work item's status.
 
-- [Truth Maintenance](/concepts/truth-maintenance) -- how resolved assertions feed into truth slots
-- [Predicates](/concepts/predicates) -- the canonical vocabulary assertions reference
-- [Security](/concepts/security) -- the security envelope carried on every assertion record
+## Next steps
+
+- [Assertions API](/api/assertions) lists, searches, and retrieves evidence records.
+- [Relationships](/concepts/relationships) explains the claims derived from them.
+- [Truth maintenance](/concepts/truth-maintenance) explains corroboration and conflict.

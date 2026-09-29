@@ -9,6 +9,20 @@ assume local `SKIP_AUTH` development; authenticated instances require an
 `Authorization: Bearer <token>` header. MCP tool availability depends on the
 [endpoint profile](/mcp/overview).
 
+## Choose the question before the search
+
+| Question | Start with | Inspect next |
+|---|---|---|
+| Which records mention this topic? | `search_all` | The returned type buckets |
+| Which document discusses this idea? | `search_docs` | Actual search mode and document evidence |
+| Which entity is this? | `search_entities` | Type, identity, and context |
+| What claims are linked to a known entity? | `search_assertions` with `entity_id` | Assertion evidence and resolution status |
+| What does the graph currently say? | `get_entity_context_bundle` and truth slots | Relationship provenance and current-value state |
+
+Results are limited to the caller's authorized space and records. An empty
+result is not proof that no matching record exists elsewhere or behind a
+clearance boundary. Keep IDs from search results for subsequent reads.
+
 ## Vector similarity search
 
 Search documents using embedding-based similarity. The query is embedded using the space's configured model and matched against document chunk vectors.
@@ -37,9 +51,22 @@ Search documents using embedding-based similarity. The query is embedded using t
   </Tab>
 </Tabs>
 
-Semantic results are ranked using the configured embedding model. The REST
-route enters semantic mode only when both `query` and `k` are present. If
-embeddings are unavailable, the supported fallback is lexical search.
+MCP `search_docs` reports the path actually used in `data.mode`:
+
+| Mode | Meaning |
+|---|---|
+| `semantic` | Document candidates came from embedding similarity |
+| `semantic+lexical` | Lexical matches were blended with semantic candidates |
+| `lexical-fallback` | Semantic search was unavailable or failed and text search was used |
+
+Inspect `data.items`, which contain a document redaction envelope and a score.
+Scores rank search results; they are not probabilities that the document's
+claims are true. A successful lexical fallback should not be described to a
+reader as embedding-based evidence.
+
+The REST route enters semantic mode only when both `query` and `k` are present.
+Omit `k` for a lexical query. Its response shape differs from the MCP envelope;
+see [Documents](/api/documents).
 
 ## Filter by collection
 
@@ -134,14 +161,25 @@ For example, a no-match result can contain:
 
 ## Search assertions
 
-Search extracted assertions by text across subject, predicate, and object fields.
+When the entity is already known, use its returned ID to retrieve resolved
+assertions directly. This avoids a broad text scan and preserves identity even
+when names have changed. On MCP, call `search_assertions`:
+
+```json
+{
+  "entity_id": "<returned entity ID>",
+  "limit": 25
+}
+```
+
+`entity_id` matches resolved subject or object links. To investigate unresolved
+mentions, search text across subject, predicate, and object fields instead:
 
 <Tabs>
   <Tab title="MCP Tool">
     ```json
     {
       "query": "works at",
-      "status": "resolved",
       "limit": 10
     }
     ```
@@ -151,14 +189,18 @@ Search extracted assertions by text across subject, predicate, and object fields
     ```bash
     curl -s -X POST http://localhost:3000/v1/assertions/search \
       -H "content-type: application/json" \
-      -d '{ "query": "works at", "status": "resolved", "limit": 10 }'
+      -d '{ "query": "works at", "limit": 10 }'
     ```
   </Tab>
 </Tabs>
 
 ## Entity context bundles
 
-Get a comprehensive view of an entity including all its relationships and summary statistics. This is useful for building entity profiles or providing context to an LLM.
+Get a bounded view of an entity for a profile or model context. MCP limits
+sections independently and applies the historical window to ended
+relationships/attributes, assertions, and events. Do not interpret this bundle
+as a complete relationship or evidence export. The REST context route has a
+separate, smaller response shape.
 
 <Tabs>
   <Tab title="MCP Tool">
@@ -173,11 +215,12 @@ Get a comprehensive view of an entity including all its relationships and summar
   </Tab>
   <Tab title="curl">
     ```bash
-    curl -s "http://localhost:3000/v1/entities/entity:550e8400.../context?window_days=30&event_limit=10"
+    curl -s "http://localhost:3000/v1/entities/$ENTITY_ID/context?window_days=30&event_limit=10"
     ```
   </Tab>
 </Tabs>
 
+For the REST example, set `ENTITY_ID` to the complete ID returned by search.
 The bundle returns:
 
 | Field | Description |
@@ -193,6 +236,26 @@ The bundle returns:
   `filters.include_deleted: true`; `search_all` uses top-level
   `include_deleted: true`. REST search routes use top-level `include_deleted`. This is useful for audit trails.
 </Accordion>
+
+## Turn a result into a supported answer
+
+The `get_provenance` convenience path below is restricted to trusted callers
+entitled to all content in the space. It currently lacks per-record clearance
+checks on returned evidence. For restricted readers, inspect claims and
+documents through individually authorized read tools. See
+[security boundaries](/concepts/security#authorization-boundaries).
+
+1. Read the selected document or entity rather than answering from its title.
+2. For a graph relationship, use `get_provenance` on the Default profile
+   to inspect its assertion and immutable source quote.
+3. Check truth-slot and temporal state before describing a historical claim as
+   current.
+4. Retain uncertainty when evidence is absent, redacted, or conflicting.
+
+If a known document is missing, first check the caller's space, permissions,
+collection filter, deleted state, and pipeline status. Then inspect the search
+mode and try an exact phrase from the source. Re-ingestion is not a retrieval
+troubleshooting step.
 
 ## Next steps
 

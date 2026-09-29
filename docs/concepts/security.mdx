@@ -1,157 +1,180 @@
 ---
 title: "Security"
-description: "Attribute-Based Access Control (ABAC) model for every record in Elephant"
+description: "Understand authentication, record authorization, subject restrictions, and derived-data visibility."
 icon: "shield-halved"
 ---
 
-Elephant enforces Attribute-Based Access Control (ABAC) on every record. Access decisions are computed at query time by comparing the caller's principal claims against the record's security envelope. Authenticated request handlers evaluate these attributes. Explicit local
-development bypass disables ABAC; direct repository access by Rust library
-callers requires authorization at the integration boundary.
+Elephant combines bearer-token authentication with attribute-based access
+control (ABAC). Authentication identifies the caller. Record authorization
+compares that principal's space, operation scopes, clearance, and subject
+restrictions with the record being read or written.
 
-## Security Envelope
+A valid token is therefore only the start of an access decision. It does not
+make every record in a space visible.
 
-Every record in Elephant carries a `Security` block in its base fields:
+## Authorization boundaries
 
-<CodeGroup>
-```rust Security
-struct Security {
-    policy_id: String,      // identifies the policy schema
-    level: i32,             // ordered integer sensitivity (0..n)
-    labels: Vec<String>,    // compartment tags
-    handling: Vec<String>,  // caveats
+Most HTTP and MCP record handlers invoke the policy engine. Lower-level Rust
+storage repositories do not carry a request principal; an embedding
+application must authorize their use at its own boundary.
+
+Administrative routes require particular care. The current REST space
+configuration handlers authenticate requests but do not perform per-record
+space or clearance checks. Keep that administrative surface restricted by
+the deployment boundary rather than treating every authenticated caller as
+an ordinary tenant. The MCP space tools do perform record authorization.
+
+The Default MCP `get_provenance` handler is another exception: it performs
+scope preflight and space-scoped lookups, but does not authorize each returned
+relationship, attribute, assertion, revision, node, or document. A caller can
+therefore receive evidence outside their record clearance by known ID. Restrict
+this tool to trusted callers authorized for all content in the selected space;
+it is not suitable for serving readers with different record clearances.
+
+REST `POST /v1/work-items/{id}/retry` likewise checks the authenticated space
+and failed status, but currently omits operation-scope and record read/write
+checks. Restrict it to trusted operators entitled to all work records in the
+space. Authentication alone must not authorize a reader to invoke retries.
+
+The explicit local-development bypass disables record ABAC. Use it only with
+isolated development data and loopback access.
+
+## Record security envelope
+
+Each record's `security` object describes its policy and restrictions:
+
+```json
+{
+  "policy_id": "project_policy_v1",
+  "level": 2,
+  "labels": ["project:atlas"],
+  "handling": ["handling:trusted_context"]
 }
 ```
-</CodeGroup>
 
-| Field | Example | Purpose |
-|---|---|---|
-| `policy_id` | `"tenant_policy_v1"` | Selects which policy schema governs this record |
-| `level` | `2` | Numeric sensitivity level; higher means more restricted |
-| `labels` | `["comp:alerts", "vis:team"]` | Compartment tags that partition access |
-| `handling` | `["handling:trusted_context"]` | Caveats that impose additional constraints |
+| Field | Meaning |
+|-------|---------|
+| `policy_id` | Policy namespace under which the record is classified |
+| `level` | Ordered sensitivity level |
+| `labels` | Compartments the caller must be cleared for |
+| `handling` | Additional caveats the caller must be allowed to handle |
 
-## Principal Claims
+The strings are exact policy values. Naming a label `public` or a caveat
+`trusted` does not create special behavior by itself.
 
-Every API request carries a principal (typically from a JWT token) with the following claims:
+## Principal clearance
 
-<CodeGroup>
-```rust Principal
-struct Principal {
-    space_id: String,
-    scopes: HashSet<String>,
-    clearances: Vec<Clearance>,
-    subject_allowlist: Option<HashSet<RecordId>>,
-    purpose: HashSet<String>,
+The corresponding principal needs an operation scope such as `read:entity`
+and a clearance for the record's policy. This is an illustrative clearance,
+not a complete JWT:
+
+```json
+{
+  "policy_id": "project_policy_v1",
+  "max_level": 2,
+  "labels": ["project:atlas"],
+  "handling_allow": ["handling:trusted_context"]
 }
 ```
-</CodeGroup>
 
-### Clearances
+For ordinary record access, every check must succeed:
 
-Each principal holds one or more `Clearance` entries, one per policy schema:
+1. The principal and record have the same `space_id`.
+2. The principal has the required operation scope.
+3. A clearance matches the record's `policy_id`.
+4. The record's `level` is within `max_level`.
+5. Every record label is present in the clearance's labels.
+6. Every handling caveat is present in `handling_allow`.
+7. Any subject restriction is satisfied.
+8. Any purposes required by the configured policy engine are present.
 
-<CodeGroup>
-```rust Clearance
-struct Clearance {
-    policy_id: String,
-    max_level: i32,
-    labels: HashSet<String>,
-    handling_allow: HashSet<String>,
-}
-```
-</CodeGroup>
+The request adapters support wildcard operation scopes and compatibility
+aliases, such as raw-document access implying document metadata access.
+Wildcard scopes do not by themselves override space, clearance, or subject
+checks.
 
-A clearance grants access to records under its `policy_id` up to `max_level`, for the listed labels and handling caveats.
+Use explicit `clearances` in new tokens. The HTTP adapter retains a legacy
+fallback that constructs clearances from flat security fields when the
+clearance list is empty. Exact authentication claims are documented in the
+[API overview](/api/overview#authentication).
 
-## Access Evaluation Rules
+## Subject restrictions
 
-Access is granted only if **all** of the following hold. If any rule fails, the request is denied.
-
-<Steps>
-  <Step title="Space match">
-    The principal's `space_id` must equal the record's `space_id`.
-  </Step>
-  <Step title="Scope check">
-    The required operation scope (e.g., `read:entity`, `write:relationship`) must be present in the principal's `scopes`.
-  </Step>
-  <Step title="Policy clearance">
-    A clearance must exist in the principal's `clearances` array matching the record's `policy_id`.
-  </Step>
-  <Step title="Level check">
-    The record's `level` must be less than or equal to the clearance's `max_level`.
-  </Step>
-  <Step title="Label subset">
-    Every label on the record must be present in the clearance's `labels` set. Formally: `record.labels` is a subset of `clearance.labels`.
-  </Step>
-  <Step title="Handling subset">
-    Every handling caveat on the record must be present in the clearance's `handling_allow` set.
-  </Step>
-  <Step title="Subject allowlist">
-    If the principal has a `subject_allowlist`, then: the record's `subjects_state` must be `complete` (unless `handling:subjectless_ok` is present), subjects must be non-empty, and every subject entity must appear in the allowlist.
-  </Step>
-  <Step title="Purpose check">
-    If the engine requires specific purposes, the principal's `purpose` set must include them.
-  </Step>
-</Steps>
-
-<Warning>
-The evaluation is **deny by default**. A principal with no clearances, no scopes, or a mismatched space will be denied access to every record.
-</Warning>
-
-## Subject State
-
-Records track whether their subject associations are fully populated:
+A principal can be restricted to a set of entity IDs with
+`subject_allowlist`. A record also declares `subjects` and `subjects_state`:
 
 | State | Meaning |
-|---|---|
-| `complete` | All relevant subject entities are known |
-| `partial` | Some subject entities are unknown |
-| `unknown` | Subject inference has not been performed |
+|-------|---------|
+| `complete` | The record's relevant subjects are known |
+| `partial` | Some subjects remain unresolved |
+| `unknown` | Subject inference has not been completed |
 
-When a principal has a `subject_allowlist` and the record's `subjects_state` is not `complete`, access is denied unless the record carries the `handling:subjectless_ok` caveat.
+For a restricted principal, the normal rule requires a complete, non-empty
+subject list, with every subject in the allowlist. If a meeting record names
+both Mara and Ivo, a principal restricted to Mara alone cannot read it.
 
-## Redaction
-
-When a principal has access to a record but lacks scope for specific fields, the response is wrapped in a `RedactionEnvelope`:
-
-<CodeGroup>
-```rust RedactionEnvelope
-struct RedactionEnvelope<T> {
-    data: T,
-    redactions: Vec<String>,  // redacted field paths
-}
-```
-</CodeGroup>
-
-For example, a principal with `read:entity` but without `read:doc:raw` will see document metadata but the `doc.text` field will be redacted. The `redactions` array lists which field paths were removed.
-
-Redaction rules map scopes to field paths:
-
-| Required Scope | Redacted Fields |
-|---|---|
-| `read:doc:raw` | `doc.text` |
-| `read:source:raw` | `source.path` |
-
-## Development Mode
+The `handling:subjectless_ok` caveat permits incomplete or empty subject
+metadata when the clearance also allows that caveat. It does not exempt a
+known subject from the allowlist.
 
 <Warning>
-Development mode bypasses all security checks and must never be used in production.
+The HTTP token adapter normalizes an empty `subject_allowlist` to no subject
+restriction. Do not encode an intended "deny everyone" policy as an empty
+array. Remove the operation scope or deny the request at the issuing boundary.
 </Warning>
 
-Setting the `SKIP_AUTH=true` environment variable injects a default principal:
+## Raw content and redaction
 
-| Field | Value |
-|---|---|
-| `subject` | `"dev-user"` |
-| `space_id` | `X-Space-Id` header, or `"default"` when absent |
-| `scopes` | `["*"]` |
-| `bypass_abac` | `true` |
+The policy vocabulary separates document metadata access from raw-text access.
+MCP document response helpers clear `doc.text` when `read:doc:raw` is missing
+and return a `RedactionEnvelope` listing the affected field in `redactions`.
+The current REST document handlers return authorized records directly and do
+not apply that helper. Treat REST document access as access to the returned
+text; a metadata scope alone does not guarantee a text-free REST response.
 
-This bypasses ABAC evaluation within the selected development space. It does
-not make data in every space part of the same request.
+A redaction receipt describes that response path. It is not a general
+scrubber for arbitrary `metadata`, sidecar fields, or application-defined
+content. Classify the whole record appropriately when those fields contain
+sensitive information.
 
-## See Also
+The current source handlers return authorized source records directly. Do not
+assume the `read:source:raw` scope automatically hides `source.uri` or
+`source.path` on every source API or MCP response. Protect sensitive source
+locations through the record envelope and deployment access policy.
 
-- [Assertions](/concepts/assertions) -- how security envelopes propagate to extracted claims
-- [Truth Maintenance](/concepts/truth-maintenance) -- how security hashes partition truth slots
-- [Predicates](/concepts/predicates) -- security on predicate registry entries
+## Derived answers retain restrictions
+
+Truth slots are partitioned by a fingerprint of the security envelope.
+Claims in different envelopes are not combined into a shared conflict group.
+This prevents a restricted claim from silently changing an answer in a less
+restricted partition, but it also means contradictions across partitions are
+not detected by truth maintenance.
+
+Knowledge-view publication uses exact security-envelope matching. Its
+projection records retain the union of contributing subjects, including
+relationship endpoints and evidence. Source projections additionally require
+`read:doc:raw` because they contain immutable document excerpts.
+
+The managed Living Wiki has a separate service grant. Creating or compiling
+that service requires explicit `manage:wiki` and unrestricted subject scope;
+a wildcard operation scope alone does not grant it. See the
+[Living Wiki architecture](/architecture/living-wiki) for publication and
+revocation behavior.
+
+## Development bypass
+
+`SKIP_AUTH=true` injects a development principal and bypasses ABAC. The HTTP
+server selects its space from `X-Space-Id`, falling back to `default`. This
+makes loopback examples easy to run, but their successful requests do not
+validate your production authorization policy.
+
+For authenticated service startup, configure the supported HS256 JWT secret
+and the intended issuer/audience constraints. MCP clients send their bearer
+token on each request; a server-side fallback token is not used to authorize
+an incoming caller. See [deployment](/operations/deployment).
+
+## Next steps
+
+- [Spaces](/concepts/spaces) explains request scoping and per-space configuration.
+- [API authentication](/api/overview#authentication) documents token claims.
+- [MCP overview](/mcp/overview) explains transport and tool visibility.

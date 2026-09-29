@@ -126,8 +126,11 @@ format](/api/relationships), including `in`, `out`, and `rel_type`.
 | `depth` | `1` | Relationship traversal depth, clamped to 1-3 |
 | `window_days` | `30` | Recent event window |
 | `event_limit` | `50` | Maximum recent events |
-| `with_relations` | `false` | Include full relationship objects |
+| `with_relations` | `false` | Accepted but currently ignored |
 
 The bundle contains `entity`, `outgoing_relations`, `incoming_relations`,
-`relations`, `recent_events`, and `alerts`. Its envelope differs from the MCP
-`get_context_bundle` response. See [searching](/guides/searching).
+`relations`, `recent_events`, and `alerts`. Outgoing and incoming entries always
+contain full relationship objects; `relations` is populated for traversal
+depths greater than one. Its envelope differs from MCP
+[`get_entity_context_bundle`](/mcp/tools#get_entity_context_bundle).
+See [searching](/guides/searching).

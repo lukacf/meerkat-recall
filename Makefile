@@ -13,7 +13,7 @@ HOOK_UNIT_ENV ?= RUST_LANE_ID=hook-unit
 HOOK_FULL_ENV ?= RUST_LANE_ID=hook-full
 HOOK_LINT_ENV ?= RUST_LANE_ID=hook-clippy
 
-.PHONY: all build release test test-unit test-all hook-test hook-test-all hook-lint test-e2e test-integration test-scenarios lint fmt fmt-check audit audit-alt ci ci-smoke clean doc doc-open coverage check verify-surface verify-version verify-version-parity release-preflight publish-dry-run install-hooks uninstall-hooks pre-commit-all update outdated bench cargo-bench run-api run-pipeline xtask help
+.PHONY: all build release test test-unit test-all hook-test hook-test-all hook-lint test-e2e test-integration test-scenarios lint fmt fmt-check audit audit-alt ci ci-smoke clean doc docs-check doc-open coverage check verify-surface verify-version verify-version-parity release-preflight publish-dry-run install-hooks uninstall-hooks pre-commit-all update outdated bench cargo-bench run-api run-pipeline xtask help
 
 all: ci
 
@@ -119,6 +119,10 @@ check:
 doc:
 	@echo "$(GREEN)Generating documentation...$(NC)"
 	$(CARGO) doc --workspace --no-deps --all-features
+
+# Install validation dependencies with npm ci --prefix scripts/docs --ignore-scripts.
+docs-check:
+	npm run --prefix scripts/docs check
 
 doc-open:
 	@echo "$(GREEN)Opening documentation...$(NC)"
@@ -232,6 +236,7 @@ help:
 	@echo ""
 	@echo "Documentation:"
 	@echo "  $(GREEN)doc$(NC)                - Generate documentation"
+	@echo "  $(GREEN)docs-check$(NC)         - Validate reader documentation"
 	@echo "  $(GREEN)doc-open$(NC)           - Generate and open documentation"
 	@echo ""
 	@echo "Maintenance:"

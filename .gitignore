@@ -86,3 +86,6 @@ test-ingest.md
 # Golden scenario run artifacts
 tests/golden_scenarios/output/
 elephant-rocksdb-bin.tmp
+
+# Documentation validation dependencies
+/scripts/docs/node_modules/

@@ -4,7 +4,9 @@ description: "How documents flow through Elephant's ingestion, extraction, embed
 icon: "conveyor-belt"
 ---
 
-Elephant's managed runtime runs concurrent worker loops that transform source-backed evidence into a structured knowledge graph. `elephant serve` runs these loops in-process by default; `elephant worker` remains available for standalone worker deployments. Each loop polls independently and communicates through the work queue and outbox event system.
+Elephant's managed runtime runs concurrent worker loops that transform source-backed evidence into a structured knowledge graph. `elephant serve` runs these loops in-process by default. `elephant worker` supports separate workers against a shared SurrealDB backend; embedded `elephant-db` requires the managed process because its state cannot be shared between processes. Each loop polls independently and communicates through the work queue and outbox event system.
+
+An ingest receipt confirms acceptance, not completed extraction. Follow the returned source and document IDs through [pipeline status](/api/documents#get-document-pipeline-status), then read the actual claims and evidence. The flow below shows graph-mode ingest; metadata and retrieval modes stop earlier.
 
 ## Full Pipeline Flow
 

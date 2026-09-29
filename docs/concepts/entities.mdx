@@ -1,114 +1,98 @@
 ---
 title: "Entities"
-description: "Core knowledge graph nodes representing people, organizations, locations, and any domain concept."
+description: "Give people, organizations, and domain concepts stable identities that survive new evidence."
 icon: "circle-nodes"
 ---
 
-Entities are the primary nodes in Elephant's knowledge graph. Every person, organization, location, or concept that the system tracks is an entity. Entities are connected to each other through [relationships](/concepts/relationships) and annotated with [attributes](/concepts/relationships#attributes).
+An entity is an identifiable person, organization, place, or domain concept.
+Its record ID connects evidence across documents even when the wording changes.
+In the [running example](/concepts/overview), Mara and Northstar Labs are two
+entities; `works_at` is the relationship between them.
 
-## Entity types
+## Choose an entity or a literal
 
-Entity types are **freeform strings**, normalized to lowercase. Any domain-appropriate type is valid -- extraction skills define which types to use for each space.
+Use an entity when the thing needs its own identity, can appear in several
+sources, or needs relationships of its own. Use an
+[attribute](/concepts/relationships#attributes) for a value such as a title,
+number, or date.
 
-Common built-in conventions:
+| Model | Example | Why |
+|-------|---------|-----|
+| Entity | Northstar Labs | Other people, projects, and locations can connect to the same organization |
+| Attribute value | `"Research engineer"` | A role label can be a literal on Mara |
+| Event | Mara joining Northstar Labs | The occurrence has its own time and evidence |
 
-| Type        | Usage                                    |
-|-------------|------------------------------------------|
-| `person`    | Individual people                        |
-| `org`       | Companies, teams, institutions           |
-| `location`  | Physical places, addresses, regions      |
-| `topic`     | Subjects, themes, areas of interest      |
-| `device`    | Hardware devices, phones, computers      |
-| `platform`  | Software platforms, services, apps       |
-| `concept`   | Abstract ideas, theories, frameworks     |
-| `group`     | Informal groupings, families, circles    |
+A display name is a label. Two records named "Mara" are not necessarily the
+same person, and renaming a record does not change its ID.
 
-<Note>
-Types are not restricted to this list. A space with `skill: "extraction/fiction"` might produce types like `character`, `magical_creature`, or `artifact`. The type system is intentionally open-ended.
-</Note>
+## Types describe your domain
 
-## Entity struct
+Entity types are freeform strings. The type constructor normalizes them to
+lowercase. Common conventions include `person`, `org`, `location`, `topic`,
+`device`, `platform`, `concept`, and `group`; a technical corpus can use
+`component` or `data_model`.
 
-<CodeGroup>
-```rust Entity
-struct Entity {
-    base: BaseFields,
-    entity_type: EntityType,
-    display_name: String,
-    aliases: Vec<String>,
-    summary: Option<String>,
-    handles: Vec<Handle>,
-    identity_keys: Vec<String>,
-    risk_level: Option<f64>,
-    trust_level: Option<f64>,
-    known_safe: bool,
-    first_seen: Option<DateTime<Utc>>,
-    last_seen: Option<DateTime<Utc>>,
-    status: EntityStatus,
-    redirect_to: Option<Link<Entity>>,
-    metadata: serde_json::Value,
-}
-```
-</CodeGroup>
+Choose a consistent vocabulary in your extraction skill. Types affect entity
+reuse during promotion, so using `person` for a software component can have
+consequences beyond display formatting. The `topic` type acts as an unknown
+bucket in the promotion compatibility check and can be refined when a more
+specific type becomes known.
 
-### Field reference
+## Names, handles, and identity keys
 
-<Accordion title="Core fields">
-| Field           | Type               | Description                                                |
-|-----------------|--------------------|------------------------------------------------------------|
-| `entity_type`   | `EntityType`       | Freeform type string, normalized to lowercase.             |
-| `display_name`  | `String`           | Primary human-readable name.                               |
-| `aliases`       | `Vec<String>`      | Alternative names. Duplicates and display_name matches are rejected on insert. |
-| `summary`       | `Option<String>`   | Brief description of the entity.                           |
-| `metadata`      | `JSON`             | Arbitrary key-value data. Defaults to `{}`.                |
-</Accordion>
+| Field | Purpose | Example |
+|-------|---------|---------|
+| `display_name` | Primary label shown to readers | `Mara` |
+| `aliases` | Alternative names for the same entity | `M. Vale` |
+| `handles` | Platform and username pairs, with optional evidence and confidence | A synthetic `github` handle |
+| `identity_keys` | Cached keys used by identity resolution | A normalized identifier supplied through the identity workflow |
+| `summary` | A short description | A brief contextual description of the person |
+| `metadata` | Application-specific JSON | Tags or external mapping information |
 
-<Accordion title="Identity fields">
-| Field           | Type               | Description                                                |
-|-----------------|--------------------|------------------------------------------------------------|
-| `handles`       | `Vec<Handle>`      | Platform-specific usernames (see Handle below).            |
-| `identity_keys` | `Vec<String>`      | Stable keys used for identity resolution and deduplication. Cached from the `entity_identity_key` table. |
-</Accordion>
+Aliases help retrieval; they do not establish identity on their own. The
+identity-key index and the promotion resolver decide reuse. The resolver
+checks all matching keys and type compatibility before selecting an existing
+entity.
 
-<Accordion title="Scoring and observation">
-| Field         | Type             | Description                                    |
-|---------------|------------------|------------------------------------------------|
-| `risk_level`  | `Option<f64>`    | Computed risk score (0.0 to 1.0).              |
-| `trust_level` | `Option<f64>`    | Computed trust score (0.0 to 1.0).             |
-| `known_safe`  | `bool`           | User-set flag marking entity as trusted.       |
-| `first_seen`  | `Option<DateTime>` | Timestamp of first observation.              |
-| `last_seen`   | `Option<DateTime>` | Timestamp of most recent observation.        |
-</Accordion>
+When compatible matches remain ambiguous, a configured disambiguator can
+choose among them. Without that disambiguator, the current fallback reuses the
+earliest compatible match with a warning. Incompatible types produce a new
+entity. Applications that require explicit identity review should inspect
+identity candidates rather than treating name similarity as a merge decision.
 
-## Handles
+## Merging duplicates
 
-A handle represents a username or identifier on a specific platform.
+An entity starts with `status: active`. A merge keeps a surviving entity and
+marks the other `merged`, with `redirect_to` pointing to the survivor. This
+preserves a way to understand references to the old identity.
 
-```rust
-struct Handle {
-    platform: String,       // e.g. "twitter", "github"
-    username: String,       // username on that platform
-    confidence: Option<f64>,
-    verified: bool,
-    first_seen: Option<DateTime<Utc>>,
-    last_seen: Option<DateTime<Utc>>,
-    evidence: Vec<RecordId>,
-}
+```mermaid
+flowchart LR
+    A["entity A: active"] --> M["Identity review and merge"]
+    B["entity B: active"] --> M
+    M --> S["entity A: survivor"]
+    M --> R["entity B: merged, redirect to A"]
 ```
 
-Handles are deduplicated by the `(platform, username)` pair -- adding a duplicate is a no-op.
+Use the supported [identity merge operation](/api/system#identity-resolution)
+so dependent graph references are handled by the merge workflow. Editing a
+name or setting a status field manually does not perform that workflow.
 
-## Entity status
+## Read an entity in context
 
-| Status   | Description                                                                 |
-|----------|-----------------------------------------------------------------------------|
-| `active` | Default. The entity is live and participates in queries and graph traversal. |
-| `merged` | The entity has been merged into another. `redirect_to` points to the surviving entity. Merged entities are excluded from search results. |
+A bare entity record answers identity and descriptive questions. To explain a
+claim, follow its relationships, attributes, truth slots, and source evidence.
+The MCP [`get_entity_context_bundle`](/mcp/tools#get_entity_context_bundle)
+operation collects authorized context; [`get_entity_with_relations`](/mcp/tools#get_entity_with_relations)
+provides the entity with its graph connections.
 
-When two entities are identified as duplicates, Elephant's identity resolution workflow merges them. The loser's status becomes `merged`, and its `redirect_to` field links to the winner. All relationships and attributes are transferred to the survivor.
+The returned context depends on the caller's space, scopes, clearances, and
+subject allowlist. The same entity ID does not imply identical visible
+context for every principal.
 
-## See also
+## Next steps
 
-- [Relationships](/concepts/relationships) -- how entities connect to each other
-- [Documents](/concepts/documents) -- source material that produces entities
-- [Spaces](/concepts/spaces) -- tenant isolation for entities
+- [Relationships and attributes](/concepts/relationships) explain claim shape,
+  status, and validity.
+- [Building graphs](/guides/building-graphs) shows how to create connected records.
+- [Entity API](/api/entities) documents request and response fields.

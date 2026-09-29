@@ -1,443 +1,264 @@
 ---
 title: "MCP Workflows"
-description: "Step-by-step guides for common Elephant MCP workflows"
-icon: "route"
+description: "Chain tool results into evidence retrieval, ingestion, identity review, and predicate governance."
+icon: "list-check"
 ---
 
-# MCP Workflows
+Use these workflows when you already have an MCP client connected to Elephant.
+Each JSON block contains the arguments for the named tool. Your MCP client wraps
+those arguments in a `tools/call` request. Angle-bracket values are placeholders:
+replace them with complete IDs returned by earlier calls.
 
-This page walks through four canonical workflows that demonstrate how to chain MCP tools together effectively. Each workflow shows the exact JSON payloads you would send as tool calls.
+## Choose the profile for the whole workflow
 
----
+Profiles expose different tool sets; they are not interchangeable roles. A
+visible tool still requires the principal's operation scopes, clearances, and
+space authorization. Check `tools/list` on your actual connection.
 
-## 1. Read Workflow
+| Workflow | Endpoint | Why |
+|---|---|---|
+| Search, entity context, and graph provenance | `/mcp` | `get_provenance` is registered only on Default |
+| Read documents and assertions | `/mcp/agent`, `/mcp/maintenance`, or `/mcp/full` | These include `get_doc` and assertion reads |
+| Ingest and inspect document pipeline status | `/mcp/full` | Default ingests, but does not expose `get_doc_pipeline_status` |
+| Review and merge duplicate identities | `/mcp/maintenance` or `/mcp/full` | Requires maintenance writes |
+| Validate and approve a staged predicate artifact | `/mcp/full` | Validation is a Full-profile tool |
 
-**Goal:** Find an entity, explore its relationships, and get full context.
+Check MCP errors and, for core handlers, the Elephant response envelope:
+`ok: false` is a failed operation even if transport succeeded. Carry values from
+`data` only after success. Runtime-control tools such as `get_runtime_status`
+return JSON directly, without this envelope. Keep the same authenticated space
+throughout a workflow. See [response handling](/mcp/overview#make-a-call-and-interpret-the-result).
 
-This is the most common workflow for LLMs that need to answer questions about the knowledge graph.
+## Retrieve an answer with its evidence
+
+Use the default `/mcp` endpoint for this workflow. `get_provenance` is
+registered there and is not exposed by the Full dispatcher. This convenience
+path is for trusted callers entitled to **all content in the space**: the
+current provenance handler does not enforce per-record clearance on every
+returned evidence record. See [security boundaries](/concepts/security#authorization-boundaries).
+For readers with restricted clearances, use individually authorized assertion
+and document reads on Agent, Maintenance, or Full.
 
 <Steps>
+  <Step title="Find the subject">
+    Call `search_entities`:
 
-### Search for the entity
-
-Start broad with `search_all` to find entities matching your query. This searches across entities, documents, sources, and relationships simultaneously.
-
-```json
-{
-  "tool": "search_all",
-  "input": {
-    "query": "Alex Chen",
-    "limit": 5,
-    "include": ["entities"]
-  }
-}
-```
-
-The response includes an `entities` bucket with matching results. Identify the entity ID from the results.
-
-### Get the entity details
-
-Once you have the entity ID, fetch it directly.
-
-```json
-{
-  "tool": "get_entity",
-  "input": {
-    "id": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479"
-  }
-}
-```
-
-This returns the entity's type, display name, summary, and metadata.
-
-### Get the full context bundle
-
-For a comprehensive view including relationships and statistics, use the context bundle.
-
-```json
-{
-  "tool": "get_entity_context_bundle",
-  "input": {
-    "id": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479",
-    "window": 30,
-    "limit": 10
-  }
-}
-```
-
-The context bundle returns:
-- The entity itself
-- Outgoing relationships (e.g., "Alex Chen works_at Acme Corp")
-- Incoming relationships (e.g., "NeuralFlow founded_by Alex Chen")
-- Statistics (total relationship count)
-
-### Drill into related entities
-
-Follow relationship targets to explore the graph further.
-
-```json
-{
-  "tool": "get_entity_with_relations",
-  "input": {
-    "id": "entity:550e8400-e29b-41d4-a716-446655440001"
-  }
-}
-```
-
-### Check timeline events
-
-See what events involve this entity.
-
-```json
-{
-  "tool": "search_events",
-  "input": {
-    "entity_ids": ["entity:f47ac10b-58cc-4372-a567-0e02b2c3d479"],
-    "limit": 10
-  }
-}
-```
-
-</Steps>
-
-<Note>
-The read workflow uses only Agent-profile tools, so it works with any profile (Default, Agent, Maintenance, or Full).
-</Note>
-
----
-
-## 2. Write Workflow
-
-**Goal:** Create entities, establish relationships, and ingest supporting documents.
-
-This workflow requires the Full profile since it involves entity creation and relationship writes.
-
-<Steps>
-
-### Create entities
-
-Create the entities that will form the nodes of your knowledge subgraph.
-
-```json
-{
-  "tool": "create_entity_simple",
-  "input": {
-    "entity_type": "person",
-    "display_name": "Alex Chen",
-    "summary": "Founder and CEO of NeuralFlow"
-  }
-}
-```
-
-Save the returned entity ID (e.g., `entity:aaa-111`).
-
-```json
-{
-  "tool": "create_entity_simple",
-  "input": {
-    "entity_type": "org",
-    "display_name": "NeuralFlow",
-    "summary": "AI research company focused on neural architecture search"
-  }
-}
-```
-
-Save this entity ID too (e.g., `entity:bbb-222`).
-
-### Create relationships
-
-Link the entities together with typed relationships.
-
-```json
-{
-  "tool": "relate_entities",
-  "input": {
-    "from_id": "entity:aaa-111",
-    "to_id": "entity:bbb-222",
-    "rel_type": "founded",
-    "weight": 0.95,
-    "evidence_text": "Alex Chen founded NeuralFlow in 2024.",
-    "evidence_source": "doc:ccc-333"
-  }
-}
-```
-
-For batch creation of multiple relationships:
-
-```json
-{
-  "tool": "batch_relationships",
-  "input": {
-    "items": [
-      { "from_id": "entity:aaa-111", "to_id": "entity:bbb-222", "rel_type": "founded", "weight": 0.95 },
-      { "from_id": "entity:aaa-111", "to_id": "entity:bbb-222", "rel_type": "ceo_of", "weight": 0.9 }
-    ]
-  }
-}
-```
-
-### Ingest a supporting document
-
-Ingest a document that provides evidence for the relationships. The pipeline will automatically extract additional assertions.
-
-```json
-{
-  "tool": "ingest_doc_simple",
-  "input": {
-    "title": "NeuralFlow Company Profile",
-    "text": "NeuralFlow was founded in 2024 by Alex Chen, a former researcher at DeepMind. The company focuses on neural architecture search and has raised $50M in Series A funding.",
-    "collection": "company_profiles"
-  }
-}
-```
-
-### Verify pipeline processing
-
-Check that the document is being processed through the extraction pipeline.
-
-```json
-{
-  "tool": "get_doc_pipeline_status",
-  "input": {
-    "id": "doc:ddd-444"
-  }
-}
-```
-
-</Steps>
-
----
-
-## 3. Identity Workflow
-
-**Goal:** Find duplicate entities, propose them as merge candidates, and merge them.
-
-This workflow requires the Maintenance profile at minimum.
-
-<Steps>
-
-### Search for potential duplicates
-
-Search for entities that might be duplicates. Look for similar names, types, or attributes.
-
-```json
-{
-  "tool": "search_entities",
-  "input": {
-    "query": "Alex Chen",
-    "filters": { "entity_type": "person" },
-    "limit": 20
-  }
-}
-```
-
-Review the results. If you find two entities that appear to be the same person (e.g., "Alex Chen" and "A. Chen"), proceed to propose a merge.
-
-### Get context for both candidates
-
-Before proposing a merge, inspect both entities to confirm they are duplicates.
-
-```json
-{
-  "tool": "get_entity_context_bundle",
-  "input": {
-    "id": "entity:aaa-111",
-    "limit": 10
-  }
-}
-```
-
-```json
-{
-  "tool": "get_entity_context_bundle",
-  "input": {
-    "id": "entity:bbb-222",
-    "limit": 10
-  }
-}
-```
-
-Compare their relationships, metadata, and summaries.
-
-### Propose the identity candidate
-
-Submit a merge proposal with your confidence score and evidence.
-
-```json
-{
-  "tool": "propose_identity_candidate",
-  "input": {
-    "candidate": {
-      "entity_a": "entity:aaa-111",
-      "entity_b": "entity:bbb-222",
-      "confidence": 0.92,
-      "evidence": "Same person: matching name 'Alex Chen', both associated with NeuralFlow, overlapping relationship graph",
-      "signal_type": "manual_review"
+    ```json
+    {
+      "query": "Cedar API",
+      "limit": 10
     }
-  }
-}
-```
+    ```
 
-### Review pending candidates
+    Inspect the names and types in `data.items`. Select the intended entity and
+    save its complete ID. Matching names alone do not establish identity.
+  </Step>
+  <Step title="Read its context">
+    Call `get_entity_context_bundle`:
 
-List all pending merge candidates to review the queue.
+    ```json
+    {
+      "id": "<selected entity ID>",
+      "window": 30,
+      "limit": 10
+    }
+    ```
 
-```json
-{
-  "tool": "list_identity_candidates",
-  "input": {
-    "filters": { "status": "pending", "min_confidence": 0.85 },
-    "limit": 20
-  }
-}
-```
+    Inspect the entity, relationships, attributes, truth slots, events,
+    assertions, freshness, and statistics. Sections are bounded by `limit`;
+    the historical window affects ended relationships/attributes, assertions,
+    and events. This is a context sample, not a complete evidence export.
+  </Step>
+  <Step title="Trace a relevant relationship">
+    Copy a returned relationship's ID into `get_provenance`:
 
-### Merge the entities
+    ```json
+    {
+      "id": "<returned relationship ID>"
+    }
+    ```
 
-Once confirmed, merge the two entities. The merge strategy determines which entity survives.
-
-```json
-{
-  "tool": "merge_entities",
-  "input": {
-    "entity_a": "entity:aaa-111",
-    "entity_b": "entity:bbb-222",
-    "strategy": "prefer_newer"
-  }
-}
-```
-
-The response includes:
-- `survivor`: the entity that absorbed the other
-- `merged_id`: the entity that was soft-deleted
-- `relations_updated`: how many relationships were repointed to the survivor
-
-### Verify the merge
-
-Confirm the survivor entity has the combined relationships.
-
-```json
-{
-  "tool": "get_entity_with_relations",
-  "input": {
-    "id": "entity:aaa-111"
-  }
-}
-```
-
+    Read `data.chain` for the linked assertions, immutable revision spans, and
+    available source quotes. The tool accepts relationship and attribute IDs,
+    not an entity ID.
+  </Step>
+  <Step title="Answer only what the evidence supports">
+    Use the source quote to verify the relationship's meaning. Include relevant
+    time or uncertainty qualifications. If the graph has no evidence links,
+    report that limit instead of treating the relationship as a verified quote.
+  </Step>
 </Steps>
 
----
+When you do not know whether a result is an entity, source, document, or
+relationship, start with `search_all` and inspect its separate result buckets.
+See [Searching](/guides/searching) for choosing a retrieval method.
 
-## 4. Predicate Governance Workflow
+## Ingest and verify a document
 
-**Goal:** Register new predicates, propose aliases, and approve them through the governance pipeline.
-
-This workflow ensures consistent predicate naming across the knowledge graph. It requires the Maintenance profile at minimum.
+Use `/mcp/full` to run every step on one connection. This workflow performs
+model-backed extraction and uses the configured provider.
 
 <Steps>
+  <Step title="Check runtime readiness">
+    Call `get_runtime_status` with `{}`. Continue only when
+    `semantic_ingest_ready` is `true`. Otherwise inspect `issues` and the
+    storage, worker, and extractor readiness fields.
+  </Step>
+  <Step title="Stage the source and its content">
+    Call `ingest_source_simple`:
 
-### Check existing predicates
+    ```json
+    {
+      "name": "Cedar architecture note",
+      "uri": "https://docs.example.com/cedar/architecture",
+      "source_type": "web",
+      "title": "Cedar dependencies",
+      "text": "Cedar API depends on Cedar Storage. Cedar Storage uses PostgreSQL.",
+      "collection": "cedar-tutorial",
+      "ingest_mode": "graph",
+      "extraction_skill": "extraction/technical-docs"
+    }
+    ```
 
-Before registering a new predicate, check what already exists to avoid duplicates.
+    Save `data.source_id`, `data.doc_id`, and `data.work_item_id`. This request
+    supplies the text directly; the URI is provenance metadata. A success
+    receipt confirms staging and enqueueing, not finished extraction.
+  </Step>
+  <Step title="Inspect progress">
+    Call `get_doc_pipeline_status`:
 
-```json
-{
-  "tool": "list_predicates",
-  "input": {
-    "status": "active",
-    "include_aliases": true,
-    "limit": 100
-  }
-}
-```
+    ```json
+    {
+      "id": "<returned document ID>"
+    }
+    ```
 
-### Register a new predicate
+    `extraction_state` is `pending`, `running`, `completed`, `failed`, or
+    `not_triggered`. Inspect `extraction_guidance` if the selected purpose or
+    skill differs from your request. Space configuration has higher priority.
+    Use `get_source` with the saved source ID to inspect lifecycle and decisions.
+  </Step>
+  <Step title="Read the claims from this source">
+    Call `list_assertions`:
 
-If the predicate does not exist, register it with a clear semantic description.
+    ```json
+    {
+      "source_id": "<returned source ID>",
+      "limit": 50
+    }
+    ```
 
-```json
-{
-  "tool": "register_predicate",
-  "input": {
-    "predicate_id": "works_at",
-    "description": "Subject works for or is employed by object"
-  }
-}
-```
+    Inspect the actual claims, their entity links, evidence, and resolution
+    statuses. Follow `next_cursor` while `has_more` is true. A count of generated
+    assertions does not establish their factual correctness.
+  </Step>
+</Steps>
+
+If the source failed, inspect its work and error before retrying. Repeated calls
+to convenience ingest tools can create additional records. Save the original
+receipt and do not use blind resubmission as a status check.
+
+For a runnable REST version, follow [From a Source to Evidence-Backed Claims](/guides/putting-it-together).
+
+## Review an identity merge
+
+Use `/mcp/maintenance` or `/mcp/full`. Merging changes graph references and
+soft-deletes one entity, so first establish that both records identify the same
+real-world subject.
+
+<Steps>
+  <Step title="Inspect both candidates">
+    Use `search_entities`, then call `get_entity_context_bundle` separately for
+    each returned ID. Compare identity keys, type, evidence, and relationships.
+    Shared names or employers alone are weak evidence.
+  </Step>
+  <Step title="Record the proposal">
+    Call `propose_identity_candidate`:
+
+    ```json
+    {
+      "candidate": {
+        "entity_a": "<first entity ID>",
+        "entity_b": "<second entity ID>",
+        "confidence": 0.92,
+        "evidence": "Verified matching external identifier in the reviewed source records.",
+        "signal_type": "manual_review"
+      }
+    }
+    ```
+
+    Replace the sample evidence with what you actually checked. A proposal
+    records a candidate; it does not merge the entities. Review proposals with
+    `list_identity_candidates` and `filters.status: "pending"`.
+  </Step>
+  <Step title="Choose the survivor and merge">
+    Once identity is established, call `merge_entities`:
+
+    ```json
+    {
+      "entity_a": "<first entity ID>",
+      "entity_b": "<second entity ID>",
+      "strategy": "prefer_a"
+    }
+    ```
+
+    `prefer_a` selects the first record. `prefer_b` selects the second, and
+    `prefer_newer` selects by the records' update timestamps. Choose based on
+    the desired canonical entity, not on an assumption about result ordering.
+  </Step>
+  <Step title="Verify the returned survivor">
+    Read `data.survivor.id`, `data.merged_id`, and `data.relations_updated`.
+    Fetch `get_entity_context_bundle` using the returned survivor ID and check
+    the resulting relationships. Never assume entity A survived when using
+    `prefer_newer`.
+  </Step>
+</Steps>
+
+## Govern predicate vocabulary
+
+Start with `list_predicates` and `get_predicate` to inspect the existing canonical
+vocabulary, aliases, and semantics. Reuse an appropriate predicate before
+registering another spelling.
 
 ### Propose an alias
 
-Extraction LLMs may use different phrasings for the same predicate. Propose an alias to map them.
+On `/mcp/maintenance` or `/mcp/full`, call `propose_predicate_alias`:
 
 ```json
 {
-  "tool": "propose_predicate_alias",
-  "input": {
-    "alias_name": "employed_by",
-    "canonical_predicate_id": "works_at",
-    "confidence": 0.9
-  }
+  "alias_name": "requires",
+  "canonical_predicate_id": "<existing canonical predicate ID>",
+  "confidence": 0.9
 }
 ```
 
-This creates a work artifact (proposal) that needs validation and approval.
+This creates a `predicate_alias` record with `status: "proposed"`. It does not
+return a `work_artifact` proposal. Do not pass this alias record ID to the
+artifact validation or approval tools.
 
-### Validate the proposal
+### Approve a separately staged proposal
 
-Check that the proposal is well-formed and does not conflict with existing predicates.
+When your pipeline or operator workflow has produced a predicate proposal
+**work artifact**, use `/mcp/full` and its actual artifact ID:
 
-```json
-{
-  "tool": "validate_predicate_proposal",
-  "input": {
-    "proposal_id": "work_artifact:eee-555"
-  }
-}
-```
+1. Call `validate_predicate_proposal` with `{"proposal_id":"<work artifact ID>"}`.
+2. Inspect the validation response. Only continue for a validated proposal.
+3. Call `approve_predicate_proposal` with the same `proposal_id` and an optional
+   `confidence` override.
+4. Call `get_predicate` with `include_aliases: true` and verify the active alias.
 
-### Approve the proposal
+These are distinct record lifecycles. The public alias-proposal tool does not
+supply an end-to-end alias-to-artifact conversion step. See
+[Predicates](/concepts/predicates) for canonical semantics and
+[Tool reference](/mcp/tools) for exact input fields.
 
-If validation passes, approve the alias to make it active. Future extractions using "employed_by" will be normalized to "works_at".
+## Handle common failures
 
-```json
-{
-  "tool": "approve_predicate_proposal",
-  "input": {
-    "proposal_id": "work_artifact:eee-555",
-    "confidence": 0.95
-  }
-}
-```
-
-### Verify the alias is active
-
-Confirm the alias appears in the predicate's alias list.
-
-```json
-{
-  "tool": "get_predicate",
-  "input": {
-    "predicate_id": "works_at",
-    "include_aliases": true
-  }
-}
-```
-
-The response should now include `employed_by` in the alias mappings.
-
-</Steps>
-
----
-
-## Tips for Chaining Tools
-
-**Start broad, then narrow down.** Use `search_all` first, then drill into specific entities or documents with `get_entity` or `get_doc`.
-
-**Use context bundles for rich views.** `get_entity_context_bundle` returns more information than `get_entity` alone -- including relationships and statistics.
-
-**Check pipeline status after ingestion.** After calling `ingest_doc` or `ingest_doc_simple`, use `get_doc_pipeline_status` to monitor extraction progress.
-
-**Use batch tools for bulk operations.** `batch_entities`, `batch_relationships`, and `batch_ingest_docs` are significantly more efficient than calling individual tools in a loop.
-
-**Respect profile boundaries.** If you are operating as an Agent profile, stick to read-only tools. Attempting to call a write tool will result in a "tool not found" error.
+| Symptom | Check |
+|---|---|
+| Tool missing from `tools/list` | Endpoint profile, principal scopes, backend, and runtime readiness |
+| Ingest accepted but no graph yet | Saved source lifecycle, pipeline state, and work item error |
+| Search returns no result | Caller space, authorization, mode, filters, and processing state |
+| A document's text is omitted | Metadata access and raw-evidence access are separate permissions |
+| A later step cannot find an ID | Carry IDs from the successful prior response and preserve the same space |
+| A proposal cannot be approved | Confirm it is a validated work artifact, not an alias or identity candidate |

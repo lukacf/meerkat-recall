@@ -13,7 +13,10 @@ icon: "check-double"
 | GET | `/v1/assertions/{id}` | Get assertion by ID |
 | PATCH | `/v1/assertions/{id}/resolution` | Update resolution status |
 
-Assertions are knowledge claims extracted from documents by the pipeline. Each assertion has a subject, predicate, object triple and a resolution status that tracks whether it has been verified and promoted into the knowledge graph.
+Assertions are source claims with evidence spans and resolved identity links.
+Resolution status describes processing of the claim; `resolved` does not prove
+that the claim is true. See [assertion concepts](/concepts/assertions) for the
+lifecycle and the distinction from truth maintenance.
 
 ---
 
@@ -21,7 +24,25 @@ Assertions are knowledge claims extracted from documents by the pipeline. Each a
 
 `POST /v1/assertions/search`
 
-Search assertions with optional filters on status, source, and predicate.
+Search assertions using text or resolved entity links, with optional status,
+source, and predicate filters. Prefer identity filters when you already know
+the entity; text search also helps find unresolved mentions.
+
+<ParamField body="query" type="string">
+  Text query over subject, predicate, object text, and object literal.
+</ParamField>
+
+<ParamField body="entity_id" type="string">
+  Resolved entity ID appearing as either subject or object.
+</ParamField>
+
+<ParamField body="subject_entity" type="string">
+  Resolved subject entity ID.
+</ParamField>
+
+<ParamField body="object_entity" type="string">
+  Resolved object entity ID.
+</ParamField>
 
 <ParamField body="status" type="string">
   Filter by resolution status. One of: `pending`, `resolved`, `partial`, `abstained`, `failed`, `superseded`.

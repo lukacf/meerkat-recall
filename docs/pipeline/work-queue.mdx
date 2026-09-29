@@ -4,7 +4,7 @@ description: "Work item lifecycle, active work kinds, lease-based claiming, and 
 icon: "list-check"
 ---
 
-The work queue is a durable, priority-ordered job scheduler that drives the top-level pipeline. Active dispatched stages are modeled as work items with a specific `kind`; structural helpers, such as document-tree building, run inside those dispatched stages. The queue manages claiming, execution, retry, and dead-letter handling.
+The work queue is a durable, priority-ordered job scheduler that drives the top-level pipeline. Active dispatched stages are modeled as work items with a specific `kind`; structural helpers, such as document-tree building, run inside those dispatched stages. The queue manages claiming, execution, and retry. Failed work remains inspectable with its error and execution history.
 
 ## Work Item Lifecycle
 
@@ -14,21 +14,22 @@ stateDiagram-v2
     Pending --> Runnable : Dependencies satisfied
     Runnable --> Running : Claimed with lease
     Running --> Done : Success
-    Running --> Failed : Error (retries exhausted)
+    Running --> Failed : Permanent error or retries exhausted
     Running --> Runnable : Lease expired / transient error
     Failed --> Runnable : Manual retry
-    Failed --> [*] : Dead-lettered
     Runnable --> Cancelled : Cancelled
 ```
 
 | Status | Description |
 |--------|-------------|
-| `Pending` | Waiting for dependencies (DAG edges). Not yet eligible to run. |
-| `Runnable` | Dependencies satisfied. Ready to be claimed by a worker. |
-| `Running` | Currently executing. Protected by a lease with an expiry time. |
-| `Done` | Completed successfully. |
-| `Failed` | Failed after all retries have been exhausted. |
-| `Cancelled` | Cancelled before execution. |
+| `pending` | Waiting for dependencies (DAG edges). Not yet eligible to run. |
+| `runnable` | Dependencies satisfied. Ready to be claimed by a worker. |
+| `running` | Currently executing. Protected by a lease with an expiry time. |
+| `done` | This stage completed successfully. Downstream stages may still be pending. |
+| `failed` | A permanent failure, lifecycle timeout, or exhausted transient retry budget. |
+| `cancelled` | Cancelled work. |
+
+The table uses JSON status values. The Rust enum variants use title case.
 
 ## Active Work Kinds
 
@@ -81,7 +82,7 @@ stateDiagram-v2
 
 Workers claim items using optimistic concurrency control:
 
-1. **Poll**: the work queue fetches runnable items ordered by priority (descending).
+1. **Poll**: the work queue selects runnable items by descending priority within its claim lanes. The active worker reserves bounded capacity for extraction before filling remaining permits from the general queue, so global priority alone does not determine execution order.
 2. **Filter**: items with a `run_after` timestamp in the future are skipped.
 3. **Claim**: an atomic conditional update sets the status to `Running` and records the `worker_id` and `lease_expires_at`.
 4. **Execute**: the worker runs the work item handler.
@@ -109,7 +110,7 @@ delay = min(base_delay * 2^(attempt-1), max_delay)
 |-----------|---------|
 | Base delay | 10 seconds |
 | Max delay | 120 seconds |
-| Max attempts | Defined per work kind via `RetryPolicy` |
+| Max attempts | `PIPELINE_WORK_TRANSIENT_RETRY_MAX_ATTEMPTS`, default 3 in the active worker |
 
 Transient errors are identified by pattern matching on error messages and types:
 
@@ -124,19 +125,28 @@ Transient errors are identified by pattern matching on error messages and types:
   Non-transient errors (validation errors, security violations, budget exceeded) are **not** retried. The item is failed immediately.
 </Warning>
 
-## Dead-Letter Handling
+The outer `PIPELINE_WORK_ITEM_TIMEOUT_SECS` deadline is handled separately: a
+handler that exceeds that lifecycle bound is marked failed. Managed wiki
+reconciliation has its own longer bound and extends its lease accordingly.
 
-When a work item exhausts all retry attempts, the dead-letter handler:
+## Inspect and retry failed work
 
-1. Creates a `work_deadletter` record containing the item reference, all run history, and the final error message.
-2. Marks the work item status as `Failed`.
-3. The dead-letter entry remains **unacknowledged** until an operator reviews it.
+1. List work items with `status: "failed"` using `list_work_items` on
+   `/mcp/full`, or `GET /v1/work-items?status=failed`. Inspect `kind`,
+   `last_error`, and `attempts`; use the recorded IDs to correlate worker logs.
+2. Correct the cause, such as unavailable credentials, a missing skill,
+   invalid input, or storage contention.
+3. Call `retry_work_item` with `{"id":"work_item:<returned UUID>"}` on
+   `/mcp/full`. The caller needs `write:work_item` in the same space. This
+   resets a **failed** item to `runnable`, clears its lease and error, and
+   resets the attempt count. It does not retry a currently running item.
+4. Verify that this stage and its dependent stages finish. A successful retry
+   request means the work was queued, not that the document finished processing.
 
-Operators can:
-
-- **List** unacknowledged dead-letter entries for a space
-- **Acknowledge** an entry with optional notes (marking it as reviewed)
-- **Retry** a dead-lettered item, which resets its status to `Runnable` with zero attempts and deletes the dead-letter entry
+The repository also defines a `work_deadletter` record and a dead-letter
+library helper. The active worker failure path marks the work item `failed`;
+it does not automatically call that helper or guarantee a separate dead-letter
+record. Monitor failed work items as the operational failure surface.
 
 ## Priority
 

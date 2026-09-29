@@ -1,149 +1,137 @@
 ---
 title: "Predicates"
-description: "The canonical vocabulary registry that ensures graph consistency across extractions"
+description: "Give claims a consistent vocabulary and govern how their values should coexist or change."
 icon: "tags"
 ---
 
-Predicates are the verbs of Elephant's knowledge graph. Every relationship and attribute uses a predicate to describe what it means -- "works_at", "born_on", "located_in". The predicate registry provides a canonical vocabulary so that different extraction runs, documents, and sources all map to the same concepts.
+A predicate names what a claim means. In `Mara works_at Northstar Labs`, the
+predicate is `works_at`. Relationships use it as `rel_type`; attributes use it
+as `attr_type`.
 
-## Why Predicates Matter
+The registry gives a space a canonical vocabulary. Its aliases connect source
+wording such as "employed by" to that vocabulary. Its semantics describe how
+claims behave over time and whether multiple values can be valid together.
 
-Without a controlled vocabulary, the same real-world relationship might appear as "works_at", "employed_by", "is_employee_of", or "works for." Each variant would create a separate, disconnected edge in the graph. The predicate registry solves this by:
+## Vocabulary and semantics are separate
 
-1. Defining **canonical predicate IDs** as the single source of truth
-2. Mapping **aliases** from raw extraction strings to canonical IDs
-3. Attaching **semantic configuration** that controls truth maintenance behavior
+| Decision | Example | Owner |
+|----------|---------|-------|
+| Canonical meaning | Use `works_at` for an employment relationship | Predicate registry |
+| Alternate wording | Map "employed by" to `works_at` | Alias governance |
+| Allowed values | A person may have several concurrent employers | Predicate semantics |
+| Current answer | Select or retain the values supported by the evidence | Truth maintenance |
 
-## Predicate Registry
-
-Each entry in the registry represents a canonical predicate:
-
-<CodeGroup>
-```rust PredicateRegistry
-struct PredicateRegistry {
-    base: BaseFields,
-
-    predicate_id: String,              // unique canonical ID, e.g. "works_at"
-    description: Option<String>,       // human-readable description
-    status: String,                    // "active" or "deprecated"
-
-    semantics: Option<PredicateSemantics>,
-    semantics_status: SemanticsStatus, // configured | default | needs_review
-
-    // Usage tracking
-    first_seen_at: Option<DateTime<Utc>>,
-    usage_count: u64,
-    last_used_at: Option<DateTime<Utc>>,
-}
-```
-</CodeGroup>
-
-### Predicate Semantics
-
-Each predicate can carry semantic configuration that drives truth maintenance:
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `temporal_model` | `TemporalPersonality` | `StateOverTime` | How the predicate relates to time |
-| `cardinality` | `Cardinality` | `Many` | Whether the predicate allows one or many values |
-| `conflict_policy` | `ConflictPolicy` | `AllowParallel` | How competing claims are resolved |
-| `recency_basis` | `RecencyBasis` | `SourceEventTime` | Which timestamp drives recency |
-| `min_evidence` | `u32` | `1` | Minimum evidence count for promotion |
-| `promotion_threshold` | `f32` | `0.7` | Minimum confidence for truth slot selection |
-| `partial_resolution_policy` | `PartialResolutionPolicy` | `Defer` | How to handle partially resolved assertions |
-
-<Accordion title="Cardinality">
-- **`one`** -- only a single value is valid at any time (e.g., "date_of_birth")
-- **`many`** -- multiple values can coexist (e.g., "speaks_language")
-</Accordion>
-
-<Accordion title="Semantics Status">
-- **`configured`** -- explicitly set by an operator
-- **`default`** -- using system defaults, not yet reviewed
-- **`needs_review`** -- flagged for operator review
-- **`llm_proposed`** -- proposed by the truth-maintenance adjudicator when it resolved a conflict on a predicate with no registered semantics. Never overwrites `configured` semantics; later adjudications may revise it
-</Accordion>
-
-## Predicate Aliases
-
-Aliases map raw extraction strings to canonical predicate IDs. When the extraction LLM outputs "employed by", the alias system maps it to the canonical `works_at`.
-
-<CodeGroup>
-```rust PredicateAlias
-struct PredicateAlias {
-    base: BaseFields,
-
-    alias: String,                 // the raw string, e.g. "employed by"
-    alias_type: AliasType,         // raw_string | plugin_code | schema_field
-    source_plugin: Option<String>, // originating plugin, if any
-    confidence: f32,               // 0.0-1.0
-    status: AliasStatus,           // proposed | active | deprecated
-    scope: AliasScope,             // global | plugin_only | source_type
-    predicate_id: String,          // target canonical predicate
-    confidence_version: u32,
-    usage_count: u64,
-}
-```
-</CodeGroup>
-
-### Alias Types
-
-| Type | Description |
-|---|---|
-| `raw_string` | A raw string from LLM extraction output |
-| `plugin_code` | A code generated by a plugin |
-| `schema_field` | A field name from a structured schema |
-
-### Alias Scopes
-
-| Scope | Description |
-|---|---|
-| `global` | Applies everywhere, across all sources and plugins |
-| `plugin_only` | Only applies within a specific plugin context |
-| `source_type` | Only applies for a particular source type |
-
-### Confidence Thresholds
-
-Alias confidence gates where the alias is used:
-
-| Threshold | Default | Purpose |
-|---|---|---|
-| `truth_min_confidence` | 0.9 | Minimum confidence to use the alias in truth maintenance |
-| `query_expand_min_confidence` | 0.6 | Minimum confidence to use the alias for query expansion |
-
-## Alias Governance Lifecycle
-
-<Steps>
-  <Step title="Propose">
-    A new alias mapping is proposed, either automatically by the extraction pipeline when it encounters an unknown predicate string, or manually via the `propose_predicate_alias` API. The alias is created with status `proposed`.
-  </Step>
-  <Step title="Validate">
-    The proposal is validated against existing aliases and predicates using `validate_predicate_proposal`. This checks for conflicts, duplicates, and semantic consistency.
-  </Step>
-  <Step title="Approve">
-    An operator (or automated policy) approves the proposal via `approve_predicate_proposal`. The alias status moves to `active` and it begins participating in canonicalization.
-  </Step>
-</Steps>
-
-<Note>
-Deprecated aliases are retained for historical queries but no longer participate in canonicalization. When an alias is deprecated, truth slots that used it are marked stale for recomputation.
-</Note>
-
-## Registering New Predicates
-
-New predicates can be registered via the `register_predicate` API:
+Registering a predicate does not settle its semantics. The MCP
+[`register_predicate`](/mcp/tools#register_predicate) operation stores an active
+registry entry with `semantics: null` and `semantics_status: default`.
+For example, its arguments can be:
 
 ```json
 {
   "predicate_id": "works_at",
-  "description": "Subject is employed by or works for the object organization"
+  "description": "The subject works for the object organization"
 }
 ```
 
-The predicate starts with `semantics_status: default` and system-default semantics. An operator can later configure specific semantics (cardinality, conflict policy, etc.) based on the predicate's real-world behavior. Alternatively, when [truth maintenance](/concepts/truth-maintenance) adjudicates a conflict on a predicate that has no registered semantics, the adjudicator proposes semantics that are persisted with `semantics_status: llm_proposed`; persisting them emits the predicate-registry outbox event so dependent truth slots recompute under the learned semantics.
+The tool registers vocabulary. The current public HTTP and MCP registration
+surfaces do not accept an arbitrary semantics object or expose a general
+semantics-update operation. Explicit operator configuration requires a
+controlled administrative integration with the registry. The REST create
+handler retains one special case for the exact predicate `has title`; do not
+assume that behavior applies to arbitrary predicates or to MCP registration.
 
-## See Also
+## Choose semantics from the domain
 
-- [Truth Maintenance](/concepts/truth-maintenance) -- how predicate semantics drive conflict resolution
-- [Assertions](/concepts/assertions) -- where raw predicate strings originate
-- [Security](/concepts/security) -- the security envelope on predicate records
+The meaning of a predicate determines whether two values contradict each
+other. Two languages a person speaks can coexist. Two different values for a
+single-valued identifier need examination. Employment may permit concurrent
+roles, so `works_at` should not automatically be configured as single-valued
+for every application.
+
+| Setting | Question |
+|---------|----------|
+| `cardinality` | Is one value or more than one value allowed? |
+| `temporal_model` | Is this a changing state, an occurrence, or another temporal pattern? |
+| `conflict_policy` | How should the deterministic fallback handle disagreement? |
+| `recency_basis` and `fallback_order` | Which timestamp represents recency when some dates are missing? |
+| `min_evidence` and `promotion_threshold` | What support and confidence are needed? |
+| `source_priority` | Are some evidence sources preferred? |
+| `alias_thresholds` | Which aliases are trusted for truth or query expansion? |
+
+The default semantics object permits many values with `allow_parallel` and a
+promotion threshold of `0.7`. An absent semantics object still means the
+predicate is unconfigured. In particular, truth maintenance examines unknown
+cardinality for possible cross-object conflicts rather than assuming it has
+been deliberately configured as `many`.
+
+## Review status records who supplied the policy
+
+| `semantics_status` | Meaning |
+|--------------------|---------|
+| `configured` | Explicitly configured by an operator |
+| `default` | Defaults or no reviewed semantics |
+| `needs_review` | Flagged for review |
+| `llm_proposed` | Proposed during truth-maintenance adjudication |
+
+When a real conflict has unknown semantics, the configured LLM adjudicator can
+propose them. A proposal cannot overwrite operator-configured semantics.
+Later adjudications can revise non-configured proposals. Registry changes
+emit an outbox event so dependent truth slots can recompute.
+
+An LLM proposal is useful evidence for review, rather than equivalent to
+operator configuration. The Living Wiki's governed graph context requires
+explicitly configured predicate semantics before those graph claims can
+contribute to an article.
+
+## Govern aliases
+
+An alias record maps a raw string, plugin code, or schema field to a canonical
+predicate. Its status can be `proposed`, `active`, or `deprecated`.
+
+```mermaid
+flowchart LR
+    P["Propose alias"] --> V["Validate proposal artifact"]
+    V --> A["Approve proposal"]
+    A --> U["Active alias"]
+```
+
+The pipeline proposal workflow stages a `work_artifact`. The MCP tools
+[`validate_predicate_proposal`](/mcp/tools#validate_predicate_proposal) and
+[`approve_predicate_proposal`](/mcp/tools#approve_predicate_proposal) consume
+that artifact's ID; an unvalidated artifact cannot be approved.
+
+The similarly named
+[`propose_predicate_alias`](/mcp/tools#propose_predicate_alias) tool creates a
+`PredicateAlias` row with status `proposed`. Its returned alias ID is not a
+proposal artifact ID and cannot be passed to the artifact validation tools.
+The [HTTP alias status operation](/api/predicates#update-alias-status) is the
+separate surface for activating or deprecating an alias row.
+
+Aliases also have scopes:
+
+| Scope | Applies within |
+|-------|----------------|
+| `global` | The space's general predicate vocabulary |
+| `plugin_only` | The specified plugin context |
+| `source_type` | The specified source-type context |
+
+Here `global` does not grant cross-space access. Record space and security
+checks continue to apply.
+
+Alias thresholds distinguish weak query assistance from canonical truth. The
+default `query_expand_min_confidence` is `0.6`; the default
+`truth_min_confidence` is `0.9`. A useful search synonym is not automatically
+strong enough to rewrite a canonical claim.
+
+## Avoid semantic surprises
+
+- Review cardinality before interpreting every different object as a conflict.
+- Keep raw wording in assertions so a canonicalization decision remains auditable.
+- Treat a semantics update as a change that can make existing truth slots stale.
+- Do not infer operator approval from an active registry entry or an LLM proposal.
+
+## Next steps
+
+- [Predicate API](/api/predicates) documents registry reads and alias operations.
+- [Truth maintenance](/concepts/truth-maintenance) explains how semantics affect answers.
+- [Assertions](/concepts/assertions) preserves the original predicate wording.

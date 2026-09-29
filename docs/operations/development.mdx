@@ -21,10 +21,10 @@ Before diving into the codebase, it helps to understand the two external systems
 </Accordion>
 
 <Accordion title="Meerkat - the LLM agent harness">
-  [Meerkat](https://github.com/lukacf/meerkat) is a modular LLM agent harness built in Rust. It provides structured output guarantees, tool dispatch, budget enforcement, and streaming for LLM interactions.
+  [Meerkat](https://github.com/lukacf/meerkat) is a modular LLM agent harness built in Rust. It provides schema-constrained output, tool dispatch, budget enforcement, and streaming for LLM interactions.
 
   **Where Elephant uses it:**
-  - **Extraction pipeline** (`crates/pipeline/src/extraction/agentic_extractor.rs`) - the agentic extractor uses Meerkat to call an LLM with a structured output schema, ensuring the response is valid JSON matching the assertion format. Meerkat handles retries, tool calls (the LLM can query the knowledge graph during extraction), and budget limits.
+  - **Extraction pipeline** (`crates/pipeline/src/extraction/agentic_extractor.rs`) - the agentic extractor uses Meerkat with an assertion output schema, bounded retries, graph query tools, and budget limits. Elephant parses and validates the result before canonical writes; a failed or malformed completion still fails extraction.
   - **Truth maintenance** (`crates/pipeline/src/truth_maintenance/adjudicator.rs`) - conflict adjudication calls the LLM through Meerkat structured output with the competing claim values in view, returning a strict-schema verdict (corroborate, single winner, coexist, supersede, needs review). Entity-reuse disambiguation at promotion uses the same pattern.
   - **Living Wiki** - Meerkat powers separate writer and verifier calls. Elephant
     serves its MCP endpoint using the Rust `rmcp` transport.
@@ -54,6 +54,7 @@ crates/        # Core libraries
   storage/      # SurrealDB repositories and connection pooling
   policy/       # ABAC policy engine and redaction
   identity/     # Identity key management and merge strategy
+  knowledge-views/ # Derived views, wiki editorial compilation, validation
   pipeline/     # Ingestion, extraction, TM, freshness, reprocess workers
   embeddings/   # Vector provider abstraction
   mcp/          # MCP protocol handlers and tool registry
@@ -82,11 +83,11 @@ Cargo aliases are still available through the wrapper and are defined in `.cargo
 | Alias | Command | Description |
 |-------|---------|-------------|
 | `./scripts/repo-cargo b` | `./scripts/repo-cargo build --workspace` | Build all workspace crates |
-| `./scripts/repo-cargo t` | `./scripts/repo-cargo test --workspace` | Run all unit tests |
+| `./scripts/repo-cargo t` | `./scripts/repo-cargo test --workspace` | Run non-ignored workspace tests; broader than the pure unit lane |
 | `./scripts/repo-cargo c` | `./scripts/repo-cargo clippy --workspace --all-targets --all-features -- -D warnings` | Lint with warnings as errors |
 | `./scripts/repo-cargo f` | `./scripts/repo-cargo fmt --all` | Format all code |
 | `./scripts/repo-cargo doc` | `./scripts/repo-cargo doc --workspace --no-deps` | Generate documentation |
-| `./scripts/repo-cargo integration` | `./scripts/repo-cargo test --workspace -- --ignored` | Run integration tests only |
+| `./scripts/repo-cargo integration` | `./scripts/repo-cargo test --workspace -- --ignored` | Run all ignored tests; may invoke live paid providers |
 | `./scripts/repo-cargo test-e2e` | See `.cargo/config.toml` for provider-test exclusions | Deterministic ignored E2E suite |
 | `./scripts/repo-cargo test-e2e-live` | `./scripts/repo-cargo test -p elephant-e2e live_llm -- --ignored --nocapture --test-threads=1` | Opt-in Alice and Wizard live extraction scenarios |
 | `./scripts/repo-cargo test-api` | `./scripts/repo-cargo test --package elephant-api` | API tests only |

@@ -1,58 +1,79 @@
 ---
 title: Introduction
-description: Elephant is a unified knowledge system that brings graph, document, and vector retrieval into one coherent model with strict provenance and security.
+description: Turn source material into a searchable, evidence-backed knowledge graph for applications and agents.
 icon: elephant
 ---
 
-## What is Elephant?
+Elephant is a Rust knowledge system for applications and AI agents. It keeps
+source material, extracted claims, and a structured graph together, so a reader
+can ask both **"What do we know?"** and **"What evidence supports it?"**
 
-Elephant is a unified knowledge system for AI-native applications. It is not a database -- it is a **knowledge layer** that combines entities, relationships, documents, and vector search into a single coherent model, with provenance tracking and access control built in from the ground up.
+Applications connect through HTTP. Agents use MCP tools to ingest evidence,
+search, navigate relationships, and read cited context. Spaces and
+attribute-based access control restrict what each caller can see or change.
 
-Feed Elephant documents, and it will extract structured knowledge automatically: entities and their relationships, assertions backed by evidence spans, and truth-maintained answers that track conflicts over time.
+## Follow one piece of evidence
 
-## Key Capabilities
+Suppose a project note says, "Alice owns the Project Cedar test plan."
 
-**Entity and relationship graph.** Store people, organizations, places, devices, and concepts as first-class entities. Connect them with typed, weighted relationships that carry evidence and provenance.
+1. A **source** records where that information came from. A **document revision**
+   preserves the rendered evidence used for extraction.
+2. The pipeline can identify **entities** such as Alice and Project Cedar, and
+   extract **assertions** linked to spans of that evidence.
+3. Validated artifacts populate the graph. **Truth maintenance** tracks support
+   and competing values for eligible subject-predicate slots.
+4. Retrieval and **Living Wiki** projections expose this knowledge with citations
+   and freshness information, subject to the reader's authorization.
 
-**Document ingestion pipeline.** Ingest text from any source. Elephant renders documents into immutable revisions, chunks them for retrieval, generates embeddings, and extracts structured assertions -- all automatically.
+```mermaid
+flowchart LR
+    Source["Source material"] --> Evidence["Document evidence"]
+    Evidence --> Claims["Extracted assertions"]
+    Claims --> Graph["Graph and truth slots"]
+    Graph --> Read["Search and cited views"]
+```
 
-**LLM-powered extraction.** A multi-stage pipeline uses large language models to extract entities, relationships, and attributes from unstructured text. Extraction produces assertions linked to evidence spans in the source document.
+If a later note names a different owner, the useful result is more than a new
+string in a database. Elephant can retain the competing claims and the evidence
+behind them. Resolution depends on the predicate, policy, and available
+evidence; a selected value is not a guarantee that the underlying claim is true.
 
-**Truth maintenance.** When multiple sources make claims about the same thing, Elephant tracks every assertion in a truth slot. Agreeing sources corroborate each other; genuinely conflicting values are adjudicated by an LLM that reads the competing claims, with configurable deterministic policies as the fallback. You always see the current best answer and the full history of competing claims.
+Read the [knowledge model](/concepts/overview) for the distinctions between
+evidence, claims, graph records, and derived views.
 
-**Identity resolution.** Elephant automatically links extracted mentions to existing entities or creates new ones. When ambiguity arises, it flags candidates for review rather than guessing.
-
-**Security and access control.** Every record is scoped to a space, and ABAC-based policies enforce access at the data layer. Redaction is applied before results leave the system.
-
-**Dual interfaces.** Elephant exposes both an HTTP API for application integration and an MCP (Model Context Protocol) interface for AI agent tooling.
-
-## Built on
-
-**[SurrealDB](https://surrealdb.com)** - the default persistent backend. Elephant uses SurrealDB when you want durable storage, SurrealQL-backed graph/document search, and the mature operational path.
-
-**`elephant-db`** - Elephant's embedded in-memory kernel for lightweight local/runtime use. It provides typed records, graph traversal, vector search, and JSON snapshot import/export without requiring an external database process.
-
-**[Meerkat](https://github.com/lukacf/meerkat)** - a modular LLM agent harness built in Rust. Elephant's extraction pipeline uses Meerkat to orchestrate LLM calls with structured output guarantees, tool access, and budget enforcement. Elephant serves MCP through the Rust `rmcp` transport.
-
-## Explore the Documentation
+## Start with the experience you need
 
 <CardGroup cols={2}>
-  <Card title="Quickstart" icon="rocket" href="/quickstart">
-    Get Elephant running locally with Docker and ingest your first document using the local development stack.
+  <Card title="Try it locally" icon="rocket" href="/quickstart">
+    Run the credential-free demo, then ingest and inspect your own synthetic evidence.
   </Card>
-  <Card title="Core Concepts" icon="shapes" href="/concepts/entities">
-    Understand spaces, entities, relationships, documents, assertions, truth slots, and predicates.
+  <Card title="Understand the model" icon="shapes" href="/concepts/overview">
+    Learn the vocabulary through one example before exploring individual record types.
   </Card>
-  <Card title="Guides" icon="book-open" href="/guides/ingesting-data">
-    Step-by-step walkthroughs for common workflows: ingesting data, searching, and building knowledge graphs.
+  <Card title="Build an integration" icon="code" href="/api/overview">
+    Authenticate, scope requests, handle asynchronous work, and paginate HTTP results.
   </Card>
-  <Card title="HTTP API" icon="code" href="/api/overview">
-    Full reference for the REST API covering entities, documents, relationships, assertions, and more.
-  </Card>
-  <Card title="MCP Tools" icon="wrench" href="/mcp/overview">
-    Use Elephant as an AI agent tool surface via the Model Context Protocol.
-  </Card>
-  <Card title="Pipeline" icon="diagram-project" href="/pipeline/overview">
-    Learn how evidence flows through source-first ingest, staged artifact commit, extraction, and truth maintenance.
+  <Card title="Connect an agent" icon="plug" href="/mcp/overview">
+    Choose an MCP profile, discover available tools, and follow a complete workflow.
   </Card>
 </CardGroup>
+
+## What to expect
+
+**Extraction is asynchronous and model-driven.** Accepting an ingest queues work.
+It does not mean extraction has completed, or that a model will produce a
+particular entity or relationship. Inspect processing status and evidence.
+
+**Evidence and derived knowledge have different lifecycles.** Reprocessing can
+change extracted results or projections while document revisions retain the
+evidence they were built from. See [documents](/concepts/documents) and
+[assertions](/concepts/assertions).
+
+**Storage is an operational choice.** SurrealDB is the default durable backend.
+The embedded `elephant-db` kernel runs in memory and supports snapshots. The
+[deployment guide](/operations/deployment) explains persistence and runtime
+configuration.
+
+**This is pre-1.0 software.** Use documentation from the same revision as your
+server. The [architecture overview](/architecture/overview) explains component
+boundaries, including Meerkat's role in model execution and the MCP transport.

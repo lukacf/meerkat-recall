@@ -49,8 +49,10 @@ writes require read and write authorization for existing and proposed records.
 These ordinary interfaces cannot change any field of an existing `Security`
 object. There is no ordinary declassification scope. Security-preserving storage
 methods compare the current security and replace the record atomically on both
-backends, including restoration, preventing stale edits from reverting a newer
-classification. Trusted internal maintenance retains the low-level update API
+backends. Ordinary replacements additionally preserve identity, subjects and raw
+subject completeness, and compare the authorized timestamp, lifecycle and full
+envelope at that same commit, including restoration. Stale edits cannot revert
+a newer classification or subject change. Trusted internal maintenance retains the low-level update API
 for intentional security changes.
 
 ## Active Source, Extraction, and Commit Path

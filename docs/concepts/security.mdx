@@ -132,10 +132,14 @@ not grant permission to reclassify an existing entity. This applies to REST
 replacement, upsert, and batch writes and to MCP `update_entity` and
 `batch_entities`, including restoration of deleted records.
 
-The storage write compares security atomically, so a stale content edit cannot
-undo a concurrent classification change. A rejected update does not restore a
+Ordinary replacements also preserve record identity, the subject set and raw
+subject completeness. They compare the authorized timestamp, lifecycle and
+complete security/subject envelope at the atomic storage write, so a stale
+content edit cannot undo a concurrent classification or subject change. A rejected update does not restore a
 deleted entity. These ordinary interfaces expose no declassification permission;
 trusted internal maintenance remains responsible for intentional security changes.
+Other domain mutations and trusted pipeline writers retain their own contracts;
+this boundary does not claim universal release enforcement.
 
 ## Raw content and redaction
 

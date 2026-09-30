@@ -267,7 +267,7 @@ where
         id: &RecordId,
         record: Entity,
     ) -> StorageResult<Entity> {
-        self.replace_preserving_security(space_id, id, record, false)
+        self.replace_preserving_security(space_id, id, record, false, None)
             .await
     }
 
@@ -286,8 +286,50 @@ where
         id: &RecordId,
         record: Entity,
     ) -> StorageResult<Entity> {
-        self.replace_preserving_security(space_id, id, record, true)
+        self.replace_preserving_security(space_id, id, record, true, None)
             .await
+    }
+
+    /// Replaces an entity only while its authorized pre-state is still current.
+    ///
+    /// Ordinary mutation callers authorize both versions and preserve the subject
+    /// envelope before calling. The commit also preserves current security and
+    /// compares the observed timestamp, lifecycle and complete authorization
+    /// envelope. Restoration and replacement are one atomic mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict for changed identity, security or observed pre-state.
+    pub async fn replace_authorized(
+        &self,
+        observed: &Entity,
+        mut proposed: Entity,
+        restore: bool,
+    ) -> StorageResult<Entity> {
+        if proposed.base.id != observed.base.id || proposed.base.space_id != observed.base.space_id
+        {
+            return Err(StorageError::Conflict(
+                "entity replacement identity changed".into(),
+            ));
+        }
+        if !restore && observed.base.deleted_at.is_some() {
+            return Err(StorageError::Conflict(
+                "active replacement cannot restore a deleted entity".into(),
+            ));
+        }
+        proposed.base.deleted_at = if restore {
+            None
+        } else {
+            observed.base.deleted_at
+        };
+        self.replace_preserving_security(
+            &observed.base.space_id,
+            &observed.base.id,
+            proposed,
+            restore,
+            Some(observed),
+        )
+        .await
     }
 
     async fn replace_preserving_security(
@@ -296,6 +338,7 @@ where
         id: &RecordId,
         mut record: Entity,
         restore_deleted: bool,
+        observed: Option<&Entity>,
     ) -> StorageResult<Entity> {
         record.base.space_id = space_id.to_string();
         record.base.id.clone_from(id);
@@ -316,7 +359,15 @@ where
                     else {
                         return Err(conflict());
                     };
-                    if existing.base.security != record.base.security {
+                    if existing.base.security != record.base.security
+                        || observed.is_some_and(|expected| {
+                            existing.base.updated_at != expected.base.updated_at
+                                || existing.base.deleted_at != expected.base.deleted_at
+                                || existing.base.security != expected.base.security
+                                || existing.base.subjects != expected.base.subjects
+                                || existing.base.subjects_state != expected.base.subjects_state
+                        })
+                    {
                         return Err(conflict());
                     }
                     Ok(mutation.replace(record)?)
@@ -325,14 +376,24 @@ where
         }
 
         // Keep the comparison in the UPDATE predicate, rather than performing
-        // a separate read whose result can become stale before the write.
+        // a separate read whose result can become stale before the write. Only
+        // the observed public variant selects these additional exact predicates.
+        let observed_predicate = if observed.is_some() {
+            " AND updated_at = $observed.updated_at \
+              AND deleted_at = $observed.deleted_at \
+              AND security = $observed.security \
+              AND subjects = $observed.subjects \
+              AND subjects_state = $observed.subjects_state"
+        } else {
+            ""
+        };
         let mut response = self
             .backend
             .query_bind_checked(
                 &format!(
                     "UPDATE $id MERGE $record WHERE space_id = $space_id \
                      AND ($restore_deleted OR deleted_at IS NONE) \
-                     AND security = $security RETURN {ENTITY_PROJECTION}"
+                     AND security = $security{observed_predicate} RETURN {ENTITY_PROJECTION}"
                 ),
                 crate::bindings! {
                     "id" => crate::surreal::thing_from_record_id(id),
@@ -340,6 +401,7 @@ where
                     "record" => crate::surreal::entity_to_value(&record)?,
                     "security" => crate::surreal::security_to_value(&record.base.security),
                     "restore_deleted" => restore_deleted,
+                    "observed" => crate::surreal::entity_to_value(observed.unwrap_or(&record))?,
                 },
             )
             .await?;
@@ -1866,6 +1928,89 @@ mod tests {
 
         let retrieved = repo.get("test_space", &id).await.unwrap().unwrap();
         assert_eq!(retrieved.display_name, "Updated Name");
+    }
+
+    async fn assert_authorized_replacement_checks_each_observed_field(repo: EntityRepository) {
+        for field in ["subjects", "subjects_state", "updated_at", "deleted_at"] {
+            let mut entity = create_test_entity("Authorized snapshot");
+            entity.base.subjects = vec![Link::new(RecordId::new_v4(TableName::Entity))];
+            entity.base.subjects_state = SubjectsState::Complete;
+            entity.base.updated_at -= chrono::Duration::minutes(1);
+            let mut observed = repo.create(entity).await.unwrap();
+            let id = observed.base.id.clone();
+            if field == "deleted_at" {
+                repo.delete("test_space", &id).await.unwrap();
+            } else {
+                let mut concurrent = observed.clone();
+                concurrent.display_name = "Concurrent authorized change".to_string();
+                concurrent.base.updated_at += chrono::Duration::seconds(1);
+                match field {
+                    "subjects" => concurrent
+                        .base
+                        .subjects
+                        .push(Link::new(RecordId::new_v4(TableName::Entity))),
+                    "subjects_state" => concurrent.base.subjects_state = SubjectsState::Partial,
+                    "updated_at" => {}
+                    _ => unreachable!(),
+                }
+                repo.update("test_space", &id, concurrent).await.unwrap();
+            }
+            let current = repo
+                .get_with_deleted("test_space", &id)
+                .await
+                .unwrap()
+                .unwrap();
+            if field == "updated_at" {
+                assert_ne!(current.base.updated_at, observed.base.updated_at);
+            } else {
+                // Isolate each predicate: an incidental timestamp difference
+                // must not make a missing subject/lifecycle comparison pass.
+                observed.base.updated_at = current.base.updated_at;
+            }
+            assert_eq!(current.base.security, observed.base.security);
+            let mut stale = observed.clone();
+            stale.display_name = "Must not overwrite the concurrent change".to_string();
+            // Restore is intentionally true so the tombstone test cannot pass
+            // merely because an active-only helper excludes deleted rows.
+            assert!(
+                matches!(
+                    repo.replace_authorized(&observed, stale, true).await,
+                    Err(StorageError::Conflict(_))
+                ),
+                "missing observed {field} comparison"
+            );
+            let after = repo
+                .get_with_deleted("test_space", &id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&after).unwrap(),
+                serde_json::to_value(&current).unwrap(),
+                "{field}"
+            );
+            let mut fresh = current.clone();
+            fresh.display_name = "Freshly authorized content".to_string();
+            let accepted = repo
+                .replace_authorized(&current, fresh, true)
+                .await
+                .unwrap();
+            assert_eq!(accepted.display_name, "Freshly authorized content");
+            assert!(accepted.base.deleted_at.is_none());
+            assert_eq!(accepted.base.subjects, current.base.subjects);
+            assert_eq!(accepted.base.subjects_state, current.base.subjects_state);
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_replacement_cas_fields_surreal() {
+        assert_authorized_replacement_checks_each_observed_field(setup_test_repo().await).await;
+    }
+
+    #[tokio::test]
+    async fn authorized_replacement_cas_fields_embedded() {
+        assert_authorized_replacement_checks_each_observed_field(setup_embedded_test_repo().await)
+            .await;
     }
 
     async fn assert_update_preserves_current_security(repo: EntityRepository) {

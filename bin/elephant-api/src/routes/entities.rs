@@ -60,6 +60,12 @@ pub trait EntityRepo: Send + Sync {
         id: &RecordId,
         record: Entity,
     ) -> StorageResult<Entity>;
+    async fn replace_authorized(
+        &self,
+        observed: &Entity,
+        proposed: Entity,
+        restore: bool,
+    ) -> StorageResult<Entity>;
     async fn delete(&self, space_id: &str, id: &RecordId) -> StorageResult<()>;
     async fn search(&self, criteria: &SearchCriteria) -> StorageResult<PaginatedResult<Entity>>;
 
@@ -97,6 +103,14 @@ pub trait EventRepo: Send + Sync {
 
 #[async_trait::async_trait]
 impl EntityRepo for EntityRepository {
+    async fn replace_authorized(
+        &self,
+        observed: &Entity,
+        proposed: Entity,
+        restore: bool,
+    ) -> StorageResult<Entity> {
+        Self::replace_authorized(self, observed, proposed, restore).await
+    }
     async fn create(&self, record: Entity) -> StorageResult<Entity> {
         elephant_storage::Repository::create(self, record).await
     }
@@ -1032,6 +1046,8 @@ fn authorize_entity_replacement(
             "ordinary entity updates cannot change security metadata",
         ));
     }
+    elephant_policy::authorize_ordinary_update(&existing.base, &updated.base)
+        .map_err(AuthzError::access_denied)?;
     Ok(())
 }
 
@@ -1084,7 +1100,7 @@ async fn update_entity(
         .map_err(entity_authz_error)?;
     let updated = state
         .entity_repo
-        .update_preserving_security(&space_id, &rid, req.entity)
+        .replace_authorized(&existing, req.entity, false)
         .await
         .map_err(|error| entity_write_error(&error))?;
     publish_entity_change(
@@ -1234,7 +1250,7 @@ async fn upsert_entity(
         (
             state
                 .entity_repo
-                .restore_and_update_preserving_security(&space_id, &rid, entity)
+                .replace_authorized(&existing, entity, true)
                 .await
                 .map_err(|error| entity_write_error(&error))?,
             EventOperation::Update,
@@ -1282,7 +1298,7 @@ async fn batch_entities(
                 (
                     state
                         .entity_repo
-                        .restore_and_update_preserving_security(&space_id, &rid, entity)
+                        .replace_authorized(&existing, entity, true)
                         .await,
                     EventOperation::Update,
                 )

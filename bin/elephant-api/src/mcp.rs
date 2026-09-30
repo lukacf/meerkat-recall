@@ -1068,6 +1068,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn empty_subject_scope_refuses_authenticated_mcp_body(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use elephant_storage::Repository;
+        let storage = StorageClient::new_embedded().await?;
+        let entity = elephant_storage::EntityRepository::new(storage.clone())
+            .create(Entity::new(
+                base_fields(TableName::Entity, "default", "fixture"),
+                EntityType::new("person"),
+                "PRIVATE MCP CANARY".into(),
+            ))
+            .await?;
+        // Deliberately synthetic key for this loopback-only regression.
+        let signing_key = "x".repeat(36);
+        let state = Arc::new(McpState::new_with_defaults(
+            storage,
+            AuthConfig {
+                secret: signing_key.clone(),
+                skip_auth: false,
+                ..AuthConfig::default()
+            },
+            "default".into(),
+            vec!["default".into()],
+        ));
+        let router = mcp_routes(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        for restricted in [true, false] {
+            let mut claims = make_claims(Some("default"), &["read:entity"]);
+            claims.subject_allowlist = if restricted { Some(Vec::new()) } else { None };
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(signing_key.as_bytes()),
+            )?;
+            let config =
+                StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+                    .auth_header(token);
+            let client = ().serve(StreamableHttpClientTransport::from_config(config)).await?;
+            let response = client
+                .call_tool(
+                    CallToolRequestParams::new("get_entity").with_arguments(
+                        serde_json::json!({"id": entity.base.id.to_string()})
+                            .as_object()
+                            .expect("args")
+                            .clone(),
+                    ),
+                )
+                .await?;
+            let text = serde_json::to_string(&response)?;
+            assert_eq!(text.contains("PRIVATE MCP CANARY"), !restricted, "{text}");
+            if restricted {
+                assert!(text.contains("Access denied"), "{text}");
+            }
+            client.cancel().await?;
+        }
+        server.abort();
+        let _ = server.await;
+        Ok(())
+    }
+
     fn looks_like_full_only_mutation_tool(name: &str) -> bool {
         FULL_ONLY_MUTATION_PREFIXES
             .iter()

@@ -10,11 +10,13 @@ pub mod engine;
 pub mod error;
 pub mod redaction;
 pub mod registry;
+pub mod update;
 
 pub use engine::{AbacEngine, AccessDecision, Clearance, Principal, RecordAttributes};
 pub use error::{PolicyError, PolicyResult};
 pub use redaction::{RedactionEnvelope, RedactionRule, RedactionRules};
 pub use registry::{PolicyDefinition, PolicyRegistry};
+pub use update::authorize_ordinary_update;
 
 #[cfg(test)]
 mod tests {

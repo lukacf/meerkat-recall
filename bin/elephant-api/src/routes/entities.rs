@@ -34,7 +34,7 @@ use elephant_types::records::entity::EntityType;
 use elephant_types::records::{Entity, Rel, SystemEvent};
 
 use crate::auth::Principal as AuthPrincipal;
-use crate::authz::AuthzState;
+use crate::authz::{AuthzError, AuthzState};
 use crate::routes::require_space_id;
 
 /// Entity repository interface used by the API layer.
@@ -48,7 +48,18 @@ pub trait EntityRepo: Send + Sync {
         ids: &[RecordId],
         include_deleted: bool,
     ) -> StorageResult<Vec<Entity>>;
-    async fn update(&self, space_id: &str, id: &RecordId, record: Entity) -> StorageResult<Entity>;
+    async fn update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Entity,
+    ) -> StorageResult<Entity>;
+    async fn restore_and_update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Entity,
+    ) -> StorageResult<Entity>;
     async fn delete(&self, space_id: &str, id: &RecordId) -> StorageResult<()>;
     async fn search(&self, criteria: &SearchCriteria) -> StorageResult<PaginatedResult<Entity>>;
 
@@ -58,7 +69,6 @@ pub trait EntityRepo: Send + Sync {
         id: &RecordId,
     ) -> StorageResult<Option<Entity>>;
     async fn restore(&self, space_id: &str, id: &RecordId) -> StorageResult<Entity>;
-    async fn upsert(&self, record: Entity) -> StorageResult<Entity>;
     async fn get_with_relations(
         &self,
         space_id: &str,
@@ -104,8 +114,22 @@ impl EntityRepo for EntityRepository {
         Self::get_many(self, space_id, ids, include_deleted).await
     }
 
-    async fn update(&self, space_id: &str, id: &RecordId, record: Entity) -> StorageResult<Entity> {
-        elephant_storage::Repository::update(self, space_id, id, record).await
+    async fn update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Entity,
+    ) -> StorageResult<Entity> {
+        Self::update_preserving_security(self, space_id, id, record).await
+    }
+
+    async fn restore_and_update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Entity,
+    ) -> StorageResult<Entity> {
+        Self::restore_and_update_preserving_security(self, space_id, id, record).await
     }
 
     async fn delete(&self, space_id: &str, id: &RecordId) -> StorageResult<()> {
@@ -126,10 +150,6 @@ impl EntityRepo for EntityRepository {
 
     async fn restore(&self, space_id: &str, id: &RecordId) -> StorageResult<Entity> {
         Self::restore(self, space_id, id).await
-    }
-
-    async fn upsert(&self, record: Entity) -> StorageResult<Entity> {
-        Self::upsert(self, record).await
     }
 
     async fn get_with_relations(
@@ -162,74 +182,6 @@ impl EventRepo for SystemEventRepository {
         limit: usize,
     ) -> StorageResult<Vec<SystemEvent>> {
         Self::find_by_entity_since(self, space_id, entity_id, since, limit).await
-    }
-}
-
-#[cfg(test)]
-#[async_trait::async_trait]
-impl EntityRepo for elephant_storage::MockEntityRepository {
-    async fn create(&self, record: Entity) -> StorageResult<Entity> {
-        elephant_storage::Repository::create(self, record).await
-    }
-
-    async fn get(&self, space_id: &str, id: &RecordId) -> StorageResult<Option<Entity>> {
-        elephant_storage::Repository::get(self, space_id, id).await
-    }
-
-    async fn get_many(
-        &self,
-        space_id: &str,
-        ids: &[RecordId],
-        include_deleted: bool,
-    ) -> StorageResult<Vec<Entity>> {
-        let mut entities = Vec::with_capacity(ids.len());
-        for id in ids {
-            let entity = if include_deleted {
-                Self::get_with_deleted(self, space_id, id).await?
-            } else {
-                elephant_storage::Repository::get(self, space_id, id).await?
-            };
-            if let Some(entity) = entity {
-                entities.push(entity);
-            }
-        }
-        Ok(entities)
-    }
-
-    async fn update(&self, space_id: &str, id: &RecordId, record: Entity) -> StorageResult<Entity> {
-        elephant_storage::Repository::update(self, space_id, id, record).await
-    }
-
-    async fn delete(&self, space_id: &str, id: &RecordId) -> StorageResult<()> {
-        elephant_storage::Repository::delete(self, space_id, id).await
-    }
-
-    async fn search(&self, criteria: &SearchCriteria) -> StorageResult<PaginatedResult<Entity>> {
-        elephant_storage::SearchRepository::search(self, criteria).await
-    }
-
-    async fn get_with_deleted(
-        &self,
-        space_id: &str,
-        id: &RecordId,
-    ) -> StorageResult<Option<Entity>> {
-        Self::get_with_deleted(self, space_id, id).await
-    }
-
-    async fn restore(&self, space_id: &str, id: &RecordId) -> StorageResult<Entity> {
-        Self::restore(self, space_id, id).await
-    }
-
-    async fn upsert(&self, record: Entity) -> StorageResult<Entity> {
-        Self::upsert(self, record).await
-    }
-
-    async fn get_with_relations(
-        &self,
-        space_id: &str,
-        id: &RecordId,
-    ) -> StorageResult<Option<EntityWithRelations>> {
-        Self::get_with_relations(self, space_id, id).await
     }
 }
 
@@ -1053,7 +1005,57 @@ async fn create_entity(
     }
 }
 
-/// PUT /v1/entities/{id} - Update entity.
+// Ordinary writes can change content, but never grant authority to reclassify it.
+fn authorize_entity_write(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    entity: &Entity,
+) -> Result<(), AuthzError> {
+    state
+        .authz
+        .authorize_record_write(principal, entity, "write:entity")?;
+    state
+        .authz
+        .authorize_record_read(principal, entity, "read:entity")
+}
+
+fn authorize_entity_replacement(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    existing: &Entity,
+    updated: &Entity,
+) -> Result<(), AuthzError> {
+    authorize_entity_write(state, principal, existing)?;
+    authorize_entity_write(state, principal, updated)?;
+    if existing.base.security != updated.base.security {
+        return Err(AuthzError::access_denied(
+            "ordinary entity updates cannot change security metadata",
+        ));
+    }
+    Ok(())
+}
+
+fn entity_authz_error(error: AuthzError) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            code: error.code,
+            message: error.message,
+            details: None,
+        }),
+    )
+}
+
+fn entity_write_error(error: &StorageError) -> (StatusCode, Json<ApiError>) {
+    let status = if matches!(error, StorageError::Conflict(_)) {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (status, Json(ApiError::internal(error.to_string())))
+}
+
+/// PUT /v1/entities/{id} - Update entity without reclassifying it.
 async fn update_entity(
     State(state): State<Arc<AppState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -1067,79 +1069,33 @@ async fn update_entity(
             Json(ApiError::validation(e.to_string())),
         )
     })?;
-    // First check if entity exists
-    match state.entity_repo.get(&space_id, &rid).await {
-        Ok(Some(existing)) => {
-            state
-                .authz
-                .authorize_record_write(&principal, &existing, "write:entity")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-
-            state
-                .authz
-                .authorize_record_read(&principal, &existing, "read:entity")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-
-            // Authorize new version
-            state
-                .authz
-                .authorize_record_write(&principal, &req.entity, "write:entity")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-
-            match state.entity_repo.update(&space_id, &rid, req.entity).await {
-                Ok(updated) => {
-                    publish_entity_change(
-                        &state,
-                        &updated,
-                        EventOperation::Update,
-                        "entity.updated",
-                        &principal.subject,
-                    )
-                    .await;
-                    Ok(Json(updated))
-                }
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
-            }
-        }
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError::not_found("Entity", &id)),
-        )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
-    }
+    let existing = state
+        .entity_repo
+        .get(&space_id, &rid)
+        .await
+        .map_err(|error| entity_write_error(&error))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::not_found("Entity", &id)),
+            )
+        })?;
+    authorize_entity_replacement(&state, &principal, &existing, &req.entity)
+        .map_err(entity_authz_error)?;
+    let updated = state
+        .entity_repo
+        .update_preserving_security(&space_id, &rid, req.entity)
+        .await
+        .map_err(|error| entity_write_error(&error))?;
+    publish_entity_change(
+        &state,
+        &updated,
+        EventOperation::Update,
+        "entity.updated",
+        &principal.subject,
+    )
+    .await;
+    Ok(Json(updated))
 }
 
 /// DELETE /v1/entities/{id} - Soft delete entity.
@@ -1264,44 +1220,40 @@ async fn upsert_entity(
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(entity): Json<Entity>,
 ) -> ApiResult<Entity> {
-    state
-        .authz
-        .authorize_record_write(&principal, &entity, "write:entity")
-        .map_err(|e| {
-            (
-                StatusCode::FORBIDDEN,
-                Json(ApiError {
-                    code: e.code,
-                    message: e.message,
-                    details: None,
-                }),
-            )
-        })?;
-
-    let operation = match state
+    let space_id = require_space_id(&principal)?;
+    authorize_entity_write(&state, &principal, &entity).map_err(entity_authz_error)?;
+    let rid = entity.base.id.clone();
+    let existing = state
         .entity_repo
-        .get_with_deleted(&entity.base.space_id, &entity.base.id)
+        .get_with_deleted(&space_id, &rid)
         .await
-    {
-        Ok(Some(_)) => EventOperation::Update,
-        Ok(None) | Err(_) => EventOperation::Create,
+        .map_err(|error| entity_write_error(&error))?;
+    let (updated, operation, event_type) = if let Some(existing) = existing {
+        authorize_entity_replacement(&state, &principal, &existing, &entity)
+            .map_err(entity_authz_error)?;
+        (
+            state
+                .entity_repo
+                .restore_and_update_preserving_security(&space_id, &rid, entity)
+                .await
+                .map_err(|error| entity_write_error(&error))?,
+            EventOperation::Update,
+            "entity.updated",
+        )
+    } else {
+        // CREATE must fail on a collision, never replace a record we did not authorize.
+        (
+            state
+                .entity_repo
+                .create(entity)
+                .await
+                .map_err(|error| entity_write_error(&error))?,
+            EventOperation::Create,
+            "entity.created",
+        )
     };
-    match state.entity_repo.upsert(entity).await {
-        Ok(updated) => {
-            let event_type = if operation == EventOperation::Create {
-                "entity.created"
-            } else {
-                "entity.updated"
-            };
-            publish_entity_change(&state, &updated, operation, event_type, &principal.subject)
-                .await;
-            Ok(Json(updated))
-        }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
-    }
+    publish_entity_change(&state, &updated, operation, event_type, &principal.subject).await;
+    Ok(Json(updated))
 }
 
 /// POST /v1/entities/batch - Batch operations.
@@ -1319,42 +1271,24 @@ async fn batch_entities(
 
         let (result, operation) = match state.entity_repo.get_with_deleted(&space_id, &rid).await {
             Ok(Some(existing)) => {
-                if let Err(e) =
-                    state
-                        .authz
-                        .authorize_record_write(&principal, &existing, "write:entity")
+                if let Err(e) = authorize_entity_replacement(&state, &principal, &existing, &entity)
                 {
                     failed.push(BatchError {
                         index,
                         error: e.message,
                     });
                     continue;
-                }
-                if let Err(e) =
-                    state
-                        .authz
-                        .authorize_record_write(&principal, &entity, "write:entity")
-                {
-                    failed.push(BatchError {
-                        index,
-                        error: e.message,
-                    });
-                    continue;
-                }
-                if existing.base.deleted_at.is_some() {
-                    let _ = state.entity_repo.restore(&space_id, &rid).await;
                 }
                 (
-                    state.entity_repo.update(&space_id, &rid, entity).await,
+                    state
+                        .entity_repo
+                        .restore_and_update_preserving_security(&space_id, &rid, entity)
+                        .await,
                     EventOperation::Update,
                 )
             }
             Ok(None) => {
-                if let Err(e) =
-                    state
-                        .authz
-                        .authorize_record_write(&principal, &entity, "write:entity")
-                {
+                if let Err(e) = authorize_entity_write(&state, &principal, &entity) {
                     failed.push(BatchError {
                         index,
                         error: e.message,

@@ -76,7 +76,11 @@ curl -f http://localhost:3000/v1/entities/entity:550e8400-e29b-41d4-a716-4466554
 `GET` accepts `include_deleted=true`. To update, edit the returned record and send
 the complete JSON to `PUT /v1/entities/{id}`. This is a replacement, not a partial
 patch. Keep the body's ID consistent with the path and preserve provenance and
-security metadata. The handler checks write access to the old and new record.
+security metadata. The handler requires read and write access to both versions
+and rejects changes to `security.policy_id`, `security.level`, `security.labels`,
+or `security.handling` with `403`, even when the caller is cleared for both
+versions. If the stored security changes concurrently, the write fails with
+`409`; fetch the current record before retrying a content edit.
 
 `DELETE` returns `204` and soft deletes the record. `POST` to the corresponding
 `/restore` route returns the restored entity.
@@ -85,10 +89,14 @@ security metadata. The handler checks write access to the old and new record.
 
 `POST /v1/entities/upsert` accepts the same full entity body. It uses the supplied
 ID to create or update a record; it does not resolve identity from a display name.
+Existing records retain their security metadata under the same checks as `PUT`,
+including when upsert restores a deleted record.
 
 `POST /v1/entities/batch` accepts `{"items": [...]}` where every item is a full
 entity. The response has `succeeded` records and `failed` entries with an `index`
-and `error`. Items are processed individually.
+and `error`. Items are processed individually. Replacements must include the
+existing security metadata unchanged. A rejected item does not update or restore
+the entity; the batch reports the failure for that item.
 
 <Warning>
   The request schema currently accepts `atomic`, but the handler does not

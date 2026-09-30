@@ -791,7 +791,8 @@ impl ToolHandler for UpdateEntityHandler {
 
     fn description(&self) -> &'static str {
         concat!(
-            "Update an entity's fields.\n\n",
+            "Update an entity's fields while preserving its security classification. ",
+            "Security fields cannot be changed through this tool.\n\n",
             "Example:\n",
             r#"{ "id": "entity:f47ac10b-58cc-4372-a567-0e02b2c3d479", "fields": { "summary": "Founder of NeuralFlow" } }"#,
         )
@@ -875,6 +876,14 @@ impl ToolHandler for UpdateEntityHandler {
         let updated: Entity = serde_json::from_value(entity_value)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
 
+        if updated.base.security != existing.base.security {
+            let response: ToolResponse<()> = ToolResponse::error(
+                "Access denied: update_entity cannot change an entity's security classification",
+            );
+            return serde_json::to_value(response)
+                .map_err(|e| McpError::ExecutionError(e.to_string()));
+        }
+
         if let Err(reason) =
             ctx.authz
                 .authorize_record_write(&ctx.principal, &updated, "write:entity")
@@ -894,7 +903,11 @@ impl ToolHandler for UpdateEntityHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        match self.repo.update(&space_id, &rid, updated).await {
+        match self
+            .repo
+            .update_preserving_security(&space_id, &rid, updated)
+            .await
+        {
             Ok(entity) => {
                 if let Err(reason) =
                     ctx.authz
@@ -1128,7 +1141,9 @@ impl ToolHandler for BatchEntitiesHandler {
 
     fn description(&self) -> &'static str {
         concat!(
-            "Batch create or update entities.\n\n",
+            "Batch create or update entities. Existing entities, including deleted entities, ",
+            "must retain their complete security classification. Include unchanged security ",
+            "fields when updating an existing entity.\n\n",
             "Example:\n",
             r#"{
   "items": [
@@ -1226,11 +1241,18 @@ impl ToolHandler for BatchEntitiesHandler {
                         continue;
                     }
 
-                    // Update existing
-                    if existing.base.deleted_at.is_some() {
-                        let _ = self.repo.restore(&space_id, &rid).await;
+                    if entity.base.security != existing.base.security {
+                        failed.push(BatchError {
+                            index,
+                            error: "Access denied: batch_entities cannot change an entity's security classification"
+                                .to_string(),
+                        });
+                        continue;
                     }
-                    self.repo.update(&space_id, &rid, entity).await
+
+                    self.repo
+                        .restore_and_update_preserving_security(&space_id, &rid, entity)
+                        .await
                 }
                 Ok(None) => {
                     if let Err(reason) =
@@ -1402,7 +1424,247 @@ mod tests {
         clippy::cognitive_complexity
     )]
     use super::*;
+    use elephant_types::records::base::Security;
     use elephant_types::records::entity::EntityStatus;
+
+    fn security_test_context(storage: StorageClient) -> ToolContext {
+        use elephant_policy::{Clearance, Principal};
+        use std::collections::HashSet;
+
+        ToolContext::new(
+            storage,
+            Principal {
+                space_id: "test_space".to_string(),
+                scopes: HashSet::from(["read:entity".to_string(), "write:entity".to_string()]),
+                clearances: ["restricted", "alternative"]
+                    .into_iter()
+                    .map(|policy_id| Clearance {
+                        policy_id: policy_id.to_string(),
+                        max_level: 3,
+                        labels: HashSet::from(["comp:private".to_string()]),
+                        handling_allow: HashSet::from(["handling:trusted_context".to_string()]),
+                    })
+                    .collect(),
+                subject_allowlist: None,
+                purpose: HashSet::new(),
+            },
+        )
+    }
+
+    fn security_test_entity() -> Entity {
+        let mut entity = semantic_test_entity("Classified entity", Some("Original summary"));
+        entity.base.security = Security {
+            policy_id: "restricted".to_string(),
+            level: 2,
+            labels: vec!["comp:private".to_string()],
+            handling: vec!["handling:trusted_context".to_string()],
+        };
+        entity
+    }
+
+    fn changed_security_envelopes(original: &Security) -> Vec<Security> {
+        vec![
+            Security {
+                level: 0,
+                ..original.clone()
+            },
+            Security {
+                level: 3,
+                ..original.clone()
+            },
+            Security {
+                policy_id: "alternative".to_string(),
+                ..original.clone()
+            },
+            Security {
+                labels: vec![],
+                ..original.clone()
+            },
+            Security {
+                handling: vec![],
+                ..original.clone()
+            },
+        ]
+    }
+
+    fn assert_security_test_access(ctx: &ToolContext, entity: &Entity) {
+        assert!(!ctx.authz.is_skip_auth());
+        assert!(ctx
+            .authz
+            .authorize_record_read(&ctx.principal, entity, "read:entity")
+            .is_ok());
+        assert!(ctx
+            .authz
+            .authorize_record_write(&ctx.principal, entity, "write:entity")
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_update_entity_cannot_change_security_with_clearance_for_both() {
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let repo = EntityRepository::new(storage.clone());
+        let existing = repo.create(security_test_entity()).await.unwrap();
+        let ctx = security_test_context(storage.clone());
+        let handler = UpdateEntityHandler::new(storage);
+        assert_security_test_access(&ctx, &existing);
+
+        for security in changed_security_envelopes(&existing.base.security) {
+            let mut proposed = existing.clone();
+            proposed.base.security = security.clone();
+            assert_security_test_access(&ctx, &proposed);
+
+            let response = handler
+                .execute(
+                    &ctx,
+                    json!({
+                        "id": existing.base.id,
+                        "fields": {"security": security, "summary": "Unauthorized change"}
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response["ok"], false);
+            assert!(response["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("Access denied: update_entity cannot change"));
+            let stored = repo
+                .get("test_space", &existing.base.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(stored).unwrap(),
+                serde_json::to_value(&existing).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_entity_content_preserves_security() {
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let repo = EntityRepository::new(storage.clone());
+        let existing = repo.create(security_test_entity()).await.unwrap();
+        let ctx = security_test_context(storage.clone());
+        let handler = UpdateEntityHandler::new(storage);
+
+        for fields in [
+            json!({"summary": "Updated summary"}),
+            json!({"display_name": "Updated name", "security": existing.base.security}),
+        ] {
+            let response = handler
+                .execute(&ctx, json!({"id": existing.base.id, "fields": fields}))
+                .await
+                .unwrap();
+            assert_eq!(response["ok"], true, "{response}");
+        }
+        let stored = repo
+            .get("test_space", &existing.base.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.summary.as_deref(), Some("Updated summary"));
+        assert_eq!(stored.display_name, "Updated name");
+        assert_eq!(stored.base.security, existing.base.security);
+    }
+
+    #[tokio::test]
+    async fn test_batch_entities_cannot_change_security_or_restore_deleted_rows() {
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let repo = EntityRepository::new(storage.clone());
+        let ctx = security_test_context(storage.clone());
+        let handler = BatchEntitiesHandler::new(storage);
+
+        for deleted in [false, true] {
+            let created = repo.create(security_test_entity()).await.unwrap();
+            if deleted {
+                repo.delete("test_space", &created.base.id).await.unwrap();
+            }
+            let existing = repo
+                .get_with_deleted("test_space", &created.base.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_security_test_access(&ctx, &existing);
+
+            for security in changed_security_envelopes(&existing.base.security) {
+                let mut proposed = existing.clone();
+                proposed.base.security = security;
+                proposed.summary = Some("Unauthorized change".to_string());
+                proposed.base.deleted_at = None;
+                assert_security_test_access(&ctx, &proposed);
+
+                let value = handler
+                    .execute(&ctx, json!({"items": [proposed]}))
+                    .await
+                    .unwrap();
+                let response: ToolResponse<BatchOutput<Entity>> =
+                    serde_json::from_value(value).unwrap();
+                let output = response.data.unwrap();
+                assert!(output.succeeded.is_empty());
+                assert_eq!(output.failed.len(), 1);
+                assert_eq!(output.failed[0].index, 0);
+                assert!(output.failed[0]
+                    .error
+                    .starts_with("Access denied: batch_entities cannot change"));
+                let stored = repo
+                    .get_with_deleted("test_space", &existing.base.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(stored).unwrap(),
+                    serde_json::to_value(&existing).unwrap()
+                );
+                assert_eq!(
+                    repo.get("test_space", &existing.base.id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    deleted
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_entities_preserves_security_on_content_update_and_restore() {
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let repo = EntityRepository::new(storage.clone());
+        let ctx = security_test_context(storage.clone());
+        let handler = BatchEntitiesHandler::new(storage);
+
+        for deleted in [false, true] {
+            let mut existing = repo.create(security_test_entity()).await.unwrap();
+            if deleted {
+                repo.delete("test_space", &existing.base.id).await.unwrap();
+                existing = repo
+                    .get_with_deleted("test_space", &existing.base.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            let mut proposed = existing.clone();
+            proposed.summary = Some("Updated summary".to_string());
+            let value = handler
+                .execute(&ctx, json!({"items": [proposed]}))
+                .await
+                .unwrap();
+            let response: ToolResponse<BatchOutput<Entity>> =
+                serde_json::from_value(value).unwrap();
+            let output = response.data.unwrap();
+            assert!(output.failed.is_empty(), "{:?}", output.failed);
+            assert_eq!(output.succeeded.len(), 1);
+            let stored = repo
+                .get("test_space", &existing.base.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.summary.as_deref(), Some("Updated summary"));
+            assert_eq!(stored.base.security, existing.base.security);
+            assert!(stored.base.deleted_at.is_none());
+        }
+    }
 
     #[test]
     fn test_search_entities_input_defaults() {

@@ -249,6 +249,106 @@ impl<B> EntityRepository<B>
 where
     B: StorageBackend,
 {
+    /// Updates an active entity without changing its current security labels.
+    ///
+    /// Use this at ordinary entity mutation boundaries after authorizing the
+    /// existing and proposed records. The security comparison and replacement
+    /// are atomic, so an earlier authorization read cannot overwrite a newer
+    /// classification. Trusted maintenance may use [`Repository::update`]
+    /// when it intentionally manages security labels.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if the current row is missing, deleted, or has
+    /// different security labels, or an error if storage access fails.
+    pub async fn update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Entity,
+    ) -> StorageResult<Entity> {
+        self.replace_preserving_security(space_id, id, record, false)
+            .await
+    }
+
+    /// Restores and updates an entity without changing its current security labels.
+    ///
+    /// Restoration and the security-checked replacement share one atomic
+    /// mutation. A failed security check cannot resurrect a deleted entity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if the current row is missing or has different
+    /// security labels, or an error if storage access fails.
+    pub async fn restore_and_update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Entity,
+    ) -> StorageResult<Entity> {
+        self.replace_preserving_security(space_id, id, record, true)
+            .await
+    }
+
+    async fn replace_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        mut record: Entity,
+        restore_deleted: bool,
+    ) -> StorageResult<Entity> {
+        record.base.space_id = space_id.to_string();
+        record.base.id.clone_from(id);
+        record.base.updated_at = Utc::now();
+        if restore_deleted {
+            record.base.deleted_at = None;
+        }
+
+        let conflict = || {
+            StorageError::Conflict(format!(
+                "Entity is missing, deleted, or its security has changed: {id}"
+            ))
+        };
+        if let Some(store) = self.backend.embedded_store() {
+            return store
+                .mutate(|mutation| {
+                    let Some(existing) = mutation.get::<Entity>(space_id, id, restore_deleted)?
+                    else {
+                        return Err(conflict());
+                    };
+                    if existing.base.security != record.base.security {
+                        return Err(conflict());
+                    }
+                    Ok(mutation.replace(record)?)
+                })
+                .await;
+        }
+
+        // Keep the comparison in the UPDATE predicate, rather than performing
+        // a separate read whose result can become stale before the write.
+        let mut response = self
+            .backend
+            .query_bind_checked(
+                &format!(
+                    "UPDATE $id MERGE $record WHERE space_id = $space_id \
+                     AND ($restore_deleted OR deleted_at IS NONE) \
+                     AND security = $security RETURN {ENTITY_PROJECTION}"
+                ),
+                crate::bindings! {
+                    "id" => crate::surreal::thing_from_record_id(id),
+                    "space_id" => space_id,
+                    "record" => crate::surreal::entity_to_value(&record)?,
+                    "security" => crate::surreal::security_to_value(&record.base.security),
+                    "restore_deleted" => restore_deleted,
+                },
+            )
+            .await?;
+        let entities: Vec<EntityDb> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse updated entity: {e}"))
+        })?;
+        Entity::try_from(entities.into_iter().next().ok_or_else(conflict)?)
+    }
+
     /// Gets multiple entities by ID while preserving requested order.
     ///
     /// # Errors
@@ -1766,6 +1866,141 @@ mod tests {
 
         let retrieved = repo.get("test_space", &id).await.unwrap().unwrap();
         assert_eq!(retrieved.display_name, "Updated Name");
+    }
+
+    async fn assert_update_preserves_current_security(repo: EntityRepository) {
+        let mut entity = create_test_entity("Protected entity");
+        entity.base.security = Security {
+            policy_id: "restricted".to_string(),
+            level: 2,
+            labels: vec!["private".to_string()],
+            handling: vec!["no_export".to_string()],
+        };
+        let created = repo.create(entity).await.unwrap();
+        let id = created.base.id.clone();
+
+        let mut unchanged = created.clone();
+        unchanged.summary = Some("An ordinary content edit".to_string());
+        // The target still owns identity even when a payload supplies another ID.
+        unchanged.base.id = RecordId::new_v4(TableName::Entity);
+        unchanged.base.space_id = "other_space".to_string();
+        let updated = repo
+            .update_preserving_security("test_space", &id, unchanged)
+            .await
+            .unwrap();
+        assert_eq!(updated.base.id, id);
+        assert_eq!(updated.base.space_id, "test_space");
+        assert_eq!(updated.base.security, created.base.security);
+        assert_eq!(updated.summary.as_deref(), Some("An ordinary content edit"));
+
+        for field in ["policy", "level_down", "level_up", "labels", "handling"] {
+            let mut attempted = updated.clone();
+            attempted.summary = Some("Must not be stored".to_string());
+            match field {
+                "policy" => attempted.base.security.policy_id = "default".to_string(),
+                "level_down" => attempted.base.security.level = 0,
+                "level_up" => attempted.base.security.level = 3,
+                "labels" => attempted.base.security.labels.clear(),
+                "handling" => attempted.base.security.handling.clear(),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                repo.update_preserving_security("test_space", &id, attempted)
+                    .await,
+                Err(StorageError::Conflict(_))
+            ));
+            let stored = repo.get("test_space", &id).await.unwrap().unwrap();
+            assert_eq!(stored.base.security, updated.base.security);
+            assert_eq!(stored.summary, updated.summary);
+        }
+
+        // An authorized reader may hold a stale snapshot while trusted
+        // maintenance raises the classification. The write must compare with
+        // storage at commit time, not with that earlier snapshot.
+        let mut reclassified = updated.clone();
+        reclassified.base.security.level = 4;
+        repo.update("test_space", &id, reclassified.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.update_preserving_security("test_space", &id, updated)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        let stored = repo.get("test_space", &id).await.unwrap().unwrap();
+        assert_eq!(stored.base.security, reclassified.base.security);
+    }
+
+    #[tokio::test]
+    async fn test_update_preserving_security_surreal() {
+        assert_update_preserves_current_security(setup_test_repo().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_preserving_security_embedded() {
+        assert_update_preserves_current_security(setup_embedded_test_repo().await).await;
+    }
+
+    async fn assert_restore_preserves_current_security(repo: EntityRepository) {
+        let created = repo
+            .create(create_test_entity("Protected deleted entity"))
+            .await
+            .unwrap();
+        let id = created.base.id.clone();
+        let mut reclassified = created.clone();
+        reclassified.base.security.level = 2;
+        repo.update("test_space", &id, reclassified.clone())
+            .await
+            .unwrap();
+        repo.delete("test_space", &id).await.unwrap();
+
+        assert!(matches!(
+            repo.restore_and_update_preserving_security("test_space", &id, created)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        let deleted = repo
+            .get_with_deleted("test_space", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deleted.base.deleted_at.is_some());
+        assert_eq!(deleted.base.security, reclassified.base.security);
+        assert_eq!(deleted.display_name, "Protected deleted entity");
+
+        // The active-only API cannot implicitly restore a deleted row.
+        assert!(matches!(
+            repo.update_preserving_security("test_space", &id, reclassified.clone())
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        reclassified.display_name = "Restored content".to_string();
+        let restored = repo
+            .restore_and_update_preserving_security("test_space", &id, reclassified.clone())
+            .await
+            .unwrap();
+        assert!(restored.base.deleted_at.is_none());
+        assert_eq!(restored.base.security, reclassified.base.security);
+        assert_eq!(restored.display_name, "Restored content");
+        assert!(repo.get("test_space", &id).await.unwrap().is_some());
+
+        let absent_id = RecordId::new_v4(TableName::Entity);
+        assert!(matches!(
+            repo.restore_and_update_preserving_security("test_space", &absent_id, restored)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(repo.get("test_space", &absent_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_restore_and_update_preserving_security_surreal() {
+        assert_restore_preserves_current_security(setup_test_repo().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_restore_and_update_preserving_security_embedded() {
+        assert_restore_preserves_current_security(setup_embedded_test_repo().await).await;
     }
 
     #[tokio::test]

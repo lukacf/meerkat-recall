@@ -573,7 +573,7 @@ async fn merge_entities(
         let rid = updated_survivor.base.id.clone();
         let updated = state
             .entity_repo
-            .update(&space_id, &rid, updated_survivor)
+            .update_preserving_security(&space_id, &rid, updated_survivor)
             .await
             .map_err(|e| {
                 (

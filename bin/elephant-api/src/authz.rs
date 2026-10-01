@@ -149,16 +149,12 @@ impl AuthzService {
             auth_principal.clearances.clone()
         };
 
+        // An absent allowlist is unrestricted; an explicit empty allowlist is
+        // still an attenuation and must retain its restriction.
         let subject_allowlist = auth_principal
             .subject_allowlist
             .as_ref()
-            .and_then(|subjects| {
-                if subjects.is_empty() {
-                    None
-                } else {
-                    Some(subjects.iter().cloned().collect())
-                }
-            });
+            .map(|subjects| subjects.iter().cloned().collect());
 
         let purpose: HashSet<String> = auth_principal.purpose.iter().cloned().collect();
 
@@ -354,6 +350,155 @@ mod tests {
         assert!(abac.scopes.contains("write:entity"));
         assert_eq!(abac.clearances.len(), 2);
         assert_eq!(abac.clearances[0].max_level, 2);
+    }
+
+    #[test]
+    fn test_subject_allowlist_preserved_through_claims_and_abac_serialization() {
+        let service = AuthzService::new();
+        let subject = RecordId::new_v4(TableName::Entity);
+        for allowlist in [None, Some(vec![]), Some(vec![subject])] {
+            let mut claims_json = serde_json::json!({
+                "sub": "test-user",
+                "exp": 0,
+                "space_id": "test_space",
+            });
+            if let Some(ref subjects) = allowlist {
+                claims_json["subject_allowlist"] = serde_json::to_value(subjects).unwrap();
+            }
+            let claims = serde_json::from_value::<crate::auth::Claims>(claims_json).unwrap();
+            let auth = AuthPrincipal::from(claims);
+            assert_eq!(auth.subject_allowlist, allowlist);
+
+            let abac = service.to_abac_principal(&auth);
+            let expected: Option<HashSet<RecordId>> =
+                allowlist.map(|subjects| subjects.into_iter().collect());
+            assert_eq!(abac.subject_allowlist, expected);
+
+            let encoded = serde_json::to_value(&abac).unwrap();
+            assert_eq!(
+                encoded.get("subject_allowlist").is_some(),
+                expected.is_some()
+            );
+            let decoded: AbacPrincipal = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded.subject_allowlist, expected);
+        }
+    }
+
+    #[test]
+    fn test_empty_subject_allowlist_denies_entity_reads_writes_and_lists() {
+        let service = AuthzService::new();
+        let entities = vec![
+            create_test_entity(0, vec![]),
+            create_test_entity(1, vec!["comp:alerts".to_string()]),
+        ];
+        for scopes in [
+            vec!["read:entity".to_string(), "write:entity".to_string()],
+            vec!["*".to_string()],
+        ] {
+            let mut auth = create_test_auth_principal();
+            auth.scopes = scopes;
+            for entity in &entities {
+                assert!(service
+                    .authorize_record_read(&auth, entity, "read:entity")
+                    .is_ok());
+                assert!(service
+                    .authorize_record_write(&auth, entity, "write:entity")
+                    .is_ok());
+            }
+
+            auth.subject_allowlist = Some(vec![]);
+            for entity in &entities {
+                let read_error = service
+                    .authorize_record_read(&auth, entity, "read:entity")
+                    .unwrap_err();
+                let write_error = service
+                    .authorize_record_write(&auth, entity, "write:entity")
+                    .unwrap_err();
+                assert!(read_error.message.contains("not in allowlist"));
+                assert!(write_error.message.contains("not in allowlist"));
+            }
+            assert!(service
+                .filter_records(&auth, entities.clone(), "read:entity")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn test_nonempty_subject_allowlist_limits_entity_access() {
+        let service = AuthzService::new();
+        let mut auth = create_test_auth_principal();
+        let allowed = create_test_entity(1, vec![]);
+        let denied = create_test_entity(1, vec![]);
+        auth.subject_allowlist = Some(vec![allowed.base.id.clone()]);
+
+        assert!(service
+            .authorize_record_read(&auth, &allowed, "read:entity")
+            .is_ok());
+        assert!(service
+            .authorize_record_write(&auth, &allowed, "write:entity")
+            .is_ok());
+        assert!(service
+            .authorize_record_read(&auth, &denied, "read:entity")
+            .is_err());
+        assert!(service
+            .authorize_record_write(&auth, &denied, "write:entity")
+            .is_err());
+    }
+
+    #[test]
+    fn test_empty_subject_allowlist_preserves_explicit_development_bypass() {
+        let service = AuthzService::new();
+        let mut auth = create_test_auth_principal();
+        auth.subject_allowlist = Some(vec![]);
+        auth.bypass_abac = true;
+        let entity = create_test_entity(1, vec![]);
+
+        assert!(service
+            .authorize_record_read(&auth, &entity, "read:entity")
+            .is_ok());
+        assert!(service
+            .authorize_record_write(&auth, &entity, "write:entity")
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_empty_subject_allowlist_does_not_grant_wiki_management() {
+        use elephant_mcp::handlers::StopManagedWikiHandler;
+        use elephant_mcp::{ToolContext, ToolHandler};
+        use elephant_storage::{StorageClient, WorkItemRepository};
+
+        let service = AuthzService::new();
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let repo = WorkItemRepository::new(storage.clone());
+        let grant = repo
+            .create_managed_wiki_grant("test_space", "manager")
+            .await
+            .unwrap();
+        let handler = StopManagedWikiHandler::new(storage.clone());
+        let mut auth = create_test_auth_principal();
+        auth.scopes = vec!["manage:wiki".to_string()];
+        auth.subject_allowlist = Some(vec![]);
+
+        let ctx = ToolContext::new(storage.clone(), service.to_abac_principal(&auth));
+        let response = handler.execute(&ctx, serde_json::json!({})).await.unwrap();
+        assert_eq!(response["ok"], false);
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("unrestricted subject scope"));
+        assert!(repo
+            .managed_wiki_grant_is_active("test_space", &grant)
+            .await
+            .unwrap());
+
+        auth.subject_allowlist = None;
+        let ctx = ToolContext::new(storage, service.to_abac_principal(&auth));
+        let response = handler.execute(&ctx, serde_json::json!({})).await.unwrap();
+        assert_eq!(response["ok"], true);
+        assert!(!repo
+            .managed_wiki_grant_is_active("test_space", &grant)
+            .await
+            .unwrap());
     }
 
     #[test]

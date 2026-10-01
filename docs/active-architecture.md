@@ -37,6 +37,22 @@ Config source of truth:
 - `.elephant/elephant_config.toml` at the project root (nearest `.git`, else cwd)
 - env-only startup remains a compatibility fallback when no config file exists
 
+## Entity Authorization Boundaries
+
+HTTP claim conversion preserves the difference between an absent
+`subject_allowlist` and an explicitly empty list. An empty list never becomes
+unrestricted; subject-bearing records remain denied even with wildcard scopes.
+The policy engine's explicit subjectless handling exception is unchanged.
+
+REST entity replacement, upsert, and batch writes and MCP entity update/batch
+writes require read and write authorization for existing and proposed records.
+These ordinary interfaces cannot change any field of an existing `Security`
+object. There is no ordinary declassification scope. Security-preserving storage
+methods compare the current security and replace the record atomically on both
+backends, including restoration, preventing stale edits from reverting a newer
+classification. Trusted internal maintenance retains the low-level update API
+for intentional security changes.
+
 ## Active Source, Extraction, and Commit Path
 
 Active path:

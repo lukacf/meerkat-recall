@@ -385,7 +385,9 @@ Create an entity with only type and display name. All base fields are auto-gener
 ### update_entity
 **Profiles:** M, F
 
-Update an entity's fields.
+Update an entity's fields while preserving its complete `security` object.
+Read and write access to both versions is required; ordinary scopes do not
+permit reclassification, even when the caller can access both classifications.
 
 | Parameter | Type and requirement | Description |
 | --- | --- | --- |
@@ -431,7 +433,10 @@ Restore a soft-deleted entity.
 ### batch_entities
 **Profiles:** F
 
-Batch create or update entities.
+Batch create or update entities. Existing entities require read and write
+access and unchanged security metadata, including when restoring deleted
+records. Include their current `security` in each replacement. Rejected items
+are reported in `failed` and do not update or restore the entity.
 
 | Parameter | Type and requirement | Description |
 | --- | --- | --- |

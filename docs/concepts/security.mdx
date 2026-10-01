@@ -117,11 +117,25 @@ The `handling:subjectless_ok` caveat permits incomplete or empty subject
 metadata when the clearance also allows that caveat. It does not exempt a
 known subject from the allowlist.
 
-<Warning>
-The HTTP token adapter normalizes an empty `subject_allowlist` to no subject
-restriction. Do not encode an intended "deny everyone" policy as an empty
-array. Remove the operation scope or deny the request at the issuing boundary.
-</Warning>
+An omitted or `null` `subject_allowlist` means no subject restriction. An
+explicit empty array stays restricted to no subjects: it denies access to every
+subject-bearing record, including entities, even with wildcard operation scopes.
+The `handling:subjectless_ok` exception described above still applies to records
+with no known subjects.
+
+## Entity security changes
+
+Ordinary entity updates require read and write access to both the existing and
+proposed record, and preserve the complete `security` object: `policy_id`,
+`level`, `labels`, and `handling`. Being cleared for both classifications does
+not grant permission to reclassify an existing entity. This applies to REST
+replacement, upsert, and batch writes and to MCP `update_entity` and
+`batch_entities`, including restoration of deleted records.
+
+The storage write compares security atomically, so a stale content edit cannot
+undo a concurrent classification change. A rejected update does not restore a
+deleted entity. These ordinary interfaces expose no declassification permission;
+trusted internal maintenance remains responsible for intentional security changes.
 
 ## Raw content and redaction
 

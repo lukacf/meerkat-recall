@@ -12,6 +12,7 @@ name = "elephant_api"
 path = "src/lib.rs"
 
 [dependencies]
+elephant-auth = { path = "../../crates/auth" }
 elephant-types = { path = "../../crates/types" }
 elephant-storage = { path = "../../crates/storage" }
 elephant-policy = { path = "../../crates/policy" }

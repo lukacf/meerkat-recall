@@ -36,3 +36,12 @@ Code namespace:
 Policy:
 - May be implemented in future phases.
 - Must remain clearly marked as non-active until dispatched from pipeline runtime.
+
+## C. Authenticated Exchange Contract Without Governed Dispatch
+
+`elephant-auth::exchange` validates a strict request-bound exchange token and
+retains authenticated claims. It is not installed as a governed HTTP/MCP
+resource endpoint, policy evaluator, live revocation service or permit issuer.
+Existing tool routes refuse that token type. Resource-generation ownership,
+current local grants, entry/replay custody, protected source envelopes and
+mandatory durable evidence must be composed before governed dispatch is active.

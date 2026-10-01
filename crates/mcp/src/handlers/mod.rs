@@ -92,6 +92,9 @@ pub struct ToolContext {
     pub authz: Arc<AuthzService>,
     /// ABAC principal for the current request.
     pub principal: AbacPrincipal,
+    /// Retained authentication evidence, distinct from the ABAC projection.
+    /// Absent for explicitly trusted embedding and skip-auth development mode.
+    verified_caller: Option<elephant_auth::VerifiedCallerContext>,
 }
 
 impl ToolContext {
@@ -102,6 +105,7 @@ impl ToolContext {
             storage,
             authz: Arc::new(AuthzService::new()),
             principal,
+            verified_caller: None,
         }
     }
 
@@ -116,7 +120,24 @@ impl ToolContext {
             storage,
             authz,
             principal,
+            verified_caller: None,
         }
+    }
+    /// Carry an already verified ingress context. Raw public policy principals
+    /// cannot manufacture this value and this does not authorize execution.
+    #[must_use]
+    pub fn with_verified_caller(
+        mut self,
+        caller: Option<elephant_auth::VerifiedCallerContext>,
+    ) -> Self {
+        self.verified_caller = caller;
+        self
+    }
+
+    /// Authentication evidence retained for trusted enforcement and attribution.
+    #[must_use]
+    pub const fn verified_caller(&self) -> Option<&elephant_auth::VerifiedCallerContext> {
+        self.verified_caller.as_ref()
     }
 }
 

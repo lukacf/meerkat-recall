@@ -354,6 +354,27 @@ Code namespaces:
 
 See `docs/non-active-catalog.md` for policy and ownership rules.
 
+## Authentication Context
+
+HTTP and MCP use `elephant-auth` as the single legacy bearer-token verifier.
+Authenticated requests retain an opaque verified caller context, including
+issuer, audience and expiry, alongside the existing public Principal/ABAC
+projections. Those projections remain policy input, not authentication proof.
+Explicit skip-auth and trusted in-process embedding have no verified context.
+
+Trusted host composition can install exact issuer/audience-to-domain mappings.
+The mapping requires independently configured issuer and audience checks; no
+domain is inferred from a subject string or URL. Mapped identity does not grant
+Elephant clearances, live delegation or governed execution. The existing local
+ABAC evaluator and subject-scope semantics remain authoritative.
+
+The auth crate also validates a strict, versioned, request-bound exchange syntax
+with required qualified identities, operation bindings and explicit time bounds.
+This is authenticated claim evidence only. Existing HTTP/MCP tool routes refuse
+its distinct token type; no governed resource endpoint is active. Canonical
+resource generations, live grant/revocation checks, replay/entry custody,
+protected result envelopes and mandatory durable evidence remain required.
+
 ## Active Data Model Notes
 
 - `source` is the first-class intake object. `source.lifecycle_status`,

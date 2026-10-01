@@ -1916,6 +1916,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "config",
+ "elephant-auth",
  "elephant-embeddings",
  "elephant-extensions",
  "elephant-identity",
@@ -1948,6 +1949,23 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+]
+
+[[package]]
+name = "elephant-auth"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "elephant-policy",
+ "elephant-types",
+ "hex",
+ "jsonschema",
+ "jsonwebtoken",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2160,6 +2178,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "elephant-auth",
  "elephant-embeddings",
  "elephant-extensions",
  "elephant-identity",

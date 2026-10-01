@@ -1,0 +1,3 @@
+# Exact historical synthetic HS256 fixture in the loopback MCP subject-scope test.
+# Current source constructs repeated bytes; full-history scans retain this commit.
+feae4da94ab5d2ed5a1714b0bea2a446bb6763b4:bin/elephant-api/src/mcp.rs:generic-api-key:1083

@@ -22,6 +22,8 @@ mod claims;
 pub mod contract;
 pub mod exchange;
 mod identity;
+pub mod information;
+pub mod restrictions;
 
 pub use claims::Claims;
 pub use identity::{

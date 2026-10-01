@@ -21,6 +21,10 @@ does not by itself establish a published release.
 - Dual licensing under MIT OR Apache-2.0.
 
 ### Security
+- Independent V1 restriction and protected dependency contracts preserve exact
+  ceilings, unresolved contributors and source-local policy observations through
+  ordinary derivation. Shared normalized vectors exercise this pure algebra;
+  no active source, tool, provider or recipient boundary consumes it yet.
 - Independent security contract compatibility negotiation refuses unknown
   versions, missing duties and profile downgrades against the shared Meerkat
   vectors. This prerequisite does not enable governed HTTP/MCP dispatch.

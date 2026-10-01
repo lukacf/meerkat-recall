@@ -50,3 +50,10 @@ mandatory durable evidence must be composed before governed dispatch is active.
 contract version/profile and mandatory-duty negotiation. Its shared corpus
 checks compatibility claims only. It does not install a capability endpoint,
 authenticate an advertisement, enable governed dispatch or replace local ABAC.
+
+`elephant-auth::restrictions` and `elephant-auth::information` independently
+consume the shared normalized restriction and information-flow corpus. Their
+ceilings, source observations and conservative derivations are unauthenticated
+claims. They do not install source envelopes on active reads, verify complete
+provenance, enforce provider/recipient boundaries or grant source-policy
+exceptions. Those production owner integrations remain unavailable.

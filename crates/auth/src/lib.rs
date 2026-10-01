@@ -19,6 +19,7 @@ macro_rules! redacted_debug {
 }
 
 mod claims;
+pub mod contract;
 pub mod exchange;
 mod identity;
 

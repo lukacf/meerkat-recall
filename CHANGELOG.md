@@ -21,6 +21,9 @@ does not by itself establish a published release.
 - Dual licensing under MIT OR Apache-2.0.
 
 ### Security
+- Independent security contract compatibility negotiation refuses unknown
+  versions, missing duties and profile downgrades against the shared Meerkat
+  vectors. This prerequisite does not enable governed HTTP/MCP dispatch.
 - Incoming MCP requests use only the caller's Authorization header; internal
   worker credentials no longer replace missing or restricted caller credentials.
 - Authenticated server startup rejects missing or short signing secrets and

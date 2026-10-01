@@ -45,3 +45,8 @@ resource endpoint, policy evaluator, live revocation service or permit issuer.
 Existing tool routes refuse that token type. Resource-generation ownership,
 current local grants, entry/replay custody, protected source envelopes and
 mandatory durable evidence must be composed before governed dispatch is active.
+
+`elephant-auth::contract` independently evaluates the shared normalized security
+contract version/profile and mandatory-duty negotiation. Its shared corpus
+checks compatibility claims only. It does not install a capability endpoint,
+authenticate an advertisement, enable governed dispatch or replace local ABAC.

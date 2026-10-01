@@ -1038,15 +1038,20 @@ impl WorkItemRepository {
                      LET $cold_done = SELECT VALUE original_id FROM $archives
                          WHERE space_id = $space_id AND record.status = $dependency_status
                          AND deleted_at IS NONE;
-                     UPDATE $id MERGE $record
+                     LET $updated = UPDATE $id MERGE $record
                          WHERE space_id = $space_id AND status = $status AND deleted_at IS NONE
                          AND array::len(array::complement($parents, array::concat($done, $cold_done))) = 0
                          RETURN {WORK_ITEM_PROJECTION};
-                     COMMIT TRANSACTION;"
+                     IF array::len($updated) > 0 {{ {retire_archive} }};
+                     RETURN $updated;
+                     COMMIT TRANSACTION;",
+                    retire_archive = crate::work_retention::RETIRE_ARCHIVE_SQL
                 ),
                 crate::bindings! {
                     "id" => crate::surreal::thing_from_record_id(id),
                     "space_id" => space_id,
+                    "space" => space_id,
+                    "archive" => crate::surreal::thing_from_record_id(&crate::work_retention::archive_id(id)),
                     "status" => expected_status.to_string(),
                     "dependency_status" => WorkItemStatus::Done.to_string(),
                     "record" => Self::work_item_to_value(&record)?,
@@ -1054,7 +1059,7 @@ impl WorkItemRepository {
             )
             .await?;
 
-        let items: Vec<WorkItemDb> = response.take(4).map_err(|e| {
+        let items: Vec<WorkItemDb> = response.take(response.num_statements() - 1).map_err(|e| {
             StorageError::QueryError(format!("Failed to parse work_item update: {e}"))
         })?;
         if items.is_empty() {

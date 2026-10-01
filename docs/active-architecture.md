@@ -462,7 +462,13 @@ Migration 029 adds durable `work_item_archive` and `work_run_archive` history.
 Retention preserves public IDs, idempotency lookup, retries, failed dependency
 barriers, provenance, and usage metrics. Historical job and document-status
 reads include archived records. Wiki authority and its current scheduling
-configuration remain available to the recurring service.
+configuration remain available to the recurring service. SurrealDB-backed
+updates and restores write both hot and archive identities in their existing
+transaction, so archival conflicts with a concurrent acknowledged retry or run
+update. The in-process SurrealKV 0.9.3 dependency uses a pinned snapshot-version
+backport; remote SurrealDB servers require their own equivalent engine repair.
+This retention guarantee does not establish general serializable authorization
+fences. See the [backport provenance](../vendor/surrealkv-0.9.3-backport.md).
 
 See [Work queue capacity and retention](work-queue-capacity.md) for
 query-plan constraints, operator settings, and acceptance criteria.

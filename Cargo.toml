@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/surrealkv-0.9.3"]
 members = [
     "crates/types",
     "crates/elephant-db",
@@ -173,3 +174,8 @@ tag-message = "Release v{{version}}"
 pre-release-hook = ["bash", "-c", "$(git rev-parse --show-toplevel)/scripts/release-hook.sh {{version}}"]
 publish = false
 push = true
+
+# Narrow 0.9.3 snapshot-publication repair, without adopting a storage rewrite.
+# Provenance and exact patch: vendor/surrealkv-0.9.3-backport.md.
+[patch.crates-io]
+surrealkv = { path = "vendor/surrealkv-0.9.3" }

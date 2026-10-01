@@ -27,9 +27,12 @@ repos:
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
+        # Preserve byte-exact upstream source, binary fixtures and backport patch.
+        exclude: ^vendor/surrealkv-0\.9\.3(?:/|-backport\.patch$)
         args: [--markdown-linebreak-ext=md]
         stages: [pre-push]
       - id: end-of-file-fixer
+        exclude: ^vendor/surrealkv-0\.9\.3(?:/|-backport\.patch$)
         stages: [pre-push]
       - id: check-yaml
         stages: [pre-push]

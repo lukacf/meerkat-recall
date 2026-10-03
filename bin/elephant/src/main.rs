@@ -331,6 +331,21 @@ async fn apply_schema(extension_dir: Option<PathBuf>) -> Result<()> {
     }
 
     info!("Schema applied successfully");
+
+    // Only with a real provider configured: the purge clears fake vectors so
+    // the workers re-embed them, which a fake or missing provider cannot do.
+    let policy = elephant_embeddings::EmbeddingPolicy::from_env();
+    if matches!(policy.provider.as_str(), "openai" | "fastembed") {
+        let report = elephant_storage::fake_embedding_repair::purge_fake_embeddings(&client)
+            .await
+            .map_err(|err| anyhow::anyhow!("fake embedding purge failed: {err}"))?;
+        info!(?report, "Fake embedding purge");
+    } else {
+        info!(
+            provider = %policy.provider,
+            "Fake embedding purge skipped: no real embedding provider configured"
+        );
+    }
     Ok(())
 }
 

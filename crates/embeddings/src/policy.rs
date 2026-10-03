@@ -124,6 +124,9 @@ impl EmbeddingProviderCache {
     }
 }
 
+/// The provider used when neither a space config nor `PIPELINE_EMBED_PROVIDER`
+/// names one. Never `fake`: that default wrote `FakeEmbeddingProvider` ramps,
+/// labelled as the real model, into a production store for its whole life.
 fn default_provider() -> String {
     #[cfg(feature = "fastembed")]
     {
@@ -132,7 +135,15 @@ fn default_provider() -> String {
 
     #[cfg(not(feature = "fastembed"))]
     {
-        "fake".to_string()
+        let has_openai_key = std::env::var("OPENAI_API_KEY")
+            .map(|key| !key.trim().is_empty())
+            .unwrap_or(false);
+        if has_openai_key {
+            "openai".to_string()
+        } else {
+            // Builds an UnavailableEmbeddingProvider: embedding fails visibly.
+            "unconfigured".to_string()
+        }
     }
 }
 

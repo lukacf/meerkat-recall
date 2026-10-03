@@ -1247,6 +1247,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fake_embedding_purge_resets_only_ramp_vectors_once() {
+        use elephant_embeddings::{EmbeddingProvider, FakeEmbeddingProvider};
+
+        let client = StorageClient::new_memory()
+            .await
+            .expect("SurrealDB memory client");
+        let revision_repo = DocRevisionRepository::new(client.clone());
+        let node_repo = DocNodeRepository::new(client.clone());
+        let repo = NodeEmbeddingRepository::new(client.clone(), PartitionManager::new());
+        let dims = 1200;
+        let ramp = FakeEmbeddingProvider::new("text-embedding-3-large", dims)
+            .embed(&["some chunk text".to_string()])
+            .await
+            .expect("fake vector")
+            .remove(0);
+        let real: Vec<f32> = (0..u16::try_from(dims).expect("dims"))
+            .map(|i| (f32::from(i) * 0.37).sin() * 0.03)
+            .collect();
+
+        let mut node_ids = Vec::new();
+        for (key, vector) in [("fake", ramp), ("real", real)] {
+            let revision = revision_repo
+                .create(make_test_revision("space"))
+                .await
+                .expect("revision");
+            let mut node = make_test_node("space", &revision.base.id, key);
+            node.embedding_model = Some("text-embedding-3-large".to_string());
+            let node = node_repo.create(node).await.expect("node");
+            let mut embedding = make_test_embedding("space", &node.base.id);
+            embedding.model = "text-embedding-3-large".to_string();
+            embedding.dims = i32::try_from(dims).expect("dims");
+            embedding.vector = vector;
+            repo.store_embedding(embedding).await.expect("store");
+            node_ids.push(node.base.id);
+        }
+
+        let report = crate::fake_embedding_repair::purge_fake_embeddings(&client)
+            .await
+            .expect("purge");
+        assert!(!report.skipped);
+        assert_eq!(
+            report.partitions.iter().map(|(_, n)| n).sum::<usize>(),
+            1,
+            "{report:?}"
+        );
+
+        let fake_node = node_repo
+            .get("space", &node_ids[0])
+            .await
+            .expect("get")
+            .expect("fake node");
+        assert!(
+            fake_node.embedding_model.is_none(),
+            "fake node re-queued for embedding"
+        );
+        let real_node = node_repo
+            .get("space", &node_ids[1])
+            .await
+            .expect("get")
+            .expect("real node");
+        assert_eq!(
+            real_node.embedding_model.as_deref(),
+            Some("text-embedding-3-large")
+        );
+
+        let again = crate::fake_embedding_repair::purge_fake_embeddings(&client)
+            .await
+            .expect("second purge");
+        assert!(again.skipped, "one-shot: the marker stops a rescan");
+    }
+
+    #[tokio::test]
     async fn test_partition_vector_search_in_surreal_memory() {
         exercise_partition_vector_search(
             StorageClient::new_memory()

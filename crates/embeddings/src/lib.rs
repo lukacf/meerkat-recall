@@ -6,18 +6,20 @@
 //! - Vector search routing
 
 pub mod error;
+pub mod factory;
 pub mod partition;
 pub mod policy;
 pub mod provider;
 
 pub use error::{EmbeddingError, EmbeddingResult};
+pub use factory::provider_for_policy;
 pub use partition::{
     discover_accessible_partition_keys, level_bucket, PartitionKey, PartitionManager,
 };
 pub use policy::{EmbeddingPolicy, EmbeddingProviderCache};
 pub use provider::{
     EmbeddingProvider, EmbeddingVector, FakeEmbeddingProvider, HashedEmbeddingProvider,
-    OpenAIConfig, OpenAIEmbeddingProvider,
+    OpenAIConfig, OpenAIEmbeddingProvider, UnavailableEmbeddingProvider,
 };
 
 #[cfg(feature = "fastembed")]

@@ -183,7 +183,9 @@ impl ToolDispatcher {
             .handlers
             .get(name)
             .ok_or_else(|| McpError::ToolNotFound(name.to_string()))?;
-        handler.execute(&self.context, params).await
+        let mut result = handler.execute(&self.context, params).await?;
+        strip_embedding_vectors(&mut result);
+        Ok(result)
     }
 
     /// Lists all registered tools.
@@ -1155,5 +1157,60 @@ mod tests {
             entity_required.contains("type") && entity_required.contains("display_name"),
             "batch_entities items.items.required must include type and display_name"
         );
+    }
+}
+
+/// Drops raw embedding vectors from a tool result.
+///
+/// Entities carry their name embedding (3072 floats, about 62 KB as JSON)
+/// in `metadata`, so five entities made a `search_all` answer of roughly
+/// 280 KB that agents had to read through. Vectors are never meaningful to a
+/// tool caller; the model name and text hash beside them are kept.
+fn strip_embedding_vectors(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|key, item| !(key.ends_with("embedding") && is_vector(item)));
+            for item in map.values_mut() {
+                strip_embedding_vectors(item);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_embedding_vectors(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_vector(value: &Value) -> bool {
+    matches!(value, Value::Array(items) if items.len() > 16 && items.iter().all(Value::is_number))
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use serde_json::json;
+
+    use super::strip_embedding_vectors;
+
+    #[test]
+    fn embedding_vectors_never_reach_tool_callers() {
+        let vector: Vec<f64> = (0..3072).map(|i| f64::from(i) * 0.001).collect();
+        let mut result = json!({
+            "ok": true,
+            "data": {"entities": {"items": [{
+                "display_name": "Ada",
+                "metadata": {
+                    "name_embedding": vector,
+                    "name_embedding_model": "text-embedding-3-large",
+                    "tags": [1, 2, 3]
+                }
+            }]}}
+        });
+        strip_embedding_vectors(&mut result);
+        let metadata = &result["data"]["entities"]["items"][0]["metadata"];
+        assert!(metadata.get("name_embedding").is_none());
+        assert_eq!(metadata["name_embedding_model"], "text-embedding-3-large");
+        assert_eq!(metadata["tags"], json!([1, 2, 3]));
     }
 }

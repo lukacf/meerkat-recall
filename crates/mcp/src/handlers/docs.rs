@@ -27,12 +27,7 @@ use tracing::warn;
 
 use elephant_embeddings::{
     discover_accessible_partition_keys, EmbeddingPolicy, EmbeddingProvider, EmbeddingProviderCache,
-    FakeEmbeddingProvider, HashedEmbeddingProvider, OpenAIConfig, OpenAIEmbeddingProvider,
     PartitionKey,
-};
-#[cfg(feature = "fastembed")]
-use elephant_embeddings::{
-    fastembed_model_dimensions, FastEmbedConfig, FastEmbedEmbeddingProvider,
 };
 use elephant_pipeline::media::{probe_video_duration_ms, probe_video_duration_ms_from_bytes};
 use elephant_pipeline::renderer::default::{DefaultTextRenderer, PassthroughRenderer};
@@ -1396,68 +1391,8 @@ pub(crate) async fn resolve_embedding_policy(
     Ok(policy)
 }
 
-#[allow(clippy::cognitive_complexity)]
 pub(crate) fn build_embedding_provider(policy: &EmbeddingPolicy) -> Arc<dyn EmbeddingProvider> {
-    match policy.provider.as_str() {
-        "hashed" => Arc::new(HashedEmbeddingProvider::new(
-            policy.model.clone(),
-            policy.dims,
-        )),
-        "openai" => match OpenAIConfig::from_env() {
-            Ok(config) => {
-                let config = config
-                    .with_model(policy.model.clone())
-                    .with_dimensions(policy.dims);
-                Arc::new(OpenAIEmbeddingProvider::new(config))
-            }
-            Err(err) => {
-                warn!("OpenAI config invalid ({err}), using fake embeddings");
-                Arc::new(FakeEmbeddingProvider::new(
-                    policy.model.clone(),
-                    policy.dims,
-                ))
-            }
-        },
-        "fastembed" => build_fastembed_provider(policy).unwrap_or_else(|| {
-            Arc::new(FakeEmbeddingProvider::new(
-                policy.model.clone(),
-                policy.dims,
-            ))
-        }),
-        _ => Arc::new(FakeEmbeddingProvider::new(
-            policy.model.clone(),
-            policy.dims,
-        )),
-    }
-}
-
-#[cfg(feature = "fastembed")]
-fn build_fastembed_provider(policy: &EmbeddingPolicy) -> Option<Arc<dyn EmbeddingProvider>> {
-    if let Some(expected) = fastembed_model_dimensions(&policy.model) {
-        if expected != policy.dims {
-            warn!(
-                "Fastembed dims mismatch for model {}: expected {}, got {}",
-                policy.model, expected, policy.dims
-            );
-        }
-    }
-
-    let config = FastEmbedConfig::new(policy.model.clone());
-    match FastEmbedEmbeddingProvider::new(config) {
-        Ok(provider) => Some(Arc::new(provider)),
-        Err(err) => {
-            warn!("Fastembed init failed ({err}), using fake embeddings");
-            None
-        }
-    }
-}
-
-#[cfg(not(feature = "fastembed"))]
-fn build_fastembed_provider(_policy: &EmbeddingPolicy) -> Option<Arc<dyn EmbeddingProvider>> {
-    warn!(
-        "Fastembed provider requested but elephant-mcp was built without `--features fastembed` (using fake embeddings)"
-    );
-    None
+    elephant_embeddings::provider_for_policy(policy)
 }
 
 async fn build_partition_keys(

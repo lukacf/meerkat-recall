@@ -38,6 +38,7 @@ pub mod entity_identity_key_repository;
 pub mod entity_merge_repository;
 pub mod entity_repository;
 pub mod event_repository;
+pub mod fake_embedding_repair;
 pub mod identity_candidate_repository;
 pub mod media_asset_repository;
 pub mod rel_repository;

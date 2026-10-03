@@ -1815,6 +1815,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fake_embedding_purge_clears_ramp_name_embeddings_only() {
+        use elephant_embeddings::{EmbeddingProvider, FakeEmbeddingProvider};
+
+        let db_id = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let client = StorageClient::new(StorageConfig {
+            database: format!("entity_repo_test_{db_id}"),
+            ..StorageConfig::default()
+        })
+        .await
+        .unwrap();
+        client.query(ENTITY_SCHEMA).await.unwrap();
+        let repo = EntityRepository::new(client.clone());
+        let ramp = FakeEmbeddingProvider::new("text-embedding-3-large", 1200)
+            .embed(&["Ada".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let real: Vec<f32> = (0..1200_u16)
+            .map(|i| (f32::from(i) * 0.37).sin() * 0.03)
+            .collect();
+        let fake_entity = repo.create(create_test_entity("Ada")).await.unwrap();
+        let real_entity = repo.create(create_test_entity("August")).await.unwrap();
+        repo.set_name_embedding(
+            "test_space",
+            &fake_entity.base.id,
+            &ramp,
+            "text-embedding-3-large",
+            "h1",
+        )
+        .await
+        .unwrap();
+        repo.set_name_embedding(
+            "test_space",
+            &real_entity.base.id,
+            &real,
+            "text-embedding-3-large",
+            "h2",
+        )
+        .await
+        .unwrap();
+
+        let report = crate::fake_embedding_repair::purge_fake_embeddings(&client)
+            .await
+            .unwrap();
+        assert_eq!(report.entity_names_cleared, 1, "{report:?}");
+
+        let mut response = client
+            .query("SELECT display_name, name_embedding_model FROM entity ORDER BY display_name")
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = response.take(0).unwrap();
+        assert_eq!(rows[0]["display_name"], "Ada");
+        assert!(rows[0]
+            .get("name_embedding_model")
+            .is_none_or(serde_json::Value::is_null));
+        assert_eq!(rows[1]["name_embedding_model"], "text-embedding-3-large");
+    }
+
+    #[tokio::test]
     async fn test_create_entity() {
         let repo = setup_test_repo().await;
         let entity = create_test_entity("John Doe");

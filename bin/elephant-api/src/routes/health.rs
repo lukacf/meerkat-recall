@@ -7,7 +7,7 @@ use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use elephant_embeddings::{EmbeddingProvider, FakeEmbeddingProvider, OpenAIEmbeddingProvider};
+use elephant_embeddings::{EmbeddingProvider, FakeEmbeddingProvider};
 use elephant_storage::{StorageBackendKind, StorageClient, StorageResult};
 use elephant_types::records::base::{Security, SubjectsState};
 
@@ -127,18 +127,14 @@ impl HealthState {
     /// Creates new health state with an abstracted storage dependency.
     #[must_use]
     pub fn new_with_storage(storage: Arc<dyn StorageHealth>, authz: AuthzState) -> Self {
+        // The provider the deployment actually embeds with, so health reports
+        // an unavailable provider instead of a healthy fake one.
         let embedding_provider: Arc<dyn EmbeddingProvider> = if cfg!(test) {
             Arc::new(FakeEmbeddingProvider::default())
-        } else if matches!(
-            std::env::var("ELEPHANT_EMBEDDINGS_PROVIDER"),
-            Ok(v) if v == "openai"
-        ) {
-            match OpenAIEmbeddingProvider::from_env() {
-                Ok(provider) => Arc::new(provider),
-                Err(_) => Arc::new(FakeEmbeddingProvider::default()),
-            }
         } else {
-            Arc::new(FakeEmbeddingProvider::default())
+            elephant_embeddings::provider_for_policy(
+                &elephant_embeddings::EmbeddingPolicy::from_env(),
+            )
         };
 
         Self {

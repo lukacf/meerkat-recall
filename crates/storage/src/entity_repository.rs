@@ -1316,13 +1316,17 @@ impl EntityRepository {
             return Ok(candidates);
         }
 
+        // Entities with no embedding come first: the window is a fixed
+        // ORDER BY id prefix, so without this an entity past the first
+        // `limit` ids whose embedding was cleared would never be refilled.
         let query = format!(
             "SELECT id, display_name, \
              IF aliases IS NOT NONE THEN aliases ELSE [] END AS aliases, \
              summary, name_embedding_model, name_embedding_text_hash, \
-             IF name_embedding IS NOT NONE THEN array::len(name_embedding) ELSE NONE END AS embedding_dims \
+             IF name_embedding IS NOT NONE THEN array::len(name_embedding) ELSE NONE END AS embedding_dims, \
+             IF name_embedding IS NONE THEN 0 ELSE 1 END AS embedded \
              FROM entity WHERE space_id = $space_id AND deleted_at IS NONE AND status != 'merged' \
-             ORDER BY id LIMIT {limit}"
+             ORDER BY embedded ASC, id ASC LIMIT {limit}"
         );
 
         let mut response = self
@@ -1871,6 +1875,29 @@ mod tests {
             .get("name_embedding_model")
             .is_none_or(serde_json::Value::is_null));
         assert_eq!(rows[1]["name_embedding_model"], "text-embedding-3-large");
+    }
+
+    #[tokio::test]
+    async fn test_embedding_candidates_put_unembedded_entities_first() {
+        let repo = setup_test_repo().await;
+        let mut ids = Vec::new();
+        for name in ["A", "B", "C", "D"] {
+            ids.push(repo.create(create_test_entity(name)).await.unwrap().base.id);
+        }
+        // Embed every entity but one; whichever it is, a window of one must
+        // pick it, or a cleared embedding past the window is never refilled.
+        let missing = ids.pop().unwrap();
+        for id in &ids {
+            repo.set_name_embedding("test_space", id, &[0.1, 0.2], "m", "h")
+                .await
+                .unwrap();
+        }
+        let candidates = repo
+            .list_embedding_candidates("test_space", 1)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].entity_id, missing);
     }
 
     #[tokio::test]

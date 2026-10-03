@@ -124,10 +124,12 @@ impl EmbeddingProviderCache {
     }
 }
 
-/// The provider used when neither a space config nor `PIPELINE_EMBED_PROVIDER`
-/// names one. Never `fake`: that default wrote `FakeEmbeddingProvider` ramps,
-/// labelled as the real model, into a production store for its whole life.
-fn default_provider() -> String {
+/// The provider used when neither a space config nor `PIPELINE_EMBED_PROVIDER` names one.
+///
+/// Never `fake`: that default wrote `FakeEmbeddingProvider` ramps, labelled as
+/// the real model, into a production store for its whole life.
+#[must_use]
+pub fn default_provider() -> String {
     #[cfg(feature = "fastembed")]
     {
         "fastembed".to_string()
@@ -147,7 +149,9 @@ fn default_provider() -> String {
     }
 }
 
-fn default_model_for(provider: &str) -> String {
+/// The default model for a provider.
+#[must_use]
+pub fn default_model_for(provider: &str) -> String {
     match provider {
         "fastembed" => "bge-small-en-v1.5".to_string(),
         "hashed" => "hashed-bow-v1".to_string(),
@@ -155,7 +159,9 @@ fn default_model_for(provider: &str) -> String {
     }
 }
 
-fn default_dims_for(provider: &str, model: &str) -> usize {
+/// The default embedding dimensions for a provider and model.
+#[must_use]
+pub fn default_dims_for(provider: &str, model: &str) -> usize {
     if provider == "fastembed" {
         #[cfg(feature = "fastembed")]
         {

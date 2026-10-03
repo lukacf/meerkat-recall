@@ -119,7 +119,8 @@ const fn default_db_backend() -> StorageBackendKind {
 }
 
 fn default_embed_provider() -> String {
-    "fake".to_string()
+    // Never "fake": see elephant_embeddings::policy::default_provider.
+    elephant_embeddings::policy::default_provider()
 }
 
 /// Embed worker configuration.

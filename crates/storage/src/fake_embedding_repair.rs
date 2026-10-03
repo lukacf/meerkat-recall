@@ -20,7 +20,9 @@ use crate::client::StorageClient;
 use crate::error::{StorageError, StorageResult};
 
 const BATCH: usize = 500;
-const MARKER: &str = "elephant_maintenance:fake_embedding_purge_v1";
+// A migration_history record: that table is declared by 001_init and on the
+// storage allowlist (an unknown table breaks entity merges).
+const MARKER: &str = "migration_history:fake_embedding_purge_v1";
 
 /// What one purge pass removed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -52,7 +54,7 @@ fn ramp_condition(field: &str) -> String {
             .join(" AND ")
     };
     format!(
-        "({field} IS NOT NONE AND array::len({field}) > 104 AND (({}) OR ({})))",
+        "(type::is::array({field}) AND array::len({field}) > 104 AND (({}) OR ({})))",
         window(0),
         window(100)
     )
@@ -82,7 +84,58 @@ fn take<T: serde::de::DeserializeOwned>(
         .map_err(|e| StorageError::QueryError(format!("Failed to parse {what}: {e}")))
 }
 
-async fn purge_partition(client: &StorageClient, table: &str) -> StorageResult<usize> {
+#[derive(Debug, Deserialize)]
+struct CountRow {
+    total: usize,
+}
+
+async fn count(client: &StorageClient, sql: &str) -> StorageResult<usize> {
+    let rows: Vec<CountRow> = take(client.query_checked(sql).await?, "count")?;
+    Ok(rows.first().map_or(0, |row| row.total))
+}
+
+async fn purge_partition(
+    client: &StorageClient,
+    key: &elephant_embeddings::PartitionKey,
+) -> StorageResult<usize> {
+    let table = key.table_name();
+    let total = count(
+        client,
+        &format!("SELECT count() AS total FROM {table} GROUP ALL"),
+    )
+    .await?;
+    let ramps = count(
+        client,
+        &format!(
+            "SELECT count() AS total FROM {table} WHERE {} GROUP ALL",
+            ramp_condition("vector")
+        ),
+    )
+    .await?;
+    if ramps == 0 {
+        return Ok(0);
+    }
+    // Every delete also unlinks the row from the HNSW graph, which costs a
+    // neighbour search per edge over 3072-dim vectors. When most rows are
+    // fake (a whole store of them, in practice) drop the index, delete, and
+    // rebuild it over what remains. The DDL below always runs, so a purge
+    // interrupted between REMOVE and DEFINE restores the index on the next
+    // pass (the completion marker is only written after every partition).
+    if ramps * 2 >= total {
+        client
+            .query_checked(&format!(
+                "REMOVE INDEX IF EXISTS {table}_hnsw ON TABLE {table}"
+            ))
+            .await?;
+    }
+    let deleted = delete_ramps(client, &table).await?;
+    client
+        .query_checked(&elephant_embeddings::PartitionManager::create_partition_ddl(key))
+        .await?;
+    Ok(deleted)
+}
+
+async fn delete_ramps(client: &StorageClient, table: &str) -> StorageResult<usize> {
     let select = format!(
         "SELECT id, node FROM {table} WHERE {} LIMIT {BATCH}",
         ramp_condition("vector")
@@ -162,19 +215,17 @@ pub async fn purge_fake_embeddings(client: &StorageClient) -> StorageResult<Fake
     }
 
     let mut report = FakeEmbeddingPurge::default();
-    let mut tables: Vec<String> = client
+    let mut keys: Vec<elephant_embeddings::PartitionKey> = client
         .list_tables()
         .await?
         .into_iter()
-        .filter(|table| {
-            table.starts_with("emb__")
-                && elephant_embeddings::PartitionKey::from_table_name(table).is_ok()
-        })
+        .filter(|table| table.starts_with("emb__"))
+        .filter_map(|table| elephant_embeddings::PartitionKey::from_table_name(&table).ok())
         .collect();
-    tables.sort();
-    for table in tables {
-        let deleted = purge_partition(client, &table).await?;
-        report.partitions.push((table, deleted));
+    keys.sort_by_key(elephant_embeddings::PartitionKey::table_name);
+    for key in keys {
+        let deleted = purge_partition(client, &key).await?;
+        report.partitions.push((key.table_name(), deleted));
     }
     report.entity_names_cleared = clear_entity_field(
         client,
@@ -190,7 +241,10 @@ pub async fn purge_fake_embeddings(client: &StorageClient) -> StorageResult<Fake
     )
     .await?;
     client
-        .query_checked(&format!("UPSERT {MARKER} SET completed_at = time::now()"))
+        .query_checked(&format!(
+            "UPSERT {MARKER} SET name = 'fake_embedding_purge_v1', \
+             applied_at = time::now(), checksum = 'fake-embedding-ramp-v1'"
+        ))
         .await?;
     Ok(report)
 }
@@ -202,6 +256,7 @@ mod tests {
     #[test]
     fn ramp_condition_checks_two_separated_windows_with_a_length_guard() {
         let condition = ramp_condition("vector");
+        assert!(condition.contains("type::is::array(vector)"));
         assert!(condition.contains("array::len(vector) > 104"));
         assert!(condition.contains("vector[1] - vector[0]"));
         assert!(condition.contains("vector[101] - vector[100]"));

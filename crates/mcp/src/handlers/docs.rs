@@ -1182,11 +1182,14 @@ impl ToolHandler for SearchDocsHandler {
             let mut best_scores: HashMap<RecordId, f64> = HashMap::new();
             let mut had_partition_error = false;
             let mut may_have_more = false;
+            // Highest "lowest returned score" across partitions that filled
+            // their window: no unseen chunk anywhere can score above it.
+            let mut full_partition_floor: Option<f64> = None;
 
             for key in &keys {
                 match self
                     .embedding_repo
-                    .search_partition(
+                    .search_partition_window(
                         key,
                         &space_id,
                         &vector,
@@ -1196,9 +1199,12 @@ impl ToolHandler for SearchDocsHandler {
                     )
                     .await
                 {
-                    Ok(part_hits) => {
-                        may_have_more |= part_hits.len() == candidate_limit;
-                        for hit in part_hits {
+                    Ok(window) => {
+                        if window.full {
+                            may_have_more = true;
+                            full_partition_floor = window.raise_floor(full_partition_floor);
+                        }
+                        for hit in window.hits {
                             best_scores
                                 .entry(hit.doc_id)
                                 .and_modify(|score| {
@@ -1262,6 +1268,7 @@ impl ToolHandler for SearchDocsHandler {
                     .then_with(|| left.0.to_string().cmp(&right.0.to_string()))
             });
             let ordered_ids: Vec<RecordId> = doc_ids.iter().map(|(id, _)| id.clone()).collect();
+            let doc_scores: HashMap<RecordId, f64> = doc_ids.iter().cloned().collect();
 
             let docs = self
                 .doc_repo
@@ -1282,11 +1289,23 @@ impl ToolHandler for SearchDocsHandler {
                 .authz
                 .filter_records(&ctx.principal, docs, "read:doc:metadata");
 
-            // Enough visible documents ends the search. Without the `k` check
-            // a partition that keeps filling its candidate window (every large
-            // one does, since nearest-neighbour search always returns the full
-            // window) doubled the window until it had read the whole partition.
-            if !may_have_more || docs.len() >= input.k {
+            // Without a settled check a partition that keeps filling its
+            // candidate window (every large one does, since nearest-neighbour
+            // search always returns the full window) doubled the window until
+            // it had read the whole partition.
+            let kth_visible_score = input
+                .k
+                .checked_sub(1)
+                .and_then(|index| docs.get(index))
+                .and_then(|doc| doc_scores.get(&doc.base.id).copied());
+            if !may_have_more
+                || elephant_storage::semantic_window_settled(
+                    docs.len(),
+                    input.k,
+                    kth_visible_score,
+                    full_partition_floor,
+                )
+            {
                 let semantic_total = docs.len();
                 let (docs, total_results, blended_lexical) = blend_semantic_with_lexical_results(
                     &self.doc_repo,

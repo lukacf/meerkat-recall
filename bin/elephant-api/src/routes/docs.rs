@@ -621,7 +621,8 @@ pub struct DocSearchResponse {
     pub cursor: Option<String>,
     /// Whether more results exist.
     pub has_more: bool,
-    /// Total count.
+    /// Total count. Exact for text search; in semantic mode a lower bound
+    /// (the search stops once the requested page is settled).
     pub total: usize,
     /// Retrieval mode used to produce these results.
     pub mode: String,
@@ -972,6 +973,8 @@ enum SemanticExpansionAction {
     ServiceUnavailable,
 }
 
+/// `may_have_more` means a partition filled its window AND the requested page
+/// is not settled yet (see `elephant_storage::semantic_window_settled`).
 const fn semantic_expansion_action(
     had_partition_error: bool,
     may_have_more: bool,
@@ -1153,11 +1156,12 @@ async fn search_docs(
             let mut best_scores: HashMap<RecordId, f64> = HashMap::new();
             let mut had_partition_error = false;
             let mut may_have_more = false;
+            let mut full_partition_floor: Option<f64> = None;
 
             for key in &keys {
                 match state
                     .embedding_repo
-                    .search_partition(
+                    .search_partition_window(
                         key,
                         &space_id,
                         &vector,
@@ -1167,9 +1171,12 @@ async fn search_docs(
                     )
                     .await
                 {
-                    Ok(part_hits) => {
-                        may_have_more |= part_hits.len() == candidate_limit;
-                        for hit in part_hits {
+                    Ok(window) => {
+                        if window.full {
+                            may_have_more = true;
+                            full_partition_floor = window.raise_floor(full_partition_floor);
+                        }
+                        for hit in window.hits {
                             best_scores
                                 .entry(hit.doc_id)
                                 .and_modify(|score| {
@@ -1230,6 +1237,7 @@ async fn search_docs(
                     .then_with(|| left.0.to_string().cmp(&right.0.to_string()))
             });
             let ordered_ids: Vec<RecordId> = doc_ids.iter().map(|(id, _)| id.clone()).collect();
+            let doc_scores: HashMap<RecordId, f64> = doc_ids.iter().cloned().collect();
 
             let docs = state
                 .doc_repo
@@ -1255,10 +1263,24 @@ async fn search_docs(
                 .authz
                 .filter_records(&principal, ordered_docs, DOC_SEARCH_SCOPE);
 
+            // The page needs `offset + limit` documents, plus one more to know
+            // whether a next page exists.
+            let needed = semantic_offset.saturating_add(page_limit).saturating_add(1);
+            let nth_visible_score = needed
+                .checked_sub(1)
+                .and_then(|index| filtered.get(index))
+                .and_then(|doc| doc_scores.get(&doc.base.id).copied());
+            let settled = elephant_storage::semantic_window_settled(
+                filtered.len(),
+                needed,
+                nth_visible_score,
+                full_partition_floor,
+            );
+
             let (filtered, total, cursor, has_more) =
                 semantic_page_metadata(filtered, semantic_offset, page_limit);
 
-            match semantic_expansion_action(had_partition_error, may_have_more) {
+            match semantic_expansion_action(had_partition_error, may_have_more && !settled) {
                 SemanticExpansionAction::ReturnPage => {
                     return Ok(Json(DocSearchResponse {
                         results: filtered,

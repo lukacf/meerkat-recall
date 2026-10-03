@@ -80,6 +80,7 @@ pub use audit_log_repository::AuditLogRepository;
 pub use backend::{MockStorageBackend, StorageBackend, SurrealStorageBackend};
 pub use chunk_embedding_repository::NodeEmbeddingRepository;
 pub use chunk_embedding_repository::NodeEmbeddingVectorHit;
+pub use chunk_embedding_repository::{semantic_window_settled, PartitionWindow};
 pub use client::{StorageBackendKind, StorageClient, StorageConfig};
 pub use doc_repository::DocRepository;
 pub use embedded::{

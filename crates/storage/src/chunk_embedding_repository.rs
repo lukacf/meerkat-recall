@@ -17,6 +17,119 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 use crate::require::required_field;
 
+/// Lower bound on the HNSW candidate list explored per partition search.
+const PARTITION_KNN_MIN_EF: usize = 100;
+
+/// Builds the nearest-neighbour query for one embedding partition.
+///
+/// Every partition table carries a cosine HNSW index on `vector`
+/// (`PartitionManager::create_partition_ddl`). Ranking by
+/// `vector::similarity::cosine` in the projection never consults it: the
+/// planner iterates the whole table and scores every vector, which on a
+/// 3072-dimension production partition outlived the engine deadline and sent
+/// every `search_docs` call to the lexical fallback. The KNN operator selects
+/// candidates through the index, and the remaining conditions are checked
+/// during the graph walk, so rows from other spaces, deleted rows, and zero
+/// vectors do not consume the `limit` slots.
+///
+/// The KNN asks for a few more neighbours than `limit`. Rows with
+/// byte-identical vectors share one graph node, and every row of an accepted
+/// node takes a KNN slot even when some of those rows fail the conditions
+/// and are dropped afterwards. Without the margin a partition could return
+/// fewer than `limit` rows while more matches exist, which callers read as
+/// "partition exhausted". The margin narrows that hole; a chunk with more
+/// failing byte-identical twins than the margin can still take the slots.
+fn partition_knn_query(table: &str, conditions: &[String], limit: usize) -> String {
+    let knn_k = limit.saturating_add((limit / 4).max(8));
+    let ef = knn_k.saturating_mul(4).max(PARTITION_KNN_MIN_EF);
+    let mut predicates = Vec::with_capacity(conditions.len() + 1);
+    predicates.push(format!("vector <|{knn_k},{ef}|> $vector"));
+    predicates.extend(conditions.iter().cloned());
+    format!(
+        "SELECT node, 1 - vector::distance::knn() AS score FROM {table} \
+         WHERE {} ORDER BY score DESC LIMIT {limit}",
+        predicates.join(" AND ")
+    )
+}
+
+/// Whether widening the semantic candidate window can still change the
+/// first `needed` documents.
+///
+/// Every partition that filled its window returned its best chunks, so any
+/// chunk not yet seen scores at most that partition's lowest returned score;
+/// `full_partition_floor` is the highest such floor. Once the `needed`-th
+/// visible document scores at least that floor, no unseen chunk can displace
+/// it (an unseen chunk scoring exactly the floor can tie; ties are broken by
+/// document id, so an exact tie at the boundary may order differently once the
+/// window widens). Counting documents alone is not enough when several partitions are
+/// searched: one partition's window can be filled by a few long documents
+/// while a better document there is still unseen.
+#[must_use]
+pub fn semantic_window_settled(
+    visible_docs: usize,
+    needed: usize,
+    nth_visible_score: Option<f64>,
+    full_partition_floor: Option<f64>,
+) -> bool {
+    if needed == 0 {
+        return true;
+    }
+    if visible_docs < needed {
+        return false;
+    }
+    match (nth_visible_score, full_partition_floor) {
+        (_, None) => true,
+        (Some(nth), Some(floor)) => nth >= floor,
+        (None, Some(_)) => false,
+    }
+}
+
+/// One partition's nearest-neighbour window, as the database returned it.
+///
+/// `full` and `floor` describe the RAW window, before rows whose node no
+/// longer resolves to a document are dropped. Deciding "full" from the
+/// filtered hits would read a window holding one orphan row as exhausted and
+/// let [`semantic_window_settled`] stop while better chunks remain unseen.
+#[derive(Debug, Clone, Default)]
+pub struct PartitionWindow {
+    /// Hits that resolve to a document.
+    pub hits: Vec<NodeEmbeddingVectorHit>,
+    /// The database returned as many rows as were asked for.
+    pub full: bool,
+    /// Lowest finite score among the raw rows.
+    pub floor: Option<f64>,
+}
+
+impl PartitionWindow {
+    fn from_raw(hits: Vec<NodeEmbeddingVectorHit>, raw_scores: &[f64], limit: usize) -> Self {
+        let floor = raw_scores
+            .iter()
+            .copied()
+            .filter(|score| score.is_finite())
+            .fold(None, |lowest: Option<f64>, score| {
+                Some(lowest.map_or(score, |seen| seen.min(score)))
+            });
+        Self {
+            hits,
+            full: limit > 0 && raw_scores.len() >= limit,
+            floor,
+        }
+    }
+
+    /// Fold this window into the running floor across full partitions.
+    #[must_use]
+    pub const fn raise_floor(&self, floor: Option<f64>) -> Option<f64> {
+        if !self.full {
+            return floor;
+        }
+        match (floor, self.floor) {
+            (Some(seen), Some(own)) => Some(seen.max(own)),
+            (None, own) => own,
+            (seen, None) => seen,
+        }
+    }
+}
+
 /// `NodeEmbedding` repository for `SurrealDB`.
 #[derive(Clone, Debug)]
 pub struct NodeEmbeddingRepository {
@@ -482,6 +595,26 @@ impl NodeEmbeddingRepository {
         collection: Option<&str>,
         include_deleted: bool,
     ) -> StorageResult<Vec<NodeEmbeddingVectorHit>> {
+        self.search_partition_window(key, space_id, vector, limit, collection, include_deleted)
+            .await
+            .map(|window| window.hits)
+    }
+
+    /// Like [`Self::search_partition`], also reporting whether the raw window
+    /// was full and its lowest score (see [`PartitionWindow`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or deserialization fails.
+    pub async fn search_partition_window(
+        &self,
+        key: &PartitionKey,
+        space_id: &str,
+        vector: &[f32],
+        limit: usize,
+        collection: Option<&str>,
+        include_deleted: bool,
+    ) -> StorageResult<PartitionWindow> {
         if let Some(store) = self.client.embedded_store() {
             return store
                 .search_node_embeddings(
@@ -494,13 +627,16 @@ impl NodeEmbeddingRepository {
                 )
                 .await
                 .map(|hits| {
-                    hits.into_iter()
+                    let raw_scores: Vec<f64> = hits.iter().map(|hit| hit.score).collect();
+                    let hits = hits
+                        .into_iter()
                         .map(|hit| NodeEmbeddingVectorHit {
                             node_id: hit.node_id,
                             doc_id: hit.doc_id,
                             score: hit.score,
                         })
-                        .collect()
+                        .collect();
+                    PartitionWindow::from_raw(hits, &raw_scores, limit)
                 });
         }
 
@@ -516,12 +652,7 @@ impl NodeEmbeddingRepository {
         }
         conditions.push("vector_norm > 0".to_string());
 
-        let where_clause = format!("WHERE {}", conditions.join(" AND "));
-
-        let query = format!(
-            "SELECT node, vector::similarity::cosine(vector, $vector) AS score \
-             FROM {table} {where_clause} ORDER BY score DESC LIMIT {limit}"
-        );
+        let query = partition_knn_query(&table, &conditions, limit);
 
         let mut response = self
             .client
@@ -545,6 +676,7 @@ impl NodeEmbeddingRepository {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| StorageError::QueryError(e.to_string()))?;
         let doc_ids_by_node = self.resolve_doc_ids_for_nodes(&node_ids).await?;
+        let raw_scores: Vec<f64> = hits.iter().map(|hit| hit.score).collect();
 
         let mut resolved = Vec::with_capacity(hits.len());
         for hit in hits {
@@ -562,7 +694,7 @@ impl NodeEmbeddingRepository {
             });
         }
 
-        Ok(resolved)
+        Ok(PartitionWindow::from_raw(resolved, &raw_scores, limit))
     }
 
     async fn resolve_doc_ids_for_nodes(
@@ -998,6 +1130,120 @@ mod tests {
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].node_id, expected[5].0);
         assert!((hits[0].score - 1.0).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn test_semantic_window_settles_only_when_unseen_chunks_cannot_win() {
+        use super::semantic_window_settled as settled;
+        // One partition, window full: k docs settle it.
+        assert!(settled(10, 10, Some(0.80), Some(0.80)));
+        // Two partitions: P1's window is filled by three long docs scoring
+        // >= 0.80, P2 adds seven docs near 0.5. The 10th visible doc scores
+        // 0.5 but P1 may still hold a 0.79 doc: widen.
+        assert!(!settled(10, 10, Some(0.5), Some(0.80)));
+        // No partition filled its window: everything was seen.
+        assert!(settled(10, 10, Some(0.1), None));
+        // Too few visible docs while a window is full: widen.
+        assert!(!settled(3, 10, None, Some(0.2)));
+        assert!(settled(0, 0, None, Some(0.9)));
+    }
+
+    #[test]
+    fn test_window_fullness_and_floor_come_from_the_raw_rows() {
+        use super::PartitionWindow;
+        let hit = |score| NodeEmbeddingVectorHit {
+            node_id: RecordId::new_v4(TableName::DocNode),
+            doc_id: RecordId::new_v4(TableName::Doc),
+            score,
+        };
+        // Three raw rows, one orphan dropped: still a full window of 3.
+        let window = PartitionWindow::from_raw(vec![hit(0.9), hit(0.7)], &[0.9, 0.8, 0.7], 3);
+        assert!(window.full);
+        assert_eq!(window.floor, Some(0.7));
+        assert_eq!(window.raise_floor(Some(0.75)), Some(0.75));
+        assert_eq!(window.raise_floor(Some(0.6)), Some(0.7));
+        let short = PartitionWindow::from_raw(vec![hit(0.9)], &[0.9], 3);
+        assert!(!short.full);
+        assert_eq!(short.raise_floor(Some(0.5)), Some(0.5));
+        assert!(!PartitionWindow::from_raw(Vec::new(), &[], 0).full);
+    }
+
+    #[tokio::test]
+    async fn test_partition_vector_search_plan_uses_the_hnsw_index() {
+        let client = StorageClient::new_memory()
+            .await
+            .expect("SurrealDB memory client");
+        let key = PartitionKey::new(
+            "default".to_string(),
+            "L0".to_string(),
+            "test-model".to_string(),
+            3,
+        )
+        .expect("partition key");
+        let table = key.table_name();
+        client
+            .query_checked(&PartitionManager::create_partition_ddl(&key))
+            .await
+            .expect("partition ddl");
+        let conditions = vec![
+            "space_id = $space_id".to_string(),
+            "deleted_at IS NONE".to_string(),
+            "vector_norm > 0".to_string(),
+        ];
+        let query = super::partition_knn_query(&table, &conditions, 10);
+        let mut response = client
+            .query_bind(
+                &format!("{query} EXPLAIN"),
+                crate::bindings! {
+                    "space_id" => "space",
+                    "vector" => surrealdb::sql::Value::Array(surrealdb::sql::Array::from(vec![1.0_f32, 0.0, 0.0]))
+                },
+            )
+            .await
+            .expect("explain partition search");
+        let plan: Vec<serde_json::Value> = response.take(0).expect("explain projection");
+        let rendered = serde_json::to_string(&plan).expect("render plan");
+        println!("partition search plan: {rendered}");
+        assert!(
+            !rendered.contains("Iterate Table"),
+            "partition search scans the table instead of the HNSW index: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("{table}_hnsw")),
+            "partition search does not name the partition HNSW index: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_orphan_rows_still_count_toward_a_full_window() {
+        let client = StorageClient::new_memory()
+            .await
+            .expect("SurrealDB memory client");
+        let repo = NodeEmbeddingRepository::new(client, PartitionManager::new());
+        let key = PartitionKey::new(
+            "default".to_string(),
+            "L0".to_string(),
+            "test-model".to_string(),
+            3,
+        )
+        .expect("partition key");
+        // An embedding whose node was never created: it can rank first but
+        // resolves to no document.
+        let orphan_node = RecordId::new_v4(TableName::DocNode);
+        let mut embedding = make_test_embedding("space", &orphan_node);
+        embedding.vector = vec![1.0, 0.0, 0.0];
+        repo.store_embedding(embedding).await.expect("store orphan");
+
+        let window = repo
+            .search_partition_window(&key, "space", &[1.0, 0.0, 0.0], 1, None, false)
+            .await
+            .expect("window");
+        assert!(window.hits.is_empty(), "the orphan resolves to no document");
+        assert!(
+            window.full,
+            "but the raw window was full: more may lie beyond it"
+        );
+        assert!(window.floor.is_some());
     }
 
     #[tokio::test]

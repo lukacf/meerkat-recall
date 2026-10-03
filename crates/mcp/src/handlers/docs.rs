@@ -917,7 +917,8 @@ pub struct DocFilters {
 pub struct SearchDocsOutput {
     /// Search results with scores.
     pub items: Vec<DocSearchResult>,
-    /// Total results available.
+    /// Visible results counted. Lexical counting stops once `k` documents are
+    /// collected, so this is a lower bound when more matches exist.
     pub total: usize,
     /// Search mode actually used to produce the results.
     pub mode: String,
@@ -1181,11 +1182,14 @@ impl ToolHandler for SearchDocsHandler {
             let mut best_scores: HashMap<RecordId, f64> = HashMap::new();
             let mut had_partition_error = false;
             let mut may_have_more = false;
+            // Highest "lowest returned score" across partitions that filled
+            // their window: no unseen chunk anywhere can score above it.
+            let mut full_partition_floor: Option<f64> = None;
 
             for key in &keys {
                 match self
                     .embedding_repo
-                    .search_partition(
+                    .search_partition_window(
                         key,
                         &space_id,
                         &vector,
@@ -1195,9 +1199,12 @@ impl ToolHandler for SearchDocsHandler {
                     )
                     .await
                 {
-                    Ok(part_hits) => {
-                        may_have_more |= part_hits.len() == candidate_limit;
-                        for hit in part_hits {
+                    Ok(window) => {
+                        if window.full {
+                            may_have_more = true;
+                            full_partition_floor = window.raise_floor(full_partition_floor);
+                        }
+                        for hit in window.hits {
                             best_scores
                                 .entry(hit.doc_id)
                                 .and_modify(|score| {
@@ -1261,6 +1268,7 @@ impl ToolHandler for SearchDocsHandler {
                     .then_with(|| left.0.to_string().cmp(&right.0.to_string()))
             });
             let ordered_ids: Vec<RecordId> = doc_ids.iter().map(|(id, _)| id.clone()).collect();
+            let doc_scores: HashMap<RecordId, f64> = doc_ids.iter().cloned().collect();
 
             let docs = self
                 .doc_repo
@@ -1281,7 +1289,23 @@ impl ToolHandler for SearchDocsHandler {
                 .authz
                 .filter_records(&ctx.principal, docs, "read:doc:metadata");
 
-            if !may_have_more {
+            // Without a settled check a partition that keeps filling its
+            // candidate window (every large one does, since nearest-neighbour
+            // search always returns the full window) doubled the window until
+            // it had read the whole partition.
+            let kth_visible_score = input
+                .k
+                .checked_sub(1)
+                .and_then(|index| docs.get(index))
+                .and_then(|doc| doc_scores.get(&doc.base.id).copied());
+            if !may_have_more
+                || elephant_storage::semantic_window_settled(
+                    docs.len(),
+                    input.k,
+                    kth_visible_score,
+                    full_partition_floor,
+                )
+            {
                 let semantic_total = docs.len();
                 let (docs, total_results, blended_lexical) = blend_semantic_with_lexical_results(
                     &self.doc_repo,
@@ -1607,7 +1631,14 @@ async fn collect_visible_text_search_results(
             }
         }
 
-        if !result.has_more {
+        // Stop as soon as the caller's k visible documents are in hand. Every
+        // page re-runs the ranked BM25 query at a growing offset plus a count
+        // query, so walking every match only to count it was quadratic in the
+        // match count: a common term over the production corpus took 30-70 s.
+        // The reported total is therefore the visible count seen so far, a
+        // lower bound once more pages remain. The repository count is not used
+        // instead because it is taken before authorization filtering.
+        if !result.has_more || visible_docs.len() >= k {
             break;
         }
 
@@ -5971,6 +6002,64 @@ mod tests {
 
     async fn setup_restamp_embedded_storage() -> StorageClient {
         StorageClient::new_embedded().await.expect("storage")
+    }
+
+    #[tokio::test]
+    async fn test_lexical_search_stops_paging_once_k_visible_docs_are_found() {
+        // A common term must not walk every match: each extra page re-runs the
+        // ranked query at a larger offset. 60 matches, k = 5: one page of 25.
+        let storage = StorageClient::new_memory().await.expect("storage");
+        let doc_repo = DocRepository::new(storage.clone());
+        for index in 0..60 {
+            doc_repo
+                .create(restamp_doc(&format!("rabbit {index}"), json!({})))
+                .await
+                .expect("create doc");
+        }
+        let ctx = restamp_ctx(&storage);
+
+        let (docs, total) = collect_visible_text_search_results(
+            &doc_repo,
+            &ctx,
+            "test_space",
+            "rabbit",
+            5,
+            false,
+            None,
+        )
+        .await
+        .expect("lexical search");
+
+        assert_eq!(docs.len(), 5);
+        assert_eq!(total, 25, "counting stopped after the first page");
+
+        let (docs, total) = collect_visible_text_search_results(
+            &doc_repo,
+            &ctx,
+            "test_space",
+            "rabbit",
+            40,
+            false,
+            None,
+        )
+        .await
+        .expect("lexical search with a larger k");
+        assert_eq!(docs.len(), 40, "the page size follows k");
+        assert_eq!(total, 40);
+
+        let (docs, total) = collect_visible_text_search_results(
+            &doc_repo,
+            &ctx,
+            "test_space",
+            "rabbit",
+            100,
+            false,
+            None,
+        )
+        .await
+        .expect("lexical search past the last match");
+        assert_eq!(docs.len(), 60, "every match when k exceeds them");
+        assert_eq!(total, 60);
     }
 
     fn restamp_ctx(storage: &StorageClient) -> ToolContext {

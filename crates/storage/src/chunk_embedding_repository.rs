@@ -17,6 +17,32 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 use crate::require::required_field;
 
+/// Lower bound on the HNSW candidate list explored per partition search.
+const PARTITION_KNN_MIN_EF: usize = 100;
+
+/// Builds the nearest-neighbour query for one embedding partition.
+///
+/// Every partition table carries a cosine HNSW index on `vector`
+/// (`PartitionManager::create_partition_ddl`). Ranking by
+/// `vector::similarity::cosine` in the projection never consults it: the
+/// planner iterates the whole table and scores every vector, which on a
+/// 3072-dimension production partition outlived the engine deadline and sent
+/// every `search_docs` call to the lexical fallback. The KNN operator selects
+/// candidates through the index, and the remaining conditions are checked
+/// during the graph walk, so rows from other spaces, deleted rows, and zero
+/// vectors do not consume the `limit` slots.
+fn partition_knn_query(table: &str, conditions: &[String], limit: usize) -> String {
+    let ef = limit.saturating_mul(4).max(PARTITION_KNN_MIN_EF);
+    let mut predicates = Vec::with_capacity(conditions.len() + 1);
+    predicates.push(format!("vector <|{limit},{ef}|> $vector"));
+    predicates.extend(conditions.iter().cloned());
+    format!(
+        "SELECT node, 1 - vector::distance::knn() AS score FROM {table} \
+         WHERE {} ORDER BY score DESC LIMIT {limit}",
+        predicates.join(" AND ")
+    )
+}
+
 /// `NodeEmbedding` repository for `SurrealDB`.
 #[derive(Clone, Debug)]
 pub struct NodeEmbeddingRepository {
@@ -516,12 +542,7 @@ impl NodeEmbeddingRepository {
         }
         conditions.push("vector_norm > 0".to_string());
 
-        let where_clause = format!("WHERE {}", conditions.join(" AND "));
-
-        let query = format!(
-            "SELECT node, vector::similarity::cosine(vector, $vector) AS score \
-             FROM {table} {where_clause} ORDER BY score DESC LIMIT {limit}"
-        );
+        let query = partition_knn_query(&table, &conditions, limit);
 
         let mut response = self
             .client
@@ -998,6 +1019,52 @@ mod tests {
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].node_id, expected[5].0);
         assert!((hits[0].score - 1.0).abs() < 0.000_001);
+    }
+
+    #[tokio::test]
+    async fn test_partition_vector_search_plan_uses_the_hnsw_index() {
+        let client = StorageClient::new_memory()
+            .await
+            .expect("SurrealDB memory client");
+        let key = PartitionKey::new(
+            "default".to_string(),
+            "L0".to_string(),
+            "test-model".to_string(),
+            3,
+        )
+        .expect("partition key");
+        let table = key.table_name();
+        client
+            .query_checked(&PartitionManager::create_partition_ddl(&key))
+            .await
+            .expect("partition ddl");
+        let conditions = vec![
+            "space_id = $space_id".to_string(),
+            "deleted_at IS NONE".to_string(),
+            "vector_norm > 0".to_string(),
+        ];
+        let query = super::partition_knn_query(&table, &conditions, 10);
+        let mut response = client
+            .query_bind(
+                &format!("{query} EXPLAIN"),
+                crate::bindings! {
+                    "space_id" => "space",
+                    "vector" => surrealdb::sql::Value::Array(surrealdb::sql::Array::from(vec![1.0_f32, 0.0, 0.0]))
+                },
+            )
+            .await
+            .expect("explain partition search");
+        let plan: Vec<serde_json::Value> = response.take(0).expect("explain projection");
+        let rendered = serde_json::to_string(&plan).expect("render plan");
+        println!("partition search plan: {rendered}");
+        assert!(
+            !rendered.contains("Iterate Table"),
+            "partition search scans the table instead of the HNSW index: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("{table}_hnsw")),
+            "partition search does not name the partition HNSW index: {rendered}"
+        );
     }
 
     #[tokio::test]

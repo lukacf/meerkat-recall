@@ -824,30 +824,41 @@ mod tests {
                             .collect();
                         recorded.lock().unwrap().push(lengths.clone());
                         let total: usize = lengths.iter().sum();
-                        let (status, payload) = if total > request_limit {
-                            (
+                        let too_long = lengths.iter().position(|length| *length > input_limit);
+                        let (status, payload) = match (total > request_limit, too_long) {
+                            (true, _) => (
                                 "400 Bad Request",
-                                serde_json::json!({"error": {"type": "invalid_request_error", "message": format!(
-                                    "Requested {total} tokens, max 300000 tokens per request"
-                                )}}),
-                            )
-                        } else if let Some(index) =
-                            lengths.iter().position(|length| *length > input_limit)
-                        {
-                            (
+                                serde_json::json!({"error": {
+                                    "type": "invalid_request_error",
+                                    "message": format!(
+                                        "Requested {total} tokens, max 300000 tokens per request"
+                                    )
+                                }}),
+                            ),
+                            (false, Some(index)) => (
                                 "400 Bad Request",
-                                serde_json::json!({"error": {"type": "invalid_request_error", "message": format!(
-                                    "Invalid 'input[{index}]': maximum input length is 8192 tokens."
-                                )}}),
-                            )
-                        } else {
-                            let data: Vec<serde_json::Value> = (0..lengths.len())
-                                .map(|index| serde_json::json!({"index": index, "embedding": [0.5, 0.5]}))
-                                .collect();
-                            (
-                                "200 OK",
-                                serde_json::json!({"data": data, "usage": {"total_tokens": total}}),
-                            )
+                                serde_json::json!({"error": {
+                                    "type": "invalid_request_error",
+                                    "message": format!(
+                                        "Invalid 'input[{index}]': maximum input length is 8192 tokens."
+                                    )
+                                }}),
+                            ),
+                            (false, None) => {
+                                let data: Vec<serde_json::Value> = (0..lengths.len())
+                                    .map(|index| {
+                                        serde_json::json!({"index": index, "embedding": [0.5, 0.5]})
+                                    })
+                                    .collect();
+                                (
+                                    "200 OK",
+                                    serde_json::json!({
+                                        "data": data,
+                                        "model": "text-embedding-3-large",
+                                        "usage": {"prompt_tokens": total, "total_tokens": total}
+                                    }),
+                                )
+                            }
                         };
                         let payload = payload.to_string();
                         let response = format!(

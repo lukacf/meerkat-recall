@@ -17,8 +17,8 @@ use tracing::warn;
 
 use elephant_embeddings::EmbeddingProviderCache;
 use elephant_storage::{
-    is_source_inventory_entity, parse_id, EntityRepository, Repository, SearchCriteria,
-    SearchRepository, SpaceConfigRepository, StorageClient,
+    is_source_inventory_entity, parse_id, EntityRepository, EntityVectorCache, Repository,
+    SearchCriteria, SearchRepository, SpaceConfigRepository, StorageClient,
 };
 use elephant_types::ids::TableName;
 use elephant_types::mcp_simple::CreateEntitySimpleInput;
@@ -186,6 +186,7 @@ pub struct SearchEntitiesHandler {
     repo: EntityRepository,
     space_config_repo: SpaceConfigRepository,
     provider_cache: EmbeddingProviderCache,
+    entity_vectors: EntityVectorCache,
 }
 
 impl SearchEntitiesHandler {
@@ -206,6 +207,7 @@ impl SearchEntitiesHandler {
             repo: EntityRepository::new(storage.clone()),
             space_config_repo: SpaceConfigRepository::new(storage),
             provider_cache,
+            entity_vectors: EntityVectorCache::new(),
         }
     }
 
@@ -249,7 +251,12 @@ impl SearchEntitiesHandler {
 
         let hits = match self
             .repo
-            .vector_search_entities(space_id, &vector, limit.saturating_mul(2).clamp(10, 50))
+            .vector_search_entities_cached(
+                &self.entity_vectors,
+                space_id,
+                &vector,
+                limit.saturating_mul(2).clamp(10, 50),
+            )
             .await
         {
             Ok(hits) => hits,

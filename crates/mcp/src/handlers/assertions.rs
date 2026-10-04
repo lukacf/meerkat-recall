@@ -980,30 +980,30 @@ impl SearchAssertionsHandler {
             .map(|entity| (entity.base.id.clone(), entity))
             .collect();
         for id in wanted {
-            let cached = match found.get(&id) {
+            let cached = found.get(&id).map_or(
                 // Dangling link: visible (unattributed), as in resolve_entity_link.
-                None => CachedEntityLink {
+                CachedEntityLink {
                     redirect: None,
                     attributed: true,
                 },
-                Some(entity) => {
-                    let survivor = entity
-                        .is_merged()
-                        .then(|| entity.redirect_to.as_ref())
-                        .flatten()
-                        .and_then(|link| survivors.get(link.id()));
-                    match survivor {
-                        Some(survivor) => CachedEntityLink {
-                            redirect: Some(survivor.base.id.clone()),
-                            attributed: entity_passes_attribution(survivor, attributed_to),
-                        },
-                        None => CachedEntityLink {
-                            redirect: None,
-                            attributed: entity_passes_attribution(entity, attributed_to),
-                        },
-                    }
-                }
-            };
+                |entity| {
+                    entity
+                        .redirect_to
+                        .as_ref()
+                        .filter(|_| entity.is_merged())
+                        .and_then(|link| survivors.get(link.id()))
+                        .map_or_else(
+                            || CachedEntityLink {
+                                redirect: None,
+                                attributed: entity_passes_attribution(entity, attributed_to),
+                            },
+                            |survivor| CachedEntityLink {
+                                redirect: Some(survivor.base.id.clone()),
+                                attributed: entity_passes_attribution(survivor, attributed_to),
+                            },
+                        )
+                },
+            );
             entity_link_cache.insert(id, cached);
         }
         Ok(())

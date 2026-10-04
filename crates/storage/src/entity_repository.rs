@@ -80,12 +80,12 @@ struct EntityVectorSnapshot {
 /// Owned by a long-lived search handler; clones share the snapshots.
 #[derive(Clone, Default)]
 pub struct EntityVectorCache {
-    snapshots: std::sync::Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<(String, usize), std::sync::Arc<EntityVectorSnapshot>>,
-        >,
-    >,
+    snapshots: std::sync::Arc<tokio::sync::Mutex<EntityVectorSnapshots>>,
 }
+
+/// Snapshots keyed by space and vector dimension.
+type EntityVectorSnapshots =
+    std::collections::HashMap<(String, usize), std::sync::Arc<EntityVectorSnapshot>>;
 
 impl EntityVectorCache {
     /// Creates an empty cache.
@@ -93,6 +93,25 @@ impl EntityVectorCache {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+/// The `limit` entities in `snapshot` closest to `embedding`, best first.
+fn rank_entity_vectors(
+    snapshot: &EntityVectorSnapshot,
+    embedding: &[f32],
+    limit: usize,
+) -> Vec<EntitySearchHit> {
+    let mut hits: Vec<EntitySearchHit> = snapshot
+        .rows
+        .iter()
+        .map(|(entity_id, vector)| EntitySearchHit {
+            entity_id: entity_id.clone(),
+            score: cosine_similarity(vector, embedding),
+        })
+        .collect();
+    hits.sort_by(|left, right| right.score.total_cmp(&left.score));
+    hits.truncate(limit);
+    hits
 }
 
 /// Lightweight view of an entity for the embedding sweep.
@@ -1262,34 +1281,24 @@ impl EntityRepository {
                 .await;
         }
         let key = (space_id.to_string(), embedding.len());
-        let mut snapshots = cache.snapshots.lock().await;
-        let fresh = snapshots
+        let fresh = cache
+            .snapshots
+            .lock()
+            .await
             .get(&key)
             .filter(|snapshot| snapshot.loaded_at.elapsed() < ENTITY_VECTOR_SNAPSHOT_TTL)
             .cloned();
-        let snapshot = if let Some(snapshot) = fresh {
-            snapshot
-        } else {
-            let snapshot = std::sync::Arc::new(EntityVectorSnapshot {
-                loaded_at: std::time::Instant::now(),
-                rows: self.load_entity_vectors(space_id, embedding.len()).await?,
-            });
-            snapshots.insert(key, snapshot.clone());
-            snapshot
-        };
-        drop(snapshots);
-
-        let mut hits: Vec<EntitySearchHit> = snapshot
-            .rows
-            .iter()
-            .map(|(entity_id, vector)| EntitySearchHit {
-                entity_id: entity_id.clone(),
-                score: cosine_similarity(vector, embedding),
-            })
-            .collect();
-        hits.sort_by(|left, right| right.score.total_cmp(&left.score));
-        hits.truncate(limit);
-        Ok(hits)
+        if let Some(snapshot) = fresh {
+            return Ok(rank_entity_vectors(&snapshot, embedding, limit));
+        }
+        // Loaded without holding the lock: a concurrent miss may load twice,
+        // which is cheaper than serialising every search behind the load.
+        let snapshot = std::sync::Arc::new(EntityVectorSnapshot {
+            loaded_at: std::time::Instant::now(),
+            rows: self.load_entity_vectors(space_id, embedding.len()).await?,
+        });
+        cache.snapshots.lock().await.insert(key, snapshot.clone());
+        Ok(rank_entity_vectors(&snapshot, embedding, limit))
     }
 
     /// Live entity vectors of one dimension in a space, for the snapshot.

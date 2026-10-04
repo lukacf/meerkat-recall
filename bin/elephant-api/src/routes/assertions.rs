@@ -852,7 +852,7 @@ async fn update_resolution(
     }
 }
 
-fn assertion_write_forbidden(error: crate::authz::AuthzError) -> (StatusCode, Json<ApiError>) {
+fn assertion_forbidden(error: crate::authz::AuthzError) -> (StatusCode, Json<ApiError>) {
     (
         StatusCode::FORBIDDEN,
         Json(ApiError {
@@ -884,7 +884,7 @@ async fn delete_assertion(
             state
                 .authz
                 .authorize_record_write(&principal, &existing, "write:assertion")
-                .map_err(assertion_write_forbidden)?;
+                .map_err(assertion_forbidden)?;
             state
                 .assertion_repo
                 .delete(&space_id, &rid)
@@ -909,6 +909,9 @@ async fn delete_assertion(
 }
 
 /// POST /v1/assertions/{id}/restore - Restore soft-deleted assertion.
+///
+/// Returns the restored record, so the caller must hold read as well as
+/// write authorization for it; both are checked before anything changes.
 async fn restore_assertion(
     State(state): State<Arc<AssertionsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -926,7 +929,11 @@ async fn restore_assertion(
             state
                 .authz
                 .authorize_record_write(&principal, &existing, "write:assertion")
-                .map_err(assertion_write_forbidden)?;
+                .map_err(assertion_forbidden)?;
+            state
+                .authz
+                .authorize_record_read(&principal, &existing, "read:assertion")
+                .map_err(assertion_forbidden)?;
             state
                 .assertion_repo
                 .restore(&space_id, &rid)

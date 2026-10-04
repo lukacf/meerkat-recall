@@ -319,6 +319,97 @@ mod tests {
         assert_eq!(after_restore.status(), StatusCode::OK);
     }
 
+    async fn mock_write_only_auth(req: Request<Body>, next: Next) -> impl IntoResponse {
+        let mut req = req;
+        req.extensions_mut().insert(AuthPrincipal {
+            subject: "write-only".to_string(),
+            space_id: Some("test_space".to_string()),
+            scopes: vec!["write:assertion".to_string()],
+            security_level: 10,
+            security_labels: vec![],
+            ..AuthPrincipal::default()
+        });
+        next.run(req).await
+    }
+
+    #[tokio::test]
+    async fn test_restore_requires_read_authorization() {
+        let authz = Arc::new(AuthzService::new());
+        let repo = Arc::new(MockAssertionRepository::empty());
+        let state = Arc::new(AssertionsState::new_with_repo(repo, authz));
+        let full = assertion_routes()
+            .layer(middleware::from_fn(mock_auth))
+            .with_state(state.clone());
+        let write_only = assertion_routes()
+            .layer(middleware::from_fn(mock_write_only_auth))
+            .with_state(state);
+        let send = |method: &str, uri: String, body: Body| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap()
+        };
+
+        let deleted = create_test_assertion("Deleted Row", "mentions");
+        let deleted_id = deleted.base.id.to_string();
+        let active = create_test_assertion("Active Row", "mentions");
+        let active_id = active.base.id.to_string();
+        for assertion in [&deleted, &active] {
+            let created = full
+                .clone()
+                .oneshot(send(
+                    "POST",
+                    "/v1/assertions".to_string(),
+                    Body::from(serde_json::to_string(assertion).unwrap()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(created.status(), StatusCode::CREATED);
+        }
+        let removed = full
+            .clone()
+            .oneshot(send(
+                "DELETE",
+                format!("/v1/assertions/{deleted_id}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+
+        // Write scope alone must neither restore nor disclose, deleted or active.
+        for id in [&deleted_id, &active_id] {
+            let response = write_only
+                .clone()
+                .oneshot(send(
+                    "POST",
+                    format!("/v1/assertions/{id}/restore"),
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(!text.contains("Deleted Row") && !text.contains("Active Row"));
+        }
+
+        // No side effect: the deleted row is still deleted.
+        let still_deleted = full
+            .oneshot(send(
+                "GET",
+                format!("/v1/assertions/{deleted_id}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(still_deleted.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn test_search_assertions() {
         let app = setup_test_app().await;

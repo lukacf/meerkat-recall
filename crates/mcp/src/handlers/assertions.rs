@@ -13,8 +13,8 @@ use tracing::warn;
 
 use elephant_embeddings::EmbeddingProviderCache;
 use elephant_storage::{
-    parse_id, AssertionRepository, EntityRepository, Repository, SpaceConfigRepository,
-    StorageClient,
+    parse_id, AssertionRepository, EntityRepository, Repository, SearchCriteria, SearchRepository,
+    SpaceConfigRepository, StorageClient,
 };
 use elephant_types::ids::TableName;
 use elephant_types::records::assertion::{Assertion, ResolutionStatus};
@@ -409,7 +409,12 @@ pub struct SearchAssertionsHandler {
     entity_repo: EntityRepository,
     space_config_repo: SpaceConfigRepository,
     provider_cache: EmbeddingProviderCache,
+    /// Rows the fallback table scan reads at most.
+    scan_window: usize,
 }
+
+/// Default bound on the fallback table scan.
+const DEFAULT_SCAN_WINDOW: usize = 2_000;
 
 impl SearchAssertionsHandler {
     /// Creates a new handler.
@@ -430,7 +435,15 @@ impl SearchAssertionsHandler {
             entity_repo: EntityRepository::new(storage.clone()),
             space_config_repo: SpaceConfigRepository::new(storage),
             provider_cache,
+            scan_window: DEFAULT_SCAN_WINDOW,
         }
+    }
+
+    /// Bounds the fallback table scan (tests shrink it).
+    #[cfg(test)]
+    const fn with_scan_window(mut self, scan_window: usize) -> Self {
+        self.scan_window = scan_window;
+        self
     }
 
     /// Entities semantically close to the text query, best first. Assertions
@@ -654,61 +667,120 @@ impl ToolHandler for SearchAssertionsHandler {
         let query_lower = query.to_lowercase();
         let query_terms = assertion_search_terms(&query_lower);
 
-        // 500-row pages: the text path scans up to `max_scan_records` rows
-        // regardless, so fewer round trips cut its wall clock ~5x.
-        let fetch_limit = 500;
-        let max_scan_records = 2_000;
         let candidate_target = output_limit.saturating_mul(10).clamp(50, 300);
-        let mut scan_cursor: Option<RecordId> = None;
-        let mut scanned = 0usize;
         let mut scored: Vec<(usize, Assertion)> = Vec::new();
+        let mut considered: HashSet<String> = HashSet::new();
         let mut entity_link_cache: HashMap<RecordId, CachedEntityLink> = HashMap::new();
 
+        // Candidates come from the BM25 index over subject, predicate and
+        // object text, in ranked pages. Scanning the table in id order capped
+        // recall at the first `max_scan_records` rows, so most of a large
+        // space was unsearchable and every query paid for the full scan.
+        let index_page_size = 200;
+        let max_index_candidates = 1_000;
+        let mut index_cursor: Option<String> = None;
+        let mut fetched = 0usize;
         loop {
-            let page = self
-                .repo
-                .list(&space_id, fetch_limit, scan_cursor.as_ref())
-                .await
-                .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-            if page.is_empty() {
-                break;
+            let mut criteria = SearchCriteria::new()
+                .with_query(query)
+                .with_space_id(space_id.clone())
+                .with_limit(index_page_size);
+            if let Some(cursor) = index_cursor.take() {
+                criteria = criteria.with_cursor(cursor);
             }
-
-            let batch_len = page.len();
-            scanned = scanned.saturating_add(batch_len);
-            scan_cursor = page.last().map(|assertion| assertion.base.id.clone());
+            let page = match self.repo.search(&criteria).await {
+                Ok(page) => page,
+                Err(err) => {
+                    // A space without the search indexes still gets the
+                    // bounded scan below rather than an error.
+                    warn!("Assertion index search failed, falling back to scan: {err}");
+                    break;
+                }
+            };
+            fetched = fetched.saturating_add(page.results.len());
             let items = ctx
                 .authz
-                .filter_records(&ctx.principal, page, "read:assertion");
-
+                .filter_records(&ctx.principal, page.results, "read:assertion");
             for assertion in items {
-                let Some(score) =
-                    search_assertion_score_if_match(&assertion, &query_lower, &query_terms)
-                else {
-                    continue;
-                };
-                if !assertion_matches_search_status(&assertion, input.status.as_deref()) {
+                if !considered.insert(assertion.base.id.to_string()) {
                     continue;
                 }
-                let Some(assertion) = self
-                    .canonicalize_and_filter_assertion(
+                if let Some(hit) = self
+                    .score_search_candidate(
                         &space_id,
                         assertion,
+                        &query_lower,
+                        &query_terms,
+                        input.status.as_deref(),
                         attributed_to,
                         &mut entity_link_cache,
                     )
                     .await?
-                else {
-                    continue;
-                };
-                scored.push((score, assertion));
+                {
+                    scored.push(hit);
+                }
             }
-
-            if batch_len < fetch_limit
-                || scanned >= max_scan_records
+            if !page.has_more
+                || page.cursor.is_none()
+                || fetched >= max_index_candidates
                 || scored.len() >= candidate_target
             {
                 break;
+            }
+            index_cursor = page.cursor;
+        }
+
+        // The index does not cover `object_literal`, so a query that only
+        // matches a literal value finds nothing above. Fall back to the
+        // bounded table scan in that case, or when the index is unavailable.
+        if scored.is_empty() {
+            let max_scan_records = self.scan_window;
+            let fetch_limit = max_scan_records.clamp(1, 500);
+            let mut scan_cursor: Option<RecordId> = None;
+            let mut scanned = 0usize;
+            loop {
+                let page = self
+                    .repo
+                    .list(&space_id, fetch_limit, scan_cursor.as_ref())
+                    .await
+                    .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+                if page.is_empty() {
+                    break;
+                }
+
+                let batch_len = page.len();
+                scanned = scanned.saturating_add(batch_len);
+                scan_cursor = page.last().map(|assertion| assertion.base.id.clone());
+                let items = ctx
+                    .authz
+                    .filter_records(&ctx.principal, page, "read:assertion");
+
+                for assertion in items {
+                    if !considered.insert(assertion.base.id.to_string()) {
+                        continue;
+                    }
+                    if let Some(hit) = self
+                        .score_search_candidate(
+                            &space_id,
+                            assertion,
+                            &query_lower,
+                            &query_terms,
+                            input.status.as_deref(),
+                            attributed_to,
+                            &mut entity_link_cache,
+                        )
+                        .await?
+                    {
+                        scored.push(hit);
+                    }
+                }
+
+                if batch_len < fetch_limit
+                    || scanned >= max_scan_records
+                    || scored.len() >= candidate_target
+                {
+                    break;
+                }
             }
         }
         scored.sort_by(|(left_score, left), (right_score, right)| {
@@ -744,7 +816,7 @@ impl ToolHandler for SearchAssertionsHandler {
                 'anchors: for (entity_id, _) in anchors {
                     let linked = match self
                         .repo
-                        .find_by_resolved_entity(&space_id, &entity_id, fetch_limit)
+                        .find_by_resolved_entity(&space_id, &entity_id, SEMANTIC_LINK_FETCH_LIMIT)
                         .await
                     {
                         Ok(linked) => linked,
@@ -797,6 +869,9 @@ impl ToolHandler for SearchAssertionsHandler {
     }
 }
 
+/// Linked assertions fetched per semantic entity anchor.
+const SEMANTIC_LINK_FETCH_LIMIT: usize = 500;
+
 /// Per-call cache entry for a resolved assertion entity link: the merge
 /// redirect (if any) plus whether the canonical entity passes the requested
 /// `attributed_to` filter. One entity fetch per distinct link id per call.
@@ -810,6 +885,38 @@ struct CachedEntityLink {
 }
 
 impl SearchAssertionsHandler {
+    /// Scores one text-search candidate and applies the status, inventory,
+    /// canonicalisation and `attributed_to` filters. Returns `None` when the
+    /// candidate does not match or is filtered out.
+    #[allow(clippy::too_many_arguments)]
+    async fn score_search_candidate(
+        &self,
+        space_id: &str,
+        assertion: Assertion,
+        query_lower: &str,
+        query_terms: &[String],
+        status: Option<&str>,
+        attributed_to: Option<&str>,
+        entity_link_cache: &mut HashMap<RecordId, CachedEntityLink>,
+    ) -> McpResult<Option<(usize, Assertion)>> {
+        let Some(score) = search_assertion_score_if_match(&assertion, query_lower, query_terms)
+        else {
+            return Ok(None);
+        };
+        if !assertion_matches_search_status(&assertion, status) {
+            return Ok(None);
+        }
+        Ok(self
+            .canonicalize_and_filter_assertion(
+                space_id,
+                assertion,
+                attributed_to,
+                entity_link_cache,
+            )
+            .await?
+            .map(|assertion| (score, assertion)))
+    }
+
     /// Canonicalizes both entity links and applies the `attributed_to`
     /// filter. Returns `None` when a filter is present and no linked entity
     /// passes it. An assertion with no resolved entity links is unattributed
@@ -1558,6 +1665,75 @@ mod tests {
         assert_eq!(data.total, 1);
         assert_eq!(data.items[0].subject_text, "Needle Person");
         assert_eq!(data.items[0].object_text.as_deref(), Some("Needle Folder"));
+    }
+
+    #[tokio::test]
+    async fn test_search_assertions_finds_matches_past_the_scan_window() {
+        let storage = StorageClient::new_memory().await.expect("storage");
+        storage
+            .query(concat!(
+                "DEFINE ANALYZER simple TOKENIZERS blank, class FILTERS lowercase, ascii;\n",
+                include_str!("../../../migrations/sql/012_assertion_search.surql")
+            ))
+            .await
+            .expect("define assertion search indexes");
+        // More rows than the scan window ahead of the only match: recall
+        // must come from the index, not the id-order scan.
+        let handler = SearchAssertionsHandler::new(storage.clone()).with_scan_window(10);
+        let repo = AssertionRepository::new(storage.clone());
+
+        for index in 0..30 {
+            create_test_assertion(
+                &repo,
+                &format!("assertion:00000000-0000-0000-0000-{index:012x}"),
+                &format!("Unrelated Subject {index}"),
+                "mentions",
+                "background fact",
+            )
+            .await;
+        }
+        create_test_assertion(
+            &repo,
+            "assertion:ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "Needle Person",
+            "owns",
+            "Needle Folder",
+        )
+        .await;
+
+        let ctx = ToolContext::new(
+            storage,
+            elephant_policy::Principal {
+                space_id: "default".to_string(),
+                scopes: std::iter::once("read:assertion".to_string()).collect(),
+                clearances: vec![elephant_policy::Clearance {
+                    policy_id: "default".to_string(),
+                    max_level: 0,
+                    labels: std::collections::HashSet::new(),
+                    handling_allow: std::collections::HashSet::new(),
+                }],
+                subject_allowlist: None,
+                purpose: std::collections::HashSet::new(),
+            },
+        );
+
+        let response = handler
+            .execute(
+                &ctx,
+                serde_json::json!({
+                    "query": "Needle Folder",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("tool response");
+        let response: ToolResponse<SearchAssertionsOutput> =
+            serde_json::from_value(response).expect("decode response");
+
+        assert!(response.ok);
+        let data = response.data.expect("tool data");
+        assert_eq!(data.total, 1);
+        assert_eq!(data.items[0].subject_text, "Needle Person");
     }
 
     #[tokio::test]

@@ -13,8 +13,8 @@ use tracing::warn;
 
 use elephant_embeddings::EmbeddingProviderCache;
 use elephant_storage::{
-    parse_id, AssertionRepository, EntityRepository, Repository, SearchCriteria, SearchRepository,
-    SpaceConfigRepository, StorageClient,
+    parse_id, AssertionRepository, EntityRepository, EntityVectorCache, Repository, SearchCriteria,
+    SearchRepository, SpaceConfigRepository, StorageClient,
 };
 use elephant_types::ids::TableName;
 use elephant_types::records::assertion::{Assertion, ResolutionStatus};
@@ -409,6 +409,7 @@ pub struct SearchAssertionsHandler {
     entity_repo: EntityRepository,
     space_config_repo: SpaceConfigRepository,
     provider_cache: EmbeddingProviderCache,
+    entity_vectors: EntityVectorCache,
     /// Rows the fallback table scan reads at most.
     scan_window: usize,
 }
@@ -438,6 +439,7 @@ impl SearchAssertionsHandler {
             entity_repo: EntityRepository::new(storage.clone()),
             space_config_repo: SpaceConfigRepository::new(storage),
             provider_cache,
+            entity_vectors: EntityVectorCache::new(),
             scan_window: DEFAULT_SCAN_WINDOW,
         }
     }
@@ -482,7 +484,12 @@ impl SearchAssertionsHandler {
         let vector = vectors.into_iter().next()?;
         let hits = match self
             .entity_repo
-            .vector_search_entities(space_id, &vector, SEMANTIC_ANCHOR_ENTITIES)
+            .vector_search_entities_cached(
+                &self.entity_vectors,
+                space_id,
+                &vector,
+                SEMANTIC_ANCHOR_ENTITIES,
+            )
             .await
         {
             Ok(hits) => hits,

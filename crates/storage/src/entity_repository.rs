@@ -66,6 +66,35 @@ pub struct EntitySearchHit {
     pub score: f32,
 }
 
+/// How long a cached entity-vector snapshot serves searches before reload.
+pub const ENTITY_VECTOR_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Entity vectors of one space and dimension, loaded at `loaded_at`.
+struct EntityVectorSnapshot {
+    loaded_at: std::time::Instant,
+    rows: Vec<(RecordId, Vec<f32>)>,
+}
+
+/// Snapshot cache for [`EntityRepository::vector_search_entities_cached`].
+///
+/// Owned by a long-lived search handler; clones share the snapshots.
+#[derive(Clone, Default)]
+pub struct EntityVectorCache {
+    snapshots: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<(String, usize), std::sync::Arc<EntityVectorSnapshot>>,
+        >,
+    >,
+}
+
+impl EntityVectorCache {
+    /// Creates an empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Lightweight view of an entity for the embedding sweep.
 ///
 /// Carries the text that gets embedded plus the stored model/hash used to
@@ -1190,6 +1219,95 @@ impl EntityRepository {
         })?;
 
         hits.into_iter().map(EntitySearchHit::try_from).collect()
+    }
+
+    /// [`Self::vector_search_entities`] for read-only search callers, ranked
+    /// in process against a snapshot of the space's entity vectors.
+    ///
+    /// The `SurrealDB` path computes `vector::similarity::cosine` for every
+    /// entity in the space on every call (entity vectors have no index: their
+    /// dimensions vary by provider, see migration 020). At ~1.5k entities of
+    /// 3,072 dims that is about 2 s per search. The snapshot is reloaded once
+    /// it is older than [`ENTITY_VECTOR_SNAPSHOT_TTL`], so results can lag
+    /// entity writes by that long. Entity resolution must keep using the
+    /// exact path: a just-created entity has to be a candidate immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading the snapshot fails.
+    pub async fn vector_search_entities_cached(
+        &self,
+        cache: &EntityVectorCache,
+        space_id: &str,
+        embedding: &[f32],
+        limit: usize,
+    ) -> StorageResult<Vec<EntitySearchHit>> {
+        if self.backend.embedded_store().is_some() {
+            return self
+                .vector_search_entities(space_id, embedding, limit)
+                .await;
+        }
+        let key = (space_id.to_string(), embedding.len());
+        let mut snapshots = cache.snapshots.lock().await;
+        let fresh = snapshots
+            .get(&key)
+            .filter(|snapshot| snapshot.loaded_at.elapsed() < ENTITY_VECTOR_SNAPSHOT_TTL)
+            .cloned();
+        let snapshot = if let Some(snapshot) = fresh {
+            snapshot
+        } else {
+            let snapshot = std::sync::Arc::new(EntityVectorSnapshot {
+                loaded_at: std::time::Instant::now(),
+                rows: self.load_entity_vectors(space_id, embedding.len()).await?,
+            });
+            snapshots.insert(key, snapshot.clone());
+            snapshot
+        };
+        drop(snapshots);
+
+        let mut hits: Vec<EntitySearchHit> = snapshot
+            .rows
+            .iter()
+            .map(|(entity_id, vector)| EntitySearchHit {
+                entity_id: entity_id.clone(),
+                score: cosine_similarity(vector, embedding),
+            })
+            .collect();
+        hits.sort_by(|left, right| right.score.total_cmp(&left.score));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    /// Live entity vectors of one dimension in a space, for the snapshot.
+    async fn load_entity_vectors(
+        &self,
+        space_id: &str,
+        dimensions: usize,
+    ) -> StorageResult<Vec<(RecordId, Vec<f32>)>> {
+        #[derive(Deserialize)]
+        struct EntityVectorDb {
+            id: surrealdb::sql::Thing,
+            name_embedding: Vec<f32>,
+        }
+        let query = format!(
+            "SELECT id, name_embedding FROM entity \
+             WHERE space_id = $space_id AND deleted_at IS NONE AND name_embedding IS NOT NONE \
+             AND array::len(name_embedding) = {dimensions}"
+        );
+        let mut response = self
+            .backend
+            .query_bind(&query, crate::bindings! { "space_id" => space_id })
+            .await?;
+        let rows: Vec<EntityVectorDb> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse entity vectors: {e}"))
+        })?;
+        rows.into_iter()
+            .map(|row| {
+                let id = crate::surreal::record_id_from_thing(&row.id)
+                    .map_err(|e| StorageError::QueryError(e.to_string()))?;
+                Ok((id, row.name_embedding))
+            })
+            .collect()
     }
 
     /// Stores the semantic-search embedding for an entity, together with the
@@ -2629,6 +2747,61 @@ mod tests {
             .await
             .unwrap();
         assert!(hits.is_empty(), "mismatched dims are filtered: {hits:?}");
+    }
+
+    #[tokio::test]
+    async fn test_cached_vector_search_matches_exact_ranking() {
+        let repo = setup_test_repo().await;
+        let vectors: [(&str, [f32; 3]); 4] = [
+            ("Near", [1.0, 0.1, 0.0]),
+            ("Middle", [0.6, 0.6, 0.1]),
+            ("Far", [0.0, 0.2, 1.0]),
+            ("Opposite", [-1.0, 0.0, 0.0]),
+        ];
+        for (name, vector) in vectors {
+            let entity = create_test_entity(name);
+            let id = entity.base.id.clone();
+            repo.create(entity).await.unwrap();
+            repo.set_name_embedding("test_space", &id, &vector, "m", name)
+                .await
+                .unwrap();
+        }
+        let deleted = create_test_entity("Deleted");
+        let deleted_id = deleted.base.id.clone();
+        repo.create(deleted).await.unwrap();
+        repo.set_name_embedding("test_space", &deleted_id, &[1.0, 0.0, 0.0], "m", "d")
+            .await
+            .unwrap();
+        repo.delete("test_space", &deleted_id).await.unwrap();
+
+        let query = [1.0, 0.0, 0.0];
+        let exact = repo
+            .vector_search_entities("test_space", &query, 3)
+            .await
+            .unwrap();
+        let cache = EntityVectorCache::new();
+        let cached = repo
+            .vector_search_entities_cached(&cache, "test_space", &query, 3)
+            .await
+            .unwrap();
+
+        let ids = |hits: &[EntitySearchHit]| {
+            hits.iter()
+                .map(|hit| hit.entity_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&cached), ids(&exact));
+        assert!(!ids(&cached).contains(&deleted_id));
+        for (cached_hit, exact_hit) in cached.iter().zip(&exact) {
+            assert!((cached_hit.score - exact_hit.score).abs() < 1e-4);
+        }
+
+        // Other dimensions are filtered out, as on the exact path.
+        let other_dims = repo
+            .vector_search_entities_cached(&cache, "test_space", &[1.0, 0.0, 0.0, 0.0], 3)
+            .await
+            .unwrap();
+        assert!(other_dims.is_empty());
     }
 
     #[tokio::test]

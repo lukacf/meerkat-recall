@@ -377,8 +377,8 @@ struct OpenAIErrorResponse {
 #[allow(dead_code)]
 struct OpenAIErrorDetail {
     message: String,
-    #[serde(rename = "type")]
-    error_type: String,
+    #[serde(rename = "type", default)]
+    error_type: Option<String>,
 }
 
 /// Configuration for the `OpenAI` embedding provider.
@@ -510,7 +510,7 @@ impl OpenAIEmbeddingProvider {
     }
 
     /// Embeds a single batch (internal helper).
-    async fn embed_batch(&self, texts: &[String]) -> EmbeddingResult<Vec<EmbeddingVector>> {
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<EmbeddingVector>, BatchError> {
         let url = format!("{}/embeddings", self.config.base_url);
 
         let request = OpenAIEmbeddingRequest {
@@ -546,7 +546,9 @@ impl OpenAIEmbeddingProvider {
                     let status = resp.status();
                     if status.is_success() {
                         let body: OpenAIEmbeddingResponse = resp.json().await.map_err(|e| {
-                            EmbeddingError::ProviderError(format!("Failed to parse response: {e}"))
+                            BatchError::Provider(EmbeddingError::ProviderError(format!(
+                                "Failed to parse response: {e}"
+                            )))
                         })?;
 
                         debug!(
@@ -573,8 +575,17 @@ impl OpenAIEmbeddingProvider {
                         let error_body: Result<OpenAIErrorResponse, _> = resp.json().await;
                         let message = error_body
                             .map_or_else(|_| "Unknown error".to_string(), |e| e.error.message);
-                        return Err(EmbeddingError::ProviderError(format!(
-                            "OpenAI API error ({status}): {message}"
+                        if is_request_too_large(&message) {
+                            return Err(BatchError::RequestTooLarge { message });
+                        }
+                        if is_input_too_long(&message) {
+                            return Err(BatchError::InputTooLong {
+                                index: input_index_in_error(&message),
+                                message,
+                            });
+                        }
+                        return Err(BatchError::Provider(EmbeddingError::ProviderError(
+                            format!("OpenAI API error ({status}): {message}"),
                         )));
                     }
                 }
@@ -587,9 +598,129 @@ impl OpenAIEmbeddingProvider {
             }
         }
 
-        Err(last_error
-            .unwrap_or_else(|| EmbeddingError::ProviderError("Max retries exceeded".to_string())))
+        Err(BatchError::Provider(last_error.unwrap_or_else(|| {
+            EmbeddingError::ProviderError("Max retries exceeded".to_string())
+        })))
     }
+
+    /// Embeds one batch, shortening any input the API rejects as too long.
+    ///
+    /// Inputs are capped at [`MAX_INPUT_CHARS`] up front. If the API still
+    /// reports an input over its token limit, that input is halved and the
+    /// batch retried, so one oversized node cannot fail every batch it lands
+    /// in. Only the beginning of an oversized input is embedded. A request
+    /// over the per-request token limit is split in half.
+    async fn embed_batch_fitting(&self, texts: &[String]) -> EmbeddingResult<Vec<EmbeddingVector>> {
+        let mut inputs: Vec<String> = texts
+            .iter()
+            .map(|text| truncate_chars(text, MAX_INPUT_CHARS).to_string())
+            .collect();
+        for _ in 0..MAX_SHRINK_ROUNDS {
+            match self.embed_batch(&inputs).await {
+                Ok(embeddings) => return Ok(embeddings),
+                Err(BatchError::Provider(err)) => return Err(err),
+                Err(BatchError::RequestTooLarge { message }) => {
+                    if inputs.len() < 2 {
+                        return Err(EmbeddingError::ProviderError(format!(
+                            "OpenAI API error (400 Bad Request): {message}"
+                        )));
+                    }
+                    // Too many tokens in one request: embed the halves separately.
+                    let (first, second) = inputs.split_at(inputs.len() / 2);
+                    let mut embeddings = Box::pin(self.embed_batch_fitting(first)).await?;
+                    embeddings.extend(Box::pin(self.embed_batch_fitting(second)).await?);
+                    return Ok(embeddings);
+                }
+                Err(BatchError::InputTooLong { index, message }) => {
+                    let Some(target) = index
+                        .filter(|index| *index < inputs.len())
+                        .or_else(|| longest_input(&inputs))
+                    else {
+                        return Err(EmbeddingError::ProviderError(format!(
+                            "OpenAI API error (400 Bad Request): {message}"
+                        )));
+                    };
+                    let current = inputs[target].chars().count();
+                    if current <= 1 {
+                        return Err(EmbeddingError::ProviderError(format!(
+                            "OpenAI API error (400 Bad Request): {message}"
+                        )));
+                    }
+                    warn!(
+                        "Embedding input {target} exceeds the model limit at {current} chars; \
+                         retrying with the first {} chars",
+                        current / 2
+                    );
+                    inputs[target] = truncate_chars(&inputs[target], current / 2).to_string();
+                }
+            }
+        }
+        Err(EmbeddingError::ProviderError(
+            "OpenAI embedding input still too long after shortening".to_string(),
+        ))
+    }
+}
+
+/// Character cap applied to every `OpenAI` embedding input before sending.
+///
+/// `text-embedding-3-*` accepts at most 8,192 tokens per input. Ordinary
+/// prose runs about four characters per token, so this cap keeps typical
+/// inputs inside the limit; dense text (base64, URLs, CJK) can still exceed
+/// it and is halved on the API's rejection.
+const MAX_INPUT_CHARS: usize = 24_000;
+
+/// Times one batch may be retried with a shortened input.
+const MAX_SHRINK_ROUNDS: usize = 16;
+
+/// Why one `OpenAI` batch request failed.
+enum BatchError {
+    /// The API rejected an input as longer than the model's token limit.
+    InputTooLong {
+        /// Index of the rejected input, when the error names one.
+        index: Option<usize>,
+        /// The API's error message.
+        message: String,
+    },
+    /// The API rejected the whole request as over its per-request token limit.
+    RequestTooLarge {
+        /// The API's error message.
+        message: String,
+    },
+    /// Any other failure.
+    Provider(EmbeddingError),
+}
+
+/// Whether an `OpenAI` error message reports a request over its total token limit.
+fn is_request_too_large(message: &str) -> bool {
+    message.contains("tokens per request")
+}
+
+/// Whether an `OpenAI` error message reports an input over the token limit.
+fn is_input_too_long(message: &str) -> bool {
+    message.contains("maximum input length") || message.contains("maximum context length")
+}
+
+/// The input index named by an error such as `Invalid 'input[53]': ...`.
+fn input_index_in_error(message: &str) -> Option<usize> {
+    let start = message.find("input[")? + "input[".len();
+    let end = start + message[start..].find(']')?;
+    message[start..end].parse().ok()
+}
+
+/// Index of the longest input, by characters.
+fn longest_input(inputs: &[String]) -> Option<usize> {
+    inputs
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, input)| input.chars().count())
+        .map(|(index, _)| index)
+}
+
+/// The first `max_chars` characters of `text`, cut on a char boundary.
+fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    text.char_indices()
+        .nth(max_chars)
+        .map_or(text, |(byte_index, _)| &text[..byte_index])
 }
 
 #[async_trait]
@@ -611,7 +742,7 @@ impl EmbeddingProvider for OpenAIEmbeddingProvider {
         let mut all_embeddings = Vec::with_capacity(texts.len());
 
         for chunk in texts.chunks(self.config.max_batch_size) {
-            let embeddings = self.embed_batch(chunk).await?;
+            let embeddings = self.embed_batch_fitting(chunk).await?;
             all_embeddings.extend(embeddings);
         }
 
@@ -636,6 +767,167 @@ mod tests {
         clippy::cognitive_complexity
     )]
     use super::*;
+
+    /// Minimal stand-in for the `OpenAI` embeddings endpoint. Rejects an input
+    /// longer than `input_limit` chars, or a request whose inputs total more
+    /// than `request_limit` chars, with the API's error messages; otherwise
+    /// returns one vector per input. Records each request's input lengths.
+    async fn fake_openai(
+        input_limit: usize,
+        request_limit: usize,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Vec<usize>>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    loop {
+                        let mut chunk = vec![0u8; 65536];
+                        let Ok(read) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..read]);
+                        let Some(header_end) =
+                            buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .map_or(0, |value| value.trim().parse().unwrap());
+                        if buffer.len() < header_end + 4 + length {
+                            continue;
+                        }
+                        let body: serde_json::Value = serde_json::from_slice(
+                            &buffer[header_end + 4..header_end + 4 + length],
+                        )
+                        .unwrap();
+                        buffer.drain(..header_end + 4 + length);
+                        let lengths: Vec<usize> = body["input"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|input| input.as_str().unwrap().chars().count())
+                            .collect();
+                        recorded.lock().unwrap().push(lengths.clone());
+                        let total: usize = lengths.iter().sum();
+                        let too_long = lengths.iter().position(|length| *length > input_limit);
+                        let (status, payload) = match (total > request_limit, too_long) {
+                            (true, _) => (
+                                "400 Bad Request",
+                                serde_json::json!({"error": {
+                                    "type": "invalid_request_error",
+                                    "message": format!(
+                                        "Requested {total} tokens, max 300000 tokens per request"
+                                    )
+                                }}),
+                            ),
+                            (false, Some(index)) => (
+                                "400 Bad Request",
+                                serde_json::json!({"error": {
+                                    "type": "invalid_request_error",
+                                    "message": format!(
+                                        "Invalid 'input[{index}]': maximum input length is 8192 tokens."
+                                    )
+                                }}),
+                            ),
+                            (false, None) => {
+                                let data: Vec<serde_json::Value> = (0..lengths.len())
+                                    .map(|index| {
+                                        serde_json::json!({"index": index, "embedding": [0.5, 0.5]})
+                                    })
+                                    .collect();
+                                (
+                                    "200 OK",
+                                    serde_json::json!({
+                                        "data": data,
+                                        "model": "text-embedding-3-large",
+                                        "usage": {"prompt_tokens": total, "total_tokens": total}
+                                    }),
+                                )
+                            }
+                        };
+                        let payload = payload.to_string();
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{payload}",
+                            payload.len()
+                        );
+                        if socket.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (base_url, calls)
+    }
+
+    fn fake_provider_config(base_url: &str) -> OpenAIConfig {
+        OpenAIConfig::new("test-key")
+            .with_dimensions(2)
+            .with_base_url(base_url)
+    }
+
+    #[tokio::test]
+    async fn test_openai_provider_shortens_input_over_the_model_limit() {
+        let (base_url, calls) = fake_openai(10_000, usize::MAX).await;
+        let provider = OpenAIEmbeddingProvider::new(fake_provider_config(&base_url));
+        let texts = vec![
+            "short".to_string(),
+            "a".repeat(30_000),
+            "also short".to_string(),
+        ];
+
+        let embeddings = provider.embed(&texts).await.unwrap();
+
+        assert_eq!(embeddings.len(), 3);
+        // Capped to 24,000 up front, then halved on each rejection of input 1.
+        let calls = calls.lock().unwrap().clone();
+        let lengths: Vec<usize> = calls.iter().map(|call| call[1]).collect();
+        assert_eq!(lengths, vec![24_000, 12_000, 6_000]);
+        assert!(calls.iter().all(|call| call[0] == 5 && call[2] == 10));
+    }
+
+    #[tokio::test]
+    async fn test_openai_provider_splits_a_request_over_the_token_limit() {
+        let (base_url, calls) = fake_openai(usize::MAX, 25_000).await;
+        let provider = OpenAIEmbeddingProvider::new(fake_provider_config(&base_url));
+        let texts: Vec<String> = (0..4).map(|_| "b".repeat(10_000)).collect();
+
+        let embeddings = provider.embed(&texts).await.unwrap();
+
+        assert_eq!(embeddings.len(), 4);
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls[0].len(), 4);
+        assert!(calls[1..].iter().all(|call| call.len() == 2));
+    }
+
+    #[test]
+    fn test_input_index_in_error_and_truncate_chars() {
+        assert_eq!(
+            input_index_in_error("Invalid 'input[53]': maximum input length is 8192 tokens."),
+            Some(53)
+        );
+        assert_eq!(
+            input_index_in_error("maximum input length is 8192 tokens."),
+            None
+        );
+        assert_eq!(truncate_chars("åäö-text", 3), "åäö");
+        assert_eq!(truncate_chars("ab", 5), "ab");
+    }
 
     #[tokio::test]
     async fn test_fake_provider() {

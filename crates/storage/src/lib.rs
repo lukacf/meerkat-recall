@@ -92,7 +92,7 @@ pub use entity_identity_key_repository::EntityIdentityKeyRepository;
 pub use entity_merge_repository::EntityMergeRepository;
 pub use entity_repository::{
     is_source_inventory_entity, EntityEmbeddingCandidate, EntityRepository, EntitySearchHit,
-    EntityWithRelations,
+    EntityVectorCache, EntityWithRelations, ENTITY_VECTOR_SNAPSHOT_TTL,
 };
 pub use error::{StorageError, StorageResult};
 pub use event_repository::{EventRepository, EventWindowQuery};

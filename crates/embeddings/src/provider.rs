@@ -377,8 +377,8 @@ struct OpenAIErrorResponse {
 #[allow(dead_code)]
 struct OpenAIErrorDetail {
     message: String,
-    #[serde(rename = "type")]
-    error_type: String,
+    #[serde(rename = "type", default)]
+    error_type: Option<String>,
 }
 
 /// Configuration for the `OpenAI` embedding provider.
@@ -790,7 +790,7 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
                     loop {
-                        let mut chunk = [0u8; 65536];
+                        let mut chunk = vec![0u8; 65536];
                         let Ok(read) = socket.read(&mut chunk).await else {
                             return;
                         };
@@ -827,7 +827,7 @@ mod tests {
                         let (status, payload) = if total > request_limit {
                             (
                                 "400 Bad Request",
-                                serde_json::json!({"error": {"message": format!(
+                                serde_json::json!({"error": {"type": "invalid_request_error", "message": format!(
                                     "Requested {total} tokens, max 300000 tokens per request"
                                 )}}),
                             )
@@ -836,7 +836,7 @@ mod tests {
                         {
                             (
                                 "400 Bad Request",
-                                serde_json::json!({"error": {"message": format!(
+                                serde_json::json!({"error": {"type": "invalid_request_error", "message": format!(
                                     "Invalid 'input[{index}]': maximum input length is 8192 tokens."
                                 )}}),
                             )

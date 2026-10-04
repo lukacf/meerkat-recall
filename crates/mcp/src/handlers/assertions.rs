@@ -697,23 +697,38 @@ impl ToolHandler for SearchAssertionsHandler {
                 let items =
                     ctx.authz
                         .filter_records(&ctx.principal, page.results, "read:assertion");
+                // Text score and status first: they need no reads. Then load
+                // every linked entity the survivors need in one batch.
+                let mut matched: Vec<(usize, Assertion)> = Vec::new();
                 for assertion in items {
                     if !considered.insert(assertion.base.id.to_string()) {
                         continue;
                     }
-                    if let Some(hit) = self
-                        .score_search_candidate(
+                    let Some(score) =
+                        search_assertion_score_if_match(&assertion, &query_lower, &query_terms)
+                    else {
+                        continue;
+                    };
+                    if !assertion_matches_search_status(&assertion, input.status.as_deref()) {
+                        continue;
+                    }
+                    matched.push((score, assertion));
+                }
+                let refs: Vec<&Assertion> =
+                    matched.iter().map(|(_, assertion)| assertion).collect();
+                self.prefetch_entity_links(&space_id, &refs, attributed_to, &mut entity_link_cache)
+                    .await?;
+                for (score, assertion) in matched {
+                    if let Some(assertion) = self
+                        .canonicalize_and_filter_assertion(
                             &space_id,
                             assertion,
-                            &query_lower,
-                            &query_terms,
-                            input.status.as_deref(),
                             attributed_to,
                             &mut entity_link_cache,
                         )
                         .await?
                     {
-                        scored.push(hit);
+                        scored.push((score, assertion));
                     }
                 }
                 false
@@ -913,6 +928,85 @@ impl SearchAssertionsHandler {
             )
             .await?
             .map(|assertion| (score, assertion)))
+    }
+
+    /// Warms `entity_link_cache` for every entity the given assertions link
+    /// to, with one query for the entities and one for merge survivors, so
+    /// canonicalising a page of candidates does not read entities one at a
+    /// time. Fills exactly what [`Self::resolve_entity_link`] would.
+    async fn prefetch_entity_links(
+        &self,
+        space_id: &str,
+        assertions: &[&Assertion],
+        attributed_to: Option<&str>,
+        entity_link_cache: &mut HashMap<RecordId, CachedEntityLink>,
+    ) -> McpResult<()> {
+        let mut wanted: Vec<RecordId> = Vec::new();
+        let mut seen: HashSet<RecordId> = HashSet::new();
+        for assertion in assertions {
+            for link in [&assertion.subject_entity, &assertion.object_entity]
+                .into_iter()
+                .flatten()
+            {
+                let id = link.id();
+                if !entity_link_cache.contains_key(id) && seen.insert(id.clone()) {
+                    wanted.push(id.clone());
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let entities = self
+            .entity_repo
+            .get_many(space_id, &wanted, false)
+            .await
+            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+        let survivor_ids: Vec<RecordId> = entities
+            .iter()
+            .filter(|entity| entity.is_merged())
+            .filter_map(|entity| entity.redirect_to.as_ref().map(|link| link.id().clone()))
+            .collect();
+        let survivors: HashMap<RecordId, Entity> = self
+            .entity_repo
+            .get_many(space_id, &survivor_ids, false)
+            .await
+            .map_err(|e| McpError::ExecutionError(e.to_string()))?
+            .into_iter()
+            .map(|entity| (entity.base.id.clone(), entity))
+            .collect();
+        let found: HashMap<RecordId, Entity> = entities
+            .into_iter()
+            .map(|entity| (entity.base.id.clone(), entity))
+            .collect();
+        for id in wanted {
+            let cached = match found.get(&id) {
+                // Dangling link: visible (unattributed), as in resolve_entity_link.
+                None => CachedEntityLink {
+                    redirect: None,
+                    attributed: true,
+                },
+                Some(entity) => {
+                    let survivor = entity
+                        .is_merged()
+                        .then(|| entity.redirect_to.as_ref())
+                        .flatten()
+                        .and_then(|link| survivors.get(link.id()));
+                    match survivor {
+                        Some(survivor) => CachedEntityLink {
+                            redirect: Some(survivor.base.id.clone()),
+                            attributed: entity_passes_attribution(survivor, attributed_to),
+                        },
+                        None => CachedEntityLink {
+                            redirect: None,
+                            attributed: entity_passes_attribution(entity, attributed_to),
+                        },
+                    }
+                }
+            };
+            entity_link_cache.insert(id, cached);
+        }
+        Ok(())
     }
 
     /// Canonicalizes both entity links and applies the `attributed_to`

@@ -395,28 +395,42 @@ where
                 .await;
         }
 
-        let mut entities = Vec::new();
-        for id in ids {
-            let entity = if include_deleted {
-                let mut response = self
-                    .backend
-                    .query_bind(
-                        &format!("SELECT {ENTITY_PROJECTION} FROM entity WHERE id = $id AND space_id = $space_id"),
-                        crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
-                    )
-                    .await?;
-                let rows: Vec<EntityDb> = response.take(0).map_err(|e| {
-                    StorageError::QueryError(format!("Failed to parse entity: {e}"))
-                })?;
-                rows.into_iter().next().map(Entity::try_from).transpose()?
-            } else {
-                Repository::<Entity>::get(self, space_id, id).await?
-            };
-            if let Some(entity) = entity {
-                entities.push(entity);
-            }
+        if ids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(entities)
+        // One query for the whole id list rather than one per id.
+        let deleted_filter = if include_deleted {
+            ""
+        } else {
+            " AND deleted_at IS NONE"
+        };
+        let things: Vec<surrealdb::sql::Value> = ids
+            .iter()
+            .map(|id| surrealdb::sql::Value::Thing(crate::surreal::thing_from_record_id(id)))
+            .collect();
+        let mut response = self
+            .backend
+            .query_bind(
+                &format!(
+                    "SELECT {ENTITY_PROJECTION} FROM $ids WHERE space_id = $space_id{deleted_filter}"
+                ),
+                crate::bindings! {
+                    "ids" => surrealdb::sql::Value::Array(surrealdb::sql::Array::from(things)),
+                    "space_id" => space_id,
+                },
+            )
+            .await?;
+        let rows: Vec<EntityDb> = response
+            .take(0)
+            .map_err(|e| StorageError::QueryError(format!("Failed to parse entities: {e}")))?;
+        let by_id: std::collections::HashMap<String, Entity> = rows
+            .into_iter()
+            .map(|row| Entity::try_from(row).map(|entity| (entity.base.id.to_string(), entity)))
+            .collect::<StorageResult<_>>()?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| by_id.get(&id.to_string()).cloned())
+            .collect())
     }
 }
 
@@ -2747,6 +2761,62 @@ mod tests {
             .await
             .unwrap();
         assert!(hits.is_empty(), "mismatched dims are filtered: {hits:?}");
+    }
+
+    #[tokio::test]
+    async fn test_get_many_batches_in_requested_order() {
+        let repo = setup_test_repo().await;
+        let mut ids = Vec::new();
+        for name in ["First", "Second", "Third"] {
+            let entity = create_test_entity(name);
+            ids.push(entity.base.id.clone());
+            repo.create(entity).await.unwrap();
+        }
+        repo.delete("test_space", &ids[1]).await.unwrap();
+        let missing = RecordId::new_v4(TableName::Entity);
+
+        let requested = vec![
+            ids[2].clone(),
+            missing,
+            ids[1].clone(),
+            ids[0].clone(),
+            ids[2].clone(),
+        ];
+        let live: Vec<RecordId> = repo
+            .get_many("test_space", &requested, false)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.base.id)
+            .collect();
+        assert_eq!(live, vec![ids[2].clone(), ids[0].clone(), ids[2].clone()]);
+
+        let all: Vec<RecordId> = repo
+            .get_many("test_space", &requested, true)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.base.id)
+            .collect();
+        assert_eq!(
+            all,
+            vec![
+                ids[2].clone(),
+                ids[1].clone(),
+                ids[0].clone(),
+                ids[2].clone()
+            ]
+        );
+        assert!(repo
+            .get_many("other_space", &ids, true)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo
+            .get_many("test_space", &[], false)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

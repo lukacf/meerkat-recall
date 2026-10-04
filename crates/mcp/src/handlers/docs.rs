@@ -1498,7 +1498,9 @@ const RANK_FUSION_K: f64 = 60.0;
 /// common word with unrelated documents ("bill", "house") buried every
 /// semantic hit once real embeddings existed. Fusion rewards a document both
 /// rankings agree on, and keeps each ranking's leaders near the top. Exact
-/// ties keep lexical-first order, so a pure exact match still leads.
+/// ties keep lexical-first order. A lexical leader the semantic ranking does
+/// not contain (for example a document not yet embedded) can rank below
+/// documents both rankings place lower.
 fn merge_lexical_and_semantic_docs(
     lexical_docs: Vec<Doc>,
     semantic_docs: Vec<Doc>,
@@ -1511,7 +1513,12 @@ fn merge_lexical_and_semantic_docs(
     let mut fused: Vec<(f64, usize, Doc)> = Vec::new();
     let mut position: HashMap<RecordId, usize> = HashMap::new();
     for ranking in [lexical_docs, semantic_docs] {
-        for (rank, doc) in ranking.into_iter().enumerate() {
+        // Each ranking counts a document once, even if it lists it twice.
+        let mut seen_in_ranking: HashSet<RecordId> = HashSet::new();
+        let ranking = ranking
+            .into_iter()
+            .filter(|doc| seen_in_ranking.insert(doc.base.id.clone()));
+        for (rank, doc) in ranking.enumerate() {
             #[allow(clippy::cast_precision_loss)]
             let contribution = 1.0 / (RANK_FUSION_K + (rank + 1) as f64);
             if let Some(&index) = position.get(&doc.base.id) {

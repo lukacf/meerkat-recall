@@ -240,6 +240,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_delete_then_restore_assertion() {
+        let app = setup_test_app().await;
+        let assertion = create_test_assertion("Test Fixture", "mentions");
+        let assertion_id = assertion.base.id.to_string();
+        let send = |method: &str, uri: String, body: Body| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap()
+        };
+
+        let created = app
+            .clone()
+            .oneshot(send(
+                "POST",
+                "/v1/assertions".to_string(),
+                Body::from(serde_json::to_string(&assertion).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let deleted = app
+            .clone()
+            .oneshot(send(
+                "DELETE",
+                format!("/v1/assertions/{assertion_id}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+        let after_delete = app
+            .clone()
+            .oneshot(send(
+                "GET",
+                format!("/v1/assertions/{assertion_id}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(after_delete.status(), StatusCode::NOT_FOUND);
+
+        let deleted_again = app
+            .clone()
+            .oneshot(send(
+                "DELETE",
+                format!("/v1/assertions/{assertion_id}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted_again.status(), StatusCode::NOT_FOUND);
+
+        let restored = app
+            .clone()
+            .oneshot(send(
+                "POST",
+                format!("/v1/assertions/{assertion_id}/restore"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(restored.status(), StatusCode::OK);
+
+        let after_restore = app
+            .oneshot(send(
+                "GET",
+                format!("/v1/assertions/{assertion_id}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(after_restore.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn test_search_assertions() {
         let app = setup_test_app().await;
 

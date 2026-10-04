@@ -352,6 +352,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_indexed_search_scopes_every_query_term() {
+        let client = crate::StorageClient::new_memory()
+            .await
+            .expect("create in-memory surreal client");
+        client
+            .query(concat!(
+                "DEFINE ANALYZER simple TOKENIZERS blank, class FILTERS lowercase, ascii;\n",
+                include_str!("../../migrations/sql/011_doc_search.surql")
+            ))
+            .await
+            .expect("define doc search indexes");
+        let repo = DocRepository::new(client);
+
+        repo.create(test_doc("default", "Rabbit notes", "The white rabbit."))
+            .await
+            .expect("create doc");
+        repo.create(test_doc("other", "Gmail export", "Another space's mail."))
+            .await
+            .expect("create other-space doc");
+        let deleted = repo
+            .create(test_doc("default", "Gmail draft", "Deleted mail."))
+            .await
+            .expect("create deleted doc");
+        repo.delete("default", &deleted.base.id)
+            .await
+            .expect("delete doc");
+
+        // The space and deleted filters must hold for the second term too.
+        let result = repo
+            .search(
+                &SearchCriteria::new()
+                    .with_space_id("default")
+                    .with_query("rabbit gmail")
+                    .with_limit(10),
+            )
+            .await
+            .expect("search docs");
+
+        let titles: Vec<&str> = result
+            .results
+            .iter()
+            .map(|doc| doc.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Rabbit notes"]);
+        assert_eq!(result.total, 1);
+    }
+
+    #[tokio::test]
     async fn test_surreal_memory_roundtrip_preserves_media_attachments() {
         let client = crate::StorageClient::new_memory()
             .await
@@ -1756,7 +1804,9 @@ impl SearchRepository<Doc> for DocRepository {
 
             let search_predicate = predicate_parts.join(" OR ");
             let score_expression = score_parts.join(" + ");
-            let where_clause = format!("WHERE {where_prefix}{search_predicate}");
+            // Parenthesised: AND binds tighter than OR, so without them every
+            // term after the first escaped the space and deleted filters.
+            let where_clause = format!("WHERE {where_prefix}({search_predicate})");
             let offset = ranked_search_offset(criteria.cursor.as_deref())?;
 
             let query = format!(

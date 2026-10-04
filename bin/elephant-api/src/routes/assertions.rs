@@ -5,6 +5,8 @@
 //! - GET /v1/assertions/{id} - Get assertion by ID
 //! - POST /v1/assertions - Create manual assertion
 //! - PATCH /v1/assertions/{id}/resolution - Update resolution status
+//! - DELETE /v1/assertions/{id} - Soft delete assertion
+//! - POST /v1/assertions/{id}/restore - Restore soft-deleted assertion
 
 use std::sync::Arc;
 
@@ -64,6 +66,13 @@ pub trait AssertionRepo: Send + Sync {
         object_entity: Option<&RecordId>,
         limit: usize,
     ) -> StorageResult<Vec<Assertion>>;
+    async fn delete(&self, space_id: &str, id: &RecordId) -> StorageResult<()>;
+    async fn get_with_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<Assertion>>;
+    async fn restore(&self, space_id: &str, id: &RecordId) -> StorageResult<Assertion>;
 }
 
 #[async_trait::async_trait]
@@ -113,11 +122,43 @@ impl AssertionRepo for AssertionRepository {
         Self::find_by_resolved_entity_pair(self, space_id, subject_entity, object_entity, limit)
             .await
     }
+
+    async fn delete(&self, space_id: &str, id: &RecordId) -> StorageResult<()> {
+        Repository::delete(self, space_id, id).await
+    }
+
+    async fn get_with_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<Assertion>> {
+        Self::get_with_deleted(self, space_id, id).await
+    }
+
+    async fn restore(&self, space_id: &str, id: &RecordId) -> StorageResult<Assertion> {
+        Self::restore(self, space_id, id).await
+    }
 }
 
 #[cfg(test)]
 #[async_trait::async_trait]
 impl AssertionRepo for elephant_storage::MockAssertionRepository {
+    async fn delete(&self, space_id: &str, id: &RecordId) -> StorageResult<()> {
+        Repository::delete(self, space_id, id).await
+    }
+
+    async fn get_with_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<Assertion>> {
+        Self::get_with_deleted(self, space_id, id).await
+    }
+
+    async fn restore(&self, space_id: &str, id: &RecordId) -> StorageResult<Assertion> {
+        Self::restore(self, space_id, id).await
+    }
+
     async fn create(&self, record: Assertion) -> StorageResult<Assertion> {
         Repository::create(self, record).await
     }
@@ -811,12 +852,114 @@ async fn update_resolution(
     }
 }
 
+fn assertion_write_forbidden(error: crate::authz::AuthzError) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            code: error.code,
+            message: error.message,
+            details: None,
+        }),
+    )
+}
+
+/// DELETE /v1/assertions/{id} - Soft delete assertion.
+///
+/// Sets `deleted_at`; search and reads skip the assertion from then on.
+/// Undo with `POST /v1/assertions/{id}/restore`.
+async fn delete_assertion(
+    State(state): State<Arc<AssertionsState>>,
+    axum::Extension(principal): axum::Extension<AuthPrincipal>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let space_id = require_space_id(&principal)?;
+    let rid = parse_id(&id, TableName::Assertion).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::validation(e.to_string())),
+        )
+    })?;
+    match state.assertion_repo.get(&space_id, &rid).await {
+        Ok(Some(existing)) => {
+            state
+                .authz
+                .authorize_record_write(&principal, &existing, "write:assertion")
+                .map_err(assertion_write_forbidden)?;
+            state
+                .assertion_repo
+                .delete(&space_id, &rid)
+                .await
+                .map(|()| StatusCode::NO_CONTENT)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiError::internal(e.to_string())),
+                    )
+                })
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError::not_found("Assertion", &id)),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::internal(e.to_string())),
+        )),
+    }
+}
+
+/// POST /v1/assertions/{id}/restore - Restore soft-deleted assertion.
+async fn restore_assertion(
+    State(state): State<Arc<AssertionsState>>,
+    axum::Extension(principal): axum::Extension<AuthPrincipal>,
+    Path(id): Path<String>,
+) -> ApiResult<Assertion> {
+    let space_id = require_space_id(&principal)?;
+    let rid = parse_id(&id, TableName::Assertion).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::validation(e.to_string())),
+        )
+    })?;
+    match state.assertion_repo.get_with_deleted(&space_id, &rid).await {
+        Ok(Some(existing)) => {
+            state
+                .authz
+                .authorize_record_write(&principal, &existing, "write:assertion")
+                .map_err(assertion_write_forbidden)?;
+            state
+                .assertion_repo
+                .restore(&space_id, &rid)
+                .await
+                .map(Json)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiError::internal(e.to_string())),
+                    )
+                })
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError::not_found("Assertion", &id)),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::internal(e.to_string())),
+        )),
+    }
+}
+
 /// Returns assertion routes.
 pub fn assertion_routes() -> Router<Arc<AssertionsState>> {
     Router::new()
         .route("/v1/assertions/search", post(search_assertions))
         .route("/v1/assertions", post(create_assertion))
-        .route("/v1/assertions/{id}", get(get_assertion))
+        .route(
+            "/v1/assertions/{id}",
+            get(get_assertion).delete(delete_assertion),
+        )
+        .route("/v1/assertions/{id}/restore", post(restore_assertion))
         .route("/v1/assertions/{id}/resolution", patch(update_resolution))
 }
 

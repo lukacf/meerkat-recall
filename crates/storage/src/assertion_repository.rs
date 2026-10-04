@@ -272,6 +272,71 @@ impl AssertionRepository {
         Self { client }
     }
 
+    /// Gets an assertion including soft-deleted ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or deserialization fails.
+    pub async fn get_with_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<Assertion>> {
+        if let Some(store) = self.client.embedded_store() {
+            return store.get::<Assertion>(space_id, id, true).await;
+        }
+
+        let mut response = self
+            .client
+            .query_bind(
+                &format!(
+                    "SELECT {ASSERTION_PROJECTION} FROM assertion WHERE id = $id AND space_id = $space_id"
+                ),
+                crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
+            )
+            .await?;
+        let items: Vec<AssertionDb> = response
+            .take(0)
+            .map_err(|e| StorageError::QueryError(format!("Failed to parse assertion: {e}")))?;
+        items
+            .into_iter()
+            .next()
+            .map(Assertion::try_from)
+            .transpose()
+    }
+
+    /// Restores a soft-deleted assertion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails or the assertion is not found in
+    /// the space.
+    pub async fn restore(&self, space_id: &str, id: &RecordId) -> StorageResult<Assertion> {
+        if let Some(store) = self.client.embedded_store() {
+            return store.restore::<Assertion>(space_id, id).await;
+        }
+
+        // Returns only rows it updated, so a foreign-space id cannot surface
+        // as a successful restore.
+        let mut response = self
+            .client
+            .query_bind_checked(
+                &format!(
+                    "UPDATE $id SET deleted_at = NONE, updated_at = time::now() WHERE space_id = $space_id RETURN {ASSERTION_PROJECTION}"
+                ),
+                crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
+            )
+            .await?;
+        let items: Vec<AssertionDb> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse restored assertion: {e}"))
+        })?;
+        let item = items
+            .into_iter()
+            .next()
+            .ok_or_else(|| StorageError::NotFound(format!("Assertion not found in space: {id}")))?;
+        Assertion::try_from(item)
+    }
+
     /// Converts an Assertion to a SurrealDB value for insertion.
     #[allow(clippy::too_many_lines)]
     fn assertion_to_value(item: &Assertion) -> StorageResult<surrealdb::sql::Value> {
@@ -731,7 +796,9 @@ impl SearchRepository<Assertion> for AssertionRepository {
 
             let search_predicate = predicate_parts.join(" OR ");
             let score_expression = score_parts.join(" + ");
-            let where_clause = format!("WHERE {where_prefix}{search_predicate}");
+            // Parenthesised: AND binds tighter than OR, so without them every
+            // term after the first escaped the space and deleted filters.
+            let where_clause = format!("WHERE {where_prefix}({search_predicate})");
             let offset = ranked_search_offset(criteria.cursor.as_deref())?;
 
             let query = format!(
@@ -1456,6 +1523,79 @@ mod tests {
         let retrieved = repo.get("test_space", &id).await.unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().predicate_raw, "works_at");
+    }
+
+    #[tokio::test]
+    async fn test_delete_and_restore_assertion() {
+        let repo = setup_test_repo().await;
+        let item = create_test_assertion();
+        let id = item.base.id.clone();
+        repo.create(item).await.unwrap();
+
+        repo.delete("test_space", &id).await.unwrap();
+        assert!(repo.get("test_space", &id).await.unwrap().is_none());
+        assert!(repo
+            .get_with_deleted("test_space", &id)
+            .await
+            .unwrap()
+            .is_some_and(|assertion| assertion.base.deleted_at.is_some()));
+        assert!(repo.restore("other_space", &id).await.is_err());
+
+        let restored = repo.restore("test_space", &id).await.unwrap();
+        assert!(restored.base.deleted_at.is_none());
+        assert!(repo.get("test_space", &id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_ranked_search_scopes_every_query_term() {
+        let repo = setup_test_repo().await;
+
+        repo.create(create_test_assertion_with_id(
+            "assertion:00000000-0000-0000-0000-000000000001",
+            "Alice",
+            "met_in",
+            Some("Paris"),
+        ))
+        .await
+        .unwrap();
+        let mut other_space = create_test_assertion_with_id(
+            "assertion:00000000-0000-0000-0000-000000000002",
+            "Mallory",
+            "met_in",
+            Some("Berlin"),
+        );
+        other_space.base.space_id = "other_space".to_string();
+        repo.create(other_space).await.unwrap();
+        let deleted_id = RecordId::from_str("assertion:00000000-0000-0000-0000-000000000003")
+            .expect("valid test record id");
+        repo.create(create_test_assertion_with_id(
+            &deleted_id.to_string(),
+            "Mallory",
+            "met_in",
+            Some("Rome"),
+        ))
+        .await
+        .unwrap();
+        repo.delete("test_space", &deleted_id).await.unwrap();
+
+        // The space and deleted filters must hold for the second term too.
+        let result = repo
+            .search(
+                &SearchCriteria::new()
+                    .with_space_id("test_space")
+                    .with_query("alice mallory")
+                    .with_limit(10),
+            )
+            .await
+            .unwrap();
+
+        let subjects: Vec<&str> = result
+            .results
+            .iter()
+            .map(|assertion| assertion.subject_text.as_str())
+            .collect();
+        assert_eq!(subjects, vec!["Alice"]);
+        assert_eq!(result.total, 1);
     }
 
     #[tokio::test]

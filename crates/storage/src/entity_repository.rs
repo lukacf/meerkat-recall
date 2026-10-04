@@ -1316,13 +1316,17 @@ impl EntityRepository {
             return Ok(candidates);
         }
 
+        // Entities with no embedding come first: the window is a fixed
+        // ORDER BY id prefix, so without this an entity past the first
+        // `limit` ids whose embedding was cleared would never be refilled.
         let query = format!(
             "SELECT id, display_name, \
              IF aliases IS NOT NONE THEN aliases ELSE [] END AS aliases, \
              summary, name_embedding_model, name_embedding_text_hash, \
-             IF name_embedding IS NOT NONE THEN array::len(name_embedding) ELSE NONE END AS embedding_dims \
+             IF name_embedding IS NOT NONE THEN array::len(name_embedding) ELSE NONE END AS embedding_dims, \
+             IF name_embedding IS NONE THEN 0 ELSE 1 END AS embedded \
              FROM entity WHERE space_id = $space_id AND deleted_at IS NONE AND status != 'merged' \
-             ORDER BY id LIMIT {limit}"
+             ORDER BY embedded ASC, id ASC LIMIT {limit}"
         );
 
         let mut response = self
@@ -1812,6 +1816,88 @@ mod tests {
         base.subjects_state = SubjectsState::Complete;
 
         Entity::new(base, EntityType::new("person"), display_name.to_string())
+    }
+
+    #[tokio::test]
+    async fn test_fake_embedding_purge_clears_ramp_name_embeddings_only() {
+        use elephant_embeddings::{EmbeddingProvider, FakeEmbeddingProvider};
+
+        let db_id = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let client = StorageClient::new(StorageConfig {
+            database: format!("entity_repo_test_{db_id}"),
+            ..StorageConfig::default()
+        })
+        .await
+        .unwrap();
+        client.query(ENTITY_SCHEMA).await.unwrap();
+        let repo = EntityRepository::new(client.clone());
+        let ramp = FakeEmbeddingProvider::new("text-embedding-3-large", 1200)
+            .embed(&["Ada".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let real: Vec<f32> = (0..1200_u16)
+            .map(|i| (f32::from(i) * 0.37).sin() * 0.03)
+            .collect();
+        let fake_entity = repo.create(create_test_entity("Ada")).await.unwrap();
+        let real_entity = repo.create(create_test_entity("August")).await.unwrap();
+        repo.set_name_embedding(
+            "test_space",
+            &fake_entity.base.id,
+            &ramp,
+            "text-embedding-3-large",
+            "h1",
+        )
+        .await
+        .unwrap();
+        repo.set_name_embedding(
+            "test_space",
+            &real_entity.base.id,
+            &real,
+            "text-embedding-3-large",
+            "h2",
+        )
+        .await
+        .unwrap();
+
+        let report = crate::fake_embedding_repair::purge_fake_embeddings(&client)
+            .await
+            .unwrap();
+        assert_eq!(report.entity_names_cleared, 1, "{report:?}");
+
+        let mut response = client
+            .query("SELECT display_name, name_embedding_model FROM entity ORDER BY display_name")
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = response.take(0).unwrap();
+        assert_eq!(rows[0]["display_name"], "Ada");
+        assert!(rows[0]
+            .get("name_embedding_model")
+            .is_none_or(serde_json::Value::is_null));
+        assert_eq!(rows[1]["name_embedding_model"], "text-embedding-3-large");
+    }
+
+    #[tokio::test]
+    async fn test_embedding_candidates_put_unembedded_entities_first() {
+        let repo = setup_test_repo().await;
+        let mut ids = Vec::new();
+        for name in ["A", "B", "C", "D"] {
+            ids.push(repo.create(create_test_entity(name)).await.unwrap().base.id);
+        }
+        // Embed every entity but one; whichever it is, a window of one must
+        // pick it, or a cleared embedding past the window is never refilled.
+        let missing = ids.pop().unwrap();
+        for id in &ids {
+            repo.set_name_embedding("test_space", id, &[0.1, 0.2], "m", "h")
+                .await
+                .unwrap();
+        }
+        let candidates = repo
+            .list_embedding_candidates("test_space", 1)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].entity_id, missing);
     }
 
     #[tokio::test]

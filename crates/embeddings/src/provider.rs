@@ -51,6 +51,48 @@ pub struct FakeEmbeddingProvider {
     dimensions: usize,
 }
 
+/// A provider that refuses to embed, carrying the reason.
+///
+/// Used wherever the configured provider cannot be built (missing API key,
+/// unknown provider name, fastembed unavailable). Embedding then fails
+/// visibly and is retried later, instead of silently writing
+/// [`FakeEmbeddingProvider`] vectors under the real model's name.
+pub struct UnavailableEmbeddingProvider {
+    model: String,
+    dimensions: usize,
+    reason: String,
+}
+
+impl UnavailableEmbeddingProvider {
+    /// Creates a provider that fails every call with `reason`.
+    #[must_use]
+    pub fn new(model: impl Into<String>, dimensions: usize, reason: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            dimensions,
+            reason: reason.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for UnavailableEmbeddingProvider {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    async fn embed(&self, _texts: &[String]) -> EmbeddingResult<Vec<EmbeddingVector>> {
+        Err(EmbeddingError::ProviderError(format!(
+            "embedding provider unavailable: {}",
+            self.reason
+        )))
+    }
+}
+
 /// A deterministic bag-of-words style embedding provider suitable for local,
 /// embedded, and browser-first execution.
 pub struct HashedEmbeddingProvider {

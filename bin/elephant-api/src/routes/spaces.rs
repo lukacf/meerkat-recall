@@ -1399,14 +1399,16 @@ struct CreateSpaceRequest {
     skill: Option<String>,
 }
 
+// A space created without an embedding policy gets the deployment's policy,
+// never "fake" (space config overrides the environment for that space).
 fn default_provider() -> String {
-    "fake".to_string()
+    elephant_embeddings::EmbeddingPolicy::from_env().provider
 }
 fn default_model() -> String {
-    "default".to_string()
+    elephant_embeddings::EmbeddingPolicy::from_env().model
 }
-const fn default_dims() -> i32 {
-    384
+fn default_dims() -> i32 {
+    i32::try_from(elephant_embeddings::EmbeddingPolicy::from_env().dims).unwrap_or(i32::MAX)
 }
 
 /// Request body for updating a space.

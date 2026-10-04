@@ -1488,6 +1488,17 @@ async fn blend_semantic_with_lexical_results(
     Ok((docs, lexical_total.max(semantic_total), blended))
 }
 
+/// Reciprocal-rank-fusion constant: a document's score from one ranking is
+/// `1 / (RANK_FUSION_K + rank)`, rank starting at 1.
+const RANK_FUSION_K: f64 = 60.0;
+
+/// Fuse the lexical and semantic rankings (reciprocal rank fusion).
+///
+/// Lexical results used to come first wholesale, so any query sharing a
+/// common word with unrelated documents ("bill", "house") buried every
+/// semantic hit once real embeddings existed. Fusion rewards a document both
+/// rankings agree on, and keeps each ranking's leaders near the top. Exact
+/// ties keep lexical-first order, so a pure exact match still leads.
 fn merge_lexical_and_semantic_docs(
     lexical_docs: Vec<Doc>,
     semantic_docs: Vec<Doc>,
@@ -1497,19 +1508,23 @@ fn merge_lexical_and_semantic_docs(
         return Vec::new();
     }
 
-    let mut seen = HashSet::new();
-    let mut merged = Vec::with_capacity(k.max(semantic_docs.len()).min(k.saturating_mul(2)));
-
-    for doc in lexical_docs.into_iter().chain(semantic_docs) {
-        if seen.insert(doc.base.id.clone()) {
-            merged.push(doc);
-        }
-        if merged.len() >= k {
-            break;
+    let mut fused: Vec<(f64, usize, Doc)> = Vec::new();
+    let mut position: HashMap<RecordId, usize> = HashMap::new();
+    for ranking in [lexical_docs, semantic_docs] {
+        for (rank, doc) in ranking.into_iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let contribution = 1.0 / (RANK_FUSION_K + (rank + 1) as f64);
+            if let Some(&index) = position.get(&doc.base.id) {
+                fused[index].0 += contribution;
+            } else {
+                position.insert(doc.base.id.clone(), fused.len());
+                let order = fused.len();
+                fused.push((contribution, order, doc));
+            }
         }
     }
-
-    merged
+    fused.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
+    fused.into_iter().take(k).map(|(_, _, doc)| doc).collect()
 }
 
 async fn collect_visible_text_search_results(
@@ -4255,6 +4270,32 @@ mod tests {
         let filters: DocFilters = serde_json::from_str("{}").unwrap();
         assert!(!filters.include_deleted);
         assert!(filters.collection.is_none());
+    }
+
+    #[test]
+    fn test_rank_fusion_lifts_agreement_without_burying_semantic_hits() {
+        fn doc(title: &str) -> Doc {
+            Doc {
+                base: BaseFieldsBuilder::new("test_space")
+                    .for_table(TableName::Doc)
+                    .build(),
+                title: title.to_string(),
+                text: String::new(),
+                sidecar_text: None,
+                source: None,
+                media_attachments: Vec::new(),
+                rendition_key: format!("rk-{title}"),
+                metadata: serde_json::json!({}),
+            }
+        }
+        let lexical: Vec<Doc> = (1..=5).map(|i| doc(&format!("L{i}"))).collect();
+        let s1 = doc("S1");
+        let both = lexical[4].clone();
+        let merged = merge_lexical_and_semantic_docs(lexical, vec![s1, both], 3);
+        let titles: Vec<&str> = merged.iter().map(|d| d.title.as_str()).collect();
+        // L5 is in both rankings; S1 ties L1 (both rank 1) and the tie keeps
+        // lexical order; the old merge returned L1, L2, L3 and dropped S1.
+        assert_eq!(titles, vec!["L5", "L1", "S1"]);
     }
 
     #[test]

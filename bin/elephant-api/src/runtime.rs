@@ -233,28 +233,31 @@ pub struct ConveyorStatus {
     /// Machine-readable cause when `blocked`, e.g. `budget_exhausted:graph`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
-    /// Embedding progress of the default space, from a background count
-    /// refreshed at most every [`EMBEDDING_PROGRESS_TTL`]. `None` until the
-    /// first count completes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding: Option<EmbeddingProgress>,
 }
 
-/// How many embeddable nodes are embedded and how many still wait.
+/// How many embeddable nodes of one space are embedded and how many wait.
 ///
-/// `pending_nodes + embedded_nodes == embeddable_nodes`; `counted_at` says how
-/// old the numbers are. Two readings minutes apart show whether embedding is
-/// moving.
+/// Derived from the space's content, so it is never part of the public status:
+/// only runtime operators of the counted space see it (MCP
+/// `get_runtime_status`). `pending_nodes + embedded_nodes + unembeddable_nodes
+/// == embeddable_nodes`; `counted_at` says how old the numbers are.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingProgress {
     /// Space the counts are for.
     pub space_id: String,
     /// Embeddable nodes still waiting for an embedding.
     pub pending_nodes: usize,
-    /// Embeddable nodes that have one.
+    /// Nodes with a real embedding, from any model.
     pub embedded_nodes: usize,
-    /// The denominator: pending plus embedded.
+    /// Nodes the worker gave up on; no vector, not counted as embedded.
+    pub unembeddable_nodes: usize,
+    /// The denominator: pending plus embedded plus unembeddable.
     pub embeddable_nodes: usize,
+    /// Embedded nodes by the model that produced them.
+    pub embedded_by_model: std::collections::BTreeMap<String, usize>,
+    /// The model new embeddings are made with (`PIPELINE_EMBED_MODEL`), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<String>,
     /// When the counts were taken (RFC 3339, UTC).
     pub counted_at: String,
 }
@@ -270,6 +273,26 @@ const EMBEDDING_PROGRESS_TTL: Duration = Duration::from_secs(300);
 struct EmbeddingProgressCache {
     latest: StdArc<StdMutex<Option<(std::time::Instant, EmbeddingProgress)>>>,
     refreshing: StdArc<AtomicBool>,
+}
+
+/// A status reading from storage counts, stamped now.
+fn embedding_progress_from_counts(
+    space_id: String,
+    counts: &elephant_storage::EmbeddingProgressCounts,
+) -> EmbeddingProgress {
+    let embedded_nodes = counts.embedded();
+    EmbeddingProgress {
+        space_id,
+        pending_nodes: counts.pending,
+        embedded_nodes,
+        unembeddable_nodes: counts.unembeddable,
+        embeddable_nodes: counts.pending + embedded_nodes + counts.unembeddable,
+        embedded_by_model: counts.embedded_by_model.clone(),
+        active_model: std::env::var("PIPELINE_EMBED_MODEL")
+            .ok()
+            .filter(|model| !model.trim().is_empty()),
+        counted_at: chrono::Utc::now().to_rfc3339(),
+    }
 }
 
 /// Decides whether a stalled conveyor is a fault, and names the cause.
@@ -634,7 +657,7 @@ impl RuntimeManager {
         // stays alive and ready while no work moves, which is exactly how the
         // 2026-07-30 budget stall went unnoticed for the better part of an hour
         // until someone happened to be counting assertions by hand.
-        if let Some(mut conveyor) = self.cached_conveyor_status().await {
+        if let Some(conveyor) = self.cached_conveyor_status().await {
             if conveyor.blocked {
                 let issue = conveyor.blocked_reason.clone().map_or_else(
                     || "conveyor_blocked".to_string(),
@@ -644,19 +667,26 @@ impl RuntimeManager {
                     status.issues.push(issue);
                 }
             }
-            conveyor.embedding = self.embedding_progress().await;
             status.conveyor = Some(conveyor);
         }
 
         status
     }
 
-    /// The last embedding progress count, starting a background recount when
-    /// it is missing or older than [`EMBEDDING_PROGRESS_TTL`]. Never waits for
-    /// the count itself.
-    async fn embedding_progress(&self) -> Option<EmbeddingProgress> {
+    /// The last embedding progress count for `space_id`, starting a
+    /// background recount when it is missing, for another space, or older than
+    /// [`EMBEDDING_PROGRESS_TTL`]. Never waits for the count itself.
+    ///
+    /// Content-derived: callers must restrict it to runtime operators of
+    /// `space_id`.
+    pub async fn embedding_progress(&self, space_id: &str) -> Option<EmbeddingProgress> {
         let cache = &self.embedding_progress;
-        let latest = cache.latest.lock().ok().and_then(|guard| guard.clone());
+        let latest = cache
+            .latest
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .filter(|(_, progress)| progress.space_id == space_id);
         let stale = latest
             .as_ref()
             .is_none_or(|(at, _)| at.elapsed() >= EMBEDDING_PROGRESS_TTL);
@@ -671,18 +701,12 @@ impl RuntimeManager {
         };
         let slot = StdArc::clone(&cache.latest);
         let refreshing = StdArc::clone(&cache.refreshing);
-        let space_id = std::env::var("MCP_SPACE_ID").unwrap_or_else(|_| "default".to_string());
+        let space_id = space_id.to_string();
         tokio::spawn(async move {
             let repo = elephant_storage::DocNodeRepository::new(storage);
             match repo.count_embedding_progress(&space_id).await {
                 Ok(counts) => {
-                    let fresh = EmbeddingProgress {
-                        space_id,
-                        pending_nodes: counts.pending,
-                        embedded_nodes: counts.embedded,
-                        embeddable_nodes: counts.pending + counts.embedded,
-                        counted_at: chrono::Utc::now().to_rfc3339(),
-                    };
+                    let fresh = embedding_progress_from_counts(space_id, &counts);
                     if let Ok(mut guard) = slot.lock() {
                         *guard = Some((std::time::Instant::now(), fresh));
                     }
@@ -692,6 +716,14 @@ impl RuntimeManager {
             refreshing.store(false, Ordering::Release);
         });
         progress
+    }
+
+    /// Stores a progress reading as if a background count had produced it.
+    #[cfg(test)]
+    pub(crate) fn seed_embedding_progress(&self, progress: EmbeddingProgress) {
+        if let Ok(mut guard) = self.embedding_progress.latest.lock() {
+            *guard = Some((std::time::Instant::now(), progress));
+        }
     }
 
     /// The conveyor status, recomputed at most once per TTL.
@@ -750,7 +782,6 @@ impl RuntimeManager {
             remaining_euros_graph: snapshot.remaining_euros_graph,
             blocked: blocked_reason.is_some(),
             blocked_reason,
-            embedding: None,
         })
     }
 

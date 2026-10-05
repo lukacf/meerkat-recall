@@ -66,6 +66,13 @@ pub struct SourcesState {
 /// Source repository interface used by the API layer.
 #[async_trait::async_trait]
 pub trait SourceRepo: Send + Sync {
+    /// Restores only if the row still matches the authorized snapshot.
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &elephant_types::RecordId,
+        authorized: &Source,
+    ) -> StorageResult<Source>;
     async fn create(&self, record: Source) -> StorageResult<Source>;
     async fn get(
         &self,
@@ -100,6 +107,15 @@ pub trait SourceRepo: Send + Sync {
 
 #[async_trait::async_trait]
 impl SourceRepo for SourceRepository {
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &elephant_types::RecordId,
+        authorized: &Source,
+    ) -> StorageResult<Source> {
+        Self::restore_guarded(self, space_id, id, authorized).await
+    }
+
     async fn create(&self, record: Source) -> StorageResult<Source> {
         elephant_storage::Repository::create(self, record).await
     }
@@ -166,6 +182,24 @@ impl SourceRepo for SourceRepository {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl SourceRepo for elephant_storage::MockSourceRepository {
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &elephant_types::RecordId,
+        authorized: &Source,
+    ) -> StorageResult<Source> {
+        let current = Self::get_with_deleted(self, space_id, id).await?;
+        let unchanged = current.is_some_and(|current| {
+            elephant_storage::base_envelope_unchanged(&current.base, &authorized.base)
+        });
+        if !unchanged {
+            return Err(elephant_storage::StorageError::Conflict(format!(
+                "Source changed since it was authorized: {id}"
+            )));
+        }
+        Self::restore(self, space_id, id).await
+    }
+
     async fn create(&self, record: Source) -> StorageResult<Source> {
         elephant_storage::Repository::create(self, record).await
     }
@@ -1897,8 +1931,20 @@ async fn restore_source(
                     )
                 })?;
 
-            match state.source_repo.restore(&space_id, &rid).await {
+            match state
+                .source_repo
+                .restore_guarded(&space_id, &rid, &existing)
+                .await
+            {
                 Ok(restored) => Ok(Json(restored)),
+                Err(elephant_storage::StorageError::Conflict(_)) => Err((
+                    StatusCode::CONFLICT,
+                    Json(ApiError {
+                        code: "CONFLICT".to_string(),
+                        message: "record changed since it was authorized; retry".to_string(),
+                        details: None,
+                    }),
+                )),
                 Err(e) => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiError::internal(e.to_string())),

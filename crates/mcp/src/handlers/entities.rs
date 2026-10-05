@@ -1096,11 +1096,19 @@ impl ToolHandler for RestoreEntityHandler {
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
 
-                let restored = self
-                    .repo
-                    .restore(&space_id, &rid)
-                    .await
-                    .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+                // Guarded: restores only the row authorized above. A row changed
+                // in between is a conflict, not acted on under the old decision.
+                let restored = match self.repo.restore_guarded(&space_id, &rid, &entity).await {
+                    Ok(restored) => restored,
+                    Err(elephant_storage::StorageError::Conflict(_)) => {
+                        let response: ToolResponse<()> = ToolResponse::error(
+                            "Entity changed since it was authorized; retry".to_string(),
+                        );
+                        return serde_json::to_value(response)
+                            .map_err(|e| McpError::ExecutionError(e.to_string()));
+                    }
+                    Err(e) => return Err(McpError::ExecutionError(e.to_string())),
+                };
 
                 if let Err(reason) =
                     ctx.authz

@@ -213,17 +213,19 @@ jobs:
           (dist / f"{stem}.sha256").write_text(f"{digest}  {archive.name}\n")
           PY
 
-      - name: Attest archive build provenance
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: dist/*.tar.gz
-
+      # Retain candidate bytes for private acceptance if attestation fails.
+      # The required attestation step still fails the run and blocks promotion.
       - name: Upload candidate artifacts
         uses: actions/upload-artifact@v4
         with:
           name: elephant-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+
+      - name: Attest archive build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
 
       - name: Report build disk usage
         if: always()

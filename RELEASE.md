@@ -48,8 +48,16 @@ candidate archives. It does not create a GitHub release or publish crates.
 
 Each archive contains the executable, license texts, and `provenance.json`
 with the source commit/tree, build command, workflow run, and binary checksum.
-The workflow also creates archive checksums and build attestations. Verify the
-successful run and download the artifacts before promotion.
+The workflow creates archive checksums, uploads the candidate artifacts, then
+requires a GitHub build attestation for each archive. A later attestation failure
+leaves the run failed while preserving the uploaded bytes for private testing.
+
+For private testing only, the owner may select those artifacts when source
+validation and the target's build, packaging and upload steps all succeeded.
+Record the exact run and attempt, artifact identity, source and checksums, and
+the attestation failure as pending evidence. Bundled `provenance.json` is build
+metadata, not a verified GitHub attestation. A downloadable artifact or a
+successful private test does not qualify it for public promotion.
 
 Record the selected build profile as well as its features. This workflow uses
 `--profile deploy`; a locally accepted `--release` executable is a separate
@@ -91,8 +99,11 @@ provider, persistence or live-isolation evidence as pending.
 
 ## Promote verified artifacts
 
-1. Check the archive checksum and bundled provenance. Smoke test the executable
-   on each supported target host and record the exact binary checksum.
+1. Require a successful candidate workflow and verify each archive's GitHub
+   build attestation against the selected source and workflow identity. Check
+   its checksum and bundled provenance. Smoke test the executable on each
+   supported target host and record the exact binary checksum. Missing or
+   failed attestation blocks public promotion even if private testing passed.
 2. Confirm the intended `vX.Y.Z` tag matches the Cargo workspace version. Tag
    the reviewed source commit after the checks pass.
 3. Create a draft GitHub release containing those verified archives, a flat

@@ -85,6 +85,9 @@ does not by itself establish a published release.
   runtime and documented only as legacy/non-active behavior.
 
 ### Fixed
+- Document paragraph and section spans preserve original byte offsets across
+  LF and CRLF line endings, preventing misplaced evidence and UTF-8 slicing
+  panics during document-tree construction.
 - Document semantic search uses partitioned vector candidates and blends
   lexical and semantic ranks. Assertion text search uses indexed candidates.
 - Document semantic search loads vector-hit nodes, revisions, and documents

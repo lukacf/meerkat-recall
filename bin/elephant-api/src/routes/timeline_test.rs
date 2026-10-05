@@ -82,6 +82,17 @@ mod tests {
 
     #[async_trait]
     impl TimelineEventRepo for FailingTimelineEventRepo {
+        async fn update_preserving_security(
+            &self,
+            _space_id: &str,
+            _id: &RecordId,
+            _record: Event,
+        ) -> StorageResult<Event> {
+            Err(StorageError::QueryError(
+                "injected update failure".to_string(),
+            ))
+        }
+
         async fn create(&self, _record: Event) -> StorageResult<Event> {
             Err(StorageError::QueryError(
                 "injected create failure".to_string(),
@@ -1116,5 +1127,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(restored.status(), StatusCode::OK);
+    }
+
+    async fn mock_private_cleared_auth(req: Request<Body>, next: Next) -> impl IntoResponse {
+        let mut req = req;
+        req.extensions_mut().insert(AuthPrincipal {
+            subject: "private-cleared".to_string(),
+            space_id: Some("test_space".to_string()),
+            scopes: vec!["read:event".to_string(), "write:event".to_string()],
+            security_level: 10,
+            security_labels: vec!["private".to_string()],
+            ..AuthPrincipal::default()
+        });
+        next.run(req).await
+    }
+
+    #[tokio::test]
+    async fn test_update_event_cannot_declassify() {
+        // A writer cleared for the private label and both levels, so every
+        // refusal below is the declassification rule, not missing clearance.
+        let authz = Arc::new(AuthzService::new());
+        let event_repo: Arc<dyn TimelineEventRepo> = Arc::new(MockEventRepository::empty());
+        let state = Arc::new(TimelineState::new_with_repo(event_repo, authz));
+        let app = timeline_routes()
+            .layer(middleware::from_fn(mock_private_cleared_auth))
+            .with_state(state);
+        let mut event = create_test_event("Classified event");
+        event.base.security.level = 2;
+        event.base.security.labels = vec!["private".to_string()];
+        let event_id = event.base.id.to_string();
+        let send = |method: &str, uri: String, body: Body| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap()
+        };
+        let created = app
+            .clone()
+            .oneshot(send(
+                "POST",
+                "/v1/timeline".to_string(),
+                Body::from(serde_json::to_string(&event).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert!(created.status().is_success());
+
+        // The caller is cleared for both envelopes, but an ordinary edit may
+        // not lower the level or drop labels.
+        let mut lowered = event.clone();
+        lowered.base.security.level = 0;
+        let mut unlabeled = event.clone();
+        unlabeled.base.security.labels.clear();
+        for attempt in [lowered, unlabeled] {
+            let response = app
+                .clone()
+                .oneshot(send(
+                    "PUT",
+                    format!("/v1/timeline/{event_id}"),
+                    Body::from(serde_json::to_string(&attempt).unwrap()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        // Unchanged security: the edit goes through.
+        let mut renamed = event.clone();
+        renamed.title = "Classified event, renamed".to_string();
+        let response = app
+            .clone()
+            .oneshot(send(
+                "PUT",
+                format!("/v1/timeline/{event_id}"),
+                Body::from(serde_json::to_string(&renamed).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let saved: Event = serde_json::from_slice(&body).unwrap();
+        assert_eq!(saved.base.security.level, 2);
+        assert_eq!(saved.base.security.labels, vec!["private".to_string()]);
     }
 }

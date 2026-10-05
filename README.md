@@ -9,6 +9,14 @@ This is pre-1.0 software. The workspace version is a development version until
 verified artifacts and release notes appear on the
 [releases page](https://github.com/lukacf/elephant/releases).
 
+## Installation paths
+
+The candidate binary distribution targets Linux x86-64 and macOS ARM64.
+[Binary installation](docs/installation.mdx) covers the archive layout,
+checksums, and model-provider prerequisites. Candidate availability is not a
+published release; use only artifacts supplied with their matching release
+record. The source demo below is a separate build without model extraction.
+
 ## Try the Living Wiki demo
 
 From a checkout, with Rust 1.94 or newer installed:

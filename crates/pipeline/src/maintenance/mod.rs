@@ -411,13 +411,9 @@ pub async fn run_maintenance_sweep(
     // wholesale rather than nudging graph quality, and switching itself on the
     // moment a new binary lands has two bad consequences:
     //
-    // 1. It breaks deployment. Certification compares the Elephant snapshot's
-    //    CONTENT digest against the one taken at quiesce
-    //    (deploy_production.py: "candidate snapshot differs from quiesced
-    //    export"). A backfill firing during the candidate boot rewrites
-    //    thousands of records, changes the content, and fails the activation —
-    //    which is exactly how activation-25 died once already, for a different
-    //    write.
+    // 1. It can invalidate deployment checks that compare a candidate snapshot
+    //    with a quiesced export. A backfill during candidate boot changes the
+    //    content before the operator can verify that the upgrade preserved it.
     // 2. It repairs the whole graph unobserved. A traversal bug would
     //    misclassify everything before anyone looked.
     //

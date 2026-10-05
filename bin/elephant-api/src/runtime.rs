@@ -217,9 +217,8 @@ pub struct RuntimeStatus {
 /// Whether derivation work can actually flow, and if not, why.
 ///
 /// The distinction that matters is between an EMPTY queue and a BLOCKED one.
-/// Both produce zero assertions per hour, but only one is a problem, and
-/// conflating them has cost real time here: the 2026-04-11 to 2026-07-30 KB gap
-/// was investigated as a dead worker when the queue simply had nothing in it.
+/// Both produce zero assertions per hour. An empty queue is idle; a blocked
+/// queue has pending work that cannot run and needs attention.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConveyorStatus {
     /// Items runnable right now, saturating at the queue's scan window.
@@ -237,15 +236,9 @@ pub struct ConveyorStatus {
 
 /// Decides whether a stalled conveyor is a fault, and names the cause.
 ///
-/// The judgement that matters is between an EMPTY queue and a BLOCKED one. Both
-/// show zero throughput, but only one needs attention, and conflating them is
-/// how the 2026-04-11 to 2026-07-30 KB gap got investigated as a dead worker
-/// when the queue simply had nothing in it.
-///
-/// So exhausted budget alone is NOT a fault. A quiet day that happens to have
-/// spent its budget is fine; reporting that red would teach everyone to ignore
-/// this field, which is the failure mode of every green-when-broken surface we
-/// already have. It is only a fault when work is waiting that cannot start.
+/// An EMPTY queue and a BLOCKED queue both show zero throughput, but only a
+/// blocked queue needs attention. Exhausted budget alone is not a fault:
+/// report a fault only when pending work cannot start.
 fn classify_conveyor_block(
     runnable_items: usize,
     remaining_euros_graph: f64,

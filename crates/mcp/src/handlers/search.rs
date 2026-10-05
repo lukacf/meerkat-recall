@@ -409,12 +409,10 @@ impl ToolHandler for UnifiedSearchHandler {
                         }
                     }
 
-                    // SEMANTIC FIRST. Vector search over stored name embeddings is the
-                    // right primary signal and it already exists - `search_entities`
-                    // has used it all along (entities.rs). Unified search never got
-                    // it, so the tool the household agents actually reach was
-                    // substring-only, which is how "Mia Example principal" returned
-                    // "Acamia AB". Substring is the fallback, not the design.
+                    // Use stored name embeddings as the primary entity search signal,
+                    // matching `search_entities` (entities.rs). This lets unified search
+                    // match related concepts without requiring literal substrings.
+                    // Substring matches remain the fallback.
                     //
                     // Degrades exactly as the entities handler does: when no provider,
                     // no stored vectors, or nothing above the similarity floor, this
@@ -733,11 +731,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_all_uses_the_semantic_path_not_just_substring() {
-        // THE STRUCTURAL GAP behind the household incident. Vector search over stored
-        // name embeddings already existed and `search_entities` used it - but
-        // `search_all`, which is the tool the household agents actually reach, was
-        // substring-only. So the knowledge base could not find anything a query did
-        // not literally spell, and answered "Mia Example principal" with "Acamia AB".
+        // Unified search must use stored name embeddings, as `search_entities` does,
+        // so a query can match entities without a literal substring match. The
+        // synthetic fixture below distinguishes semantic hits from lexical matches.
         //
         // Mutation: delete the semantic block from the unified handler - executed, red.
         use std::collections::HashSet;

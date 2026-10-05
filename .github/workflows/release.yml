@@ -178,38 +178,54 @@ jobs:
           binary.chmod(0o755)
           for name in ("LICENSE", "LICENSE-MIT", "LICENSE-APACHE"):
               shutil.copyfile(name, bundle / name)
+          shutil.copytree("skills", bundle / "skills")
           provenance = {
               "version": version,
               "target": target,
               "license": package["license"],
               "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
               "source_tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(),
+              "cargo_lock_sha256": hashlib.sha256(pathlib.Path("Cargo.lock").read_bytes()).hexdigest(),
               "workflow_run": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
               "workflow_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
               "build_command": "./scripts/repo-cargo build --locked --profile deploy -p elephant-bin --features rocksdb",
+              "build_profile": "deploy",
+              "features": ["rocksdb"],
+              "default_features": True,
               "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
               "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+              "runtime_assets": {
+                  str(path.relative_to(bundle)): hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in sorted((bundle / "skills").rglob("*")) if path.is_file()
+              },
           }
           (bundle / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
           archive = dist / f"{stem}.tar.gz"
+          def public_member(info):
+              info.uid = info.gid = 0
+              info.uname = info.gname = ""
+              return info
+
           with tarfile.open(archive, "w:gz") as tar:
               for entry in sorted(bundle.iterdir()):
-                  tar.add(entry, arcname=entry.name)
+                  tar.add(entry, arcname=entry.name, filter=public_member)
           digest = hashlib.sha256(archive.read_bytes()).hexdigest()
           (dist / f"{stem}.sha256").write_text(f"{digest}  {archive.name}\n")
           PY
 
-      - name: Attest archive build provenance
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: dist/*.tar.gz
-
+      # Retain candidate bytes for private acceptance if attestation fails.
+      # The required attestation step still fails the run and blocks promotion.
       - name: Upload candidate artifacts
         uses: actions/upload-artifact@v4
         with:
           name: elephant-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+
+      - name: Attest archive build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
 
       - name: Report build disk usage
         if: always()

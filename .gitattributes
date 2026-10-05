@@ -21,3 +21,7 @@
 /*.octoshift.log export-ignore
 /*.octoshift.verbose.log export-ignore
 /test-ingest.md export-ignore
+
+# Preserve verbatim CRLF notice blocks copied from the existing book fixture.
+/tests/e2e/fixtures/alice_in_wonderland.txt whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+/tests/scenarios/fixtures/alice_in_wonderland.txt whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

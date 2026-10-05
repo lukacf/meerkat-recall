@@ -22,6 +22,9 @@ assume local `SKIP_AUTH` development; authenticated instances require an
 Results are limited to the caller's authorized space and records. An empty
 result is not proof that no matching record exists elsewhere or behind a
 clearance boundary. Keep IDs from search results for subsequent reads.
+Multiword document and assertion text queries apply the selected space and
+soft-deletion conditions to the entire term expression, including result-count
+queries. Term matching does not widen the authorized space.
 
 ## Vector similarity search
 
@@ -63,6 +66,14 @@ Inspect `data.items`, which contain a document redaction envelope and a score.
 Scores rank search results; they are not probabilities that the document's
 claims are true. A successful lexical fallback should not be described to a
 reader as embedding-based evidence.
+
+With the OpenAI embedding provider, each input is capped at 24,000 characters
+before sending. Inputs that the provider still rejects for length are shortened
+further; oversized batches are split. The resulting vector represents the
+retained prefix, so a passage near the end of a long input may not influence
+semantic ranking. Stored source text and evidence are not truncated by this
+embedding step. A progressing worker is not proof that every pending record
+already has an embedding.
 
 The REST route enters semantic mode only when both `query` and `k` are present.
 Omit `k` for a lexical query. Its response shape differs from the MCP envelope;
@@ -122,6 +133,13 @@ Find entities by name, type, or free-text query. Filter by `entity_type` to narr
     ```
   </Tab>
 </Tabs>
+
+For the SurrealDB backend, MCP entity search can reuse a vector snapshot for
+up to 60 seconds, keyed by space and vector dimension. New or changed vectors
+may therefore take that long to affect ranking. Search reloads current entity
+records and applies the caller's record authorization; the snapshot does not
+cache access decisions. Identity resolution uses the uncached path so that
+newly created entities remain immediately eligible for resolution.
 
 ## Unified search with search_all
 

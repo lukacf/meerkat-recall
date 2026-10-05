@@ -304,6 +304,22 @@ fn detect_content_type(text: &str) -> ContentType {
     ContentType::PlainText
 }
 
+/// Yields line contents with byte offsets into the original text.
+///
+/// Like `str::lines`, removes LF or CRLF endings from the contents, but counts
+/// every delimiter byte when advancing the offset.
+fn lines_with_byte_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.split_inclusive('\n').scan(0, |offset, raw_line| {
+        let start = *offset;
+        *offset += raw_line.len();
+        let line = raw_line
+            .strip_suffix("\r\n")
+            .or_else(|| raw_line.strip_suffix('\n'))
+            .unwrap_or(raw_line);
+        Some((start, line))
+    })
+}
+
 /// Detects section boundaries in text.
 ///
 /// Sections are detected by:
@@ -312,25 +328,14 @@ fn detect_content_type(text: &str) -> ContentType {
 #[allow(clippy::cast_possible_truncation)] // Text positions fit in u32
 fn detect_sections(text: &str) -> Vec<DetectedSection> {
     let mut sections = Vec::new();
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<_> = lines_with_byte_offsets(text).collect();
 
     if lines.is_empty() {
         return sections;
     }
 
     let mut current_section_start: Option<(usize, String)> = None;
-    let mut byte_offset = 0usize;
-
-    for (i, line) in lines.iter().enumerate() {
-        let line_start = byte_offset;
-        let line_len = line.len();
-        // Account for newline character (if not last line)
-        let line_end = if i < lines.len() - 1 {
-            byte_offset + line_len + 1
-        } else {
-            byte_offset + line_len
-        };
-
+    for (i, &(line_start, line)) in lines.iter().enumerate() {
         // Check for Markdown-style heading (# Heading)
         let trimmed = line.trim_start();
         if trimmed.starts_with('#') {
@@ -353,7 +358,7 @@ fn detect_sections(text: &str) -> Vec<DetectedSection> {
         }
         // Check for Setext-style heading (underline on next line)
         else if i + 1 < lines.len() {
-            let next_line = lines[i + 1].trim();
+            let next_line = lines[i + 1].1.trim();
             let is_setext = !line.trim().is_empty()
                 && (next_line.chars().all(|c| c == '=') && next_line.len() >= 3
                     || next_line.chars().all(|c| c == '-') && next_line.len() >= 3);
@@ -373,8 +378,6 @@ fn detect_sections(text: &str) -> Vec<DetectedSection> {
                 current_section_start = Some((line_start, title));
             }
         }
-
-        byte_offset = line_end;
     }
 
     // Close final section
@@ -403,11 +406,9 @@ fn detect_paragraphs(text: &str, range_start: u32, range_end: u32) -> Vec<Detect
 
     let mut para_start: Option<usize> = None;
     let mut last_non_empty_end = 0usize;
-    let mut byte_offset = 0usize;
     let mut prev_was_empty = true;
 
-    for line in range_text.lines() {
-        let line_start = byte_offset;
+    for (line_start, line) in lines_with_byte_offsets(range_text) {
         let line_len = line.len();
         let is_empty = line.trim().is_empty();
 
@@ -416,7 +417,7 @@ fn detect_paragraphs(text: &str, range_start: u32, range_end: u32) -> Vec<Detect
                 // Start new paragraph
                 para_start = Some(line_start);
             }
-            last_non_empty_end = byte_offset + line_len;
+            last_non_empty_end = line_start + line_len;
         } else if !prev_was_empty && para_start.is_some() {
             // End of paragraph (first blank line after content)
             paragraphs.push(DetectedParagraph {
@@ -426,8 +427,6 @@ fn detect_paragraphs(text: &str, range_start: u32, range_end: u32) -> Vec<Detect
         }
 
         prev_was_empty = is_empty;
-        // Add 1 for newline
-        byte_offset += line_len + 1;
     }
 
     // Handle final paragraph (no trailing newline)
@@ -1575,9 +1574,10 @@ pub async fn execute_embed_chunks<P: EmbeddingProvider>(
 
 /// Splits text into chunks with overlap.
 ///
-/// Returns a vector of (start, end) byte offsets.
+/// Returns a vector of (start, end) byte offsets on UTF-8 character boundaries.
+/// A single character may exceed the byte budget rather than being split.
 fn split_text_into_chunks(text: &str, max_size: usize, overlap: usize) -> Vec<(u32, u32)> {
-    if text.is_empty() {
+    if text.is_empty() || max_size == 0 {
         return vec![];
     }
 
@@ -1587,14 +1587,24 @@ fn split_text_into_chunks(text: &str, max_size: usize, overlap: usize) -> Vec<(u
     }
 
     let mut chunks = Vec::new();
-    let mut start = 0;
+    let mut start = 0usize;
 
     while start < text_len {
-        let end = (start + max_size).min(text_len);
+        let end = text.floor_char_boundary(start.saturating_add(max_size).min(text_len));
+        let end = if end == start {
+            text.ceil_char_boundary(start + 1)
+        } else {
+            end
+        };
 
         // Try to break at a word boundary
         let actual_end = if end < text_len {
-            find_word_boundary(text, end)
+            let word_end = find_word_boundary(text, end);
+            if word_end > start {
+                word_end
+            } else {
+                end
+            }
         } else {
             end
         };
@@ -1605,16 +1615,12 @@ fn split_text_into_chunks(text: &str, max_size: usize, overlap: usize) -> Vec<(u
             break;
         }
 
-        // Calculate next start with overlap
-        let next_start = if actual_end > overlap {
-            actual_end - overlap
-        } else {
-            actual_end
-        };
+        // Round overlap forward so it cannot begin inside a UTF-8 character.
+        let next_start = text.ceil_char_boundary(actual_end.saturating_sub(overlap));
 
-        // Ensure we always make progress
+        // Even an overlap larger than the chunk must advance by one character.
         start = if next_start <= start {
-            start + 1
+            text.ceil_char_boundary(start + 1)
         } else {
             next_start
         };
@@ -1879,6 +1885,47 @@ mod tests {
         let chunks = split_text_into_chunks("Hello", 100, 20);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], (0, 5));
+    }
+
+    #[test]
+    fn test_split_text_into_chunks_unicode_targets_and_overlap() {
+        assert_eq!(
+            split_text_into_chunks("a\u{e9}b", 2, 0),
+            vec![(0, 1), (1, 3), (3, 4)]
+        );
+        assert_eq!(
+            split_text_into_chunks("ab\u{e9} cd", 5, 2),
+            vec![(0, 5), (4, 7)]
+        );
+        assert!(split_text_into_chunks("\u{732b}", 0, 0).is_empty());
+    }
+
+    #[test]
+    fn test_fixed_and_semantic_fallback_chunks_preserve_unicode_coverage() {
+        let ascii = format!("a {}", "b".repeat(80));
+        for text in ["a\u{e9}\u{732b}\u{1f642} \t\r\nb\u{732b}", ascii.as_str()] {
+            for max_size in [1, 2, 3, 4, 5, 8, usize::MAX] {
+                for overlap in [0, 1, 2, 7, usize::MAX] {
+                    for chunks in [
+                        split_text_into_chunks(text, max_size, overlap),
+                        semantic_split_text(text, max_size, overlap),
+                    ] {
+                        assert_eq!(chunks.first().unwrap().0, 0);
+                        assert_eq!(chunks.last().unwrap().1 as usize, text.len());
+                        assert!(chunks.len() <= text.chars().count());
+                        for &(start, end) in &chunks {
+                            assert!(start < end);
+                            assert!(text.get(start as usize..end as usize).is_some());
+                        }
+                        for pair in chunks.windows(2) {
+                            assert!(pair[1].0 > pair[0].0, "starts must advance");
+                            assert!(pair[1].0 <= pair[0].1, "coverage must not have gaps");
+                            assert!(pair[1].1 >= pair[0].1, "ends must not move backward");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2151,6 +2198,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_build_doc_tree_default_unicode_fallback_spans() {
+        let storage = StorageClient::new_memory().await.expect("storage");
+        let text = "\u{732b}".repeat(400);
+        let doc = make_doc(&text);
+        let mut registry = RendererRegistry::new();
+        registry.register(Box::new(PassthroughRenderer::new()));
+        let rendered = execute_render_doc(&storage, &registry, &doc, Some("text/plain"))
+            .await
+            .expect("render");
+        let config = DocTreeConfig::default();
+
+        let result = execute_build_doc_tree(&storage, &rendered.revision_id, &config)
+            .await
+            .expect("build tree");
+        let mut chunks = DocNodeRepository::new(storage)
+            .find_chunks_by_revision(&rendered.revision_id)
+            .await
+            .expect("stored chunks");
+        chunks.sort_by_key(|node| node.span.start);
+
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.len(), result.chunk_nodes);
+        assert_eq!(chunks.first().unwrap().span.start, 0);
+        assert_eq!(chunks.last().unwrap().span.end as usize, text.len());
+        for chunk in &chunks {
+            let excerpt = text
+                .get(chunk.span.start as usize..chunk.span.end as usize)
+                .expect("stored span must align with original UTF-8 text");
+            assert!(!excerpt.is_empty());
+            assert!(excerpt.len() <= config.max_chunk_size);
+        }
+        for pair in chunks.windows(2) {
+            assert!(pair[1].span.start > pair[0].span.start);
+            assert!(pair[1].span.start <= pair[0].span.end);
+        }
+    }
+
+    #[tokio::test]
     async fn test_supersession_handling() {
         let storage = StorageClient::new_memory().await.expect("storage");
         let doc = make_doc("Initial content");
@@ -2352,6 +2437,31 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_sections_mixed_line_endings_exact_spans() {
+        let prefix = "preamble\r\n\r\n";
+        let first = "# Caf\u{e9}\r\n\r\nintro \u{1f642}\n\n";
+        for ending in ["", "\n", "\r\n"] {
+            let second = format!("\u{732b}\r\n===\r\n\r\nlast{ending}");
+            let text = format!("{prefix}{first}{second}");
+            let sections = detect_sections(&text);
+
+            assert_eq!(sections.len(), 2);
+            assert_eq!(sections[0].title, "Caf\u{e9}");
+            assert_eq!(sections[1].title, "\u{732b}");
+            assert_eq!(sections[0].start as usize, prefix.len());
+            assert_eq!(sections[0].end as usize, prefix.len() + first.len());
+            assert_eq!(sections[1].start, sections[0].end);
+            assert_eq!(sections[1].end as usize, text.len());
+            for (section, expected) in sections.iter().zip([first, second.as_str()]) {
+                assert_eq!(
+                    text.get(section.start as usize..section.end as usize),
+                    Some(expected)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_detect_sections_no_sections() {
         let text = "Just plain text without any headings.";
 
@@ -2389,6 +2499,45 @@ mod tests {
         let paragraphs = detect_paragraphs(text, range_start, range_end);
 
         assert_eq!(paragraphs.len(), 2);
+    }
+
+    #[test]
+    fn test_detect_paragraphs_mixed_line_endings_exact_spans() {
+        let prefix = "excluded \u{1f642}\r\n";
+        let expected = ["Caf\u{e9}\r\ncontinued.", "\u{732b}\u{1f642}", "last"];
+        for ending in ["", "\n", "\r\n"] {
+            let body = format!(
+                "{}\r\n \t\r\n\n{}\n\n{}{ending}",
+                expected[0], expected[1], expected[2]
+            );
+            let text = format!("{prefix}{body}\nexcluded suffix");
+            let paragraphs = detect_paragraphs(
+                &text,
+                prefix.len() as u32,
+                (prefix.len() + body.len()) as u32,
+            );
+
+            assert_eq!(paragraphs.len(), expected.len());
+            for (paragraph, expected_text) in paragraphs.iter().zip(expected) {
+                let expected_start = text.find(expected_text).unwrap();
+                assert_eq!(paragraph.start as usize, expected_start);
+                assert_eq!(paragraph.end as usize, expected_start + expected_text.len());
+                assert_eq!(
+                    text.get(paragraph.start as usize..paragraph.end as usize),
+                    Some(expected_text)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_detect_paragraphs_preserves_final_bare_carriage_return() {
+        let text = "Caf\u{e9}\r";
+        let paragraphs = detect_paragraphs(text, 0, text.len() as u32);
+
+        assert_eq!(paragraphs.len(), 1);
+        assert_eq!(paragraphs[0].start, 0);
+        assert_eq!(paragraphs[0].end as usize, text.len());
     }
 
     #[test]

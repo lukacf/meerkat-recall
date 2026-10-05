@@ -72,7 +72,7 @@ Most REST data responses return JSON; SSE and no-content responses are exception
 | `401 Unauthorized` | Missing, invalid, or expired authentication token |
 | `403 Forbidden` | Authorization denied |
 | `404 Not Found` | Resource does not exist |
-| `409 Conflict` | Resource already exists |
+| `409 Conflict` | Resource already exists or a guarded write conflicts with the current record |
 | `500 Internal Server Error` | Unexpected server failure |
 | `503 Service Unavailable` | A required dependency or runtime capability is unavailable |
 
@@ -103,6 +103,19 @@ Resource handlers use a structured JSON error body:
 Authentication errors instead use `{"error":"missing_token","message":"..."}`
 with HTTP 401 or 403. Malformed HTTP/JSON input can fail before a resource
 handler runs, so clients should check status and content type before decoding.
+
+### Authorization conflicts
+
+REST restore endpoints for documents, entities, relationships, sources, timeline
+events, and assertions check that the authorized record still matches at the
+write. Assertion delete and resolution updates use the same protection. If
+security, subjects or their completeness state, relevant entity links, or the
+exact soft-deletion marker changes before the mutation, the request returns `409` with code
+`CONFLICT`, without applying the requested change or returning record content.
+The same conflict occurs if the record disappears after authorization.
+
+Fetch the current record and reassess the operation before retrying. MCP
+`restore_entity` reports an equivalent concurrent change as a tool error.
 
 ## Asynchronous processing
 

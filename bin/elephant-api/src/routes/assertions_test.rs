@@ -895,4 +895,100 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    async fn mock_attenuated_auth(req: Request<Body>, next: Next) -> impl IntoResponse {
+        let mut req = req;
+        req.extensions_mut().insert(AuthPrincipal {
+            subject: "attenuated".to_string(),
+            space_id: Some("test_space".to_string()),
+            scopes: vec!["read:assertion".to_string(), "write:assertion".to_string()],
+            security_level: 10,
+            security_labels: vec![],
+            subject_allowlist: Some(vec![]),
+            ..AuthPrincipal::default()
+        });
+        next.run(req).await
+    }
+
+    async fn entity_search(
+        app: &Router,
+        entity_id: &str,
+        limit: usize,
+    ) -> (StatusCode, Option<AssertionSearchResponse>) {
+        let body = serde_json::json!({ "entity_id": entity_id, "limit": limit });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assertions/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).ok())
+    }
+
+    #[tokio::test]
+    async fn test_entity_filter_search_counts_only_authorized_rows() {
+        use elephant_storage::Repository;
+
+        let authz = Arc::new(AuthzService::new());
+        let repo = Arc::new(MockAssertionRepository::empty());
+        let state = Arc::new(AssertionsState::new_with_repo(repo.clone(), authz));
+        let full = assertion_routes()
+            .layer(middleware::from_fn(mock_auth))
+            .with_state(state.clone());
+        let write_only = assertion_routes()
+            .layer(middleware::from_fn(mock_write_only_auth))
+            .with_state(state.clone());
+        let attenuated = assertion_routes()
+            .layer(middleware::from_fn(mock_attenuated_auth))
+            .with_state(state);
+
+        // Five rows above the caller's clearance stored AHEAD of two visible
+        // ones (more hidden rows than limit + 1), all linked to one entity.
+        let entity = RecordId::new_v4(TableName::Entity);
+        for index in 0..7 {
+            let mut assertion = create_test_assertion(&format!("Linked {index}"), "mentions");
+            assertion.subject_entity = Some(Link::new(entity.clone()));
+            if index < 5 {
+                assertion.base.security.level = 99;
+            }
+            repo.create(assertion).await.unwrap();
+        }
+        let entity_id = entity.to_string();
+
+        // Counts and has_more come from authorized rows only.
+        let (status, page) = entity_search(&full, &entity_id, 10).await;
+        assert_eq!(status, StatusCode::OK);
+        let page = page.expect("search response");
+        assert_eq!(page.results.len(), 2);
+        assert_eq!(page.total, 2);
+        assert!(!page.has_more);
+
+        let (_, page) = entity_search(&full, &entity_id, 1).await;
+        let page = page.expect("search response");
+        assert_eq!(page.results.len(), 1);
+        assert_eq!(page.total, 2);
+        assert!(page.has_more);
+
+        // Without read:assertion: refused before any lookup.
+        let (status, _) = entity_search(&write_only, &entity_id, 10).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Subject-attenuated reader: no row passes, and nothing is counted.
+        let (status, page) = entity_search(&attenuated, &entity_id, 10).await;
+        assert_eq!(status, StatusCode::OK);
+        let page = page.expect("search response");
+        assert!(page.results.is_empty());
+        assert_eq!(page.total, 0);
+        assert!(!page.has_more);
+    }
 }

@@ -357,6 +357,33 @@ pub struct ResolutionUpdateRequest {
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
+/// Read-scope preflight for assertion search.
+///
+/// Scope only: per-record clearance and subject checks still run on every
+/// result. Evaluating a synthetic record here would refuse subject-attenuated
+/// callers outright, since the engine requires non-empty allowed subjects.
+#[allow(clippy::result_large_err)]
+fn authorize_assertion_search(
+    principal: &AuthPrincipal,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let allowed = principal.bypass_abac
+        || principal
+            .scopes
+            .iter()
+            .any(|scope| scope == "*" || scope == "read:assertion");
+    if allowed {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            code: "ACCESS_DENIED".to_string(),
+            message: "Access denied: missing required scope `read:assertion`".to_string(),
+            details: None,
+        }),
+    ))
+}
+
 /// POST /v1/assertions/search - Search assertions.
 #[allow(clippy::too_many_lines)]
 async fn search_assertions(
@@ -365,6 +392,9 @@ async fn search_assertions(
     Json(req): Json<AssertionSearchRequest>,
 ) -> ApiResult<AssertionSearchResponse> {
     let space_id = require_space_id(&principal)?;
+    // Deny before any lookup: without read:assertion the caller must not learn
+    // even whether matching rows exist.
+    authorize_assertion_search(&principal)?;
 
     let query = req
         .query
@@ -397,99 +427,10 @@ async fn search_assertions(
         "INVALID_ENTITY_ID",
     )?;
 
-    if req.cursor.is_none()
-        && query.is_none()
-        && (entity_filter.is_some()
-            || subject_entity_filter.is_some()
-            || object_entity_filter.is_some())
-    {
-        let fetch_limit = req.limit.saturating_add(1);
-        let assertions = if let Some(ref entity_id) = entity_filter {
-            state
-                .assertion_repo
-                .find_by_resolved_entity(&space_id, entity_id, fetch_limit)
-                .await
-        } else {
-            state
-                .assertion_repo
-                .find_by_resolved_entity_pair(
-                    &space_id,
-                    subject_entity_filter.as_ref(),
-                    object_entity_filter.as_ref(),
-                    fetch_limit,
-                )
-                .await
-        }
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-
-        let filtered: Vec<Assertion> = assertions
-            .into_iter()
-            .filter(|a| {
-                if let Some(ref status) = req.status {
-                    if &a.resolution_status != status {
-                        return false;
-                    }
-                }
-                if let Some(ref predicate) = req.predicate {
-                    if &a.predicate_raw != predicate {
-                        return false;
-                    }
-                }
-                if let Some(ref source_id) = source_filter {
-                    if !a
-                        .base
-                        .provenance
-                        .sources
-                        .iter()
-                        .any(|source| source == source_id)
-                    {
-                        return false;
-                    }
-                }
-                if let Some(ref subject_entity) = subject_entity_filter {
-                    if a.subject_entity
-                        .as_ref()
-                        .is_none_or(|link| link.id() != subject_entity)
-                    {
-                        return false;
-                    }
-                }
-                if let Some(ref object_entity) = object_entity_filter {
-                    if a.object_entity
-                        .as_ref()
-                        .is_none_or(|link| link.id() != object_entity)
-                    {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect();
-        let total = filtered.len();
-        let mut visible = state
-            .authz
-            .filter_records(&principal, filtered, "read:assertion");
-        let has_more = visible.len() > req.limit;
-        if has_more {
-            visible.truncate(req.limit);
-        }
-        let cursor = if has_more {
-            visible.last().map(|a| a.base.id.to_string())
-        } else {
-            None
-        };
-        return Ok(Json(AssertionSearchResponse {
-            results: visible,
-            cursor,
-            has_more,
-            total,
-        }));
-    }
+    // Entity-filtered searches go through the same authorized scanner as every
+    // other search. The former linked-entity fast path counted rows before
+    // ABAC and read only one candidate batch, so it disclosed hidden matches
+    // and could under-report has_more.
 
     let mut ranked_cursor = 0usize;
     let mut cursor = None;

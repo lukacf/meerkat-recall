@@ -1251,8 +1251,14 @@ mod tests {
                 )
                 .await
                 .expect("explain lookup");
-            let plan: Vec<serde_json::Value> = response.take(0).expect("explain projection");
-            let rendered = serde_json::to_string(&plan).expect("render plan");
+            // The plan holds record ids, which serde_json cannot represent;
+            // read it as a SurrealDB value and check its rendering.
+            let plan: surrealdb::Value = response.take(0).expect("explain projection");
+            let rendered = format!("{plan:?}");
+            assert!(
+                rendered.contains("Iterate"),
+                "unexpected plan shape for {query}: {rendered}"
+            );
             assert!(
                 !rendered.contains("Iterate Table"),
                 "lookup scans a table instead of fetching records: {query} -> {rendered}"

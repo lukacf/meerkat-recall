@@ -705,10 +705,13 @@ impl NodeEmbeddingRepository {
             return Ok(std::collections::HashMap::new());
         }
 
+        // FROM $ids fetches the hit nodes directly. `FROM doc_node WHERE id
+        // INSIDE $ids` scanned the whole table and timed out under load, which
+        // silently sent semantic search to the text fallback.
         let mut node_response = self
             .client
             .query_bind(
-                "SELECT id, revision FROM doc_node WHERE id INSIDE $ids",
+                NODE_REVISION_LOOKUP,
                 crate::bindings! {
                     "ids" => surrealdb::sql::Value::Array(surrealdb::sql::Array::from(
                         node_ids
@@ -746,7 +749,7 @@ impl NodeEmbeddingRepository {
         let mut revision_response = self
             .client
             .query_bind(
-                "SELECT id, doc FROM doc_revision WHERE id INSIDE $ids",
+                REVISION_DOC_LOOKUP,
                 crate::bindings! {
                     "ids" => surrealdb::sql::Value::Array(surrealdb::sql::Array::from(
                         revision_things
@@ -783,6 +786,12 @@ impl NodeEmbeddingRepository {
         Ok(docs_by_node)
     }
 }
+
+/// Revision of each hit node, fetched by record id.
+const NODE_REVISION_LOOKUP: &str = "SELECT id, revision FROM $ids";
+
+/// Doc of each revision, fetched by record id.
+const REVISION_DOC_LOOKUP: &str = "SELECT id, doc FROM $ids";
 
 /// Vector search hit from a chunk embedding partition.
 #[derive(Debug, Clone)]
@@ -1212,6 +1221,49 @@ mod tests {
             rendered.contains(&format!("{table}_hnsw")),
             "partition search does not name the partition HNSW index: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_hit_lookups_fetch_records_without_scanning_tables() {
+        let client = StorageClient::new_memory()
+            .await
+            .expect("SurrealDB memory client");
+        let node_ids = vec![
+            RecordId::new_v4(TableName::DocNode),
+            RecordId::new_v4(TableName::DocNode),
+        ];
+        let revision_ids = vec![RecordId::new_v4(TableName::DocRevision)];
+        for (query, ids) in [
+            (super::NODE_REVISION_LOOKUP, &node_ids),
+            (super::REVISION_DOC_LOOKUP, &revision_ids),
+        ] {
+            let things: Vec<surrealdb::sql::Value> = ids
+                .iter()
+                .map(crate::surreal::thing_from_record_id)
+                .map(surrealdb::sql::Value::from)
+                .collect();
+            let mut response = client
+                .query_bind(
+                    &format!("{query} EXPLAIN"),
+                    crate::bindings! {
+                        "ids" => surrealdb::sql::Value::Array(surrealdb::sql::Array::from(things))
+                    },
+                )
+                .await
+                .expect("explain lookup");
+            // The plan holds record ids, which serde_json cannot represent;
+            // read it as a SurrealDB value and check its rendering.
+            let plan: surrealdb::Value = response.take(0).expect("explain projection");
+            let rendered = format!("{plan:?}");
+            assert!(
+                rendered.contains("Iterate"),
+                "unexpected plan shape for {query}: {rendered}"
+            );
+            assert!(
+                !rendered.contains("Iterate Table"),
+                "lookup scans a table instead of fetching records: {query} -> {rendered}"
+            );
+        }
     }
 
     #[tokio::test]

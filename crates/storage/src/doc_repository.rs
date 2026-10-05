@@ -1183,9 +1183,10 @@ impl DocRepository {
         } else {
             " AND deleted_at IS NONE"
         };
-        let query = format!(
-            "SELECT {DOC_PROJECTION} FROM doc WHERE id INSIDE $ids AND space_id = $space_id{deleted_clause}"
-        );
+        // FROM $ids fetches the listed records directly; `FROM doc WHERE id
+        // INSIDE $ids` scanned the whole table.
+        let query =
+            format!("SELECT {DOC_PROJECTION} FROM $ids WHERE space_id = $space_id{deleted_clause}");
         let mut response = self
             .client
             .query_bind(

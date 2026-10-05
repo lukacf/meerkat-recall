@@ -265,11 +265,131 @@ pub struct AssertionRepository {
     client: StorageClient,
 }
 
+/// Whether `current` still has the authorization envelope and lifecycle of
+/// `authorized`: security, subjects, subjects state, and deleted or active.
+#[must_use]
+pub fn assertion_envelope_unchanged(current: &Assertion, authorized: &Assertion) -> bool {
+    current.base.security == authorized.base.security
+        && current.base.subjects == authorized.base.subjects
+        && current.base.subjects_state == authorized.base.subjects_state
+        && current.base.deleted_at.is_some() == authorized.base.deleted_at.is_some()
+}
+
+fn guard_conflict(id: &RecordId) -> StorageError {
+    StorageError::Conflict(format!(
+        "Assertion changed since it was authorized (envelope or lifecycle): {id}"
+    ))
+}
+
 impl AssertionRepository {
     /// Creates a new assertion repository.
     #[must_use]
     pub const fn new(client: StorageClient) -> Self {
         Self { client }
+    }
+
+    /// Restores an assertion only if it is unchanged since `authorized`.
+    ///
+    /// `authorized` is the row the caller's authorization was decided on. The
+    /// stored security, subjects, subjects state and lifecycle (deleted or
+    /// active) must still equal it in the same mutation that restores, so a
+    /// concurrent reclassification or lifecycle change cannot be acted on, or
+    /// disclosed, under the earlier decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if the row is missing or its envelope or lifecycle
+    /// changed, or an error if storage access fails.
+    pub async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<Assertion> {
+        self.mutate_guarded(space_id, id, authorized, false).await
+    }
+
+    /// Soft-deletes an active assertion only if it is unchanged since
+    /// `authorized`; see [`Self::restore_guarded`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if the row is missing, already deleted, or its
+    /// envelope changed, or an error if storage access fails.
+    pub async fn delete_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<()> {
+        if authorized.base.deleted_at.is_some() {
+            return Err(guard_conflict(id));
+        }
+        self.mutate_guarded(space_id, id, authorized, true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn mutate_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+        delete: bool,
+    ) -> StorageResult<Assertion> {
+        if let Some(store) = self.client.embedded_store() {
+            return store
+                .mutate(|mutation| {
+                    let Some(mut current) = mutation.get::<Assertion>(space_id, id, true)? else {
+                        return Err(guard_conflict(id));
+                    };
+                    if !assertion_envelope_unchanged(&current, authorized) {
+                        return Err(guard_conflict(id));
+                    }
+                    let now = chrono::Utc::now();
+                    current.base.deleted_at = delete.then_some(now);
+                    current.base.updated_at = now;
+                    Ok(mutation.replace(current)?)
+                })
+                .await;
+        }
+
+        let lifecycle = if authorized.base.deleted_at.is_some() {
+            "deleted_at IS NOT NONE"
+        } else {
+            "deleted_at IS NONE"
+        };
+        let set = if delete {
+            "deleted_at = time::now()"
+        } else {
+            "deleted_at = NONE"
+        };
+        // Every comparison sits in the UPDATE predicate, so nothing changes
+        // unless the row still has the envelope the caller was authorized on.
+        let mut response = self
+            .client
+            .query_bind_checked(
+                &format!(
+                    "UPDATE $id SET {set}, updated_at = time::now() \
+                     WHERE space_id = $space_id AND security = $security \
+                     AND subjects = $subjects AND subjects_state = $subjects_state \
+                     AND {lifecycle} RETURN {ASSERTION_PROJECTION}"
+                ),
+                crate::bindings! {
+                    "id" => crate::surreal::thing_from_record_id(id),
+                    "space_id" => space_id,
+                    "security" => crate::surreal::security_to_value(&authorized.base.security),
+                    "subjects" => surrealdb::sql::Value::Array(crate::surreal::things_from_links(
+                        authorized.base.subjects.clone(),
+                    )),
+                    "subjects_state" => crate::surreal::enum_to_surreal(&authorized.base.subjects_state)?,
+                },
+            )
+            .await?;
+        let rows: Vec<AssertionDb> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse guarded assertion update: {e}"))
+        })?;
+        Assertion::try_from(rows.into_iter().next().ok_or_else(|| guard_conflict(id))?)
     }
 
     /// Gets an assertion including soft-deleted ones.
@@ -1523,6 +1643,80 @@ mod tests {
         let retrieved = repo.get("test_space", &id).await.unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().predicate_raw, "works_at");
+    }
+
+    /// Guarded restore/delete act only on the row the caller was authorized
+    /// on; each race below has a concurrent writer commit between the
+    /// authorization snapshot and the guarded mutation.
+    async fn assert_guarded_lifecycle(repo: &AssertionRepository) {
+        let space = "test_space";
+        let item = create_test_assertion();
+        let id = item.base.id.clone();
+        repo.create(item).await.unwrap();
+
+        // Reclassified while active, after the snapshot: restore and delete
+        // both conflict, and the stricter row is untouched.
+        let snapshot = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let mut stricter = snapshot.clone();
+        stricter.base.security.level = 5;
+        repo.update(space, &id, stricter).await.unwrap();
+        assert!(matches!(
+            repo.restore_guarded(space, &id, &snapshot).await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(matches!(
+            repo.delete_guarded(space, &id, &snapshot).await,
+            Err(StorageError::Conflict(_))
+        ));
+        let current = repo.get(space, &id).await.unwrap().expect("still active");
+        assert_eq!(current.base.security.level, 5);
+
+        // Active -> deleted race: someone deletes after the snapshot; a stale
+        // guarded delete conflicts instead of acting on the changed row.
+        let active = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        repo.delete(space, &id).await.unwrap();
+        assert!(matches!(
+            repo.delete_guarded(space, &id, &active).await,
+            Err(StorageError::Conflict(_))
+        ));
+
+        // Deleted -> active race: a stale restore of the deleted snapshot
+        // conflicts once the row has been restored by someone else.
+        let deleted = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        assert!(deleted.base.deleted_at.is_some());
+        repo.restore(space, &id).await.unwrap();
+        assert!(matches!(
+            repo.restore_guarded(space, &id, &deleted).await,
+            Err(StorageError::Conflict(_))
+        ));
+
+        // Fresh snapshots succeed: guarded delete, then guarded restore.
+        let active = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        repo.delete_guarded(space, &id, &active).await.unwrap();
+        assert!(repo.get(space, &id).await.unwrap().is_none());
+        let deleted = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let restored = repo.restore_guarded(space, &id, &deleted).await.unwrap();
+        assert!(restored.base.deleted_at.is_none());
+        assert_eq!(restored.base.security.level, 5);
+
+        // Another space's caller never matches.
+        let snapshot = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        assert!(matches!(
+            repo.restore_guarded("other_space", &id, &snapshot).await,
+            Err(StorageError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_guarded_lifecycle_surreal() {
+        let repo = setup_test_repo().await;
+        assert_guarded_lifecycle(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn test_guarded_lifecycle_embedded() {
+        let repo = AssertionRepository::new(StorageClient::new_embedded().await.unwrap());
+        assert_guarded_lifecycle(&repo).await;
     }
 
     #[tokio::test]

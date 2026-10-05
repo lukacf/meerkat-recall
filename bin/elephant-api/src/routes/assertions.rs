@@ -73,10 +73,42 @@ pub trait AssertionRepo: Send + Sync {
         id: &RecordId,
     ) -> StorageResult<Option<Assertion>>;
     async fn restore(&self, space_id: &str, id: &RecordId) -> StorageResult<Assertion>;
+    /// Restores only if the row still matches the authorized snapshot.
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<Assertion>;
+    /// Soft-deletes only if the row still matches the authorized snapshot.
+    async fn delete_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<()>;
 }
 
 #[async_trait::async_trait]
 impl AssertionRepo for AssertionRepository {
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<Assertion> {
+        Self::restore_guarded(self, space_id, id, authorized).await
+    }
+
+    async fn delete_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<()> {
+        Self::delete_guarded(self, space_id, id, authorized).await
+    }
+
     async fn create(&self, record: Assertion) -> StorageResult<Assertion> {
         Repository::create(self, record).await
     }
@@ -143,6 +175,42 @@ impl AssertionRepo for AssertionRepository {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl AssertionRepo for elephant_storage::MockAssertionRepository {
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<Assertion> {
+        let current = Self::get_with_deleted(self, space_id, id).await?;
+        if !current.is_some_and(|current| {
+            elephant_storage::assertion_envelope_unchanged(&current, authorized)
+        }) {
+            return Err(elephant_storage::StorageError::Conflict(format!(
+                "Assertion changed since it was authorized: {id}"
+            )));
+        }
+        Self::restore(self, space_id, id).await
+    }
+
+    async fn delete_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<()> {
+        let current = Self::get_with_deleted(self, space_id, id).await?;
+        if authorized.base.deleted_at.is_some()
+            || !current.is_some_and(|current| {
+                elephant_storage::assertion_envelope_unchanged(&current, authorized)
+            })
+        {
+            return Err(elephant_storage::StorageError::Conflict(format!(
+                "Assertion changed since it was authorized: {id}"
+            )));
+        }
+        Repository::delete(self, space_id, id).await
+    }
+
     async fn delete(&self, space_id: &str, id: &RecordId) -> StorageResult<()> {
         Repository::delete(self, space_id, id).await
     }
@@ -866,6 +934,25 @@ async fn update_resolution(
     }
 }
 
+/// Storage failure as an API error: a guard conflict is 409 and carries no
+/// record content.
+fn assertion_storage_error(error: &elephant_storage::StorageError) -> (StatusCode, Json<ApiError>) {
+    if matches!(error, elephant_storage::StorageError::Conflict(_)) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                code: "CONFLICT".to_string(),
+                message: "Assertion changed since it was authorized; retry".to_string(),
+                details: None,
+            }),
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError::internal(error.to_string())),
+    )
+}
+
 fn assertion_forbidden(error: crate::authz::AuthzError) -> (StatusCode, Json<ApiError>) {
     (
         StatusCode::FORBIDDEN,
@@ -899,17 +986,14 @@ async fn delete_assertion(
                 .authz
                 .authorize_record_write(&principal, &existing, "write:assertion")
                 .map_err(assertion_forbidden)?;
+            // Guarded: the delete applies only if the row still has the
+            // envelope authorized above.
             state
                 .assertion_repo
-                .delete(&space_id, &rid)
+                .delete_guarded(&space_id, &rid, &existing)
                 .await
                 .map(|()| StatusCode::NO_CONTENT)
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiError::internal(e.to_string())),
-                    )
-                })
+                .map_err(|e| assertion_storage_error(&e))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -948,17 +1032,13 @@ async fn restore_assertion(
                 .authz
                 .authorize_record_read(&principal, &existing, "read:assertion")
                 .map_err(assertion_forbidden)?;
+            // Guarded: restores, and returns, only the row authorized above.
             state
                 .assertion_repo
-                .restore(&space_id, &rid)
+                .restore_guarded(&space_id, &rid, &existing)
                 .await
                 .map(Json)
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiError::internal(e.to_string())),
-                    )
-                })
+                .map_err(|e| assertion_storage_error(&e))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,

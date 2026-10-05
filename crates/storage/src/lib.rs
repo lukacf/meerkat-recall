@@ -123,7 +123,7 @@ pub use test_utils::{
 };
 
 // Ingestion-to-Graph re-exports (formerly v08)
-pub use assertion_repository::AssertionRepository;
+pub use assertion_repository::{assertion_envelope_unchanged, AssertionRepository};
 pub use attribute_repository::AttributeRepository;
 pub use conflict_group_repository::ConflictGroupRepository;
 pub use cost_ledger_daily_repository::CostLedgerDailyRepository;

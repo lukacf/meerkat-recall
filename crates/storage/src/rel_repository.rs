@@ -188,7 +188,8 @@ impl RelRepository {
     ///
     /// See [`crate::lifecycle_guard`]: the stored security, subjects, subjects
     /// state and exact lifecycle must still equal `authorized` in the same
-    /// mutation that restores (and, in the embedded store, its subject and object endpoints; `SurrealDB` fixes them at `RELATE`).
+    /// mutation that restores, and so must its subject and object endpoints (a
+    /// hard delete and re-create can reuse the ID with other endpoints).
     ///
     /// # Errors
     ///
@@ -231,12 +232,25 @@ impl RelRepository {
             "space_id".to_string(),
             surrealdb::sql::Value::from(space_id),
         );
+        bindings.insert(
+            "guard_subject".to_string(),
+            surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(
+                authorized.subject.id(),
+            )),
+        );
+        bindings.insert(
+            "guard_object".to_string(),
+            surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(
+                authorized.object.id(),
+            )),
+        );
         let mut response = self
             .client
             .query_bind_checked(
                 &format!(
                     "UPDATE $id SET deleted_at = NONE, updated_at = time::now() \
-                     WHERE space_id = $space_id AND {condition} RETURN {REL_PROJECTION}"
+                     WHERE space_id = $space_id AND {condition} \
+                     AND `in` = $guard_subject AND `out` = $guard_object RETURN {REL_PROJECTION}"
                 ),
                 bindings,
             )
@@ -1876,6 +1890,48 @@ mod tests {
             matches!(result, Err(StorageError::Conflict(_))),
             "{result:?}"
         );
+    }
+
+    /// A row re-created under the same ID with other endpoints is not the
+    /// authorized row, even when its envelope and lifecycle are identical.
+    async fn assert_restore_guarded_endpoints(repo: &RelRepository, space: &str) {
+        let subject = RecordId::new_v4(TableName::Entity);
+        let object = RecordId::new_v4(TableName::Entity);
+        let record = create_test_rel_with_entities("works_at", subject.clone(), object.clone());
+        let id = record.base.id.clone();
+        let authorized = repo.create(record.clone()).await.unwrap();
+
+        for (new_subject, new_object) in [
+            (subject.clone(), RecordId::new_v4(TableName::Entity)),
+            (RecordId::new_v4(TableName::Entity), object.clone()),
+        ] {
+            repo.hard_delete(space, &id).await.unwrap();
+            let mut replacement =
+                create_test_rel_with_entities("works_at", new_subject.clone(), new_object.clone());
+            replacement.base = record.base.clone();
+            repo.create(replacement).await.unwrap();
+
+            let result = repo.restore_guarded(space, &id, &authorized).await;
+            assert!(
+                matches!(result, Err(StorageError::Conflict(_))),
+                "{result:?}"
+            );
+            let stored = repo.get(space, &id).await.unwrap().unwrap();
+            assert_eq!(stored.subject.id(), &new_subject);
+            assert_eq!(stored.object.id(), &new_object);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_guarded_endpoints_surreal() {
+        let repo = setup_test_repo().await;
+        assert_restore_guarded_endpoints(&repo, "test_space").await;
+    }
+
+    #[tokio::test]
+    async fn test_restore_guarded_endpoints_embedded() {
+        let repo = RelRepository::new(StorageClient::new_embedded().await.unwrap());
+        assert_restore_guarded_endpoints(&repo, "test_space").await;
     }
 
     #[tokio::test]

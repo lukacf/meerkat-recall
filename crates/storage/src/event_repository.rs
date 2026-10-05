@@ -1327,13 +1327,13 @@ mod tests {
     #[tokio::test]
     async fn test_update_preserving_security_surreal() {
         let repo = setup_test_repo().await;
-        assert_update_preserves_security(&repo).await;
+        Box::pin(assert_update_preserves_security(&repo)).await;
     }
 
     #[tokio::test]
     async fn test_update_preserving_security_embedded() {
         let repo = EventRepository::new(StorageClient::new_embedded().await.unwrap());
-        assert_update_preserves_security(&repo).await;
+        Box::pin(assert_update_preserves_security(&repo)).await;
     }
 
     #[tokio::test]

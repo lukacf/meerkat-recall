@@ -132,6 +132,45 @@ impl TryFrom<DocNodeDb> for DocNode {
     }
 }
 
+/// `embedding_model` marker for nodes that can never be embedded.
+///
+/// The embed worker sets it on nodes with an invalid span or a missing
+/// revision: they leave the pending set without a vector. Null the field to
+/// send a repaired node back.
+pub const UNEMBEDDABLE_EMBEDDING_MODEL: &str = "unembeddable";
+
+/// Embedding progress of one space.
+///
+/// Produced by [`DocNodeRepository::count_embedding_progress`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmbeddingProgressCounts {
+    /// Embeddable nodes still waiting for an embedding.
+    pub pending: usize,
+    /// Nodes the worker gave up on.
+    ///
+    /// Marked [`UNEMBEDDABLE_EMBEDDING_MODEL`]; they have no vector and are
+    /// not counted as embedded.
+    pub unembeddable: usize,
+    /// Nodes with a real embedding, by the model that produced it.
+    pub embedded_by_model: std::collections::BTreeMap<String, usize>,
+}
+
+impl EmbeddingProgressCounts {
+    /// Nodes with a real embedding from any model.
+    #[must_use]
+    pub fn embedded(&self) -> usize {
+        self.embedded_by_model.values().sum()
+    }
+
+    fn record(&mut self, model: Option<&str>, count: usize) {
+        match model {
+            None => self.pending += count,
+            Some(UNEMBEDDABLE_EMBEDDING_MODEL) => self.unembeddable += count,
+            Some(model) => *self.embedded_by_model.entry(model.to_string()).or_insert(0) += count,
+        }
+    }
+}
+
 /// Document node repository for `SurrealDB`.
 #[derive(Clone, Debug)]
 pub struct DocNodeRepository {
@@ -449,6 +488,64 @@ impl DocNodeRepository {
         // Reverse so it goes root → ... → immediate parent
         chain.reverse();
         Ok(chain)
+    }
+
+    /// Counts a space's embeddable nodes by embedding state.
+    ///
+    /// Embeddable means `chunk`, `paragraph` or `summary` and not deleted. The
+    /// split is pending (the [`Self::find_pending_embedding`] predicate), given
+    /// up ([`UNEMBEDDABLE_EMBEDDING_MODEL`]) and embedded per model.
+    ///
+    /// Counts the whole table: call it periodically (the embed loop does),
+    /// never per request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the count query fails.
+    pub async fn count_embedding_progress(
+        &self,
+        space_id: &str,
+    ) -> StorageResult<EmbeddingProgressCounts> {
+        #[derive(Deserialize)]
+        struct ModelCountRow {
+            embedding_model: Option<String>,
+            total: usize,
+        }
+
+        let mut counts = EmbeddingProgressCounts::default();
+        if let Some(store) = self.client.embedded_store() {
+            for item in store.scan::<DocNode>().await? {
+                if item.base.space_id == space_id
+                    && item.base.deleted_at.is_none()
+                    && matches!(
+                        item.role,
+                        NodeRole::Chunk | NodeRole::Paragraph | NodeRole::Summary
+                    )
+                {
+                    counts.record(item.embedding_model.as_deref(), 1);
+                }
+            }
+            return Ok(counts);
+        }
+
+        let mut response = self
+            .client
+            .query_bind(
+                "SELECT embedding_model, count() AS total FROM doc_node \
+                 WHERE space_id = $space_id \
+                   AND role IN ['chunk', 'paragraph', 'summary'] \
+                   AND deleted_at IS NONE \
+                 GROUP BY embedding_model",
+                crate::bindings! { "space_id" => space_id },
+            )
+            .await?;
+        let rows: Vec<ModelCountRow> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse embedding progress counts: {e}"))
+        })?;
+        for row in rows {
+            counts.record(row.embedding_model.as_deref(), row.total);
+        }
+        Ok(counts)
     }
 
     /// Finds embeddable nodes that have not yet been embedded.
@@ -1010,6 +1107,39 @@ mod tests {
             )),
             "All returned nodes should have embeddable roles"
         );
+
+        // A dead node and a second model, to pin the split.
+        let mut dead = create_test_doc_node();
+        dead.base = BaseFields::new(
+            RecordId::new_v4(TableName::DocNode),
+            "test_space".to_string(),
+            "test_agent".to_string(),
+        );
+        dead.role = NodeRole::Chunk;
+        dead.revision = Link::new(revision_id.clone());
+        dead.node_key = "chunk-dead".to_string();
+        dead.embedding_model = Some(UNEMBEDDABLE_EMBEDDING_MODEL.to_string());
+        repo.create(dead).await.unwrap();
+        let mut other_model = create_test_doc_node();
+        other_model.base = BaseFields::new(
+            RecordId::new_v4(TableName::DocNode),
+            "test_space".to_string(),
+            "test_agent".to_string(),
+        );
+        other_model.role = NodeRole::Summary;
+        other_model.revision = Link::new(revision_id.clone());
+        other_model.node_key = "summary-v2".to_string();
+        other_model.embedding_model = Some("model-v2".to_string());
+        repo.create(other_model).await.unwrap();
+
+        // Two pending, one given up (not embedded), one per real model, and
+        // the document-role node on no side.
+        let counts = repo.count_embedding_progress("test_space").await.unwrap();
+        assert_eq!(counts.pending, 2);
+        assert_eq!(counts.unembeddable, 1);
+        assert_eq!(counts.embedded(), 2);
+        assert_eq!(counts.embedded_by_model.get("model-v1"), Some(&1));
+        assert_eq!(counts.embedded_by_model.get("model-v2"), Some(&1));
     }
 
     #[tokio::test]

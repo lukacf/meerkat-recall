@@ -411,6 +411,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_resolution_requires_read_authorization() {
+        let authz = Arc::new(AuthzService::new());
+        let repo = Arc::new(MockAssertionRepository::empty());
+        let state = Arc::new(AssertionsState::new_with_repo(repo, authz));
+        let full = assertion_routes()
+            .layer(middleware::from_fn(mock_auth))
+            .with_state(state.clone());
+        let write_only = assertion_routes()
+            .layer(middleware::from_fn(mock_write_only_auth))
+            .with_state(state);
+        let assertion = create_test_assertion("Private Row", "mentions");
+        let id = assertion.base.id.to_string();
+        let created = full
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assertions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&assertion).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let update = serde_json::json!({"status": "resolved", "rationale": "write-only"});
+        let response = write_only
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/v1/assertions/{id}/resolution"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("Private Row"));
+
+        // No side effect: the stored status is unchanged.
+        let stored = full
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/assertions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(stored.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stored: Assertion = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stored.resolution_status, ResolutionStatus::Pending);
+    }
+
+    #[tokio::test]
     async fn test_search_assertions() {
         let app = setup_test_app().await;
 

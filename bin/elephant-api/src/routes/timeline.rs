@@ -462,6 +462,9 @@ async fn restore_event(
         Ok(Some(existing)) => {
             authorize_event(state.as_ref(), &principal, &existing, "write:event")
                 .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
+            // The response carries the restored event, so read is required too.
+            authorize_event(state.as_ref(), &principal, &existing, "read:event")
+                .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
 
             match state.event_repo.restore(&space_id, &rid).await {
                 Ok(restored) => Ok(Json(restored)),

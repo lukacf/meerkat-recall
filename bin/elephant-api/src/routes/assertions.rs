@@ -833,6 +833,20 @@ async fn update_resolution(
                 }),
             )
         })?;
+    // The response carries the updated record, so read is required too.
+    state
+        .authz
+        .authorize_record_read(&principal, &assertion, "read:assertion")
+        .map_err(|e| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError {
+                    code: e.code,
+                    message: e.message,
+                    details: None,
+                }),
+            )
+        })?;
 
     assertion.resolution_status = req.status;
     if let Some(rationale) = req.rationale {

@@ -16,7 +16,7 @@ use crate::error::{PipelineError, PipelineResult};
 /// missing revision). Keeps them out of `find_pending_embedding` without
 /// storing a phantom vector; null the field to send a repaired node back to
 /// the pending set.
-pub const UNEMBEDDABLE_SENTINEL: &str = "unembeddable";
+pub const UNEMBEDDABLE_SENTINEL: &str = elephant_storage::UNEMBEDDABLE_EMBEDDING_MODEL;
 
 /// Result of an embedding operation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

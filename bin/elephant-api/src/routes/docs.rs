@@ -2107,6 +2107,20 @@ async fn restore_doc(
                         }),
                     )
                 })?;
+            // The response carries the restored record, so read is required too.
+            state
+                .authz
+                .authorize_record_read(&principal, &existing, "read:doc")
+                .map_err(|e| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(ApiError {
+                            code: e.code,
+                            message: e.message,
+                            details: None,
+                        }),
+                    )
+                })?;
 
             match state.doc_repo.restore(&space_id, &rid).await {
                 Ok(restored) => Ok(Json(restored)),
@@ -2778,6 +2792,62 @@ mod tests {
             .expect("persisted source");
         assert_eq!(source.base.created_by, "original-author");
         assert_eq!(source.author.as_deref(), Some("original-author"));
+    }
+
+    #[tokio::test]
+    async fn test_restore_doc_requires_read_authorization() {
+        let storage = StorageClient::new_embedded()
+            .await
+            .expect("embedded storage");
+        let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
+        let doc_id = RecordId::new_v4(TableName::Doc);
+        let doc = Doc {
+            base: BaseFields::new(doc_id.clone(), "default".to_string(), "tester".to_string()),
+            title: "Private Fixture".to_string(),
+            text: "secret body".to_string(),
+            sidecar_text: None,
+            source: None,
+            media_attachments: Vec::new(),
+            rendition_key: "private-doc".to_string(),
+            metadata: serde_json::json!({}),
+        };
+        state.doc_repo.create(doc).await.expect("create doc");
+        state
+            .doc_repo
+            .delete("default", &doc_id)
+            .await
+            .expect("soft-delete doc");
+
+        // Write scope alone: refused, and nothing changes.
+        let denied = restore_doc(
+            State(state.clone()),
+            axum::Extension(make_api_principal("default", &["write:doc"])),
+            Path(doc_id.to_string()),
+        )
+        .await;
+        assert_eq!(
+            denied.as_ref().err().map(|(status, _)| *status),
+            Some(StatusCode::FORBIDDEN)
+        );
+        if let Err((_, Json(error))) = &denied {
+            assert!(!error.message.contains("secret body"));
+        }
+        let stored = state
+            .doc_repo
+            .get_with_deleted("default", &doc_id)
+            .await
+            .expect("load doc")
+            .expect("doc exists");
+        assert!(stored.base.deleted_at.is_some());
+
+        // Positive control: the same principal with read restores it.
+        let allowed = restore_doc(
+            State(state.clone()),
+            axum::Extension(make_api_principal("default", &["write:doc", "read:doc"])),
+            Path(doc_id.to_string()),
+        )
+        .await;
+        assert!(allowed.is_ok());
     }
 
     #[tokio::test]

@@ -49,6 +49,14 @@ pub trait TimelineEventRepo: Send + Sync {
     async fn create(&self, record: Event) -> StorageResult<Event>;
     async fn get(&self, space_id: &str, id: &RecordId) -> StorageResult<Option<Event>>;
     async fn update(&self, space_id: &str, id: &RecordId, record: Event) -> StorageResult<Event>;
+    /// Replaces an active event only while its stored security equals the
+    /// replacement's, atomically; a conflict otherwise.
+    async fn update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Event,
+    ) -> StorageResult<Event>;
     async fn delete(&self, space_id: &str, id: &RecordId) -> StorageResult<()>;
     async fn search(&self, criteria: &SearchCriteria) -> StorageResult<PaginatedResult<Event>>;
 
@@ -64,6 +72,15 @@ pub trait TimelineEventRepo: Send + Sync {
 impl TimelineEventRepo for EventRepository {
     async fn create(&self, record: Event) -> StorageResult<Event> {
         Repository::create(self, record).await
+    }
+
+    async fn update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Event,
+    ) -> StorageResult<Event> {
+        Self::update_preserving_security(self, space_id, id, record).await
     }
 
     async fn get(&self, space_id: &str, id: &RecordId) -> StorageResult<Option<Event>> {
@@ -108,6 +125,21 @@ impl TimelineEventRepo for EventRepository {
 impl TimelineEventRepo for MockEventRepository {
     async fn create(&self, record: Event) -> StorageResult<Event> {
         Repository::create(self, record).await
+    }
+
+    async fn update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Event,
+    ) -> StorageResult<Event> {
+        let current = Repository::get(self, space_id, id).await?;
+        if current.is_none_or(|current| current.base.security != record.base.security) {
+            return Err(elephant_storage::StorageError::Conflict(format!(
+                "Event is missing, deleted, or its security has changed: {id}"
+            )));
+        }
+        Repository::update(self, space_id, id, record).await
     }
 
     async fn get(&self, space_id: &str, id: &RecordId) -> StorageResult<Option<Event>> {
@@ -388,9 +420,34 @@ async fn update_event(
                 .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
             authorize_event(state.as_ref(), &principal, &event, "write:event")
                 .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
+            // Ordinary edits keep the event's classification: being cleared for
+            // both envelopes is not a grant to declassify.
+            if existing.base.security != event.base.security {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(ApiError {
+                        code: "ACCESS_DENIED".to_string(),
+                        message: "ordinary event updates cannot change security metadata"
+                            .to_string(),
+                        details: None,
+                    }),
+                ));
+            }
 
-            match state.event_repo.update(&space_id, &rid, event).await {
+            match state
+                .event_repo
+                .update_preserving_security(&space_id, &rid, event)
+                .await
+            {
                 Ok(updated) => Ok(Json(updated)),
+                Err(elephant_storage::StorageError::Conflict(message)) => Err((
+                    StatusCode::CONFLICT,
+                    Json(ApiError {
+                        code: "CONFLICT".to_string(),
+                        message,
+                        details: None,
+                    }),
+                )),
                 Err(e) => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiError::internal(e.to_string())),

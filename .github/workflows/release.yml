@@ -4,6 +4,29 @@ name: Build release candidates
 # docs/operations/deployment.mdx. Creating a tag must not publish another binary.
 on:
   workflow_dispatch:
+      inputs:
+        accept_existing_candidate:
+          description: 'Private artifact checks only; skip validation and builds'
+          type: boolean
+          default: false
+        linux_artifact_id:
+          description: 'Owner-verified run 37288087305 attempt 1 Linux artifact ID'
+          type: string
+        linux_archive_sha256:
+          description: 'Owner-verified Linux tar.gz SHA256'
+          type: string
+        linux_binary_sha256:
+          description: 'Owner-verified Linux elephant SHA256'
+          type: string
+        macos_artifact_id:
+          description: 'Owner-verified run 37288087305 attempt 1 macOS artifact ID'
+          type: string
+        macos_archive_sha256:
+          description: 'Owner-verified macOS tar.gz SHA256'
+          type: string
+        macos_binary_sha256:
+          description: 'Owner-verified macOS elephant SHA256'
+          type: string
 
 permissions:
   contents: read
@@ -18,6 +41,7 @@ env:
 
 jobs:
   release-validate:
+    if: ${{ !inputs.accept_existing_candidate }}
     name: Validate release state
     runs-on: ubuntu-22.04
     steps:
@@ -73,6 +97,7 @@ jobs:
         run: make ci-smoke
 
   build-binaries:
+    if: ${{ !inputs.accept_existing_candidate }}
     name: Build ${{ matrix.target }} candidate
     needs: [release-validate]
     permissions:
@@ -240,3 +265,227 @@ jobs:
           if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
             du -sh "$CARGO_HOME" "$CARGO_TARGET_DIR" || true
           fi
+
+  accept-existing-candidate:
+    name: Private installed-artifact checks (${{ matrix.target }})
+    if: ${{ inputs.accept_existing_candidate && github.repository == 'lukacf/elephant' }}
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            input: linux
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            input: macos
+    env:
+      ACCEPT_TARGET: ${{ matrix.target }}
+      ARTIFACT_ID: ${{ inputs[format('{0}_artifact_id', matrix.input)] }}
+      ARCHIVE_SHA256: ${{ inputs[format('{0}_archive_sha256', matrix.input)] }}
+      BINARY_SHA256: ${{ inputs[format('{0}_binary_sha256', matrix.input)] }}
+    steps:
+      # No checkout, Cargo, compiler setup, provider credentials or service startup.
+      - name: Select Python for archive verification
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Verify the fixed candidate and retained archive before extraction
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ACCEPT_DIR="$RUNNER_TEMP/accept-$ACCEPT_TARGET"
+          mkdir -p "$ACCEPT_DIR/receipt"
+          python3 -I - <<'PYVERIFY' 2>&1 | tee "$ACCEPT_DIR/receipt/verify.log"
+          import hashlib, json, os, pathlib, re, shutil, subprocess, tarfile, zipfile
+          from datetime import datetime, timedelta
+          root = pathlib.Path(os.environ['ACCEPT_DIR'])
+          target = os.environ['ACCEPT_TARGET']
+          artifact_id = os.environ['ARTIFACT_ID']
+          archive_sha, binary_sha = os.environ['ARCHIVE_SHA256'], os.environ['BINARY_SHA256']
+          assert re.fullmatch(r'[1-9][0-9]*', artifact_id), 'Supply the exact artifact ID'
+          assert all(re.fullmatch(r'[0-9a-f]{64}', v) for v in (archive_sha, binary_sha)), 'Supply trusted SHA256s'
+          repo, run_id, attempt = 'lukacf/elephant', 37288087305, 1
+          commit, tree = '9354e3a286287ac3dee84e57320355149eb8e172', '36a558fedc0794b2b98e27704daab17bf6ee792c'
+          run_url = f'https://github.com/{repo}/actions/runs/{run_id}'
+          def api(path, *flags, receipt_name):
+              raw = subprocess.check_output(['gh', 'api', f'repos/{repo}/{path}', *flags], text=True)
+              (root / 'receipt' / receipt_name).write_text(raw)
+              return json.loads(raw)
+          def digest(stream):
+              return hashlib.file_digest(stream, 'sha256').hexdigest()
+          run = api(f'actions/runs/{run_id}/attempts/{attempt}', receipt_name='candidate-attempt-run.json')
+          pages = api(f'actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100', '--paginate', '--slurp', receipt_name='candidate-attempt-jobs.json')
+          assert run['id'] == run_id and run['run_attempt'] == attempt and run['head_sha'] == commit
+          assert run['repository']['full_name'] == repo and run['repository']['private'] is True
+          assert run['workflow_id'] == 370222081 and run['path'] == '.github/workflows/release.yml'
+          assert run['event'] == 'workflow_dispatch' and run['head_branch'] == 'codex/release-candidate-python'
+          assert run['status'] == 'completed' and run['conclusion'] in ('success', 'failure')
+          jobs = [job for page in pages for job in page['jobs']]
+          names = ['Validate release state'] + [f'Build {t} candidate' for t in ('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin')]
+          validation = [j for j in jobs if j['name'] == names[0]]
+          assert len(validation) == 1 and validation[0]['conclusion'] == 'success', 'Candidate validation must pass'
+          assert len(jobs) == 3 and sorted(j['name'] for j in jobs) == sorted(names)
+          assert all(j['run_id'] == run_id and j['run_attempt'] == attempt and j['head_sha'] == commit and j['status'] == 'completed' for j in jobs)
+          attestations = {}
+          for job in (j for j in jobs if j['name'] != names[0]):
+              def step(name):
+                  matches = [s for s in job['steps'] if s['name'] == name]
+                  assert len(matches) == 1, name
+                  return matches[0]['conclusion']
+              for name in ('Build and smoke test RocksDB binary', 'Package binary, licenses and provenance', 'Upload candidate artifacts'):
+                  assert step(name) == 'success', name
+              attestation = step('Attest archive build provenance')
+              assert attestation in ('success', 'failure')
+              assert all(s['conclusion'] in ('success', 'skipped') or (s['name'] == 'Attest archive build provenance' and s['conclusion'] == 'failure') for s in job['steps'])
+              assert job['conclusion'] == ('failure' if attestation == 'failure' else 'success')
+              attestations[job['name']] = attestation
+          assert run['conclusion'] == ('failure' if 'failure' in attestations.values() else 'success')
+          artifact = api(f'actions/artifacts/{artifact_id}', receipt_name='candidate-artifact.json')
+          assert artifact['id'] == int(artifact_id) and artifact['name'] == f'elephant-{target}' and not artifact['expired']
+          assert artifact['workflow_run']['id'] == run_id and artifact['workflow_run']['head_sha'] == commit
+          assert re.fullmatch(r'sha256:[0-9a-f]{64}', artifact['digest']), 'Missing GitHub artifact digest'
+          selected_job = next(j for j in jobs if j['name'] == f'Build {target} candidate')
+          upload = next(s for s in selected_job['steps'] if s['name'] == 'Upload candidate artifacts')
+          def timestamp(value):
+              parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+              assert parsed.tzinfo is not None, 'Timestamp must include a timezone'
+              return parsed
+          created = timestamp(artifact['created_at'])
+          start, end = timestamp(upload['started_at']), timestamp(upload['completed_at'])
+          slack = timedelta(seconds=1)  # API timestamps have second precision.
+          assert start <= end and start - slack <= created <= end + slack, 'Artifact creation is outside the selected upload step'
+          assert timestamp(selected_job['started_at']) - slack <= created <= timestamp(selected_job['completed_at']) + slack
+          assert timestamp(artifact['updated_at']) >= created
+          upload_binding = dict(job_id=selected_job['id'], job_started_at=selected_job['started_at'],
+              job_completed_at=selected_job['completed_at'], upload_started_at=upload['started_at'],
+              upload_completed_at=upload['completed_at'], artifact_created_at=artifact['created_at'],
+              artifact_updated_at=artifact['updated_at'], timestamp_tolerance_seconds=1)
+          archive_zip = root / 'artifact.zip'
+          with archive_zip.open('xb') as dst:
+              subprocess.run(['gh', 'api', f'repos/{repo}/actions/artifacts/{artifact_id}/zip'], stdout=dst, check=True)
+          with archive_zip.open('rb') as src:
+              assert digest(src) == artifact['digest'].removeprefix('sha256:'), 'Artifact ZIP digest mismatch'
+          stem = f'elephant-0.1.0-{target}'
+          archive = root / f'{stem}.tar.gz'
+          with zipfile.ZipFile(archive_zip) as zipped:
+              assert len(zipped.infolist()) == 2 and set(zipped.namelist()) == {archive.name, f'{stem}.sha256'}
+              assert zipped.read(f'{stem}.sha256').decode().split() == [archive_sha, archive.name]
+              with zipped.open(archive.name) as src, archive.open('xb') as dst:
+                  shutil.copyfileobj(src, dst)
+          with archive.open('rb') as src:
+              assert digest(src) == archive_sha, 'Archive digest mismatch'
+          bundle = root / 'bundle'
+          with tarfile.open(archive, 'r:gz') as tar:
+              members = tar.getmembers()
+              member_names = [m.name for m in members]
+              assert len(set(member_names)) == len(member_names), 'Duplicate archive paths'
+              files = {'elephant', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'provenance.json'}
+              for m in members:
+                  p = pathlib.PurePosixPath(m.name)
+                  assert p.as_posix() == m.name and not p.is_absolute() and '..' not in p.parts and '\\' not in m.name
+                  assert m.isfile() or m.isdir(), 'Links and special files are not accepted'
+                  assert m.uid == 0 and m.gid == 0 and m.uname == '' and m.gname == '', 'Archive ownership is not normalized'
+                  assert (m.mode & 0o6000) == 0, 'Set-id archive mode is forbidden'
+                  assert m.name in files | {'CANDIDATE.txt', 'skills'} or m.name.startswith('skills/')
+              assert all(tar.getmember(name).isfile() for name in files)
+              assert tar.getmember('elephant').mode == 0o755, 'Archive binary mode must be 0755'
+              provenance = json.load(tar.extractfile('provenance.json'))
+              expected = {'source_commit': commit, 'source_tree': tree,
+                  'cargo_lock_sha256': 'acf5d35d3e6038c2a5c008a8720e07127935abfb3a316e28c6eb28576de69961',
+                  'version': '0.1.0', 'license': 'MIT OR Apache-2.0', 'target': target,
+                  'workflow_run': run_url, 'workflow_attempt': str(attempt), 'binary_sha256': binary_sha,
+                  'build_profile': 'deploy', 'build_command': './scripts/repo-cargo build --locked --profile deploy -p elephant-bin --features rocksdb',
+                  'features': ['rocksdb'], 'default_features': True}
+              assert all(provenance.get(k) == v for k, v in expected.items()), 'Candidate provenance mismatch'
+              assert digest(tar.extractfile('elephant')) == binary_sha, 'Binary digest mismatch'
+              assets = provenance['runtime_assets']
+              assert assets and set(assets) == {m.name for m in members if m.isfile() and m.name.startswith('skills/')}
+              for name, sha in assets.items():
+                  assert re.fullmatch(r'[0-9a-f]{64}', sha) and digest(tar.extractfile(name)) == sha, name
+              bundle.mkdir()
+              tar.extractall(bundle, filter='data')
+          shutil.copyfile(bundle / 'provenance.json', root / 'receipt' / 'provenance.json')
+          (root / 'receipt' / 'archive-members.txt').write_text('\n'.join(member_names) + '\n')
+          (root / 'receipt' / 'archive-metadata.json').write_text(json.dumps([
+              dict(name=m.name, uid=m.uid, gid=m.gid, uname=m.uname, gname=m.gname, mode=oct(m.mode))
+              for m in members], indent=2) + '\n')
+          receipt = dict(expected, candidate_run_id=run_id, candidate_attempt=attempt,
+              artifact_id=int(artifact_id), artifact_zip_digest=artifact['digest'], archive_sha256=archive_sha,
+              artifact_upload_binding=upload_binding, archive_ownership='uid/gid 0; empty owner/group names',
+              archive_binary_mode='0755', archive_set_id_bits=False,
+              candidate_attestation_steps=attestations, scope='private hosted-runner archive checks only',
+              provider_persistence_auth='not run; HomeCore/ADR owned', public_promotion='not qualified',
+              fresh_pristine_os=False, browser_quarantine='not tested',
+              acceptance_source_commit=os.environ['GITHUB_SHA'], acceptance_workflow_ref=os.environ['GITHUB_WORKFLOW_REF'],
+              acceptance_run_url=f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              acceptance_run_attempt=os.environ['GITHUB_RUN_ATTEMPT'])
+          (root / 'receipt' / 'identity.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print('Exact retained archive, provenance, binary and skills verified before TAR extraction/execution')
+          PYVERIFY
+
+      - name: Inspect linkage and installed help with a restricted environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ACCEPT_DIR="$RUNNER_TEMP/accept-$ACCEPT_TARGET"
+          RECEIPT="$ACCEPT_DIR/receipt"
+          BUNDLE="$ACCEPT_DIR/bundle"
+          ACCEPT_HOME="$ACCEPT_DIR/home"
+          SAFE_PATH=/usr/bin:/bin:/usr/sbin:/sbin
+          mkdir -p "$ACCEPT_HOME/.local/bin"
+          uname -srm > "$RECEIPT/host.txt"
+          printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" >> "$RECEIPT/host.txt"
+          case "$ACCEPT_TARGET:$(uname -s):$(uname -m)" in
+            x86_64-unknown-linux-gnu:Linux:x86_64)
+              env -i PATH="$SAFE_PATH" HOME="$ACCEPT_HOME" ldd "$BUNDLE/elephant" > "$RECEIPT/linkage.txt" ;;
+            aarch64-apple-darwin:Darwin:arm64)
+              sw_vers >> "$RECEIPT/host.txt"
+              env -i PATH="$SAFE_PATH" HOME="$ACCEPT_HOME" otool -L "$BUNDLE/elephant" > "$RECEIPT/linkage.txt" ;;
+            *) echo 'Unexpected native host' >&2; exit 1 ;;
+          esac
+          file "$BUNDLE/elephant" > "$RECEIPT/file.txt"
+          python3 -I - <<'PYLINK'
+          import os, pathlib
+          root = pathlib.Path(os.environ['ACCEPT_DIR'])
+          lines = (root / 'receipt' / 'linkage.txt').read_text().splitlines()
+          linux = os.environ['ACCEPT_TARGET'] == 'x86_64-unknown-linux-gnu'
+          paths = []
+          for line in (lines if linux else lines[1:]):
+              line = line.strip()
+              if linux and line.startswith('linux-vdso.so.'):
+                  continue
+              token = (line.split('=>', 1)[1] if '=>' in line else line).strip().split()[0]
+              allowed = ('/lib/', '/lib64/', '/usr/lib/', '/usr/lib64/') if linux else ('/usr/lib/', '/System/Library/')
+              assert token.startswith(allowed) and os.path.realpath(token).startswith(allowed), f'Non-system or missing dependency: {line}'
+              paths.append(token)
+          assert paths, 'No system dependency evidence'
+          (root / 'receipt' / 'environment.txt').write_text('Hosted development image; no source checkout or Cargo invocation.\nBinary runs use env -i with isolated HOME, PATH=/usr/bin:/bin:/usr/sbin:/sbin and absolute PIPELINE_SKILLS_DIR only.\nExplicit linked dependencies resolve to system paths; dlopen behavior and provider execution remain untested.\n')
+          PYLINK
+          env -i HOME="$ACCEPT_HOME" PATH="$SAFE_PATH" PIPELINE_SKILLS_DIR="$BUNDLE/skills" "$BUNDLE/elephant" --help > "$RECEIPT/bundle-help.txt"
+          install -m 0755 "$BUNDLE/elephant" "$ACCEPT_HOME/.local/bin/elephant"
+          python3 -I - <<'PYINSTALL'
+          import hashlib, os, pathlib
+          binary = pathlib.Path(os.environ['ACCEPT_DIR'], 'home/.local/bin/elephant')
+          with binary.open('rb') as stream:
+              assert hashlib.file_digest(stream, 'sha256').hexdigest() == os.environ['BINARY_SHA256']
+          PYINSTALL
+          test -d "$BUNDLE/skills"
+          env -i HOME="$ACCEPT_HOME" PATH="$SAFE_PATH" PIPELINE_SKILLS_DIR="$BUNDLE/skills" "$ACCEPT_HOME/.local/bin/elephant" --help > "$RECEIPT/installed-help.txt"
+          printf 'PASS: identity, archive, skills, native host, system linkage, install and restricted-environment help\n' > "$RECEIPT/result.txt"
+
+      - name: Retain private per-target check receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: private-archive-check-${{ matrix.target }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/accept-${{ matrix.target }}/receipt/
+          if-no-files-found: warn

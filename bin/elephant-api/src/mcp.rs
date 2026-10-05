@@ -344,16 +344,6 @@ fn can_manage_runtime(state: &McpState, principal: Option<&AbacPrincipal>) -> bo
         })
 }
 
-/// Whether the caller may see the default space's embedding progress counts:
-/// a runtime operator (as for runtime management) of that same space.
-fn can_view_embedding_progress(state: &McpState, principal: Option<&AbacPrincipal>) -> bool {
-    state.auth.skip_auth
-        || principal.is_some_and(|principal| {
-            principal.space_id == state.default_space_id
-                && (principal.scopes.contains("*") || principal.scopes.contains("write:system"))
-        })
-}
-
 fn can_read_runtime_config(state: &McpState, principal: Option<&AbacPrincipal>) -> bool {
     state.auth.skip_auth
         || principal.is_some_and(|principal| {
@@ -389,22 +379,8 @@ async fn handle_runtime_tool(
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     match name {
         TOOL_GET_RUNTIME_STATUS => {
-            let mut status = serde_json::to_value(state.runtime.get_status().await);
-            // Embedding counts are derived from space content: readiness stays
-            // public, the counts go only to runtime operators of that space.
-            if can_view_embedding_progress(state, principal) {
-                let progress = state
-                    .runtime
-                    .embedding_progress(&state.default_space_id)
-                    .await;
-                if let (Ok(Value::Object(fields)), Some(progress)) = (status.as_mut(), progress) {
-                    fields.insert(
-                        "embedding".to_string(),
-                        serde_json::to_value(progress).unwrap_or(Value::Null),
-                    );
-                }
-            }
-            runtime_json_result(status)
+            let status = state.runtime.get_status().await;
+            runtime_json_result(serde_json::to_value(status))
         }
         TOOL_INITIALIZE_RUNTIME => {
             if !can_manage_runtime(state, principal) {
@@ -2077,82 +2053,5 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    fn runtime_principal(space_id: &str, scopes: &[&str]) -> AbacPrincipal {
-        AbacPrincipal {
-            space_id: space_id.to_string(),
-            scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
-            clearances: Vec::new(),
-            subject_allowlist: None,
-            purpose: HashSet::new(),
-        }
-    }
-
-    async fn runtime_status_json(state: &McpState, principal: Option<&AbacPrincipal>) -> Value {
-        let result = handle_runtime_tool(
-            state,
-            TOOL_GET_RUNTIME_STATUS,
-            Value::Object(serde_json::Map::new()),
-            principal,
-        )
-        .await
-        .expect("runtime status");
-        let content = result.content.first().expect("tool content");
-        let text = content.as_text().expect("text content");
-        serde_json::from_str(&text.text).expect("status json")
-    }
-
-    #[tokio::test]
-    async fn test_embedding_progress_only_for_runtime_operators_of_the_space() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        let state = McpState::new_with_defaults(
-            storage,
-            AuthConfig {
-                secret: "test-secret".to_string(),
-                algorithm: Algorithm::HS256,
-                audience: None,
-                issuer: None,
-                skip_auth: false,
-            },
-            "space_a".to_string(),
-            vec!["default".to_string()],
-        );
-        state
-            .runtime
-            .seed_embedding_progress(crate::runtime::EmbeddingProgress {
-                space_id: "space_a".to_string(),
-                pending_nodes: 7,
-                embedded_nodes: 3,
-                unembeddable_nodes: 1,
-                embeddable_nodes: 11,
-                embedded_by_model: std::collections::BTreeMap::from([("model-x".to_string(), 3)]),
-                active_model: Some("model-x".to_string()),
-                counted_at: "2026-10-05T00:00:00+00:00".to_string(),
-            });
-
-        // Anonymous, same-space reader, and another space's operator: no counts.
-        let reader = runtime_principal("space_a", &["read:doc", "read:assertion"]);
-        let other_operator = runtime_principal("space_b", &["*"]);
-        for principal in [None, Some(&reader), Some(&other_operator)] {
-            let status = runtime_status_json(&state, principal).await;
-            assert!(status.get("embedding").is_none(), "leaked: {status}");
-        }
-
-        // Runtime operators of the counted space see them.
-        for scopes in [&["*"][..], &["write:system"][..]] {
-            let operator = runtime_principal("space_a", scopes);
-            let status = runtime_status_json(&state, Some(&operator)).await;
-            assert_eq!(status["embedding"]["pending_nodes"], 7);
-            assert_eq!(status["embedding"]["unembeddable_nodes"], 1);
-            assert_eq!(
-                status["embedding"]["counted_at"],
-                "2026-10-05T00:00:00+00:00"
-            );
-        }
-
-        // The public status (REST /v1/runtime/status) never carries them.
-        let public = serde_json::to_string(&state.runtime.get_status().await).expect("status");
-        assert!(!public.contains("pending_nodes"));
     }
 }

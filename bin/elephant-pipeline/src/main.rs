@@ -7359,6 +7359,30 @@ async fn complete_work_item_and_promote(
     Ok(())
 }
 
+/// How often the embed loop logs each space's embedding progress.
+const EMBED_PROGRESS_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Logs one space's embedding progress for the operator.
+///
+/// Counts are derived from space content, so they go to the server log under
+/// the `elephant::embedding_progress` target, never to an API. Enable them
+/// with `RUST_LOG=...,elephant::embedding_progress=info`.
+async fn report_embedding_progress(node_repo: &DocNodeRepository, space_id: &str, model: &str) {
+    match node_repo.count_embedding_progress(space_id).await {
+        Ok(counts) => info!(
+            target: "elephant::embedding_progress",
+            space_id,
+            pending = counts.pending,
+            embedded = counts.embedded(),
+            unembeddable = counts.unembeddable,
+            embedded_by_model = ?counts.embedded_by_model,
+            active_model = model,
+            "embedding progress"
+        ),
+        Err(err) => warn!("Embedding progress count failed for space {space_id}: {err}"),
+    }
+}
+
 /// Helper function to run the embed worker loop.
 #[allow(clippy::too_many_arguments)]
 async fn run_embed_loop(
@@ -7372,6 +7396,7 @@ async fn run_embed_loop(
     mut rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let fallback_policy = policy_from_embed_config(&embed_config);
+    let mut last_progress_report: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
             _ = rx.changed() => {
@@ -7383,6 +7408,11 @@ async fn run_embed_loop(
             () = tokio::time::sleep(embed_config.poll_interval()) => {
                 let spaces = doc_repo.get_all_spaces().await.unwrap_or_else(|_| vec!["default".to_string()]);
                 let spaces = if spaces.is_empty() { vec!["default".to_string()] } else { spaces };
+                let report_progress = last_progress_report
+                    .is_none_or(|at| at.elapsed() >= EMBED_PROGRESS_REPORT_INTERVAL);
+                if report_progress {
+                    last_progress_report = Some(std::time::Instant::now());
+                }
 
                 for space_id in spaces {
                     let policy = match resolve_embedding_policy(
@@ -7421,6 +7451,9 @@ async fn run_embed_loop(
                         Err(e) => {
                             error!("Embed worker error for space {}: {}", space_id, e);
                         }
+                    }
+                    if report_progress {
+                        report_embedding_progress(&node_repo, &space_id, &policy.model).await;
                     }
                 }
             }

@@ -73,10 +73,63 @@ pub trait AssertionRepo: Send + Sync {
         id: &RecordId,
     ) -> StorageResult<Option<Assertion>>;
     async fn restore(&self, space_id: &str, id: &RecordId) -> StorageResult<Assertion>;
+    /// Restores only if the row still matches the authorized snapshot.
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<Assertion>;
+    /// Soft-deletes only if the row still matches the authorized snapshot.
+    async fn delete_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<()>;
+    /// Sets only the resolution fields, if the row still matches the
+    /// authorized snapshot.
+    async fn resolve_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+        status: ResolutionStatus,
+        rationale: Option<String>,
+    ) -> StorageResult<Assertion>;
 }
 
 #[async_trait::async_trait]
 impl AssertionRepo for AssertionRepository {
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<Assertion> {
+        Self::restore_guarded(self, space_id, id, authorized).await
+    }
+
+    async fn delete_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<()> {
+        Self::delete_guarded(self, space_id, id, authorized).await
+    }
+
+    async fn resolve_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+        status: ResolutionStatus,
+        rationale: Option<String>,
+    ) -> StorageResult<Assertion> {
+        Self::resolve_guarded(self, space_id, id, authorized, status, rationale).await
+    }
+
     async fn create(&self, record: Assertion) -> StorageResult<Assertion> {
         Repository::create(self, record).await
     }
@@ -143,6 +196,66 @@ impl AssertionRepo for AssertionRepository {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl AssertionRepo for elephant_storage::MockAssertionRepository {
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<Assertion> {
+        let current = Self::get_with_deleted(self, space_id, id).await?;
+        if !current.is_some_and(|current| {
+            elephant_storage::assertion_envelope_unchanged(&current, authorized)
+        }) {
+            return Err(elephant_storage::StorageError::Conflict(format!(
+                "Assertion changed since it was authorized: {id}"
+            )));
+        }
+        Self::restore(self, space_id, id).await
+    }
+
+    async fn delete_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+    ) -> StorageResult<()> {
+        let current = Self::get_with_deleted(self, space_id, id).await?;
+        if authorized.base.deleted_at.is_some()
+            || !current.is_some_and(|current| {
+                elephant_storage::assertion_envelope_unchanged(&current, authorized)
+            })
+        {
+            return Err(elephant_storage::StorageError::Conflict(format!(
+                "Assertion changed since it was authorized: {id}"
+            )));
+        }
+        Repository::delete(self, space_id, id).await
+    }
+
+    async fn resolve_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+        status: ResolutionStatus,
+        rationale: Option<String>,
+    ) -> StorageResult<Assertion> {
+        let current = Self::get_with_deleted(self, space_id, id).await?;
+        let Some(mut current) = current.filter(|current| {
+            authorized.base.deleted_at.is_none()
+                && elephant_storage::assertion_envelope_unchanged(current, authorized)
+        }) else {
+            return Err(elephant_storage::StorageError::Conflict(format!(
+                "Assertion changed since it was authorized: {id}"
+            )));
+        };
+        current.resolution_status = status;
+        if let Some(rationale) = rationale {
+            current.retry_state.abstention_reason = Some(rationale);
+        }
+        Repository::update(self, space_id, id, current).await
+    }
+
     async fn delete(&self, space_id: &str, id: &RecordId) -> StorageResult<()> {
         Repository::delete(self, space_id, id).await
     }
@@ -357,6 +470,33 @@ pub struct ResolutionUpdateRequest {
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
+/// Read-scope preflight for assertion search.
+///
+/// Scope only: per-record clearance and subject checks still run on every
+/// result. Evaluating a synthetic record here would refuse subject-attenuated
+/// callers outright, since the engine requires non-empty allowed subjects.
+#[allow(clippy::result_large_err)]
+fn authorize_assertion_search(
+    principal: &AuthPrincipal,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let allowed = principal.bypass_abac
+        || principal
+            .scopes
+            .iter()
+            .any(|scope| scope == "*" || scope == "read:assertion");
+    if allowed {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            code: "ACCESS_DENIED".to_string(),
+            message: "Access denied: missing required scope `read:assertion`".to_string(),
+            details: None,
+        }),
+    ))
+}
+
 /// POST /v1/assertions/search - Search assertions.
 #[allow(clippy::too_many_lines)]
 async fn search_assertions(
@@ -365,6 +505,9 @@ async fn search_assertions(
     Json(req): Json<AssertionSearchRequest>,
 ) -> ApiResult<AssertionSearchResponse> {
     let space_id = require_space_id(&principal)?;
+    // Deny before any lookup: without read:assertion the caller must not learn
+    // even whether matching rows exist.
+    authorize_assertion_search(&principal)?;
 
     let query = req
         .query
@@ -397,99 +540,10 @@ async fn search_assertions(
         "INVALID_ENTITY_ID",
     )?;
 
-    if req.cursor.is_none()
-        && query.is_none()
-        && (entity_filter.is_some()
-            || subject_entity_filter.is_some()
-            || object_entity_filter.is_some())
-    {
-        let fetch_limit = req.limit.saturating_add(1);
-        let assertions = if let Some(ref entity_id) = entity_filter {
-            state
-                .assertion_repo
-                .find_by_resolved_entity(&space_id, entity_id, fetch_limit)
-                .await
-        } else {
-            state
-                .assertion_repo
-                .find_by_resolved_entity_pair(
-                    &space_id,
-                    subject_entity_filter.as_ref(),
-                    object_entity_filter.as_ref(),
-                    fetch_limit,
-                )
-                .await
-        }
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-
-        let filtered: Vec<Assertion> = assertions
-            .into_iter()
-            .filter(|a| {
-                if let Some(ref status) = req.status {
-                    if &a.resolution_status != status {
-                        return false;
-                    }
-                }
-                if let Some(ref predicate) = req.predicate {
-                    if &a.predicate_raw != predicate {
-                        return false;
-                    }
-                }
-                if let Some(ref source_id) = source_filter {
-                    if !a
-                        .base
-                        .provenance
-                        .sources
-                        .iter()
-                        .any(|source| source == source_id)
-                    {
-                        return false;
-                    }
-                }
-                if let Some(ref subject_entity) = subject_entity_filter {
-                    if a.subject_entity
-                        .as_ref()
-                        .is_none_or(|link| link.id() != subject_entity)
-                    {
-                        return false;
-                    }
-                }
-                if let Some(ref object_entity) = object_entity_filter {
-                    if a.object_entity
-                        .as_ref()
-                        .is_none_or(|link| link.id() != object_entity)
-                    {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect();
-        let total = filtered.len();
-        let mut visible = state
-            .authz
-            .filter_records(&principal, filtered, "read:assertion");
-        let has_more = visible.len() > req.limit;
-        if has_more {
-            visible.truncate(req.limit);
-        }
-        let cursor = if has_more {
-            visible.last().map(|a| a.base.id.to_string())
-        } else {
-            None
-        };
-        return Ok(Json(AssertionSearchResponse {
-            results: visible,
-            cursor,
-            has_more,
-            total,
-        }));
-    }
+    // Entity-filtered searches go through the same authorized scanner as every
+    // other search. The former linked-entity fast path counted rows before
+    // ABAC and read only one candidate batch, so it disclosed hidden matches
+    // and could under-report has_more.
 
     let mut ranked_cursor = 0usize;
     let mut cursor = None;
@@ -804,7 +858,7 @@ async fn update_resolution(
         )
     })?;
 
-    let mut assertion = match state.assertion_repo.get(&space_id, &rid).await {
+    let assertion = match state.assertion_repo.get(&space_id, &rid).await {
         Ok(Some(a)) => a,
         Ok(None) => {
             return Err((
@@ -848,22 +902,34 @@ async fn update_resolution(
             )
         })?;
 
-    assertion.resolution_status = req.status;
-    if let Some(rationale) = req.rationale {
-        assertion.retry_state.abstention_reason = Some(rationale);
-    }
-
-    match state
+    // Only the resolution fields are written, and only while the row still
+    // has the envelope authorized above: a stale snapshot never overwrites a
+    // newer classification, subject set or entity link.
+    state
         .assertion_repo
-        .update(&space_id, &rid, assertion)
+        .resolve_guarded(&space_id, &rid, &assertion, req.status, req.rationale)
         .await
-    {
-        Ok(updated) => Ok(Json(updated)),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        .map(Json)
+        .map_err(|e| assertion_storage_error(&e))
+}
+
+/// Storage failure as an API error: a guard conflict is 409 and carries no
+/// record content.
+fn assertion_storage_error(error: &elephant_storage::StorageError) -> (StatusCode, Json<ApiError>) {
+    if matches!(error, elephant_storage::StorageError::Conflict(_)) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                code: "CONFLICT".to_string(),
+                message: "Assertion changed since it was authorized; retry".to_string(),
+                details: None,
+            }),
+        );
     }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError::internal(error.to_string())),
+    )
 }
 
 fn assertion_forbidden(error: crate::authz::AuthzError) -> (StatusCode, Json<ApiError>) {
@@ -899,17 +965,14 @@ async fn delete_assertion(
                 .authz
                 .authorize_record_write(&principal, &existing, "write:assertion")
                 .map_err(assertion_forbidden)?;
+            // Guarded: the delete applies only if the row still has the
+            // envelope authorized above.
             state
                 .assertion_repo
-                .delete(&space_id, &rid)
+                .delete_guarded(&space_id, &rid, &existing)
                 .await
                 .map(|()| StatusCode::NO_CONTENT)
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiError::internal(e.to_string())),
-                    )
-                })
+                .map_err(|e| assertion_storage_error(&e))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -948,17 +1011,13 @@ async fn restore_assertion(
                 .authz
                 .authorize_record_read(&principal, &existing, "read:assertion")
                 .map_err(assertion_forbidden)?;
+            // Guarded: restores, and returns, only the row authorized above.
             state
                 .assertion_repo
-                .restore(&space_id, &rid)
+                .restore_guarded(&space_id, &rid, &existing)
                 .await
                 .map(Json)
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiError::internal(e.to_string())),
-                    )
-                })
+                .map_err(|e| assertion_storage_error(&e))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,

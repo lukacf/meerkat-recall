@@ -143,6 +143,162 @@ pub struct EventRepository {
 }
 
 impl EventRepository {
+    /// Pins a replacement event to its space and ID and normalizes its subject
+    /// links, as every update does before writing.
+    async fn prepare_replacement(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        mut record: Event,
+    ) -> StorageResult<Event> {
+        record.base.space_id = space_id.to_string();
+        record.base.id.clone_from(id);
+        record.base.updated_at = Utc::now();
+        let original_subject_count = record.base.subjects.len();
+        let (subjects, removed_subjects) = self
+            .normalize_subject_links_in_space(space_id, &record.base.subjects)
+            .await?;
+        record.base.subjects = subjects;
+        if removed_subjects > 0 || record.base.subjects.len() < original_subject_count {
+            record.base.subjects_state = if record.base.subjects.is_empty() {
+                SubjectsState::Unknown
+            } else {
+                SubjectsState::Partial
+            };
+        }
+        record.validate()?;
+        self.validate_subject_links_in_space(space_id, &record.base.subjects)
+            .await?;
+        Ok(record)
+    }
+
+    /// Replaces an active event without changing its security metadata.
+    ///
+    /// For ordinary event edits, after authorizing the existing and proposed
+    /// records. The stored security must equal the replacement's security in
+    /// the same mutation that writes it, so a stale authorization cannot
+    /// overwrite a newer classification, and no edit can declassify. Trusted
+    /// maintenance that manages security uses [`Repository::update`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if the row is missing, deleted, or its security
+    /// differs from the replacement's, or an error if storage access fails.
+    pub async fn update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Event,
+    ) -> StorageResult<Event> {
+        let record = self.prepare_replacement(space_id, id, record).await?;
+        let conflict = || {
+            StorageError::Conflict(format!(
+                "Event is missing, deleted, or its security has changed: {id}"
+            ))
+        };
+        if let Some(store) = self.client.embedded_store() {
+            return store
+                .mutate(|mutation| {
+                    let Some(existing) = mutation.get::<Event>(space_id, id, false)? else {
+                        return Err(conflict());
+                    };
+                    if existing.base.security != record.base.security {
+                        return Err(conflict());
+                    }
+                    Ok(mutation.replace(record)?)
+                })
+                .await;
+        }
+
+        // The comparison sits in the UPDATE predicate rather than in a separate
+        // read whose result could be stale by the time of the write.
+        let mut response = self
+            .client
+            .query_bind_checked(
+                &format!(
+                    "UPDATE $id MERGE $record WHERE space_id = $space_id AND deleted_at IS NONE \
+                     AND security = $security RETURN {EVENT_PROJECTION}"
+                ),
+                crate::bindings! {
+                    "id" => crate::surreal::thing_from_record_id(id),
+                    "space_id" => space_id,
+                    "record" => Self::event_to_value(&record)?,
+                    "security" => crate::surreal::security_to_value(&record.base.security),
+                },
+            )
+            .await?;
+        let rows: Vec<EventDb> = response
+            .take(0)
+            .map_err(|e| StorageError::QueryError(format!("Failed to parse updated event: {e}")))?;
+        Event::try_from(rows.into_iter().next().ok_or_else(conflict)?)
+    }
+
+    /// Restores a event only if it is unchanged since `authorized`, the row
+    /// the caller's authorization was decided on.
+    ///
+    /// See [`crate::lifecycle_guard`]: the stored security, subjects, subjects
+    /// state and exact lifecycle must still equal `authorized` in the same
+    /// mutation that restores.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if the row is missing or changed, or an error if
+    /// storage access fails.
+    pub async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Event,
+    ) -> StorageResult<Event> {
+        if let Some(store) = self.client.embedded_store() {
+            return store
+                .mutate(|mutation| {
+                    let Some(mut current) = mutation.get::<Event>(space_id, id, true)? else {
+                        return Err(crate::lifecycle_guard::guard_conflict("Event", id));
+                    };
+                    if !crate::lifecycle_guard::base_envelope_unchanged(
+                        &current.base,
+                        &authorized.base,
+                    ) {
+                        return Err(crate::lifecycle_guard::guard_conflict("Event", id));
+                    }
+                    current.base.deleted_at = None;
+                    current.base.updated_at = chrono::Utc::now();
+                    Ok(mutation.replace(current)?)
+                })
+                .await;
+        }
+
+        let (condition, mut bindings) =
+            crate::lifecycle_guard::base_envelope_condition(&authorized.base)?;
+        bindings.insert(
+            "id".to_string(),
+            surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(id)),
+        );
+        bindings.insert(
+            "space_id".to_string(),
+            surrealdb::sql::Value::from(space_id),
+        );
+        let mut response = self
+            .client
+            .query_bind_checked(
+                &format!(
+                    "UPDATE $id SET deleted_at = NONE, updated_at = time::now() \
+                     WHERE space_id = $space_id AND {condition} RETURN {EVENT_PROJECTION}"
+                ),
+                bindings,
+            )
+            .await?;
+        let rows: Vec<EventDb> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse guarded event restore: {e}"))
+        })?;
+        Event::try_from(
+            rows.into_iter()
+                .next()
+                .ok_or_else(|| crate::lifecycle_guard::guard_conflict("Event", id))?,
+        )
+    }
+
     /// Finds active events that name an entity as a participant.
     pub async fn find_by_subject_entity(
         &self,
@@ -689,25 +845,7 @@ impl Repository<Event> for EventRepository {
     }
 
     async fn update(&self, space_id: &str, id: &RecordId, record: Event) -> StorageResult<Event> {
-        let mut record = record;
-        record.base.space_id = space_id.to_string();
-        record.base.id.clone_from(id);
-        record.base.updated_at = Utc::now();
-        let original_subject_count = record.base.subjects.len();
-        let (subjects, removed_subjects) = self
-            .normalize_subject_links_in_space(space_id, &record.base.subjects)
-            .await?;
-        record.base.subjects = subjects;
-        if removed_subjects > 0 || record.base.subjects.len() < original_subject_count {
-            record.base.subjects_state = if record.base.subjects.is_empty() {
-                SubjectsState::Unknown
-            } else {
-                SubjectsState::Partial
-            };
-        }
-        record.validate()?;
-        self.validate_subject_links_in_space(space_id, &record.base.subjects)
-            .await?;
+        let record = self.prepare_replacement(space_id, id, record).await?;
 
         if let Some(store) = self.client.embedded_store() {
             return store.update_existing(space_id, id, record).await;
@@ -1108,6 +1246,94 @@ mod tests {
         };
         entity_repo.create(entity).await.expect("create entity");
         id
+    }
+
+    /// Ordinary event edits keep the stored security, atomically, on any backend.
+    async fn assert_update_preserves_security(repo: &EventRepository) {
+        let space_id = "space_a";
+        let mut event = make_event(space_id, "Classified", EventStatus::Approved, None);
+        event.base.security = Security {
+            policy_id: "default".to_string(),
+            level: 3,
+            labels: vec!["private".to_string()],
+            handling: vec!["no-share".to_string()],
+        };
+        let id = event.base.id.clone();
+        repo.create(event).await.unwrap();
+        let stored = repo.get(space_id, &id).await.unwrap().expect("event");
+
+        // Declassifying edits conflict and leave the row untouched.
+        let mut lowered = stored.clone();
+        lowered.base.security.level = 0;
+        let mut unlabeled = stored.clone();
+        unlabeled.base.security.labels.clear();
+        let mut unhandled = stored.clone();
+        unhandled.base.security.handling.clear();
+        let mut other_policy = stored.clone();
+        other_policy.base.security.policy_id = "other_policy".to_string();
+        for attempt in [lowered, unlabeled, unhandled, other_policy] {
+            let result = repo
+                .update_preserving_security(space_id, &id, attempt)
+                .await;
+            assert!(
+                matches!(result, Err(StorageError::Conflict(_))),
+                "{result:?}"
+            );
+        }
+        let after = repo.get(space_id, &id).await.unwrap().expect("event");
+        assert_eq!(after.base.security, stored.base.security);
+        assert_eq!(after.title, "Classified");
+
+        // An edit that keeps the security succeeds and keeps it exactly.
+        let mut edit = stored.clone();
+        edit.title = "Classified, renamed".to_string();
+        let saved = repo
+            .update_preserving_security(space_id, &id, edit)
+            .await
+            .unwrap();
+        assert_eq!(saved.title, "Classified, renamed");
+        assert_eq!(saved.base.security, stored.base.security);
+
+        // Stale authorization: another writer restricts the row after this
+        // caller's snapshot; the late write conflicts and the restriction stays.
+        let snapshot = repo.get(space_id, &id).await.unwrap().expect("event");
+        let mut stricter = snapshot.clone();
+        stricter.base.security.level = 5;
+        stricter.title = "Restricted".to_string();
+        repo.update(space_id, &id, stricter).await.unwrap();
+        let mut late = snapshot.clone();
+        late.title = "Late edit".to_string();
+        let result = repo.update_preserving_security(space_id, &id, late).await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+        let current = repo.get(space_id, &id).await.unwrap().expect("event");
+        assert_eq!(current.base.security.level, 5);
+        assert_eq!(current.title, "Restricted");
+
+        // A deleted row is not revived by an ordinary edit.
+        repo.delete(space_id, &id).await.unwrap();
+        let mut revive = current.clone();
+        revive.title = "Revived".to_string();
+        let result = repo.update_preserving_security(space_id, &id, revive).await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+        assert!(repo.get(space_id, &id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_preserving_security_surreal() {
+        let repo = setup_test_repo().await;
+        Box::pin(assert_update_preserves_security(&repo)).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_preserving_security_embedded() {
+        let repo = EventRepository::new(StorageClient::new_embedded().await.unwrap());
+        Box::pin(assert_update_preserves_security(&repo)).await;
     }
 
     #[tokio::test]
@@ -1818,5 +2044,78 @@ mod tests {
         let rows = repo.query_window(space_id, &query).await.unwrap();
         let titles: Vec<&str> = rows.iter().map(|event| event.title.as_str()).collect();
         assert_eq!(titles, vec!["Approved event"]);
+    }
+
+    /// Guarded restore acts only on the snapshot the caller was authorized on.
+    async fn assert_restore_guarded_lifecycle(repo: &EventRepository, space: &str, record: Event) {
+        let id = record.base.id.clone();
+        repo.create(record).await.unwrap();
+
+        // A fresh tombstone snapshot restores.
+        repo.delete(space, &id).await.unwrap();
+        let tombstone = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let restored = repo.restore_guarded(space, &id, &tombstone).await.unwrap();
+        assert!(restored.base.deleted_at.is_none());
+
+        // Tombstone ABA: snapshot D1, restored and deleted again as D2; the
+        // stale restore from D1 conflicts and the row stays deleted.
+        repo.delete(space, &id).await.unwrap();
+        let tombstone_d1 = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        repo.restore(space, &id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        repo.delete(space, &id).await.unwrap();
+        let result = repo.restore_guarded(space, &id, &tombstone_d1).await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+        assert!(repo.get(space, &id).await.unwrap().is_none());
+
+        // Another space never matches.
+        let tombstone_d2 = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let result = repo
+            .restore_guarded("other_space", &id, &tombstone_d2)
+            .await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+
+        // Reclassified after an active snapshot: the guarded restore conflicts
+        // and the stricter row is untouched.
+        repo.restore(space, &id).await.unwrap();
+        let snapshot = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let mut stricter = snapshot.clone();
+        stricter.base.security.level = 5;
+        repo.update(space, &id, stricter).await.unwrap();
+        let result = repo.restore_guarded(space, &id, &snapshot).await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+        let current = repo.get(space, &id).await.unwrap().expect("active");
+        assert_eq!(current.base.security.level, 5);
+    }
+
+    #[tokio::test]
+    async fn test_restore_guarded_lifecycle_surreal() {
+        let repo = setup_test_repo().await;
+        assert_restore_guarded_lifecycle(
+            &repo,
+            "space_a",
+            make_event("space_a", "Guarded", EventStatus::Approved, None),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_restore_guarded_lifecycle_embedded() {
+        let repo = EventRepository::new(StorageClient::new_embedded().await.unwrap());
+        assert_restore_guarded_lifecycle(
+            &repo,
+            "space_a",
+            make_event("space_a", "Guarded", EventStatus::Approved, None),
+        )
+        .await;
     }
 }

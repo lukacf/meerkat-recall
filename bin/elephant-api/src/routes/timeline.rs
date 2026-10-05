@@ -46,9 +46,24 @@ pub struct TimelineState {
 /// Timeline event repository interface used by the API layer.
 #[async_trait::async_trait]
 pub trait TimelineEventRepo: Send + Sync {
+    /// Restores only if the row still matches the authorized snapshot.
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &elephant_types::RecordId,
+        authorized: &Event,
+    ) -> StorageResult<Event>;
     async fn create(&self, record: Event) -> StorageResult<Event>;
     async fn get(&self, space_id: &str, id: &RecordId) -> StorageResult<Option<Event>>;
     async fn update(&self, space_id: &str, id: &RecordId, record: Event) -> StorageResult<Event>;
+    /// Replaces an active event only while its stored security equals the
+    /// replacement's, atomically; a conflict otherwise.
+    async fn update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Event,
+    ) -> StorageResult<Event>;
     async fn delete(&self, space_id: &str, id: &RecordId) -> StorageResult<()>;
     async fn search(&self, criteria: &SearchCriteria) -> StorageResult<PaginatedResult<Event>>;
 
@@ -62,8 +77,26 @@ pub trait TimelineEventRepo: Send + Sync {
 
 #[async_trait::async_trait]
 impl TimelineEventRepo for EventRepository {
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &elephant_types::RecordId,
+        authorized: &Event,
+    ) -> StorageResult<Event> {
+        Self::restore_guarded(self, space_id, id, authorized).await
+    }
+
     async fn create(&self, record: Event) -> StorageResult<Event> {
         Repository::create(self, record).await
+    }
+
+    async fn update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Event,
+    ) -> StorageResult<Event> {
+        Self::update_preserving_security(self, space_id, id, record).await
     }
 
     async fn get(&self, space_id: &str, id: &RecordId) -> StorageResult<Option<Event>> {
@@ -106,8 +139,41 @@ impl TimelineEventRepo for EventRepository {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl TimelineEventRepo for MockEventRepository {
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &elephant_types::RecordId,
+        authorized: &Event,
+    ) -> StorageResult<Event> {
+        let current = Self::get_with_deleted(self, space_id, id).await?;
+        let unchanged = current.is_some_and(|current| {
+            elephant_storage::base_envelope_unchanged(&current.base, &authorized.base)
+        });
+        if !unchanged {
+            return Err(elephant_storage::StorageError::Conflict(format!(
+                "Event changed since it was authorized: {id}"
+            )));
+        }
+        Self::restore(self, space_id, id).await
+    }
+
     async fn create(&self, record: Event) -> StorageResult<Event> {
         Repository::create(self, record).await
+    }
+
+    async fn update_preserving_security(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        record: Event,
+    ) -> StorageResult<Event> {
+        let current = Repository::get(self, space_id, id).await?;
+        if current.is_none_or(|current| current.base.security != record.base.security) {
+            return Err(elephant_storage::StorageError::Conflict(format!(
+                "Event is missing, deleted, or its security has changed: {id}"
+            )));
+        }
+        Repository::update(self, space_id, id, record).await
     }
 
     async fn get(&self, space_id: &str, id: &RecordId) -> StorageResult<Option<Event>> {
@@ -388,9 +454,34 @@ async fn update_event(
                 .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
             authorize_event(state.as_ref(), &principal, &event, "write:event")
                 .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
+            // Ordinary edits keep the event's classification: being cleared for
+            // both envelopes is not a grant to declassify.
+            if existing.base.security != event.base.security {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(ApiError {
+                        code: "ACCESS_DENIED".to_string(),
+                        message: "ordinary event updates cannot change security metadata"
+                            .to_string(),
+                        details: None,
+                    }),
+                ));
+            }
 
-            match state.event_repo.update(&space_id, &rid, event).await {
+            match state
+                .event_repo
+                .update_preserving_security(&space_id, &rid, event)
+                .await
+            {
                 Ok(updated) => Ok(Json(updated)),
+                Err(elephant_storage::StorageError::Conflict(message)) => Err((
+                    StatusCode::CONFLICT,
+                    Json(ApiError {
+                        code: "CONFLICT".to_string(),
+                        message,
+                        details: None,
+                    }),
+                )),
                 Err(e) => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiError::internal(e.to_string())),
@@ -466,8 +557,20 @@ async fn restore_event(
             authorize_event(state.as_ref(), &principal, &existing, "read:event")
                 .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
 
-            match state.event_repo.restore(&space_id, &rid).await {
+            match state
+                .event_repo
+                .restore_guarded(&space_id, &rid, &existing)
+                .await
+            {
                 Ok(restored) => Ok(Json(restored)),
+                Err(elephant_storage::StorageError::Conflict(_)) => Err((
+                    StatusCode::CONFLICT,
+                    Json(ApiError {
+                        code: "CONFLICT".to_string(),
+                        message: "record changed since it was authorized; retry".to_string(),
+                        details: None,
+                    }),
+                )),
                 Err(e) => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiError::internal(e.to_string())),

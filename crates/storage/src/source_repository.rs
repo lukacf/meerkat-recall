@@ -159,6 +159,72 @@ pub struct SourceRepository {
 }
 
 impl SourceRepository {
+    /// Restores a source only if it is unchanged since `authorized`, the row
+    /// the caller's authorization was decided on.
+    ///
+    /// See [`crate::lifecycle_guard`]: the stored security, subjects, subjects
+    /// state and exact lifecycle must still equal `authorized` in the same
+    /// mutation that restores.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if the row is missing or changed, or an error if
+    /// storage access fails.
+    pub async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Source,
+    ) -> StorageResult<Source> {
+        if let Some(store) = self.client.embedded_store() {
+            return store
+                .mutate(|mutation| {
+                    let Some(mut current) = mutation.get::<Source>(space_id, id, true)? else {
+                        return Err(crate::lifecycle_guard::guard_conflict("Source", id));
+                    };
+                    if !crate::lifecycle_guard::base_envelope_unchanged(
+                        &current.base,
+                        &authorized.base,
+                    ) {
+                        return Err(crate::lifecycle_guard::guard_conflict("Source", id));
+                    }
+                    current.base.deleted_at = None;
+                    current.base.updated_at = chrono::Utc::now();
+                    Ok(mutation.replace(current)?)
+                })
+                .await;
+        }
+
+        let (condition, mut bindings) =
+            crate::lifecycle_guard::base_envelope_condition(&authorized.base)?;
+        bindings.insert(
+            "id".to_string(),
+            surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(id)),
+        );
+        bindings.insert(
+            "space_id".to_string(),
+            surrealdb::sql::Value::from(space_id),
+        );
+        let mut response = self
+            .client
+            .query_bind_checked(
+                &format!(
+                    "UPDATE $id SET deleted_at = NONE, updated_at = time::now() \
+                     WHERE space_id = $space_id AND {condition} RETURN {SOURCE_PROJECTION}"
+                ),
+                bindings,
+            )
+            .await?;
+        let rows: Vec<SourceDb> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse guarded source restore: {e}"))
+        })?;
+        Source::try_from(
+            rows.into_iter()
+                .next()
+                .ok_or_else(|| crate::lifecycle_guard::guard_conflict("Source", id))?,
+        )
+    }
+
     const fn pending_graph_statuses() -> [WorkItemStatus; 4] {
         [
             WorkItemStatus::Pending,
@@ -1488,5 +1554,67 @@ mod tests {
     #[tokio::test]
     async fn test_archived_failure_blocks_graph_ready_embedded() {
         assert_archived_failure_blocks_graph_ready(setup_embedded_test_repo().await).await;
+    }
+
+    /// Guarded restore acts only on the snapshot the caller was authorized on.
+    async fn assert_restore_guarded_lifecycle(
+        repo: &SourceRepository,
+        space: &str,
+        record: Source,
+    ) {
+        let id = record.base.id.clone();
+        repo.create(record).await.unwrap();
+
+        // A fresh tombstone snapshot restores.
+        repo.delete(space, &id).await.unwrap();
+        let tombstone = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let restored = repo.restore_guarded(space, &id, &tombstone).await.unwrap();
+        assert!(restored.base.deleted_at.is_none());
+
+        // Tombstone ABA: snapshot D1, restored and deleted again as D2; the
+        // stale restore from D1 conflicts and the row stays deleted.
+        repo.delete(space, &id).await.unwrap();
+        let tombstone_d1 = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        repo.restore(space, &id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        repo.delete(space, &id).await.unwrap();
+        let result = repo.restore_guarded(space, &id, &tombstone_d1).await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+        assert!(repo.get(space, &id).await.unwrap().is_none());
+
+        // Another space never matches.
+        let tombstone_d2 = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let result = repo
+            .restore_guarded("other_space", &id, &tombstone_d2)
+            .await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_guarded_lifecycle_surreal() {
+        let repo = setup_test_repo().await;
+        assert_restore_guarded_lifecycle(
+            &repo,
+            "test_space",
+            create_test_source(SourceType::Manual, "guarded-hash"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_restore_guarded_lifecycle_embedded() {
+        let repo = setup_embedded_test_repo().await;
+        assert_restore_guarded_lifecycle(
+            &repo,
+            "test_space",
+            create_test_source(SourceType::Manual, "guarded-hash"),
+        )
+        .await;
     }
 }

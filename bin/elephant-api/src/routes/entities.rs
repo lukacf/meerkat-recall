@@ -40,6 +40,13 @@ use crate::routes::require_space_id;
 /// Entity repository interface used by the API layer.
 #[async_trait::async_trait]
 pub trait EntityRepo: Send + Sync {
+    /// Restores only if the row still matches the authorized snapshot.
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &elephant_types::RecordId,
+        authorized: &Entity,
+    ) -> StorageResult<Entity>;
     async fn create(&self, record: Entity) -> StorageResult<Entity>;
     async fn get(&self, space_id: &str, id: &RecordId) -> StorageResult<Option<Entity>>;
     async fn get_many(
@@ -97,6 +104,15 @@ pub trait EventRepo: Send + Sync {
 
 #[async_trait::async_trait]
 impl EntityRepo for EntityRepository {
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &elephant_types::RecordId,
+        authorized: &Entity,
+    ) -> StorageResult<Entity> {
+        Self::restore_guarded(self, space_id, id, authorized).await
+    }
+
     async fn create(&self, record: Entity) -> StorageResult<Entity> {
         elephant_storage::Repository::create(self, record).await
     }
@@ -1199,7 +1215,11 @@ async fn restore_entity(
                     )
                 })?;
 
-            match state.entity_repo.restore(&space_id, &rid).await {
+            match state
+                .entity_repo
+                .restore_guarded(&space_id, &rid, &existing)
+                .await
+            {
                 Ok(restored) => {
                     publish_entity_change(
                         &state,
@@ -1211,6 +1231,14 @@ async fn restore_entity(
                     .await;
                     Ok(Json(restored))
                 }
+                Err(elephant_storage::StorageError::Conflict(_)) => Err((
+                    StatusCode::CONFLICT,
+                    Json(ApiError {
+                        code: "CONFLICT".to_string(),
+                        message: "record changed since it was authorized; retry".to_string(),
+                        details: None,
+                    }),
+                )),
                 Err(e) => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiError::internal(e.to_string())),

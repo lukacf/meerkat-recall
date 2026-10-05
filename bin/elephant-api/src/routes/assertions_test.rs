@@ -895,4 +895,272 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    async fn mock_attenuated_auth(req: Request<Body>, next: Next) -> impl IntoResponse {
+        let mut req = req;
+        req.extensions_mut().insert(AuthPrincipal {
+            subject: "attenuated".to_string(),
+            space_id: Some("test_space".to_string()),
+            scopes: vec!["read:assertion".to_string(), "write:assertion".to_string()],
+            security_level: 10,
+            security_labels: vec![],
+            subject_allowlist: Some(vec![]),
+            ..AuthPrincipal::default()
+        });
+        next.run(req).await
+    }
+
+    async fn entity_search(
+        app: &Router,
+        entity_id: &str,
+        limit: usize,
+    ) -> (StatusCode, Option<AssertionSearchResponse>) {
+        let body = serde_json::json!({ "entity_id": entity_id, "limit": limit });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assertions/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).ok())
+    }
+
+    #[tokio::test]
+    async fn test_entity_filter_search_counts_only_authorized_rows() {
+        use elephant_storage::Repository;
+
+        let authz = Arc::new(AuthzService::new());
+        let repo = Arc::new(MockAssertionRepository::empty());
+        let state = Arc::new(AssertionsState::new_with_repo(repo.clone(), authz));
+        let full = assertion_routes()
+            .layer(middleware::from_fn(mock_auth))
+            .with_state(state.clone());
+        let write_only = assertion_routes()
+            .layer(middleware::from_fn(mock_write_only_auth))
+            .with_state(state.clone());
+        let attenuated = assertion_routes()
+            .layer(middleware::from_fn(mock_attenuated_auth))
+            .with_state(state);
+
+        // Five rows above the caller's clearance stored AHEAD of two visible
+        // ones (more hidden rows than limit + 1), all linked to one entity.
+        let entity = RecordId::new_v4(TableName::Entity);
+        for index in 0..7 {
+            let mut assertion = create_test_assertion(&format!("Linked {index}"), "mentions");
+            // Ordered ids: the scanner reads in id order, so the hidden rows
+            // really come first.
+            assertion.base.id = ordered_assertion_id(index);
+            assertion.subject_entity = Some(Link::new(entity.clone()));
+            if index < 5 {
+                assertion.base.security.level = 99;
+            }
+            repo.create(assertion).await.unwrap();
+        }
+        let entity_id = entity.to_string();
+
+        // Counts and has_more come from authorized rows only.
+        let (status, page) = entity_search(&full, &entity_id, 10).await;
+        assert_eq!(status, StatusCode::OK);
+        let page = page.expect("search response");
+        assert_eq!(page.results.len(), 2);
+        assert_eq!(page.total, 2);
+        assert!(!page.has_more);
+
+        let (_, page) = entity_search(&full, &entity_id, 1).await;
+        let page = page.expect("search response");
+        assert_eq!(page.results.len(), 1);
+        assert_eq!(page.total, 2);
+        assert!(page.has_more);
+
+        // Without read:assertion: refused before any lookup.
+        let (status, _) = entity_search(&write_only, &entity_id, 10).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Subject-attenuated reader: no row passes, and nothing is counted.
+        let (status, page) = entity_search(&attenuated, &entity_id, 10).await;
+        assert_eq!(status, StatusCode::OK);
+        let page = page.expect("search response");
+        assert!(page.results.is_empty());
+        assert_eq!(page.total, 0);
+        assert!(!page.has_more);
+    }
+
+    fn ordered_assertion_id(index: usize) -> RecordId {
+        use std::str::FromStr;
+        RecordId::from_str(&format!("assertion:00000000-0000-0000-0000-{index:012x}"))
+            .expect("ordered id")
+    }
+
+    #[tokio::test]
+    async fn test_entity_filter_search_pages_past_the_scan_batch() {
+        use elephant_storage::Repository;
+
+        let authz = Arc::new(AuthzService::new());
+        let repo = Arc::new(MockAssertionRepository::empty());
+        let state = Arc::new(AssertionsState::new_with_repo(repo.clone(), authz));
+        let app = assertion_routes()
+            .layer(middleware::from_fn(mock_auth))
+            .with_state(state);
+
+        // 2,050 hidden rows first (past the scanner's 2,000-row batch), then
+        // 120 visible ones, all linked to one entity.
+        let entity = RecordId::new_v4(TableName::Entity);
+        let mut visible = std::collections::BTreeSet::new();
+        for index in 0..2_170 {
+            let mut assertion = create_test_assertion(&format!("Row {index}"), "mentions");
+            assertion.base.id = ordered_assertion_id(index);
+            assertion.subject_entity = Some(Link::new(entity.clone()));
+            if index < 2_050 {
+                assertion.base.security.level = 99;
+            } else {
+                visible.insert(assertion.base.id.to_string());
+            }
+            repo.create(assertion).await.unwrap();
+        }
+
+        // Walk every page: each visible row exactly once, no hidden row,
+        // first-page total counts only authorized matches.
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        for page_number in 0..10 {
+            let mut body = serde_json::json!({ "entity_id": entity.to_string(), "limit": 50 });
+            if let Some(cursor) = &cursor {
+                body["cursor"] = serde_json::json!(cursor);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/assertions/search")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let page: AssertionSearchResponse = serde_json::from_slice(&bytes).unwrap();
+            if page_number == 0 {
+                assert_eq!(page.total, 120);
+                assert_eq!(page.results.len(), 50);
+            }
+            seen.extend(page.results.iter().map(|a| a.base.id.to_string()));
+            if !page.has_more {
+                break;
+            }
+            cursor = page.cursor;
+            assert!(cursor.is_some(), "has_more without a cursor");
+        }
+        assert_eq!(seen.len(), 120);
+        let unique: std::collections::BTreeSet<String> = seen.into_iter().collect();
+        assert_eq!(unique, visible);
+    }
+
+    #[tokio::test]
+    async fn test_combined_filters_with_subject_allowlist() {
+        use elephant_storage::Repository;
+
+        let entity_a = RecordId::new_v4(TableName::Entity);
+        let entity_b = RecordId::new_v4(TableName::Entity);
+        let source = RecordId::new_v4(TableName::Source);
+        let allowed = entity_a.clone();
+        let authz = Arc::new(AuthzService::new());
+        let repo = Arc::new(MockAssertionRepository::empty());
+        let state = Arc::new(AssertionsState::new_with_repo(repo.clone(), authz));
+        let app = assertion_routes()
+            .layer(middleware::from_fn(
+                move |mut req: Request<Body>, next: Next| {
+                    let allowed = allowed.clone();
+                    async move {
+                        req.extensions_mut().insert(AuthPrincipal {
+                            subject: "attenuated".to_string(),
+                            space_id: Some("test_space".to_string()),
+                            scopes: vec!["read:assertion".to_string()],
+                            security_level: 10,
+                            security_labels: vec![],
+                            subject_allowlist: Some(vec![allowed]),
+                            ..AuthPrincipal::default()
+                        });
+                        next.run(req).await
+                    }
+                },
+            ))
+            .with_state(state);
+
+        let make =
+            |index: usize, predicate: &str, status: ResolutionStatus, object: Option<&RecordId>| {
+                let mut assertion = create_test_assertion(&format!("Combined {index}"), predicate);
+                assertion.base.id = ordered_assertion_id(10_000 + index);
+                assertion.subject_entity = Some(Link::new(entity_a.clone()));
+                assertion.object_entity = object.map(|id| Link::new(id.clone()));
+                assertion.resolution_status = status;
+                assertion.base.provenance.sources = vec![source.clone()];
+                assertion
+            };
+        // Matching and allowed; then one each failing predicate, status, and
+        // the allowlist (object B is outside it).
+        repo.create(make(0, "mentions", ResolutionStatus::Pending, None))
+            .await
+            .unwrap();
+        repo.create(make(1, "owns", ResolutionStatus::Pending, None))
+            .await
+            .unwrap();
+        repo.create(make(2, "mentions", ResolutionStatus::Resolved, None))
+            .await
+            .unwrap();
+        repo.create(make(
+            3,
+            "mentions",
+            ResolutionStatus::Pending,
+            Some(&entity_b),
+        ))
+        .await
+        .unwrap();
+
+        let body = serde_json::json!({
+            "subject_entity": entity_a.to_string(),
+            "predicate": "mentions",
+            "status": "pending",
+            "source_id": source.to_string(),
+            "limit": 10
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assertions/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: AssertionSearchResponse = serde_json::from_slice(&bytes).unwrap();
+        let subjects: Vec<&str> = page
+            .results
+            .iter()
+            .map(|a| a.subject_text.as_str())
+            .collect();
+        assert_eq!(subjects, vec!["Combined 0"]);
+        assert_eq!(page.total, 1);
+        assert!(!page.has_more);
+    }
 }

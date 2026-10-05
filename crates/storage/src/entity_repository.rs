@@ -276,6 +276,72 @@ pub struct EntityRepository<B = SurrealStorageBackend> {
 }
 
 impl EntityRepository {
+    /// Restores a entity only if it is unchanged since `authorized`, the row
+    /// the caller's authorization was decided on.
+    ///
+    /// See [`crate::lifecycle_guard`]: the stored security, subjects, subjects
+    /// state and exact lifecycle must still equal `authorized` in the same
+    /// mutation that restores.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if the row is missing or changed, or an error if
+    /// storage access fails.
+    pub async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Entity,
+    ) -> StorageResult<Entity> {
+        if let Some(store) = self.backend.embedded_store() {
+            return store
+                .mutate(|mutation| {
+                    let Some(mut current) = mutation.get::<Entity>(space_id, id, true)? else {
+                        return Err(crate::lifecycle_guard::guard_conflict("Entity", id));
+                    };
+                    if !crate::lifecycle_guard::base_envelope_unchanged(
+                        &current.base,
+                        &authorized.base,
+                    ) {
+                        return Err(crate::lifecycle_guard::guard_conflict("Entity", id));
+                    }
+                    current.base.deleted_at = None;
+                    current.base.updated_at = chrono::Utc::now();
+                    Ok(mutation.replace(current)?)
+                })
+                .await;
+        }
+
+        let (condition, mut bindings) =
+            crate::lifecycle_guard::base_envelope_condition(&authorized.base)?;
+        bindings.insert(
+            "id".to_string(),
+            surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(id)),
+        );
+        bindings.insert(
+            "space_id".to_string(),
+            surrealdb::sql::Value::from(space_id),
+        );
+        let mut response = self
+            .backend
+            .query_bind_checked(
+                &format!(
+                    "UPDATE $id SET deleted_at = NONE, updated_at = time::now() \
+                     WHERE space_id = $space_id AND {condition} RETURN {ENTITY_PROJECTION}"
+                ),
+                bindings,
+            )
+            .await?;
+        let rows: Vec<EntityDb> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse guarded entity restore: {e}"))
+        })?;
+        Entity::try_from(
+            rows.into_iter()
+                .next()
+                .ok_or_else(|| crate::lifecycle_guard::guard_conflict("Entity", id))?,
+        )
+    }
+
     /// Creates a new entity repository.
     #[must_use]
     pub const fn new(client: StorageClient) -> Self {
@@ -2893,5 +2959,72 @@ mod tests {
     async fn test_embedded_name_embedding_roundtrip() {
         let repo = setup_embedded_test_repo().await;
         assert_name_embedding_roundtrip(&repo).await;
+    }
+
+    /// Guarded restore acts only on the snapshot the caller was authorized on.
+    async fn assert_restore_guarded_lifecycle(
+        repo: &EntityRepository,
+        space: &str,
+        record: Entity,
+    ) {
+        let id = record.base.id.clone();
+        repo.create(record).await.unwrap();
+
+        // A fresh tombstone snapshot restores.
+        repo.delete(space, &id).await.unwrap();
+        let tombstone = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let restored = repo.restore_guarded(space, &id, &tombstone).await.unwrap();
+        assert!(restored.base.deleted_at.is_none());
+
+        // Tombstone ABA: snapshot D1, restored and deleted again as D2; the
+        // stale restore from D1 conflicts and the row stays deleted.
+        repo.delete(space, &id).await.unwrap();
+        let tombstone_d1 = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        repo.restore(space, &id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        repo.delete(space, &id).await.unwrap();
+        let result = repo.restore_guarded(space, &id, &tombstone_d1).await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+        assert!(repo.get(space, &id).await.unwrap().is_none());
+
+        // Another space never matches.
+        let tombstone_d2 = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let result = repo
+            .restore_guarded("other_space", &id, &tombstone_d2)
+            .await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+
+        // Reclassified after an active snapshot: the guarded restore conflicts
+        // and the stricter row is untouched.
+        repo.restore(space, &id).await.unwrap();
+        let snapshot = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let mut stricter = snapshot.clone();
+        stricter.base.security.level = 5;
+        repo.update(space, &id, stricter).await.unwrap();
+        let result = repo.restore_guarded(space, &id, &snapshot).await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+        let current = repo.get(space, &id).await.unwrap().expect("active");
+        assert_eq!(current.base.security.level, 5);
+    }
+
+    #[tokio::test]
+    async fn test_restore_guarded_lifecycle_surreal() {
+        let repo = setup_test_repo().await;
+        assert_restore_guarded_lifecycle(&repo, "test_space", create_test_entity("Guarded")).await;
+    }
+
+    #[tokio::test]
+    async fn test_restore_guarded_lifecycle_embedded() {
+        let repo = setup_embedded_test_repo().await;
+        assert_restore_guarded_lifecycle(&repo, "test_space", create_test_entity("Guarded")).await;
     }
 }

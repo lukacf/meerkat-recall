@@ -46,6 +46,13 @@ pub struct TimelineState {
 /// Timeline event repository interface used by the API layer.
 #[async_trait::async_trait]
 pub trait TimelineEventRepo: Send + Sync {
+    /// Restores only if the row still matches the authorized snapshot.
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &elephant_types::RecordId,
+        authorized: &Event,
+    ) -> StorageResult<Event>;
     async fn create(&self, record: Event) -> StorageResult<Event>;
     async fn get(&self, space_id: &str, id: &RecordId) -> StorageResult<Option<Event>>;
     async fn update(&self, space_id: &str, id: &RecordId, record: Event) -> StorageResult<Event>;
@@ -70,6 +77,15 @@ pub trait TimelineEventRepo: Send + Sync {
 
 #[async_trait::async_trait]
 impl TimelineEventRepo for EventRepository {
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &elephant_types::RecordId,
+        authorized: &Event,
+    ) -> StorageResult<Event> {
+        Self::restore_guarded(self, space_id, id, authorized).await
+    }
+
     async fn create(&self, record: Event) -> StorageResult<Event> {
         Repository::create(self, record).await
     }
@@ -123,6 +139,24 @@ impl TimelineEventRepo for EventRepository {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl TimelineEventRepo for MockEventRepository {
+    async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &elephant_types::RecordId,
+        authorized: &Event,
+    ) -> StorageResult<Event> {
+        let current = Self::get_with_deleted(self, space_id, id).await?;
+        let unchanged = current.is_some_and(|current| {
+            elephant_storage::base_envelope_unchanged(&current.base, &authorized.base)
+        });
+        if !unchanged {
+            return Err(elephant_storage::StorageError::Conflict(format!(
+                "Event changed since it was authorized: {id}"
+            )));
+        }
+        Self::restore(self, space_id, id).await
+    }
+
     async fn create(&self, record: Event) -> StorageResult<Event> {
         Repository::create(self, record).await
     }
@@ -523,8 +557,20 @@ async fn restore_event(
             authorize_event(state.as_ref(), &principal, &existing, "read:event")
                 .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
 
-            match state.event_repo.restore(&space_id, &rid).await {
+            match state
+                .event_repo
+                .restore_guarded(&space_id, &rid, &existing)
+                .await
+            {
                 Ok(restored) => Ok(Json(restored)),
+                Err(elephant_storage::StorageError::Conflict(_)) => Err((
+                    StatusCode::CONFLICT,
+                    Json(ApiError {
+                        code: "CONFLICT".to_string(),
+                        message: "record changed since it was authorized; retry".to_string(),
+                        details: None,
+                    }),
+                )),
                 Err(e) => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiError::internal(e.to_string())),

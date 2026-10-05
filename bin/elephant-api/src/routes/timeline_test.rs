@@ -93,6 +93,17 @@ mod tests {
             ))
         }
 
+        async fn restore_guarded(
+            &self,
+            _space_id: &str,
+            _id: &elephant_types::RecordId,
+            _authorized: &Event,
+        ) -> StorageResult<Event> {
+            Err(StorageError::QueryError(
+                "injected restore failure".to_string(),
+            ))
+        }
+
         async fn create(&self, _record: Event) -> StorageResult<Event> {
             Err(StorageError::QueryError(
                 "injected create failure".to_string(),

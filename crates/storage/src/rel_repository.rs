@@ -183,6 +183,88 @@ pub struct RelRepository {
 }
 
 impl RelRepository {
+    /// Restores a relationship only if it is unchanged since `authorized`, the row
+    /// the caller's authorization was decided on.
+    ///
+    /// See [`crate::lifecycle_guard`]: the stored security, subjects, subjects
+    /// state and exact lifecycle must still equal `authorized` in the same
+    /// mutation that restores, and so must its subject and object endpoints (a
+    /// hard delete and re-create can reuse the ID with other endpoints).
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if the row is missing or changed, or an error if
+    /// storage access fails.
+    pub async fn restore_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Rel,
+    ) -> StorageResult<Rel> {
+        if let Some(store) = self.client.embedded_store() {
+            return store
+                .mutate(|mutation| {
+                    let Some(mut current) = mutation.get::<Rel>(space_id, id, true)? else {
+                        return Err(crate::lifecycle_guard::guard_conflict("Rel", id));
+                    };
+                    if !crate::lifecycle_guard::base_envelope_unchanged(
+                        &current.base,
+                        &authorized.base,
+                    ) || current.subject != authorized.subject
+                        || current.object != authorized.object
+                    {
+                        return Err(crate::lifecycle_guard::guard_conflict("Rel", id));
+                    }
+                    current.base.deleted_at = None;
+                    current.base.updated_at = chrono::Utc::now();
+                    Ok(mutation.replace(current)?)
+                })
+                .await;
+        }
+
+        let (condition, mut bindings) =
+            crate::lifecycle_guard::base_envelope_condition(&authorized.base)?;
+        bindings.insert(
+            "id".to_string(),
+            surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(id)),
+        );
+        bindings.insert(
+            "space_id".to_string(),
+            surrealdb::sql::Value::from(space_id),
+        );
+        bindings.insert(
+            "guard_subject".to_string(),
+            surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(
+                authorized.subject.id(),
+            )),
+        );
+        bindings.insert(
+            "guard_object".to_string(),
+            surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(
+                authorized.object.id(),
+            )),
+        );
+        let mut response = self
+            .client
+            .query_bind_checked(
+                &format!(
+                    "UPDATE $id SET deleted_at = NONE, updated_at = time::now() \
+                     WHERE space_id = $space_id AND {condition} \
+                     AND `in` = $guard_subject AND `out` = $guard_object RETURN {REL_PROJECTION}"
+                ),
+                bindings,
+            )
+            .await?;
+        let rows: Vec<RelDb> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse guarded relationship restore: {e}"))
+        })?;
+        Rel::try_from(
+            rows.into_iter()
+                .next()
+                .ok_or_else(|| crate::lifecycle_guard::guard_conflict("Rel", id))?,
+        )
+    }
+
     /// Creates a new relationship repository.
     #[must_use]
     pub const fn new(client: StorageClient) -> Self {
@@ -1772,5 +1854,95 @@ mod tests {
         let count = repo.repoint_entity(&old_entity, &new_entity).await.unwrap();
 
         assert_eq!(count, 0, "Should not repoint deleted relationships");
+    }
+
+    /// Guarded restore acts only on the snapshot the caller was authorized on.
+    async fn assert_restore_guarded_lifecycle(repo: &RelRepository, space: &str, record: Rel) {
+        let id = record.base.id.clone();
+        repo.create(record).await.unwrap();
+
+        // A fresh tombstone snapshot restores.
+        repo.delete(space, &id).await.unwrap();
+        let tombstone = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let restored = repo.restore_guarded(space, &id, &tombstone).await.unwrap();
+        assert!(restored.base.deleted_at.is_none());
+
+        // Tombstone ABA: snapshot D1, restored and deleted again as D2; the
+        // stale restore from D1 conflicts and the row stays deleted.
+        repo.delete(space, &id).await.unwrap();
+        let tombstone_d1 = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        repo.restore(space, &id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        repo.delete(space, &id).await.unwrap();
+        let result = repo.restore_guarded(space, &id, &tombstone_d1).await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+        assert!(repo.get(space, &id).await.unwrap().is_none());
+
+        // Another space never matches.
+        let tombstone_d2 = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let result = repo
+            .restore_guarded("other_space", &id, &tombstone_d2)
+            .await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+    }
+
+    /// A row re-created under the same ID with other endpoints is not the
+    /// authorized row, even when its envelope and lifecycle are identical.
+    async fn assert_restore_guarded_endpoints(repo: &RelRepository, space: &str) {
+        let subject = RecordId::new_v4(TableName::Entity);
+        let object = RecordId::new_v4(TableName::Entity);
+        let record = create_test_rel_with_entities("works_at", subject.clone(), object.clone());
+        let id = record.base.id.clone();
+        let authorized = repo.create(record.clone()).await.unwrap();
+
+        for (new_subject, new_object) in [
+            (subject.clone(), RecordId::new_v4(TableName::Entity)),
+            (RecordId::new_v4(TableName::Entity), object.clone()),
+        ] {
+            repo.hard_delete(space, &id).await.unwrap();
+            let mut replacement =
+                create_test_rel_with_entities("works_at", new_subject.clone(), new_object.clone());
+            replacement.base = record.base.clone();
+            repo.create(replacement).await.unwrap();
+
+            let result = repo.restore_guarded(space, &id, &authorized).await;
+            assert!(
+                matches!(result, Err(StorageError::Conflict(_))),
+                "{result:?}"
+            );
+            let stored = repo.get(space, &id).await.unwrap().unwrap();
+            assert_eq!(stored.subject.id(), &new_subject);
+            assert_eq!(stored.object.id(), &new_object);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_guarded_endpoints_surreal() {
+        let repo = setup_test_repo().await;
+        assert_restore_guarded_endpoints(&repo, "test_space").await;
+    }
+
+    #[tokio::test]
+    async fn test_restore_guarded_endpoints_embedded() {
+        let repo = RelRepository::new(StorageClient::new_embedded().await.unwrap());
+        assert_restore_guarded_endpoints(&repo, "test_space").await;
+    }
+
+    #[tokio::test]
+    async fn test_restore_guarded_lifecycle_surreal() {
+        let repo = setup_test_repo().await;
+        assert_restore_guarded_lifecycle(&repo, "test_space", create_test_rel("works_at")).await;
+    }
+
+    #[tokio::test]
+    async fn test_restore_guarded_lifecycle_embedded() {
+        let repo = RelRepository::new(StorageClient::new_embedded().await.unwrap());
+        assert_restore_guarded_lifecycle(&repo, "test_space", create_test_rel("works_at")).await;
     }
 }

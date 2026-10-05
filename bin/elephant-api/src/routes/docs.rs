@@ -2122,8 +2122,20 @@ async fn restore_doc(
                     )
                 })?;
 
-            match state.doc_repo.restore(&space_id, &rid).await {
+            match state
+                .doc_repo
+                .restore_guarded(&space_id, &rid, &existing)
+                .await
+            {
                 Ok(restored) => Ok(Json(restored)),
+                Err(elephant_storage::StorageError::Conflict(_)) => Err((
+                    StatusCode::CONFLICT,
+                    Json(ApiError {
+                        code: "CONFLICT".to_string(),
+                        message: "record changed since it was authorized; retry".to_string(),
+                        details: None,
+                    }),
+                )),
                 Err(e) => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiError::internal(e.to_string())),

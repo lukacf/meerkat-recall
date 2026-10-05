@@ -7365,12 +7365,12 @@ const EMBED_PROGRESS_REPORT_INTERVAL: std::time::Duration = std::time::Duration:
 /// Logs one space's embedding progress for the operator.
 ///
 /// Counts are derived from space content, so they go to the server log under
-/// the `elephant::embedding_progress` target, never to an API. Enable them
-/// with `RUST_LOG=...,elephant::embedding_progress=info`; while the target is
-/// disabled the loop never runs the count.
+/// the `elephant::embedding_progress` target at debug, never to an API. Opt in
+/// with `RUST_LOG=...,elephant::embedding_progress=debug`; the default `info`
+/// filter leaves it off, and while it is off the loop never runs the count.
 async fn report_embedding_progress(node_repo: &DocNodeRepository, space_id: &str, model: &str) {
     match node_repo.count_embedding_progress(space_id).await {
-        Ok(counts) => info!(
+        Ok(counts) => tracing::debug!(
             target: "elephant::embedding_progress",
             space_id,
             pending = counts.pending,
@@ -7410,8 +7410,9 @@ async fn run_embed_loop(
                 let spaces = doc_repo.get_all_spaces().await.unwrap_or_else(|_| vec!["default".to_string()]);
                 let spaces = if spaces.is_empty() { vec!["default".to_string()] } else { spaces };
                 // The count walks doc_node: only pay for it when the operator
-                // has enabled the progress target.
-                let report_progress = tracing::enabled!(target: "elephant::embedding_progress", Level::INFO)
+                // opted in to the debug progress target (off under the default
+                // `info` filter).
+                let report_progress = tracing::enabled!(target: "elephant::embedding_progress", Level::DEBUG)
                     && last_progress_report
                         .is_none_or(|at| at.elapsed() >= EMBED_PROGRESS_REPORT_INTERVAL);
                 if report_progress {

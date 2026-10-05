@@ -918,4 +918,112 @@ mod tests {
             "Should find the created entity via search"
         );
     }
+
+    async fn mock_write_only_auth(req: Request<Body>, next: Next) -> impl IntoResponse {
+        let mut req = req;
+        req.extensions_mut().insert(AuthPrincipal {
+            subject: "write-only".to_string(),
+            space_id: Some("test_space".to_string()),
+            scopes: vec!["write:entity".to_string()],
+            security_level: 10,
+            security_labels: vec![],
+            ..AuthPrincipal::default()
+        });
+        next.run(req).await
+    }
+
+    #[tokio::test]
+    async fn test_restore_entity_requires_read_authorization() {
+        let authz = Arc::new(AuthzService::new());
+        let entity_repo = Arc::new(EntityRepository::new(
+            StorageClient::new_embedded().await.unwrap(),
+        ));
+        let state = Arc::new(EntitiesState::new_with_repos(
+            entity_repo,
+            Arc::new(MockRelRepository::empty()),
+            Arc::new(NoopEventRepo),
+            authz,
+        ));
+        let full = entity_routes()
+            .layer(middleware::from_fn(mock_auth))
+            .with_state(state.clone());
+        let write_only = entity_routes()
+            .layer(middleware::from_fn(mock_write_only_auth))
+            .with_state(state);
+        let send = |method: &str, uri: String, body: Body| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap()
+        };
+
+        let deleted = create_test_entity("Private Fixture");
+        let deleted_id = deleted.base.id.to_string();
+        let active = create_test_entity("Private Fixture Active");
+        let active_id = active.base.id.to_string();
+        for record in [
+            serde_json::to_string(&deleted).unwrap(),
+            serde_json::to_string(&active).unwrap(),
+        ] {
+            let created = full
+                .clone()
+                .oneshot(send("POST", "/v1/entities".to_string(), Body::from(record)))
+                .await
+                .unwrap();
+            assert!(created.status().is_success());
+        }
+        let removed = full
+            .clone()
+            .oneshot(send(
+                "DELETE",
+                format!("/v1/entities/{deleted_id}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(removed.status().is_success());
+
+        // Write scope alone must neither restore nor disclose, deleted or active.
+        for id in [&deleted_id, &active_id] {
+            let response = write_only
+                .clone()
+                .oneshot(send(
+                    "POST",
+                    format!("/v1/entities/{id}/restore"),
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains("Private Fixture"));
+        }
+
+        // No side effect: the deleted row is still deleted.
+        let still_deleted = full
+            .clone()
+            .oneshot(send(
+                "GET",
+                format!("/v1/entities/{deleted_id}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(still_deleted.status(), StatusCode::NOT_FOUND);
+
+        // Positive control: read and write together restore it.
+        let restored = full
+            .oneshot(send(
+                "POST",
+                format!("/v1/entities/{deleted_id}/restore"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(restored.status(), StatusCode::OK);
+    }
 }

@@ -1184,6 +1184,20 @@ async fn restore_entity(
                         }),
                     )
                 })?;
+            // The response carries the restored record, so read is required too.
+            state
+                .authz
+                .authorize_record_read(&principal, &existing, "read:entity")
+                .map_err(|e| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(ApiError {
+                            code: e.code,
+                            message: e.message,
+                            details: None,
+                        }),
+                    )
+                })?;
 
             match state.entity_repo.restore(&space_id, &rid).await {
                 Ok(restored) => {

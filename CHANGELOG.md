@@ -88,6 +88,8 @@ does not by itself establish a published release.
 - Document paragraph and section spans preserve original byte offsets across
   LF and CRLF line endings, preventing misplaced evidence and UTF-8 slicing
   panics during document-tree construction.
+- Fixed-size chunks and sentence-free fallback chunks keep UTF-8 characters
+  intact at chunk and overlap boundaries while preserving complete coverage.
 - Document semantic search uses partitioned vector candidates and blends
   lexical and semantic ranks. Assertion text search uses indexed candidates.
 - Document semantic search loads vector-hit nodes, revisions, and documents

@@ -1574,9 +1574,10 @@ pub async fn execute_embed_chunks<P: EmbeddingProvider>(
 
 /// Splits text into chunks with overlap.
 ///
-/// Returns a vector of (start, end) byte offsets.
+/// Returns a vector of (start, end) byte offsets on UTF-8 character boundaries.
+/// A single character may exceed the byte budget rather than being split.
 fn split_text_into_chunks(text: &str, max_size: usize, overlap: usize) -> Vec<(u32, u32)> {
-    if text.is_empty() {
+    if text.is_empty() || max_size == 0 {
         return vec![];
     }
 
@@ -1586,14 +1587,24 @@ fn split_text_into_chunks(text: &str, max_size: usize, overlap: usize) -> Vec<(u
     }
 
     let mut chunks = Vec::new();
-    let mut start = 0;
+    let mut start = 0usize;
 
     while start < text_len {
-        let end = (start + max_size).min(text_len);
+        let end = text.floor_char_boundary(start.saturating_add(max_size).min(text_len));
+        let end = if end == start {
+            text.ceil_char_boundary(start + 1)
+        } else {
+            end
+        };
 
         // Try to break at a word boundary
         let actual_end = if end < text_len {
-            find_word_boundary(text, end)
+            let word_end = find_word_boundary(text, end);
+            if word_end > start {
+                word_end
+            } else {
+                end
+            }
         } else {
             end
         };
@@ -1604,16 +1615,12 @@ fn split_text_into_chunks(text: &str, max_size: usize, overlap: usize) -> Vec<(u
             break;
         }
 
-        // Calculate next start with overlap
-        let next_start = if actual_end > overlap {
-            actual_end - overlap
-        } else {
-            actual_end
-        };
+        // Round overlap forward so it cannot begin inside a UTF-8 character.
+        let next_start = text.ceil_char_boundary(actual_end.saturating_sub(overlap));
 
-        // Ensure we always make progress
+        // Even an overlap larger than the chunk must advance by one character.
         start = if next_start <= start {
-            start + 1
+            text.ceil_char_boundary(start + 1)
         } else {
             next_start
         };
@@ -1878,6 +1885,47 @@ mod tests {
         let chunks = split_text_into_chunks("Hello", 100, 20);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], (0, 5));
+    }
+
+    #[test]
+    fn test_split_text_into_chunks_unicode_targets_and_overlap() {
+        assert_eq!(
+            split_text_into_chunks("a\u{e9}b", 2, 0),
+            vec![(0, 1), (1, 3), (3, 4)]
+        );
+        assert_eq!(
+            split_text_into_chunks("ab\u{e9} cd", 5, 2),
+            vec![(0, 5), (4, 7)]
+        );
+        assert!(split_text_into_chunks("\u{732b}", 0, 0).is_empty());
+    }
+
+    #[test]
+    fn test_fixed_and_semantic_fallback_chunks_preserve_unicode_coverage() {
+        let ascii = format!("a {}", "b".repeat(80));
+        for text in ["a\u{e9}\u{732b}\u{1f642} \t\r\nb\u{732b}", ascii.as_str()] {
+            for max_size in [1, 2, 3, 4, 5, 8, usize::MAX] {
+                for overlap in [0, 1, 2, 7, usize::MAX] {
+                    for chunks in [
+                        split_text_into_chunks(text, max_size, overlap),
+                        semantic_split_text(text, max_size, overlap),
+                    ] {
+                        assert_eq!(chunks.first().unwrap().0, 0);
+                        assert_eq!(chunks.last().unwrap().1 as usize, text.len());
+                        assert!(chunks.len() <= text.chars().count());
+                        for &(start, end) in &chunks {
+                            assert!(start < end);
+                            assert!(text.get(start as usize..end as usize).is_some());
+                        }
+                        for pair in chunks.windows(2) {
+                            assert!(pair[1].0 > pair[0].0, "starts must advance");
+                            assert!(pair[1].0 <= pair[0].1, "coverage must not have gaps");
+                            assert!(pair[1].1 >= pair[0].1, "ends must not move backward");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2147,6 +2195,44 @@ mod tests {
 
         assert!(tree_result.nodes_created >= 2); // root + at least 1 chunk
         assert!(tree_result.chunk_nodes >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_build_doc_tree_default_unicode_fallback_spans() {
+        let storage = StorageClient::new_memory().await.expect("storage");
+        let text = "\u{732b}".repeat(400);
+        let doc = make_doc(&text);
+        let mut registry = RendererRegistry::new();
+        registry.register(Box::new(PassthroughRenderer::new()));
+        let rendered = execute_render_doc(&storage, &registry, &doc, Some("text/plain"))
+            .await
+            .expect("render");
+        let config = DocTreeConfig::default();
+
+        let result = execute_build_doc_tree(&storage, &rendered.revision_id, &config)
+            .await
+            .expect("build tree");
+        let mut chunks = DocNodeRepository::new(storage)
+            .find_chunks_by_revision(&rendered.revision_id)
+            .await
+            .expect("stored chunks");
+        chunks.sort_by_key(|node| node.span.start);
+
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.len(), result.chunk_nodes);
+        assert_eq!(chunks.first().unwrap().span.start, 0);
+        assert_eq!(chunks.last().unwrap().span.end as usize, text.len());
+        for chunk in &chunks {
+            let excerpt = text
+                .get(chunk.span.start as usize..chunk.span.end as usize)
+                .expect("stored span must align with original UTF-8 text");
+            assert!(!excerpt.is_empty());
+            assert!(excerpt.len() <= config.max_chunk_size);
+        }
+        for pair in chunks.windows(2) {
+            assert!(pair[1].span.start > pair[0].span.start);
+            assert!(pair[1].span.start <= pair[0].span.end);
+        }
     }
 
     #[tokio::test]

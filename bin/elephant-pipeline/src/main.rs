@@ -7366,7 +7366,8 @@ const EMBED_PROGRESS_REPORT_INTERVAL: std::time::Duration = std::time::Duration:
 ///
 /// Counts are derived from space content, so they go to the server log under
 /// the `elephant::embedding_progress` target, never to an API. Enable them
-/// with `RUST_LOG=...,elephant::embedding_progress=info`.
+/// with `RUST_LOG=...,elephant::embedding_progress=info`; while the target is
+/// disabled the loop never runs the count.
 async fn report_embedding_progress(node_repo: &DocNodeRepository, space_id: &str, model: &str) {
     match node_repo.count_embedding_progress(space_id).await {
         Ok(counts) => info!(
@@ -7408,8 +7409,11 @@ async fn run_embed_loop(
             () = tokio::time::sleep(embed_config.poll_interval()) => {
                 let spaces = doc_repo.get_all_spaces().await.unwrap_or_else(|_| vec!["default".to_string()]);
                 let spaces = if spaces.is_empty() { vec!["default".to_string()] } else { spaces };
-                let report_progress = last_progress_report
-                    .is_none_or(|at| at.elapsed() >= EMBED_PROGRESS_REPORT_INTERVAL);
+                // The count walks doc_node: only pay for it when the operator
+                // has enabled the progress target.
+                let report_progress = tracing::enabled!(target: "elephant::embedding_progress", Level::INFO)
+                    && last_progress_report
+                        .is_none_or(|at| at.elapsed() >= EMBED_PROGRESS_REPORT_INTERVAL);
                 if report_progress {
                     last_progress_report = Some(std::time::Instant::now());
                 }

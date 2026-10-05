@@ -233,6 +233,43 @@ pub struct ConveyorStatus {
     /// Machine-readable cause when `blocked`, e.g. `budget_exhausted:graph`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    /// Embedding progress of the default space, from a background count
+    /// refreshed at most every [`EMBEDDING_PROGRESS_TTL`]. `None` until the
+    /// first count completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<EmbeddingProgress>,
+}
+
+/// How many embeddable nodes are embedded and how many still wait.
+///
+/// `pending_nodes + embedded_nodes == embeddable_nodes`; `counted_at` says how
+/// old the numbers are. Two readings minutes apart show whether embedding is
+/// moving.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingProgress {
+    /// Space the counts are for.
+    pub space_id: String,
+    /// Embeddable nodes still waiting for an embedding.
+    pub pending_nodes: usize,
+    /// Embeddable nodes that have one.
+    pub embedded_nodes: usize,
+    /// The denominator: pending plus embedded.
+    pub embeddable_nodes: usize,
+    /// When the counts were taken (RFC 3339, UTC).
+    pub counted_at: String,
+}
+
+/// How often the embedding progress counts are recomputed.
+///
+/// Counting walks the whole `doc_node` table, so it runs in a background task
+/// and status calls only ever read the last result.
+const EMBEDDING_PROGRESS_TTL: Duration = Duration::from_secs(300);
+
+/// Last embedding progress count, plus a flag so only one count runs at a time.
+#[derive(Debug, Default)]
+struct EmbeddingProgressCache {
+    latest: StdArc<StdMutex<Option<(std::time::Instant, EmbeddingProgress)>>>,
+    refreshing: StdArc<AtomicBool>,
 }
 
 /// Decides whether a stalled conveyor is a fault, and names the cause.
@@ -451,6 +488,8 @@ pub struct RuntimeManager {
     readiness_refresh: Mutex<()>,
     /// Last computed conveyor status and when. See [`CONVEYOR_STATUS_TTL`].
     conveyor_cache: Mutex<Option<(std::time::Instant, ConveyorStatus)>>,
+    /// Background embedding progress count. See [`EMBEDDING_PROGRESS_TTL`].
+    embedding_progress: EmbeddingProgressCache,
 }
 
 /// How long a computed conveyor status is reused.
@@ -520,6 +559,7 @@ impl RuntimeManager {
             reconfigure: Mutex::new(()),
             readiness_refresh: Mutex::new(()),
             conveyor_cache: Mutex::new(None),
+            embedding_progress: EmbeddingProgressCache::default(),
         })
     }
 
@@ -565,6 +605,7 @@ impl RuntimeManager {
             reconfigure: Mutex::new(()),
             readiness_refresh: Mutex::new(()),
             conveyor_cache: Mutex::new(None),
+            embedding_progress: EmbeddingProgressCache::default(),
         }
     }
 
@@ -593,7 +634,7 @@ impl RuntimeManager {
         // stays alive and ready while no work moves, which is exactly how the
         // 2026-07-30 budget stall went unnoticed for the better part of an hour
         // until someone happened to be counting assertions by hand.
-        if let Some(conveyor) = self.cached_conveyor_status().await {
+        if let Some(mut conveyor) = self.cached_conveyor_status().await {
             if conveyor.blocked {
                 let issue = conveyor.blocked_reason.clone().map_or_else(
                     || "conveyor_blocked".to_string(),
@@ -603,10 +644,54 @@ impl RuntimeManager {
                     status.issues.push(issue);
                 }
             }
+            conveyor.embedding = self.embedding_progress().await;
             status.conveyor = Some(conveyor);
         }
 
         status
+    }
+
+    /// The last embedding progress count, starting a background recount when
+    /// it is missing or older than [`EMBEDDING_PROGRESS_TTL`]. Never waits for
+    /// the count itself.
+    async fn embedding_progress(&self) -> Option<EmbeddingProgress> {
+        let cache = &self.embedding_progress;
+        let latest = cache.latest.lock().ok().and_then(|guard| guard.clone());
+        let stale = latest
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= EMBEDDING_PROGRESS_TTL);
+        let progress = latest.map(|(_, progress)| progress);
+        if !stale || cache.refreshing.swap(true, Ordering::AcqRel) {
+            return progress;
+        }
+        let storage = self.inner.read().await.storage.clone();
+        let Some(storage) = storage else {
+            cache.refreshing.store(false, Ordering::Release);
+            return progress;
+        };
+        let slot = StdArc::clone(&cache.latest);
+        let refreshing = StdArc::clone(&cache.refreshing);
+        let space_id = std::env::var("MCP_SPACE_ID").unwrap_or_else(|_| "default".to_string());
+        tokio::spawn(async move {
+            let repo = elephant_storage::DocNodeRepository::new(storage);
+            match repo.count_embedding_progress(&space_id).await {
+                Ok(counts) => {
+                    let fresh = EmbeddingProgress {
+                        space_id,
+                        pending_nodes: counts.pending,
+                        embedded_nodes: counts.embedded,
+                        embeddable_nodes: counts.pending + counts.embedded,
+                        counted_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    if let Ok(mut guard) = slot.lock() {
+                        *guard = Some((std::time::Instant::now(), fresh));
+                    }
+                }
+                Err(err) => warn!("Embedding progress count failed: {err}"),
+            }
+            refreshing.store(false, Ordering::Release);
+        });
+        progress
     }
 
     /// The conveyor status, recomputed at most once per TTL.
@@ -665,6 +750,7 @@ impl RuntimeManager {
             remaining_euros_graph: snapshot.remaining_euros_graph,
             blocked: blocked_reason.is_some(),
             blocked_reason,
+            embedding: None,
         })
     }
 
@@ -1705,6 +1791,7 @@ mod tests {
             reconfigure: tokio::sync::Mutex::new(()),
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
+            embedding_progress: EmbeddingProgressCache::default(),
         };
         env::set_var("SURREALDB_QUERY_TIMEOUT_SECS", "31");
         let patch: RuntimeConfigPatch = serde_json::from_value(serde_json::json!({
@@ -2029,6 +2116,7 @@ mod tests {
             reconfigure: tokio::sync::Mutex::new(()),
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
+            embedding_progress: EmbeddingProgressCache::default(),
         };
 
         runtime
@@ -2147,6 +2235,7 @@ mod tests {
             reconfigure: tokio::sync::Mutex::new(()),
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
+            embedding_progress: EmbeddingProgressCache::default(),
         };
 
         let attempts = StdArc::new(AtomicUsize::new(0));
@@ -2206,6 +2295,7 @@ mod tests {
             reconfigure: tokio::sync::Mutex::new(()),
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
+            embedding_progress: EmbeddingProgressCache::default(),
         };
 
         let attempts = StdArc::new(AtomicUsize::new(0));
@@ -2281,6 +2371,7 @@ mod tests {
             reconfigure: tokio::sync::Mutex::new(()),
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
+            embedding_progress: EmbeddingProgressCache::default(),
         };
 
         let refreshed = runtime
@@ -2718,6 +2809,7 @@ mod tests {
             reconfigure: tokio::sync::Mutex::new(()),
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
+            embedding_progress: EmbeddingProgressCache::default(),
         }
     }
 

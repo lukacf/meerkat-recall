@@ -127,7 +127,7 @@ pub use assertion_repository::AssertionRepository;
 pub use attribute_repository::AttributeRepository;
 pub use conflict_group_repository::ConflictGroupRepository;
 pub use cost_ledger_daily_repository::CostLedgerDailyRepository;
-pub use doc_node_repository::DocNodeRepository;
+pub use doc_node_repository::{DocNodeRepository, EmbeddingProgressCounts};
 pub use doc_revision_repository::DocRevisionRepository;
 pub use freshness_repository::FreshnessRepository;
 pub use ingest_decision_repository::IngestDecisionRepository;

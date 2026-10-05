@@ -132,6 +132,16 @@ impl TryFrom<DocNodeDb> for DocNode {
     }
 }
 
+/// Embedding progress of one space, from
+/// [`DocNodeRepository::count_embedding_progress`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbeddingProgressCounts {
+    /// Embeddable nodes still waiting for an embedding.
+    pub pending: usize,
+    /// Embeddable nodes that have one.
+    pub embedded: usize,
+}
+
 /// Document node repository for `SurrealDB`.
 #[derive(Clone, Debug)]
 pub struct DocNodeRepository {
@@ -449,6 +459,72 @@ impl DocNodeRepository {
         // Reverse so it goes root → ... → immediate parent
         chain.reverse();
         Ok(chain)
+    }
+
+    /// Embeddable nodes (`chunk`, `paragraph`, `summary`, not deleted) in a
+    /// space, split into those still waiting for an embedding and those that
+    /// have one. The pending side uses the same predicate as
+    /// [`Self::find_pending_embedding`].
+    ///
+    /// Counts the whole table: call it from a background refresh, never per
+    /// request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either count query fails.
+    pub async fn count_embedding_progress(
+        &self,
+        space_id: &str,
+    ) -> StorageResult<EmbeddingProgressCounts> {
+        #[derive(Deserialize)]
+        struct CountRow {
+            total: usize,
+        }
+
+        if let Some(store) = self.client.embedded_store() {
+            let mut counts = EmbeddingProgressCounts::default();
+            for item in store.scan::<DocNode>().await? {
+                if item.base.space_id != space_id
+                    || item.base.deleted_at.is_some()
+                    || !matches!(
+                        item.role,
+                        NodeRole::Chunk | NodeRole::Paragraph | NodeRole::Summary
+                    )
+                {
+                    continue;
+                }
+                if item.embedding_model.is_none() {
+                    counts.pending += 1;
+                } else {
+                    counts.embedded += 1;
+                }
+            }
+            return Ok(counts);
+        }
+
+        let mut counts = EmbeddingProgressCounts::default();
+        for (pending, slot) in [(true, &mut counts.pending), (false, &mut counts.embedded)] {
+            let model_filter = if pending { "IS NONE" } else { "IS NOT NONE" };
+            let mut response = self
+                .client
+                .query_bind(
+                    &format!(
+                        "SELECT count() AS total FROM doc_node \
+                         WHERE space_id = $space_id \
+                           AND role IN ['chunk', 'paragraph', 'summary'] \
+                           AND embedding_model {model_filter} \
+                           AND deleted_at IS NONE \
+                         GROUP ALL"
+                    ),
+                    crate::bindings! { "space_id" => space_id },
+                )
+                .await?;
+            let rows: Vec<CountRow> = response.take(0).map_err(|e| {
+                StorageError::QueryError(format!("Failed to parse embedding progress count: {e}"))
+            })?;
+            *slot = rows.first().map_or(0, |row| row.total);
+        }
+        Ok(counts)
     }
 
     /// Finds embeddable nodes that have not yet been embedded.
@@ -1009,6 +1085,17 @@ mod tests {
                 NodeRole::Chunk | NodeRole::Paragraph | NodeRole::Summary
             )),
             "All returned nodes should have embeddable roles"
+        );
+
+        // The progress counts use the same predicate: two pending, one
+        // embedded, and the document-role node counted on neither side.
+        let counts = repo.count_embedding_progress("test_space").await.unwrap();
+        assert_eq!(
+            counts,
+            EmbeddingProgressCounts {
+                pending: 2,
+                embedded: 1,
+            }
         );
     }
 

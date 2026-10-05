@@ -283,6 +283,16 @@ pub fn assertion_envelope_unchanged(current: &Assertion, authorized: &Assertion)
         && current.base.deleted_at == authorized.base.deleted_at
 }
 
+/// The change a guarded mutation applies once the envelope still matches.
+enum GuardedChange {
+    Restore,
+    Delete,
+    Resolve {
+        status: ResolutionStatus,
+        rationale: Option<String>,
+    },
+}
+
 fn guard_conflict(id: &RecordId) -> StorageError {
     StorageError::Conflict(format!(
         "Assertion changed since it was authorized (envelope or lifecycle): {id}"
@@ -314,7 +324,8 @@ impl AssertionRepository {
         id: &RecordId,
         authorized: &Assertion,
     ) -> StorageResult<Assertion> {
-        self.mutate_guarded(space_id, id, authorized, false).await
+        self.mutate_guarded(space_id, id, authorized, GuardedChange::Restore)
+            .await
     }
 
     /// Soft-deletes an active assertion only if it is unchanged since
@@ -333,9 +344,40 @@ impl AssertionRepository {
         if authorized.base.deleted_at.is_some() {
             return Err(guard_conflict(id));
         }
-        self.mutate_guarded(space_id, id, authorized, true)
+        self.mutate_guarded(space_id, id, authorized, GuardedChange::Delete)
             .await
             .map(|_| ())
+    }
+
+    /// Sets an active assertion's resolution status (and, if given, its
+    /// rationale) only if it is unchanged since `authorized`; see
+    /// [`Self::restore_guarded`].
+    ///
+    /// Only the resolution fields are written, so a stale snapshot never
+    /// replaces a newer classification, subject set or entity link.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if the row is missing, deleted, or its envelope
+    /// changed, or an error if storage access fails.
+    pub async fn resolve_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+        status: ResolutionStatus,
+        rationale: Option<String>,
+    ) -> StorageResult<Assertion> {
+        if authorized.base.deleted_at.is_some() {
+            return Err(guard_conflict(id));
+        }
+        self.mutate_guarded(
+            space_id,
+            id,
+            authorized,
+            GuardedChange::Resolve { status, rationale },
+        )
+        .await
     }
 
     async fn mutate_guarded(
@@ -343,7 +385,7 @@ impl AssertionRepository {
         space_id: &str,
         id: &RecordId,
         authorized: &Assertion,
-        delete: bool,
+        change: GuardedChange,
     ) -> StorageResult<Assertion> {
         if let Some(store) = self.client.embedded_store() {
             return store
@@ -355,7 +397,16 @@ impl AssertionRepository {
                         return Err(guard_conflict(id));
                     }
                     let now = chrono::Utc::now();
-                    current.base.deleted_at = delete.then_some(now);
+                    match &change {
+                        GuardedChange::Restore => current.base.deleted_at = None,
+                        GuardedChange::Delete => current.base.deleted_at = Some(now),
+                        GuardedChange::Resolve { status, rationale } => {
+                            current.resolution_status = *status;
+                            if let Some(rationale) = rationale {
+                                current.retry_state.abstention_reason = Some(rationale.clone());
+                            }
+                        }
+                    }
                     current.base.updated_at = now;
                     Ok(mutation.replace(current)?)
                 })
@@ -378,11 +429,44 @@ impl AssertionRepository {
         } else {
             "object_entity IS NONE"
         };
-        let set = if delete {
-            "deleted_at = time::now()"
-        } else {
-            "deleted_at = NONE"
+        let mut change_bindings = std::collections::BTreeMap::new();
+        let set = match change {
+            GuardedChange::Restore => "deleted_at = NONE",
+            GuardedChange::Delete => "deleted_at = time::now()",
+            GuardedChange::Resolve { status, rationale } => {
+                change_bindings.insert(
+                    "resolution_status".to_string(),
+                    crate::surreal::enum_to_surreal(&status)?,
+                );
+                rationale.map_or("resolution_status = $resolution_status", |rationale| {
+                    change_bindings.insert(
+                        "abstention_reason".to_string(),
+                        surrealdb::sql::Value::from(rationale),
+                    );
+                    "resolution_status = $resolution_status, \
+                     retry_state.abstention_reason = $abstention_reason"
+                })
+            }
         };
+        let mut bindings = crate::bindings! {
+            "id" => crate::surreal::thing_from_record_id(id),
+            "space_id" => space_id,
+            "security" => crate::surreal::security_to_value(&authorized.base.security),
+            "subjects" => surrealdb::sql::Value::Array(crate::surreal::things_from_links(
+                authorized.base.subjects.clone(),
+            )),
+            "subjects_state" => crate::surreal::enum_to_surreal(&authorized.base.subjects_state)?,
+            "subject_entity" => authorized.subject_entity.as_ref().map_or(surrealdb::sql::Value::None, |link| {
+                surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(link.id()))
+            }),
+            "object_entity" => authorized.object_entity.as_ref().map_or(surrealdb::sql::Value::None, |link| {
+                surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(link.id()))
+            }),
+            "deleted_at" => authorized.base.deleted_at.map_or(surrealdb::sql::Value::None, |at| {
+                surrealdb::sql::Value::from(crate::surreal::datetime_from_chrono(at))
+            }),
+        };
+        bindings.extend(change_bindings);
         // Every comparison sits in the UPDATE predicate, so nothing changes
         // unless the row still has the envelope the caller was authorized on.
         let mut response = self
@@ -395,24 +479,7 @@ impl AssertionRepository {
                      AND {subject_link} AND {object_link} \
                      AND {lifecycle} RETURN {ASSERTION_PROJECTION}"
                 ),
-                crate::bindings! {
-                    "id" => crate::surreal::thing_from_record_id(id),
-                    "space_id" => space_id,
-                    "security" => crate::surreal::security_to_value(&authorized.base.security),
-                    "subjects" => surrealdb::sql::Value::Array(crate::surreal::things_from_links(
-                        authorized.base.subjects.clone(),
-                    )),
-                    "subjects_state" => crate::surreal::enum_to_surreal(&authorized.base.subjects_state)?,
-                    "subject_entity" => authorized.subject_entity.as_ref().map_or(surrealdb::sql::Value::None, |link| {
-                        surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(link.id()))
-                    }),
-                    "object_entity" => authorized.object_entity.as_ref().map_or(surrealdb::sql::Value::None, |link| {
-                        surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(link.id()))
-                    }),
-                    "deleted_at" => authorized.base.deleted_at.map_or(surrealdb::sql::Value::None, |at| {
-                        surrealdb::sql::Value::from(crate::surreal::datetime_from_chrono(at))
-                    }),
-                },
+                bindings,
             )
             .await?;
         let rows: Vec<AssertionDb> = response.take(0).map_err(|e| {
@@ -1786,6 +1853,133 @@ mod tests {
             repo.restore_guarded("other_space", &id, &snapshot).await,
             Err(StorageError::Conflict(_))
         ));
+    }
+
+    /// A guarded resolution writes only the resolution fields, and only while
+    /// the row still has the authorized envelope: a stale snapshot never
+    /// writes back an older classification, subject set or entity link.
+    async fn assert_guarded_resolution(repo: &AssertionRepository) {
+        let space = "test_space";
+        let item = create_test_assertion();
+        let id = item.base.id.clone();
+        repo.create(item).await.unwrap();
+
+        // Raised to level 5 after a level-0 snapshot: conflict, and neither
+        // the classification nor the status moves.
+        let snapshot = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let mut stricter = snapshot.clone();
+        stricter.base.security.level = 5;
+        repo.update(space, &id, stricter).await.unwrap();
+        let result = repo
+            .resolve_guarded(space, &id, &snapshot, ResolutionStatus::Resolved, None)
+            .await;
+        assert!(
+            matches!(result, Err(StorageError::Conflict(_))),
+            "{result:?}"
+        );
+        let current = repo.get(space, &id).await.unwrap().unwrap();
+        assert_eq!(current.base.security.level, 5);
+        assert_eq!(current.resolution_status, snapshot.resolution_status);
+
+        // Subjects or an entity link changed after the snapshot: conflict.
+        let snapshot = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let mut subjects = snapshot.clone();
+        subjects
+            .base
+            .subjects
+            .push(Link::new(RecordId::new_v4(TableName::Entity)));
+        repo.update(space, &id, subjects).await.unwrap();
+        assert!(matches!(
+            repo.resolve_guarded(space, &id, &snapshot, ResolutionStatus::Resolved, None)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        let snapshot = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let mut relinked = snapshot.clone();
+        relinked.object_entity = Some(Link::new(RecordId::new_v4(TableName::Entity)));
+        repo.update(space, &id, relinked).await.unwrap();
+        assert!(matches!(
+            repo.resolve_guarded(space, &id, &snapshot, ResolutionStatus::Resolved, None)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+
+        // Deleted after the snapshot: conflict, and the row stays deleted. A
+        // deleted snapshot never resolves either.
+        let active = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        repo.delete(space, &id).await.unwrap();
+        assert!(matches!(
+            repo.resolve_guarded(space, &id, &active, ResolutionStatus::Resolved, None)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        let deleted = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        assert!(matches!(
+            repo.resolve_guarded(space, &id, &deleted, ResolutionStatus::Resolved, None)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(repo.get(space, &id).await.unwrap().is_none());
+        repo.restore(space, &id).await.unwrap();
+
+        // Another space's caller never matches.
+        let fresh = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        assert!(matches!(
+            repo.resolve_guarded("other_space", &id, &fresh, ResolutionStatus::Resolved, None)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+
+        // A fresh snapshot resolves: status and rationale change, the
+        // envelope and everything else stay as stored.
+        let resolved = repo
+            .resolve_guarded(
+                space,
+                &id,
+                &fresh,
+                ResolutionStatus::Abstained,
+                Some("ambiguous subject".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.resolution_status, ResolutionStatus::Abstained);
+        assert_eq!(
+            resolved.retry_state.abstention_reason.as_deref(),
+            Some("ambiguous subject")
+        );
+        assert_eq!(resolved.base.security, fresh.base.security);
+        assert_eq!(resolved.base.subjects, fresh.base.subjects);
+        assert_eq!(resolved.object_entity, fresh.object_entity);
+        assert_eq!(resolved.predicate_raw, fresh.predicate_raw);
+        assert_eq!(
+            resolved.retry_state.resolution_attempts,
+            fresh.retry_state.resolution_attempts
+        );
+        let stored = repo.get(space, &id).await.unwrap().unwrap();
+        assert_eq!(stored.resolution_status, ResolutionStatus::Abstained);
+
+        // Without a rationale the stored one is kept.
+        let resolved = repo
+            .resolve_guarded(space, &id, &stored, ResolutionStatus::Resolved, None)
+            .await
+            .unwrap();
+        assert_eq!(resolved.resolution_status, ResolutionStatus::Resolved);
+        assert_eq!(
+            resolved.retry_state.abstention_reason.as_deref(),
+            Some("ambiguous subject")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_guarded_resolution_surreal() {
+        let repo = setup_test_repo().await;
+        assert_guarded_resolution(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn test_guarded_resolution_embedded() {
+        let repo = AssertionRepository::new(StorageClient::new_embedded().await.unwrap());
+        assert_guarded_resolution(&repo).await;
     }
 
     #[tokio::test]

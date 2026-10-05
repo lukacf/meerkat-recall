@@ -87,6 +87,16 @@ pub trait AssertionRepo: Send + Sync {
         id: &RecordId,
         authorized: &Assertion,
     ) -> StorageResult<()>;
+    /// Sets only the resolution fields, if the row still matches the
+    /// authorized snapshot.
+    async fn resolve_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+        status: ResolutionStatus,
+        rationale: Option<String>,
+    ) -> StorageResult<Assertion>;
 }
 
 #[async_trait::async_trait]
@@ -107,6 +117,17 @@ impl AssertionRepo for AssertionRepository {
         authorized: &Assertion,
     ) -> StorageResult<()> {
         Self::delete_guarded(self, space_id, id, authorized).await
+    }
+
+    async fn resolve_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+        status: ResolutionStatus,
+        rationale: Option<String>,
+    ) -> StorageResult<Assertion> {
+        Self::resolve_guarded(self, space_id, id, authorized, status, rationale).await
     }
 
     async fn create(&self, record: Assertion) -> StorageResult<Assertion> {
@@ -209,6 +230,30 @@ impl AssertionRepo for elephant_storage::MockAssertionRepository {
             )));
         }
         Repository::delete(self, space_id, id).await
+    }
+
+    async fn resolve_guarded(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        authorized: &Assertion,
+        status: ResolutionStatus,
+        rationale: Option<String>,
+    ) -> StorageResult<Assertion> {
+        let current = Self::get_with_deleted(self, space_id, id).await?;
+        let Some(mut current) = current.filter(|current| {
+            authorized.base.deleted_at.is_none()
+                && elephant_storage::assertion_envelope_unchanged(current, authorized)
+        }) else {
+            return Err(elephant_storage::StorageError::Conflict(format!(
+                "Assertion changed since it was authorized: {id}"
+            )));
+        };
+        current.resolution_status = status;
+        if let Some(rationale) = rationale {
+            current.retry_state.abstention_reason = Some(rationale);
+        }
+        Repository::update(self, space_id, id, current).await
     }
 
     async fn delete(&self, space_id: &str, id: &RecordId) -> StorageResult<()> {
@@ -872,7 +917,7 @@ async fn update_resolution(
         )
     })?;
 
-    let mut assertion = match state.assertion_repo.get(&space_id, &rid).await {
+    let assertion = match state.assertion_repo.get(&space_id, &rid).await {
         Ok(Some(a)) => a,
         Ok(None) => {
             return Err((
@@ -916,22 +961,15 @@ async fn update_resolution(
             )
         })?;
 
-    assertion.resolution_status = req.status;
-    if let Some(rationale) = req.rationale {
-        assertion.retry_state.abstention_reason = Some(rationale);
-    }
-
-    match state
+    // Only the resolution fields are written, and only while the row still
+    // has the envelope authorized above: a stale snapshot never overwrites a
+    // newer classification, subject set or entity link.
+    state
         .assertion_repo
-        .update(&space_id, &rid, assertion)
+        .resolve_guarded(&space_id, &rid, &assertion, req.status, req.rationale)
         .await
-    {
-        Ok(updated) => Ok(Json(updated)),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
-    }
+        .map(Json)
+        .map_err(|e| assertion_storage_error(&e))
 }
 
 /// Storage failure as an API error: a guard conflict is 409 and carries no

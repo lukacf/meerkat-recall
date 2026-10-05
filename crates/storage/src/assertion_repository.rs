@@ -266,13 +266,17 @@ pub struct AssertionRepository {
 }
 
 /// Whether `current` still has the authorization envelope and lifecycle of
-/// `authorized`: security, subjects, subjects state, and deleted or active.
+/// `authorized`.
+///
+/// Compares security, subjects, subjects state and the exact deletion
+/// timestamp (or its absence): a row restored and deleted again since the
+/// snapshot carries a different tombstone and does not match.
 #[must_use]
 pub fn assertion_envelope_unchanged(current: &Assertion, authorized: &Assertion) -> bool {
     current.base.security == authorized.base.security
         && current.base.subjects == authorized.base.subjects
         && current.base.subjects_state == authorized.base.subjects_state
-        && current.base.deleted_at.is_some() == authorized.base.deleted_at.is_some()
+        && current.base.deleted_at == authorized.base.deleted_at
 }
 
 fn guard_conflict(id: &RecordId) -> StorageError {
@@ -354,8 +358,9 @@ impl AssertionRepository {
                 .await;
         }
 
+        // The exact tombstone the caller saw, not just deleted-or-active.
         let lifecycle = if authorized.base.deleted_at.is_some() {
-            "deleted_at IS NOT NONE"
+            "deleted_at = $deleted_at"
         } else {
             "deleted_at IS NONE"
         };
@@ -383,6 +388,9 @@ impl AssertionRepository {
                         authorized.base.subjects.clone(),
                     )),
                     "subjects_state" => crate::surreal::enum_to_surreal(&authorized.base.subjects_state)?,
+                    "deleted_at" => authorized.base.deleted_at.map_or(surrealdb::sql::Value::None, |at| {
+                        surrealdb::sql::Value::from(crate::surreal::datetime_from_chrono(at))
+                    }),
                 },
             )
             .await?;
@@ -1689,6 +1697,23 @@ mod tests {
             repo.restore_guarded(space, &id, &deleted).await,
             Err(StorageError::Conflict(_))
         ));
+
+        // Tombstone ABA: snapshot tombstone D1, someone restores and deletes
+        // again (tombstone D2, same envelope); restoring from D1 must conflict
+        // rather than revive the later deletion.
+        repo.delete(space, &id).await.unwrap();
+        let tombstone_d1 = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        repo.restore(space, &id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        repo.delete(space, &id).await.unwrap();
+        let tombstone_d2 = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        assert_ne!(tombstone_d1.base.deleted_at, tombstone_d2.base.deleted_at);
+        assert!(matches!(
+            repo.restore_guarded(space, &id, &tombstone_d1).await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(repo.get(space, &id).await.unwrap().is_none());
+        repo.restore(space, &id).await.unwrap();
 
         // Fresh snapshots succeed: guarded delete, then guarded restore.
         let active = repo.get_with_deleted(space, &id).await.unwrap().unwrap();

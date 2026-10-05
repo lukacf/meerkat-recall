@@ -1129,9 +1129,29 @@ mod tests {
         assert_eq!(restored.status(), StatusCode::OK);
     }
 
+    async fn mock_private_cleared_auth(req: Request<Body>, next: Next) -> impl IntoResponse {
+        let mut req = req;
+        req.extensions_mut().insert(AuthPrincipal {
+            subject: "private-cleared".to_string(),
+            space_id: Some("test_space".to_string()),
+            scopes: vec!["read:event".to_string(), "write:event".to_string()],
+            security_level: 10,
+            security_labels: vec!["private".to_string()],
+            ..AuthPrincipal::default()
+        });
+        next.run(req).await
+    }
+
     #[tokio::test]
     async fn test_update_event_cannot_declassify() {
-        let app = setup_test_app().await;
+        // A writer cleared for the private label and both levels, so every
+        // refusal below is the declassification rule, not missing clearance.
+        let authz = Arc::new(AuthzService::new());
+        let event_repo: Arc<dyn TimelineEventRepo> = Arc::new(MockEventRepository::empty());
+        let state = Arc::new(TimelineState::new_with_repo(event_repo, authz));
+        let app = timeline_routes()
+            .layer(middleware::from_fn(mock_private_cleared_auth))
+            .with_state(state);
         let mut event = create_test_event("Classified event");
         event.base.security.level = 2;
         event.base.security.labels = vec!["private".to_string()];

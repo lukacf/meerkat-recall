@@ -1712,6 +1712,29 @@ mod tests {
         ));
         assert!(repo.get(space, &id).await.unwrap().is_some());
 
+        // The reviewed attenuated-authority sequence: a caller allowed only
+        // entity A authorized this row while its endpoints were A/None; a
+        // resolver then points object_entity at an excluded B. The stale
+        // guarded restore must conflict, not act on (and return) the row.
+        let entity_a = RecordId::new_v4(TableName::Entity);
+        let mut endpoints_a = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        endpoints_a.subject_entity = Some(Link::new(entity_a));
+        endpoints_a.object_entity = None;
+        repo.update(space, &id, endpoints_a).await.unwrap();
+        let snapshot_a = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let mut object_b = snapshot_a.clone();
+        object_b.object_entity = Some(Link::new(RecordId::new_v4(TableName::Entity)));
+        repo.update(space, &id, object_b).await.unwrap();
+        assert!(matches!(
+            repo.restore_guarded(space, &id, &snapshot_a).await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(matches!(
+            repo.delete_guarded(space, &id, &snapshot_a).await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(repo.get(space, &id).await.unwrap().is_some());
+
         // Active -> deleted race: someone deletes after the snapshot; a stale
         // guarded delete conflicts instead of acting on the changed row.
         let active = repo.get_with_deleted(space, &id).await.unwrap().unwrap();

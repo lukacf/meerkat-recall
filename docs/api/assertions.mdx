@@ -12,6 +12,8 @@ icon: "check-double"
 | POST | `/v1/assertions` | Create manual assertion |
 | GET | `/v1/assertions/{id}` | Get assertion by ID |
 | PATCH | `/v1/assertions/{id}/resolution` | Update resolution status |
+| DELETE | `/v1/assertions/{id}` | Soft-delete an assertion |
+| POST | `/v1/assertions/{id}/restore` | Restore a soft-deleted assertion |
 
 Assertions are source claims with evidence spans and resolved identity links.
 Resolution status describes processing of the claim; `resolved` does not prove
@@ -162,11 +164,32 @@ curl http://localhost:3000/v1/assertions/assertion:550e8400-e29b-41d4-a716-44665
 
 ---
 
+## Delete and restore
+
+`DELETE /v1/assertions/{id}` requires `write:assertion` and record write
+authorization. It sets `deleted_at` and returns `204` without a record body.
+Ordinary reads then return `404`; search excludes the record unless the caller
+requests `include_deleted` and is authorized to read it. Deleting an already
+deleted or missing assertion returns `404`.
+
+`POST /v1/assertions/{id}/restore` clears the soft-deletion marker and returns
+the assertion as JSON. It requires both `write:assertion` and `read:assertion`
+with their record checks before changing the row. A write-only caller receives
+`403`, including when the requested row is already active. A missing row in the
+caller's space returns `404`. Restoration retains the existing security
+classification and evidence; it does not create a new extraction or adjudicate
+the claim.
+
 ## Update Resolution Status
 
 `PATCH /v1/assertions/{id}/resolution`
 
-Update the resolution status of an existing assertion. Changing this field alone does not resolve entity references, generate evidence, or perform truth adjudication.
+Update the resolution status of an existing assertion. Because the response
+contains the existing assertion's content, this route requires both
+`write:assertion` and `read:assertion` with their record checks before changing
+the status. A write-only caller receives `403` without a status change.
+Changing this field alone does not resolve entity references, generate evidence,
+or perform truth adjudication.
 
 <ParamField path="id" type="string" required>
   Assertion record ID.

@@ -25,9 +25,16 @@ command syntax.
 
 See [deployment](/operations/deployment) for environment settings and
 [quickstart](/quickstart) for a credential-free demo or persistent local stack.
-The demo's article generation requires model configuration and a build with
-the relevant features; the no-default-features demo exposes evidence and
-context projections without generated articles.
+The distributed candidate includes Meerkat extraction by default. Its
+`demo-wiki` command needs a configured model provider before it can plan and
+write articles. See [binary demo prerequisites](/installation#run-the-model-backed-demo).
+The separate `--no-default-features` source build exposes evidence and context
+projections without generated articles. There is no runtime feature toggle
+that converts the candidate binary into that credential-free build.
+
+The current CLI does not expose `--version`. Use the bundled `provenance.json`
+and executable checksum to identify a candidate; `--help` checks command
+availability without making model calls.
 
 ## Target a running server
 

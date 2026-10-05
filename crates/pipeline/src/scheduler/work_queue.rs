@@ -327,11 +327,8 @@ impl WorkQueue {
 
     /// Counts work items that are runnable right now.
     ///
-    /// This exists so health surfaces can tell "the queue has nothing to do"
-    /// apart from "the queue cannot do anything" — two states that look
-    /// identical from throughput alone, and which have been confused here
-    /// before: the KB gap from 2026-04-11 to 2026-07-30 was diagnosed as a dead
-    /// queue when the queue was merely empty.
+    /// Health surfaces use this count to distinguish an empty queue from a
+    /// blocked queue, since both states show zero throughput.
     ///
     /// Uses an aggregate across all spaces, independent of the candidate scan
     /// window used when claiming work.

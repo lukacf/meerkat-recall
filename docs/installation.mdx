@@ -1,0 +1,146 @@
+---
+title: Binary installation
+description: Verify and install an Elephant candidate archive, then configure its model-backed demo.
+icon: download
+---
+
+Candidate archives are prepared for Linux x86-64 and macOS ARM64. This page
+explains how to install an archive supplied with its matching release record;
+it does not announce a public release or an available download. The source
+currently declares `0.1.0` with Meerkat `0.8.45`. See
+[release binaries](/operations/deployment#release-binaries) for the promotion process
+and build provenance requirements.
+
+## Choose the matching artifact
+
+| Target | Archive name |
+|---|---|
+| Linux x86-64 | `elephant-0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS ARM64 (Apple Silicon) | `elephant-0.1.0-aarch64-apple-darwin.tar.gz` |
+
+The candidate workflow builds Linux on Ubuntu 22.04 and macOS on a native
+ARM64 runner. Check the selected release's actual host and dynamic-library
+acceptance before treating another OS version as supported. No Windows,
+Linux ARM64, or Intel macOS binary is specified by this candidate matrix.
+
+Obtain the archive and its adjacent `.sha256` file from the release owner or,
+when published, the verified release assets. Keep them in the same directory.
+Use the checksum and source identity recorded for that candidate; a checksum
+bundled with an untrusted download does not establish its origin.
+
+The commands below require `tar`, `jq`, and the platform checksum tool. Run
+them from the directory containing the supplied files. They are installation
+instructions, not a record that either target has passed a clean-machine test.
+
+## Verify, unpack, and install
+
+The archives have a flat layout: `elephant`, `LICENSE`, `LICENSE-MIT`,
+`LICENSE-APACHE`, `provenance.json`, and the `skills/` tree are at the archive
+root. A private candidate may also include `CANDIDATE.txt`. There is no nested
+version directory and no `bin/` prefix. Extract into a new directory
+so the bundled license and provenance files remain together.
+
+<Tabs>
+  <Tab title="Linux x86-64">
+    ```bash
+    (
+    set -eu
+    archive=elephant-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+    sha256sum --check "${archive%.tar.gz}.sha256"
+    bundle_dir="$PWD/${archive%.tar.gz}"
+    mkdir "$bundle_dir"
+    tar -xzf "$archive" -C "$bundle_dir"
+    jq . "$bundle_dir/provenance.json"
+    printf '%s  %s\n' "$(jq -r '.binary_sha256' "$bundle_dir/provenance.json")" \
+      "$bundle_dir/elephant" | sha256sum --check
+    "$bundle_dir/elephant" --help
+    install -d "$HOME/.local/bin"
+    install -m 0755 "$bundle_dir/elephant" "$HOME/.local/bin/elephant"
+    "$HOME/.local/bin/elephant" --help
+    )
+    ```
+  </Tab>
+  <Tab title="macOS ARM64">
+    ```bash
+    (
+    set -eu
+    archive=elephant-0.1.0-aarch64-apple-darwin.tar.gz
+    shasum -a 256 --check "${archive%.tar.gz}.sha256"
+    bundle_dir="$PWD/${archive%.tar.gz}"
+    mkdir "$bundle_dir"
+    tar -xzf "$archive" -C "$bundle_dir"
+    jq . "$bundle_dir/provenance.json"
+    printf '%s  %s\n' "$(jq -r '.binary_sha256' "$bundle_dir/provenance.json")" \
+      "$bundle_dir/elephant" | shasum -a 256 --check
+    "$bundle_dir/elephant" --help
+    install -d "$HOME/.local/bin"
+    install -m 0755 "$bundle_dir/elephant" "$HOME/.local/bin/elephant"
+    "$HOME/.local/bin/elephant" --help
+    )
+    ```
+  </Tab>
+</Tabs>
+
+Stop if a checksum check fails or the provenance does not match the supplied
+release record. Retain the extracted licenses and provenance. Add
+`$HOME/.local/bin` to your shell's normal `PATH` configuration for future
+sessions. The current binary does not implement `--version`; use the verified
+provenance and executable digest to identify it.
+
+## Run the model-backed demo
+
+The default-feature executable includes Meerkat extraction. `demo-wiki` asks
+models to plan articles, write them, and verify their statements before it
+starts serving the demo. It needs provider credentials and model access;
+provider calls can incur charges. No database service is required.
+
+The writer is selected by `ELEPHANT_WIKI_WRITER_MODEL`, then
+`PIPELINE_AGENTIC_MODEL`, then the source default `gpt-5.6-sol`. The verifier
+uses `ELEPHANT_WIKI_VERIFIER_MODEL` or the writer's model. For the default
+selection, configure `OPENAI_API_KEY` through your normal secret configuration
+and ensure that account has access to the selected model. If selecting another
+provider or a different verifier, configure credentials for both selections.
+
+```bash
+# Configure provider credentials in this shell before running the demo.
+elephant demo-wiki
+```
+
+Use `elephant demo-wiki --port 3100` if port 3000 is occupied. When startup
+finishes, inspect the printed article-generation results and the context
+projection, compilation receipt, and source evidence at the printed loopback
+URLs. Do not count missing credentials, failed model calls, or blocked articles
+as successful semantic generation. The demo uses an isolated in-memory store;
+Ctrl-C stops it and discards the demo data.
+
+For a credential-free projection demo, use the separate
+[no-default-features source build](/quickstart#try-the-demo-first). That build
+leaves the article wiki empty and does not validate the distributed binary's
+model path. For durable data, continue with
+[persistent deployment](/operations/deployment) and its readiness and
+authentication checks.
+
+## Retain skills for persistent extraction
+
+Keep the entire bundled `skills/` tree in the extracted directory after
+installing the executable. Persistent extraction needs these guidance files.
+Set `PIPELINE_SKILLS_DIR` to that tree's absolute path in the environment of
+the server or standalone worker that performs extraction:
+
+```bash
+# Replace this with the absolute skills path in your retained bundle.
+export PIPELINE_SKILLS_DIR="/absolute/path/to/extracted-elephant/skills"
+```
+
+For a service, configure the same value in its service environment. For a
+container, mount the retained skills tree and use its absolute container path.
+If an older or private archive lacks `skills/`, obtain the matching skills
+tree from its source
+before enabling persistent extraction. Do not rely on a developer checkout,
+the process working directory, or a path embedded during compilation being
+available on an installed machine. A missing skills file only produces a
+warning and processing continues without that guidance, so startup success
+alone does not verify the configuration.
+
+This setting concerns persistent pipeline extraction. It does not replace
+the provider credentials required by the model-backed demo above.

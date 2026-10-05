@@ -137,6 +137,12 @@ undo a concurrent classification change. A rejected update does not restore a
 deleted entity. These ordinary interfaces expose no declassification permission;
 trusted internal maintenance remains responsible for intentional security changes.
 
+The REST timeline update, `PUT /v1/timeline/{id}`, also preserves the existing
+`security` fields. A payload that changes them returns `403`, even when the
+caller is cleared for both classifications. If stored security changes after
+authorization, the write returns `409`; fetch the current event before retrying
+a content edit.
+
 ## Raw content and redaction
 
 The policy vocabulary separates document metadata access from raw-text access.

@@ -17,10 +17,35 @@ does not by itself establish a published release.
 - Direct budget-record reads and indexed daily ledger aggregation prevent
   budget checks from scanning the complete accounting history.
 - Meerkat 0.8.45, current MCP/PDF dependencies, and stricter API authorization
-  and ingestion error handling.
+  and ingestion error handling. This candidate keeps the six direct Meerkat
+  family dependencies at exactly 0.8.45; it does not upgrade to a 0.9 platform
+  or establish compatibility with a separately installed MobKit release.
 - Dual licensing under MIT OR Apache-2.0.
 
 ### Security
+- An explicitly empty `subject_allowlist` remains a restriction. Ordinary
+  entity updates and batch upserts cannot change existing `Security` fields.
+- Multiword document and assertion text queries keep every term inside the
+  selected space and soft-deletion filters, including their count queries.
+- Assertion delete and restore routes check record write authorization.
+  Restore also requires record read authorization before mutation because it
+  returns the restored assertion; write-only callers cannot use it to read
+  either active or deleted assertions.
+- REST restore routes for documents, entities, relationships, sources, and
+  timeline events, plus assertion resolution updates, now require record read
+  authorization before returning existing content, in addition to write
+  authorization.
+- REST restores, MCP entity restore, and assertion-delete mutations compare
+  the stored authorization fields and lifecycle against the authorized
+  snapshot in the same write.
+  Stale requests return a conflict without changing or returning the newer row.
+- Assertion resolution writes only the resolution fields under the same guard,
+  preserving a concurrent classification or subject restriction.
+- Ordinary timeline updates cannot change `Security` fields, even when the
+  caller can access both classifications. A concurrent security change causes
+  a conflict instead of being overwritten by the update.
+- Assertion search counts only authorized matching rows, including queries
+  filtered by an entity link and requests continued with a cursor.
 - Incoming MCP requests use only the caller's Authorization header; internal
   worker credentials no longer replace missing or restricted caller credentials.
 - Authenticated server startup rejects missing or short signing secrets and
@@ -60,6 +85,17 @@ does not by itself establish a published release.
   runtime and documented only as legacy/non-active behavior.
 
 ### Fixed
+- Document semantic search uses partitioned vector candidates and blends
+  lexical and semantic ranks. Assertion text search uses indexed candidates.
+- Document semantic search loads vector-hit nodes, revisions, and documents
+  by record ID instead of scanning their tables while assembling results.
+- OpenAI embedding requests cap inputs at 24,000 characters, shorten inputs
+  rejected for exceeding the model limit, and split batches rejected for their
+  aggregate token count. Oversized inputs embed a prefix, not the entire text;
+  stored source evidence remains intact.
+- MCP entity search reuses vector snapshots per space and dimension for up to
+  60 seconds and loads matching entity records in batches. Ranking can lag
+  vector writes until refresh; current records still pass request authorization.
 - Space ID mismatch in create handlers: body `space_id` is now overridden with
   the principal's space.
 

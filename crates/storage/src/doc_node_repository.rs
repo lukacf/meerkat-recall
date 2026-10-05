@@ -132,19 +132,24 @@ impl TryFrom<DocNodeDb> for DocNode {
     }
 }
 
-/// `embedding_model` value the embed worker stores on nodes that can never be
-/// embedded (invalid span, missing revision): they leave the pending set
-/// without a vector. Null the field to send a repaired node back.
+/// `embedding_model` marker for nodes that can never be embedded.
+///
+/// The embed worker sets it on nodes with an invalid span or a missing
+/// revision: they leave the pending set without a vector. Null the field to
+/// send a repaired node back.
 pub const UNEMBEDDABLE_EMBEDDING_MODEL: &str = "unembeddable";
 
-/// Embedding progress of one space, from
-/// [`DocNodeRepository::count_embedding_progress`].
+/// Embedding progress of one space.
+///
+/// Produced by [`DocNodeRepository::count_embedding_progress`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmbeddingProgressCounts {
     /// Embeddable nodes still waiting for an embedding.
     pub pending: usize,
-    /// Nodes the worker gave up on ([`UNEMBEDDABLE_EMBEDDING_MODEL`]); they
-    /// have no vector and are not counted as embedded.
+    /// Nodes the worker gave up on.
+    ///
+    /// Marked [`UNEMBEDDABLE_EMBEDDING_MODEL`]; they have no vector and are
+    /// not counted as embedded.
     pub unembeddable: usize,
     /// Nodes with a real embedding, by the model that produced it.
     pub embedded_by_model: std::collections::BTreeMap<String, usize>,
@@ -485,17 +490,18 @@ impl DocNodeRepository {
         Ok(chain)
     }
 
-    /// Embeddable nodes (`chunk`, `paragraph`, `summary`, not deleted) in a
-    /// space, split into pending (the [`Self::find_pending_embedding`]
-    /// predicate), given up ([`UNEMBEDDABLE_EMBEDDING_MODEL`]) and embedded per
-    /// model.
+    /// Counts a space's embeddable nodes by embedding state.
     ///
-    /// Counts the whole table: call it from a background refresh, never per
-    /// request.
+    /// Embeddable means `chunk`, `paragraph` or `summary` and not deleted. The
+    /// split is pending (the [`Self::find_pending_embedding`] predicate), given
+    /// up ([`UNEMBEDDABLE_EMBEDDING_MODEL`]) and embedded per model.
+    ///
+    /// Counts the whole table: call it periodically (the embed loop does),
+    /// never per request.
     ///
     /// # Errors
     ///
-    /// Returns an error if either count query fails.
+    /// Returns an error if the count query fails.
     pub async fn count_embedding_progress(
         &self,
         space_id: &str,

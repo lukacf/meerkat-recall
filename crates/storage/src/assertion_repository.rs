@@ -268,14 +268,18 @@ pub struct AssertionRepository {
 /// Whether `current` still has the authorization envelope and lifecycle of
 /// `authorized`.
 ///
-/// Compares security, subjects, subjects state and the exact deletion
-/// timestamp (or its absence): a row restored and deleted again since the
-/// snapshot carries a different tombstone and does not match.
+/// Compares everything the assertion's authorization reads (security,
+/// subjects, subjects state, and the subject/object entity links, which ABAC
+/// adds to the subjects) plus the exact deletion timestamp or its absence: a
+/// row restored and deleted again since the snapshot carries a different
+/// tombstone and does not match.
 #[must_use]
 pub fn assertion_envelope_unchanged(current: &Assertion, authorized: &Assertion) -> bool {
     current.base.security == authorized.base.security
         && current.base.subjects == authorized.base.subjects
         && current.base.subjects_state == authorized.base.subjects_state
+        && current.subject_entity == authorized.subject_entity
+        && current.object_entity == authorized.object_entity
         && current.base.deleted_at == authorized.base.deleted_at
 }
 
@@ -364,6 +368,16 @@ impl AssertionRepository {
         } else {
             "deleted_at IS NONE"
         };
+        let subject_link = if authorized.subject_entity.is_some() {
+            "subject_entity = $subject_entity"
+        } else {
+            "subject_entity IS NONE"
+        };
+        let object_link = if authorized.object_entity.is_some() {
+            "object_entity = $object_entity"
+        } else {
+            "object_entity IS NONE"
+        };
         let set = if delete {
             "deleted_at = time::now()"
         } else {
@@ -378,6 +392,7 @@ impl AssertionRepository {
                     "UPDATE $id SET {set}, updated_at = time::now() \
                      WHERE space_id = $space_id AND security = $security \
                      AND subjects = $subjects AND subjects_state = $subjects_state \
+                     AND {subject_link} AND {object_link} \
                      AND {lifecycle} RETURN {ASSERTION_PROJECTION}"
                 ),
                 crate::bindings! {
@@ -388,6 +403,12 @@ impl AssertionRepository {
                         authorized.base.subjects.clone(),
                     )),
                     "subjects_state" => crate::surreal::enum_to_surreal(&authorized.base.subjects_state)?,
+                    "subject_entity" => authorized.subject_entity.as_ref().map_or(surrealdb::sql::Value::None, |link| {
+                        surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(link.id()))
+                    }),
+                    "object_entity" => authorized.object_entity.as_ref().map_or(surrealdb::sql::Value::None, |link| {
+                        surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(link.id()))
+                    }),
                     "deleted_at" => authorized.base.deleted_at.map_or(surrealdb::sql::Value::None, |at| {
                         surrealdb::sql::Value::from(crate::surreal::datetime_from_chrono(at))
                     }),
@@ -1678,6 +1699,18 @@ mod tests {
         ));
         let current = repo.get(space, &id).await.unwrap().expect("still active");
         assert_eq!(current.base.security.level, 5);
+
+        // Endpoint change: ABAC reads subject/object entity links as subjects,
+        // so a concurrent relink also invalidates the snapshot.
+        let snapshot = repo.get_with_deleted(space, &id).await.unwrap().unwrap();
+        let mut relinked = snapshot.clone();
+        relinked.subject_entity = Some(Link::new(RecordId::new_v4(TableName::Entity)));
+        repo.update(space, &id, relinked).await.unwrap();
+        assert!(matches!(
+            repo.delete_guarded(space, &id, &snapshot).await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(repo.get(space, &id).await.unwrap().is_some());
 
         // Active -> deleted race: someone deletes after the snapshot; a stale
         // guarded delete conflicts instead of acting on the changed row.

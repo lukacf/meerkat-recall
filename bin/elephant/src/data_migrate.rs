@@ -508,14 +508,14 @@ async fn copy_snapshot(
         .await?;
     report.push(("work_item_archive", item_archives.len()));
     for archive in item_archives {
-        elephant_storage::work_retention::import_item_archive(&dst, archive).await?;
+        elephant_storage::work_retention::import_item_archive(dst, archive).await?;
     }
     let run_archives = src
         .scan::<elephant_types::records::WorkRunArchive>()
         .await?;
     report.push(("work_run_archive", run_archives.len()));
     for archive in run_archives {
-        elephant_storage::work_retention::import_run_archive(&dst, archive).await?;
+        elephant_storage::work_retention::import_run_archive(dst, archive).await?;
     }
     copy_table!(
         src,

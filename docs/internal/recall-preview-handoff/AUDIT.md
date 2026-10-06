@@ -4,6 +4,8 @@ Date: 6 October 2026. This is the portable record of the completed Elephant audi
 
 Read [PLAN.md](PLAN.md) for the consumer-reviewed delivery scope and [SOURCE-STATUS.md](SOURCE-STATUS.md) before assigning implementation or treating any historical finding as still open on the selected implementation base.
 
+**Lifecycle clarification after user review:** substantial deletion/restoration, audit-revert, temporal correction and retention/archive machinery already exists. The later static [lifecycle and RTBF inventory](LIFECYCLE-STATUS.md) at `f59e6f5` corrects the blanket preview-deferral proposal. F06 concerns incomplete propagation and integrated guarantees, not absence of all lifecycle functionality.
+
 ## Source and evidence status
 
 - **Audit baseline:** `7f8446856b3a9eb7b74976a406536e90d09c1cf6`, committed 5 October 2026. F01-F11 and their source links below describe this pinned source. The original review covered architecture, functionality, authorization, documentation, test design, release readiness and the boundary with Core and Meta. Connect was outside the maturity comparison.

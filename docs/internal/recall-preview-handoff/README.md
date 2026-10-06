@@ -6,13 +6,14 @@ Start here when handing this work to a new agent on another machine. This packag
 
 Publishing these documents does not start implementation, tests, deployment or consumer migration. The work in this audit chat remained static. A receiving agent needs the implementation mandate supplied with the handoff; the proposed packages are not assignments issued by this document.
 
-## Read these four documents
+## Read these documents
 
 | Document | Purpose |
 | --- | --- |
 | [Plan](PLAN.md) | Complete six-package proposal, sizes, risks, shared contracts, parallel branches and qualification gates. |
 | [Audit](AUDIT.md) | Architecture/maturity review and F01-F11 findings with pinned source evidence. Findings describe their stated baseline, not every later revision. |
 | [Source status and transfer](SOURCE-STATUS.md) | What is already merged, what remains, and the unqualified F01 work to recover rather than duplicate. |
+| [Lifecycle and RTBF clarification](LIFECYCLE-STATUS.md) | Existing deletion, restoration, correction and retention to reuse; the separate erasure guarantees still to establish. Supersedes the earlier blanket lifecycle-deferral wording. |
 | [F01 checkpoint](checkpoint/README.md) | Exact base, patch, checksum, staged-tree identity and known compilation failure. This is incomplete source, not a passing candidate. |
 
 All necessary plan text and the source patch are in this GitHub directory. Local machine paths, private bus archives and this conversation are not prerequisites for reading the handoff. The repository is private; the receiving agent needs repository access.
@@ -23,7 +24,7 @@ All necessary plan text and the source patch are in this GitHub directory. Local
 - **Spaces remain core.** Named spaces, authorized administration, per-space configuration, isolation and recovery are retained. A default-space-only preview was explicitly rejected.
 - **No generic legacy migration or backward-compatibility program.** HomeCore, the existing real user, may own a bespoke transition. Existing useful aliases and finite migration safeguards need not be removed. Fresh initialization and retained save/restore commands must still behave honestly.
 - Favor substantial independently executable assignments, separate worktrees/branches, and as much useful parallelism as possible. Wall-clock time and integration cost matter more than token scarcity.
-- The six-package structure is the recommended execution design, not a blanket approval of every scope proposal. Proposed cuts such as one storage backend, wiki/views deferral, broader lifecycle restrictions or embedding-profile immutability must not silently become user decisions.
+- The six-package structure is the recommended execution design, not a blanket approval of every scope proposal. Proposed cuts such as one storage backend, wiki/views deferral or embedding-profile immutability must not silently become user decisions. The earlier blanket correction/restoration deferral is withdrawn: preserve and qualify the substantial existing lifecycle implementation, as explained in the lifecycle clarification.
 - Source-scoped erasure is the recommended bounded lifecycle addition. OB3 requires it before real-data adoption, and HomeCore supports it. This is not a claim that a general person-level purge engine is already selected or that a consumer's full adoption is a universal publication gate.
 - HomeCore transition/observation and OB3 qualification proceed independently. Neither is automatically serialized behind the other.
 

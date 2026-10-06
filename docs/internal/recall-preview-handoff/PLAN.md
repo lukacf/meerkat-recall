@@ -18,7 +18,9 @@ Accepted human constraints:
 4. Implementation assignments should be substantial and independently executable, with each agent in a separate worktree and branch.
 5. This plan belongs to a new agent on another machine, still to be selected.
 
-The one-backend recommendation, wiki/editorial-view deferral, broader correction/restoration restrictions, transport allowlists and other functional cuts are **proposals, not blanket user-approved decisions**. Neither consumer's current feature use defines the independent product's scope. HomeCore's preferred cut retains extraction and promoted knowledge; a retrieval-only service would be a different product cut.
+The one-backend recommendation, wiki/editorial-view deferral, transport allowlists and other functional cuts are **proposals, not blanket user-approved decisions**. Neither consumer's current feature use defines the independent product's scope. HomeCore's preferred cut retains extraction and promoted knowledge; a retrieval-only service would be a different product cut.
+
+**Lifecycle correction:** the earlier blanket proposal to defer "advanced correction/restoration" is withdrawn. Guarded restore, audit revert, temporal supersession/reprocessing and retention/archive recovery already have substantial implementations and test definitions. Preserve and qualify that foundation. Complete source/person erasure is a separate coverage question; no person-level RTBF workflow was found in the inspected current or retained historical source. That is a bounded search result, not proof it never existed or permission to cut it. See [LIFECYCLE-STATUS.md](LIFECYCLE-STATUS.md).
 
 Correctness remains required for every retained capability. A finding affecting exposed behavior needs repair and appropriate qualification, or an explicitly selected and enforced capability restriction. A preview label, documentation warning, hidden tool or disabled adjudicator does not enforce a restriction. Refusal must cover public entry points, direct dispatch, ingestion requests, scheduling, worker claims and replay. Disabled consumers must not start in the background, and readiness must report the capability as absent.
 
@@ -26,8 +28,8 @@ Correctness remains required for every retained capability. A finding affecting 
 | --- | --- | --- |
 | Persistence | Single node using SurrealDB with embedded RocksDB, fresh stores, one supported backup/restore procedure. | One backend is a proposed operational simplification. ElephantDB parity and generic old-store conversion are outside that proposal. It does not reduce the number of supported spaces. |
 | Spaces and security | Named spaces, authorized creation/administration, per-space settings, isolated ingestion/retrieval/provenance, and working recovery in every space. | Required. A separate hosted SaaS account/billing/control plane is not promised. |
-| Knowledge | Real embeddings, extraction, grounded promotion, entities/claims, hybrid search and provenance; current-source revision replacement; an explicitly qualified set of temporal/supersession cases. | Wiki/editorial views, person-level purge and general correction/restoration remain proposed deferrals, not accepted cuts. |
-| Deletion and retraction | Evidence that is deleted or retracted stops ordinary retrieval of records supported only by it. In-flight work cannot resurrect it. | Define the exact supported lifecycle allowlist. Disable a mutation if its full exposed semantics cannot be met. |
+| Knowledge | Real embeddings, extraction, grounded promotion, entities/claims, hybrid search and provenance; current-source revision replacement; existing correction/supersession behavior qualified for supported workflows. | Wiki/editorial views remain a proposed deferral. Reuse existing lifecycle code; do not describe it as wholly absent or presume a blanket cut. |
+| Existing lifecycle, deletion and retraction | Preserve and qualify guarded restore, audit revert, supersession/reprocessing and retention/archive recovery. Deleted or retracted evidence stops ordinary retrieval of records supported only by it; in-flight work cannot resurrect it. | Repair source-head, authorization, propagation and stale-work interactions. Any specific capability restriction requires an explicit scope decision and enforcement. |
 | Source erasure | Remove a selected source's live representations and exclusive derived support, fence stale work, and replay an independently durable erasure journal before restored readiness. | Required for OB3 real-data adoption, recommended for the preview, supported by HomeCore. If deferred, OB3 is synthetic qualification only. It is narrower than a person-discovery/purge engine. |
 | Operations | All-space recovery, attempt fencing, truthful completion, capability-specific readiness, authorized backlog and honest usage labels. | Multi-instance embedding/library guarantees and precise currency accounting are proposed limits. Per-space configuration remains supported in one instance. |
 | Consumers | Independent HomeCore and OB3 branches, documented standalone installation, and supported HTTP/MCP use. | No mandatory Recall crate/backend or MobKit dependency for OB3. Field adoption requires its own evidence. |
@@ -60,6 +62,8 @@ OB3 initially does not need native MCP, PDF conversion, wiki/views, explicit cro
 
 Omitting person entities does not remove personal content from raw documents, chunks, claims or embeddings. OB3 withdrew that proposed shortcut. OB3 can identify affected sources in its own authority and re-ingest corrected text, so its first workflow does not need a generic person-search/purge engine.
 
+Existing per-record hard deletion and age-based retention are real machinery to reuse. They do not, by themselves, establish coordinated removal of a source/person across revisions, derived knowledge, indexes, work history and backups. Map that coverage before selecting new implementation or a narrowly justified restriction; do not start from an assumption that all deletion/correction functionality is missing.
+
 Real-data OB3 adoption requires source-scoped live erasure, preservation of independently supported knowledge, stale-work fencing, bounded backup retention and restore-time erasure replay. The journal must survive restoring an older data snapshot and contain no erased payload. Processor-side retention boundaries must be explicit. HomeCore supports this recommendation for household data too.
 
 This is a consumer adoption requirement and scope recommendation, not user approval to implement it or an automatic universal publication gate. Synthetic OB3 qualification can proceed early if erasure is deferred; it must not be reported as production adoption.
@@ -82,6 +86,8 @@ Sizes are relative planning judgments, not durations: M is bounded implementatio
 ### A. Write-path integrity - XL
 
 Own the canonical plan, operation receipt, event schema, effect idempotency and canonical schema changes. Carry resolved space and authority through lineage, operation identity, records, receipts and events. Grounding, security inheritance, atomic publication and retry reconciliation form one coherent result.
+
+Reuse the existing guarded lifecycle, audit revert, temporal supersession and reprocessing mechanisms. A owns their coherent canonical effects and source-head interactions; B owns the retention/archive, delivery and restore coordination. The lifecycle clarification is an inventory and integration requirement, not an additional rewrite package.
 
 At commit, atomically check space ownership, current source revision/tombstone, policy preconditions and B's authoritative attempt generation. Reject stale publication even if the queue would later reject the attempt's completion. An existing assertion cannot stand for successful completion of all canonical effects, outbox and receipt. External source identity is space-local. Replacement/retraction retire obsolete support without destroying independent support.
 

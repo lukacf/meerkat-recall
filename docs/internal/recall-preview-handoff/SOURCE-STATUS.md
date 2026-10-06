@@ -50,6 +50,8 @@ This disposition reconciles existing reviews and receipts. It is not a new compl
 
 ## New consumer contracts are additional work
 
+The [lifecycle follow-up](LIFECYCLE-STATUS.md), statically checked at the same `f59e6f5` main revision, credits extensive existing delete/restore, audit-revert, supersession/reprocessing and retention/archive behavior. It withdraws the broad correction/restoration deferral proposal. Coordinated source/person erasure remains a separate coverage gap to assess. This clarification does not close F06 or claim tests were executed.
+
 The HomeCore/OB3 discussion specifies source-head generation/CAS at acceptance and publication, revision-aware coverage/results, all-model-operation approved provider binding, and a recommended source-scoped erasure/restore barrier. These are not supplied by PR22's entity CAS or the F01 authorization draft. Their owners and scope distinctions are in the [plan](PLAN.md).
 
 HomeCore needs MCP/native deployment and a bespoke optional transition. OB3 needs HTTP/container deployment and a separate consumer adapter. OB3 real-data adoption requires source-scoped erasure; synthetic qualification can proceed earlier. Neither consumer's full adoption is silently made a universal publication gate.

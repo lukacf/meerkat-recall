@@ -62,6 +62,11 @@ Active path:
 Key behavior:
 - Source-first ingestion is the canonical lifecycle. Doc-ingest entrypoints are
   convenience wrappers that create a `Manual` source first.
+- File and URL PDF ingestion extracts plain text in-process with `pdf-inspector`.
+  Its optional Python and OCR features are disabled. The extracted text enters
+  the same source-first lifecycle as other text documents. A pinned compatibility
+  patch preserves form text, existing OCR text layers, and plain text output; see
+  `vendor/pdf-inspector/ELEPHANT_PATCH.md` for its scope and upgrade tests.
 - Media-backed docs follow the same active path. Image/video inputs are
   attached to the source/doc lineage, `render_doc` produces the canonical text
   projection, and extraction remains downstream of `build_doc_tree`.

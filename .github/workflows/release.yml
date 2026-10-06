@@ -181,7 +181,7 @@ jobs:
           binary = bundle / "elephant"
           shutil.copyfile(pathlib.Path(os.environ["CARGO_TARGET_DIR"], "deploy", "elephant"), binary)
           binary.chmod(0o755)
-          for name in ("LICENSE", "LICENSE-MIT", "LICENSE-APACHE"):
+          for name in ("LICENSE", "LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_NOTICES.md"):
               shutil.copyfile(name, bundle / name)
           shutil.copytree("skills", bundle / "skills")
           provenance = {

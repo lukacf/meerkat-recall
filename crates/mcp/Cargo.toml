@@ -31,7 +31,7 @@ reqwest = { workspace = true }
 walkdir = { workspace = true }
 globset = "0.4"
 zip = "2.2"
-pdf-extract = "0.12.1"
+pdf-inspector = { version = "=1.25.2", default-features = false }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

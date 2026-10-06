@@ -20,6 +20,7 @@ docs/architecture/*
 !docs/architecture/living-wiki.mdx
 *.md
 !README.md
+!THIRD_PARTY_NOTICES.md
 
 # Test files
 # (included so workspace members under tests/ can build)

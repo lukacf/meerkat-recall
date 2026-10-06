@@ -861,7 +861,7 @@ fn extract_text_from_docx(bytes: &[u8]) -> Result<String, McpError> {
 
 fn extract_text_by_source_type(bytes: &[u8], source_type: &str) -> Result<String, McpError> {
     match source_type {
-        "application/pdf" => pdf_extract::extract_text_from_mem(bytes)
+        "application/pdf" => pdf_inspector::extractor::extract_text_mem(bytes)
             .map_err(|e| McpError::ExecutionError(format!("Failed to extract PDF text: {e}"))),
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
             extract_text_from_docx(bytes)
@@ -4219,16 +4219,41 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn pdf_with_catalog_value(value: &str) -> Vec<u8> {
+        pdf_with_text_pages(
+            value,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            &["BT /F1 12 Tf 72 720 Td (Hello Elephant) Tj ET"],
+        )
+    }
+
+    fn pdf_with_text_pages(value: &str, font: &str, streams: &[&str]) -> Vec<u8> {
+        let font_id = 3 + streams.len() * 2;
+        let kids = (0..streams.len())
+            .map(|index| format!("{} 0 R", 3 + index * 2))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut objects = vec![
+            format!("<< /Type /Catalog /Pages 2 0 R /X {value} >>"),
+            format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", streams.len()),
+        ];
+        for (index, stream) in streams.iter().enumerate() {
+            let content_id = 4 + index * 2;
+            objects.push(format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>"
+            ));
+            objects.push(format!(
+                "<< /Length {} >>\nstream\n{stream}\nendstream",
+                stream.len()
+            ));
+        }
+        objects.push(font.to_string());
+        pdf_from_objects(&objects)
+    }
+
+    fn pdf_from_objects(objects: &[String]) -> Vec<u8> {
         use std::fmt::Write;
 
-        let stream = "BT /F1 12 Tf 72 720 Td (Hello Elephant) Tj ET";
-        let objects = [
-            format!("<< /Type /Catalog /Pages 2 0 R /X {value} >>"),
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_string(),
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
-            format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()),
-        ];
+        let object_count = objects.len() + 1;
         let mut pdf = "%PDF-1.4\n".to_string();
         let mut offsets = Vec::new();
         for (index, object) in objects.iter().enumerate() {
@@ -4236,13 +4261,13 @@ mod tests {
             writeln!(pdf, "{} 0 obj\n{object}\nendobj", index + 1).unwrap();
         }
         let xref = pdf.len();
-        writeln!(pdf, "xref\n0 6\n0000000000 65535 f ").unwrap();
+        writeln!(pdf, "xref\n0 {object_count}\n0000000000 65535 f ").unwrap();
         for offset in offsets {
             writeln!(pdf, "{offset:010} 00000 n ").unwrap();
         }
         writeln!(
             pdf,
-            "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF"
+            "trailer\n<< /Size {object_count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF"
         )
         .unwrap();
         pdf.into_bytes()
@@ -4253,6 +4278,163 @@ mod tests {
         let pdf = pdf_with_catalog_value("[]");
         let text = extract_text_by_source_type(&pdf, "application/pdf").unwrap();
         assert!(text.contains("Hello Elephant"), "extracted text: {text:?}");
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_preserves_page_and_line_order() {
+        let pdf = pdf_with_text_pages(
+            "[]",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            &[
+                "BT /F1 12 Tf 72 720 Td (First line) Tj 0 -20 Td (Second line) Tj ET",
+                "BT /F1 12 Tf 72 720 Td (Next page) Tj ET",
+            ],
+        );
+        let text = extract_text_by_source_type(&pdf, "application/pdf").unwrap();
+        assert_eq!(
+            text.split_whitespace().collect::<Vec<_>>(),
+            ["First", "line", "Second", "line", "Next", "page"],
+            "extracted text: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_decodes_winansi_characters() {
+        let pdf = pdf_with_text_pages(
+            "[]",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+            &["BT /F1 12 Tf 72 720 Td <436166E920C5C4D620E5E4F6> Tj ET"],
+        );
+        let text = extract_text_by_source_type(&pdf, "application/pdf").unwrap();
+        assert!(text.contains("Café ÅÄÖ åäö"), "extracted text: {text:?}");
+    }
+
+    fn nested_form_pdf_objects(page: &str) -> Vec<String> {
+        let inner = "BT /F1 12 Tf 0 0 Td (Text inside nested form) Tj ET";
+        let outer = "q 1 0 0 1 72 720 cm /Inner Do Q";
+        vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Outer 5 0 R >> >> /Contents 4 0 R >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{page}\nendstream", page.len()),
+            format!("<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /XObject << /Inner 6 0 R >> >> /Length {} >>\nstream\n{outer}\nendstream", outer.len()),
+            format!("<< /Type /XObject /Subtype /Form /BBox [0 0 300 20] /Resources << /Font << /F1 7 0 R >> >> /Length {} >>\nstream\n{inner}\nendstream", inner.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ]
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_reads_nested_form_xobjects() {
+        let pdf = pdf_from_objects(&nested_form_pdf_objects("/Outer Do"));
+        let text = extract_text_by_source_type(&pdf, "application/pdf").unwrap();
+        assert_eq!(text.trim(), "Text inside nested form");
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_inherits_nearest_page_resources() {
+        let mut objects = nested_form_pdf_objects("/Outer Do");
+        objects[1] = "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /XObject << /Outer 5 0 R >> >> >>".to_string();
+        objects[2] =
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_string();
+        let text =
+            extract_text_by_source_type(&pdf_from_objects(&objects), "application/pdf").unwrap();
+        assert_eq!(text.trim(), "Text inside nested form");
+
+        // An explicit child dictionary shadows the parent's resources, even if empty.
+        objects[2] = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>".to_string();
+        let text =
+            extract_text_by_source_type(&pdf_from_objects(&objects), "application/pdf").unwrap();
+        assert!(text.trim().is_empty(), "extracted text: {text:?}");
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_rejects_partial_document_at_page_operation_limit() {
+        let oversized = "q ".repeat(1_000_001);
+        let pdf = pdf_with_text_pages(
+            "[]",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            &["BT /F1 12 Tf 72 720 Td (Good first page) Tj ET", &oversized],
+        );
+        let error = extract_text_by_source_type(&pdf, "application/pdf").unwrap_err();
+        assert!(
+            matches!(error, McpError::ExecutionError(message) if message.contains("page 2") && message.contains("operation limit"))
+        );
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_rejects_partial_form_expansion() {
+        let pdf = pdf_from_objects(&nested_form_pdf_objects(&"/Outer Do ".repeat(5_001)));
+        let error = extract_text_by_source_type(&pdf, "application/pdf").unwrap_err();
+        assert!(
+            matches!(error, McpError::ExecutionError(message) if message.contains("Form XObject") && message.contains("completely"))
+        );
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_preserves_short_invisible_ocr_text() {
+        let pdf = pdf_with_text_pages(
+            "[]",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            &["BT /F1 12 Tf 3 Tr 72 720 Td (OCR 123) Tj ET"],
+        );
+        let text = extract_text_by_source_type(&pdf, "application/pdf").unwrap();
+        assert_eq!(text.trim(), "OCR 123");
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_keeps_visible_and_invisible_text_on_same_page() {
+        let pdf = pdf_with_text_pages(
+            "[]",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            &["BT /F1 12 Tf 72 720 Td (Visible header) Tj 0 -20 Td 3 Tr (OCR body) Tj ET"],
+        );
+        let text = extract_text_by_source_type(&pdf, "application/pdf").unwrap();
+        assert_eq!(text.trim(), "Visible header\nOCR body");
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_preserves_numeric_footers() {
+        let pdf = pdf_with_text_pages(
+            "[]",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            &[
+                "BT /F1 12 Tf 72 720 Td (First page) Tj 228 -700 Td (1) Tj ET",
+                "BT /F1 12 Tf 72 720 Td (Second page) Tj 228 -700 Td (2) Tj ET",
+            ],
+        );
+        let text = extract_text_by_source_type(&pdf, "application/pdf").unwrap();
+        assert_eq!(text.trim(), "First page\n1\nSecond page\n2");
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_preserves_literal_markup_without_adding_tags() {
+        let pdf = pdf_with_text_pages(
+            "[]",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            &["BT /F1 12 Tf 72 720 Td (x) Tj /F1 8 Tf 5 Ts (a) Tj 0 Ts /F1 12 Tf 0 -30 Td (<sup>literal</sup>) Tj ET"],
+        );
+        let text = extract_text_by_source_type(&pdf, "application/pdf").unwrap();
+        assert_eq!(text.trim(), "xa\n<sup>literal</sup>");
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_rejects_invalid_input() {
+        let error = extract_text_by_source_type(b"not a PDF", "application/pdf").unwrap_err();
+        assert!(matches!(
+            error,
+            McpError::ExecutionError(message) if message.starts_with("Failed to extract PDF text:")
+        ));
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_returns_empty_for_a_blank_page() {
+        let pdf = pdf_with_text_pages(
+            "[]",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            &[""],
+        );
+        let text = extract_text_by_source_type(&pdf, "application/pdf").unwrap();
+        assert!(text.trim().is_empty(), "extracted text: {text:?}");
     }
 
     #[test]

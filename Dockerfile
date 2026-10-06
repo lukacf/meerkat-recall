@@ -11,6 +11,7 @@ FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY vendor/ vendor/
 COPY bin/ bin/
 COPY skills/ skills/
 COPY tests/ tests/
@@ -35,6 +36,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=planner /app/recipe.json recipe.json
+# cargo-chef does not reconstruct excluded path dependencies.
+COPY vendor/ vendor/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
@@ -42,6 +45,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY vendor/ vendor/
 COPY bin/ bin/
 COPY skills/ skills/
 COPY tests/ tests/
@@ -78,7 +82,7 @@ COPY --from=builder /tmp/elephant /usr/local/bin/
 # Copy migrations (SQL files)
 COPY --from=builder /app/crates/migrations/sql/ /app/migrations/
 COPY --from=builder /app/skills/ /app/skills/
-COPY LICENSE LICENSE-MIT LICENSE-APACHE /usr/share/licenses/elephant/
+COPY LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md /usr/share/licenses/elephant/
 
 # Set ownership
 RUN chown -R elephant:elephant /app

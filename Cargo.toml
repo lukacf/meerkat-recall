@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/pdf-inspector"]
 members = [
     "crates/types",
     "crates/elephant-db",
@@ -171,3 +172,7 @@ tag-message = "Release v{{version}}"
 pre-release-hook = ["bash", "-c", "$(git rev-parse --show-toplevel)/scripts/release-hook.sh {{version}}"]
 publish = false
 push = true
+
+# Preserve PDF text extraction behavior until the compatibility patch is upstream.
+[patch.crates-io]
+pdf-inspector = { path = "vendor/pdf-inspector" }

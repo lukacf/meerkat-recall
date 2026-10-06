@@ -52,3 +52,7 @@ putting-it-together-full.png
 # OS
 .DS_Store
 Thumbs.db
+
+# Preserve the pinned dependency exactly, including source metadata and license.
+!vendor/
+!vendor/**

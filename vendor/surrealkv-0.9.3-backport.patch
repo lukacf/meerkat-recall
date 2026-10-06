@@ -1,0 +1,73 @@
+--- a/src/snapshot.rs
++++ b/src/snapshot.rs
+@@ -19,8 +19,10 @@
+         let index = store.indexer.read();
+         let index_version = index.version();
+ 
+-        // Calculate the snapshot version as one greater than the current read timestamp.
+-        let read_version = store.read_ts() + 1;
++        // Tag the cloned index with its published version. The oracle can already
++        // include a commit whose index has not yet been published; using that
++        // version would hide the writer from conflict detection.
++        let read_version = index_version + 1;
+ 
+         // Ensure that the snapshot read version is not older than the current index version.
+         if read_version < index_version {
+--- a/src/transaction.rs
++++ b/src/transaction.rs
+@@ -4381,3 +4381,55 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod publication_race_regression {
++    use crate::transaction::Durability;
++    use crate::{Options, Store};
++
++    #[test]
++    fn snapshot_cannot_claim_unpublished_commit_version() {
++        for enable_versions in [false, true] {
++            let mut opts = Options::new();
++            opts.disk_persistence = false;
++            opts.enable_versions = enable_versions;
++            let store = Store::new(opts).unwrap();
++            let mut initial = store.begin().unwrap();
++            initial.set(b"hot", b"failed").unwrap();
++            initial.commit().unwrap();
++
++            let mut retry = store.begin().unwrap();
++            retry.set(b"hot", b"runnable").unwrap();
++            // Pause the actual commit phases after assigning its version, but
++            // before publishing its index. No scheduling or sleeps are needed.
++            let retry_commit_version = store.core.oracle.new_commit_ts(&retry).unwrap();
++            let mut archiver = store.begin().unwrap();
++            assert_eq!(archiver.get(b"hot").unwrap(), Some(b"failed".to_vec()));
++            assert!(archiver.read_ts < retry_commit_version);
++            let entries = std::mem::take(&mut retry.write_set)
++                .into_values()
++                .flatten()
++                .map(|entry| entry.e)
++                .collect();
++            store
++                .core
++                .write_entries(entries, retry_commit_version, Durability::Eventual)
++                .unwrap();
++            assert_eq!(
++                store.begin().unwrap().get(b"hot").unwrap(),
++                Some(b"runnable".to_vec())
++            );
++            archiver.set(b"cold", b"failed").unwrap();
++            archiver.soft_delete(b"hot").unwrap();
++            assert!(
++                matches!(archiver.commit(), Err(crate::Error::TransactionWriteConflict)),
++                "stale archiver must conflict after acknowledged retry"
++            );
++            assert_eq!(
++                store.begin().unwrap().get(b"hot").unwrap(),
++                Some(b"runnable".to_vec())
++            );
++            assert_eq!(store.begin().unwrap().get(b"cold").unwrap(), None);
++        }
++    }
++}

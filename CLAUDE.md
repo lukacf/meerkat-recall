@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Elephant is a unified knowledge system built in Rust using SurrealDB and the embedded `elephant-db` runtime. It provides entity management, relationship traversal, identity resolution, assertion storage, source-first document pipelines, truth maintenance, and ABAC-based policy enforcement.
+Meerkat Recall is a unified knowledge system built in Rust using SurrealDB and the embedded `elephant-db` runtime. It provides entity management, relationship traversal, identity resolution, assertion storage, source-first document pipelines, truth maintenance, and ABAC-based policy enforcement.
 
 ## Build & Development Commands
 
@@ -19,7 +19,7 @@ make lint
 make test-unit
 
 ./scripts/repo-cargo test -p elephant-pipeline test_name
-./scripts/repo-cargo run -p elephant-bin -- serve
+./scripts/repo-cargo run -p meerkat-recall-bin -- serve
 ```
 
 Read `docs/active-architecture.md` and `docs/non-active-catalog.md` before editing
@@ -29,7 +29,7 @@ live provider tests are opt-in; see `CONTRIBUTING.md`.
 ## Workspace Structure
 
 **Binaries** (`bin/`):
-- `elephant` (`elephant-bin`) - Primary CLI: serve, worker, migrate, status, snapshot, data-migrate and demo-wiki
+- `elephant` (`meerkat-recall-bin`) - Primary CLI: serve, worker, migrate, status, snapshot, data-migrate and demo-wiki
 - `elephant-api` - HTTP API server (Axum, port 3000)
 - `elephant-pipeline` - Background worker runtime for ingest, embedding, maintenance, and truth maintenance
 

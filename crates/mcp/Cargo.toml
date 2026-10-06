@@ -7,6 +7,7 @@ license.workspace = true
 description = "MCP tool definitions and dispatcher for Elephant"
 
 [dependencies]
+elephant-auth = { path = "../auth" }
 elephant-types = { path = "../types" }
 elephant-storage = { path = "../storage" }
 elephant-policy = { path = "../policy" }

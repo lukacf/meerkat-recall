@@ -1,13 +1,13 @@
 ---
 title: Binary installation
-description: Verify and install an Elephant candidate archive, then configure its model-backed demo.
+description: Verify and install a Meerkat Recall candidate archive, then configure its model-backed demo.
 icon: download
 ---
 
 Candidate archives are prepared for Linux x86-64 and macOS ARM64. This page
 explains how to install an archive supplied with its matching release record;
 it does not announce a public release or an available download. The source
-currently declares `0.1.0` with Meerkat `0.8.45`. See
+currently declares `0.1.0` with Meerkat `0.8.51`. See
 [release binaries](/operations/deployment#release-binaries) for the promotion process
 and build provenance requirements.
 
@@ -15,8 +15,8 @@ and build provenance requirements.
 
 | Target | Archive name |
 |---|---|
-| Linux x86-64 | `elephant-0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS ARM64 (Apple Silicon) | `elephant-0.1.0-aarch64-apple-darwin.tar.gz` |
+| Linux x86-64 | `meerkat-recall-0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS ARM64 (Apple Silicon) | `meerkat-recall-0.1.0-aarch64-apple-darwin.tar.gz` |
 
 The candidate workflow builds Linux on Ubuntu 22.04 and macOS on a native
 ARM64 runner. Check the selected release's actual host and dynamic-library
@@ -34,9 +34,9 @@ instructions, not a record that either target has passed a clean-machine test.
 
 ## Verify, unpack, and install
 
-The archives have a flat layout: `elephant`, `LICENSE`, `LICENSE-MIT`,
-`LICENSE-APACHE`, `provenance.json`, and the `skills/` tree are at the archive
-root. A private candidate may also include `CANDIDATE.txt`. There is no nested
+The archives have a flat layout: `meerkat-recall`, its `elephant` compatibility
+symlink, `LICENSE`, `LICENSE-MIT`, `LICENSE-APACHE`, `THIRD_PARTY_NOTICES.md`,
+`provenance.json`, `third-party/`, and the `skills/` tree are at the archive root. A private candidate may also include `CANDIDATE.txt`. There is no nested
 version directory and no `bin/` prefix. Extract into a new directory
 so the bundled license and provenance files remain together.
 
@@ -45,18 +45,21 @@ so the bundled license and provenance files remain together.
     ```bash
     (
     set -eu
-    archive=elephant-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+    archive=meerkat-recall-0.1.0-x86_64-unknown-linux-gnu.tar.gz
     sha256sum --check "${archive%.tar.gz}.sha256"
     bundle_dir="$PWD/${archive%.tar.gz}"
     mkdir "$bundle_dir"
     tar -xzf "$archive" -C "$bundle_dir"
     jq . "$bundle_dir/provenance.json"
     printf '%s  %s\n' "$(jq -r '.binary_sha256' "$bundle_dir/provenance.json")" \
-      "$bundle_dir/elephant" | sha256sum --check
-    "$bundle_dir/elephant" --help
+      "$bundle_dir/meerkat-recall" | sha256sum --check
+    "$bundle_dir/meerkat-recall" --version
+    "$bundle_dir/elephant" --version
+    "$bundle_dir/meerkat-recall" --help
     install -d "$HOME/.local/bin"
-    install -m 0755 "$bundle_dir/elephant" "$HOME/.local/bin/elephant"
-    "$HOME/.local/bin/elephant" --help
+    install -m 0755 "$bundle_dir/meerkat-recall" "$HOME/.local/bin/meerkat-recall"
+    ln -s meerkat-recall "$HOME/.local/bin/elephant"
+    "$HOME/.local/bin/meerkat-recall" --version
     )
     ```
   </Tab>
@@ -64,18 +67,21 @@ so the bundled license and provenance files remain together.
     ```bash
     (
     set -eu
-    archive=elephant-0.1.0-aarch64-apple-darwin.tar.gz
+    archive=meerkat-recall-0.1.0-aarch64-apple-darwin.tar.gz
     shasum -a 256 --check "${archive%.tar.gz}.sha256"
     bundle_dir="$PWD/${archive%.tar.gz}"
     mkdir "$bundle_dir"
     tar -xzf "$archive" -C "$bundle_dir"
     jq . "$bundle_dir/provenance.json"
     printf '%s  %s\n' "$(jq -r '.binary_sha256' "$bundle_dir/provenance.json")" \
-      "$bundle_dir/elephant" | shasum -a 256 --check
-    "$bundle_dir/elephant" --help
+      "$bundle_dir/meerkat-recall" | shasum -a 256 --check
+    "$bundle_dir/meerkat-recall" --version
+    "$bundle_dir/elephant" --version
+    "$bundle_dir/meerkat-recall" --help
     install -d "$HOME/.local/bin"
-    install -m 0755 "$bundle_dir/elephant" "$HOME/.local/bin/elephant"
-    "$HOME/.local/bin/elephant" --help
+    install -m 0755 "$bundle_dir/meerkat-recall" "$HOME/.local/bin/meerkat-recall"
+    ln -s meerkat-recall "$HOME/.local/bin/elephant"
+    "$HOME/.local/bin/meerkat-recall" --version
     )
     ```
   </Tab>
@@ -84,8 +90,10 @@ so the bundled license and provenance files remain together.
 Stop if a checksum check fails or the provenance does not match the supplied
 release record. Retain the extracted licenses and provenance. Add
 `$HOME/.local/bin` to your shell's normal `PATH` configuration for future
-sessions. The current binary does not implement `--version`; use the verified
-provenance and executable digest to identify it.
+sessions. These commands assume a fresh installation. If the legacy `elephant`
+path already exists, retain its rollback copy before replacing it with the
+compatibility alias. `--version` identifies the package version; provenance and
+the executable digest identify the exact build.
 
 ## Run the model-backed demo
 
@@ -103,10 +111,10 @@ provider or a different verifier, configure credentials for both selections.
 
 ```bash
 # Configure provider credentials in this shell before running the demo.
-elephant demo-wiki
+meerkat-recall demo-wiki
 ```
 
-Use `elephant demo-wiki --port 3100` if port 3000 is occupied. When startup
+Use `meerkat-recall demo-wiki --port 3100` if port 3000 is occupied. When startup
 finishes, inspect the printed article-generation results and the context
 projection, compilation receipt, and source evidence at the printed loopback
 URLs. Do not count missing credentials, failed model calls, or blocked articles
@@ -129,7 +137,7 @@ the server or standalone worker that performs extraction:
 
 ```bash
 # Replace this with the absolute skills path in your retained bundle.
-export PIPELINE_SKILLS_DIR="/absolute/path/to/extracted-elephant/skills"
+export PIPELINE_SKILLS_DIR="/absolute/path/to/extracted-recall/skills"
 ```
 
 For a service, configure the same value in its service environment. For a

@@ -28,7 +28,7 @@ Archive tables grow as retained history; the hot scheduler tables no longer need
 
 Embedded SurrealDB receives finite query and transaction limits at connection time, defaulting to 30 seconds. Configure positive integer seconds with `SURREALDB_QUERY_TIMEOUT_SECS` and `SURREALDB_TRANSACTION_TIMEOUT_SECS`, or the corresponding runtime storage configuration fields. Restart the process to apply a deadline change to an open persistent embedded database. Live reconfiguration cannot reopen the same RocksDB store while its existing connection owns the store lock.
 
-SurrealDB 2.6.5 stores its transaction option without enforcing it. Elephant therefore gives the engine the shorter of the two configured limits as the query-batch deadline. A long explicit transaction is cancelled and rolled back under that deadline. This also means a multi-statement query can end at the shorter transaction setting.
+SurrealDB 2.6.5 stores its transaction option without enforcing it. Meerkat Recall therefore gives the engine the shorter of the two configured limits as the query-batch deadline. A long explicit transaction is cancelled and rolled back under that deadline. This also means a multi-statement query can end at the shorter transaction setting.
 
 Remote SurrealDB ignores these client-side execution options. Set a finite deadline on the database server itself. The repository's Compose service supplies `--query-timeout`, configurable with `SURREAL_QUERY_TIMEOUT` (default `30s`). A timeout on the caller alone does not prove database cancellation.
 

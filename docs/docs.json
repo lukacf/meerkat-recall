@@ -1,6 +1,6 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "name": "Elephant",
+  "name": "Meerkat Recall",
   "description": "A unified knowledge system with entity management, document pipelines, and truth maintenance",
   "theme": "maple",
   "colors": {
@@ -12,7 +12,7 @@
     "links": [
       {
         "label": "GitHub",
-        "href": "https://github.com/lukacf/elephant"
+        "href": "https://github.com/lukacf/meerkat-recall"
       }
     ]
   },
@@ -141,7 +141,7 @@
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/lukacf/elephant"
+      "github": "https://github.com/lukacf/meerkat-recall"
     }
   }
 }

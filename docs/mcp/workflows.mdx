@@ -4,7 +4,7 @@ description: "Chain tool results into evidence retrieval, ingestion, identity re
 icon: "list-check"
 ---
 
-Use these workflows when you already have an MCP client connected to Elephant.
+Use these workflows when you already have an MCP client connected to Meerkat Recall.
 Each JSON block contains the arguments for the named tool. Your MCP client wraps
 those arguments in a `tools/call` request. Angle-bracket values are placeholders:
 replace them with complete IDs returned by earlier calls.
@@ -23,7 +23,7 @@ space authorization. Check `tools/list` on your actual connection.
 | Review and merge duplicate identities | `/mcp/maintenance` or `/mcp/full` | Requires maintenance writes |
 | Validate and approve a staged predicate artifact | `/mcp/full` | Validation is a Full-profile tool |
 
-Check MCP errors and, for core handlers, the Elephant response envelope:
+Check MCP errors and, for core handlers, the Meerkat Recall response envelope:
 `ok: false` is a failed operation even if transport succeeded. Carry values from
 `data` only after success. Runtime-control tools such as `get_runtime_status`
 return JSON directly, without this envelope. Keep the same authenticated space

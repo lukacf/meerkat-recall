@@ -1,0 +1,2026 @@
+{
+  "contract_version": {
+    "major": 1,
+    "minor": 0
+  },
+  "cases": [
+    {
+      "id": "governed-v1-exact-compatible",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [
+          "qualified_identity",
+          "retained_work_association",
+          "attenuating_delegation",
+          "conjunctive_decisions",
+          "exact_operation_binding",
+          "participating_authority_fence",
+          "durable_security_evidence",
+          "conservative_dependencies",
+          "current_audience_release",
+          "rollback_resistance"
+        ],
+        "obligations": [
+          "durable_entry_receipt",
+          "durable_settlement_receipt",
+          "current_resource_use",
+          "current_recipient_release",
+          "preserve_dependencies",
+          "confine_secrets"
+        ]
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "compatible"
+    },
+    {
+      "id": "missing-required-profile-does-not-mean-embedded",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "semantics": [
+          "qualified_identity",
+          "retained_work_association",
+          "attenuating_delegation",
+          "conjunctive_decisions",
+          "exact_operation_binding",
+          "participating_authority_fence",
+          "durable_security_evidence",
+          "conservative_dependencies",
+          "current_audience_release",
+          "rollback_resistance"
+        ],
+        "obligations": [
+          "durable_entry_receipt",
+          "durable_settlement_receipt",
+          "current_resource_use",
+          "current_recipient_release",
+          "preserve_dependencies",
+          "confine_secrets"
+        ]
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "decode_refusal"
+    },
+    {
+      "id": "unknown-obligation-is-not-ignored",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [
+          "qualified_identity",
+          "retained_work_association",
+          "attenuating_delegation",
+          "conjunctive_decisions",
+          "exact_operation_binding",
+          "participating_authority_fence",
+          "durable_security_evidence",
+          "conservative_dependencies",
+          "current_audience_release",
+          "rollback_resistance"
+        ],
+        "obligations": [
+          "durable_entry_receipt",
+          "durable_settlement_receipt",
+          "current_resource_use",
+          "current_recipient_release",
+          "preserve_dependencies",
+          "confine_secrets",
+          "future_release_authority"
+        ]
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "decode_refusal"
+    },
+    {
+      "id": "unknown-security-field-is-not-ignored",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [
+          "qualified_identity",
+          "retained_work_association",
+          "attenuating_delegation",
+          "conjunctive_decisions",
+          "exact_operation_binding",
+          "participating_authority_fence",
+          "durable_security_evidence",
+          "conservative_dependencies",
+          "current_audience_release",
+          "rollback_resistance"
+        ],
+        "obligations": [
+          "durable_entry_receipt",
+          "durable_settlement_receipt",
+          "current_resource_use",
+          "current_recipient_release",
+          "preserve_dependencies",
+          "confine_secrets"
+        ],
+        "allow_unaudited": true
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "decode_refusal"
+    },
+    {
+      "id": "future-minor-advertisements-do-not-implement-semantics",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 1
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [
+          "qualified_identity",
+          "retained_work_association",
+          "attenuating_delegation",
+          "conjunctive_decisions",
+          "exact_operation_binding",
+          "participating_authority_fence",
+          "durable_security_evidence",
+          "conservative_dependencies",
+          "current_audience_release",
+          "rollback_resistance"
+        ],
+        "obligations": [
+          "durable_entry_receipt",
+          "durable_settlement_receipt",
+          "current_resource_use",
+          "current_recipient_release",
+          "preserve_dependencies",
+          "confine_secrets"
+        ]
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 1
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 1
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 1
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 1
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "unknown_version"
+    },
+    {
+      "id": "remote-cannot-drop-settlement-evidence",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [
+          "qualified_identity",
+          "retained_work_association",
+          "attenuating_delegation",
+          "conjunctive_decisions",
+          "exact_operation_binding",
+          "participating_authority_fence",
+          "durable_security_evidence",
+          "conservative_dependencies",
+          "current_audience_release",
+          "rollback_resistance"
+        ],
+        "obligations": [
+          "durable_entry_receipt",
+          "durable_settlement_receipt",
+          "current_resource_use",
+          "current_recipient_release",
+          "preserve_dependencies",
+          "confine_secrets"
+        ]
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "unsupported_obligation_remote"
+    },
+    {
+      "id": "local-cannot-borrow-remote-release-support",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [
+          "qualified_identity",
+          "retained_work_association",
+          "attenuating_delegation",
+          "conjunctive_decisions",
+          "exact_operation_binding",
+          "participating_authority_fence",
+          "durable_security_evidence",
+          "conservative_dependencies",
+          "current_audience_release",
+          "rollback_resistance"
+        ],
+        "obligations": [
+          "durable_entry_receipt",
+          "durable_settlement_receipt",
+          "current_resource_use",
+          "current_recipient_release",
+          "preserve_dependencies",
+          "confine_secrets"
+        ]
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "unsupported_obligation_local"
+    },
+    {
+      "id": "retained-governed-work-cannot-downgrade",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [
+          "qualified_identity",
+          "retained_work_association",
+          "attenuating_delegation",
+          "conjunctive_decisions",
+          "exact_operation_binding",
+          "participating_authority_fence",
+          "durable_security_evidence",
+          "conservative_dependencies",
+          "current_audience_release",
+          "rollback_resistance"
+        ],
+        "obligations": [
+          "durable_entry_receipt",
+          "durable_settlement_receipt",
+          "current_resource_use",
+          "current_recipient_release",
+          "preserve_dependencies",
+          "confine_secrets"
+        ]
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "unsupported_profile_remote"
+    },
+    {
+      "id": "remote-newer-version-is-not-implicitly-compatible",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [
+          "qualified_identity",
+          "retained_work_association",
+          "attenuating_delegation",
+          "conjunctive_decisions",
+          "exact_operation_binding",
+          "participating_authority_fence",
+          "durable_security_evidence",
+          "conservative_dependencies",
+          "current_audience_release",
+          "rollback_resistance"
+        ],
+        "obligations": [
+          "durable_entry_receipt",
+          "durable_settlement_receipt",
+          "current_resource_use",
+          "current_recipient_release",
+          "preserve_dependencies",
+          "confine_secrets"
+        ]
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 2,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 2,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "unsupported_version_remote"
+    },
+    {
+      "id": "empty-wire-sets-cannot-drop-durable-governed-semantics",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [],
+        "obligations": []
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "unsupported_semantic_remote"
+    },
+    {
+      "id": "empty-wire-sets-still-negotiate-full-baseline",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [],
+        "obligations": []
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "compatible"
+    },
+    {
+      "id": "unknown-advertised-meaning-refuses-v1-decoding",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [
+          "qualified_identity",
+          "retained_work_association",
+          "attenuating_delegation",
+          "conjunctive_decisions",
+          "exact_operation_binding",
+          "participating_authority_fence",
+          "durable_security_evidence",
+          "conservative_dependencies",
+          "current_audience_release",
+          "rollback_resistance"
+        ],
+        "obligations": [
+          "durable_entry_receipt",
+          "durable_settlement_receipt",
+          "current_resource_use",
+          "current_recipient_release",
+          "preserve_dependencies",
+          "confine_secrets"
+        ]
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance",
+              "unrecognized_security_semantics"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance",
+              "unrecognized_security_semantics"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "decode_refusal"
+    },
+    {
+      "id": "support-cannot-be-borrowed-from-a-different-profile",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [
+          "qualified_identity",
+          "retained_work_association",
+          "attenuating_delegation",
+          "conjunctive_decisions",
+          "exact_operation_binding",
+          "participating_authority_fence",
+          "durable_security_evidence",
+          "conservative_dependencies",
+          "current_audience_release",
+          "rollback_resistance"
+        ],
+        "obligations": [
+          "durable_entry_receipt",
+          "durable_settlement_receipt",
+          "current_resource_use",
+          "current_recipient_release",
+          "preserve_dependencies",
+          "confine_secrets"
+        ]
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "unsupported_obligation_remote"
+    },
+    {
+      "id": "duplicate-support-does-not-create-implicit-rule-order",
+      "required": {
+        "version": {
+          "major": 1,
+          "minor": 0
+        },
+        "profile": "governed_buffered_v1",
+        "semantics": [
+          "qualified_identity",
+          "retained_work_association",
+          "attenuating_delegation",
+          "conjunctive_decisions",
+          "exact_operation_binding",
+          "participating_authority_fence",
+          "durable_security_evidence",
+          "conservative_dependencies",
+          "current_audience_release",
+          "rollback_resistance"
+        ],
+        "obligations": [
+          "durable_entry_receipt",
+          "durable_settlement_receipt",
+          "current_resource_use",
+          "current_recipient_release",
+          "preserve_dependencies",
+          "confine_secrets"
+        ]
+      },
+      "local": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "remote": {
+        "contracts": [
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "trusted_embedded",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          },
+          {
+            "version": {
+              "major": 1,
+              "minor": 0
+            },
+            "profile": "governed_buffered_v1",
+            "semantics": [
+              "qualified_identity",
+              "retained_work_association",
+              "attenuating_delegation",
+              "conjunctive_decisions",
+              "exact_operation_binding",
+              "participating_authority_fence",
+              "durable_security_evidence",
+              "conservative_dependencies",
+              "current_audience_release",
+              "rollback_resistance"
+            ],
+            "obligations": [
+              "durable_entry_receipt",
+              "durable_settlement_receipt",
+              "current_resource_use",
+              "current_recipient_release",
+              "preserve_dependencies",
+              "confine_secrets"
+            ]
+          }
+        ]
+      },
+      "expected": "ambiguous_support_remote"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Elephant will be documented in this file.
+All notable changes to Meerkat Recall will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
@@ -16,15 +16,24 @@ does not by itself establish a published release.
   database execution deadlines to address growing-queue saturation.
 - Direct budget-record reads and indexed daily ledger aggregation prevent
   budget checks from scanning the complete accounting history.
-- Meerkat 0.8.45, current MCP/PDF dependencies, and stricter API authorization
+- Retention and retry transactions preserve acknowledged updates across the
+  active/archive boundary. A pinned SurrealKV snapshot-publication backport
+  fixes the corresponding in-process engine race; remote database servers
+  require their own engine correction.
+- Meerkat 0.8.51, current MCP/PDF dependencies, and stricter API authorization
   and ingestion error handling. This candidate keeps the six direct Meerkat
-  family dependencies at exactly 0.8.45; it does not upgrade to a 0.9 platform
+  family dependencies at exactly 0.8.51; it does not upgrade to a 0.9 platform
   or establish compatibility with a separately installed MobKit release.
 - Dual licensing under MIT OR Apache-2.0.
 
 ### Security
 - An explicitly empty `subject_allowlist` remains a restriction. Ordinary
-  entity updates and batch upserts cannot change existing `Security` fields.
+  entity updates and batch upserts cannot change existing `Security`, `subjects`
+  or `subjects_state` fields, and compare the complete authorized snapshot in
+  the write to reject stale replacements.
+- HTTP and MCP authentication share the token verifier and retain the verified
+  legacy caller identity through dispatch. Operation-bound exchange verification
+  remains separate groundwork; resource routes continue refusing exchange tokens.
 - Multiword document and assertion text queries keep every term inside the
   selected space and soft-deletion filters, including their count queries.
 - Assertion delete and restore routes check record write authorization.
@@ -46,6 +55,13 @@ does not by itself establish a published release.
   a conflict instead of being overwritten by the update.
 - Assertion search counts only authorized matching rows, including queries
   filtered by an entity link and requests continued with a cursor.
+- Independent V1 restriction and protected dependency contracts preserve exact
+  ceilings, unresolved contributors and source-local policy observations through
+  ordinary derivation. Shared normalized vectors exercise this pure algebra;
+  no active source, tool, provider or recipient boundary consumes it yet.
+- Independent security contract compatibility negotiation refuses unknown
+  versions, missing duties and profile downgrades against the shared Meerkat
+  vectors. This prerequisite does not enable governed HTTP/MCP dispatch.
 - Incoming MCP requests use only the caller's Authorization header; internal
   worker credentials no longer replace missing or restricted caller credentials.
 - Authenticated server startup rejects missing or short signing secrets and
@@ -55,6 +71,15 @@ does not by itself establish a published release.
   limits fixture exceptions to their exact synthetic values and source paths.
 
 ### Release tooling
+- The product and native command are Meerkat Recall and `meerkat-recall`.
+  Archives retain an `elephant` executable alias for the 0.1 line; configuration,
+  data and HTTP/MCP wire identifiers keep their existing spelling.
+- `--version` identifies the package version. `status --require-ready` fails
+  unless health and semantic ingestion are ready, with bounded HTTP requests
+  and diagnostic JSON preserved on stdout.
+- Snapshot migration preflight rejects any occupied target table, unverifiable
+  metadata and unsupported source extensions before schema/data writes. Reports
+  never overwrite existing files, and partial-copy failures remain explicit.
 - Release candidates are built explicitly for Linux x86-64 and macOS ARM64
   with RocksDB and the default Meerkat extraction support.
 - Candidate archives include license texts, source/build provenance, and flat
@@ -129,4 +154,4 @@ does not by itself establish a published release.
 - Space-based tenant isolation
 - Field-level redaction policies
 
-[Unreleased]: https://github.com/lukacf/elephant/commits/main
+[Unreleased]: https://github.com/lukacf/meerkat-recall/commits/main

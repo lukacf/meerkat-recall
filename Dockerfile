@@ -10,8 +10,8 @@ RUN cargo install cargo-chef --locked
 FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock ./
-COPY crates/ crates/
 COPY vendor/ vendor/
+COPY crates/ crates/
 COPY bin/ bin/
 COPY skills/ skills/
 COPY tests/ tests/
@@ -44,8 +44,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo chef cook --locked --release --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
-COPY crates/ crates/
 COPY vendor/ vendor/
+COPY crates/ crates/
 COPY bin/ bin/
 COPY skills/ skills/
 COPY tests/ tests/
@@ -58,8 +58,8 @@ COPY docs/architecture/living-wiki.mdx docs/architecture/living-wiki.mdx
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --locked --release -p elephant-bin --features meerkat-extraction && \
-    cp /app/target/release/elephant /tmp/
+    cargo build --locked --release -p meerkat-recall-bin --features meerkat-extraction && \
+    cp /app/target/release/meerkat-recall /tmp/
 
 # Runtime stage
 FROM debian:bookworm-slim AS runtime
@@ -77,12 +77,15 @@ RUN useradd -r -s /bin/false elephant
 WORKDIR /app
 
 # Copy binaries from builder (from /tmp/ since target is a cache mount)
-COPY --from=builder /tmp/elephant /usr/local/bin/
+COPY --from=builder /tmp/meerkat-recall /usr/local/bin/
+RUN ln -s meerkat-recall /usr/local/bin/elephant
 
 # Copy migrations (SQL files)
 COPY --from=builder /app/crates/migrations/sql/ /app/migrations/
 COPY --from=builder /app/skills/ /app/skills/
 COPY LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md /usr/share/licenses/elephant/
+COPY vendor/surrealkv-0.9.3/LICENSE /usr/share/licenses/elephant/surrealkv-0.9.3/LICENSE
+COPY vendor/surrealkv-0.9.3-backport.md vendor/surrealkv-0.9.3-backport.patch vendor/surrealkv-0.9.3-upstream-sha256.json /usr/share/licenses/elephant/
 
 # Set ownership
 RUN chown -R elephant:elephant /app
@@ -104,4 +107,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3000/v1/health || exit 1
 
-CMD ["elephant", "serve"]
+CMD ["meerkat-recall", "serve"]

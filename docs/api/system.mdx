@@ -46,7 +46,7 @@ curl http://localhost:3000/v1/runtime/status
 </CodeGroup>
 
 Use this endpoint to distinguish:
-- Elephant unreachable
+- Meerkat Recall unreachable
 - reachable but not configured
 - configured but not ingest-ready
 - fully semantic-ingest ready
@@ -54,11 +54,11 @@ Use this endpoint to distinguish:
 `config_path` is intentionally not exposed here. The response is safe for unauthenticated bootstrap/readiness checks.
 
 <ResponseField name="configured" type="boolean" required>
-  Whether Elephant has a persisted config or equivalent env-driven runtime configuration.
+  Whether Meerkat Recall has a persisted config or equivalent env-driven runtime configuration.
 </ResponseField>
 
 <ResponseField name="bootstrap_mode" type="boolean" required>
-  True when Elephant is exposing only bootstrap-safe runtime surfaces.
+  True when Meerkat Recall is exposing only bootstrap-safe runtime surfaces.
 </ResponseField>
 
 <ResponseField name="runtime_mode" type="string" required>
@@ -78,7 +78,7 @@ Use this endpoint to distinguish:
 </ResponseField>
 
 <ResponseField name="semantic_ingest_ready" type="boolean" required>
-  Whether Elephant is currently allowed to expose semantic ingest tools and routes.
+  Whether Meerkat Recall is currently allowed to expose semantic ingest tools and routes.
 </ResponseField>
 
 <ResponseField name="issues" type="array" required>
@@ -89,7 +89,7 @@ Use this endpoint to distinguish:
 
 ### GET /v1/health
 
-Returns the health status of the Elephant API and its dependencies. This endpoint accepts an optional JWT -- when unauthenticated, it still returns basic health information.
+Returns the health status of the Meerkat Recall API and its dependencies. This endpoint accepts an optional JWT -- when unauthenticated, it still returns basic health information.
 
 <CodeGroup>
 ```bash Request
@@ -181,7 +181,7 @@ curl http://localhost:3000/v1/capabilities \
 
 ## Embedded Snapshots
 
-Snapshot import/export is only available when Elephant is running with `ELEPHANT_DB=elephant-db`.
+Snapshot import/export is only available when Meerkat Recall is running with `ELEPHANT_DB=elephant-db`.
 
 | Method | Path | Description |
 |---|---|---|

@@ -16,8 +16,10 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use serde::{Deserialize, Serialize};
+pub use elephant_auth::Claims;
+use elephant_auth::{IssuerMappings, LegacyVerifier, VerifiedCallerContext};
+use jsonwebtoken::Algorithm;
+use serde::Serialize;
 
 use elephant_policy::Clearance;
 use elephant_types::RecordId;
@@ -31,6 +33,20 @@ pub struct AuthError {
     pub message: String,
 }
 
+impl From<elephant_auth::AuthError> for AuthError {
+    fn from(error: elephant_auth::AuthError) -> Self {
+        Self {
+            error: if error == elephant_auth::AuthError::ExpiredToken {
+                "expired_token"
+            } else {
+                "invalid_token"
+            }
+            .to_string(),
+            message: error.to_string(),
+        }
+    }
+}
+
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
         let status = match self.error.as_str() {
@@ -40,75 +56,6 @@ impl IntoResponse for AuthError {
         };
 
         (status, Json(self)).into_response()
-    }
-}
-
-/// Claims extracted from JWT tokens.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Claims {
-    /// Subject (user or service identifier).
-    pub sub: String,
-    /// Expiration timestamp.
-    pub exp: i64,
-    /// Issued at timestamp.
-    #[serde(default)]
-    pub iat: i64,
-    /// Issuer.
-    #[serde(default)]
-    pub iss: Option<String>,
-    /// Audience.
-    #[serde(default)]
-    pub aud: Option<Vec<String>>,
-    /// Space ID the token grants access to.
-    #[serde(default)]
-    pub space_id: Option<String>,
-    /// Scopes/permissions granted.
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    /// Security level the principal can access.
-    #[serde(default)]
-    pub security_level: i32,
-    /// Security labels the principal can access.
-    #[serde(default)]
-    pub security_labels: Vec<String>,
-    /// ABAC clearances for different policies.
-    #[serde(default)]
-    pub clearances: Vec<Clearance>,
-    /// Allowlist of subject entities (if restricted).
-    #[serde(default)]
-    pub subject_allowlist: Option<Vec<RecordId>>,
-    /// Purpose labels for access.
-    #[serde(default)]
-    pub purpose: Vec<String>,
-}
-
-impl Claims {
-    /// Checks if the claims include a specific scope.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn has_scope(&self, scope: &str) -> bool {
-        self.scopes.iter().any(|s| s == scope || s == "*")
-    }
-
-    /// Checks if the claims include any of the specified scopes.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn has_any_scope(&self, scopes: &[&str]) -> bool {
-        scopes.iter().any(|s| self.has_scope(s))
-    }
-
-    /// Checks if the claims include all of the specified scopes.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn has_all_scopes(&self, scopes: &[&str]) -> bool {
-        scopes.iter().all(|s| self.has_scope(s))
-    }
-
-    /// Gets the principal identifier.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn principal(&self) -> &str {
-        &self.sub
     }
 }
 
@@ -218,19 +165,22 @@ impl AuthConfig {
         Ok(())
     }
 
-    /// Creates the jsonwebtoken Validation struct.
-    fn validation(&self) -> Validation {
-        let mut validation = Validation::new(self.algorithm);
-
-        if let Some(ref aud) = self.audience {
-            validation.set_audience(&[aud]);
+    /// One verifier shared by HTTP and MCP. The result is authentication evidence,
+    /// not a current policy decision or operation permit.
+    pub(crate) fn verify_token(
+        &self,
+        token: &str,
+        mappings: Option<&IssuerMappings>,
+    ) -> Result<VerifiedCallerContext, AuthError> {
+        LegacyVerifier {
+            secret: &self.secret,
+            algorithm: self.algorithm,
+            audience: self.audience.as_deref(),
+            issuer: self.issuer.as_deref(),
+            mappings,
         }
-
-        if let Some(ref iss) = self.issuer {
-            validation.set_issuer(&[iss]);
-        }
-
-        validation
+        .verify(token)
+        .map_err(AuthError::from)
     }
 }
 
@@ -304,37 +254,11 @@ pub async fn jwt_auth(
         }
     };
 
-    // Decode and validate the token
-    let key = DecodingKey::from_secret(config.secret.as_bytes());
-    let validation = config.validation();
-
-    let token_data = decode::<Claims>(token, &key, &validation).map_err(|e| {
-        let (error, message) = match e.kind() {
-            jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
-                ("expired_token", "Token has expired")
-            }
-            jsonwebtoken::errors::ErrorKind::InvalidToken => ("invalid_token", "Token is invalid"),
-            jsonwebtoken::errors::ErrorKind::InvalidSignature => {
-                ("invalid_token", "Token signature is invalid")
-            }
-            jsonwebtoken::errors::ErrorKind::InvalidAudience => {
-                ("invalid_token", "Token audience is invalid")
-            }
-            jsonwebtoken::errors::ErrorKind::InvalidIssuer => {
-                ("invalid_token", "Token issuer is invalid")
-            }
-            _ => ("invalid_token", "Token validation failed"),
-        };
-
-        AuthError {
-            error: error.to_string(),
-            message: message.to_string(),
-        }
-    })?;
-
-    // Store principal in request extensions
-    let principal = Principal::from(token_data.claims);
+    let mappings = request.extensions().get::<Arc<IssuerMappings>>();
+    let verified = config.verify_token(token, mappings.map(AsRef::as_ref))?;
+    let principal = Principal::from(verified.claims().clone());
     request.extensions_mut().insert(principal);
+    request.extensions_mut().insert(verified);
 
     Ok(next.run(request).await)
 }
@@ -450,7 +374,7 @@ mod tests {
     )]
     use super::*;
     use axum::{middleware, routing, Router};
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
     use tower::ServiceExt as _;
 
     fn create_test_token(claims: &Claims, secret: &str) -> String {
@@ -694,4 +618,9 @@ mod tests {
         let result = decode::<Claims>(&token, &key, &validation);
         assert!(result.is_err());
     }
+    include!("auth_context_tests.rs");
 }
+
+#[cfg(test)]
+#[path = "auth_test_support.rs"]
+pub(crate) mod test_support;

@@ -140,13 +140,13 @@ SURREALDB_URL="$surrealdb_ws_url" \
   SURREALDB_PASS="$surrealdb_pass" \
   SURREALDB_DATABASE="$db" \
   SURREALDB_NAMESPACE="$ns" \
-  "$repo_cargo" run -p elephant-bin -- migrate > /dev/null
+  "$repo_cargo" run -p meerkat-recall-bin -- migrate > /dev/null
 
 # 5. Start Services (if requested)
 if [ "$ensure_services" -eq 1 ]; then
   echo "Starting elephant serve..." >&2
   # Build first to avoid build output in logs
-  "$repo_cargo" build -p elephant-bin > /dev/null
+  "$repo_cargo" build -p meerkat-recall-bin > /dev/null
 
   RUST_LOG="${RUST_LOG:-info}" \
     PIPELINE_DISABLED=true \
@@ -155,7 +155,7 @@ if [ "$ensure_services" -eq 1 ]; then
     SURREALDB_PASS="$surrealdb_pass" \
     SURREALDB_DATABASE="$db" \
     SURREALDB_NAMESPACE="$ns" \
-    nohup "${debug_bin_dir}/elephant" serve --server-only >> "$api_log" 2>&1 &
+    nohup "${debug_bin_dir}/meerkat-recall" serve --server-only >> "$api_log" 2>&1 &
 
   if ! wait_for_http_200 "http://127.0.0.1:3000/health" 30 "elephant serve"; then
     echo "elephant serve failed to start. Logs:" >&2
@@ -171,7 +171,7 @@ if [ "$ensure_services" -eq 1 ]; then
     SURREALDB_PASS="$surrealdb_pass" \
     SURREALDB_DATABASE="$db" \
     SURREALDB_NAMESPACE="$ns" \
-    nohup "${debug_bin_dir}/elephant" worker >> "$pipeline_log" 2>&1 &
+    nohup "${debug_bin_dir}/meerkat-recall" worker >> "$pipeline_log" 2>&1 &
 fi
 
 echo "Database reset complete." >&2

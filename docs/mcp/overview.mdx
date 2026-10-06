@@ -4,7 +4,7 @@ description: Connect an agent, choose a tool profile, and handle readiness and t
 icon: plug
 ---
 
-Elephant exposes knowledge operations through MCP over Streamable HTTP. An
+Meerkat Recall exposes knowledge operations through MCP over Streamable HTTP. An
 agent can discover tool schemas, submit evidence, search the graph, and inspect
 cited context using the caller's space and permissions.
 
@@ -21,7 +21,7 @@ Send `Authorization: Bearer <token>` when authentication is enabled. The token
 must select the intended space and authorize the requested operations. In local
 `SKIP_AUTH` mode, `X-Space-Id` selects the development principal's space.
 
-`elephant serve` runs an HTTP server. The separate `elephant-local-helper` is a
+`meerkat-recall serve` runs an HTTP server. The separate `elephant-local-helper` is a
 stdio service for client-side file ingestion. The server's Full-profile file
 tools read paths on the **server**; the helper reads paths on the **client**.
 See [ingesting data](/guides/ingesting-data) before choosing either path.
@@ -68,7 +68,7 @@ elephant_mcp --method tools/call --tool-name search_all \
 ```
 
 Change `MCP_URL` to the desired profile endpoint, then list its tools again.
-These commands connect directly to your Elephant server; they do not require
+These commands connect directly to your Meerkat Recall server; they do not require
 an Inspector web session.
 
 ## Choose a profile
@@ -110,7 +110,7 @@ storage is configured.
 
 Runtime environment settings such as `ELEPHANT_DB` or `SURREALDB_URL` select
 configured mode. They do not automatically make the extractor ready. If the
-extractor connects to Elephant's own `/mcp/agent`, startup retries after the
+extractor connects to Meerkat Recall's own `/mcp/agent`, startup retries after the
 listener binds; a brief initial `extractor_ready: false` can be expected.
 
 Ingest tools are hidden while semantic ingest is unavailable. Configuration
@@ -138,7 +138,7 @@ After MCP initialization, this is a `tools/call` request body:
 An MCP client library normally handles the protocol envelope. Tool reference
 examples show only the `arguments` object.
 
-Elephant has several result layers. Check each layer instead of treating a
+Meerkat Recall has several result layers. Check each layer instead of treating a
 successful HTTP request as a successful operation:
 
 1. A transport or JSON-RPC error means the request failed before a usable tool
@@ -146,7 +146,7 @@ successful HTTP request as a successful operation:
 2. An MCP result with `isError: true` means dispatch or execution failed. Read
    its content for the error.
 3. Many core handlers return JSON in a text content block using the following
-   Elephant envelope. Check `ok` before consuming `data`.
+   Meerkat Recall envelope. Check `ok` before consuming `data`.
 
 ```json
 {
@@ -155,7 +155,7 @@ successful HTTP request as a successful operation:
 }
 ```
 
-Absent optional fields are omitted. For an Elephant-level failure, `ok` is
+Absent optional fields are omitted. For a Meerkat Recall-level failure, `ok` is
 `false` and `error` contains the reason; do not require null-valued optional keys.
 Runtime-control tools return their own JSON response directly; do not require
 this envelope for `get_runtime_status` or configuration calls. Consult the

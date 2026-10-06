@@ -502,6 +502,80 @@ mod tests {
     }
 
     #[test]
+    fn explicit_empty_subject_scope_stays_restricted() {
+        let service = AuthzService::new();
+        let mut auth = create_test_auth_principal();
+        let entity = create_test_entity(1, vec![]);
+        assert!(service
+            .authorize_record_read(&auth, &entity, "read:entity")
+            .is_ok());
+        auth.subject_allowlist = Some(Vec::new());
+        assert_eq!(
+            service.to_abac_principal(&auth).subject_allowlist,
+            Some(HashSet::new())
+        );
+        assert!(service
+            .authorize_record_read(&auth, &entity, "read:entity")
+            .is_err());
+        auth.subject_allowlist = Some(vec![entity.base.id.clone()]);
+        assert!(service
+            .authorize_record_read(&auth, &entity, "read:entity")
+            .is_ok());
+    }
+
+    #[test]
+    fn empty_scope_preserves_subjectless_waiver_truth_table() {
+        let service = AuthzService::new();
+        let mut auth = create_test_auth_principal();
+        auth.subject_allowlist = Some(Vec::new());
+        auth.clearances = vec![Clearance {
+            policy_id: "default".into(),
+            max_level: 3,
+            labels: HashSet::new(),
+            handling_allow: HashSet::from(["handling:subjectless_ok".into()]),
+        }];
+        for state in [
+            SubjectsState::Complete,
+            SubjectsState::Partial,
+            SubjectsState::Unknown,
+        ] {
+            for waiver in [false, true] {
+                for named in [false, true] {
+                    let mut record = RecordAttributes {
+                        space_id: "test_space".into(),
+                        security: Security {
+                            policy_id: "default".into(),
+                            ..Security::default()
+                        },
+                        subjects: Vec::new(),
+                        subjects_state: state,
+                    };
+                    if waiver {
+                        record
+                            .security
+                            .handling
+                            .push("handling:subjectless_ok".into());
+                    }
+                    if named {
+                        record
+                            .subjects
+                            .push(Link::new(RecordId::new_v4(TableName::Entity)));
+                    }
+                    assert_eq!(
+                        service.evaluate(&auth, &record, "read:entity").is_ok(),
+                        waiver && !named
+                    );
+                    let mut uncleared = auth.clone();
+                    uncleared.clearances[0].handling_allow.clear();
+                    assert!(service
+                        .evaluate(&uncleared, &record, "read:entity")
+                        .is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_authorize_entity_read_allowed() {
         let service = AuthzService::new();
         let auth = create_test_auth_principal();

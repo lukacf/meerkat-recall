@@ -6,19 +6,19 @@ icon: "rocket"
 
 The supplied Compose file is a loopback development deployment. It uses local
 database credentials and defaults to `SKIP_AUTH=true`. Use the setup below to
-evaluate Elephant; build a production service configuration with explicit
+evaluate Meerkat Recall; build a production service configuration with explicit
 credentials, authentication, TLS, storage, and rollback procedures before
 serving remote callers.
 
 ## Architecture Overview
 
-Elephant can run against either `surreal-db` (default) or embedded `elephant-db`.
-The default Docker deployment starts `elephant serve` and `surrealdb`; standalone workers are optional:
+Meerkat Recall can run against either `surreal-db` (default) or embedded `elephant-db`.
+The default Docker deployment starts `meerkat-recall serve` and `surrealdb`; standalone workers are optional:
 
 | Service | Binary | Default Port | Description |
 |---------|--------|--------------|-------------|
-| `elephant` | `elephant serve` | 3000 | HTTP API server (Axum), MCP endpoints, and managed workers |
-| `elephant-worker` | `elephant worker` | N/A | Optional standalone background workers |
+| `elephant` | `meerkat-recall serve` | 3000 | HTTP API server (Axum), MCP endpoints, and managed workers |
+| `elephant-worker` | `meerkat-recall worker` | N/A | Optional standalone background workers |
 | `surrealdb` | SurrealDB v2.4.1 | 8000 | Default persistent backend |
 
 The API owns the managed runtime by default, including background worker loops. The pipeline can also run as a separate advanced worker deployment.
@@ -47,7 +47,7 @@ To promote a release:
 1. Select the reviewed source commit and confirm its CI checks passed. Verify
    that the proposed `vX.Y.Z` tag matches the workspace package version.
 2. Download successful build artifacts, verify archive checksums and inspect
-   their bundled provenance. Smoke test `elephant --help` on each target host.
+   their bundled provenance. Smoke test `meerkat-recall --help` on each target host.
    Keep the binary checksum, build source, and release source in the release
    record. If promoting an existing build from another commit, verify identical
    source trees or document and review the exact build-excluded differences.
@@ -69,15 +69,15 @@ release binaries does not publish Rust crates or the local-helper npm package.
 
 <Tabs>
   <Tab title="Managed workers (default)">
-    The default `docker compose up` runs `elephant serve` with managed workers in the same container. Storage is still SurrealDB by default.
+    The default `docker compose up` runs `meerkat-recall serve` with managed workers in the same container. Storage is still SurrealDB by default.
 
     ```bash
     docker compose up -d
     ```
   </Tab>
   <Tab title="Separate workers">
-    Custom deployments can run `elephant serve --server-only` and
-    `elephant worker` as separate services against the same SurrealDB namespace
+    Custom deployments can run `meerkat-recall serve --server-only` and
+    `meerkat-recall worker` as separate services against the same SurrealDB namespace
     and database. Configure the worker's extractor and maintenance MCP URLs to
     reach the API service, and supply an authenticated MCP token when needed.
 
@@ -100,16 +100,16 @@ release binaries does not publish Rust crates or the local-helper npm package.
     export SURREALDB_PASS=root
     export SKIP_AUTH=true  # Local development only
     export ELEPHANT_HOST=127.0.0.1
-    ./scripts/repo-cargo run -p elephant-bin -- migrate
+    ./scripts/repo-cargo run -p meerkat-recall-bin -- migrate
 
     # 3. Start API server
-    ./scripts/repo-cargo run -p elephant-bin -- serve --server-only
+    ./scripts/repo-cargo run -p meerkat-recall-bin -- serve --server-only
 
     # 4. (Optional) Start pipeline worker separately
-    ./scripts/repo-cargo run -p elephant-bin -- worker
+    ./scripts/repo-cargo run -p meerkat-recall-bin -- worker
 
     # 5. (Optional) Run fully embedded mode instead of SurrealDB
-    ELEPHANT_DB=elephant-db ./scripts/repo-cargo run -p elephant-bin -- serve
+    ELEPHANT_DB=elephant-db ./scripts/repo-cargo run -p meerkat-recall-bin -- serve
     ```
   </Tab>
 </Tabs>
@@ -136,14 +136,14 @@ release binaries does not publish Rust crates or the local-helper npm package.
   <Step title="Start the database and apply schema">
     ```bash
     docker compose up -d surrealdb
-    docker compose run --rm elephant elephant migrate
+    docker compose run --rm elephant meerkat-recall migrate
     ```
 
     This applies schema using the same service configuration as the server.
     For existing data, first rehearse against a consistent backup. Migrations
     are forward-only; rollback requires the matching database backup.
   </Step>
-  <Step title="Start Elephant">
+  <Step title="Start Meerkat Recall">
     ```bash
     docker compose up -d elephant
     ```
@@ -210,17 +210,17 @@ actually inherited by the process or use the managed runtime configuration.
 | `SURREALDB_PASS` | `root` | Local development database password; configure your own credentials for deployment |
 | `SURREALDB_QUERY_TIMEOUT_SECS` | `30` | Embedded SurrealDB engine query deadline, positive integer seconds (1-86400) |
 | `SURREALDB_TRANSACTION_TIMEOUT_SECS` | `30` | Embedded transaction limit; the shorter of this and query timeout bounds the query batch |
-| `SURREAL_QUERY_TIMEOUT` | `30s` in Compose | Remote SurrealDB server query deadline; not an Elephant client-side limit |
+| `SURREAL_QUERY_TIMEOUT` | `30s` in Compose | Remote SurrealDB server query deadline; not a Meerkat Recall client-side limit |
 
 <Note>
   `SURREALDB_*` variables only apply when `ELEPHANT_DB=surreal-db`. In Docker Compose, the SurrealDB URL is `ws://surrealdb:8000`; for local development, use `ws://localhost:8000`.
 </Note>
 
 Embedded SurrealDB deadline changes require a process restart. SurrealDB 2.6.5
-does not enforce its transaction option independently, so Elephant applies the
+does not enforce its transaction option independently, so Meerkat Recall applies the
 shorter configured limit as its engine query-batch deadline. Remote connections
 do not apply these client options to the server. See the
-[capacity and retention guide](https://github.com/lukacf/elephant/blob/main/docs/work-queue-capacity.md)
+[capacity and retention guide](https://github.com/lukacf/meerkat-recall/blob/main/docs/work-queue-capacity.md)
 for cancellation and archival details.
 
 ### MCP transport
@@ -229,7 +229,7 @@ for cancellation and archival details.
 | --- | --- | --- |
 | `MCP_ALLOWED_HOSTS` | loopback hosts | Comma-separated remote hostnames or `host:port` values; loopback remains allowed |
 | `MCP_ALLOWED_ORIGINS` | unrestricted by this optional origin filter | Comma-separated exact browser origins; scheme, host, and effective port must match |
-| `MCP_BEARER_TOKEN` | _(none)_ | Bearer token for pipeline calls to authenticated Elephant MCP endpoints |
+| `MCP_BEARER_TOKEN` | _(none)_ | Bearer token for pipeline calls to authenticated Meerkat Recall MCP endpoints |
 
 Requests without an `Origin` header remain accepted. The opaque `null` origin
 requires an explicit entry. Host/origin checks do not replace JWT or ABAC.
@@ -247,8 +247,8 @@ Snapshot import/export is available only when `ELEPHANT_DB=elephant-db`.
 Operational helpers:
 
 ```bash
-elephant snapshot export /tmp/elephant.json
-elephant snapshot import /tmp/elephant.json
+meerkat-recall snapshot export /tmp/elephant.json
+meerkat-recall snapshot import /tmp/elephant.json
 ```
 
 Paths are on the server host, not the CLI client's filesystem. Import replaces
@@ -378,12 +378,12 @@ and keep a verified export before replacing data.
 
 ## Migrations
 
-Elephant uses SurrealQL migrations managed by `elephant migrate`:
+Meerkat Recall uses SurrealQL migrations managed by `meerkat-recall migrate`:
 
 ```bash
 # Use the same database environment as the running server.
 # With Compose, inherit it from the elephant service:
-docker compose run --rm elephant elephant migrate
+docker compose run --rm elephant meerkat-recall migrate
 ```
 
 <Warning>
@@ -398,7 +398,7 @@ The `docker-compose.yml` defines two services:
 - **`elephant`** -- API server with managed pipeline workers. Health check via `GET /v1/health`.
 
 The local ports bind to loopback. The skills directory is mounted read-only at
-`/skills` in the Elephant container. Configure a separate production deployment
+`/skills` in the Meerkat Recall container. Configure a separate production deployment
 with database credentials, TLS, JWT authentication, and restricted network
 access; publishing the development ports is not a production configuration.
 

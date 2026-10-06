@@ -91,6 +91,145 @@ mod tests {
         (app, entity_repo)
     }
 
+    #[tokio::test]
+    async fn ordinary_entity_writes_refuse_relabel_without_changing_sink() {
+        for mode in ["update", "upsert", "batch", "deleted_batch"] {
+            let (app, repo) = setup_test_app().await;
+            let mut original = create_test_entity("Protected");
+            original.base.security.level = 5;
+            repo.create(original.clone()).await.unwrap();
+            if mode == "deleted_batch" {
+                repo.delete("test_space", &original.base.id).await.unwrap();
+            }
+            let before = repo
+                .get_with_deleted("test_space", &original.base.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut changed = before.clone();
+            changed.base.security.level = 0;
+            changed.display_name = "Leaked replacement".into();
+            let (method, uri, body) = match mode {
+                "update" => (
+                    "PUT",
+                    format!("/v1/entities/{}", original.base.id),
+                    serde_json::json!(changed),
+                ),
+                "upsert" => (
+                    "POST",
+                    "/v1/entities/upsert".into(),
+                    serde_json::json!(changed),
+                ),
+                _ => (
+                    "POST",
+                    "/v1/entities/batch".into(),
+                    serde_json::json!({"items": [changed]}),
+                ),
+            };
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if mode.contains("batch") {
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["succeeded"].as_array().unwrap().len(), 0);
+                assert_eq!(body["failed"].as_array().unwrap().len(), 1);
+            } else {
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{mode}");
+            }
+            let after = repo
+                .get_with_deleted("test_space", &original.base.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(after).unwrap(),
+                serde_json::to_value(before).unwrap(),
+                "{mode}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_entity_update_preserves_envelope_and_changes_content() {
+        let (app, repo) = setup_test_app().await;
+        let original = create_test_entity("Before");
+        repo.create(original.clone()).await.unwrap();
+        let mut changed = original.clone();
+        changed.display_name = "After".into();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/entities/{}", original.base.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!(changed).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            repo.get("test_space", &original.base.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "After"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_subject_scope_refuses_http_entity_body() {
+        let repo = Arc::new(EntityRepository::new(
+            StorageClient::new_embedded().await.unwrap(),
+        ));
+        let entity = create_test_entity("PRIVATE BODY CANARY");
+        repo.create(entity.clone()).await.unwrap();
+        let state = Arc::new(EntitiesState::new_with_repos(
+            repo,
+            Arc::new(MockRelRepository::empty()),
+            Arc::new(NoopEventRepo),
+            Arc::new(AuthzService::new()),
+        ));
+        let principal = AuthPrincipal {
+            subject: "reader".into(),
+            space_id: Some("test_space".into()),
+            scopes: vec!["read:entity".into()],
+            security_level: 10,
+            subject_allowlist: Some(Vec::new()),
+            ..AuthPrincipal::default()
+        };
+        let app = entity_routes()
+            .layer(axum::Extension(principal))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/entities/{}", entity.base.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE BODY CANARY"));
+    }
+
     async fn mock_auth(req: Request<Body>, next: Next) -> impl IntoResponse {
         let mut req = req;
         req.extensions_mut().insert(AuthPrincipal {
@@ -200,6 +339,150 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn entity_writes_preserve_subject_envelope_and_deleted_state() {
+        for route in ["put", "upsert", "batch"] {
+            for deleted in [false, true] {
+                if deleted && route == "put" {
+                    continue;
+                }
+                for change in ["remove_subject", "add_subject", "completeness"] {
+                    let (app, repo, authz, principal) = setup_security_test_app().await;
+                    let mut original = create_test_entity("Subject protected");
+                    original.base.subjects = vec![
+                        elephant_types::Link::new(RecordId::new_v4(TableName::Entity)),
+                        elephant_types::Link::new(RecordId::new_v4(TableName::Entity)),
+                    ];
+                    repo.create(original.clone()).await.unwrap();
+                    if deleted {
+                        repo.delete("test_space", &original.base.id).await.unwrap();
+                    }
+                    let before = repo
+                        .get_with_deleted("test_space", &original.base.id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut proposed = before.clone();
+                    proposed.display_name = "Must not relabel subjects".to_string();
+                    match change {
+                        "remove_subject" => {
+                            proposed.base.subjects.pop();
+                        }
+                        "add_subject" => proposed.base.subjects.push(elephant_types::Link::new(
+                            RecordId::new_v4(TableName::Entity),
+                        )),
+                        "completeness" => proposed.base.subjects_state = SubjectsState::Unknown,
+                        _ => unreachable!(),
+                    }
+                    for record in [&before, &proposed] {
+                        authz
+                            .authorize_record_read(&principal, record, "read:entity")
+                            .unwrap();
+                        authz
+                            .authorize_record_write(&principal, record, "write:entity")
+                            .unwrap();
+                    }
+                    let response = send_entity_write(app, route, &proposed).await;
+                    let status = response.status();
+                    let body: serde_json::Value = serde_json::from_slice(
+                        &axum::body::to_bytes(response.into_body(), usize::MAX)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    if route == "batch" {
+                        assert_eq!(status, StatusCode::OK);
+                        assert!(body["succeeded"].as_array().unwrap().is_empty());
+                        assert_eq!(body["failed"].as_array().unwrap().len(), 1);
+                        assert!(body["failed"][0]["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("separately authorized relabel"));
+                    } else {
+                        assert_eq!(status, StatusCode::FORBIDDEN);
+                        assert!(body["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("separately authorized relabel"));
+                    }
+                    let after = repo
+                        .get_with_deleted("test_space", &original.base.id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(after).unwrap(),
+                        serde_json::to_value(before).unwrap(),
+                        "{route}/{deleted}/{change}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_without_read_refuses_before_any_entity_mutation() {
+        for route in ["put", "upsert", "batch"] {
+            for existing in [false, true] {
+                if !existing && route == "put" {
+                    continue;
+                }
+                let (_, repo, authz, mut principal) = setup_security_test_app().await;
+                principal.scopes = vec!["write:entity".to_string()];
+                let entity = create_test_entity("Read scope required");
+                let before = if existing {
+                    Some(repo.create(entity.clone()).await.unwrap())
+                } else {
+                    None
+                };
+                authz
+                    .authorize_record_write(&principal, &entity, "write:entity")
+                    .unwrap();
+                assert!(authz
+                    .authorize_record_read(&principal, &entity, "read:entity")
+                    .is_err());
+                let state = Arc::new(EntitiesState::new_with_repos(
+                    repo.clone(),
+                    Arc::new(MockRelRepository::empty()),
+                    Arc::new(NoopEventRepo),
+                    authz,
+                ));
+                let app = entity_routes()
+                    .layer(axum::Extension(principal))
+                    .with_state(state);
+                let mut proposed = entity.clone();
+                proposed.display_name = "Must not persist".to_string();
+                let response = send_entity_write(app, route, &proposed).await;
+                if route == "batch" {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body: serde_json::Value = serde_json::from_slice(
+                        &axum::body::to_bytes(response.into_body(), usize::MAX)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert!(body["succeeded"].as_array().unwrap().is_empty());
+                    assert_eq!(body["failed"].as_array().unwrap().len(), 1);
+                    assert!(body["failed"][0]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("read:entity"));
+                } else {
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                }
+                let after = repo
+                    .get_with_deleted("test_space", &entity.base.id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(after).unwrap(),
+                    serde_json::to_value(before).unwrap(),
+                    "{route}/{existing}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

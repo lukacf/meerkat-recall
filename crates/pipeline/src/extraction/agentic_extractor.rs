@@ -2246,6 +2246,7 @@ impl AgentLlmClient for AnthropicLlmAdapter {
             model: self.model.clone(),
             messages: messages.to_vec(),
             tools: tools.to_vec(),
+            tool_choice: Default::default(),
             max_tokens,
             temperature,
             stop_sequences: None,

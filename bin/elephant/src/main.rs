@@ -20,8 +20,8 @@ mod data_migrate;
 mod wiki_demo;
 
 #[derive(Parser, Debug)]
-#[command(name = "elephant")]
-#[command(about = "Elephant knowledge system", long_about = None)]
+#[command(name = "meerkat-recall", version)]
+#[command(about = "Meerkat Recall knowledge system", long_about = None)]
 struct Cli {
     #[command(flatten)]
     api: ApiTarget,
@@ -31,7 +31,7 @@ struct Cli {
 
 #[derive(Args, Debug, Clone, Default)]
 struct ApiTarget {
-    /// Base URL for the running Elephant API.
+    /// Base URL for the running Meerkat Recall API.
     #[arg(long, global = true)]
     api_url: Option<String>,
     /// Bearer token for admin API calls.
@@ -54,7 +54,7 @@ enum Commands {
     },
     /// One-time data migration: embedded snapshot -> `SurrealDB` backend.
     DataMigrate(data_migrate::DataMigrateArgs),
-    /// Show health and managed runtime status for a running Elephant API.
+    /// Show health and managed runtime status for a running Meerkat Recall API.
     Status(StatusArgs),
     /// Launch an embedded, evidence-backed Living Wiki demonstration.
     DemoWiki(DemoWikiArgs),
@@ -76,7 +76,7 @@ struct MigrateArgs {
 
 #[derive(Subcommand, Debug)]
 enum SnapshotCommand {
-    /// Export the live embedded snapshot to a file on the Elephant host.
+    /// Export the live embedded snapshot to a file on the Meerkat Recall host.
     Export { path: PathBuf },
     /// Import a snapshot file into the live embedded store.
     Import { path: PathBuf },
@@ -87,6 +87,9 @@ struct StatusArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+    /// Exit unsuccessfully unless health and semantic ingestion are ready.
+    #[arg(long)]
+    require_ready: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -135,6 +138,10 @@ struct SnapshotResponse {
 struct StatusResponse {
     health: serde_json::Value,
     runtime: Option<serde_json::Value>,
+    #[serde(skip)]
+    health_success: bool,
+    #[serde(skip)]
+    health_status: reqwest::StatusCode,
 }
 
 #[tokio::main]
@@ -171,7 +178,10 @@ fn init_tracing() -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new("info"))
         .context("invalid RUST_LOG filter")?;
-    let subscriber = FmtSubscriber::builder().with_env_filter(filter).finish();
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .finish();
     tracing::subscriber::set_global_default(subscriber)?;
     Ok(())
 }
@@ -191,7 +201,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         backend = status.backend.as_deref().unwrap_or("unconfigured"),
         worker_ready = status.worker_ready,
         semantic_ingest_ready = status.semantic_ingest_ready,
-        "Starting Elephant server"
+        "Starting Meerkat Recall server"
     );
     let runtime = Arc::new(runtime);
     let snapshot_autosave_path = snapshot_autosave_path(&config);
@@ -209,12 +219,12 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 
     tokio::select! {
         result = &mut api_task => {
-            result.context("Elephant API task panicked")??;
+            result.context("Meerkat Recall API task panicked")??;
             Ok(())
         }
         signal = tokio::signal::ctrl_c() => {
             signal.context("failed to listen for Ctrl-C")?;
-            info!("Shutdown requested; draining Elephant runtime");
+            info!("Shutdown requested; draining Meerkat Recall runtime");
             runtime.shutdown().await;
             if let Some(path) = snapshot_autosave_path {
                 if let Some(storage) = runtime.current_storage().await {
@@ -225,7 +235,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 }
             }
             let _ = shutdown_tx.send(true);
-            api_task.await.context("Elephant API task panicked")??;
+            api_task.await.context("Meerkat Recall API task panicked")??;
             Ok(())
         }
     }
@@ -275,7 +285,7 @@ async fn run_worker() -> Result<()> {
     .with_env_timeouts()?;
     let storage = StorageClient::new(storage_config)
         .await
-        .context("failed to connect to Elephant storage")?;
+        .context("failed to connect to Meerkat Recall storage")?;
     elephant_pipeline_bin::run_pipeline_with_client(config, storage).await
 }
 
@@ -403,7 +413,23 @@ async fn run_snapshot_command(
 }
 
 async fn run_status_command(target: &ApiTarget, args: StatusArgs) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("build status client")?;
+    let payload = fetch_status(target, &client).await?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_status(&payload);
+    }
+    if args.require_ready {
+        require_ready(&payload)?;
+    }
+    Ok(())
+}
+
+async fn fetch_status(target: &ApiTarget, client: &reqwest::Client) -> Result<StatusResponse> {
     let base_url = api_base_url_from_target(target);
     let mut health_request = client.get(format!("{base_url}/v1/health"));
     let mut runtime_request = client.get(format!("{base_url}/v1/runtime/status"));
@@ -427,34 +453,59 @@ async fn run_status_command(target: &ApiTarget, args: StatusArgs) -> Result<()> 
         _ => None,
     };
 
-    let payload = StatusResponse { health, runtime };
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-        return Ok(());
-    }
+    Ok(StatusResponse {
+        health,
+        runtime,
+        health_success: health_status.is_success(),
+        health_status,
+    })
+}
 
+fn require_ready(payload: &StatusResponse) -> Result<()> {
+    if !payload.health_success
+        || payload
+            .health
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            != Some("healthy")
+    {
+        anyhow::bail!("server health is not ready");
+    }
+    let runtime: elephant_api::runtime::RuntimeStatus = serde_json::from_value(
+        payload
+            .runtime
+            .clone()
+            .context("runtime status is unavailable")?,
+    )
+    .context("runtime status is malformed")?;
+    if !runtime.semantic_ingest_ready {
+        anyhow::bail!("semantic ingestion is not ready");
+    }
+    Ok(())
+}
+
+fn print_status(payload: &StatusResponse) {
     let health_label = payload
         .health
         .get("status")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_else(|| health_status.as_str());
+        .unwrap_or_else(|| payload.health_status.as_str());
     println!("health: {health_label}");
-    if let Some(runtime) = payload.runtime {
+    if let Some(runtime) = &payload.runtime {
         println!(
             "runtime: configured={}, bootstrap={}, backend={}, worker_ready={}, semantic_ingest_ready={}",
-            json_bool(&runtime, "configured"),
-            json_bool(&runtime, "bootstrap_mode"),
+            json_bool(runtime, "configured"),
+            json_bool(runtime, "bootstrap_mode"),
             runtime
                 .get("backend")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unconfigured"),
-            json_bool(&runtime, "worker_ready"),
-            json_bool(&runtime, "semantic_ingest_ready")
+            json_bool(runtime, "worker_ready"),
+            json_bool(runtime, "semantic_ingest_ready")
         );
     } else {
         println!("runtime: unavailable");
     }
-    Ok(())
 }
 
 fn api_base_url_from_target(target: &ApiTarget) -> String {
@@ -526,6 +577,60 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn stalled_status_endpoints_fail_readiness_within_the_request_timeout() {
+        use axum::{routing::get, Json, Router};
+        use std::time::Duration;
+
+        for stalled_endpoint in ["/v1/health", "/v1/runtime/status"] {
+            let stall_health = stalled_endpoint == "/v1/health";
+            let app = Router::new()
+                .route(
+                    "/v1/health",
+                    get(move || async move {
+                        if stall_health {
+                            std::future::pending::<()>().await;
+                        }
+                        Json(serde_json::json!({"status": "healthy"}))
+                    }),
+                )
+                .route(
+                    "/v1/runtime/status",
+                    get(move || async move {
+                        if !stall_health {
+                            std::future::pending::<()>().await;
+                        }
+                        Json(serde_json::json!({}))
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target = ApiTarget {
+                api_url: Some(format!("http://{}", listener.local_addr().unwrap())),
+                token: Some("fixture".into()),
+            };
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap();
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), fetch_status(&target, &client))
+                    .await
+                    .unwrap();
+            if stalled_endpoint == "/v1/health" {
+                assert!(result.is_err());
+            } else {
+                let payload = result.unwrap();
+                assert!(payload.runtime.is_none());
+                assert!(require_ready(&payload).is_err());
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
 
     #[test]
     fn parses_command_tree() {

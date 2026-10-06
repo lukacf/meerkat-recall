@@ -144,12 +144,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./scripts/repo-cargo build --locked --profile deploy -p elephant-bin --features rocksdb
-          "$CARGO_TARGET_DIR/deploy/elephant" --help
+          ./scripts/repo-cargo build --locked --profile deploy -p meerkat-recall-bin --features rocksdb
+          "$CARGO_TARGET_DIR/deploy/meerkat-recall" --help
+          "$CARGO_TARGET_DIR/deploy/meerkat-recall" --version
           if [[ "$RUNNER_OS" == "Linux" ]]; then
-            ldd "$CARGO_TARGET_DIR/deploy/elephant"
+            ldd "$CARGO_TARGET_DIR/deploy/meerkat-recall"
           else
-            otool -L "$CARGO_TARGET_DIR/deploy/elephant"
+            otool -L "$CARGO_TARGET_DIR/deploy/meerkat-recall"
           fi
 
       - name: Package binary, licenses and provenance
@@ -170,20 +171,26 @@ jobs:
           import tarfile
 
           metadata = json.loads(pathlib.Path(os.environ["RUNNER_TEMP"], "elephant-metadata.json").read_text())
-          package = next(p for p in metadata["packages"] if p["name"] == "elephant-bin")
+          package = next(p for p in metadata["packages"] if p["name"] == "meerkat-recall-bin")
           version = package["version"]
           target = os.environ["TARGET"]
-          stem = f"elephant-{version}-{target}"
+          stem = f"meerkat-recall-{version}-{target}"
           dist = pathlib.Path("dist")
           dist.mkdir()
           bundle = pathlib.Path(os.environ["RUNNER_TEMP"], stem)
           bundle.mkdir()
-          binary = bundle / "elephant"
-          shutil.copyfile(pathlib.Path(os.environ["CARGO_TARGET_DIR"], "deploy", "elephant"), binary)
+          binary = bundle / "meerkat-recall"
+          shutil.copyfile(pathlib.Path(os.environ["CARGO_TARGET_DIR"], "deploy", "meerkat-recall"), binary)
           binary.chmod(0o755)
+          (bundle / "elephant").symlink_to("meerkat-recall")
           for name in ("LICENSE", "LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_NOTICES.md"):
               shutil.copyfile(name, bundle / name)
           shutil.copytree("skills", bundle / "skills")
+          third_party = bundle / "third-party"
+          (third_party / "surrealkv-0.9.3").mkdir(parents=True)
+          shutil.copyfile("vendor/surrealkv-0.9.3/LICENSE", third_party / "surrealkv-0.9.3/LICENSE")
+          for name in ("surrealkv-0.9.3-backport.md", "surrealkv-0.9.3-backport.patch", "surrealkv-0.9.3-upstream-sha256.json"):
+              shutil.copyfile(pathlib.Path("vendor", name), third_party / name)
           provenance = {
               "version": version,
               "target": target,
@@ -193,11 +200,13 @@ jobs:
               "cargo_lock_sha256": hashlib.sha256(pathlib.Path("Cargo.lock").read_bytes()).hexdigest(),
               "workflow_run": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
               "workflow_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-              "build_command": "./scripts/repo-cargo build --locked --profile deploy -p elephant-bin --features rocksdb",
+              "build_command": "./scripts/repo-cargo build --locked --profile deploy -p meerkat-recall-bin --features rocksdb",
               "build_profile": "deploy",
               "features": ["rocksdb"],
               "default_features": True,
               "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
+              "executable": "meerkat-recall",
+              "compatibility_aliases": {"elephant": "meerkat-recall"},
               "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "runtime_assets": {
                   str(path.relative_to(bundle)): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -223,7 +232,7 @@ jobs:
       - name: Upload candidate artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: elephant-${{ matrix.target }}
+          name: meerkat-recall-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 

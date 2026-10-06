@@ -6,14 +6,14 @@ icon: "code"
 
 ## Key Dependencies
 
-Before diving into the codebase, it helps to understand the two external systems Elephant depends on:
+Before diving into the codebase, it helps to understand the two external systems Meerkat Recall depends on:
 
 <Accordion title="Storage backends - SurrealDB and elephant-db">
   [SurrealDB](https://surrealdb.com) is a multi-model database written in Rust. It handles document storage, graph traversals, full-text search, and vector similarity search in a single engine.
 
-  **Why Elephant uses it:** It is the default persistent backend. Instead of running Postgres + Neo4j + a separate vector store, Elephant can use one SurrealDB deployment for documents, graph, and vectors.
+  **Why Meerkat Recall uses it:** It is the default persistent backend. Instead of running Postgres + Neo4j + a separate vector store, Meerkat Recall can use one SurrealDB deployment for documents, graph, and vectors.
 
-  **`elephant-db`:** Elephant also has an embedded in-memory backend for lightweight local/runtime use and the WASM-oriented kernel path. It supports graph traversal, lexical/vector search, and JSON snapshots, but it is not a general SurrealQL replacement.
+  **`elephant-db`:** Meerkat Recall also has an embedded in-memory backend for lightweight local/runtime use and the WASM-oriented kernel path. It supports graph traversal, lexical/vector search, and JSON snapshots, but it is not a general SurrealQL replacement.
 
   **Development setup:** `docker compose up` starts a SurrealDB instance on port 8000. Embedded mode is enabled with `ELEPHANT_DB=elephant-db`.
 
@@ -23,28 +23,28 @@ Before diving into the codebase, it helps to understand the two external systems
 <Accordion title="Meerkat - the LLM agent harness">
   [Meerkat](https://github.com/lukacf/meerkat) is a modular LLM agent harness built in Rust. It provides schema-constrained output, tool dispatch, budget enforcement, and streaming for LLM interactions.
 
-  **Where Elephant uses it:**
-  - **Extraction pipeline** (`crates/pipeline/src/extraction/agentic_extractor.rs`) - the agentic extractor uses Meerkat with an assertion output schema, bounded retries, graph query tools, and budget limits. Elephant parses and validates the result before canonical writes; a failed or malformed completion still fails extraction.
+  **Where Meerkat Recall uses it:**
+  - **Extraction pipeline** (`crates/pipeline/src/extraction/agentic_extractor.rs`) - the agentic extractor uses Meerkat with an assertion output schema, bounded retries, graph query tools, and budget limits. Meerkat Recall parses and validates the result before canonical writes; a failed or malformed completion still fails extraction.
   - **Truth maintenance** (`crates/pipeline/src/truth_maintenance/adjudicator.rs`) - conflict adjudication calls the LLM through Meerkat structured output with the competing claim values in view, returning a strict-schema verdict (corroborate, single winner, coexist, supersede, needs review). Entity-reuse disambiguation at promotion uses the same pattern.
-  - **Living Wiki** - Meerkat powers separate writer and verifier calls. Elephant
+  - **Living Wiki** - Meerkat powers separate writer and verifier calls. Meerkat Recall
     serves its MCP endpoint using the Rust `rmcp` transport.
 
-  **Feature flag:** The Meerkat-based extractor is behind the `meerkat-extraction` Cargo feature. When disabled, Elephant no longer performs degraded semantic extraction; the managed runtime reports `semantic_ingest_ready=false`, ingest tools are hidden, and extraction work fails loudly if forced to run without a real extractor.
+  **Feature flag:** The Meerkat-based extractor is behind the `meerkat-extraction` Cargo feature. When disabled, Meerkat Recall no longer performs degraded semantic extraction; the managed runtime reports `semantic_ingest_ready=false`, ingest tools are hidden, and extraction work fails loudly if forced to run without a real extractor.
 </Accordion>
 
 <Note>
-The primary runtime is now MCP-first and config-backed. Elephant can start in bootstrap mode with no storage configured yet, expose `get_runtime_status` and runtime setup tools, and only expose semantic ingest once storage, workers, and the extractor are all ready.
+The primary runtime is now MCP-first and config-backed. Meerkat Recall can start in bootstrap mode with no storage configured yet, expose `get_runtime_status` and runtime setup tools, and only expose semantic ingest once storage, workers, and the extractor are all ready.
 </Note>
 
 Two practical nuances:
-- if you set runtime env vars like `ELEPHANT_DB` or `SURREALDB_URL`, Elephant starts in configured mode rather than bootstrap mode
-- self-referential extractor URLs such as `PIPELINE_AGENTIC_MCP_URL=http://127.0.0.1:3000/mcp/agent` are supported; Elephant retries extractor readiness after the listener binds, so clients can poll `get_runtime_status` instead of issuing a manual reconnect
+- if you set runtime env vars like `ELEPHANT_DB` or `SURREALDB_URL`, Meerkat Recall starts in configured mode rather than bootstrap mode
+- self-referential extractor URLs such as `PIPELINE_AGENTIC_MCP_URL=http://127.0.0.1:3000/mcp/agent` are supported; Meerkat Recall retries extractor readiness after the listener binds, so clients can poll `get_runtime_status` instead of issuing a manual reconnect
 
 ## Repository Structure
 
 ```
 bin/           # Binaries
-  elephant/             # Unified CLI (`elephant serve`, `worker`, `migrate`, `snapshot`, `status`)
+  elephant/             # Unified CLI (`meerkat-recall serve`, `worker`, `migrate`, `snapshot`, `status`)
   elephant-api/         # Internal HTTP API library crate
   elephant-pipeline/    # Internal worker runtime crate
 
@@ -74,7 +74,7 @@ tests/         # Test suites
 Use the repo wrapper for Rust commands so each checkout/worktree gets isolated Cargo state:
 
 ```bash
-./scripts/repo-cargo check -p elephant-bin -p elephant
+./scripts/repo-cargo check -p meerkat-recall-bin -p elephant
 ./scripts/repo-cargo test -p elephant-storage
 ```
 
@@ -169,7 +169,7 @@ Heavy all-features tests, docs, E2E, WASM, and audit run in CI/release lanes rat
 
 ## Testing Tiers
 
-Elephant uses four testing tiers with increasing scope:
+Meerkat Recall uses four testing tiers with increasing scope:
 
 <Steps>
   <Step title="Unit tests">
@@ -232,15 +232,15 @@ All clippy warnings are treated as errors (`-D warnings`) in CI and pre-push hoo
 # Start the development database and apply the loopback-only dev environment
 docker compose -f docker-compose.dev.yml up -d
 source .envrc
-./scripts/repo-cargo run -p elephant-bin -- migrate
+./scripts/repo-cargo run -p meerkat-recall-bin -- migrate
 
-# Start Elephant API / MCP runtime
-./scripts/repo-cargo run -p elephant-bin -- serve
+# Start Meerkat Recall API / MCP runtime
+./scripts/repo-cargo run -p meerkat-recall-bin -- serve
 ```
 
 This example sets `SKIP_AUTH=true` and binds to loopback for local development.
 Use MCP `get_runtime_status` (or `GET /v1/runtime/status`) to inspect readiness.
-Without storage environment variables or persisted configuration, Elephant starts
+Without storage environment variables or persisted configuration, Meerkat Recall starts
 in bootstrap mode. Authenticated startup still requires a valid `JWT_SECRET`.
 The preferred local project config lives at `.elephant/elephant_config.toml`.
 
@@ -248,7 +248,7 @@ For an isolated embedded demo:
 
 ```bash
 SKIP_AUTH=true ELEPHANT_HOST=127.0.0.1 ELEPHANT_DB=elephant-db \
-  ./scripts/repo-cargo run -p elephant-bin -- serve
+  ./scripts/repo-cargo run -p meerkat-recall-bin -- serve
 ```
 
 An optional bootstrap snapshot can be selected with

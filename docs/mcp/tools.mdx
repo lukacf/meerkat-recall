@@ -1,6 +1,6 @@
 ---
 title: "Tool Reference"
-description: "Complete reference for all Elephant MCP tools organized by category"
+description: "Complete reference for all Meerkat Recall MCP tools organized by category"
 icon: "wrench"
 ---
 
@@ -57,7 +57,7 @@ Search documents using semantic search, with lexical fallback when embeddings ar
 ### ingest_doc
 **Profiles:** D, F
 
-Ingest a new document for processing using the full document-shaped body. Elephant stages a source-backed document and enqueues the source-first pipeline. Prefer `ingest_doc_simple` when you only need title, text/media, collection, and metadata.
+Ingest a new document for processing using the full document-shaped body. Meerkat Recall stages a source-backed document and enqueues the source-first pipeline. Prefer `ingest_doc_simple` when you only need title, text/media, collection, and metadata.
 
 | Parameter | Type and requirement | Description |
 | --- | --- | --- |
@@ -71,7 +71,7 @@ Ingest a new document for processing using the full document-shaped body. Elepha
 {
   "doc": {
     "title": "Meeting notes",
-    "text": "Alice met Bob on 2026-02-02 to discuss Project Elephant."
+    "text": "Alice met Bob on 2026-02-02 to discuss Project Meerkat Recall."
   }
 }
 ```
@@ -263,7 +263,7 @@ may be removed. Inspect the result before relying on the corrected metadata.
 ### ingest_file
 **Profiles:** F
 
-Read a path on the Elephant server and ingest its text or media content.
+Read a path on the Meerkat Recall server and ingest its text or media content.
 Explicitly mount intended files into a container; the supplied Compose file
 does not provide an `/ingest` mount. The similarly named local-helper tool
 reads client-side UTF-8 text and has a separate schema.
@@ -547,7 +547,7 @@ root. This requires write authorization for the selected root record.
 ### materialize_knowledge_views
 **Profiles:** M, F
 
-Compile existing Elephant data into Living Wiki pages without first naming
+Compile existing Meerkat Recall data into Living Wiki pages without first naming
 individual roots. The tool scans bounded, ID-ordered pages of entities,
 sources, and graph-view definitions. It applies record-level ABAC, continues
 past isolated compilation failures, and returns independent cursors for each
@@ -1234,7 +1234,7 @@ Approve a predicate alias proposal from a work artifact, creating an active alia
 ### add_timeline_event
 **Profiles:** D, M, F
 
-Create a timeline event with explicit evidence references. Elephant requires at least one `assertion_refs` or `source_refs` item, so this tool stays provenance-safe instead of creating bare events.
+Create a timeline event with explicit evidence references. Meerkat Recall requires at least one `assertion_refs` or `source_refs` item, so this tool stays provenance-safe instead of creating bare events.
 
 | Parameter | Type and requirement | Description |
 | --- | --- | --- |
@@ -1590,7 +1590,7 @@ Get managed-runtime readiness, bootstrap status, and semantic ingest availabilit
 ### initialize_runtime
 **Profiles:** D, M, F (bootstrap mode only)
 
-Initialize Elephant from bootstrap mode and persist `.elephant/elephant_config.toml`.
+Initialize Meerkat Recall from bootstrap mode and persist `.elephant/elephant_config.toml`.
 
 | Parameter | Type and requirement | Description |
 | --- | --- | --- |
@@ -1745,7 +1745,7 @@ Export the live embedded store to a host path.
 ```
 
 <Note>
-  This tool only appears when Elephant is running `ELEPHANT_DB=elephant-db` and the caller qualifies for global snapshot administration.
+  This tool only appears when Meerkat Recall is running `ELEPHANT_DB=elephant-db` and the caller qualifies for global snapshot administration.
 </Note>
 
 ---

@@ -1,22 +1,22 @@
 # Active Architecture (Code-Truth)
 
-This document is the canonical source of truth for what Elephant runs today.
+This document is the canonical source of truth for what Meerkat Recall runs today.
 If this file conflicts with older design notes or historical docs, this file wins.
 
 ## Runtime Topology
 
-Elephant now has a managed runtime layer.
+Meerkat Recall now has a managed runtime layer.
 
 Primary runtime:
-- `elephant serve`: HTTP + MCP server plus managed runtime owner.
+- `meerkat-recall serve`: HTTP + MCP server plus managed runtime owner.
 - storage backend: `surreal-db` (default, persistent) or embedded `elephant-db`.
-- in configured write-capable modes, `elephant serve` also starts the background
+- in configured write-capable modes, `meerkat-recall serve` also starts the background
   pipeline worker loops in-process through the shared runtime manager.
 
 Advanced runtime:
-- `elephant worker`: reusable worker runtime used by the managed runtime and
+- `meerkat-recall worker`: reusable worker runtime used by the managed runtime and
   available as a standalone advanced surface for SurrealDB-backed deployments.
-- `elephant serve --server-only`: HTTP/MCP server without managed workers.
+- `meerkat-recall serve --server-only`: HTTP/MCP server without managed workers.
 
 Managed runtime modes:
 - `bootstrap`: no `.elephant/elephant_config.toml` yet; only runtime status and
@@ -49,8 +49,10 @@ writes require read and write authorization for existing and proposed records.
 These ordinary interfaces cannot change any field of an existing `Security`
 object. There is no ordinary declassification scope. Security-preserving storage
 methods compare the current security and replace the record atomically on both
-backends, including restoration, preventing stale edits from reverting a newer
-classification. Trusted internal maintenance retains the low-level update API
+backends. Ordinary replacements additionally preserve identity, subjects and raw
+subject completeness, and compare the authorized timestamp, lifecycle and full
+envelope at that same commit, including restoration. Stale edits cannot revert
+a newer classification or subject change. Trusted internal maintenance retains the low-level update API
 for intentional security changes.
 
 ## Active Source, Extraction, and Commit Path
@@ -205,7 +207,7 @@ that featured hierarchy and section counts; each section remains browsable in
 full without placing hundreds of reference pages on the front page. Navigation
 is derived metadata and never becomes a graph fact or source.
 
-Elephant fills omitted related-article links from explicitly governed graph
+Meerkat Recall fills omitted related-article links from explicitly governed graph
 edges and resolved source-evidence co-mentions, then uses separate writer and
 verifier calls for every article. Writer contexts include governed current
 attributes, approved first-class events, truth-slot uncertainty, canonical
@@ -230,7 +232,7 @@ scope, avoiding collisions with a cancelled periodic item in the same time
 bucket. Failed articles leave the fingerprint uncached so the next run retries
 instead of accepting a partial wiki as current. The
 authenticated `/wiki` browser renders the LLM-organized sections over verified
-English revisions, and `elephant demo-wiki` remains the small isolated example.
+English revisions, and `meerkat-recall demo-wiki` remains the small isolated example.
 Knowledge-view invalidation has its own event watcher and does not depend on
 the truth-maintenance worker being enabled. Direct entity API mutations also
 publish semantic outbox records, so creates, updates, deletes, restores,
@@ -357,6 +359,27 @@ Code namespaces:
 
 See `docs/non-active-catalog.md` for policy and ownership rules.
 
+## Authentication Context
+
+HTTP and MCP use `elephant-auth` as the single legacy bearer-token verifier.
+Authenticated requests retain an opaque verified caller context, including
+issuer, audience and expiry, alongside the existing public Principal/ABAC
+projections. Those projections remain policy input, not authentication proof.
+Explicit skip-auth and trusted in-process embedding have no verified context.
+
+Trusted host composition can install exact issuer/audience-to-domain mappings.
+The mapping requires independently configured issuer and audience checks; no
+domain is inferred from a subject string or URL. Mapped identity does not grant
+Meerkat Recall clearances, live delegation or governed execution. The existing local
+ABAC evaluator and subject-scope semantics remain authoritative.
+
+The auth crate also validates a strict, versioned, request-bound exchange syntax
+with required qualified identities, operation bindings and explicit time bounds.
+This is authenticated claim evidence only. Existing HTTP/MCP tool routes refuse
+its distinct token type; no governed resource endpoint is active. Canonical
+resource generations, live grant/revocation checks, replay/entry custody,
+protected result envelopes and mandatory durable evidence remain required.
+
 ## Active Data Model Notes
 
 - `source` is the first-class intake object. `source.lifecycle_status`,
@@ -444,7 +467,13 @@ Migration 029 adds durable `work_item_archive` and `work_run_archive` history.
 Retention preserves public IDs, idempotency lookup, retries, failed dependency
 barriers, provenance, and usage metrics. Historical job and document-status
 reads include archived records. Wiki authority and its current scheduling
-configuration remain available to the recurring service.
+configuration remain available to the recurring service. SurrealDB-backed
+updates and restores write both hot and archive identities in their existing
+transaction, so archival conflicts with a concurrent acknowledged retry or run
+update. The in-process SurrealKV 0.9.3 dependency uses a pinned snapshot-version
+backport; remote SurrealDB servers require their own equivalent engine repair.
+This retention guarantee does not establish general serializable authorization
+fences. See the [backport provenance](../vendor/surrealkv-0.9.3-backport.md).
 
 See [Work queue capacity and retention](work-queue-capacity.md) for
 query-plan constraints, operator settings, and acceptance criteria.

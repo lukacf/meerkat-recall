@@ -195,6 +195,7 @@ mod tests {
         Entity::new(base, EntityType::new("person"), display_name.to_string())
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn test_get_capabilities_shape_matches_spec() {
         let (app, ..) = setup_test_app().await;

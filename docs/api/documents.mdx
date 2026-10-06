@@ -1,6 +1,6 @@
 ---
 title: "Documents"
-description: "Ingest, search, and manage documents in the Elephant knowledge pipeline."
+description: "Ingest, search, and manage documents in the Meerkat Recall knowledge pipeline."
 icon: "file-lines"
 ---
 
@@ -95,7 +95,7 @@ curl -X POST http://localhost:3000/v1/docs/search \
 
 `POST /v1/docs/ingest`
 
-Ingest a new document into the processing pipeline. Elephant stages a source-backed document and enqueues source-first work so the pipeline can triage, render, chunk, embed, and extract knowledge from it.
+Ingest a new document into the processing pipeline. Meerkat Recall stages a source-backed document and enqueues source-first work so the pipeline can triage, render, chunk, embed, and extract knowledge from it.
 
 <ParamField body="title" type="string" required>
   Document title.
@@ -134,7 +134,7 @@ curl -X POST http://localhost:3000/v1/docs/ingest \
   -H "Content-Type: application/json" \
   -d '{
     "title": "Meeting Notes",
-    "text": "Alice met Bob on 2026-02-02 to discuss Project Elephant.",
+    "text": "Alice met Bob on 2026-02-02 to discuss Project Meerkat Recall.",
     "collection": "meeting-notes"
   }'
 ```

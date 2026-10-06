@@ -14,7 +14,8 @@
 //! The target must be EMPTY (fresh rocksdb path or empty database); the tool
 //! refuses a non-empty target rather than guessing about merges.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use clap::Args;
@@ -40,6 +41,44 @@ use elephant_types::records::{
 
 const EMBEDDING_CHUNK: usize = 500;
 
+// Every nonempty source table must have an explicit copy path below. New
+// typed tables must fail closed just like opaque extension tables.
+const SUPPORTED_TABLES: &[&str] = &[
+    "space_config",
+    "entity",
+    "source",
+    "cost_ledger_daily",
+    "ingest_decision",
+    "doc",
+    "doc_revision",
+    "doc_node",
+    "media_asset",
+    "chunk_embedding",
+    "entity_identity_key",
+    "identity_candidate",
+    "entity_merge",
+    "predicate_registry",
+    "predicate_alias",
+    "assertion",
+    "attribute",
+    "rel",
+    "conflict_group",
+    "truth_slot",
+    "event",
+    "freshness",
+    "reprocess_job",
+    "work_item",
+    "work_edge",
+    "work_run",
+    "work_item_archive",
+    "work_run_archive",
+    "work_artifact",
+    "work_deadletter",
+    "system_event",
+    "audit_log",
+    "id_map",
+];
+
 #[derive(Args, Debug, Clone)]
 pub struct DataMigrateArgs {
     /// Path to the elephant-db JSON snapshot to migrate.
@@ -54,7 +93,7 @@ pub struct DataMigrateArgs {
     /// Target database. Defaults to `SURREALDB_DATABASE` or "elephant".
     #[arg(long)]
     pub database: Option<String>,
-    /// Write a machine-readable JSON report of per-table row counts here.
+    /// Write a JSON report to a new file; existing paths are never overwritten.
     #[arg(long)]
     pub report: Option<PathBuf>,
 }
@@ -160,21 +199,85 @@ pub async fn run(args: DataMigrateArgs) -> anyhow::Result<()> {
         .await
         .context("connect target surreal backend")?;
 
-    // Refuse a non-empty target: this is a one-time migration, not a merge.
-    let existing = dst
-        .query_checked("SELECT count() FROM doc GROUP ALL")
+    preflight(&src, &dst, args.report.as_deref()).await?;
+    copy_snapshot(&src, &dst, args.report.as_deref())
         .await
-        .ok()
-        .and_then(|mut r| r.take::<Option<serde_json::Value>>(0).ok().flatten());
-    if let Some(value) = existing {
-        let count = value.get("count").and_then(serde_json::Value::as_u64);
-        if count.unwrap_or(0) > 0 {
-            bail!("target already contains documents; refusing to migrate into a non-empty store");
+        .context("migration failed after preflight; the target may contain a partial copy, and the input snapshot is unchanged")
+}
+
+async fn preflight(
+    src: &EmbeddedStore,
+    dst: &StorageClient,
+    report: Option<&Path>,
+) -> anyhow::Result<()> {
+    let unsupported_tables: Vec<String> = src
+        .persisted_table_names()
+        .await
+        .context("enumerate snapshot tables")?
+        .into_iter()
+        .filter(|table| !SUPPORTED_TABLES.contains(&table.as_str()))
+        .collect();
+    if !unsupported_tables.is_empty() {
+        bail!("unsupported snapshot tables: {unsupported_tables:?}; no target schema or data was written");
+    }
+    if let Some(path) = report {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => bail!(
+                "report path already exists: {}; refusing to overwrite it",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("check report output path"),
         }
     }
+    ensure_empty_target(dst).await
+}
 
-    println!("Applying schema to {url} ...");
-    elephant_migrations::apply_schema(&dst)
+#[derive(serde::Deserialize)]
+struct DatabaseInfo {
+    tables: std::collections::BTreeMap<String, String>,
+}
+
+async fn ensure_empty_target(dst: &StorageClient) -> anyhow::Result<()> {
+    // Inspect every table, including archives and caller-defined tables. An
+    // empty SELECT on doc alone says nothing about the rest of the database.
+    let mut response = dst
+        .query_checked("INFO FOR DB")
+        .await
+        .context("cannot verify target table metadata")?;
+    let mut metadata: Vec<DatabaseInfo> =
+        response.take(0).context("invalid target table metadata")?;
+    if metadata.len() != 1 {
+        bail!("missing or ambiguous target table metadata");
+    }
+    let info = metadata.pop().context("missing target table metadata")?;
+    for table in info.tables.keys() {
+        let mut response = dst
+            .query_bind_checked(
+                "RETURN array::len((SELECT VALUE id FROM type::table($table) LIMIT 1))",
+                vec![("table".to_owned(), table.clone())],
+            )
+            .await
+            .with_context(|| format!("cannot verify target table {table}"))?;
+        let occupied: Option<u64> = response
+            .take(0)
+            .with_context(|| format!("invalid occupancy result for target table {table}"))?;
+        match occupied {
+            Some(0) => {}
+            Some(_) => bail!("target table {table} contains records; refusing a non-empty target"),
+            None => bail!("missing occupancy result for target table {table}"),
+        }
+    }
+    Ok(())
+}
+
+async fn copy_snapshot(
+    src: &EmbeddedStore,
+    dst: &StorageClient,
+    report_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    println!("Applying target schema ...");
+    elephant_migrations::apply_schema(dst)
         .await
         .map_err(|e| anyhow::anyhow!("apply schema: {e}"))?;
 
@@ -512,32 +615,28 @@ pub async fn run(args: DataMigrateArgs) -> anyhow::Result<()> {
             report.push(("id_map(raw)", rows.len()));
         }
     }
-    // Extension tables have NO surreal surface at all: enumerate loudly.
-    let extension_tables = src
-        .mutate(|tx| Ok(tx.extension_table_names()))
-        .await
-        .unwrap_or_default();
-    if !extension_tables.is_empty() {
-        println!(
-            "WARNING: snapshot carries extension tables with NO surreal migration path: {extension_tables:?}"
-        );
-    }
-
     println!("\n=== MIGRATION REPORT ===");
     for (label, count) in &report {
         println!("{label}: {count}");
     }
-    if let Some(path) = &args.report {
+    if let Some(path) = report_path {
         let tables: serde_json::Map<String, serde_json::Value> = report
             .iter()
             .map(|(label, count)| ((*label).to_string(), serde_json::json!(count)))
             .collect();
-        std::fs::write(
-            path,
-            serde_json::to_vec_pretty(&serde_json::json!({ "tables": tables }))
-                .context("serialize report")?,
-        )
-        .with_context(|| format!("write report to {}", path.display()))?;
+        // create_new also refuses symlink/hard-link aliases of the snapshot
+        // and closes the race after the preflight existence check.
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("create report {}", path.display()))?;
+        output
+            .write_all(
+                &serde_json::to_vec_pretty(&serde_json::json!({ "tables": tables }))
+                    .context("serialize report")?,
+            )
+            .with_context(|| format!("write report to {}", path.display()))?;
         println!("report written: {}", path.display());
     }
     Ok(())
@@ -545,7 +644,245 @@ pub async fn run(args: DataMigrateArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_nul;
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn preflight_checks_every_target_table_without_writing_schema() {
+        for table in ["entity", "work_item_archive", "custom_records"] {
+            let dst = StorageClient::new_memory().await.unwrap();
+            dst.query_checked(&format!("CREATE {table}:existing SET value = 'preserve'"))
+                .await
+                .unwrap();
+            let before = dst.list_tables().await.unwrap();
+            let error = preflight(&EmbeddedStore::new(), &dst, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(table), "{error:#}");
+            assert_eq!(dst.list_tables().await.unwrap(), before);
+            let mut response = dst
+                .query_checked(&format!("SELECT VALUE value FROM {table}:existing"))
+                .await
+                .unwrap();
+            assert_eq!(response.take::<Vec<String>>(0).unwrap(), vec!["preserve"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_extensions_are_rejected_before_target_writes() {
+        let src = EmbeddedStore::new();
+        src.mutate(|tx| {
+            tx.upsert_extension_row(
+                "custom_records",
+                serde_json::json!({"id":"custom_records:one","space_id":"space","value":"preserve"}),
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("source.json");
+        src.export_snapshot(&snapshot).await.unwrap();
+        let before = std::fs::read(&snapshot).unwrap();
+        let src = EmbeddedStore::from_snapshot(&snapshot).await.unwrap();
+        let dst = StorageClient::new_memory().await.unwrap();
+        assert!(preflight(&src, &dst, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("custom_records"));
+        assert!(dst.list_tables().await.unwrap().is_empty());
+        assert_eq!(std::fs::read(snapshot).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn embedding_snapshot_accepts_rebuilt_indexes_but_refuses_opaque_rows() {
+        use elephant_types::ids::TableName;
+        use elephant_types::records::BaseFields;
+        use elephant_types::{Link, RecordId};
+
+        let src = EmbeddedStore::new();
+        let embedding = NodeEmbedding {
+            base: BaseFields::new(
+                RecordId::new_v4(TableName::ChunkEmbedding),
+                "space".into(),
+                "fixture".into(),
+            ),
+            node: Link::new(RecordId::new_v4(TableName::DocNode)),
+            model: "test-model".into(),
+            dims: 3,
+            vector: vec![1.0, 0.0, 0.0],
+        };
+        src.mutate(|tx| {
+            tx.create(embedding.clone())?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("source.json");
+        src.export_snapshot(&snapshot).await.unwrap();
+        let before = std::fs::read(&snapshot).unwrap();
+        let src = EmbeddedStore::from_snapshot(&snapshot).await.unwrap();
+        assert_eq!(
+            src.persisted_table_names().await.unwrap(),
+            vec!["chunk_embedding"]
+        );
+        let partition = src
+            .table_names()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|name| name != "chunk_embedding")
+            .unwrap();
+        let dst = StorageClient::new_memory().await.unwrap();
+        preflight(&src, &dst, None).await.unwrap();
+        assert!(dst.list_tables().await.unwrap().is_empty());
+        assert_eq!(src.scan::<NodeEmbedding>().await.unwrap(), vec![embedding]);
+        assert_eq!(std::fs::read(snapshot).unwrap(), before);
+
+        // A real opaque table with the same spelling as a derived partition
+        // must still be rejected; partition name prefixes grant no exemption.
+        src.mutate(|tx| {
+            tx.upsert_extension_row(
+                &partition,
+                serde_json::json!({
+                    "id": format!("{partition}:one"), "space_id": "space", "value": "preserve"
+                }),
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(preflight(&src, &dst, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains(&partition));
+        assert!(dst.list_tables().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsupported_typed_tables_are_rejected_before_target_writes() {
+        use elephant_types::ids::TableName;
+        use elephant_types::records::{BaseFields, SourceWatch, SourceWatchStatus};
+        use elephant_types::{Link, RecordId};
+
+        let src = EmbeddedStore::new();
+        let watch = SourceWatch {
+            base: BaseFields::new(
+                RecordId::new_v4(TableName::SourceWatch),
+                "space".into(),
+                "fixture".into(),
+            ),
+            source: Link::new(RecordId::new_v4(TableName::Source)),
+            requested_uri: "https://example.test/source.txt".into(),
+            status: SourceWatchStatus::Enabled,
+            interval_seconds: 3600,
+            next_check_at: chrono::Utc::now(),
+            last_checked_at: None,
+            last_changed_at: None,
+            etag: None,
+            last_modified: None,
+            observed_hash: None,
+            consecutive_failures: 0,
+            last_error: None,
+            latest_check: None,
+        };
+        src.mutate(|tx| {
+            tx.create(watch.clone())?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("source.json");
+        src.export_snapshot(&snapshot).await.unwrap();
+        let before = std::fs::read(&snapshot).unwrap();
+        let src = EmbeddedStore::from_snapshot(&snapshot).await.unwrap();
+        let dst = StorageClient::new_memory().await.unwrap();
+        let error = preflight(&src, &dst, None).await.unwrap_err();
+        assert!(error.to_string().contains("source_watch"), "{error:#}");
+        assert!(dst.list_tables().await.unwrap().is_empty());
+        assert_eq!(src.scan::<SourceWatch>().await.unwrap(), vec![watch]);
+        assert_eq!(std::fs::read(snapshot).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn unverifiable_target_and_existing_report_are_refused() {
+        let src = EmbeddedStore::new();
+        let unsupported = StorageClient::new_embedded().await.unwrap();
+        assert!(preflight(&src, &unsupported, None).await.is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("source.json");
+        src.export_snapshot(&snapshot).await.unwrap();
+        let before = std::fs::read(&snapshot).unwrap();
+        let dst = StorageClient::new_memory().await.unwrap();
+        assert!(preflight(&src, &dst, Some(&snapshot)).await.is_err());
+        assert!(dst.list_tables().await.unwrap().is_empty());
+        assert_eq!(std::fs::read(snapshot).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn isolated_empty_target_preserves_entity_identity_and_security() {
+        use elephant_types::ids::TableName;
+        use elephant_types::records::{BaseFields, EntityType};
+        use elephant_types::RecordId;
+        let src = EmbeddedStore::new();
+        let mut entity = Entity::new(
+            BaseFields::new(
+                RecordId::new_v4(TableName::Entity),
+                "space".into(),
+                "fixture".into(),
+            ),
+            EntityType::new("person"),
+            "Migration fixture".into(),
+        );
+        entity.base.security.level = 3;
+        entity.base.security.labels = vec!["restricted".into()];
+        src.mutate(|tx| {
+            tx.create(entity.clone())?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("source.json");
+        src.export_snapshot(&snapshot).await.unwrap();
+        let before = std::fs::read(&snapshot).unwrap();
+        let src = EmbeddedStore::from_snapshot(&snapshot).await.unwrap();
+        let dst = StorageClient::new_memory().await.unwrap();
+        preflight(&src, &dst, None).await.unwrap();
+        assert!(dst.list_tables().await.unwrap().is_empty());
+        copy_snapshot(&src, &dst, None).await.unwrap();
+        let actual = EntityRepository::new(dst)
+            .get("space", &entity.base.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(entity).unwrap()
+        );
+        assert_eq!(std::fs::read(snapshot).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_report_symlink_is_refused_before_target_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.json");
+        let missing = dir.path().join("missing.json");
+        std::os::unix::fs::symlink(&missing, &report).unwrap();
+        let dst = StorageClient::new_memory().await.unwrap();
+        let error = preflight(&EmbeddedStore::new(), &dst, Some(&report))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("report path already exists"));
+        assert!(dst.list_tables().await.unwrap().is_empty());
+        assert_eq!(std::fs::read_link(report).unwrap(), missing);
+    }
 
     #[test]
     fn strip_nul_scrubs_nested_strings_and_reports_touch() {

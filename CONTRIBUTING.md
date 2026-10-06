@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping make Elephant better.
+Thanks for helping make Meerkat Recall better.
 
 ## Development Setup
 
@@ -18,7 +18,7 @@ For the local SurrealDB-backed stack:
 
 ```bash
 docker compose up -d surrealdb
-docker compose run --rm elephant elephant migrate
+docker compose run --rm elephant meerkat-recall migrate
 docker compose up -d elephant
 ```
 
@@ -26,7 +26,7 @@ For embedded local mode:
 
 ```bash
 SKIP_AUTH=true ELEPHANT_HOST=127.0.0.1 ELEPHANT_DB=elephant-db \
-  ./scripts/repo-cargo run -p elephant-bin -- serve
+  ./scripts/repo-cargo run -p meerkat-recall-bin -- serve
 ```
 
 ## Before Opening A Pull Request

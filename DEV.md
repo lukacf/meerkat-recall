@@ -10,8 +10,8 @@ Start a local SurrealDB and use the development environment:
 ```bash
 docker compose -f docker-compose.dev.yml up -d
 source .envrc
-./scripts/repo-cargo run -p elephant-bin -- migrate
-./scripts/repo-cargo run -p elephant-bin -- serve
+./scripts/repo-cargo run -p meerkat-recall-bin -- migrate
+./scripts/repo-cargo run -p meerkat-recall-bin -- serve
 ```
 
 These defaults bind to loopback and bypass authentication for local development.
@@ -36,7 +36,7 @@ before starting the other Compose stack (both use port 8000):
 ```bash
 docker compose -f docker-compose.dev.yml down
 docker compose up -d surrealdb
-docker compose run --rm elephant elephant migrate
+docker compose run --rm elephant meerkat-recall migrate
 docker compose up --build -d elephant
 ```
 

@@ -616,6 +616,7 @@ impl ResolutionDisambiguator for AgenticDisambiguator {
                 model: self.model.clone(),
                 messages: messages.clone(),
                 tools: tool_defs.clone(),
+                tool_choice: Default::default(),
                 max_tokens,
                 temperature: Some(0.0),
                 stop_sequences: None,

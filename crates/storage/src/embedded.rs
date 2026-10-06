@@ -146,9 +146,15 @@ impl EmbeddedStore {
         self.db.import_snapshot_db(validated).map_err(Into::into)
     }
 
-    /// Returns the set of logical table names with at least one stored record.
+    /// Returns nonempty persisted tables and derived vector partition names.
     pub async fn table_names(&self) -> StorageResult<Vec<String>> {
         self.with_import_read_guard(|db| db.table_names().map_err(Into::into))
+            .await
+    }
+
+    /// Returns nonempty typed and extension tables, excluding derived indexes.
+    pub async fn persisted_table_names(&self) -> StorageResult<Vec<String>> {
+        self.with_import_read_guard(|db| db.persisted_table_names().map_err(Into::into))
             .await
     }
 

@@ -2105,36 +2105,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "elephant-bin"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.8.9",
- "chrono",
- "clap",
- "elephant",
- "elephant-api",
- "elephant-embeddings",
- "elephant-knowledge-views",
- "elephant-migrations",
- "elephant-pipeline",
- "elephant-pipeline-bin",
- "elephant-storage",
- "elephant-types",
- "hex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "walkdir",
-]
-
-[[package]]
 name = "elephant-calibration"
 version = "0.1.0"
 dependencies = [
@@ -4739,6 +4709,37 @@ checksum = "9458d21a0e22cc9ee8a8ba1f505e4ba4cd1d205717c7051e508daa448b03bea3"
 dependencies = [
  "meerkat-auth-core",
  "meerkat-llm-core",
+]
+
+[[package]]
+name = "meerkat-recall-bin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.9",
+ "chrono",
+ "clap",
+ "elephant",
+ "elephant-api",
+ "elephant-embeddings",
+ "elephant-knowledge-views",
+ "elephant-migrations",
+ "elephant-pipeline",
+ "elephant-pipeline-bin",
+ "elephant-storage",
+ "elephant-types",
+ "hex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]

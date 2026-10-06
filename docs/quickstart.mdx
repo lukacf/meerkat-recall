@@ -1,6 +1,6 @@
 ---
 title: Quickstart
-description: Start a local Elephant server, verify readiness, ingest a synthetic document, and inspect the result.
+description: Start a local Meerkat Recall server, verify readiness, ingest a synthetic document, and inspect the result.
 icon: rocket
 ---
 
@@ -18,8 +18,8 @@ set; it is not a runtime switch on the distributed binary.
 Both routes start from a checkout. With Git installed, run:
 
 ```bash
-git clone https://github.com/lukacf/elephant.git
-cd elephant
+git clone https://github.com/lukacf/meerkat-recall.git
+cd meerkat-recall
 ```
 
 Run the remaining commands from this directory.
@@ -30,13 +30,13 @@ The Living Wiki demo needs Rust 1.94 or newer, but no database service or model
 credentials:
 
 ```bash
-./scripts/repo-cargo run -p elephant-bin --no-default-features -- demo-wiki
+./scripts/repo-cargo run -p meerkat-recall-bin --no-default-features -- demo-wiki
 ```
 
 The first source build can take several minutes. Once the server starts:
 
 1. Open the `Editorial context projection` URL printed in the terminal, or find
-   **Elephant Living Wiki architecture** in the
+   **Meerkat Recall Living Wiki architecture** in the
    [context inspector](http://localhost:3000/inspect/knowledge-views).
 2. Read the projected context and its **Compilation receipt**. The receipt
    records what was compiled; it is not a judgment that every claim is true.
@@ -63,13 +63,13 @@ model calls can incur charges.
 cp .env.example .env
 # Edit .env with your provider credentials.
 docker compose up -d surrealdb
-docker compose run --rm elephant elephant migrate
+docker compose run --rm elephant meerkat-recall migrate
 docker compose up -d elephant
 ```
 
 Migrations must run against the same namespace and database as the server.
 Running the migration inside the Compose service uses that service's settings.
-Elephant runs managed workers in the server process by default.
+Meerkat Recall runs managed workers in the server process by default.
 
 <Warning>
 Compose is a local development configuration with authentication bypass.

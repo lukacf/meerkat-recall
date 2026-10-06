@@ -1,15 +1,15 @@
 [package]
-name = "elephant-bin"
+name = "meerkat-recall-bin"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Unified Elephant command line interface"
+description = "Meerkat Recall command line interface"
 publish = false
 
 [[bin]]
-name = "elephant"
+name = "meerkat-recall"
 path = "src/main.rs"
 
 [dependencies]
@@ -40,6 +40,7 @@ chrono = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true }
 tower = { workspace = true }
+tempfile = "3"
 
 [features]
 rocksdb = ["elephant-storage/rocksdb"]

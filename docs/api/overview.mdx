@@ -1,6 +1,6 @@
 ---
 title: "API Overview"
-description: "Base URL, authentication, versioning, response format, pagination, and error handling for the Elephant HTTP API."
+description: "Base URL, authentication, versioning, response format, pagination, and error handling for the Meerkat Recall HTTP API."
 icon: "book"
 ---
 
@@ -20,7 +20,7 @@ Use the HTTP API from application code and scripts. For a first integration:
 
 ## Base URL
 
-All API endpoints are served by `elephant serve` (Axum, default port 3000):
+All API endpoints are served by `meerkat-recall serve` (Axum, default port 3000):
 
 ```
 http://localhost:3000
@@ -36,7 +36,7 @@ not promise a fixed deprecation window.
 
 ## Authentication
 
-Elephant uses **JWT Bearer tokens** for authentication. Include the token in the `Authorization` header of every request:
+Meerkat Recall uses **JWT Bearer tokens** for authentication. Include the token in the `Authorization` header of every request:
 
 ```
 Authorization: Bearer <your-jwt-token>

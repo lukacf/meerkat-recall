@@ -10,7 +10,7 @@ the HTTP and MCP APIs; the database boundary needs its own representation.
 
 ## Keep storage proxies separate from domain records
 
-Elephant's domain records flatten `BaseFields` for API JSON. Do not send those
+Meerkat Recall's domain records flatten `BaseFields` for API JSON. Do not send those
 flattened structs directly through the SurrealDB driver. Use a database proxy
 with explicit fields, then convert it with `TryFrom`.
 
@@ -20,7 +20,7 @@ separately. Its conversion constructs the domain `BaseFields` and validates ID
 conversion before returning an `Entity`.
 
 Read the actual
-[entity storage proxy and conversion](https://github.com/lukacf/elephant/blob/main/crates/storage/src/entity_repository.rs)
+[entity storage proxy and conversion](https://github.com/lukacf/meerkat-recall/blob/main/crates/storage/src/entity_repository.rs)
 as the starting point for a new repository. Copying a partial domain struct
 into a proxy risks dropping security or provenance fields.
 
@@ -32,8 +32,8 @@ Use a Serde `Visitor` with the methods required for the type: string, map, or
 native enum access.
 
 A map visitor is not a replacement for `visit_enum`. The current
-[record ID deserializers](https://github.com/lukacf/elephant/blob/main/crates/types/src/ids.rs)
-show how Elephant handles the supported native and string representations.
+[record ID deserializers](https://github.com/lukacf/meerkat-recall/blob/main/crates/types/src/ids.rs)
+show how Meerkat Recall handles the supported native and string representations.
 Reject unknown representations explicitly rather than guessing a value.
 
 When changing a deserializer, test both the public JSON representation and a

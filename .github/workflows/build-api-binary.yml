@@ -50,10 +50,10 @@ jobs:
           df -h / /mnt
       - name: Build unified elephant binary with RocksDB
         run: |
-          ./scripts/repo-cargo build --locked --profile deploy -p elephant-bin --features rocksdb
+          ./scripts/repo-cargo build --locked --profile deploy -p meerkat-recall-bin --features rocksdb
           target_dir="$(./scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')"
           mkdir -p artifacts
-          cp "$target_dir/deploy/elephant" artifacts/elephant
+          cp "$target_dir/deploy/meerkat-recall" artifacts/elephant
           ldd artifacts/elephant
           artifacts/elephant --help
           sha256sum artifacts/elephant > artifacts/elephant.sha256

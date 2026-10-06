@@ -1,13 +1,13 @@
-# Elephant
+# Meerkat Recall
 
-Elephant is a Rust knowledge system for applications and AI agents. It combines
+Meerkat Recall is a Rust knowledge system for applications and AI agents. It combines
 entity graphs, document and vector search, evidence-backed extraction, and
 truth maintenance behind HTTP and MCP interfaces with space isolation and
 attribute-based access control.
 
 This is pre-1.0 software. The workspace version is a development version until
 verified artifacts and release notes appear on the
-[releases page](https://github.com/lukacf/elephant/releases).
+[releases page](https://github.com/lukacf/meerkat-recall/releases).
 
 ## Installation paths
 
@@ -17,14 +17,20 @@ checksums, and model-provider prerequisites. Candidate availability is not a
 published release; use only artifacts supplied with their matching release
 record. The source demo below is a separate build without model extraction.
 
+The command is `meerkat-recall`; native archives retain an `elephant` alias
+through the 0.1 line. Existing `.elephant` configuration, `ELEPHANT_*` variables,
+database names and HTTP/MCP wire identifiers remain unchanged. The first
+release provides source and native downloads, without a registry-published
+Rust library.
+
 ## Try the Living Wiki demo
 
 From a checkout, with Rust 1.94 or newer installed:
 
 ```bash
-git clone https://github.com/lukacf/elephant.git
-cd elephant
-./scripts/repo-cargo run -p elephant-bin --no-default-features -- demo-wiki
+git clone https://github.com/lukacf/meerkat-recall.git
+cd meerkat-recall
+./scripts/repo-cargo run -p meerkat-recall-bin --no-default-features -- demo-wiki
 ```
 
 Open the [context inspector](http://localhost:3000/inspect/knowledge-views) and
@@ -37,7 +43,7 @@ The first source build can take several minutes. Press Ctrl-C to stop it.
 
 ## Run a persistent local server
 
-Docker Compose runs Elephant and SurrealDB. For semantic ingestion, copy
+Docker Compose runs Meerkat Recall and SurrealDB. For semantic ingestion, copy
 [.env.example](.env.example) to `.env` and configure `OPENAI_API_KEY` for the
 Compose embedding provider and `ANTHROPIC_API_KEY` for its extraction model.
 These calls can incur provider charges.
@@ -46,7 +52,7 @@ These calls can incur provider charges.
 cp .env.example .env
 # Edit .env with your local provider configuration before continuing.
 docker compose up -d surrealdb
-docker compose run --rm elephant elephant migrate
+docker compose run --rm elephant meerkat-recall migrate
 docker compose up -d elephant
 curl -fsS http://localhost:3000/v1/runtime/status
 ```
@@ -57,7 +63,7 @@ Compose configuration uses development authentication bypass; see
 [deployment and authentication](docs/operations/deployment.mdx) before
 exposing an instance to other users.
 
-Elephant's public command is `elephant` ([CLI reference](docs/cli/overview.mdx)):
+Meerkat Recall's public command is `meerkat-recall` ([CLI reference](docs/cli/overview.mdx)):
 
 - `serve` runs HTTP, MCP, and managed workers together.
 - `serve --server-only` runs HTTP and MCP without workers.
@@ -68,7 +74,7 @@ Elephant's public command is `elephant` ([CLI reference](docs/cli/overview.mdx))
 
 ## Connect an MCP client
 
-Use Streamable HTTP at `http://localhost:3000/mcp`. `elephant serve` is an HTTP
+Use Streamable HTTP at `http://localhost:3000/mcp`. `meerkat-recall serve` is an HTTP
 server, not a stdio MCP process. Configure the client with this URL and an
 `Authorization: Bearer <token>` header when authentication is enabled.
 
@@ -125,7 +131,7 @@ let receipt = elephant.ingest_text(IngestTextRequest {
     space_id: "local".into(),
     actor: "app".into(),
     title: "Note".into(),
-    text: "Elephant can run as a library.".into(),
+    text: "Meerkat Recall can run as a library.".into(),
     ..Default::default()
 }).await?;
 ```

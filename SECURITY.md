@@ -11,7 +11,7 @@ the affected surface is still active.
 
 ## Reporting A Vulnerability
 
-Use [GitHub private vulnerability reporting](https://github.com/lukacf/elephant/security/advisories/new)
+Use [GitHub private vulnerability reporting](https://github.com/lukacf/meerkat-recall/security/advisories/new)
 when the repository has it enabled. Before public launch, maintainers must enable
 that channel and verify that an external reporter can reach it. While it is
 unavailable, request a private contact route without including vulnerability

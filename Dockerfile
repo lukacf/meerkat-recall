@@ -58,8 +58,8 @@ COPY docs/architecture/living-wiki.mdx docs/architecture/living-wiki.mdx
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --locked --release -p elephant-bin --features meerkat-extraction && \
-    cp /app/target/release/elephant /tmp/
+    cargo build --locked --release -p meerkat-recall-bin --features meerkat-extraction && \
+    cp /app/target/release/meerkat-recall /tmp/
 
 # Runtime stage
 FROM debian:bookworm-slim AS runtime
@@ -77,7 +77,8 @@ RUN useradd -r -s /bin/false elephant
 WORKDIR /app
 
 # Copy binaries from builder (from /tmp/ since target is a cache mount)
-COPY --from=builder /tmp/elephant /usr/local/bin/
+COPY --from=builder /tmp/meerkat-recall /usr/local/bin/
+RUN ln -s meerkat-recall /usr/local/bin/elephant
 
 # Copy migrations (SQL files)
 COPY --from=builder /app/crates/migrations/sql/ /app/migrations/
@@ -106,4 +107,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3000/v1/health || exit 1
 
-CMD ["elephant", "serve"]
+CMD ["meerkat-recall", "serve"]

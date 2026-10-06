@@ -4,19 +4,19 @@ description: How the API, managed workers, policy layer, storage, and model runt
 icon: sitemap
 ---
 
-Elephant has two related responsibilities: serve authorized knowledge reads and
+Meerkat Recall has two related responsibilities: serve authorized knowledge reads and
 writes, and process evidence into derived knowledge. The public `elephant`
 command assembles these into a managed runtime.
 
 ## Default runtime
 
-`elephant serve` runs HTTP, MCP, and managed workers in one process. Workers and
+`meerkat-recall serve` runs HTTP, MCP, and managed workers in one process. Workers and
 request handlers share the configured storage backend.
 
 ```mermaid
 flowchart TD
     Client["Application or agent"] --> API["HTTP and MCP handlers"]
-    subgraph Runtime["elephant serve"]
+    subgraph Runtime["meerkat-recall serve"]
         API --> Policy["Principal, space, and policy checks"]
         Policy --> Repos["Storage repositories"]
         Workers["Managed pipeline workers"] --> Repos
@@ -43,7 +43,7 @@ The [pipeline overview](/pipeline/overview) describes that sequence; the
 | Storage repositories | Provide the application's typed storage contract over the selected backend | Backend capabilities and persistence still differ |
 | Knowledge views | Build derived, cited projections and track their freshness | A view is a projection of authorized evidence, not a new source of evidence |
 
-Meerkat provides model execution. Elephant owns the knowledge schema, policies,
+Meerkat provides model execution. Meerkat Recall owns the knowledge schema, policies,
 pipeline scheduling, artifact validation, and storage. The MCP server uses the
 Rust `rmcp` transport. See [MCP profiles](/mcp/overview) for the tool surface;
 tool visibility also depends on runtime readiness and authorization.
@@ -52,11 +52,11 @@ tool visibility also depends on runtime readiness and authorization.
 
 | Layout | How it runs | Operational boundary |
 | --- | --- | --- |
-| Managed server with SurrealDB | `elephant serve` plus a persistent SurrealDB backend | Default Compose layout; apply migrations before serving |
-| Managed embedded server | `elephant serve` with `ELEPHANT_DB=elephant-db` | API and workers share one in-memory store; snapshots provide explicit recovery points |
-| Separate worker with SurrealDB | `elephant serve --server-only` and `elephant worker` against the same database | Advanced configuration; check readiness and coordinate schema and worker configuration |
+| Managed server with SurrealDB | `meerkat-recall serve` plus a persistent SurrealDB backend | Default Compose layout; apply migrations before serving |
+| Managed embedded server | `meerkat-recall serve` with `ELEPHANT_DB=elephant-db` | API and workers share one in-memory store; snapshots provide explicit recovery points |
+| Separate worker with SurrealDB | `meerkat-recall serve --server-only` and `meerkat-recall worker` against the same database | Advanced configuration; check readiness and coordinate schema and worker configuration |
 
-`elephant worker` rejects the embedded ElephantDB backend: a separate process
+`meerkat-recall worker` rejects the embedded ElephantDB backend: a separate process
 would own a different in-memory store. The supplied configuration does not
 establish a tested multi-node scaling or high-availability contract. Treat
 such a topology as deployment work requiring its own acceptance tests.

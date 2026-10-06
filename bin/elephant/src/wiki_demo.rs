@@ -34,11 +34,11 @@ struct SeededDemo {
     context_view_id: RecordId,
 }
 
-/// Seeds an isolated embedded graph and serves the regular Elephant API over it.
+/// Seeds an isolated embedded graph and serves the regular Meerkat Recall API over it.
 pub async fn run(port: u16) -> Result<()> {
     let storage = StorageClient::new_embedded()
         .await
-        .context("failed to create embedded Elephant storage")?;
+        .context("failed to create embedded Meerkat Recall storage")?;
     let seeded = Box::pin(seed(&storage)).await?;
     let wiki_url = format!("http://localhost:{port}/wiki");
     #[cfg(feature = "meerkat-extraction")]
@@ -113,7 +113,7 @@ async fn seed(storage: &StorageClient) -> Result<SeededDemo> {
     source.current_ingest_mode = Some(IngestMode::Graph);
     source.external_id = Some("elephant:docs/architecture/living-wiki.mdx".to_string());
     source.path = Some("docs/architecture/living-wiki.mdx".to_string());
-    source.author = Some("Elephant project".to_string());
+    source.author = Some("Meerkat Recall project".to_string());
     SourceRepository::new(storage.clone())
         .create(source)
         .await
@@ -122,7 +122,7 @@ async fn seed(storage: &StorageClient) -> Result<SeededDemo> {
     DocRepository::new(storage.clone())
         .create(Doc {
             base: demo_base(doc_id.clone()),
-            title: "Elephant Living Wiki architecture".to_string(),
+            title: "Meerkat Recall Living Wiki architecture".to_string(),
             text: SOURCE_TEXT.to_string(),
             sidecar_text: None,
             source: Some(Link::new(source_id.clone())),
@@ -154,13 +154,13 @@ async fn seed(storage: &StorageClient) -> Result<SeededDemo> {
     let mut wiki = demo_entity(
         "living-wiki",
         "topic",
-        "Elephant Living Wiki",
-        "A derived, cited, freshness-aware read model over canonical Elephant knowledge.",
+        "Meerkat Recall Living Wiki",
+        "A derived, cited, freshness-aware read model over canonical Meerkat Recall knowledge.",
     );
     let graph = demo_entity(
         "canonical-graph",
         "knowledge_system",
-        "Canonical Elephant graph",
+        "Canonical Meerkat Recall graph",
         "The authoritative graph of entities, relationships, attributes, and truth state.",
     );
     let evidence = demo_entity(
@@ -196,16 +196,16 @@ async fn seed(storage: &StorageClient) -> Result<SeededDemo> {
             key: "derived-from-graph",
             subject: &wiki_id,
             object: &graph_id,
-            subject_text: "Elephant Living Wiki",
+            subject_text: "Meerkat Recall Living Wiki",
             predicate: "derived_from",
             object_text: "canonical knowledge",
-            quote: "Elephant's Living Wiki is the human-readable semantic projection of canonical\nknowledge.",
+            quote: "Meerkat Recall's Living Wiki is the human-readable semantic projection of canonical\nknowledge.",
         },
         DemoRelationClaim {
             key: "preserves-source-authority",
             subject: &wiki_id,
             object: &evidence_id,
-            subject_text: "Elephant Living Wiki",
+            subject_text: "Meerkat Recall Living Wiki",
             predicate: "preserves_authority_of",
             object_text: "immutable source evidence",
             quote: "the canonical graph and immutable source evidence remain authoritative",
@@ -275,7 +275,7 @@ async fn seed(storage: &StorageClient) -> Result<SeededDemo> {
     let policy_quote = "Factual prose is not an unstructured model completion.";
     let policy_assertion = demo_assertion(
         "factual-prose-policy",
-        "Elephant Living Wiki",
+        "Meerkat Recall Living Wiki",
         "factual_prose_policy",
         None,
         Some(serde_json::Value::String(
@@ -323,7 +323,7 @@ async fn seed(storage: &StorageClient) -> Result<SeededDemo> {
     definition_base.subjects_state = SubjectsState::Complete;
     let definition = KnowledgeViewDefinition {
         base: definition_base,
-        title: "Elephant Living Wiki architecture".to_string(),
+        title: "Meerkat Recall Living Wiki architecture".to_string(),
         publication_status: KnowledgeViewPublicationStatus::Published,
         related_articles: Vec::new(),
         navigation: None,

@@ -26,7 +26,7 @@ committed, removing it from the latest tree does not remove it from history.
 
 ## Candidate contract
 
-The current source declares Elephant `0.1.0` and pins its six direct Meerkat
+The current source declares Meerkat Recall `0.1.0` and pins its six direct Meerkat
 family dependencies to `0.8.51`. It has no direct MobKit dependency. These
 source versions do not imply acceptance of an external MobKit or HomeCore
 runtime, or compatibility with the planned 0.9 platform. Record that
@@ -40,6 +40,12 @@ The checked-in [installation instructions](docs/installation.mdx) use the
 workflow's flat archive layout and require a model provider for the
 default-feature demo.
 
+The public source repository is `lukacf/meerkat-recall`; candidate work remains
+private until publication is authorized. Source downloads and native archives
+share the selected `v0.1.0` source identity. Internal crates, configuration paths,
+environment names, database identities and HTTP/MCP wire names retain their
+existing spelling. No automatic data relocation is part of this rename.
+
 ## Build candidates
 
 Manually run `.github/workflows/release.yml` (**Build release candidates**) for
@@ -47,7 +53,8 @@ the reviewed ref. It validates the source, builds Linux x86-64 and macOS ARM64
 binaries with RocksDB and the default Meerkat extraction feature, and uploads
 candidate archives. It does not create a GitHub release or publish crates.
 
-Each archive contains the executable, license texts, and `provenance.json`
+Each archive contains `meerkat-recall`, an `elephant` symlink for the 0.1
+compatibility line, license texts, and `provenance.json`
 with the source commit/tree, build command, workflow run, and binary checksum.
 The workflow creates archive checksums, uploads the candidate artifacts, then
 requires a GitHub build attestation for each archive. A later attestation failure
@@ -81,12 +88,13 @@ each target, preserve a receipt with:
   or fixture compatibility.
 - A clean host's OS version and architecture, required dynamic libraries, and
   the commands used to verify, unpack, and install the archive without Cargo.
-- `elephant --help` output. This source does not provide a `--version` flag;
-  identify its version through provenance and its verified digest.
+- `meerkat-recall --help` and `meerkat-recall --version` output, plus identical
+  version output from the `elephant` compatibility alias. Bind the reported
+  version to provenance and the verified digest.
 - A configured model provider with access to the selected writer and verifier
   models. Record provider/model names and success or failure, never credentials.
   Missing credentials are an unmet prerequisite, not a semantic demo pass.
-- A run of the installed `elephant demo-wiki`: inspect its context projection,
+- A run of the installed `meerkat-recall demo-wiki`: inspect its context projection,
   compilation receipt, source evidence, article-generation results and any
   verifier rejections. Record the returned evidence, not just HTTP status.
 - Separate persistent-runtime checks for migration, restart persistence,

@@ -1,6 +1,6 @@
 ---
 title: "Domain Model"
-description: "Record families, shared fields, and the Rust types behind Elephant's evidence and knowledge graph"
+description: "Record families, shared fields, and the Rust types behind Meerkat Recall's evidence and knowledge graph"
 icon: "diagram-project"
 ---
 
@@ -25,7 +25,7 @@ values. Use the corresponding endpoint schema when constructing a request.
 
 ## RecordId System
 
-Every record in Elephant is identified by a `RecordId` -- a typed Elephant record identifier with the format `table:uuid` (for example, `entity:550e8400-e29b-41d4-a716-446655440000`).
+Every record in Meerkat Recall is identified by a `RecordId` -- a typed Meerkat Recall record identifier with the format `table:uuid` (for example, `entity:550e8400-e29b-41d4-a716-446655440000`).
 
 ```rust
 pub struct RecordId {
@@ -239,7 +239,7 @@ pub struct Attribute {
 
 ### Doc
 
-Top-level source-backed document record ingested into Elephant. For media-backed ingest, `text` is the renderer-owned canonical searchable projection rather than the raw caller payload.
+Top-level source-backed document record ingested into Meerkat Recall. For media-backed ingest, `text` is the renderer-owned canonical searchable projection rather than the raw caller payload.
 
 ```rust
 pub struct Doc {

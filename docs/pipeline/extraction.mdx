@@ -1,6 +1,6 @@
 ---
 title: "Extraction"
-description: "How Elephant selects extraction skills and transforms documents into structured assertions."
+description: "How Meerkat Recall selects extraction skills and transforms documents into structured assertions."
 icon: "microscope"
 ---
 
@@ -49,7 +49,7 @@ The most common way to configure extraction is to set `purpose` and `skill` on t
 
 ### Built-in skills
 
-Elephant ships with domain-neutral extraction skills in the `skills/extraction/` directory. Each is a `SKILL.md` file containing markdown guidance that gets injected into the LLM prompt. App-specific domains, including email/chat semantics, should provide their own skill directory and select it through metadata, space config, or `PIPELINE_SKILL_BY_SOURCE_TYPE_JSON`.
+Meerkat Recall ships with domain-neutral extraction skills in the `skills/extraction/` directory. Each is a `SKILL.md` file containing markdown guidance that gets injected into the LLM prompt. App-specific domains, including email/chat semantics, should provide their own skill directory and select it through metadata, space config, or `PIPELINE_SKILL_BY_SOURCE_TYPE_JSON`.
 
 <Accordion title="extraction/fiction - novels, stories, narratives">
   **Entity types:** person, location, device, group, topic
@@ -89,7 +89,7 @@ The extractor receives an `ExtractionContext` containing everything it needs:
 The primary extractor, enabled via the `meerkat-extraction` feature flag. It uses [Meerkat](https://github.com/lukacf/meerkat) - a modular LLM agent harness - to orchestrate extraction as a structured conversation with tool access.
 
 - **Model:** configurable via `PIPELINE_AGENTIC_MODEL` (binary default: `gpt-5.6-sol`; Docker Compose selects `claude-opus-4-6`). Supply credentials for the selected provider.
-- **Structured output:** Meerkat receives a strict assertion schema and a bounded schema-repair retry count. Elephant parses and validates the result before staging candidates. Invalid output or an incomplete run can still fail the work item; a schema is not a guarantee of factual correctness.
+- **Structured output:** Meerkat receives a strict assertion schema and a bounded schema-repair retry count. Meerkat Recall parses and validates the result before staging candidates. Invalid output or an incomplete run can still fail the work item; a schema is not a guarantee of factual correctness.
 - **Tool access:** the normal agentic path provides `ReadTextRangeDispatcher` for text-span checks and `ElephantToolBridge` for querying existing entities and predicates. Large text spans use a direct structured extraction path without those tools. An empty result from the agentic path can also trigger one direct structured retry.
 - **Budget enforcement:** the extractor uses the lower token and duration limits from its configuration and extraction context (defaults: 500,000 tokens and 600 seconds). The worker's lifecycle timeout is a separate bound; see [work queue configuration](/operations/deployment#pipeline-work-queue).
 - **Progress:** the extraction call returns a completed result to the worker. Inspect document pipeline status and work-run logs for stage progress; this is not a public stream of partially committed assertions.
@@ -98,7 +98,7 @@ The agentic extractor can resolve ambiguities by querying the knowledge graph du
 
 ### Non-Active Fallbacks
 
-Elephant no longer uses a rule-based semantic fallback in the active runtime. If the real extractor is unavailable, semantic ingest is hidden and extraction work fails loudly with an explicit runtime/work-item error.
+Meerkat Recall no longer uses a rule-based semantic fallback in the active runtime. If the real extractor is unavailable, semantic ingest is hidden and extraction work fails loudly with an explicit runtime/work-item error.
 
 Any non-LLM extraction helpers that remain in the codebase are test-only or legacy compatibility scaffolding, not part of the supported product path.
 
@@ -127,7 +127,7 @@ pub struct RawAssertion {
 
 ## Artifact Commit Boundary
 
-After extraction, Elephant does not write graph rows directly from raw assertions. Instead:
+After extraction, Meerkat Recall does not write graph rows directly from raw assertions. Instead:
 
 1. `extract_assertions` stages `knowledge_candidates`
 2. `validate_artifacts` validates those candidates

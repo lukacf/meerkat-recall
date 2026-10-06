@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Elephant will be documented in this file.
+All notable changes to Meerkat Recall will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
@@ -71,6 +71,15 @@ does not by itself establish a published release.
   limits fixture exceptions to their exact synthetic values and source paths.
 
 ### Release tooling
+- The product and native command are Meerkat Recall and `meerkat-recall`.
+  Archives retain an `elephant` executable alias for the 0.1 line; configuration,
+  data and HTTP/MCP wire identifiers keep their existing spelling.
+- `--version` identifies the package version. `status --require-ready` fails
+  unless health and semantic ingestion are ready, with bounded HTTP requests
+  and diagnostic JSON preserved on stdout.
+- Snapshot migration preflight rejects any occupied target table, unverifiable
+  metadata and unsupported source extensions before schema/data writes. Reports
+  never overwrite existing files, and partial-copy failures remain explicit.
 - Release candidates are built explicitly for Linux x86-64 and macOS ARM64
   with RocksDB and the default Meerkat extraction support.
 - Candidate archives include license texts, source/build provenance, and flat
@@ -145,4 +154,4 @@ does not by itself establish a published release.
 - Space-based tenant isolation
 - Field-level redaction policies
 
-[Unreleased]: https://github.com/lukacf/elephant/commits/main
+[Unreleased]: https://github.com/lukacf/meerkat-recall/commits/main

@@ -3,7 +3,7 @@ title: "Living Wiki"
 description: "Graph-native, cited, freshness-aware knowledge projections"
 ---
 
-Elephant's Living Wiki is the human-readable semantic projection of canonical
+Meerkat Recall's Living Wiki is the human-readable semantic projection of canonical
 knowledge. It does not create evidence and its output must never be re-ingested
 as a source. A source record, an entity row, and a compiled projection are not
 automatically wiki articles. Publication requires editorial selection,
@@ -15,16 +15,16 @@ use the [MCP surface](#mcp-surface) and [tool reference](/mcp/tools).
 
 | Reader question | Surface | What to inspect |
 | --- | --- | --- |
-| What does Elephant know about a subject? | `/wiki` | Published articles and their citations |
+| What does Meerkat Recall know about a subject? | `/wiki` | Published articles and their citations |
 | What did the original material say? | `/evidence` | Sources, immutable excerpts, and provenance |
 | How was a projection constructed? | `/inspect/knowledge-views` | Dependencies, revisions, freshness, and validation receipts |
 
 The implementation has three deliberately separate surfaces:
 
-1. **Wiki** answers "what does Elephant know?" with curated articles.
-2. **Evidence** answers "why does Elephant believe this?" with source content,
+1. **Wiki** answers "what does Meerkat Recall know?" with curated articles.
+2. **Evidence** answers "why does Meerkat Recall believe this?" with source content,
    quotations, dates, and provenance.
-3. **Inspector** answers "what did Elephant's machinery do?" with record IDs,
+3. **Inspector** answers "what did Meerkat Recall's machinery do?" with record IDs,
    revision IDs, hashes, compiler receipts, dependency inventories, and ingest
    state.
 
@@ -40,7 +40,7 @@ The renderer additionally requires explicit `published` state. Topic,
 community, and query projections cannot become wiki articles by changing a
 flag.
 
-## Research basis and Elephant adaptation
+## Research basis and Meerkat Recall adaptation
 
 [Karpathy's original LLM Wiki idea file](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
 separates immutable raw sources, an LLM-maintained wiki, and an evolving schema.
@@ -58,7 +58,7 @@ cross-page consistency checks are all needed because unsupported facts,
 malformed references, dangling links, and contradictions recur in generated
 wikis.
 
-Elephant adopts the compounding read model but changes the authority boundary:
+Meerkat Recall adopts the compounding read model but changes the authority boundary:
 
 - the canonical graph and immutable source evidence remain authoritative; wiki
   Markdown is a rendering and can never become evidence by being re-ingested
@@ -174,7 +174,7 @@ two people. Invalid predicate edges are claim-blocking because rendering them
 turns graph noise into authoritative-looking prose.
 
 Application-specific graph audits may supply additional classifications.
-Elephant owns the generic typed issue and publication-receipt mechanism;
+Meerkat Recall owns the generic typed issue and publication-receipt mechanism;
 application policy must not become untyped canonical graph truth.
 
 ## Freshness and change propagation
@@ -284,10 +284,10 @@ an article implicitly.
 
 ## Runnable projection demo
 
-Run a fully isolated example using Elephant's normal Meerkat LLM runtime:
+Run a fully isolated example using Meerkat Recall's normal Meerkat LLM runtime:
 
 ```bash
-./scripts/repo-cargo run -p elephant-bin -- demo-wiki
+./scripts/repo-cargo run -p meerkat-recall-bin -- demo-wiki
 ```
 
 The command loads this architecture document as a real source, creates an
@@ -327,7 +327,7 @@ freshness state when they truncate selection.
 
 ## Article planning and managed publication
 
-Elephant has an explicit LLM article planner, LLM information architect,
+Meerkat Recall has an explicit LLM article planner, LLM information architect,
 article writer, and statement-level verifier. `create_wiki_from_graph` scans
 the complete caller-authorized semantic graph with no configurable prefix or
 record ceiling. It isolates exact security envelopes and reads entities,
@@ -339,18 +339,18 @@ planning shard of at most 30 entities. The old global top-60 reduction is not
 part of the active path. The LLM planner must account for every entity, normally
 with one article per semantic subject. With the default `max_articles: 0`, the
 automatic budget is the complete eligible population, bounded at 2,000. An
-entity may be synthesized into another page only when Elephant identified the
+entity may be synthesized into another page only when Meerkat Recall identified the
 two records as a possible person-identity duplicate and the planner explicitly
 records the consolidation. The full plan must retain at least 70 percent as
 many pages as eligible subjects. A separate LLM organizer sees the complete
 planned corpus, infers the space purpose, selects the defining featured pages,
 and designs semantic reader lenses. Exhaustive placement is then performed by
-bounded 30-article LLM assignment calls against that fixed taxonomy. Elephant
+bounded 30-article LLM assignment calls against that fixed taxonomy. Meerkat Recall
 validates that every selected article appears exactly once before compiling any
 page. These are disposable navigation, not graph assertions or a pre-created
 folder tree.
 
-Elephant fills omitted article links from governed direct graph edges and
+Meerkat Recall fills omitted article links from governed direct graph edges and
 resolved source-evidence co-mentions among selected subjects. It creates topic
 definitions for single subjects and seeded-community definitions for an
 explicitly consolidated identity cluster. Possible duplicates are never
@@ -450,7 +450,7 @@ following remain implementation gaps, not implicit features:
   graph-quality audits; active generic publication gating already withholds
   likely duplicate people and non-configured predicates and reports categorized
   counts, but application-specific audit taxonomies are not canonical
-  Elephant graph truth
+  Meerkat Recall graph truth
 - human approval queues for plans in deployments that require approval beyond
   the explicit `publish` request
 - article-local inline entity links inside prose; first-class related-article

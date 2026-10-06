@@ -1,22 +1,22 @@
 # Active Architecture (Code-Truth)
 
-This document is the canonical source of truth for what Elephant runs today.
+This document is the canonical source of truth for what Meerkat Recall runs today.
 If this file conflicts with older design notes or historical docs, this file wins.
 
 ## Runtime Topology
 
-Elephant now has a managed runtime layer.
+Meerkat Recall now has a managed runtime layer.
 
 Primary runtime:
-- `elephant serve`: HTTP + MCP server plus managed runtime owner.
+- `meerkat-recall serve`: HTTP + MCP server plus managed runtime owner.
 - storage backend: `surreal-db` (default, persistent) or embedded `elephant-db`.
-- in configured write-capable modes, `elephant serve` also starts the background
+- in configured write-capable modes, `meerkat-recall serve` also starts the background
   pipeline worker loops in-process through the shared runtime manager.
 
 Advanced runtime:
-- `elephant worker`: reusable worker runtime used by the managed runtime and
+- `meerkat-recall worker`: reusable worker runtime used by the managed runtime and
   available as a standalone advanced surface for SurrealDB-backed deployments.
-- `elephant serve --server-only`: HTTP/MCP server without managed workers.
+- `meerkat-recall serve --server-only`: HTTP/MCP server without managed workers.
 
 Managed runtime modes:
 - `bootstrap`: no `.elephant/elephant_config.toml` yet; only runtime status and
@@ -207,7 +207,7 @@ that featured hierarchy and section counts; each section remains browsable in
 full without placing hundreds of reference pages on the front page. Navigation
 is derived metadata and never becomes a graph fact or source.
 
-Elephant fills omitted related-article links from explicitly governed graph
+Meerkat Recall fills omitted related-article links from explicitly governed graph
 edges and resolved source-evidence co-mentions, then uses separate writer and
 verifier calls for every article. Writer contexts include governed current
 attributes, approved first-class events, truth-slot uncertainty, canonical
@@ -232,7 +232,7 @@ scope, avoiding collisions with a cancelled periodic item in the same time
 bucket. Failed articles leave the fingerprint uncached so the next run retries
 instead of accepting a partial wiki as current. The
 authenticated `/wiki` browser renders the LLM-organized sections over verified
-English revisions, and `elephant demo-wiki` remains the small isolated example.
+English revisions, and `meerkat-recall demo-wiki` remains the small isolated example.
 Knowledge-view invalidation has its own event watcher and does not depend on
 the truth-maintenance worker being enabled. Direct entity API mutations also
 publish semantic outbox records, so creates, updates, deletes, restores,
@@ -370,7 +370,7 @@ Explicit skip-auth and trusted in-process embedding have no verified context.
 Trusted host composition can install exact issuer/audience-to-domain mappings.
 The mapping requires independently configured issuer and audience checks; no
 domain is inferred from a subject string or URL. Mapped identity does not grant
-Elephant clearances, live delegation or governed execution. The existing local
+Meerkat Recall clearances, live delegation or governed execution. The existing local
 ABAC evaluator and subject-scope semantics remain authoritative.
 
 The auth crate also validates a strict, versioned, request-bound exchange syntax

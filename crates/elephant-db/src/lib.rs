@@ -337,10 +337,15 @@ impl ElephantDb {
         Ok(db)
     }
 
-    /// Returns the set of logical table names with at least one stored record.
+    /// Returns nonempty persisted tables and derived vector partition names.
     pub fn table_names(&self) -> Result<Vec<String>> {
         let state = self.read_state();
         Ok(state.table_names())
+    }
+
+    /// Returns nonempty typed and extension tables, excluding derived indexes.
+    pub fn persisted_table_names(&self) -> Result<Vec<String>> {
+        Ok(self.read_state().persisted_table_names())
     }
 
     /// Returns true when the kernel contains no records.
@@ -1063,6 +1068,14 @@ impl ElephantDbTx<'_> {
 
 impl ElephantDbState {
     fn table_names(&self) -> Vec<String> {
+        let mut names = self.persisted_table_names();
+        names.extend(self.indexes.vector_partitions.keys().cloned());
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn persisted_table_names(&self) -> Vec<String> {
         let mut names: Vec<_> = self
             .tables
             .iter()
@@ -1075,7 +1088,6 @@ impl ElephantDbState {
                 .filter(|(_, rows)| !rows.is_empty())
                 .map(|(table, _)| table.clone()),
         );
-        names.extend(self.indexes.vector_partitions.keys().cloned());
         names.sort();
         names.dedup();
         names

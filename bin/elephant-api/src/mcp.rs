@@ -857,8 +857,8 @@ impl ServerHandler for ElephantMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::LATEST)
-            .with_server_info(Implementation::new("elephant", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Elephant MCP server: entity, relationship, docs, assertion, truth-slot, and system tools.")
+            .with_server_info(Implementation::new("elephant", env!("CARGO_PKG_VERSION")).with_title("Meerkat Recall"))
+            .with_instructions("Meerkat Recall MCP server: entity, relationship, docs, assertion, truth-slot, and system tools.")
     }
 
     async fn list_tools(
@@ -896,8 +896,8 @@ impl ServerHandler for ElephantMcpDefaultServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::LATEST)
-            .with_server_info(Implementation::new("elephant", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Elephant MCP server: entity, relationship, docs, assertion, truth-slot, and system tools.")
+            .with_server_info(Implementation::new("elephant", env!("CARGO_PKG_VERSION")).with_title("Meerkat Recall"))
+            .with_instructions("Meerkat Recall MCP server: entity, relationship, docs, assertion, truth-slot, and system tools.")
     }
 
     async fn list_tools(
@@ -935,12 +935,12 @@ impl ServerHandler for ElephantMcpAgentServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::LATEST)
-            .with_server_info(Implementation::new(
-                "elephant-agent",
-                env!("CARGO_PKG_VERSION"),
-            ))
+            .with_server_info(
+                Implementation::new("elephant-agent", env!("CARGO_PKG_VERSION"))
+                    .with_title("Meerkat Recall"),
+            )
             .with_instructions(
-                "Elephant MCP agent server: read-only tools for extraction agents (§8.3).",
+                "Meerkat Recall MCP agent server: read-only tools for extraction agents (§8.3).",
             )
     }
 
@@ -988,8 +988,8 @@ impl ServerHandler for ElephantMcpMaintenanceServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::LATEST)
-            .with_server_info(Implementation::new("elephant-maintenance", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Elephant MCP maintenance server: agent read tools plus identity resolution, predicate management, and entity updates.")
+            .with_server_info(Implementation::new("elephant-maintenance", env!("CARGO_PKG_VERSION")).with_title("Meerkat Recall"))
+            .with_instructions("Meerkat Recall MCP maintenance server: agent read tools plus identity resolution, predicate management, and entity updates.")
     }
 
     async fn list_tools(

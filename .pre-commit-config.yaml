@@ -27,13 +27,12 @@ repos:
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
-        # Preserve the bundled upstream notice byte for byte.
-        exclude: ^vendor/pdf-inspector/external/bcmaps/LICENSE$
+        # Preserve exact published notices, source metadata, and storage backport bytes.
+        exclude: ^vendor/(?:pdf-inspector/external/bcmaps/LICENSE$|surrealkv-0\.9\.3(?:/|-backport\.patch$))
         args: [--markdown-linebreak-ext=md]
         stages: [pre-push]
       - id: end-of-file-fixer
-        # Preserve the published crate's source metadata byte for byte.
-        exclude: ^vendor/pdf-inspector/\.cargo_vcs_info\.json$
+        exclude: ^vendor/(?:pdf-inspector/\.cargo_vcs_info\.json$|surrealkv-0\.9\.3(?:/|-backport\.patch$))
         stages: [pre-push]
       - id: check-yaml
         stages: [pre-push]

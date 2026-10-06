@@ -184,6 +184,11 @@ jobs:
           for name in ("LICENSE", "LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_NOTICES.md"):
               shutil.copyfile(name, bundle / name)
           shutil.copytree("skills", bundle / "skills")
+          third_party = bundle / "third-party"
+          (third_party / "surrealkv-0.9.3").mkdir(parents=True)
+          shutil.copyfile("vendor/surrealkv-0.9.3/LICENSE", third_party / "surrealkv-0.9.3/LICENSE")
+          for name in ("surrealkv-0.9.3-backport.md", "surrealkv-0.9.3-backport.patch", "surrealkv-0.9.3-upstream-sha256.json"):
+              shutil.copyfile(pathlib.Path("vendor", name), third_party / name)
           provenance = {
               "version": version,
               "target": target,

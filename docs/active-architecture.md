@@ -49,8 +49,10 @@ writes require read and write authorization for existing and proposed records.
 These ordinary interfaces cannot change any field of an existing `Security`
 object. There is no ordinary declassification scope. Security-preserving storage
 methods compare the current security and replace the record atomically on both
-backends, including restoration, preventing stale edits from reverting a newer
-classification. Trusted internal maintenance retains the low-level update API
+backends. Ordinary replacements additionally preserve identity, subjects and raw
+subject completeness, and compare the authorized timestamp, lifecycle and full
+envelope at that same commit, including restoration. Stale edits cannot revert
+a newer classification or subject change. Trusted internal maintenance retains the low-level update API
 for intentional security changes.
 
 ## Active Source, Extraction, and Commit Path
@@ -357,6 +359,27 @@ Code namespaces:
 
 See `docs/non-active-catalog.md` for policy and ownership rules.
 
+## Authentication Context
+
+HTTP and MCP use `elephant-auth` as the single legacy bearer-token verifier.
+Authenticated requests retain an opaque verified caller context, including
+issuer, audience and expiry, alongside the existing public Principal/ABAC
+projections. Those projections remain policy input, not authentication proof.
+Explicit skip-auth and trusted in-process embedding have no verified context.
+
+Trusted host composition can install exact issuer/audience-to-domain mappings.
+The mapping requires independently configured issuer and audience checks; no
+domain is inferred from a subject string or URL. Mapped identity does not grant
+Elephant clearances, live delegation or governed execution. The existing local
+ABAC evaluator and subject-scope semantics remain authoritative.
+
+The auth crate also validates a strict, versioned, request-bound exchange syntax
+with required qualified identities, operation bindings and explicit time bounds.
+This is authenticated claim evidence only. Existing HTTP/MCP tool routes refuse
+its distinct token type; no governed resource endpoint is active. Canonical
+resource generations, live grant/revocation checks, replay/entry custody,
+protected result envelopes and mandatory durable evidence remain required.
+
 ## Active Data Model Notes
 
 - `source` is the first-class intake object. `source.lifecycle_status`,
@@ -444,7 +467,13 @@ Migration 029 adds durable `work_item_archive` and `work_run_archive` history.
 Retention preserves public IDs, idempotency lookup, retries, failed dependency
 barriers, provenance, and usage metrics. Historical job and document-status
 reads include archived records. Wiki authority and its current scheduling
-configuration remain available to the recurring service.
+configuration remain available to the recurring service. SurrealDB-backed
+updates and restores write both hot and archive identities in their existing
+transaction, so archival conflicts with a concurrent acknowledged retry or run
+update. The in-process SurrealKV 0.9.3 dependency uses a pinned snapshot-version
+backport; remote SurrealDB servers require their own equivalent engine repair.
+This retention guarantee does not establish general serializable authorization
+fences. See the [backport provenance](../vendor/surrealkv-0.9.3-backport.md).
 
 See [Work queue capacity and retention](work-queue-capacity.md) for
 query-plan constraints, operator settings, and acceptance criteria.

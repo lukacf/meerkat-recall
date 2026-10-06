@@ -140,6 +140,14 @@ pub(crate) async fn get_run(
     rows.into_iter().next().map(WorkRun::try_from).transpose()
 }
 
+// DELETE of an absent archive is a SurrealQL no-op. Snapshot-isolated engines
+// may also forget a deleted hot key's version. Write both identities so a
+// concurrent archive conflicts on the surviving cold row, and a concurrent
+// update conflicts on the surviving hot row. This temporary archive is deleted
+// in the same transaction and is never committed as another history owner.
+pub(crate) const RETIRE_ARCHIVE_SQL: &str =
+    "UPSERT $archive CONTENT { space_id: $space, original_id: $id, archived_at: time::now(), record: $record }; DELETE $archive;";
+
 /// Restore and replace in the same transaction, including conditional retries.
 pub(crate) async fn update_item(
     client: &StorageClient,
@@ -178,7 +186,7 @@ pub(crate) async fn update_item(
             .await;
     }
     let mut response = client.query_bind_checked(
-        "BEGIN TRANSACTION; LET $hot = (SELECT * FROM ONLY $id WHERE space_id = $space); LET $cold = (SELECT * FROM ONLY $archive WHERE space_id = $space); LET $old = IF $hot != NONE { $hot } ELSE { $cold.record }; LET $changed = IF $old != NONE AND $old.deleted_at IS NONE AND ($expected = NONE OR $old.status = $expected) { UPSERT $id CONTENT $record; DELETE $archive; RETURN true; } ELSE { RETURN false; }; RETURN $changed; COMMIT TRANSACTION;",
+        &format!("BEGIN TRANSACTION; LET $hot = (SELECT * FROM ONLY $id WHERE space_id = $space); LET $cold = (SELECT * FROM ONLY $archive WHERE space_id = $space); LET $old = IF $hot != NONE {{ $hot }} ELSE {{ $cold.record }}; LET $changed = IF $old != NONE AND $old.deleted_at IS NONE AND ($expected = NONE OR $old.status = $expected) {{ UPSERT $id CONTENT $record; {RETIRE_ARCHIVE_SQL} RETURN true; }} ELSE {{ RETURN false; }}; RETURN $changed; COMMIT TRANSACTION;"),
         crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "archive" => crate::surreal::thing_from_record_id(&archive_id(id)), "space" => space, "expected" => expected.map_or(surrealdb::sql::Value::None, |v| v.to_string().into()), "record" => WorkItemRepository::work_item_to_value(&record)? }
     ).await?;
     let changed: Option<bool> = response
@@ -221,7 +229,7 @@ pub(crate) async fn update_run(
             .await;
     }
     client.query_bind_checked(
-        "BEGIN TRANSACTION; LET $hot = (SELECT * FROM ONLY $id WHERE space_id = $space); LET $cold = (SELECT * FROM ONLY $archive WHERE space_id = $space); LET $old = IF $hot != NONE { $hot } ELSE { $cold.record }; IF $old = NONE OR $old.deleted_at IS NOT NONE { THROW 'work_run_not_found'; }; UPSERT $id CONTENT $record; DELETE $archive; COMMIT TRANSACTION;",
+        &format!("BEGIN TRANSACTION; LET $hot = (SELECT * FROM ONLY $id WHERE space_id = $space); LET $cold = (SELECT * FROM ONLY $archive WHERE space_id = $space); LET $old = IF $hot != NONE {{ $hot }} ELSE {{ $cold.record }}; IF $old = NONE OR $old.deleted_at IS NOT NONE {{ THROW 'work_run_not_found'; }}; UPSERT $id CONTENT $record; {RETIRE_ARCHIVE_SQL} COMMIT TRANSACTION;"),
         crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "archive" => crate::surreal::thing_from_record_id(&archive_id(id)), "space" => space, "record" => WorkRunRepository::work_run_to_value(&record)? }
     ).await?;
     Ok(record)
@@ -1009,10 +1017,33 @@ mod tests {
         );
     }
 
+    async fn assert_hot_only(client: &StorageClient, id: &RecordId) {
+        if client.embedded_store().is_some() {
+            return;
+        }
+        let mut rows = client
+            .query_bind_checked(
+                "SELECT VALUE 'present' FROM $id; SELECT VALUE 'present' FROM $archive;",
+                crate::bindings! {
+                    "id" => crate::surreal::thing_from_record_id(id),
+                    "archive" => crate::surreal::thing_from_record_id(&archive_id(id))
+                },
+            )
+            .await
+            .unwrap();
+        let hot: Vec<String> = rows.take(0).unwrap();
+        let cold: Vec<String> = rows.take(1).unwrap();
+        assert_eq!(hot, vec!["present"], "acknowledged update must stay hot");
+        assert!(
+            cold.is_empty(),
+            "acknowledged update must leave no stale archive"
+        );
+    }
+
     async fn retry_race(client: StorageClient) {
         indexes(&client).await;
         let items = WorkItemRepository::new(client.clone());
-        for _ in 0..8 {
+        for _ in 0..32 {
             let old = items
                 .create(item(WorkItemStatus::Failed, "retry"))
                 .await
@@ -1025,6 +1056,7 @@ mod tests {
             );
             archived.unwrap();
             retried.unwrap().unwrap();
+            assert_hot_only(&client, &old.base.id).await;
             assert_eq!(
                 items
                     .get("space", &old.base.id)
@@ -1054,6 +1086,170 @@ mod tests {
     async fn retention_retry_race_embedded() {
         retry_race(StorageClient::new_embedded().await.unwrap()).await;
     }
+    async fn sibling_update_races(client: StorageClient) {
+        indexes(&client).await;
+        let items = WorkItemRepository::new(client.clone());
+        let runs = WorkRunRepository::new(client.clone());
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        let parent = items
+            .create(item(WorkItemStatus::Runnable, "run_parent"))
+            .await
+            .unwrap();
+        for iteration in 0..32 {
+            let old = runs
+                .create(run_for(&parent, iteration + 1, true))
+                .await
+                .unwrap();
+            let mut next = old.clone();
+            next.completed_at = None;
+            let (archived, updated) = if iteration % 2 == 0 {
+                tokio::join!(biased;
+                    archive_terminal_work(&client, cutoff, 1),
+                    runs.update("space", &old.base.id, next)
+                )
+            } else {
+                let (updated, archived) = tokio::join!(biased;
+                    runs.update("space", &old.base.id, next),
+                    archive_terminal_work(&client, cutoff, 1)
+                );
+                (archived, updated)
+            };
+            archived.unwrap();
+            let updated = updated.unwrap();
+            assert_hot_only(&client, &old.base.id).await;
+            assert_eq!(
+                runs.get("space", &old.base.id).await.unwrap(),
+                Some(updated)
+            );
+
+            let old = items
+                .create(item(WorkItemStatus::Failed, "conditional_retry"))
+                .await
+                .unwrap();
+            let mut next = old.clone();
+            next.status = WorkItemStatus::Runnable;
+            let (archived, updated) = tokio::join!(
+                archive_terminal_work(&client, cutoff, 1),
+                items.update_if_status_and_dependencies_done(
+                    "space",
+                    &old.base.id,
+                    next,
+                    WorkItemStatus::Failed
+                )
+            );
+            archived.unwrap();
+            if let Some(updated) = updated.unwrap() {
+                assert_hot_only(&client, &old.base.id).await;
+                assert_eq!(
+                    items.get("space", &old.base.id).await.unwrap(),
+                    Some(updated)
+                );
+            } else {
+                // This method intentionally updates hot items only. If archival
+                // wins, a refusal is valid; an acknowledged stale update is not.
+                assert_eq!(
+                    items
+                        .get("space", &old.base.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    WorkItemStatus::Failed
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_sibling_update_races_surreal() {
+        sibling_update_races(StorageClient::new_memory().await.unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn retention_sibling_update_races_embedded() {
+        sibling_update_races(StorageClient::new_embedded().await.unwrap()).await;
+    }
+
+    async fn both_commit_orders(client: StorageClient) {
+        indexes(&client).await;
+        let items = WorkItemRepository::new(client.clone());
+        let runs = WorkRunRepository::new(client.clone());
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        for archive_first in [false, true] {
+            let old = items
+                .create(item(WorkItemStatus::Failed, "ordered_retry"))
+                .await
+                .unwrap();
+            if archive_first {
+                assert_eq!(
+                    archive_terminal_work(&client, cutoff, 1)
+                        .await
+                        .unwrap()
+                        .items_archived,
+                    1
+                );
+            }
+            let mut next = old.clone();
+            next.status = WorkItemStatus::Runnable;
+            let updated = items.update("space", &old.base.id, next).await.unwrap();
+            if !archive_first {
+                assert_eq!(
+                    archive_terminal_work(&client, cutoff, 1)
+                        .await
+                        .unwrap()
+                        .items_archived,
+                    0
+                );
+            }
+            assert_hot_only(&client, &old.base.id).await;
+            assert_eq!(
+                items.get("space", &old.base.id).await.unwrap(),
+                Some(updated)
+            );
+
+            let old_run = runs.create(run_for(&old, 1, true)).await.unwrap();
+            if archive_first {
+                assert_eq!(
+                    archive_terminal_work(&client, cutoff, 1)
+                        .await
+                        .unwrap()
+                        .runs_archived,
+                    1
+                );
+            }
+            let mut next_run = old_run.clone();
+            next_run.completed_at = None;
+            let updated_run = runs
+                .update("space", &old_run.base.id, next_run)
+                .await
+                .unwrap();
+            if !archive_first {
+                assert_eq!(
+                    archive_terminal_work(&client, cutoff, 1)
+                        .await
+                        .unwrap()
+                        .runs_archived,
+                    0
+                );
+            }
+            assert_hot_only(&client, &old_run.base.id).await;
+            assert_eq!(
+                runs.get("space", &old_run.base.id).await.unwrap(),
+                Some(updated_run)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_both_commit_orders_surreal() {
+        both_commit_orders(StorageClient::new_memory().await.unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn retention_both_commit_orders_embedded() {
+        both_commit_orders(StorageClient::new_embedded().await.unwrap()).await;
+    }
+
     #[tokio::test]
     async fn retention_legacy_string_runs_and_archived_done_dependencies() {
         let client = StorageClient::new_memory().await.unwrap();

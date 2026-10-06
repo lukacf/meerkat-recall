@@ -57,6 +57,9 @@ jobs:
           ldd artifacts/elephant
           artifacts/elephant --help
           sha256sum artifacts/elephant > artifacts/elephant.sha256
+          mkdir -p artifacts/elephant-third-party/surrealkv-0.9.3
+          cp vendor/surrealkv-0.9.3/LICENSE artifacts/elephant-third-party/surrealkv-0.9.3/LICENSE
+          cp vendor/surrealkv-0.9.3-backport.md vendor/surrealkv-0.9.3-backport.patch vendor/surrealkv-0.9.3-upstream-sha256.json artifacts/elephant-third-party/
       - name: Report build disk usage
         if: always()
         run: |

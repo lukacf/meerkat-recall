@@ -2296,6 +2296,7 @@ mod tests {
             .any(|issue| issue == ISSUE_SEMANTIC_EXTRACTOR_FEATURE_UNAVAILABLE));
     }
 
+    #[serial_test::serial(cwd_env)]
     #[tokio::test]
     async fn test_managed_pipeline_thread_starts_and_stops_on_embedded_storage() {
         let storage = StorageClient::new(StorageConfig {
@@ -2374,6 +2375,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial(cwd_env)]
     #[tokio::test]
     async fn test_managed_pipeline_thread_claims_runnable_work_items_on_embedded_storage() {
         let storage = StorageClient::new(StorageConfig {
@@ -2434,6 +2436,7 @@ mod tests {
         stop_pipeline_handle(Some(pipeline)).await;
     }
 
+    #[serial_test::serial(cwd_env)]
     #[tokio::test]
     async fn test_managed_pipeline_thread_claims_runnable_item_with_stale_lease_fields() {
         let storage = StorageClient::new(StorageConfig {

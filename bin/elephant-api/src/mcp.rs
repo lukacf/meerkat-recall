@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use jsonwebtoken::{decode, DecodingKey, Validation};
+use elephant_auth::{IssuerMappings, VerifiedCallerContext};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
@@ -31,7 +31,7 @@ use elephant_mcp::{
 use elephant_policy::{Clearance, Principal as AbacPrincipal};
 use elephant_storage::StorageClient;
 
-use crate::auth::{AuthConfig, AuthError, Claims, Principal as AuthPrincipal};
+use crate::auth::{AuthConfig, AuthError, Principal as AuthPrincipal};
 use crate::authz::AuthzService;
 use crate::runtime::{RuntimeConfigPatch, RuntimeManager, RuntimeMode, RuntimeStatus};
 
@@ -154,6 +154,7 @@ pub struct McpState {
     authz: AuthzService,
     default_space_id: String,
     policy_ids: Vec<String>,
+    issuer_mappings: Option<Arc<IssuerMappings>>,
 }
 
 impl McpState {
@@ -219,7 +220,16 @@ impl McpState {
             authz: AuthzService::new(),
             default_space_id,
             policy_ids,
+            issuer_mappings: None,
         }
+    }
+
+    /// Install identity mappings from trusted host composition. This does not
+    /// enable governed dispatch or grant Elephant resource rights.
+    #[must_use]
+    pub fn with_issuer_mappings(mut self, mappings: Arc<IssuerMappings>) -> Self {
+        self.issuer_mappings = Some(mappings);
+        self
     }
 
     /// Creates MCP state with explicit defaults (for testing, avoids env var races).
@@ -487,51 +497,22 @@ fn bearer_from_context(context: &RequestContext<RoleServer>) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
-fn decode_claims(state: &McpState, token: &str) -> Result<Claims, AuthError> {
-    let key = DecodingKey::from_secret(state.auth.secret.as_bytes());
-    let mut validation = Validation::new(state.auth.algorithm);
-    if let Some(ref aud) = state.auth.audience {
-        validation.set_audience(&[aud]);
-    }
-    if let Some(ref iss) = state.auth.issuer {
-        validation.set_issuer(&[iss]);
-    }
-
-    let token_data = decode::<Claims>(token, &key, &validation).map_err(|e| {
-        let (error, message) = match e.kind() {
-            jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
-                ("expired_token", "Token has expired")
-            }
-            jsonwebtoken::errors::ErrorKind::InvalidToken => ("invalid_token", "Token is invalid"),
-            jsonwebtoken::errors::ErrorKind::InvalidSignature => {
-                ("invalid_token", "Token signature is invalid")
-            }
-            jsonwebtoken::errors::ErrorKind::InvalidAudience => {
-                ("invalid_token", "Token audience is invalid")
-            }
-            jsonwebtoken::errors::ErrorKind::InvalidIssuer => {
-                ("invalid_token", "Token issuer is invalid")
-            }
-            _ => ("invalid_token", "Token validation failed"),
-        };
-
-        AuthError {
-            error: error.to_string(),
-            message: message.to_string(),
-        }
-    })?;
-
-    Ok(token_data.claims)
+struct McpRequestPrincipal {
+    principal: AbacPrincipal,
+    verified: Option<VerifiedCallerContext>,
 }
 
 fn principal_from_context(
     state: &McpState,
     context: &RequestContext<RoleServer>,
-) -> Result<AbacPrincipal, AuthError> {
+) -> Result<McpRequestPrincipal, AuthError> {
     if state.auth.skip_auth {
         let mut principal = default_principal(state);
         principal.space_id = space_id_from_context(context, &state.default_space_id);
-        return Ok(principal);
+        return Ok(McpRequestPrincipal {
+            principal,
+            verified: None,
+        });
     }
 
     let token = bearer_from_context(context).ok_or_else(|| AuthError {
@@ -539,19 +520,29 @@ fn principal_from_context(
         message: "Authorization header with Bearer token required".to_string(),
     })?;
 
-    let claims = decode_claims(state, &token)?;
-    let auth_principal = AuthPrincipal::from(claims);
-    Ok(state.authz.to_abac_principal(&auth_principal))
+    verified_principal(state, &token)
+}
+
+fn verified_principal(state: &McpState, token: &str) -> Result<McpRequestPrincipal, AuthError> {
+    let verified = state
+        .auth
+        .verify_token(token, state.issuer_mappings.as_deref())?;
+    let auth_principal = AuthPrincipal::from(verified.claims().clone());
+    Ok(McpRequestPrincipal {
+        principal: state.authz.to_abac_principal(&auth_principal),
+        verified: Some(verified),
+    })
 }
 
 async fn dispatcher_for(
     state: &McpState,
-    principal: AbacPrincipal,
+    caller: McpRequestPrincipal,
     profile: DispatcherProfile,
 ) -> Option<elephant_mcp::ToolDispatcher> {
     let storage = state.runtime.current_storage().await?;
     let authz = Arc::new(McpAuthzService::new_with_skip_auth(state.auth.skip_auth));
-    let context = ToolContext::with_authz(storage, authz, principal);
+    let context = ToolContext::with_authz(storage, authz, caller.principal)
+        .with_verified_caller(caller.verified);
     Some(match profile {
         DispatcherProfile::Full => create_dispatcher_with_context(context),
         DispatcherProfile::Default => create_default_dispatcher_with_context(context),
@@ -581,7 +572,12 @@ async fn list_tools_for_profile(
     let principal = principal_from_context(state, &context).ok();
     // Readiness, not get_status: listing tools must never wait on a queue scan.
     let status = state.runtime.get_readiness().await;
-    let mut tools = runtime_tools_for_profile(state, &status, principal.as_ref(), profile);
+    let mut tools = runtime_tools_for_profile(
+        state,
+        &status,
+        principal.as_ref().map(|caller| &caller.principal),
+        profile,
+    );
     if let Some(principal) = principal {
         if let Some(dispatcher) = dispatcher_for(state, principal, profile).await {
             tools.extend(filtered_tools_for_dispatcher(&dispatcher, &status));
@@ -611,7 +607,13 @@ async fn call_tool_for_profile(
     ) && (!matches!(profile, DispatcherProfile::Agent)
         || request.name == TOOL_GET_RUNTIME_STATUS);
     if runtime_tool_allowed {
-        return handle_runtime_tool(state, &request.name, params, principal.as_ref()).await;
+        return handle_runtime_tool(
+            state,
+            &request.name,
+            params,
+            principal.as_ref().map(|caller| &caller.principal),
+        )
+        .await;
     }
     let Some(principal) = principal else {
         return Ok(CallToolResult::error(vec![Content::text(
@@ -1023,6 +1025,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::auth::Claims;
     use chrono::Utc;
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use rmcp::model::CallToolRequestParams;
@@ -1066,6 +1069,68 @@ mod tests {
             subject_allowlist: None,
             purpose: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn empty_subject_scope_refuses_authenticated_mcp_body(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use elephant_storage::Repository;
+        let storage = StorageClient::new_embedded().await?;
+        let entity = elephant_storage::EntityRepository::new(storage.clone())
+            .create(Entity::new(
+                base_fields(TableName::Entity, "default", "fixture"),
+                EntityType::new("person"),
+                "PRIVATE MCP CANARY".into(),
+            ))
+            .await?;
+        // Deliberately synthetic key for this loopback-only regression.
+        let signing_key = "x".repeat(36);
+        let state = Arc::new(McpState::new_with_defaults(
+            storage,
+            AuthConfig {
+                secret: signing_key.clone(),
+                skip_auth: false,
+                ..AuthConfig::default()
+            },
+            "default".into(),
+            vec!["default".into()],
+        ));
+        let router = mcp_routes(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        for restricted in [true, false] {
+            let mut claims = make_claims(Some("default"), &["read:entity"]);
+            claims.subject_allowlist = if restricted { Some(Vec::new()) } else { None };
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(signing_key.as_bytes()),
+            )?;
+            let config =
+                StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+                    .auth_header(token);
+            let client = ().serve(StreamableHttpClientTransport::from_config(config)).await?;
+            let response = client
+                .call_tool(
+                    CallToolRequestParams::new("get_entity").with_arguments(
+                        serde_json::json!({"id": entity.base.id.to_string()})
+                            .as_object()
+                            .expect("args")
+                            .clone(),
+                    ),
+                )
+                .await?;
+            let text = serde_json::to_string(&response)?;
+            assert_eq!(text.contains("PRIVATE MCP CANARY"), !restricted, "{text}");
+            if restricted {
+                assert!(text.contains("Access denied"), "{text}");
+            }
+            client.cancel().await?;
+        }
+        server.abort();
+        let _ = server.await;
+        Ok(())
     }
 
     fn looks_like_full_only_mutation_tool(name: &str) -> bool {
@@ -2054,4 +2119,5 @@ mod tests {
 
         Ok(())
     }
+    include!("mcp_auth_context_tests.rs");
 }

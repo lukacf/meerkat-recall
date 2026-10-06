@@ -10,8 +10,8 @@ RUN cargo install cargo-chef --locked
 FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock ./
-COPY crates/ crates/
 COPY vendor/ vendor/
+COPY crates/ crates/
 COPY bin/ bin/
 COPY skills/ skills/
 COPY tests/ tests/
@@ -44,8 +44,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo chef cook --locked --release --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
-COPY crates/ crates/
 COPY vendor/ vendor/
+COPY crates/ crates/
 COPY bin/ bin/
 COPY skills/ skills/
 COPY tests/ tests/
@@ -83,6 +83,8 @@ COPY --from=builder /tmp/elephant /usr/local/bin/
 COPY --from=builder /app/crates/migrations/sql/ /app/migrations/
 COPY --from=builder /app/skills/ /app/skills/
 COPY LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md /usr/share/licenses/elephant/
+COPY vendor/surrealkv-0.9.3/LICENSE /usr/share/licenses/elephant/surrealkv-0.9.3/LICENSE
+COPY vendor/surrealkv-0.9.3-backport.md vendor/surrealkv-0.9.3-backport.patch vendor/surrealkv-0.9.3-upstream-sha256.json /usr/share/licenses/elephant/
 
 # Set ownership
 RUN chown -R elephant:elephant /app

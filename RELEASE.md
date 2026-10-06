@@ -27,12 +27,13 @@ committed, removing it from the latest tree does not remove it from history.
 ## Candidate contract
 
 The current source declares Elephant `0.1.0` and pins its six direct Meerkat
-family dependencies to `0.8.45`. It has no direct MobKit dependency. These
+family dependencies to `0.8.51`. It has no direct MobKit dependency. These
 source versions do not imply acceptance of an external MobKit or HomeCore
 runtime, or compatibility with the planned 0.9 platform. Record that
 integration's exact versions and live acceptance separately.
 
-The initial candidate distribution is binary-only: Linux x86-64
+The initial distribution includes source and native binary downloads, without
+a registry-published Rust library. Native targets are Linux x86-64
 (`x86_64-unknown-linux-gnu`) and macOS ARM64 (`aarch64-apple-darwin`). Public
 support for a target requires its own artifact and clean-machine receipt.
 The checked-in [installation instructions](docs/installation.mdx) use the

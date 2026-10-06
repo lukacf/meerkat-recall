@@ -892,6 +892,15 @@ impl ToolHandler for UpdateEntityHandler {
         }
 
         if let Err(reason) =
+            elephant_policy::authorize_ordinary_update(&existing.base, &updated.base)
+        {
+            return serde_json::to_value(ToolResponse::<()>::error(format!(
+                "Access denied: {reason}"
+            )))
+            .map_err(|e| McpError::ExecutionError(e.to_string()));
+        }
+
+        if let Err(reason) =
             ctx.authz
                 .authorize_record_write(&ctx.principal, &updated, "write:entity")
         {
@@ -912,7 +921,7 @@ impl ToolHandler for UpdateEntityHandler {
 
         match self
             .repo
-            .update_preserving_security(&space_id, &rid, updated)
+            .replace_authorized(&existing, updated, false)
             .await
         {
             Ok(entity) => {
@@ -1265,9 +1274,18 @@ impl ToolHandler for BatchEntitiesHandler {
                         continue;
                     }
 
-                    self.repo
-                        .restore_and_update_preserving_security(&space_id, &rid, entity)
-                        .await
+                    if let Err(reason) =
+                        elephant_policy::authorize_ordinary_update(&existing.base, &entity.base)
+                    {
+                        failed.push(BatchError {
+                            index,
+                            error: format!("Access denied: {reason}"),
+                        });
+                        continue;
+                    }
+
+                    // Update existing
+                    self.repo.replace_authorized(&existing, entity, true).await
                 }
                 Ok(None) => {
                     if let Err(reason) =
@@ -1860,6 +1878,209 @@ mod tests {
         assert_eq!(output.items.len(), 1);
         assert_eq!(output.items[0].display_name, "Riley Example");
         assert_eq!(output.items[0].status, EntityStatus::Active);
+    }
+
+    async fn ordinary_update_fixture(embedded: bool) -> (ToolContext, EntityRepository, Entity) {
+        use elephant_policy::{Clearance, Principal};
+        use elephant_storage::Repository;
+        use elephant_types::records::base::{BaseFields, SubjectsState};
+        use elephant_types::{Link, RecordId};
+        use std::collections::HashSet;
+
+        let storage = if embedded {
+            StorageClient::new_embedded().await
+        } else {
+            StorageClient::new_memory().await
+        }
+        .expect("storage");
+        if !embedded {
+            storage
+                .query("DEFINE TABLE entity SCHEMALESS;")
+                .await
+                .expect("schema");
+        }
+        let repo = EntityRepository::new(storage.clone());
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::Entity),
+            "test_space".into(),
+            "fixture".into(),
+        );
+        base.security.policy_id = "default".into();
+        base.security.level = 2;
+        base.security.labels = vec!["private".into()];
+        base.subjects = vec![Link::new(RecordId::new_v4(TableName::Entity))];
+        base.subjects_state = SubjectsState::Complete;
+        let entity = repo
+            .create(Entity::new(
+                base,
+                EntityType::new("person"),
+                "Before".into(),
+            ))
+            .await
+            .expect("seed");
+        let ctx = ToolContext::new(
+            storage,
+            Principal {
+                space_id: "test_space".into(),
+                scopes: HashSet::from(["*".into()]),
+                clearances: vec![Clearance {
+                    policy_id: "default".into(),
+                    max_level: 5,
+                    labels: HashSet::from(["private".into()]),
+                    handling_allow: HashSet::from(["handling:subjectless_ok".into()]),
+                }],
+                subject_allowlist: None,
+                purpose: HashSet::new(),
+            },
+        );
+        (ctx, repo, entity)
+    }
+
+    #[tokio::test]
+    async fn ordinary_update_refuses_relabel_on_both_storage_backends() {
+        use elephant_storage::Repository;
+        for embedded in [false, true] {
+            let (ctx, repo, entity) = ordinary_update_fixture(embedded).await;
+            let handler = UpdateEntityHandler::new(ctx.storage.clone());
+            let patches = [
+                json!({"security": {"policy_id": "default", "level": 0, "labels": ["private"], "handling": []}}),
+                json!({"security": {"policy_id": "default", "level": 2, "labels": [], "handling": ["handling:subjectless_ok"]}}),
+                json!({"subjects": []}),
+                json!({"subjects_state": "unknown"}),
+            ];
+            for fields in patches {
+                let expected_reason = if fields.get("security").is_some() {
+                    "update_entity cannot change"
+                } else {
+                    "separately authorized relabel"
+                };
+                let response = handler
+                    .execute(
+                        &ctx,
+                        json!({"id": entity.base.id.to_string(), "fields": fields}),
+                    )
+                    .await
+                    .expect("dispatch");
+                assert_eq!(response["ok"], false, "{response}");
+                assert!(response["error"]
+                    .as_str()
+                    .expect("error")
+                    .contains(expected_reason));
+                let stored = repo
+                    .get("test_space", &entity.base.id)
+                    .await
+                    .expect("read")
+                    .expect("entity");
+                assert_eq!(
+                    serde_json::to_value(stored).expect("json"),
+                    serde_json::to_value(&entity).expect("json")
+                );
+            }
+            let response = handler
+                .execute(
+                    &ctx,
+                    json!({"id": entity.base.id.to_string(), "fields": {"display_name": "After"}}),
+                )
+                .await
+                .expect("update");
+            assert_eq!(response["ok"], true, "{response}");
+            assert_eq!(
+                repo.get("test_space", &entity.base.id)
+                    .await
+                    .expect("read")
+                    .expect("entity")
+                    .display_name,
+                "After"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_batch_refuses_relabel_before_restoring_deleted_entity() {
+        use elephant_storage::Repository;
+        for embedded in [false, true] {
+            let (ctx, repo, entity) = ordinary_update_fixture(embedded).await;
+            repo.delete("test_space", &entity.base.id)
+                .await
+                .expect("delete");
+            let before = repo
+                .get_with_deleted("test_space", &entity.base.id)
+                .await
+                .expect("read")
+                .expect("entity");
+            let mut replacement = before.clone();
+            replacement.base.security.level = 0;
+            let handler = BatchEntitiesHandler::new(ctx.storage.clone());
+            let response = handler
+                .execute(&ctx, json!({"items": [replacement]}))
+                .await
+                .expect("batch");
+            assert_eq!(
+                response["data"]["succeeded"]
+                    .as_array()
+                    .expect("succeeded")
+                    .len(),
+                0,
+                "{response}"
+            );
+            assert_eq!(
+                response["data"]["failed"].as_array().expect("failed").len(),
+                1
+            );
+            let after = repo
+                .get_with_deleted("test_space", &entity.base.id)
+                .await
+                .expect("read")
+                .expect("entity");
+            assert_eq!(
+                serde_json::to_value(after).expect("json"),
+                serde_json::to_value(&before).expect("json")
+            );
+            let response = handler
+                .execute(&ctx, json!({"items": [before]}))
+                .await
+                .expect("batch same envelope");
+            assert_eq!(
+                response["data"]["failed"].as_array().expect("failed").len(),
+                0,
+                "{response}"
+            );
+            assert!(repo
+                .get("test_space", &entity.base.id)
+                .await
+                .expect("read")
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_replacement_refuses_concurrent_envelope_change() {
+        use elephant_storage::Repository;
+        for embedded in [false, true] {
+            let (_, repo, observed) = ordinary_update_fixture(embedded).await;
+            let mut reclassified = observed.clone();
+            reclassified.base.security.level = 4;
+            let current = repo
+                .update("test_space", &observed.base.id, reclassified)
+                .await
+                .expect("trusted reclassification");
+            let mut stale_update = observed.clone();
+            stale_update.display_name = "Stale".into();
+            assert!(matches!(
+                repo.replace_authorized(&observed, stale_update, false)
+                    .await,
+                Err(elephant_storage::StorageError::Conflict(_))
+            ));
+            let after = repo
+                .get("test_space", &observed.base.id)
+                .await
+                .expect("read")
+                .expect("entity");
+            assert_eq!(
+                serde_json::to_value(after).expect("json"),
+                serde_json::to_value(current).expect("json")
+            );
+        }
     }
 
     /// Deterministic provider for semantic ranking tests: known texts map to

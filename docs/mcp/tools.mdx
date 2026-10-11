@@ -1321,10 +1321,20 @@ List recent domain events for the caller's space, ordered by recency.
 
 List upcoming domain events within a time window.
 
+Events are ordered by `time_start`. Besides events that start within the window, the result
+includes events still in progress (`time_end` at or after now) and day-precision events
+dated today. Day-precision events are anchored at 00:00Z of their date and Elephant has no
+household timezone, so they stay listed for 24 hours after that anchor; filter the exact
+local day on the client.
+
+The page is applied after candidate and authorization filtering. The response carries
+`items` and `truncated`, which is true when more visible events existed than were returned.
+
 | Parameter | Type and requirement | Description |
 | --- | --- | --- |
 | `days` | integer; optional; default 7 | Look-ahead window in days (1-365) |
 | `include_candidates` | boolean; optional; default false | Include candidate-status events |
+| `limit` | integer; optional; default 50 | Maximum events to return (1-50) |
 
 ```json
 { "days": 14, "include_candidates": false }

@@ -51,7 +51,33 @@ const EVENT_PROJECTION: &str = r"
     metadata
 ";
 
-const DEFAULT_UPCOMING_LIMIT: usize = 50;
+/// Default (and maximum) page size for upcoming-event listings.
+pub const DEFAULT_UPCOMING_LIMIT: usize = 50;
+
+/// Upper bound on rows scanned for an upcoming-event listing before caller-side filtering
+/// (authorization, candidate status) and paging.
+pub const UPCOMING_SCAN_LIMIT: usize = 1000;
+
+/// How far back (in hours) a day-precision event stays "upcoming" after 00:00Z of its date.
+const UPCOMING_DAY_PRECISION_GRACE_HOURS: i64 = 24;
+
+/// Returns whether `event` belongs in an upcoming listing (see `get_upcoming_at`).
+fn is_upcoming(
+    event: &Event,
+    now: DateTime<Utc>,
+    horizon: DateTime<Utc>,
+    day_floor: DateTime<Utc>,
+) -> bool {
+    let Some(time_start) = event.time_start else {
+        return false;
+    };
+    if time_start > horizon {
+        return false;
+    }
+    time_start >= now
+        || event.time_end.is_some_and(|time_end| time_end >= now)
+        || (event.time_precision == TimePrecision::Day && time_start >= day_floor)
+}
 
 /// Window query for explicit time-range and status filtering.
 #[derive(Debug, Clone)]
@@ -605,28 +631,46 @@ impl EventRepository {
         rows.into_iter().map(Event::try_from).collect()
     }
 
-    /// Gets upcoming events in the next N days.
+    /// Gets upcoming events in the next N days, capped at the default page size.
+    ///
+    /// See [`Self::get_upcoming_at`] for the inclusion rules.
     pub async fn get_upcoming(&self, space_id: &str, days: u32) -> StorageResult<Vec<Event>> {
-        let now = Utc::now();
+        self.get_upcoming_at(space_id, days, Utc::now(), DEFAULT_UPCOMING_LIMIT)
+            .await
+    }
+
+    /// Gets upcoming events relative to `now`, ordered by `time_start`, at most `max_rows`.
+    ///
+    /// An event is included when its `time_start` is at or before `now + days` and:
+    /// - it starts at or after `now`; or
+    /// - it is still in progress (`time_end` is set and at or after `now`); or
+    /// - it has day precision and starts no earlier than `now - 24h`. Day-precision events
+    ///   are stored at 00:00Z of their date and Elephant has no household timezone, so this
+    ///   conservative bound keeps "today" visible in every timezone; callers filter the exact
+    ///   local day.
+    pub async fn get_upcoming_at(
+        &self,
+        space_id: &str,
+        days: u32,
+        now: DateTime<Utc>,
+        max_rows: usize,
+    ) -> StorageResult<Vec<Event>> {
         let horizon = now + Duration::days(i64::from(days));
+        let day_floor = now - Duration::hours(UPCOMING_DAY_PRECISION_GRACE_HOURS);
 
         if let Some(store) = self.client.embedded_store() {
             let mut rows = store.scan::<Event>().await?;
             rows.retain(|row| {
                 row.base.space_id == space_id
                     && row.base.deleted_at.is_none()
-                    && row
-                        .time_start
-                        .is_some_and(|time_start| time_start >= now && time_start <= horizon)
+                    && is_upcoming(row, now, horizon, day_floor)
             });
             rows.sort_by(|lhs, rhs| {
                 lhs.time_start
                     .cmp(&rhs.time_start)
                     .then_with(|| lhs.base.id.to_string().cmp(&rhs.base.id.to_string()))
             });
-            if rows.len() > DEFAULT_UPCOMING_LIMIT {
-                rows.truncate(DEFAULT_UPCOMING_LIMIT);
-            }
+            rows.truncate(max_rows);
             return Ok(rows);
         }
 
@@ -636,13 +680,18 @@ impl EventRepository {
                 &format!(
                     "SELECT {EVENT_PROJECTION} FROM event \
                      WHERE space_id = $space_id AND deleted_at IS NONE \
-                     AND time_start IS NOT NONE AND time_start >= $now AND time_start <= $horizon \
-                     ORDER BY time_start ASC LIMIT {DEFAULT_UPCOMING_LIMIT}"
+                     AND time_start IS NOT NONE AND time_start <= $horizon \
+                     AND (time_start >= $now \
+                          OR (time_end IS NOT NONE AND time_end >= $now) \
+                          OR (time_precision = 'day' AND time_start >= $day_floor)) \
+                     ORDER BY time_start ASC LIMIT $max_rows"
                 ),
                 crate::bindings! {
                     "space_id" => space_id,
                     "now" => now,
                     "horizon" => horizon,
+                    "day_floor" => day_floor,
+                    "max_rows" => i64::try_from(max_rows).unwrap_or(i64::MAX),
                 },
             )
             .await?;
@@ -1602,6 +1651,141 @@ mod tests {
         assert!(titles.contains("Soon event"));
         assert!(!titles.contains("Past event"));
         assert!(!titles.contains("Far event"));
+    }
+
+    fn utc(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn make_timed_event(
+        space_id: &str,
+        title: &str,
+        precision: TimePrecision,
+        time_start: &str,
+        time_end: Option<&str>,
+    ) -> Event {
+        let mut event = make_event(
+            space_id,
+            title,
+            EventStatus::Approved,
+            Some(utc(time_start)),
+        );
+        event.time_end = time_end.map(utc);
+        event.time_precision = precision;
+        event
+    }
+
+    async fn upcoming_titles_at(repo: &EventRepository, space_id: &str, now: &str) -> Vec<String> {
+        repo.get_upcoming_at(space_id, 7, utc(now), DEFAULT_UPCOMING_LIMIT)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.title)
+            .collect()
+    }
+
+    /// iss-20261011-75020ed6: day-precision and in-progress events stay upcoming.
+    async fn assert_upcoming_precision_semantics(repo: &EventRepository) {
+        let space_id = "space_upcoming";
+        for event in [
+            make_timed_event(
+                space_id,
+                "Today (day)",
+                TimePrecision::Day,
+                "2026-10-11T00:00:00Z",
+                None,
+            ),
+            make_timed_event(
+                space_id,
+                "Yesterday (day)",
+                TimePrecision::Day,
+                "2026-10-10T00:00:00Z",
+                None,
+            ),
+            make_timed_event(
+                space_id,
+                "In progress",
+                TimePrecision::Minute,
+                "2026-10-11T09:00:00Z",
+                Some("2026-10-11T11:00:00Z"),
+            ),
+            make_timed_event(
+                space_id,
+                "Ended",
+                TimePrecision::Minute,
+                "2026-10-11T08:00:00Z",
+                Some("2026-10-11T09:00:00Z"),
+            ),
+            make_timed_event(
+                space_id,
+                "Started, no end",
+                TimePrecision::Exact,
+                "2026-10-11T09:30:00Z",
+                None,
+            ),
+            make_timed_event(
+                space_id,
+                "Later today",
+                TimePrecision::Minute,
+                "2026-10-11T15:00:00Z",
+                Some("2026-10-11T16:00:00Z"),
+            ),
+            make_timed_event(
+                space_id,
+                "Beyond horizon",
+                TimePrecision::Day,
+                "2026-10-30T00:00:00Z",
+                None,
+            ),
+        ] {
+            repo.create(event).await.unwrap();
+        }
+
+        // 10:00Z (12:00 in Stockholm): today's day event, the in-progress meeting and the
+        // later meeting are upcoming, ordered by time_start.
+        let titles = upcoming_titles_at(repo, space_id, "2026-10-11T10:00:00Z").await;
+        assert_eq!(titles, vec!["Today (day)", "In progress", "Later today"]);
+
+        // 23:30Z: today's day event is still within 24h of its 00:00Z anchor; yesterday's
+        // (47.5h old) is not.
+        let titles = upcoming_titles_at(repo, space_id, "2026-10-11T23:30:00Z").await;
+        assert_eq!(titles, vec!["Today (day)"]);
+
+        // Yesterday's day event was still upcoming at 23:30Z on its own date.
+        let titles = upcoming_titles_at(repo, space_id, "2026-10-10T23:30:00Z").await;
+        assert_eq!(
+            titles,
+            vec![
+                "Yesterday (day)",
+                "Today (day)",
+                "Ended",
+                "In progress",
+                "Started, no end",
+                "Later today"
+            ]
+        );
+
+        // max_rows caps the ordered result.
+        let capped = repo
+            .get_upcoming_at(space_id, 7, utc("2026-10-11T10:00:00Z"), 2)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].title, "Today (day)");
+    }
+
+    #[tokio::test]
+    async fn test_upcoming_includes_day_precision_and_in_progress_events_surreal() {
+        let repo = setup_test_repo().await;
+        assert_upcoming_precision_semantics(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn test_upcoming_includes_day_precision_and_in_progress_events_embedded() {
+        let repo = EventRepository::new(StorageClient::new_embedded().await.unwrap());
+        assert_upcoming_precision_semantics(&repo).await;
     }
 
     #[tokio::test]

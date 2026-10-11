@@ -96,7 +96,9 @@ pub use entity_repository::{
     EntityVectorCache, EntityWithRelations, ENTITY_VECTOR_SNAPSHOT_TTL,
 };
 pub use error::{StorageError, StorageResult};
-pub use event_repository::{EventRepository, EventWindowQuery};
+pub use event_repository::{
+    EventRepository, EventWindowQuery, DEFAULT_UPCOMING_LIMIT, UPCOMING_SCAN_LIMIT,
+};
 pub use identity_candidate_repository::IdentityCandidateRepository;
 pub use media_asset_repository::MediaAssetRepository;
 pub use pool::{ConnectionPool, PoolConfig, PoolStats, ServerStats, SessionKey};

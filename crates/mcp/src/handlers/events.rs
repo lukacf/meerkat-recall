@@ -15,7 +15,7 @@ use std::str::FromStr;
 
 use elephant_storage::{
     parse_id, AssertionRepository, EntityRepository, EventRepository, Repository, SearchCriteria,
-    SourceRepository, StorageClient,
+    SourceRepository, StorageClient, DEFAULT_UPCOMING_LIMIT, UPCOMING_SCAN_LIMIT,
 };
 use elephant_types::ids::TableName;
 use elephant_types::records::assertion::Assertion;
@@ -94,11 +94,22 @@ pub struct ListUpcomingEventsInput {
     pub days: u32,
     #[serde(default)]
     pub include_candidates: bool,
+    /// Maximum items to return; defaults to and is capped at `DEFAULT_UPCOMING_LIMIT`.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListEventsOutput {
     pub items: Vec<Event>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListUpcomingEventsOutput {
+    pub items: Vec<Event>,
+    /// True when more visible upcoming events existed than were returned.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -747,6 +758,10 @@ impl ToolHandler for ListUpcomingEventsHandler {
     fn description(&self) -> &'static str {
         concat!(
             "List upcoming domain events within a time window.\n\n",
+            "Includes events still in progress and day-precision events dated today ",
+            "(UTC-conservative: up to 24h back; filter the exact local day client-side). ",
+            "Returns at most `limit` items (default and max 50); `truncated` is true when ",
+            "more visible events existed.\n\n",
             "Example:\n",
             r#"{ "days": 14, "include_candidates": false }"#,
         )
@@ -758,7 +773,13 @@ impl ToolHandler for ListUpcomingEventsHandler {
             "required": [],
             "properties": {
                 "days": { "type": "integer", "default": 7, "minimum": 1, "maximum": 365 },
-                "include_candidates": { "type": "boolean", "default": false }
+                "include_candidates": { "type": "boolean", "default": false },
+                "limit": {
+                    "type": "integer",
+                    "default": DEFAULT_UPCOMING_LIMIT,
+                    "minimum": 1,
+                    "maximum": DEFAULT_UPCOMING_LIMIT
+                }
             }
         })
     }
@@ -779,17 +800,31 @@ impl ToolHandler for ListUpcomingEventsHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
+        let limit = input
+            .limit
+            .unwrap_or(DEFAULT_UPCOMING_LIMIT)
+            .clamp(1, DEFAULT_UPCOMING_LIMIT);
         let mut events = self
             .repo
-            .get_upcoming(&space_id, input.days)
+            .get_upcoming_at(
+                &space_id,
+                input.days,
+                chrono::Utc::now(),
+                UPCOMING_SCAN_LIMIT,
+            )
             .await
             .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+        // Hitting the scan ceiling means more rows may exist beyond what was read.
+        let scan_exhausted = events.len() >= UPCOMING_SCAN_LIMIT;
         if !input.include_candidates {
             events.retain(|event| event.status != EventStatus::Candidate);
         }
-        let output = ListEventsOutput {
-            items: authorized_events(ctx, events),
-        };
+        // Page only after candidate and authorization filtering, so callers never get a
+        // short page while more visible rows exist.
+        let mut items = authorized_events(ctx, events);
+        let truncated = scan_exhausted || items.len() > limit;
+        items.truncate(limit);
+        let output = ListUpcomingEventsOutput { items, truncated };
         let response = ToolResponse::success(output);
         serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
     }
@@ -1095,5 +1130,110 @@ mod tests {
         let decoded: ToolResponse<()> = serde_json::from_value(response).expect("decode");
         assert!(!decoded.ok);
         assert!(decoded.error.unwrap_or_default().contains("Access denied"));
+    }
+
+    /// Seeds `visible` events readable at clearance level 1 and `hidden` events at level 5,
+    /// all starting in the next few hours. Hidden rows come first in time order so a
+    /// cap-before-filter would starve the visible page.
+    async fn seed_upcoming(storage: &StorageClient, visible: usize, hidden: usize) {
+        let repo = EventRepository::new(storage.clone());
+        let now = chrono::Utc::now();
+        for index in 0..visible + hidden {
+            let is_hidden = index < hidden;
+            let mut base = BaseFields::new(
+                RecordId::new_v4(TableName::Event),
+                "default".to_string(),
+                "tester".to_string(),
+            );
+            base.security = Security {
+                policy_id: "default".to_string(),
+                level: if is_hidden { 5 } else { 0 },
+                labels: Vec::new(),
+                handling: Vec::new(),
+            };
+            let mut event = Event::new(
+                base,
+                format!("Event {index}"),
+                vec![Link::new(RecordId::new_v4(TableName::Assertion))],
+                Vec::new(),
+            )
+            .expect("event");
+            event.status = EventStatus::Approved;
+            let offset = i64::try_from(index).expect("index") + 1;
+            event.time_start = Some(now + chrono::Duration::minutes(offset));
+            event.time_precision = TimePrecision::Minute;
+            repo.create(event).await.expect("create event");
+        }
+    }
+
+    fn upcoming_ctx(storage: &StorageClient) -> ToolContext {
+        ToolContext::new(
+            storage.clone(),
+            Principal {
+                space_id: "default".to_string(),
+                scopes: std::iter::once("read:event".to_string()).collect(),
+                clearances: vec![Clearance {
+                    policy_id: "default".to_string(),
+                    max_level: 1,
+                    labels: HashSet::new(),
+                    handling_allow: HashSet::new(),
+                }],
+                subject_allowlist: None,
+                purpose: HashSet::new(),
+            },
+        )
+    }
+
+    async fn list_upcoming(storage: &StorageClient, params: Value) -> ListUpcomingEventsOutput {
+        let handler = ListUpcomingEventsHandler::new(storage.clone());
+        let response = handler
+            .execute(&upcoming_ctx(storage), params)
+            .await
+            .expect("response");
+        let decoded: ToolResponse<ListUpcomingEventsOutput> =
+            serde_json::from_value(response).expect("decode");
+        assert!(decoded.ok, "error: {:?}", decoded.error);
+        decoded.data.expect("data")
+    }
+
+    #[tokio::test]
+    async fn test_list_upcoming_caps_after_authorization() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        seed_upcoming(&storage, 40, 20).await;
+
+        let output = list_upcoming(&storage, json!({})).await;
+        assert_eq!(output.items.len(), 40);
+        assert!(!output.truncated);
+    }
+
+    #[tokio::test]
+    async fn test_list_upcoming_reports_truncation() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        seed_upcoming(&storage, 55, 5).await;
+
+        let output = list_upcoming(&storage, json!({})).await;
+        assert_eq!(output.items.len(), DEFAULT_UPCOMING_LIMIT);
+        assert!(output.truncated);
+        // Ordered by start time: the earliest visible event comes first.
+        assert_eq!(output.items[0].title, "Event 5");
+
+        let output = list_upcoming(&storage, json!({ "limit": 10 })).await;
+        assert_eq!(output.items.len(), 10);
+        assert!(output.truncated);
+
+        // A limit above the maximum is clamped to the default page size.
+        let output = list_upcoming(&storage, json!({ "limit": 500 })).await;
+        assert_eq!(output.items.len(), DEFAULT_UPCOMING_LIMIT);
+        assert!(output.truncated);
+    }
+
+    #[tokio::test]
+    async fn test_list_upcoming_exact_fit_is_not_truncated() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        seed_upcoming(&storage, 12, 3).await;
+
+        let output = list_upcoming(&storage, json!({ "limit": 12 })).await;
+        assert_eq!(output.items.len(), 12);
+        assert!(!output.truncated);
     }
 }

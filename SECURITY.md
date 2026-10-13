@@ -49,3 +49,17 @@ allowlist covers synthetic assertion idempotency keys only. Use a manual privacy
 review as well: names, household data, incident narratives and private project
 paths are often not credentials and are not detected by a secret scanner.
 Source archive exclusions do not hide files from Git history or GitHub PRs.
+
+## Tracked upstream maintenance exception
+
+The pinned Meerkat 0.8.51 SDK uses `meerkat-skills` → `serde_yaml` →
+`unsafe-libyaml` 0.2.11 to parse and serialize skill frontmatter.
+[RUSTSEC-2024-0449](https://rustsec.org/advisories/RUSTSEC-2024-0449.html)
+classifies `unsafe-libyaml` as unmaintained and lists no patched version. The
+security audit permits this one advisory while that SDK remains pinned;
+this does not establish memory safety or suppress other vulnerability advisories.
+
+The Recall release owner must re-evaluate and remove or explicitly renew this
+exception when upgrading to the released Meerkat 0.9 SDK, before publishing the
+matching Recall version. Replacing the parser inside the pinned SDK requires a
+separate compatibility change; a lockfile upgrade cannot remove it.

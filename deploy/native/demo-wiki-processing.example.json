@@ -1,0 +1,33 @@
+{
+  "generation": 1,
+  "index_generation": 0,
+  "policy_id": "demo-approved",
+  "connections": {
+    "demo-account": {
+      "id": "demo-account",
+      "provider": "openai",
+      "account_id": "REPLACE_WITH_APPROVED_ACCOUNT",
+      "endpoint": "https://api.openai.com/v1",
+      "credential_ref": "RECALL_DEMO_PROVIDER_KEY",
+      "credential_generation": 1,
+      "revoked": false
+    }
+  },
+  "profiles": {
+    "demo-writer": {
+      "id": "demo-writer",
+      "connection_id": "demo-account",
+      "model": "REPLACE_WITH_APPROVED_MODEL",
+      "model_version": "REPLACE_WITH_PINNED_VERSION",
+      "dimensions": null,
+      "preprocessing": "text-v1"
+    }
+  },
+  "bindings": {
+    "wiki_planner": {"id": "demo-plan-v1", "profile_id": "demo-writer", "revoked": false},
+    "wiki_writer": {"id": "demo-write-v1", "profile_id": "demo-writer", "revoked": false},
+    "wiki_verifier": {"id": "demo-verify-v1", "profile_id": "demo-writer", "revoked": false}
+  },
+  "active_embedding_profile_id": null,
+  "pending_reindex": null
+}

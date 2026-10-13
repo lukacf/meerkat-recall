@@ -1,0 +1,218 @@
+{
+  "format": "recall-independent-render-coordinate-fixtures/v1",
+  "source_review_only": true,
+  "execution_authorized": false,
+  "product_acceptance": false,
+  "wire_field_names_status": "Frozen C5575d5ece5814c1a8903703512648327c625d6d9; all additive fields required, hashes bare lowercase64hex.",
+  "renderer": {
+    "name": "elephant.renderer.text",
+    "version": "1.0.0",
+    "config_hash": null
+  },
+  "coordinate_contract": {
+    "existing_span_and_quote": "Exact immutable accepted source revision bytes; preserve promised public semantics.",
+    "rendered_identity": "Exact currently authorized original immutable DocRevision identity, rendered byte span and selected rendered quote hash; full original DTO supplies exact rendered bytes.",
+    "mapping": "Pinned transform-derived smallest contiguous source byte cover of the selected rendered interval. Removed bytes between mapped support bytes remain in raw quote. Synthesized terminal LF has no raw interval. No substring search or occurrence guessing.",
+    "revalidation": "Original accepted bytes/hash, exact renderer identity/config, original complete render proof, immutable rendered bytes/hash, both interval slices and current ancestor policy must verify.",
+    "synthetic_only": "Refuse an interval containing no original source-supported byte.",
+    "response_budget": "Do not silently duplicate complete quotations or reuse old encoded-response arithmetic after additive wire changes."
+  },
+  "positive_cases": [
+    {
+      "id": "identity_without_synthetic_lf",
+      "accepted_text": "Mira maintains Helios.",
+      "accepted_utf8_sha256": "837d5285260451e0480c01b1c4ec8e1120acdd6821a8342f4d71fe8ea1392c31",
+      "rendered_text": "Mira maintains Helios.\n",
+      "rendered_utf8_sha256": "df1261b42de4885a1b199f156389a1adfd496a14cfa1de1fba300bc9524a69c0",
+      "raw_span": {
+        "start": 0,
+        "end": 22
+      },
+      "raw_quote": "Mira maintains Helios.",
+      "raw_quote_sha256": "837d5285260451e0480c01b1c4ec8e1120acdd6821a8342f4d71fe8ea1392c31",
+      "rendered_span": {
+        "start": 0,
+        "end": 22
+      },
+      "rendered_quote": "Mira maintains Helios.",
+      "rendered_quote_sha256": "837d5285260451e0480c01b1c4ec8e1120acdd6821a8342f4d71fe8ea1392c31",
+      "expectation": "Original successful equal-byte evidence remains unchanged."
+    },
+    {
+      "id": "support_with_synthetic_terminal_lf",
+      "accepted_text": "Mira maintains Helios.",
+      "accepted_utf8_sha256": "837d5285260451e0480c01b1c4ec8e1120acdd6821a8342f4d71fe8ea1392c31",
+      "rendered_text": "Mira maintains Helios.\n",
+      "rendered_utf8_sha256": "df1261b42de4885a1b199f156389a1adfd496a14cfa1de1fba300bc9524a69c0",
+      "raw_span": {
+        "start": 0,
+        "end": 22
+      },
+      "raw_quote": "Mira maintains Helios.",
+      "raw_quote_sha256": "837d5285260451e0480c01b1c4ec8e1120acdd6821a8342f4d71fe8ea1392c31",
+      "rendered_span": {
+        "start": 0,
+        "end": 23
+      },
+      "rendered_quote": "Mira maintains Helios.\n",
+      "rendered_quote_sha256": "df1261b42de4885a1b199f156389a1adfd496a14cfa1de1fba300bc9524a69c0",
+      "expectation": "Added final LF has no raw bytes; retain full rendered support and exact original raw cover, with explicitly different coordinates/hashes."
+    },
+    {
+      "id": "second_repeated_phrase_after_crlf_trim",
+      "accepted_text": "Mira maintains Helios.  \r\n\r\nMira maintains Helios.\r\n",
+      "accepted_utf8_sha256": "83f036c88308b9858b585df3c7c69736ea5a089e5dbad18db6bea5b9198210d5",
+      "rendered_text": "Mira maintains Helios.\n\nMira maintains Helios.\n",
+      "rendered_utf8_sha256": "d46236961ccf38554c1321df0caccf6dbb4bdf92afda489d58886bfa4eca4bbc",
+      "raw_span": {
+        "start": 28,
+        "end": 50
+      },
+      "raw_quote": "Mira maintains Helios.",
+      "raw_quote_sha256": "837d5285260451e0480c01b1c4ec8e1120acdd6821a8342f4d71fe8ea1392c31",
+      "rendered_span": {
+        "start": 24,
+        "end": 46
+      },
+      "rendered_quote": "Mira maintains Helios.",
+      "rendered_quote_sha256": "837d5285260451e0480c01b1c4ec8e1120acdd6821a8342f4d71fe8ea1392c31",
+      "expectation": "The second occurrence must map to the second original occurrence despite identical quote bytes; searching for the quote is invalid."
+    },
+    {
+      "id": "support_crosses_trimmed_crlf_boundary",
+      "accepted_text": "Mira maintains  \r\nHelios.\t\r\n",
+      "accepted_utf8_sha256": "b9b7ad3d30f8497842729cc0018e58dae7b5ff1dcba5984159ad822a4e3b554a",
+      "rendered_text": "Mira maintains\nHelios.\n",
+      "rendered_utf8_sha256": "e4ed2a8a118a29e73df33bdac8662c94affde139c013276e5944e41ddaca6c73",
+      "raw_span": {
+        "start": 0,
+        "end": 25
+      },
+      "raw_quote": "Mira maintains  \r\nHelios.",
+      "raw_quote_sha256": "bcccd21d7e61e2b4a8b281c25ad05f99d3c94ba5c41fa9a312e1f1f7cb646f55",
+      "rendered_span": {
+        "start": 0,
+        "end": 22
+      },
+      "rendered_quote": "Mira maintains\nHelios.",
+      "rendered_quote_sha256": "3f5800d188982b0efd7bb6892fb27a9b0ca0b9423cb45032f7c57863c5915601",
+      "expectation": "Contiguous raw cover retains removed internal trailing spaces and CRLF. It is not a clipped or silently relabeled rendered quote."
+    },
+    {
+      "id": "unicode_after_lone_cr_and_crlf",
+      "accepted_text": "Åsa  \r\n🦊 keeps café.\r",
+      "accepted_utf8_sha256": "cfcdcddaed7fd42e9acd662a51167437102b6bb5b09b7b664bda0b3395ef9e80",
+      "rendered_text": "Åsa\n🦊 keeps café.\n",
+      "rendered_utf8_sha256": "a3b6c6e7277c1f285db823037cbb23651bc9afd191d814dd9e60b88ccbdc692f",
+      "raw_span": {
+        "start": 8,
+        "end": 25
+      },
+      "raw_quote": "🦊 keeps café.",
+      "raw_quote_sha256": "fff5d72fb7124907e90634f4e1d39295518926b477c42687f859cd4220363d11",
+      "rendered_span": {
+        "start": 5,
+        "end": 22
+      },
+      "rendered_quote": "🦊 keeps café.",
+      "rendered_quote_sha256": "fff5d72fb7124907e90634f4e1d39295518926b477c42687f859cd4220363d11",
+      "expectation": "All coordinates are UTF8 bytes, including emoji and accented letters; neither Unicode scalar nor UTF16 offsets qualify."
+    },
+    {
+      "id": "unicode_trailing_whitespace",
+      "accepted_text": "Mira maintains Helios.  \r\nNext fact.",
+      "accepted_utf8_sha256": "2410216d765a8e172896199f73400bbb4d428d6348a6982e85a3e3c60dcb2784",
+      "rendered_text": "Mira maintains Helios.\nNext fact.\n",
+      "rendered_utf8_sha256": "338803d1c4ac8cd6234a20c767c820576094cf5b62efa187b4c4b8adc66cbd93",
+      "raw_span": {
+        "start": 29,
+        "end": 39
+      },
+      "raw_quote": "Next fact.",
+      "raw_quote_sha256": "ae96de4c465cd2b0bde764ec273a4a05b849cd71aa820d855933879f9bc5b95c",
+      "rendered_span": {
+        "start": 23,
+        "end": 33
+      },
+      "rendered_quote": "Next fact.",
+      "rendered_quote_sha256": "ae96de4c465cd2b0bde764ec273a4a05b849cd71aa820d855933879f9bc5b95c",
+      "expectation": "Pinned Rust trim_end semantics remove NBSP and EM SPACE at line end; preserve exact later-paragraph offsets."
+    },
+    {
+      "id": "interior_unicode_nel_is_not_a_line_break",
+      "accepted_text": "Miramaintains Helios.\r\n",
+      "accepted_utf8_sha256": "f838eeb41ba4ce8b839a2f818dfd893e9265a1bc8b227835c0879fd77648af90",
+      "rendered_text": "Miramaintains Helios.\n",
+      "rendered_utf8_sha256": "7238fafdf29848e13247d004b26f65fa058434046eba08101a43ed00d1715e34",
+      "raw_span": {
+        "start": 0,
+        "end": 23
+      },
+      "raw_quote": "Miramaintains Helios.",
+      "raw_quote_sha256": "901eb57cf6d83878c1153cbf079d7c56b95fcd42f7d41ceefe7dc7adebf82b60",
+      "rendered_span": {
+        "start": 0,
+        "end": 23
+      },
+      "rendered_quote": "Miramaintains Helios.",
+      "rendered_quote_sha256": "901eb57cf6d83878c1153cbf079d7c56b95fcd42f7d41ceefe7dc7adebf82b60",
+      "expectation": "An interior NEL remains present: Rust str::lines does not split it. A generic splitlines implementation must not redefine the renderer."
+    }
+  ],
+  "negative_cases": [
+    {
+      "id": "equal_quote_wrong_occurrence",
+      "base_case": "second_repeated_phrase_after_crlf_trim",
+      "invalid_raw_span": {
+        "start": 0,
+        "end": 22
+      },
+      "expect": "refuse even though raw quote bytes and quote hash equal the requested second occurrence"
+    },
+    {
+      "id": "inside_emoji",
+      "base_case": "unicode_after_lone_cr_and_crlf",
+      "invalid_rendered_start": 6,
+      "expect": "refuse non-UTF8-boundary span before mapping"
+    },
+    {
+      "id": "only_added_final_lf",
+      "base_case": "support_with_synthetic_terminal_lf",
+      "invalid_rendered_span": {
+        "start": 22,
+        "end": 23
+      },
+      "expect": "refuse; no original support bytes exist"
+    },
+    {
+      "id": "stale_original_input",
+      "expect": "any changed accepted source bytes/hash or different source revision/generation cannot borrow the old mapping"
+    },
+    {
+      "id": "renderer_identity_mismatch",
+      "expect": "unknown or changed renderer name/version/config must not silently use the default mapping"
+    },
+    {
+      "id": "rendered_tamper",
+      "expect": "self-consistent new rendered text/hash cannot borrow an original completed-render proof"
+    },
+    {
+      "id": "empty_reversed_out_of_range",
+      "expect": "invalid intervals refuse; no trim, clamp, clip or replacement quote"
+    },
+    {
+      "id": "missing_current_authority",
+      "expect": "valid coordinate arithmetic cannot authorize retracted, erased, replaced or denied current evidence"
+    }
+  ],
+  "proof_limits": [
+    "Literal UTF8/hash arithmetic only; no renderer/product/model or transport executed.",
+    "This does not approve a particular unseen helper implementation or wire change.",
+    "Full actual public search and immutable revision route fixtures on both backends remain required."
+  ],
+  "required_additive_wire_fields": [
+    "rendered_span",
+    "rendered_quote_sha256",
+    "rendered_text_sha256"
+  ]
+}

@@ -1,0 +1,91 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Cargo lock for libraries (keep for binaries)
+# Cargo.lock
+
+# Environment files
+.env
+.env.*
+!.env.example
+.env.*.local
+
+# Test coverage
+*.profraw
+*.profdata
+coverage/
+lcov.info
+
+# Debug files
+*.log
+*.pdb
+*.log.txt
+*.last.txt
+*.pid
+nohup.out
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Documentation build
+/docs/book/
+docs/archive/
+
+# Local tool state
+.mcp-the-force/
+.mdp-the-force/
+.mcp-the-force
+# FastEmbed model cache
+.fastembed_cache/
+
+# Local agent artifacts
+.agents/
+.claude/agents/
+.claude/skills/dist/
+.claude/skills/rct-methodology
+.claude/skills/rust-cicd-pipeline/
+.claude/skills/skill-creator/
+.claude/settings.local.json
+.claude/skills/meerkat-platform
+.claude/worktrees/
+.codemob-mcp/
+.codex/*
+.codex-command-logs/
+.rct/
+.rct-old/
+.elephant/
+.elephant-snapshots/
+.playwright-mcp/
+.tmp/
+tmp/
+tmp.txt
+.codex_run_phase5_reviews.sh
+test-ingest.md
+
+# Root-level visual/debug artifacts (keep under docs/assets instead)
+/explorer-*.png
+/entity-explorer.html
+/elephant-architecture.html
+/Elephant_Presentation.pptx
+/pit-full-check.png
+/putting-it-together-full.png
+
+# Golden scenario run artifacts
+tests/golden_scenarios/output/
+elephant-rocksdb-bin.tmp
+
+# Documentation validation dependencies
+/scripts/docs/node_modules/

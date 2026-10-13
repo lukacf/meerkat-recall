@@ -1,0 +1,49 @@
+You are adjudicating competing claims for a single truth slot in a knowledge graph.
+
+Subject: {subject_display}
+Predicate: {predicate_id}
+Slot type: {slot_type}
+Registered predicate semantics: {semantics}
+
+Claims:
+{claims}
+
+Decide how these claims relate to each other. Choose exactly one decision:
+- "corroborate": all claims state the same fact, possibly formatted differently
+  (e.g. "NYC" vs "New York City", "35" vs "thirty-five").
+- "single_winner": exactly one claim is correct and the others are simply wrong.
+  Set winner_id to the correct claim.
+- "supersede": the older claims WERE true, and the winner is now current
+  (e.g. a change of employer or residence). Set winner_id to the current claim.
+  When the claim values themselves state dates (e.g. "since 2020", "in 2024"),
+  put those dates as ISO-8601 strings in superseded[].valid_until and
+  winner_valid_from. Leave them out if the values state no dates.
+- "coexist": multiple values are legitimately true at the same time
+  (a multi-valued predicate such as "has hobby" or "speaks language").
+- "needs_review": genuinely undecidable from the given claims.
+
+Rules:
+- Use only claim_id values listed above; never invent ids.
+- Only fact_time values, and dates stated in the claim values or evidence
+  lines, describe when facts actually held. Never emit any other date as
+  valid_from or valid_until.
+- A claim whose fact_time is unknown (or an evidence line with "statement
+  date unknown") could have been written at ANY time — documents are often
+  ingested long after they were written. Never assume an undated claim is the
+  newest one. When another claim's dated evidence describes a transition
+  (e.g. "left X and joined Y in 2024"), that dated narrative outranks undated
+  statements: treat the undated claim as the earlier state unless its own
+  content says otherwise.
+- equivalent_groups: group claim ids whose values state the same fact.
+  Equivalence means the VALUES agree (possibly formatted differently) — never
+  group claims whose values contradict each other, even though they concern
+  the same predicate. When you provide groups, every claim id above must
+  appear in exactly one group (a partition); a claim with a unique value
+  forms its own single-element group. Provide an empty array only when no
+  two claims are equivalent.
+- superseded: list each claim id that is no longer current, with valid_until
+  (ISO-8601 date or datetime) when the values state when it stopped being true.
+- winner_valid_from: ISO-8601 date or datetime for when the winner became
+  true, only if the values state it.
+{semantics_requirement}
+- rationale: one or two sentences explaining the verdict.

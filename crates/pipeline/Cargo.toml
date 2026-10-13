@@ -1,0 +1,59 @@
+[package]
+name = "elephant-pipeline"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Ingestion and processing pipeline for Elephant"
+
+[dependencies]
+anyhow = { workspace = true }
+elephant-auth = { path = "../auth" }
+elephant-types = { path = "../types" }
+elephant-storage = { path = "../storage" }
+elephant-embeddings = { path = "../embeddings" }
+elephant-identity = { path = "../identity" }
+elephant-extensions = { path = "../extensions" }
+elephant-outbox = { path = "../outbox" }
+elephant-knowledge-views = { path = "../knowledge-views" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+async-stream = "0.3.6"
+chrono = { workspace = true }
+uuid = { workspace = true }
+toml = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+futures = { workspace = true }
+surrealdb = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+mp4parse = "0.17"
+
+# Meerkat integration (optional, for LLM-powered extraction)
+meerkat = { workspace = true, optional = true }
+meerkat-core = { workspace = true, optional = true }
+meerkat-mcp = { workspace = true, optional = true }
+meerkat-runtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+elephant-auth = { path = "../auth" }
+elephant-policy = { path = "../policy" }
+jsonwebtoken = { workspace = true }
+meerkat-core = { workspace = true }
+meerkat-models = { workspace = true }
+elephant-migrations = { path = "../migrations" }
+tokio-test = { workspace = true }
+rstest = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+default = []
+meerkat-extraction = ["meerkat", "meerkat-core", "meerkat-mcp", "meerkat-runtime"]
+
+[lints]
+workspace = true

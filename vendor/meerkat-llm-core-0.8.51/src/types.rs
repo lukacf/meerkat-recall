@@ -1,0 +1,998 @@
+//! LLM client types
+//!
+//! Defines the core trait and normalized event types.
+
+use crate::error::LlmError;
+use async_trait::async_trait;
+use futures::Stream;
+use meerkat_core::image_generation::{
+    GenerateImageExecutionPlan, GenerateImageRequest, ImageFormatPreference,
+    ImageGenerationToolResult, ImageOperationTerminalClass, ImageProviderTerminalObservation,
+    ImageSizePreference, ProviderImageMetadata, ProviderTextDisposition, RevisedPromptDisposition,
+};
+use meerkat_core::lifecycle::run_primitive::{ProviderTag, ToolChoice};
+use meerkat_core::schema::{CompiledSchema, SchemaError};
+use meerkat_core::web_search::{WebSearchRequest, WebSearchResult};
+use meerkat_core::{
+    AssistantBlock, AssistantImageRef, MediaType, Message, OutputSchema, Provider, ServerToolKind,
+    StopReason, ToolDef, ToolResult, Usage,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::any::Any;
+use std::fmt;
+use std::pin::Pin;
+use std::sync::Arc;
+
+/// Stream type alias — Send on native, not required on wasm32 (single-threaded).
+#[cfg(not(target_arch = "wasm32"))]
+pub type LlmStream<'a> = Pin<Box<dyn Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>>;
+#[cfg(target_arch = "wasm32")]
+pub type LlmStream<'a> = Pin<Box<dyn Stream<Item = Result<LlmEvent, LlmError>> + 'a>>;
+
+/// Abstraction over LLM providers
+///
+/// Each provider implementation normalizes its streaming response
+/// to the common `LlmEvent` type, hiding provider-specific quirks.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait LlmClient: Send + Sync {
+    /// Prepare replay messages together with any opaque, request-scoped route
+    /// witness required to keep later lowering and dispatch coherent.
+    fn project_replay_request(
+        &self,
+        messages: &[Message],
+    ) -> Result<LlmReplayProjection, LlmError> {
+        self.project_replay_messages(messages)
+            .map(LlmReplayProjection::new)
+    }
+
+    /// Project canonical Meerkat transcript history into the provider-safe
+    /// replay history for this client.
+    ///
+    /// Core owns canonical messages; provider clients own the policy for which
+    /// blocks can be replayed, transformed, or rejected for their wire API.
+    /// The default fails closed so raw canonical history is never implicitly
+    /// treated as provider-safe.
+    fn project_replay_messages(&self, _messages: &[Message]) -> Result<Vec<Message>, LlmError> {
+        Err(LlmError::InvalidRequest {
+            message: format!(
+                "{} client does not implement provider replay projection",
+                self.provider().as_str()
+            ),
+        })
+    }
+
+    /// Return an exact witness for the largest serialized JSON body this
+    /// invocation may send. The default is unavailable for custom providers.
+    fn request_pressure(
+        &self,
+        _request: &LlmRequest,
+    ) -> Result<Option<meerkat_core::ProviderRequestPressure>, LlmError> {
+        Ok(None)
+    }
+
+    /// Measure a request through the exact route witness captured while its
+    /// replay projection was built.
+    fn prepared_request_pressure(
+        &self,
+        request: &PreparedLlmRequest,
+    ) -> Result<Option<meerkat_core::ProviderRequestPressure>, LlmError> {
+        self.request_pressure(request.request())
+    }
+
+    /// Return non-authoritative claims for cache breakpoints authored by the exact
+    /// provider lowering used for this request.
+    ///
+    /// `canonical_messages` is the pre-projection transcript. Providers must
+    /// return no claim when their replay projection cannot map a lowered
+    /// boundary back to the same canonical message count.
+    fn authored_cache_breakpoints(
+        &self,
+        _request: &LlmRequest,
+        _canonical_messages: &[Message],
+    ) -> Result<Vec<meerkat_core::ProviderCacheBreakpointClaim>, LlmError> {
+        Ok(Vec::new())
+    }
+
+    /// Author cache evidence through the exact route witness captured while
+    /// this request was projected.
+    fn prepared_cache_breakpoints(
+        &self,
+        request: &PreparedLlmRequest,
+        canonical_messages: &[Message],
+    ) -> Result<Vec<meerkat_core::ProviderCacheBreakpointClaim>, LlmError> {
+        self.authored_cache_breakpoints(request.request(), canonical_messages)
+    }
+
+    /// Stream a completion request
+    ///
+    /// Returns a stream of normalized events. The stream completes
+    /// when the model finishes (either with EndTurn or ToolUse).
+    fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a>;
+
+    /// Dispatch through the exact route witness captured while this request
+    /// was projected.
+    fn stream_prepared<'a>(&'a self, request: &'a PreparedLlmRequest) -> LlmStream<'a> {
+        self.stream(request.request())
+    }
+
+    /// Typed provider identity for this client.
+    ///
+    /// Each provider implementation statically knows its own identity and
+    /// returns the corresponding [`Provider`] variant. Callers that need a
+    /// display/log label use `provider().as_str()`.
+    fn provider(&self) -> Provider;
+
+    /// Check if the client is healthy/connected
+    async fn health_check(&self) -> Result<(), LlmError>;
+
+    /// Compile an output schema for this provider.
+    ///
+    /// Default implementation normalizes the schema without provider-specific lowering.
+    /// Provider implementations override this to apply provider-specific transformations.
+    /// The result is the validation schema (see [`CompiledSchema`]); a schema an
+    /// adapter sends in its native structured-output slot may be lowered further.
+    fn compile_schema(&self, output_schema: &OutputSchema) -> Result<CompiledSchema, SchemaError> {
+        Ok(CompiledSchema {
+            schema: output_schema.schema.as_value().clone(),
+            warnings: Vec::new(),
+        })
+    }
+}
+
+/// Opaque in-process route evidence carried only between one client's replay
+/// projection, pressure/cache lowering, and dispatch.
+#[derive(Clone)]
+pub struct LlmRequestRouteWitness(Arc<dyn Any + Send + Sync>);
+
+impl LlmRequestRouteWitness {
+    pub fn new<T>(witness: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self(Arc::new(witness))
+    }
+
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+}
+
+impl fmt::Debug for LlmRequestRouteWitness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LlmRequestRouteWitness(..)")
+    }
+}
+
+/// Provider-safe replay projection plus request-scoped route evidence.
+#[derive(Debug, Clone)]
+pub struct LlmReplayProjection {
+    messages: Vec<Message>,
+    route_witness: Option<LlmRequestRouteWitness>,
+}
+
+impl LlmReplayProjection {
+    pub fn new(messages: Vec<Message>) -> Self {
+        Self {
+            messages,
+            route_witness: None,
+        }
+    }
+
+    pub fn with_route_witness(mut self, witness: LlmRequestRouteWitness) -> Self {
+        self.route_witness = Some(witness);
+        self
+    }
+}
+
+/// One provider request bound to the route evidence that authored its replay
+/// projection.
+#[derive(Debug, Clone)]
+pub struct PreparedLlmRequest {
+    request: LlmRequest,
+    route_witness: Option<LlmRequestRouteWitness>,
+}
+
+impl PreparedLlmRequest {
+    pub fn from_projection(mut request: LlmRequest, projection: LlmReplayProjection) -> Self {
+        request.messages = projection.messages;
+        Self {
+            request,
+            route_witness: projection.route_witness,
+        }
+    }
+
+    pub fn request(&self) -> &LlmRequest {
+        &self.request
+    }
+
+    pub fn route_witness<T: Any>(&self) -> Option<&T> {
+        self.route_witness
+            .as_ref()
+            .and_then(LlmRequestRouteWitness::downcast_ref)
+    }
+}
+
+/// Provider-neutral image execution seam.
+///
+/// The request is already a typed projection from machine/runtime state. Provider
+/// crates consume it as mechanics-only input and return normalized, pre-blob
+/// image bytes plus metadata for the runtime to commit durably.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait ImageGenerationExecutor: Send + Sync {
+    async fn execute_image_generation(
+        &self,
+        request: ProviderImageGenerationRequest,
+    ) -> Result<ProviderImageGenerationOutput, LlmError>;
+}
+
+/// Provider-neutral executor for the Meerkat-owned web-search fallback tool.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait WebSearchExecutor: Send + Sync {
+    async fn execute_web_search(
+        &self,
+        request: WebSearchRequest,
+    ) -> Result<WebSearchResult, LlmError>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderImageGenerationRequest {
+    pub operation_id: meerkat_core::ImageOperationId,
+    pub model: String,
+    pub generate_request: GenerateImageRequest,
+    pub execution_plan: GenerateImageExecutionPlan,
+    /// Machine-owned provider projection. Provider adapters do not construct
+    /// replay policy from transcript history; they lower these messages to the
+    /// provider-native request.
+    #[serde(default)]
+    pub projected_messages: Vec<Message>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderGeneratedImage {
+    pub media_type: MediaType,
+    /// Base64-encoded image bytes without a data URL prefix.
+    pub base64_data: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderImageGenerationOutput {
+    pub operation_id: meerkat_core::ImageOperationId,
+    pub terminal_observation: ImageProviderTerminalObservation,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ProviderGeneratedImage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_text: Option<String>,
+    pub revised_prompt: RevisedPromptDisposition,
+    pub native_metadata: ProviderImageMetadata,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<meerkat_core::ImageGenerationWarning>,
+}
+
+impl ProviderImageGenerationOutput {
+    pub fn to_tool_result(
+        &self,
+        terminal: ImageOperationTerminalClass,
+        committed_images: Vec<AssistantImageRef>,
+        provider_text: ProviderTextDisposition,
+    ) -> ImageGenerationToolResult {
+        ImageGenerationToolResult {
+            operation_id: self.operation_id,
+            terminal,
+            images: committed_images,
+            provider_text,
+            revised_prompt: self.revised_prompt.clone(),
+            native_metadata: self.native_metadata.clone(),
+            warnings: self.warnings.clone(),
+        }
+    }
+}
+
+pub fn normalize_base64_image_data(data: &str) -> String {
+    data.split_once(";base64,")
+        .map(|(_, payload)| payload)
+        .unwrap_or(data)
+        .trim()
+        .to_string()
+}
+
+pub fn media_type_from_format_preference(format: ImageFormatPreference) -> MediaType {
+    let media_type = match format {
+        ImageFormatPreference::Jpeg => "image/jpeg",
+        ImageFormatPreference::Webp => "image/webp",
+        ImageFormatPreference::Auto | ImageFormatPreference::Png => "image/png",
+    };
+    MediaType::new(media_type)
+}
+
+pub fn dimensions_from_size_preference(size: &ImageSizePreference) -> (u32, u32) {
+    match size {
+        ImageSizePreference::Auto => (0, 0),
+        ImageSizePreference::Square1024 => (1024, 1024),
+        ImageSizePreference::Portrait1024x1536 => (1024, 1536),
+        ImageSizePreference::Landscape1536x1024 => (1536, 1024),
+        ImageSizePreference::Custom { width, height } => (width.get(), height.get()),
+    }
+}
+
+/// Request to the LLM
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmRequest {
+    pub model: String,
+    pub messages: Vec<Message>,
+    #[serde(default)]
+    pub tools: Vec<Arc<ToolDef>>,
+    pub max_tokens: u32,
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub stop_sequences: Option<Vec<String>>,
+    /// Typed provider-specific knobs. `ProviderTag` is a provider-tagged
+    /// enum with typed fields for every known knob; callers construct it
+    /// typed end-to-end (K2 deleted the legacy untyped-JSON projection), so
+    /// the request surface never carries `serde_json::Value`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_params: Option<ProviderTag>,
+    /// Tool choice lowered to the provider's native field. `Auto` (the
+    /// default) keeps every adapter's request bytes as they were.
+    #[serde(default, skip_serializing_if = "ToolChoice::is_auto")]
+    pub tool_choice: ToolChoice,
+}
+
+impl LlmRequest {
+    /// Create a new request
+    pub fn new(model: &str, messages: Vec<Message>) -> Self {
+        Self {
+            model: model.to_string(),
+            messages,
+            tools: Vec::new(),
+            max_tokens: 4096,
+            temperature: None,
+            stop_sequences: None,
+            provider_params: None,
+            tool_choice: ToolChoice::Auto,
+        }
+    }
+
+    /// Set the tool choice for this call.
+    #[must_use]
+    pub fn with_tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = choice;
+        self
+    }
+
+    /// Check the tool choice against the offered tools, before lowering.
+    /// A forcing choice needs tools; a named tool must be offered.
+    pub fn validate_tool_choice(&self, provider: &str) -> Result<(), LlmError> {
+        let refusal = match &self.tool_choice {
+            ToolChoice::Auto | ToolChoice::None => return Ok(()),
+            ToolChoice::Required if self.tools.is_empty() => {
+                crate::error::ToolChoiceRefusal::NoToolsOffered
+            }
+            ToolChoice::Required => return Ok(()),
+            ToolChoice::Tool { name } if self.tools.iter().any(|tool| &tool.name == name) => {
+                return Ok(());
+            }
+            ToolChoice::Tool { .. } => crate::error::ToolChoiceRefusal::ToolNotOffered,
+        };
+        Err(LlmError::ToolChoiceUnsupported {
+            provider: provider.to_owned(),
+            choice: self.tool_choice.clone(),
+            reason: refusal,
+        })
+    }
+
+    /// Set max tokens
+    pub fn with_max_tokens(mut self, max: u32) -> Self {
+        self.max_tokens = max;
+        self
+    }
+
+    /// Set temperature
+    pub fn with_temperature(mut self, temp: f32) -> Self {
+        self.temperature = Some(temp);
+        self
+    }
+
+    /// Add tools
+    pub fn with_tools(mut self, tools: Vec<Arc<ToolDef>>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// Whether the typed request contains any user, assistant, tool-result, or
+    /// nested system-notice image content.
+    pub fn has_images(&self) -> bool {
+        self.messages.iter().any(|message| match message {
+            Message::User(user) => user.has_images(),
+            Message::BlockAssistant(assistant) => assistant
+                .blocks
+                .iter()
+                .any(|block| matches!(block, AssistantBlock::Image { .. })),
+            Message::ToolResults { results, .. } => results.iter().any(ToolResult::has_images),
+            Message::SystemNotice(notice) => notice.has_images(),
+            Message::System(_) => false,
+        })
+    }
+
+    /// Set provider-specific parameters (replaces any existing params).
+    pub fn with_provider_params(mut self, params: ProviderTag) -> Self {
+        self.provider_params = Some(params);
+        self
+    }
+
+    /// Merge a typed knob into the existing `ProviderTag::Anthropic`
+    /// slot, constructing a default `AnthropicProviderTag` if none is
+    /// present. Chainable test/builder convenience.
+    pub fn with_anthropic_tag_merge<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&mut meerkat_core::lifecycle::run_primitive::AnthropicProviderTag),
+    {
+        use meerkat_core::lifecycle::run_primitive::AnthropicProviderTag;
+        let mut tag = match self.provider_params.take() {
+            Some(ProviderTag::Anthropic(t)) => t,
+            _ => AnthropicProviderTag::default(),
+        };
+        f(&mut tag);
+        self.provider_params = Some(ProviderTag::Anthropic(tag));
+        self
+    }
+
+    /// Merge a typed knob into the existing `ProviderTag::OpenAi` slot.
+    pub fn with_openai_tag_merge<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&mut meerkat_core::lifecycle::run_primitive::OpenAiProviderTag),
+    {
+        use meerkat_core::lifecycle::run_primitive::OpenAiProviderTag;
+        let mut tag = match self.provider_params.take() {
+            Some(ProviderTag::OpenAi(t)) => t,
+            _ => OpenAiProviderTag::default(),
+        };
+        f(&mut tag);
+        self.provider_params = Some(ProviderTag::OpenAi(tag));
+        self
+    }
+
+    /// Merge a typed knob into the existing `ProviderTag::Gemini` slot.
+    pub fn with_gemini_tag_merge<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&mut meerkat_core::lifecycle::run_primitive::GeminiProviderTag),
+    {
+        use meerkat_core::lifecycle::run_primitive::GeminiProviderTag;
+        let mut tag = match self.provider_params.take() {
+            Some(ProviderTag::Gemini(t)) => t,
+            _ => GeminiProviderTag::default(),
+        };
+        f(&mut tag);
+        self.provider_params = Some(ProviderTag::Gemini(tag));
+        self
+    }
+
+    /// Set the structured-output schema on an existing provider tag.
+    /// Requires the request already has a `ProviderTag` variant selected
+    /// (the schema lives in the per-provider slot; there is no
+    /// provider-agnostic home for it).
+    pub fn with_output_schema(mut self, schema: OutputSchema) -> Self {
+        self.provider_params = match self.provider_params.take() {
+            Some(ProviderTag::Anthropic(mut a)) => {
+                a.structured_output = Some(schema);
+                Some(ProviderTag::Anthropic(a))
+            }
+            Some(ProviderTag::OpenAi(mut o)) => {
+                o.structured_output = Some(schema);
+                Some(ProviderTag::OpenAi(o))
+            }
+            Some(ProviderTag::Gemini(mut g)) => {
+                g.structured_output = Some(schema);
+                Some(ProviderTag::Gemini(g))
+            }
+            Some(other) => Some(other),
+            None => None,
+        };
+        self
+    }
+}
+
+/// Normalized streaming events from LLM
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum LlmDoneOutcome {
+    Success { stop_reason: StopReason },
+    Error { error: LlmError },
+}
+
+/// Normalized streaming events from LLM
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LlmEvent {
+    /// Final ordered output supplied by a provider's terminal response.
+    /// Replaces provisional delta assembly, including metadata that only
+    /// becomes available at completion. This is not another transcript.
+    AssistantOutput {
+        blocks: Vec<meerkat_core::AssistantBlock>,
+    },
+
+    /// Incremental text output.
+    /// Gemini may include `meta` for thoughtSignature on text parts.
+    TextDelta {
+        delta: String,
+        /// Provider metadata (Gemini thoughtSignature on text parts)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Box<meerkat_core::ProviderMeta>>,
+    },
+
+    /// Incremental reasoning/thinking content
+    ReasoningDelta { delta: String },
+
+    /// Complete reasoning block (emitted at content_block_stop)
+    ReasoningComplete {
+        text: String,
+        /// Typed provider metadata - each adapter knows its provider
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Box<meerkat_core::ProviderMeta>>,
+    },
+
+    /// Incremental tool call (may arrive in pieces)
+    ToolCallDelta {
+        id: String,
+        name: Option<String>,
+        args_delta: String,
+    },
+
+    /// Complete tool call (after buffering deltas)
+    ToolCallComplete {
+        id: String,
+        name: String,
+        args: Value,
+        /// Typed provider metadata
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Box<meerkat_core::ProviderMeta>>,
+    },
+
+    /// Provider-executed tool content, including web-search citations and
+    /// grounding metadata that are not caller-dispatched tool calls.
+    ServerToolContent {
+        id: Option<String>,
+        /// Typed semantic tool kind, parsed once at the provider adapter.
+        kind: ServerToolKind,
+        content: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Box<meerkat_core::ProviderMeta>>,
+    },
+
+    /// Token usage update
+    UsageUpdate { usage: meerkat_core::TurnUsage },
+
+    /// Wire-level liveness: the provider connection delivered at least one
+    /// complete line that produced no other event (SSE keepalive comments,
+    /// `event:` lines, ping/lifecycle bookkeeping). Carries no content; its
+    /// only effect is bumping the adapter's stream-activity counter so the
+    /// inactivity watchdog does not classify a working wire as stalled.
+    /// Providers emit at most one per received HTTP chunk.
+    WireLiveness,
+
+    /// Stream completed with stop reason
+    Done {
+        #[serde(flatten)]
+        outcome: LlmDoneOutcome,
+    },
+}
+
+/// Accumulated response from LLM stream
+#[derive(Debug, Clone, Default)]
+pub struct LlmResponse {
+    pub content: String,
+    pub tool_calls: Vec<meerkat_core::ToolCall>,
+    pub stop_reason: StopReason,
+    pub usage: Usage,
+}
+
+/// Buffer for accumulating tool call arguments during streaming
+///
+/// Uses pre-allocated capacity to minimize allocations during streaming.
+/// The default capacity of 256 bytes handles most small tool arguments
+/// without reallocation.
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallBuffer {
+    pub id: String,
+    pub name: Option<String>,
+    pub args_json: String,
+}
+
+/// Default capacity for tool call args buffer (256 bytes handles most small args)
+const TOOL_CALL_ARGS_CAPACITY: usize = 256;
+
+impl ToolCallBuffer {
+    /// Create a new buffer for a tool call with pre-allocated capacity
+    pub fn new(id: String) -> Self {
+        Self {
+            id,
+            name: None,
+            args_json: String::with_capacity(TOOL_CALL_ARGS_CAPACITY),
+        }
+    }
+
+    /// Create a new buffer with custom capacity for large arguments
+    pub fn with_capacity(id: String, capacity: usize) -> Self {
+        Self {
+            id,
+            name: None,
+            args_json: String::with_capacity(capacity),
+        }
+    }
+
+    /// Append to the args buffer
+    #[inline]
+    pub fn push_args(&mut self, delta: &str) {
+        self.args_json.push_str(delta);
+    }
+
+    /// Try to complete the tool call (parse JSON args).
+    ///
+    /// Returns `Ok(None)` for the legitimate benign "not a complete tool call"
+    /// states (no name yet, or empty args treated as an empty object). Returns
+    /// `Err(LlmError::StreamParseError)` only when non-empty accumulated args
+    /// fail to parse as JSON — a malformed/truncated tool call must surface as a
+    /// typed fault rather than silently vanishing.
+    pub fn try_complete(&self) -> Result<Option<meerkat_core::ToolCall>, LlmError> {
+        let Some(name) = self.name.as_ref() else {
+            return Ok(None);
+        };
+
+        // Try to parse the accumulated JSON
+        // Handle empty args (tools with no parameters) by treating as empty object
+        let args: Value = if self.args_json.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&self.args_json).map_err(|error| LlmError::StreamParseError {
+                message: format!("invalid tool call arguments JSON for {}: {error}", self.id),
+            })?
+        };
+
+        Ok(Some(meerkat_core::ToolCall::new(
+            self.id.clone(),
+            name.clone(),
+            args,
+        )))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_image_detection_includes_nested_system_notice_content() {
+        let request = LlmRequest::new(
+            "model",
+            vec![Message::SystemNotice(
+                meerkat_core::SystemNoticeMessage::with_block(
+                    meerkat_core::SystemNoticeKind::ExternalEvent,
+                    None,
+                    meerkat_core::SystemNoticeBlock::ExternalEvent {
+                        source: "test".to_string(),
+                        event_type: "image".to_string(),
+                        summary: None,
+                        body: None,
+                        payload: None,
+                        content: vec![meerkat_core::ContentBlock::Image {
+                            media_type: "image/png".to_string(),
+                            data: meerkat_core::ImageData::Inline {
+                                data: "IMAGE_BYTES".to_string(),
+                            },
+                        }],
+                    },
+                ),
+            )],
+        );
+
+        assert!(request.has_images());
+    }
+
+    #[test]
+    fn test_llm_event_serialization() -> Result<(), Box<dyn std::error::Error>> {
+        let events = vec![
+            LlmEvent::TextDelta {
+                delta: "Hello".to_string(),
+                meta: None,
+            },
+            LlmEvent::ReasoningDelta {
+                delta: "thinking...".to_string(),
+            },
+            LlmEvent::ReasoningComplete {
+                text: "done thinking".to_string(),
+                meta: Some(Box::new(meerkat_core::ProviderMeta::Anthropic {
+                    signature: "sig123".to_string(),
+                })),
+            },
+            LlmEvent::ToolCallDelta {
+                id: "tc_1".to_string(),
+                name: Some("read_file".to_string()),
+                args_delta: "{\"path\":".to_string(),
+            },
+            LlmEvent::ToolCallComplete {
+                id: "tc_1".to_string(),
+                name: "read_file".to_string(),
+                args: serde_json::json!({"path": "/tmp/test"}),
+                meta: None,
+            },
+            LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    Provider::Other,
+                    "event-test",
+                    Usage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        cache_creation_tokens: None,
+                        cache_read_tokens: None,
+                        reasoning_tokens: None,
+                        provider_accounting: None,
+                    },
+                ),
+            },
+            LlmEvent::Done {
+                outcome: LlmDoneOutcome::Success {
+                    stop_reason: StopReason::EndTurn,
+                },
+            },
+        ];
+
+        for event in events {
+            let json = serde_json::to_value(&event)?;
+            assert!(json.get("type").is_some());
+
+            let parsed: LlmEvent = serde_json::from_value(json)?;
+            let _ = serde_json::to_value(&parsed)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_tool_call_buffer() -> Result<(), Box<dyn std::error::Error>> {
+        let mut buffer = ToolCallBuffer::new("tc_1".to_string());
+        buffer.name = Some("test_tool".to_string());
+        buffer.args_json = r#"{"key": "value"}"#.to_string();
+
+        let completed = buffer.try_complete()?.ok_or("incomplete")?;
+        assert_eq!(completed.id, "tc_1");
+        assert_eq!(completed.name, "test_tool");
+        assert_eq!(completed.args["key"], "value");
+        Ok(())
+    }
+
+    #[test]
+    fn test_tool_call_buffer_incomplete() {
+        // No name yet: legitimate benign "not a complete tool call" -> Ok(None).
+        let buffer = ToolCallBuffer::new("tc_1".to_string());
+        assert!(matches!(buffer.try_complete(), Ok(None)));
+
+        // Name present but malformed/truncated args: typed StreamParseError fault.
+        let mut buffer = ToolCallBuffer::new("tc_1".to_string());
+        buffer.name = Some("test".to_string());
+        buffer.args_json = r#"{"incomplete"#.to_string();
+        assert!(matches!(
+            buffer.try_complete(),
+            Err(LlmError::StreamParseError { .. })
+        ));
+    }
+
+    #[test]
+    fn test_tool_call_buffer_empty_args() -> Result<(), Box<dyn std::error::Error>> {
+        let mut buffer = ToolCallBuffer::new("tc_1".to_string());
+        buffer.name = Some("get_todays_activities".to_string());
+        buffer.args_json = String::new();
+
+        let completed = buffer.try_complete()?.ok_or("incomplete")?;
+        assert_eq!(completed.id, "tc_1");
+        assert_eq!(completed.name, "get_todays_activities");
+        assert_eq!(completed.args, serde_json::json!({}));
+        Ok(())
+    }
+
+    #[test]
+    fn test_llm_request_builder() {
+        let request = LlmRequest::new("claude-3", vec![])
+            .with_max_tokens(8192)
+            .with_temperature(0.7);
+
+        assert_eq!(request.model, "claude-3");
+        assert_eq!(request.max_tokens, 8192);
+        assert_eq!(request.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn test_llm_request_typed_provider_params_round_trip() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use meerkat_core::lifecycle::run_primitive::{
+            AnthropicProviderTag, AnthropicThinkingConfig,
+        };
+        let request = LlmRequest::new("claude-3", vec![]).with_provider_params(
+            ProviderTag::Anthropic(AnthropicProviderTag {
+                thinking: Some(AnthropicThinkingConfig::Enabled {
+                    budget_tokens: 10000,
+                }),
+                ..Default::default()
+            }),
+        );
+
+        let json = serde_json::to_value(&request)?;
+        assert!(json.get("provider_params").is_some());
+        let parsed: LlmRequest = serde_json::from_value(json)?;
+        match parsed.provider_params {
+            Some(ProviderTag::Anthropic(t)) => {
+                assert_eq!(
+                    t.thinking,
+                    Some(AnthropicThinkingConfig::Enabled {
+                        budget_tokens: 10000,
+                    }),
+                );
+            }
+            other => return Err(format!("wrong variant: {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_tool_call_buffer_preallocated_capacity() {
+        let buffer = ToolCallBuffer::new("tc_1".to_string());
+        assert!(
+            buffer.args_json.capacity() >= TOOL_CALL_ARGS_CAPACITY,
+            "Buffer should have pre-allocated capacity of at least {} bytes, got {}",
+            TOOL_CALL_ARGS_CAPACITY,
+            buffer.args_json.capacity()
+        );
+    }
+
+    #[test]
+    fn test_tool_call_buffer_with_capacity() {
+        let buffer = ToolCallBuffer::with_capacity("tc_1".to_string(), 1024);
+        assert!(buffer.args_json.capacity() >= 1024);
+    }
+
+    #[test]
+    fn test_tool_call_buffer_push_args() -> Result<(), Box<dyn std::error::Error>> {
+        let mut buffer = ToolCallBuffer::new("tc_1".to_string());
+        buffer.name = Some("test_tool".to_string());
+        buffer.push_args(r#"{"key""#);
+        buffer.push_args(r#": "value"}"#);
+
+        let completed = buffer.try_complete()?.ok_or("incomplete")?;
+        assert_eq!(completed.args["key"], "value");
+        Ok(())
+    }
+
+    #[test]
+    fn test_tool_call_buffer_no_reallocation_small_args() {
+        let mut buffer = ToolCallBuffer::new("tc_1".to_string());
+        let initial_capacity = buffer.args_json.capacity();
+        let small_json = r#"{"path": "/tmp/test.txt"}"#;
+        buffer.push_args(small_json);
+        assert_eq!(buffer.args_json.capacity(), initial_capacity);
+    }
+
+    #[test]
+    fn test_regression_tool_call_buffer_delta_streaming() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::collections::HashMap;
+
+        let deltas = vec![
+            ("tc_1", Some("read_file"), r#"{"pa"#),
+            ("tc_1", None, r#"th": ""#),
+            ("tc_1", None, r#"/tmp/test.txt"}"#),
+        ];
+
+        let mut buffers: HashMap<String, ToolCallBuffer> = HashMap::new();
+
+        for (id, name, args_delta) in deltas {
+            let buffer = buffers
+                .entry(id.to_string())
+                .or_insert_with(|| ToolCallBuffer::new(id.to_string()));
+
+            if let Some(n) = name {
+                buffer.name = Some(n.to_string());
+            }
+            buffer.push_args(args_delta);
+        }
+
+        let tool_calls: Vec<_> = buffers
+            .into_values()
+            .filter_map(|b| b.try_complete().transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "read_file");
+        assert_eq!(tool_calls[0].args["path"], "/tmp/test.txt");
+
+        Ok(())
+    }
+
+    #[test]
+    fn tool_choice_serde_shape_and_auto_omission() {
+        use meerkat_core::ToolChoice;
+        for (choice, encoded) in [
+            (ToolChoice::Auto, serde_json::json!({"mode": "auto"})),
+            (
+                ToolChoice::Required,
+                serde_json::json!({"mode": "required"}),
+            ),
+            (ToolChoice::None, serde_json::json!({"mode": "none"})),
+            (
+                ToolChoice::Tool {
+                    name: "deny_probe".into(),
+                },
+                serde_json::json!({"mode": "tool", "name": "deny_probe"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&choice).unwrap(), encoded);
+            assert_eq!(
+                serde_json::from_value::<ToolChoice>(encoded).unwrap(),
+                choice
+            );
+        }
+        assert!(
+            serde_json::from_value::<ToolChoice>(serde_json::json!({"mode": "tool"})).is_err(),
+            "a named choice needs its name"
+        );
+        let request = LlmRequest::new("m", Vec::new());
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert!(
+            encoded.get("tool_choice").is_none(),
+            "Auto is omitted: {encoded}"
+        );
+        let forced = request.with_tool_choice(ToolChoice::Required);
+        let encoded = serde_json::to_value(&forced).unwrap();
+        assert_eq!(
+            encoded["tool_choice"],
+            serde_json::json!({"mode": "required"})
+        );
+    }
+
+    #[test]
+    fn validate_tool_choice_checks_offered_tools() {
+        use crate::error::ToolChoiceRefusal;
+        use meerkat_core::ToolChoice;
+        let tool = Arc::new(ToolDef {
+            name: "lookup".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+            provenance: None,
+        });
+        let refused = |request: &LlmRequest| match request.validate_tool_choice("p") {
+            Err(LlmError::ToolChoiceUnsupported { reason, .. }) => Some(reason),
+            Err(other) => panic!("unexpected {other:?}"),
+            Ok(()) => None,
+        };
+        let base = LlmRequest::new("m", Vec::new());
+        assert_eq!(refused(&base), None);
+        assert_eq!(
+            refused(&base.clone().with_tool_choice(ToolChoice::None)),
+            None
+        );
+        assert_eq!(
+            refused(&base.clone().with_tool_choice(ToolChoice::Required)),
+            Some(ToolChoiceRefusal::NoToolsOffered)
+        );
+        let offered = base.with_tools(vec![tool]);
+        assert_eq!(
+            refused(&offered.clone().with_tool_choice(ToolChoice::Required)),
+            None
+        );
+        assert_eq!(
+            refused(&offered.clone().with_tool_choice(ToolChoice::Tool {
+                name: "lookup".into()
+            })),
+            None
+        );
+        assert_eq!(
+            refused(&offered.with_tool_choice(ToolChoice::Tool {
+                name: "other".into()
+            })),
+            Some(ToolChoiceRefusal::ToolNotOffered)
+        );
+    }
+}

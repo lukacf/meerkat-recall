@@ -1,0 +1,52 @@
+[package]
+name = "elephant-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "SurrealDB storage layer for Elephant"
+
+[dependencies]
+elephant-types = { path = "../types" }
+elephant-auth = { path = "../auth" }
+elephant-policy = { path = "../policy" }
+elephant-db = { path = "../elephant-db" }
+elephant-embeddings = { path = "../embeddings" }
+surrealdb = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+num-traits = "0.2"
+hex = { workspace = true }
+getrandom = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+
+[dev-dependencies]
+jsonwebtoken = { workspace = true }
+tempfile = "3"
+# Test-only deterministic in-transaction loopback barrier; production native
+# capabilities remain unchanged. The workspace pins the existing dependency.
+surrealdb = { workspace = true, features = ["http"] }
+tokio-test = { workspace = true }
+rstest = { workspace = true }
+
+[features]
+# Embedded persistent RocksDB engine (rocksdb:// URLs). Off by default —
+# pulls the C++ librocksdb build; deploy builds enable it explicitly.
+rocksdb = ["surrealdb/kv-rocksdb"]
+# Embedded versioned SurrealKV engine for retained history and physical checks.
+surrealkv = ["surrealdb/kv-surrealkv"]
+test-utils = []
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+These PDF fixtures, expected passages and fixture-generation code are original
+synthetic work contributed to this repository. They contain no third-party font
+programs, downloaded documents, real personal data, screenshots or model output.
+
+They are available under the repository's MIT OR Apache-2.0 licensing terms:
+../../../LICENSE-MIT and ../../../LICENSE-APACHE.
+
+SPDX-License-Identifier: MIT OR Apache-2.0
+
+The tested pdf-inspector library and its bundled decoding tables retain their
+own notices in vendor/pdf-inspector/LICENSE, vendor/pdf-inspector/external/bcmaps/LICENSE
+and THIRD_PARTY_NOTICES.md. This fixture license does not replace those notices.

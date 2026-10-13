@@ -1,0 +1,97 @@
+# cargo-deny configuration for Elephant
+# https://embarkstudios.github.io/cargo-deny/
+#
+# Install: cargo install cargo-deny
+# Run: cargo deny check
+# Update DB: cargo deny fetch
+
+[graph]
+# Target all platforms
+targets = []
+# Include dev dependencies in checks
+exclude-dev = false
+
+# ============================================================================
+# Advisories - Check for known security vulnerabilities
+# ============================================================================
+[advisories]
+# How to handle advisories that have been yanked
+yanked = "warn"
+# Ignore specific advisories (use sparingly, document why)
+ignore = [
+    # Unmaintained crates - transitive dependencies, not security vulnerabilities
+    "RUSTSEC-2025-0141",  # bincode unmaintained - used by surrealdb
+    # ttf-parser remains an unmaintained transitive font reader even with
+    # patched lopdf 0.42; no vulnerability is reported by this advisory.
+    "RUSTSEC-2026-0192",  # ttf-parser
+    # proc-macro-error2 unmaintained; proc-macro-only dependency, transitive
+    # via validator_derive (elephant-types input validation). Not a runtime
+    # security exposure; revisit when validator moves off it.
+    "RUSTSEC-2026-0173",  # proc-macro-error2
+]
+
+# ============================================================================
+# Licenses - Ensure dependencies use acceptable licenses
+# ============================================================================
+[licenses]
+# Confidence threshold for license detection
+confidence-threshold = 0.8
+
+# List of allowed licenses (SPDX identifiers)
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unlicense",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "OpenSSL",
+    "NCSA",                   # Used by libfuzzer-sys (OSI approved)
+    "MIT-0",                  # MIT No Attribution (OSI approved)
+    "BUSL-1.1",               # SurrealDB Business Source License
+    "CDLA-Permissive-2.0",    # webpki-root-certs Community Data License
+]
+
+# Clarify license for specific crates
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+
+# ============================================================================
+# Bans - Block specific crates or versions
+# ============================================================================
+[bans]
+# Lint level for multiple versions of the same crate
+multiple-versions = "warn"
+# Lint level for wildcard dependencies
+wildcards = "allow"
+# Allow specific duplicates (document why)
+skip = []
+# Skip checking tree for specific crates
+skip-tree = []
+
+# ============================================================================
+# Sources - Restrict where crates can come from
+# ============================================================================
+[sources]
+# Lint level for crates not from an allowed source
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# Allowed registries
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# Allowed git sources (for private dependencies)
+allow-git = ["https://github.com/lukacf/meerkat.git"]
+
+# Allow specific organizations' git repos
+[sources.allow-org]
+github = ["lukacf"]

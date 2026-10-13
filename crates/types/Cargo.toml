@@ -1,0 +1,23 @@
+[package]
+name = "elephant-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core types and data models for Elephant knowledge system"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+validator = { workspace = true }
+derive_more = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+rstest = { workspace = true }
+
+[lints]
+workspace = true

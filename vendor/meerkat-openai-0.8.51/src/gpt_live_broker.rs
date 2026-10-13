@@ -1,0 +1,442 @@
+//! Provider-neutral GPT Live broker vocabulary shared by the public Live
+//! broker and the deprecated experimental (private-protocol) broker.
+//!
+//! Observations are sanitized: no provider call, session, turn,
+//! transcript-item, or delegation identifier leaks through `Debug`, and text
+//! is semantic observation content rather than a raw payload. Errors carry a
+//! sanitized terminal class only.
+
+/// Sanitized terminal classification for broker transport mechanics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GptLiveBrokerTerminalClass {
+    Configuration,
+    Protocol,
+    Http,
+    WebSocket,
+    Closed,
+}
+
+/// Provider input latency measured from the sideband alone.
+///
+/// The provider reflects every input audio frame it receives on the sideband
+/// (before any model-input muting) at a fixed PCM16 24 kHz format, so the sum
+/// of reflected samples is the provider's input clock. Each input-transcript
+/// delta names the provider-clock span it transcribes. `backlog_ms` is the
+/// reflected input clock at the delta's arrival
+/// (`measured_at_reflected_clock_ms`) minus that span's end: how far the
+/// provider's input processing (transcription and the turn handling gated on
+/// it) runs behind the audio it has received. Healthy sessions measure about
+/// one second; a degraded provider session grows it without bound and emits
+/// no other signal.
+///
+/// This is telemetry, never authority: no machine input is derived from it
+/// and no runtime branch reads it to decide anything. "Degraded" remains a
+/// machine status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GptLiveProviderInputLatency {
+    /// Provider input processing lag behind received audio, in milliseconds.
+    pub backlog_ms: u64,
+    /// Reflected provider input clock when the lag was measured.
+    pub measured_at_reflected_clock_ms: u64,
+}
+
+/// The latest provider input latency reading beside the current reflected
+/// input clock. A reading whose anchor trails the clock by a long way is
+/// stale (no input transcript has arrived since), which a consumer can see
+/// from the provider's own clock without any wall-clock timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GptLiveProviderInputLatencyStatus {
+    pub latest: Option<GptLiveProviderInputLatency>,
+    pub reflected_input_clock_ms: u64,
+}
+
+/// Opaque local identity for one append attempt.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GptLiveAppendToken(pub(crate) u64);
+
+impl std::fmt::Debug for GptLiveAppendToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GptLiveAppendToken(<local>)")
+    }
+}
+
+/// A finished user turn a client delegation re-presents: its reference and
+/// the exact transcript its `TurnFinished` reported.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GptLiveRepresentedUserTurn {
+    pub turn: GptLiveTurnRef,
+    pub transcript: String,
+}
+
+impl std::fmt::Debug for GptLiveRepresentedUserTurn {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GptLiveRepresentedUserTurn")
+            .field("turn", &self.turn)
+            .field("transcript", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Opaque delegation reference that can only be minted by this adapter.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct GptLiveDelegationRef(pub(crate) String);
+
+impl GptLiveDelegationRef {
+    /// Borrow only at the facade boundary that seals the provider-neutral
+    /// opaque delegation reference. The value must never be logged.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __opaque_provider_id(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct GptLiveTranscriptItemRef(pub(crate) String);
+
+impl GptLiveTranscriptItemRef {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __opaque_provider_id(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for GptLiveTranscriptItemRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GptLiveTranscriptItemRef(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct GptLiveTurnRef(pub(crate) String);
+
+impl GptLiveTurnRef {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __opaque_provider_id(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for GptLiveTurnRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GptLiveTurnRef(<redacted>)")
+    }
+}
+
+/// Qualified target carried by a joined client delegation observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GptLiveDelegationTarget {
+    Client,
+}
+
+impl std::fmt::Debug for GptLiveDelegationRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GptLiveDelegationRef(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GptLiveTurnRole {
+    User,
+    Assistant,
+    Unknown,
+}
+
+impl GptLiveTurnRole {
+    #[cfg(feature = "experimental-gpt-live")]
+    pub(crate) fn from_provider_role(role: &str) -> Self {
+        match role {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Sanitized provider observations emitted by a GPT Live sideband broker.
+///
+/// No provider call, session, turn, transcript-item, handoff, or delegation
+/// identifier is exposed. Text is semantic observation content, not a raw
+/// private payload.
+#[derive(Clone, PartialEq, Eq)]
+pub enum GptLiveBrokerObservation {
+    SessionReady,
+    /// The user's speech and audible assistant audio overlap (a barge-in),
+    /// whichever started first: a reflected input frame over the floor
+    /// guard's speech threshold within the assistant's output-silence
+    /// window. A client
+    /// ducks assistant playback on it, so the user's floor wins at the
+    /// overlap instead of when the provider yields.
+    UserSpeechOverAssistant,
+    /// Ends a [`Self::UserSpeechOverAssistant`]: the user's speech or the
+    /// assistant's output has gone quiet for its release length on the
+    /// provider audio clock. A client restores assistant playback.
+    AssistantPlaybackRestorable,
+    SessionContextAppendAcknowledged {
+        token: GptLiveAppendToken,
+    },
+    /// Closing interrupted the append. This does not prove zero consumption.
+    SessionContextAppendRejected {
+        token: GptLiveAppendToken,
+    },
+    /// Every fragment of a quiet factual-context append was acknowledged.
+    ThinkingContextAppendAcknowledged {
+        token: GptLiveAppendToken,
+    },
+    /// A native error rejected at least one fragment; other fragments may
+    /// already be consumed. This is ambiguous aggregate delivery, not a
+    /// definitive pre-delivery refusal, even after a local close request.
+    /// It does not authorize replay.
+    ThinkingContextAppendRejected {
+        token: GptLiveAppendToken,
+    },
+    /// Confirmed provider session closure interrupted an unresolved append.
+    /// Prior fragments may be consumed; this does not authorize replay.
+    ThinkingContextAppendInterruptedByClose {
+        token: GptLiveAppendToken,
+    },
+    /// Every fragment of a trusted instructions-lane append (the historical
+    /// bootstrap summary) was acknowledged.
+    InstructionsContextAppendAcknowledged {
+        token: GptLiveAppendToken,
+    },
+    /// A native error rejected at least one instructions fragment; other
+    /// fragments may already be consumed. Ambiguous aggregate delivery.
+    InstructionsContextAppendRejected {
+        token: GptLiveAppendToken,
+    },
+    /// Confirmed provider session closure interrupted an unresolved
+    /// instructions append. Prior fragments may be consumed.
+    InstructionsContextAppendInterruptedByClose {
+        token: GptLiveAppendToken,
+    },
+    UserTranscriptFragment {
+        item: GptLiveTranscriptItemRef,
+        text: String,
+    },
+    AssistantTranscriptFragment {
+        item: GptLiveTranscriptItemRef,
+        text: String,
+    },
+    TurnStarted {
+        turn: GptLiveTurnRef,
+        role: GptLiveTurnRole,
+    },
+    TurnSnapshotDelta {
+        turn: GptLiveTurnRef,
+        delta: String,
+    },
+    TurnFinished {
+        turn: GptLiveTurnRef,
+        role: GptLiveTurnRole,
+        transcript: String,
+    },
+    /// The user turn about to finish continues the utterance of
+    /// `delegation`: that delegation was created while this user's turn was
+    /// open (a pause mid-sentence), and this is the next user turn to finish
+    /// before any other client delegation. The protocol has no utterance
+    /// identity, so this is the closest typed stand-in for "the rest of the
+    /// same sentence". Emitted immediately before the turn's `TurnFinished`.
+    UserTurnContinuesDelegation {
+        turn: GptLiveTurnRef,
+        delegation: GptLiveDelegationRef,
+        /// The continuing turn's transcript, exactly as its `TurnFinished`
+        /// reports it.
+        transcript: String,
+    },
+    /// Exact client-targeted delegation joined to its final user turn.
+    ///
+    /// This is provider evidence only. It does not itself authorize executor
+    /// work or establish canonical transcript commitment. Public sessions
+    /// join the delegation to a locally synthesized user turn.
+    ///
+    /// `transcript` is the terminated user turn (the canonical row).
+    /// `request_transcript` is the executor input: every user transcript
+    /// delta received since the previous `session.delegation.created` on
+    /// this session (or since open), regardless of assistant output in
+    /// between, because the provider's backchannels are designed behaviour
+    /// and never end the user's request. `assistant_context` is the
+    /// assistant transcript received in that same window, so the executor
+    /// can see what was already answered natively; it is never merged into
+    /// the request.
+    ClientDelegationFinal {
+        delegation: GptLiveDelegationRef,
+        target: GptLiveDelegationTarget,
+        turn: GptLiveTurnRef,
+        transcript: String,
+        request_transcript: String,
+        assistant_context: String,
+        /// User turns already finished (and reported with `TurnFinished`)
+        /// that this delegation re-presents because no user turn was open
+        /// when it arrived; empty when the delegation terminated an open
+        /// user turn.
+        represented_turns: Vec<GptLiveRepresentedUserTurn>,
+    },
+    DelegationActionableInputUnsupported {
+        delegation: GptLiveDelegationRef,
+    },
+    DelegationContextAppendAcknowledged {
+        token: GptLiveAppendToken,
+    },
+    /// Closing interrupted the append. This does not authorize replay.
+    DelegationContextAppendRejected {
+        token: GptLiveAppendToken,
+    },
+    UnsupportedProviderEvent,
+    /// Provider input latency telemetry (see [`GptLiveProviderInputLatency`]):
+    /// the latest reading beside the current reflected input clock. Emitted on
+    /// each input-transcript delta and on each second the reflected clock
+    /// advances. Never authority: consumers only record it for display.
+    ProviderInputLatency(GptLiveProviderInputLatencyStatus),
+}
+
+impl std::fmt::Debug for GptLiveBrokerObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::SessionReady => "session_ready",
+            Self::UserSpeechOverAssistant => "user_speech_over_assistant",
+            Self::AssistantPlaybackRestorable => "assistant_playback_restorable",
+            Self::SessionContextAppendAcknowledged { .. } => "session_context_append_acknowledged",
+            Self::SessionContextAppendRejected { .. } => "session_context_append_rejected",
+            Self::ThinkingContextAppendAcknowledged { .. } => {
+                "thinking_context_append_acknowledged"
+            }
+            Self::ThinkingContextAppendRejected { .. } => "thinking_context_append_rejected",
+            Self::ThinkingContextAppendInterruptedByClose { .. } => {
+                "thinking_context_append_interrupted_by_close"
+            }
+            Self::InstructionsContextAppendAcknowledged { .. } => {
+                "instructions_context_append_acknowledged"
+            }
+            Self::InstructionsContextAppendRejected { .. } => {
+                "instructions_context_append_rejected"
+            }
+            Self::InstructionsContextAppendInterruptedByClose { .. } => {
+                "instructions_context_append_interrupted_by_close"
+            }
+            Self::UserTranscriptFragment { .. } => "user_transcript_fragment",
+            Self::AssistantTranscriptFragment { .. } => "assistant_transcript_fragment",
+            Self::TurnStarted { .. } => "turn_started",
+            Self::TurnSnapshotDelta { .. } => "turn_snapshot_delta",
+            Self::TurnFinished { .. } => "turn_finished",
+            Self::UserTurnContinuesDelegation { .. } => "user_turn_continues_delegation",
+            Self::ClientDelegationFinal { .. } => "client_delegation_final",
+            Self::DelegationActionableInputUnsupported { .. } => {
+                "delegation_actionable_input_unsupported"
+            }
+            Self::DelegationContextAppendAcknowledged { .. } => {
+                "delegation_context_append_acknowledged"
+            }
+            Self::DelegationContextAppendRejected { .. } => "delegation_context_append_rejected",
+            Self::UnsupportedProviderEvent => "unsupported_provider_event",
+            Self::ProviderInputLatency(_) => "provider_input_latency",
+        };
+        formatter
+            .debug_struct("GptLiveBrokerObservation")
+            .field("kind", &kind)
+            .field("payload", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Sanitized failure surface for browser bootstrap and sideband mechanics.
+#[derive(thiserror::Error)]
+pub enum GptLiveBrokerError {
+    #[error("GPT Live browser bootstrap requires a non-empty SDP offer")]
+    MissingOfferSdp,
+    #[error("GPT Live browser bootstrap requires a non-empty voice")]
+    MissingVoice,
+    #[error("GPT Live Responses bridge requires a catalogued non-realtime OpenAI model")]
+    InvalidResponsesProfile,
+    #[error("GPT Live context append requires non-empty text")]
+    MissingContext,
+    #[error("a GPT Live context append is already awaiting acknowledgement")]
+    AppendInFlight,
+    #[error("GPT Live append delivery is ambiguous and must not be retried blindly")]
+    AppendDeliveryAmbiguous { token: GptLiveAppendToken },
+    #[error("GPT Live transport terminated")]
+    Transport { class: GptLiveBrokerTerminalClass },
+}
+
+impl std::fmt::Debug for GptLiveBrokerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingOfferSdp => formatter.write_str("MissingOfferSdp"),
+            Self::MissingVoice => formatter.write_str("MissingVoice"),
+            Self::InvalidResponsesProfile => formatter.write_str("InvalidResponsesProfile"),
+            Self::MissingContext => formatter.write_str("MissingContext"),
+            Self::AppendInFlight => formatter.write_str("AppendInFlight"),
+            Self::AppendDeliveryAmbiguous { token } => formatter
+                .debug_struct("AppendDeliveryAmbiguous")
+                .field("token", token)
+                .finish(),
+            Self::Transport { class } => formatter
+                .debug_struct("Transport")
+                .field("class", class)
+                .finish(),
+        }
+    }
+}
+
+pub(crate) fn protocol_error() -> GptLiveBrokerError {
+    GptLiveBrokerError::Transport {
+        class: GptLiveBrokerTerminalClass::Protocol,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnknownProviderEventSummary {
+    pub(crate) event_kind_sha256: String,
+    pub(crate) error_class: &'static str,
+    pub(crate) top_level_field_count: usize,
+    pub(crate) normalized_json_bytes: usize,
+    pub(crate) message_bytes: usize,
+}
+
+/// Redacting fingerprint of an unsupported provider event: only a hash of
+/// the discriminator, an error class, and byte counts survive.
+pub(crate) fn summarize_unknown_provider_event(
+    kind: &str,
+    raw: &serde_json::Value,
+) -> UnknownProviderEventSummary {
+    use sha2::{Digest, Sha256};
+
+    let message = raw
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let error_class = if message.contains("maximum")
+        || message.contains("too long")
+        || message.contains("exceed")
+    {
+        "size_limit"
+    } else if message.contains("Unknown parameter") {
+        "unknown_parameter"
+    } else if message.contains("Missing required parameter") {
+        "missing_parameter"
+    } else if message.contains("Invalid") || message.contains("invalid") {
+        "invalid_parameter"
+    } else if kind == "error" {
+        "other_provider_error"
+    } else {
+        "unsupported_event"
+    };
+    UnknownProviderEventSummary {
+        event_kind_sha256: format!("{:x}", Sha256::digest(kind.as_bytes())),
+        error_class,
+        top_level_field_count: raw.as_object().map_or(0, serde_json::Map::len),
+        normalized_json_bytes: serde_json::to_vec(raw).map_or(0, |bytes| bytes.len()),
+        message_bytes: message.len(),
+    }
+}
+
+pub(crate) fn require_context(text: impl Into<String>) -> Result<String, GptLiveBrokerError> {
+    let text = text.into();
+    if text.trim().is_empty() {
+        return Err(GptLiveBrokerError::MissingContext);
+    }
+    Ok(text)
+}

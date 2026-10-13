@@ -1,0 +1,85 @@
+{
+  "format": "recall-pdf-corpus-v1",
+  "license": "MIT OR Apache-2.0",
+  "expected_sha256": "d5083926e49ca0cf5f7d46048ce11ad2079a00262d8d482b407e8f2af276cbdf",
+  "files": [
+    {
+      "id": "acroform",
+      "file": "fixtures/acroform.pdf",
+      "bytes": 1027,
+      "sha256": "ecb70ddea495b0552b013c87e12a5e50a3716aceb31d45ce5b49d2bfbc03e8ac"
+    },
+    {
+      "id": "blank_page",
+      "file": "fixtures/blank_page.pdf",
+      "bytes": 580,
+      "sha256": "ea589fc8dde97c8ee7bb6c839ca04f8dff3b5f13efae859e643c4ea3c74fabc4"
+    },
+    {
+      "id": "broken_second_page",
+      "file": "fixtures/broken_second_page.pdf",
+      "bytes": 994,
+      "sha256": "9dab3e1dc2553782fdad753c364e383239a7821fefafea2d6884f8836ae035b8"
+    },
+    {
+      "id": "crop_visibility",
+      "file": "fixtures/crop_visibility.pdf",
+      "bytes": 771,
+      "sha256": "252eda542a74a9086c60d0e016be381572a42237f1de1b1275078212f6137d47"
+    },
+    {
+      "id": "existing_ocr_layer",
+      "file": "fixtures/existing_ocr_layer.pdf",
+      "bytes": 1124,
+      "sha256": "980a1fba2eb5a8ee330bc0eccf902260a6d6fdcc84ceede9b393fee081f5b724"
+    },
+    {
+      "id": "image_only",
+      "file": "fixtures/image_only.pdf",
+      "bytes": 930,
+      "sha256": "b4f36cfece540530d7002a9e30c97818ea540d9529c05213aaab54a14618dbed"
+    },
+    {
+      "id": "inherited_forms",
+      "file": "fixtures/inherited_forms.pdf",
+      "bytes": 1351,
+      "sha256": "7598e361e98c51b85bedbf22166a8eee393084d3b2f3c429fe5936c9b08e39a4"
+    },
+    {
+      "id": "multilingual",
+      "file": "fixtures/multilingual.pdf",
+      "bytes": 1728,
+      "sha256": "51605a9255a8cd51725a964919df4a7a85c2b4562a33e47120f13a5e5ff51d5b"
+    },
+    {
+      "id": "nested_forms",
+      "file": "fixtures/nested_forms.pdf",
+      "bytes": 1353,
+      "sha256": "95e42272a8b3e17f24ca329111b94c80a36a7ac681a673405eda6a807b2125de"
+    },
+    {
+      "id": "not_pdf",
+      "file": "fixtures/not_pdf.pdf",
+      "bytes": 52,
+      "sha256": "b2f8df72ca8434a4c083b2274c3a37917ac27b7b9da645d9d9682d7de4369bf3"
+    },
+    {
+      "id": "page_order",
+      "file": "fixtures/page_order.pdf",
+      "bytes": 1248,
+      "sha256": "88dc413c9b7645f9074e55a72c6e4e975976cef55025ed599ebb20e185d2c51b"
+    },
+    {
+      "id": "truncated",
+      "file": "fixtures/truncated.pdf",
+      "bytes": 48,
+      "sha256": "51d600bf8407f4f4ad12bc2f13fa57a62c6c636f05d0240d549036db3dc04fca"
+    },
+    {
+      "id": "winansi",
+      "file": "fixtures/winansi.pdf",
+      "bytes": 649,
+      "sha256": "527877b5c024a3cf95ae8a382752ca6451087076ec01f6eeb95ed2650e516006"
+    }
+  ]
+}

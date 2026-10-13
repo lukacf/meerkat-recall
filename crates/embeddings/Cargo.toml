@@ -1,0 +1,32 @@
+[package]
+name = "elephant-embeddings"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Embedding generation and vector storage for Elephant"
+
+[dependencies]
+elephant-db = { path = "../elephant-db" }
+elephant-types = { path = "../types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true }
+fastembed = { version = "5", optional = true }
+
+[features]
+fastembed = ["dep:fastembed"]
+
+[dev-dependencies]
+tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
+tokio-test = { workspace = true }
+rstest = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+{
+  "name": "rav1e",
+  "version": "0.8.1",
+  "archive_url": "https://static.crates.io/crates/rav1e/rav1e-0.8.1.crate",
+  "metadata_url": "https://crates.io/api/v1/crates/rav1e/0.8.1",
+  "archive_sha256": "43b6dd56e85d9483277cde964fd1bdb0428de4fec5ebba7540995639a21cb32b",
+  "archive_bytes": 1465215,
+  "license": "BSD-2-Clause",
+  "upstream_vcs": {
+    "git": {
+      "sha1": "38806721f718e7ae6919e72385bc305bf824ef81"
+    },
+    "path_in_vcs": ""
+  },
+  "license_file_sha256": "2dd0a109751e939dec3f80ddcfbc1ba91553f18c574399e85c159632182a2c0a",
+  "modified_files": [
+    "Cargo.toml"
+  ],
+  "modifications": [
+    "Use maintained pastey =0.2.3 under the existing paste import name."
+  ],
+  "rust_source_changed": false,
+  "upstream_features_changed": false
+}

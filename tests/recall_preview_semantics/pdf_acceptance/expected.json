@@ -1,0 +1,28 @@
+{
+  "format": "recall-pdf-expectations-v1",
+  "normalization": "CRLF to LF; trim outer whitespace only; preserve all internal text, Unicode, order and punctuation",
+  "cases": [
+    {"id": "winansi", "outcome": "text", "lines": ["Café ÅÄÖ åäö"], "forbidden": ["�"], "claim": "WinAnsi accented Latin characters retain exact codepoints"},
+    {"id": "multilingual", "outcome": "text", "lines": ["Αθήνα 2026", "Москва 2026", "東京 図書館"], "forbidden": ["�"], "claim": "Explicit Type0 ToUnicode mappings preserve Greek, Cyrillic and CJK in authored line order"},
+    {"id": "page_order", "outcome": "text", "lines": ["First page heading", "<sup>literal</sup> & 5 < 7", "1", "Second page heading", "Final source sentence.", "2"], "forbidden": ["&lt;sup&gt;", "<sub>"], "claim": "Page and positioned line order, numeric footers and literal markup survive plain extraction"},
+    {"id": "nested_forms", "outcome": "text", "lines": ["Nested form source", "Repeated form source", "Repeated form source"], "forbidden": [], "claim": "Nested Form XObjects and distinct positioned uses retain text and multiplicity"},
+    {"id": "inherited_forms", "outcome": "text", "lines": ["Nested form source", "Repeated form source", "Repeated form source"], "forbidden": [], "claim": "A leaf page without Resources uses inherited page-tree Form resources"},
+    {"id": "acroform", "outcome": "text", "lines": ["Application form", "name: Mara Example", "decision: Approved"], "forbidden": [], "claim": "Simple ASCII AcroForm text fields retain qualified field names and values"},
+    {"id": "existing_ocr_layer", "outcome": "text", "lines": ["Visible invoice header", "OCR invoice 314. Total 27 EUR."], "forbidden": ["METADATA IS NOT PAGE TEXT", "DO NOT INVENT OCR TEXT", "[Image"], "claim": "Existing Tr=3 text is extracted alongside visible text; no OCR is performed"},
+    {"id": "image_only", "outcome": "text", "lines": [], "forbidden": ["METADATA IS NOT PAGE TEXT", "DO NOT INVENT OCR TEXT", "[Image"], "claim": "An image-only page supplies no text and cannot fabricate metadata or OCR output"},
+    {"id": "crop_visibility", "outcome": "text", "lines": ["Inside crop"], "forbidden": ["OUTSIDE CROP MUST BE ABSENT"], "claim": "Text wholly outside the page CropBox is excluded"},
+    {"id": "blank_page", "outcome": "text", "lines": [], "forbidden": [], "claim": "A valid blank page is empty, distinct from a parser error"},
+    {"id": "not_pdf", "outcome": "error", "error_contains": [], "claim": "Non-PDF bytes fail before source acceptance"},
+    {"id": "truncated", "outcome": "error", "error_contains": [], "claim": "An unfinished catalog with no usable pages fails before source acceptance"},
+    {"id": "broken_second_page", "outcome": "error", "error_contains": ["page 2"], "claim": "A corrupt later content stream rejects the document instead of returning a successful first-page prefix"}
+  ],
+  "unsupported_claims": [
+    "OCR recognition or accuracy from raster pixels",
+    "General multilingual font rendering, right-to-left bidi or complex-script shaping",
+    "Arbitrary reading order for columns, tables, charts, rotated layouts or scanned pages",
+    "General AcroForm, XFA, JavaScript, encrypted/password-protected or signature support",
+    "All malformed PDF, resource-exhaustion, decompression-limit or parser-security cases",
+    "Signed HTTP/MCP authentication, installed artifact fidelity or full worker/publication completion",
+    "Model extraction quality, promoted facts, embeddings, semantic retrieval or source erasure"
+  ]
+}

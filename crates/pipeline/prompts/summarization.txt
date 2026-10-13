@@ -1,0 +1,8 @@
+Summarize the following text in at most {max_chars} characters and within {max_tokens} tokens.
+Focus on the main points and key entities, avoiding repetition.
+Return ONLY the summary text, nothing else.
+
+Text:
+{text}
+
+Summary:

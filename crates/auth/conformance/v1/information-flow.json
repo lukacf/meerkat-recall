@@ -1,0 +1,1614 @@
+{
+  "schema_version": 1,
+  "contract_version": {
+    "major": 1,
+    "minor": 0
+  },
+  "corpus": "bounded-restrictions-and-protected-information",
+  "evidence_status": "pure-contract-conformance-only; no runtime, external-owner, or Elephant differential acceptance",
+  "normalization": [
+    "Every field is required unless a particular bound kind has no such field. Unknown fields or variants are rejected.",
+    "Fixture keys are opaque references, not identifiers whose spelling grants authority. Resolve references exactly through the named fixture map.",
+    "Set and unresolved arrays are mathematical sets; comparison is order-insensitive. Exact empty sets permit nothing. Unrestricted is explicit.",
+    "Absent, unknown and unavailable remain different unresolved facts; every unresolved fact prevents use and survives conjunction.",
+    "Time is unsigned Unix milliseconds, not-before inclusive and expiry exclusive. Remaining delegation depth counts child edges, not current use.",
+    "Principal qualification names an exact trust domain, kind and ID. Equal ID text in another domain is another principal. No fixture is authentication evidence.",
+    "Source content revision and historical security epoch are separate. Union preserves every distinct observation and every unknown contributor. No stored epoch proves current permission.",
+    "Policy attributes and subject completeness remain local to their source observation. A permission exception on one source cannot authorize another source.",
+    "Source and policy fixture references in inventories are expanded mechanically. Expected references and bound values are authored independently, never computed by the implementation under test.",
+    "All ordinary derivations include all observed content, control and provider-context inputs. They preserve dependency union and conjoin processor/audience bounds without declassification.",
+    "Dependency inventory completeness only means no declared unknown contributor. It does not establish subject completeness, a subjectless waiver, caller clearance, current access, or authorization; Elephant policy decisions require separate differential vectors."
+  ],
+  "atoms": {
+    "actions": {
+      "read": {
+        "feature": "records",
+        "action": "read"
+      },
+      "write": {
+        "feature": "records",
+        "action": "write"
+      },
+      "literal-star": {
+        "feature": "records",
+        "action": "*"
+      }
+    },
+    "resource_domains": {
+      "records-A": {
+        "authority": {
+          "kind": "service_account",
+          "id": "resource-owner",
+          "qualification": {
+            "kind": "qualified",
+            "trust_domain_id": "authority-A"
+          }
+        },
+        "namespace": "records"
+      },
+      "records-B": {
+        "authority": {
+          "kind": "service_account",
+          "id": "resource-owner",
+          "qualification": {
+            "kind": "qualified",
+            "trust_domain_id": "authority-B"
+          }
+        },
+        "namespace": "records"
+      }
+    },
+    "processors": {
+      "route-A": {
+        "processor": "route",
+        "authority": {
+          "kind": "service_account",
+          "id": "provider",
+          "qualification": {
+            "kind": "qualified",
+            "trust_domain_id": "authority-A"
+          }
+        },
+        "route_id": "route-A"
+      },
+      "route-B": {
+        "processor": "route",
+        "authority": {
+          "kind": "service_account",
+          "id": "provider",
+          "qualification": {
+            "kind": "qualified",
+            "trust_domain_id": "authority-A"
+          }
+        },
+        "route_id": "route-B"
+      }
+    },
+    "audiences": {
+      "alice": {
+        "audience": "principal",
+        "principal": {
+          "kind": "service_account",
+          "id": "alice",
+          "qualification": {
+            "kind": "qualified",
+            "trust_domain_id": "authority-A"
+          }
+        }
+      },
+      "bob": {
+        "audience": "principal",
+        "principal": {
+          "kind": "service_account",
+          "id": "bob",
+          "qualification": {
+            "kind": "qualified",
+            "trust_domain_id": "authority-A"
+          }
+        }
+      },
+      "charlie": {
+        "audience": "principal",
+        "principal": {
+          "kind": "service_account",
+          "id": "charlie",
+          "qualification": {
+            "kind": "qualified",
+            "trust_domain_id": "authority-A"
+          }
+        }
+      },
+      "other-domain-alice": {
+        "audience": "principal",
+        "principal": {
+          "kind": "service_account",
+          "id": "alice",
+          "qualification": {
+            "kind": "qualified",
+            "trust_domain_id": "authority-B"
+          }
+        }
+      }
+    }
+  },
+  "set_cases": [
+    {
+      "id": "empty-never-unrestricted",
+      "dimension": "actions",
+      "inputs": [
+        {
+          "bound": "exact",
+          "values": [],
+          "unresolved": []
+        },
+        {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "exact",
+        "values": [],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "read",
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "child-cannot-widen-parent",
+      "dimension": "actions",
+      "inputs": [
+        {
+          "bound": "exact",
+          "values": [
+            "read"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "exact",
+          "values": [
+            "read",
+            "write"
+          ],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "exact",
+        "values": [
+          "read"
+        ],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "read",
+          "expected": "matches"
+        },
+        {
+          "value": "write",
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "unknown-keeps-known-parent-bound",
+      "dimension": "actions",
+      "inputs": [
+        {
+          "bound": "exact",
+          "values": [
+            "read"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": [
+            "unknown"
+          ]
+        }
+      ],
+      "expected": {
+        "bound": "exact",
+        "values": [
+          "read"
+        ],
+        "unresolved": [
+          "unknown"
+        ]
+      },
+      "probes": [
+        {
+          "value": "read",
+          "expected": "unresolved"
+        },
+        {
+          "value": "write",
+          "expected": "unresolved"
+        }
+      ]
+    },
+    {
+      "id": "all-unresolved-facts-survive-empty",
+      "dimension": "audiences",
+      "inputs": [
+        {
+          "bound": "exact",
+          "values": [],
+          "unresolved": []
+        },
+        {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": [
+            "absent"
+          ]
+        },
+        {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": [
+            "unknown"
+          ]
+        },
+        {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": [
+            "unavailable"
+          ]
+        }
+      ],
+      "expected": {
+        "bound": "exact",
+        "values": [],
+        "unresolved": [
+          "absent",
+          "unknown",
+          "unavailable"
+        ]
+      },
+      "probes": [
+        {
+          "value": "alice",
+          "expected": "unresolved"
+        }
+      ]
+    },
+    {
+      "id": "authority-qualified-domains-do-not-collapse",
+      "dimension": "resource_domains",
+      "inputs": [
+        {
+          "bound": "exact",
+          "values": [
+            "records-A"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "exact",
+          "values": [
+            "records-B"
+          ],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "exact",
+        "values": [],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "records-A",
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "three-input-audience-conflict-stays-empty",
+      "dimension": "audiences",
+      "inputs": [
+        {
+          "bound": "exact",
+          "values": [
+            "alice",
+            "bob"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "exact",
+          "values": [
+            "bob",
+            "charlie"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "exact",
+          "values": [
+            "alice",
+            "charlie"
+          ],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "exact",
+        "values": [],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "alice",
+          "expected": "outside_bounds"
+        },
+        {
+          "value": "bob",
+          "expected": "outside_bounds"
+        },
+        {
+          "value": "charlie",
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "literal-star-does-not-mean-every-action",
+      "dimension": "actions",
+      "inputs": [
+        {
+          "bound": "exact",
+          "values": [
+            "literal-star"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "exact",
+          "values": [
+            "read"
+          ],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "exact",
+        "values": [],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "read",
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "processor-route-is-exact",
+      "dimension": "processors",
+      "inputs": [
+        {
+          "bound": "exact",
+          "values": [
+            "route-A"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "exact",
+          "values": [
+            "route-B"
+          ],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "exact",
+        "values": [],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "route-A",
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "same-name-other-principal-domain-is-distinct",
+      "dimension": "audiences",
+      "inputs": [
+        {
+          "bound": "exact",
+          "values": [
+            "alice"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "exact",
+          "values": [
+            "other-domain-alice"
+          ],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "exact",
+        "values": [],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "alice",
+          "expected": "outside_bounds"
+        }
+      ]
+    }
+  ],
+  "lifetime_cases": [
+    {
+      "id": "requested-lifetime-cannot-extend-parent",
+      "inputs": [
+        {
+          "bound": "window",
+          "not_before_ms": 100,
+          "expires_at_ms": 200,
+          "unresolved": []
+        },
+        {
+          "bound": "window",
+          "not_before_ms": 0,
+          "expires_at_ms": 999,
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "window",
+        "not_before_ms": 100,
+        "expires_at_ms": 200,
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "now_ms": 99,
+          "expected": "outside_bounds"
+        },
+        {
+          "now_ms": 100,
+          "expected": "matches"
+        },
+        {
+          "now_ms": 199,
+          "expected": "matches"
+        },
+        {
+          "now_ms": 200,
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "touching-lifetimes-have-empty-intersection",
+      "inputs": [
+        {
+          "bound": "window",
+          "not_before_ms": 100,
+          "expires_at_ms": 200,
+          "unresolved": []
+        },
+        {
+          "bound": "window",
+          "not_before_ms": 200,
+          "expires_at_ms": 300,
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "empty",
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "now_ms": 200,
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "unavailable-lifetime-keeps-parent-window",
+      "inputs": [
+        {
+          "bound": "window",
+          "not_before_ms": 100,
+          "expires_at_ms": 200,
+          "unresolved": []
+        },
+        {
+          "bound": "unrestricted",
+          "unresolved": [
+            "unavailable"
+          ]
+        }
+      ],
+      "expected": {
+        "bound": "window",
+        "not_before_ms": 100,
+        "expires_at_ms": 200,
+        "unresolved": [
+          "unavailable"
+        ]
+      },
+      "probes": [
+        {
+          "now_ms": 150,
+          "expected": "unresolved"
+        }
+      ]
+    }
+  ],
+  "depth_cases": [
+    {
+      "id": "child-consumes-exactly-one-parent-edge",
+      "parent": {
+        "bound": "remaining",
+        "remaining": 2,
+        "unresolved": []
+      },
+      "requested": {
+        "bound": "unrestricted",
+        "unresolved": []
+      },
+      "expected": {
+        "bound": "remaining",
+        "remaining": 1,
+        "unresolved": []
+      }
+    },
+    {
+      "id": "child-cannot-reset-depth",
+      "parent": {
+        "bound": "remaining",
+        "remaining": 1,
+        "unresolved": []
+      },
+      "requested": {
+        "bound": "remaining",
+        "remaining": 4294967295,
+        "unresolved": []
+      },
+      "expected": {
+        "bound": "remaining",
+        "remaining": 0,
+        "unresolved": []
+      }
+    },
+    {
+      "id": "zero-depth-refuses-child",
+      "parent": {
+        "bound": "remaining",
+        "remaining": 0,
+        "unresolved": []
+      },
+      "requested": {
+        "bound": "unrestricted",
+        "unresolved": []
+      },
+      "expected_error": "exhausted"
+    },
+    {
+      "id": "unknown-depth-refuses-child",
+      "parent": {
+        "bound": "unrestricted",
+        "unresolved": [
+          "unknown"
+        ]
+      },
+      "requested": {
+        "bound": "remaining",
+        "remaining": 1,
+        "unresolved": []
+      },
+      "expected_error": "unresolved"
+    },
+    {
+      "id": "requested-unavailable-depth-stays-unavailable",
+      "parent": {
+        "bound": "remaining",
+        "remaining": 2,
+        "unresolved": []
+      },
+      "requested": {
+        "bound": "unrestricted",
+        "unresolved": [
+          "unavailable"
+        ]
+      },
+      "expected": {
+        "bound": "remaining",
+        "remaining": 1,
+        "unresolved": [
+          "unavailable"
+        ]
+      }
+    }
+  ],
+  "attenuation_cases": [
+    {
+      "id": "all-child-bounds-retain-parent-ceiling",
+      "parent": {
+        "actions": {
+          "bound": "exact",
+          "values": [
+            "read"
+          ],
+          "unresolved": []
+        },
+        "resource_domains": {
+          "bound": "exact",
+          "values": [
+            "records-A"
+          ],
+          "unresolved": []
+        },
+        "processors": {
+          "bound": "exact",
+          "values": [
+            "route-A"
+          ],
+          "unresolved": []
+        },
+        "audiences": {
+          "bound": "exact",
+          "values": [
+            "alice"
+          ],
+          "unresolved": []
+        },
+        "lifetime": {
+          "bound": "window",
+          "not_before_ms": 100,
+          "expires_at_ms": 200,
+          "unresolved": []
+        },
+        "delegation_depth": {
+          "bound": "remaining",
+          "remaining": 1,
+          "unresolved": []
+        }
+      },
+      "requested": {
+        "actions": {
+          "bound": "exact",
+          "values": [
+            "read",
+            "write"
+          ],
+          "unresolved": []
+        },
+        "resource_domains": {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": []
+        },
+        "processors": {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": []
+        },
+        "audiences": {
+          "bound": "exact",
+          "values": [
+            "alice",
+            "bob"
+          ],
+          "unresolved": []
+        },
+        "lifetime": {
+          "bound": "window",
+          "not_before_ms": 0,
+          "expires_at_ms": 999,
+          "unresolved": []
+        },
+        "delegation_depth": {
+          "bound": "unrestricted",
+          "unresolved": []
+        }
+      },
+      "expected": {
+        "actions": {
+          "bound": "exact",
+          "values": [
+            "read"
+          ],
+          "unresolved": []
+        },
+        "resource_domains": {
+          "bound": "exact",
+          "values": [
+            "records-A"
+          ],
+          "unresolved": []
+        },
+        "processors": {
+          "bound": "exact",
+          "values": [
+            "route-A"
+          ],
+          "unresolved": []
+        },
+        "audiences": {
+          "bound": "exact",
+          "values": [
+            "alice"
+          ],
+          "unresolved": []
+        },
+        "lifetime": {
+          "bound": "window",
+          "not_before_ms": 100,
+          "expires_at_ms": 200,
+          "unresolved": []
+        },
+        "delegation_depth": {
+          "bound": "remaining",
+          "remaining": 0,
+          "unresolved": []
+        }
+      }
+    },
+    {
+      "id": "unknown-child-cannot-remove-exact-parent",
+      "parent": {
+        "actions": {
+          "bound": "exact",
+          "values": [
+            "read"
+          ],
+          "unresolved": []
+        },
+        "resource_domains": {
+          "bound": "exact",
+          "values": [
+            "records-A"
+          ],
+          "unresolved": []
+        },
+        "processors": {
+          "bound": "exact",
+          "values": [
+            "route-A"
+          ],
+          "unresolved": []
+        },
+        "audiences": {
+          "bound": "exact",
+          "values": [
+            "alice"
+          ],
+          "unresolved": []
+        },
+        "lifetime": {
+          "bound": "window",
+          "not_before_ms": 100,
+          "expires_at_ms": 200,
+          "unresolved": []
+        },
+        "delegation_depth": {
+          "bound": "remaining",
+          "remaining": 2,
+          "unresolved": []
+        }
+      },
+      "requested": {
+        "actions": {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": [
+            "unknown"
+          ]
+        },
+        "resource_domains": {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": []
+        },
+        "processors": {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": [
+            "unavailable"
+          ]
+        },
+        "audiences": {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": []
+        },
+        "lifetime": {
+          "bound": "unrestricted",
+          "unresolved": []
+        },
+        "delegation_depth": {
+          "bound": "unrestricted",
+          "unresolved": []
+        }
+      },
+      "expected": {
+        "actions": {
+          "bound": "exact",
+          "values": [
+            "read"
+          ],
+          "unresolved": [
+            "unknown"
+          ]
+        },
+        "resource_domains": {
+          "bound": "exact",
+          "values": [
+            "records-A"
+          ],
+          "unresolved": []
+        },
+        "processors": {
+          "bound": "exact",
+          "values": [
+            "route-A"
+          ],
+          "unresolved": [
+            "unavailable"
+          ]
+        },
+        "audiences": {
+          "bound": "exact",
+          "values": [
+            "alice"
+          ],
+          "unresolved": []
+        },
+        "lifetime": {
+          "bound": "window",
+          "not_before_ms": 100,
+          "expires_at_ms": 200,
+          "unresolved": []
+        },
+        "delegation_depth": {
+          "bound": "remaining",
+          "remaining": 1,
+          "unresolved": []
+        }
+      }
+    }
+  ],
+  "sources": {
+    "public-v1": {
+      "resource": {
+        "domain": {
+          "authority": {
+            "kind": "service_account",
+            "id": "resource-owner",
+            "qualification": {
+              "kind": "qualified",
+              "trust_domain_id": "authority-A"
+            }
+          },
+          "namespace": "records"
+        },
+        "resource_id": "public-record"
+      },
+      "content_revision": "content-1",
+      "observed_security_epoch": 1
+    },
+    "private-v1": {
+      "resource": {
+        "domain": {
+          "authority": {
+            "kind": "service_account",
+            "id": "resource-owner",
+            "qualification": {
+              "kind": "qualified",
+              "trust_domain_id": "authority-A"
+            }
+          },
+          "namespace": "records"
+        },
+        "resource_id": "private-record"
+      },
+      "content_revision": "content-1",
+      "observed_security_epoch": 1
+    },
+    "private-reclassified": {
+      "resource": {
+        "domain": {
+          "authority": {
+            "kind": "service_account",
+            "id": "resource-owner",
+            "qualification": {
+              "kind": "qualified",
+              "trust_domain_id": "authority-A"
+            }
+          },
+          "namespace": "records"
+        },
+        "resource_id": "private-record"
+      },
+      "content_revision": "content-1",
+      "observed_security_epoch": 2
+    },
+    "private-v2": {
+      "resource": {
+        "domain": {
+          "authority": {
+            "kind": "service_account",
+            "id": "resource-owner",
+            "qualification": {
+              "kind": "qualified",
+              "trust_domain_id": "authority-A"
+            }
+          },
+          "namespace": "records"
+        },
+        "resource_id": "private-record"
+      },
+      "content_revision": "content-2",
+      "observed_security_epoch": 2
+    },
+    "other-authority-private": {
+      "resource": {
+        "domain": {
+          "authority": {
+            "kind": "service_account",
+            "id": "resource-owner",
+            "qualification": {
+              "kind": "qualified",
+              "trust_domain_id": "authority-B"
+            }
+          },
+          "namespace": "records"
+        },
+        "resource_id": "private-record"
+      },
+      "content_revision": "content-1",
+      "observed_security_epoch": 1
+    },
+    "waived-v1": {
+      "resource": {
+        "domain": {
+          "authority": {
+            "kind": "service_account",
+            "id": "resource-owner",
+            "qualification": {
+              "kind": "qualified",
+              "trust_domain_id": "authority-A"
+            }
+          },
+          "namespace": "records"
+        },
+        "resource_id": "waived-record"
+      },
+      "content_revision": "content-1",
+      "observed_security_epoch": 1
+    },
+    "legacy-bundle": {
+      "resource": {
+        "domain": {
+          "authority": {
+            "kind": "service_account",
+            "id": "resource-owner",
+            "qualification": {
+              "kind": "qualified",
+              "trust_domain_id": "authority-A"
+            }
+          },
+          "namespace": "records"
+        },
+        "resource_id": "legacy-bundle"
+      },
+      "content_revision": "bundle-1",
+      "observed_security_epoch": 1
+    }
+  },
+  "unknown_contributors": {
+    "unidentified": {
+      "kind": "unidentified_source"
+    },
+    "remote-cache": {
+      "kind": "uninventoried_provider_context",
+      "details": {
+        "processor": {
+          "processor": "route",
+          "authority": {
+            "kind": "service_account",
+            "id": "provider",
+            "qualification": {
+              "kind": "qualified",
+              "trust_domain_id": "authority-A"
+            }
+          },
+          "route_id": "route-A"
+        }
+      }
+    },
+    "legacy": {
+      "kind": "unknown_legacy_provenance",
+      "details": {
+        "bundle": {
+          "domain": {
+            "authority": {
+              "kind": "service_account",
+              "id": "resource-owner",
+              "qualification": {
+                "kind": "qualified",
+                "trust_domain_id": "authority-A"
+              }
+            },
+            "namespace": "records"
+          },
+          "resource_id": "legacy-bundle"
+        }
+      }
+    }
+  },
+  "dependency_cases": [
+    {
+      "id": "same-source-distinct-revisions-epochs-influences-retained",
+      "inputs": [
+        {
+          "records": [
+            {
+              "source": "private-v1",
+              "influence": "content"
+            }
+          ],
+          "unknown": []
+        },
+        {
+          "records": [
+            {
+              "source": "private-v1",
+              "influence": "control"
+            },
+            {
+              "source": "private-reclassified",
+              "influence": "provider_held_context"
+            },
+            {
+              "source": "private-v2",
+              "influence": "content"
+            }
+          ],
+          "unknown": []
+        }
+      ],
+      "expected": {
+        "records": [
+          {
+            "source": "private-v1",
+            "influence": "content"
+          },
+          {
+            "source": "private-v1",
+            "influence": "control"
+          },
+          {
+            "source": "private-reclassified",
+            "influence": "provider_held_context"
+          },
+          {
+            "source": "private-v2",
+            "influence": "content"
+          }
+        ],
+        "unknown": []
+      },
+      "expected_dependency_inventory_complete": true
+    },
+    {
+      "id": "union-preserves-all-unknown-contributors",
+      "inputs": [
+        {
+          "records": [
+            {
+              "source": "public-v1",
+              "influence": "content"
+            }
+          ],
+          "unknown": [
+            "unidentified"
+          ]
+        },
+        {
+          "records": [
+            {
+              "source": "private-v1",
+              "influence": "control"
+            }
+          ],
+          "unknown": [
+            "remote-cache"
+          ]
+        }
+      ],
+      "expected": {
+        "records": [
+          {
+            "source": "public-v1",
+            "influence": "content"
+          },
+          {
+            "source": "private-v1",
+            "influence": "control"
+          }
+        ],
+        "unknown": [
+          "unidentified",
+          "remote-cache"
+        ]
+      },
+      "expected_dependency_inventory_complete": false
+    },
+    {
+      "id": "different-resource-authorities-do-not-collapse",
+      "inputs": [
+        {
+          "records": [
+            {
+              "source": "private-v1",
+              "influence": "content"
+            }
+          ],
+          "unknown": []
+        },
+        {
+          "records": [
+            {
+              "source": "other-authority-private",
+              "influence": "content"
+            }
+          ],
+          "unknown": []
+        }
+      ],
+      "expected": {
+        "records": [
+          {
+            "source": "private-v1",
+            "influence": "content"
+          },
+          {
+            "source": "other-authority-private",
+            "influence": "content"
+          }
+        ],
+        "unknown": []
+      },
+      "expected_dependency_inventory_complete": true
+    }
+  ],
+  "policy_snapshots": {
+    "public-policy": {
+      "source": "public-v1",
+      "policy_domain": "records",
+      "policy_revision": "policy-1",
+      "attributes": [
+        {
+          "kind": "classification",
+          "name": "public"
+        }
+      ],
+      "subjects": {
+        "entities": [],
+        "completeness": "complete"
+      }
+    },
+    "private-policy": {
+      "source": "private-v1",
+      "policy_domain": "records",
+      "policy_revision": "policy-1",
+      "attributes": [
+        {
+          "kind": "classification",
+          "name": "private"
+        }
+      ],
+      "subjects": {
+        "entities": [],
+        "completeness": "unknown"
+      }
+    },
+    "waived-policy": {
+      "source": "waived-v1",
+      "policy_domain": "records",
+      "policy_revision": "policy-1",
+      "attributes": [
+        {
+          "kind": "classification",
+          "name": "private"
+        },
+        {
+          "kind": "permission_exception",
+          "name": "handling:subjectless_ok"
+        }
+      ],
+      "subjects": {
+        "entities": [],
+        "completeness": "unknown"
+      }
+    },
+    "legacy-policy": {
+      "source": "legacy-bundle",
+      "policy_domain": "records",
+      "policy_revision": "policy-1",
+      "attributes": [
+        {
+          "kind": "classification",
+          "name": "private"
+        }
+      ],
+      "subjects": {
+        "entities": [],
+        "completeness": "unknown"
+      }
+    }
+  },
+  "envelopes": {
+    "public-alice": {
+      "dependencies": {
+        "records": [
+          {
+            "source": "public-v1",
+            "influence": "content"
+          }
+        ],
+        "unknown": []
+      },
+      "processors": {
+        "bound": "exact",
+        "values": [
+          "route-A"
+        ],
+        "unresolved": []
+      },
+      "audiences": {
+        "bound": "exact",
+        "values": [
+          "alice"
+        ],
+        "unresolved": []
+      },
+      "policy_snapshots": [
+        "public-policy"
+      ]
+    },
+    "control-bob": {
+      "dependencies": {
+        "records": [
+          {
+            "source": "private-v1",
+            "influence": "control"
+          }
+        ],
+        "unknown": []
+      },
+      "processors": {
+        "bound": "exact",
+        "values": [
+          "route-A"
+        ],
+        "unresolved": []
+      },
+      "audiences": {
+        "bound": "exact",
+        "values": [
+          "bob"
+        ],
+        "unresolved": []
+      },
+      "policy_snapshots": [
+        "private-policy"
+      ]
+    },
+    "unknown-cache": {
+      "dependencies": {
+        "records": [],
+        "unknown": [
+          "remote-cache"
+        ]
+      },
+      "processors": {
+        "bound": "unrestricted",
+        "values": [],
+        "unresolved": [
+          "unknown"
+        ]
+      },
+      "audiences": {
+        "bound": "unrestricted",
+        "values": [],
+        "unresolved": []
+      },
+      "policy_snapshots": []
+    },
+    "waived-alice": {
+      "dependencies": {
+        "records": [
+          {
+            "source": "waived-v1",
+            "influence": "content"
+          }
+        ],
+        "unknown": []
+      },
+      "processors": {
+        "bound": "exact",
+        "values": [
+          "route-A"
+        ],
+        "unresolved": []
+      },
+      "audiences": {
+        "bound": "exact",
+        "values": [
+          "alice"
+        ],
+        "unresolved": []
+      },
+      "policy_snapshots": [
+        "waived-policy"
+      ]
+    },
+    "not-waived-alice": {
+      "dependencies": {
+        "records": [
+          {
+            "source": "private-v1",
+            "influence": "content"
+          }
+        ],
+        "unknown": []
+      },
+      "processors": {
+        "bound": "exact",
+        "values": [
+          "route-A"
+        ],
+        "unresolved": []
+      },
+      "audiences": {
+        "bound": "exact",
+        "values": [
+          "alice"
+        ],
+        "unresolved": []
+      },
+      "policy_snapshots": [
+        "private-policy"
+      ]
+    },
+    "legacy-alice": {
+      "dependencies": {
+        "records": [
+          {
+            "source": "legacy-bundle",
+            "influence": "content"
+          }
+        ],
+        "unknown": [
+          "legacy"
+        ]
+      },
+      "processors": {
+        "bound": "exact",
+        "values": [
+          "route-A"
+        ],
+        "unresolved": []
+      },
+      "audiences": {
+        "bound": "exact",
+        "values": [
+          "alice"
+        ],
+        "unresolved": []
+      },
+      "policy_snapshots": [
+        "legacy-policy"
+      ]
+    }
+  },
+  "derivation_cases": [
+    {
+      "id": "uncited-control-influences-summary-and-every-later-derivative",
+      "inputs": [
+        "public-alice",
+        "control-bob"
+      ],
+      "derivations": [
+        "model_answer",
+        "summary",
+        "compaction",
+        "embedding",
+        "memory_extraction",
+        "cache_copy",
+        "tool_arguments",
+        "artifact"
+      ],
+      "expected": {
+        "dependencies": {
+          "records": [
+            {
+              "source": "public-v1",
+              "influence": "content"
+            },
+            {
+              "source": "private-v1",
+              "influence": "control"
+            }
+          ],
+          "unknown": []
+        },
+        "processors": {
+          "bound": "exact",
+          "values": [
+            "route-A"
+          ],
+          "unresolved": []
+        },
+        "audiences": {
+          "bound": "exact",
+          "values": [],
+          "unresolved": []
+        },
+        "policy_snapshots": [
+          "public-policy",
+          "private-policy"
+        ]
+      },
+      "expected_dependency_inventory_complete": true
+    },
+    {
+      "id": "unknown-provider-context-remains-on-summary-embedding-cache",
+      "inputs": [
+        "public-alice",
+        "unknown-cache"
+      ],
+      "derivations": [
+        "summary",
+        "embedding",
+        "cache_copy"
+      ],
+      "expected": {
+        "dependencies": {
+          "records": [
+            {
+              "source": "public-v1",
+              "influence": "content"
+            }
+          ],
+          "unknown": [
+            "remote-cache"
+          ]
+        },
+        "processors": {
+          "bound": "exact",
+          "values": [
+            "route-A"
+          ],
+          "unresolved": [
+            "unknown"
+          ]
+        },
+        "audiences": {
+          "bound": "exact",
+          "values": [
+            "alice"
+          ],
+          "unresolved": []
+        },
+        "policy_snapshots": [
+          "public-policy"
+        ]
+      },
+      "expected_dependency_inventory_complete": false
+    },
+    {
+      "id": "subjectless-waiver-remains-local-to-one-source",
+      "inputs": [
+        "waived-alice",
+        "not-waived-alice"
+      ],
+      "derivations": [
+        "summary"
+      ],
+      "expected": {
+        "dependencies": {
+          "records": [
+            {
+              "source": "waived-v1",
+              "influence": "content"
+            },
+            {
+              "source": "private-v1",
+              "influence": "content"
+            }
+          ],
+          "unknown": []
+        },
+        "processors": {
+          "bound": "exact",
+          "values": [
+            "route-A"
+          ],
+          "unresolved": []
+        },
+        "audiences": {
+          "bound": "exact",
+          "values": [
+            "alice"
+          ],
+          "unresolved": []
+        },
+        "policy_snapshots": [
+          "waived-policy",
+          "private-policy"
+        ]
+      },
+      "expected_exception_sources": [
+        "waived-v1"
+      ],
+      "expected_dependency_inventory_complete": true
+    },
+    {
+      "id": "ordinary-compaction-does-not-adopt-unknown-legacy-contributors",
+      "inputs": [
+        "legacy-alice"
+      ],
+      "derivations": [
+        "compaction"
+      ],
+      "expected": {
+        "dependencies": {
+          "records": [
+            {
+              "source": "legacy-bundle",
+              "influence": "content"
+            }
+          ],
+          "unknown": [
+            "legacy"
+          ]
+        },
+        "processors": {
+          "bound": "exact",
+          "values": [
+            "route-A"
+          ],
+          "unresolved": []
+        },
+        "audiences": {
+          "bound": "exact",
+          "values": [
+            "alice"
+          ],
+          "unresolved": []
+        },
+        "policy_snapshots": [
+          "legacy-policy"
+        ]
+      },
+      "expected_dependency_inventory_complete": false
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+[package]
+name = "elephant-identity"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Identity resolution and entity merging for Elephant"
+
+[dependencies]
+elephant-types = { path = "../types" }
+elephant-storage = { path = "../storage" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+rstest = { workspace = true }
+
+[lints]
+workspace = true

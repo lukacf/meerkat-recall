@@ -1,0 +1,66 @@
+[package]
+name = "elephant-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "HTTP + MCP API server for Elephant knowledge system"
+autobins = false
+
+[lib]
+name = "elephant_api"
+path = "src/lib.rs"
+
+[dependencies]
+elephant-auth = { path = "../../crates/auth" }
+elephant-types = { path = "../../crates/types" }
+elephant-storage = { path = "../../crates/storage" }
+elephant-policy = { path = "../../crates/policy" }
+elephant-identity = { path = "../../crates/identity" }
+elephant-extensions = { path = "../../crates/extensions" }
+elephant-outbox = { path = "../../crates/outbox" }
+elephant-migrations = { path = "../../crates/migrations" }
+elephant-embeddings = { path = "../../crates/embeddings" }
+elephant-pipeline = { path = "../../crates/pipeline" }
+elephant-pipeline-bin = { path = "../elephant-pipeline", package = "elephant-pipeline-bin" }
+elephant-mcp = { path = "../../crates/mcp" }
+elephant-knowledge-views = { path = "../../crates/knowledge-views" }
+rmcp = { version = "1.8", features = ["server", "client", "tower", "transport-streamable-http-server", "transport-streamable-http-server-session", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "transport-worker"] }
+
+tokio = { workspace = true }
+axum = { workspace = true }
+futures = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+config = { workspace = true }
+jsonwebtoken = { workspace = true }
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+chrono = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+elephant-storage = { path = "../../crates/storage", features = ["test-utils"] }
+elephant-pipeline-bin = { path = "../elephant-pipeline", package = "elephant-pipeline-bin", features = ["test-utils"] }
+tokio-test = { workspace = true }
+rstest = { workspace = true }
+serial_test = "3.2"
+
+[features]
+fastembed = ["elephant-embeddings/fastembed", "elephant-mcp/fastembed"]
+meerkat-extraction = ["elephant-pipeline/meerkat-extraction", "elephant-mcp/meerkat-extraction"]
+e2e = []
+
+[lints]
+workspace = true

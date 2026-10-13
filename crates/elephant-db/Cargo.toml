@@ -1,0 +1,28 @@
+[package]
+name = "elephant-db"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Sync in-memory graph/vector storage kernel for Elephant"
+
+[dependencies]
+chrono = { workspace = true }
+elephant-types = { path = "../types" }
+parking_lot = "0.12"
+petgraph = "0.7"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-test = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+
+[lints]
+workspace = true

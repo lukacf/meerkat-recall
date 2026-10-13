@@ -1,0 +1,161 @@
+[
+  {
+    "id": "mercury_planet_astronomy",
+    "description": "Astronomy context: the mention refers to the planet candidate, not the chemical element.",
+    "input": {
+      "mention": "Mercury",
+      "normalized_type": "topic",
+      "context_snippet": "Mercury is the closest planet to the Sun and completes an orbit in just 88 days.",
+      "candidates": [
+        { "id": "entity:mercury-planet", "display_name": "Mercury", "entity_type": "location", "summary": "The innermost planet of the Solar System." },
+        { "id": "entity:mercury-element", "display_name": "Mercury", "entity_type": "topic", "summary": "Chemical element Hg, a heavy silvery metal that is liquid at room temperature." }
+      ]
+    },
+    "expected": { "action": "reuse", "entity_id": "entity:mercury-planet" },
+    "acceptable_alternatives": [],
+    "tags": ["namesake", "reuse"]
+  },
+  {
+    "id": "mercury_car_brand",
+    "description": "Car-brand context with only planet and element candidates on offer: neither matches, so a new entity is created.",
+    "input": {
+      "mention": "Mercury",
+      "normalized_type": "org",
+      "context_snippet": "He spent the summer restoring a 1967 Mercury Cougar, a classic from Ford's defunct Mercury division.",
+      "candidates": [
+        { "id": "entity:mercury-planet", "display_name": "Mercury", "entity_type": "location", "summary": "The innermost planet of the Solar System." },
+        { "id": "entity:mercury-element", "display_name": "Mercury", "entity_type": "topic", "summary": "Chemical element Hg, a heavy silvery metal that is liquid at room temperature." }
+      ]
+    },
+    "expected": { "action": "create_new" },
+    "acceptable_alternatives": [],
+    "tags": ["namesake", "create-new"]
+  },
+  {
+    "id": "mercury_element_chemistry",
+    "description": "Chemistry context: the mention refers to the element candidate.",
+    "input": {
+      "mention": "Mercury",
+      "normalized_type": "topic",
+      "context_snippet": "Mercury is highly toxic and was commonly used in thermometers before digital alternatives.",
+      "candidates": [
+        { "id": "entity:mercury-planet", "display_name": "Mercury", "entity_type": "location", "summary": "The innermost planet of the Solar System." },
+        { "id": "entity:mercury-element", "display_name": "Mercury", "entity_type": "topic", "summary": "Chemical element Hg, a heavy silvery metal that is liquid at room temperature." }
+      ]
+    },
+    "expected": { "action": "reuse", "entity_id": "entity:mercury-element" },
+    "acceptable_alternatives": [],
+    "tags": ["namesake", "reuse"]
+  },
+  {
+    "id": "jordan_person_boardroom",
+    "description": "Same name, different kinds: a person mention in a boardroom context must pick the person candidate over the country.",
+    "input": {
+      "mention": "Jordan",
+      "normalized_type": "person",
+      "context_snippet": "Jordan presented the quarterly results to the board and took questions afterwards.",
+      "candidates": [
+        { "id": "entity:jordan-country", "display_name": "Jordan", "entity_type": "location", "summary": "A country in the Middle East bordering Israel, Saudi Arabia, and Iraq." },
+        { "id": "entity:jordan-lee", "display_name": "Jordan", "entity_type": "person", "summary": "Jordan Lee, VP of Finance at Acme Corp." }
+      ]
+    },
+    "expected": { "action": "reuse", "entity_id": "entity:jordan-lee" },
+    "acceptable_alternatives": [],
+    "tags": ["namesake", "person-vs-place", "reuse"]
+  },
+  {
+    "id": "jordan_country_office",
+    "description": "Same candidates, country context: an office opening near Amman refers to the country.",
+    "input": {
+      "mention": "Jordan",
+      "normalized_type": "location",
+      "context_snippet": "The company opened a new regional office in Jordan, just outside Amman.",
+      "candidates": [
+        { "id": "entity:jordan-country", "display_name": "Jordan", "entity_type": "location", "summary": "A country in the Middle East bordering Israel, Saudi Arabia, and Iraq." },
+        { "id": "entity:jordan-lee", "display_name": "Jordan", "entity_type": "person", "summary": "Jordan Lee, VP of Finance at Acme Corp." }
+      ]
+    },
+    "expected": { "action": "reuse", "entity_id": "entity:jordan-country" },
+    "acceptable_alternatives": [],
+    "tags": ["namesake", "person-vs-place", "reuse"]
+  },
+  {
+    "id": "org_rebrand_old_name",
+    "description": "Rebrand: the mention uses the old name, and the candidate's summary records the rebrand, so it is the same entity.",
+    "input": {
+      "mention": "Twitter",
+      "normalized_type": "platform",
+      "context_snippet": "She posted the announcement on Twitter, where it quickly gathered thousands of reposts.",
+      "candidates": [
+        { "id": "entity:x-platform", "display_name": "X", "entity_type": "platform", "summary": "Social media platform formerly known as Twitter, rebranded to X in 2023." }
+      ]
+    },
+    "expected": { "action": "reuse", "entity_id": "entity:x-platform" },
+    "acceptable_alternatives": [],
+    "tags": ["rebrand", "reuse"]
+  },
+  {
+    "id": "stockholm_single_candidate",
+    "description": "Unambiguous single candidate: a conference city mention matching the stored capital of Sweden.",
+    "input": {
+      "mention": "Stockholm",
+      "normalized_type": "location",
+      "context_snippet": "The conference will be held in Stockholm this September, with workshops on the first day.",
+      "candidates": [
+        { "id": "entity:stockholm", "display_name": "Stockholm", "entity_type": "location", "summary": "Capital city of Sweden." }
+      ]
+    },
+    "expected": { "action": "reuse", "entity_id": "entity:stockholm" },
+    "acceptable_alternatives": [],
+    "tags": ["single-candidate", "reuse"]
+  },
+  {
+    "id": "apollo_type_only_signal",
+    "description": "Both candidates lack summaries, so the stored type is the only signal: a project-flavored mention should pick the topic-bucket candidate over the person.",
+    "input": {
+      "mention": "Apollo",
+      "normalized_type": "topic",
+      "context_snippet": "The Apollo migration project kicked off last sprint and is tracked on the platform roadmap.",
+      "candidates": [
+        { "id": "entity:apollo-initiative", "display_name": "Apollo", "entity_type": "topic", "summary": null },
+        { "id": "entity:apollo-person", "display_name": "Apollo", "entity_type": "person", "summary": null }
+      ]
+    },
+    "expected": { "action": "reuse", "entity_id": "entity:apollo-initiative" },
+    "acceptable_alternatives": [
+      { "action": "create_new" }
+    ],
+    "tags": ["empty-summary", "type-signal"]
+  },
+  {
+    "id": "alex_chen_namesake_new_hire",
+    "description": "Same-name person who is clearly someone else: a junior designer fresh out of school cannot be the veteran CTO on record.",
+    "input": {
+      "mention": "Alex Chen",
+      "normalized_type": "person",
+      "context_snippet": "We just hired Alex Chen, a junior designer straight out of school, onto the brand team.",
+      "candidates": [
+        { "id": "entity:alex-chen-cto", "display_name": "Alex Chen", "entity_type": "person", "summary": "Alex Chen, CTO of Acme Corp since 2015 and a veteran distributed-systems engineer." }
+      ]
+    },
+    "expected": { "action": "create_new" },
+    "acceptable_alternatives": [],
+    "tags": ["namesake", "create-new", "person"]
+  },
+  {
+    "id": "atlas_generic_topic_summaries",
+    "description": "Stored types are the generic topic bucket, so meaning must come from the summaries: an API mention matches the internal data platform, not the mythological titan.",
+    "input": {
+      "mention": "Atlas",
+      "normalized_type": "app",
+      "context_snippet": "The Atlas API now supports batch export, so downstream jobs can pull snapshots nightly.",
+      "candidates": [
+        { "id": "entity:atlas-platform", "display_name": "Atlas", "entity_type": "topic", "summary": "Internal data platform product exposing a public API for entity snapshots." },
+        { "id": "entity:atlas-titan", "display_name": "Atlas", "entity_type": "topic", "summary": "Titan from Greek mythology condemned to hold up the sky." }
+      ]
+    },
+    "expected": { "action": "reuse", "entity_id": "entity:atlas-platform" },
+    "acceptable_alternatives": [],
+    "tags": ["generic-type", "summary-signal", "reuse"]
+  }
+]

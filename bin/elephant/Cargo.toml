@@ -1,0 +1,55 @@
+[package]
+name = "meerkat-recall-bin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Meerkat Recall command line interface"
+publish = false
+
+[[bin]]
+name = "meerkat-recall"
+path = "src/main.rs"
+
+[dependencies]
+elephant-auth = { path = "../../crates/auth" }
+elephant-policy = { path = "../../crates/policy" }
+elephant = { path = "../../crates/elephant" }
+elephant-api = { path = "../elephant-api" }
+elephant-migrations = { path = "../../crates/migrations" }
+elephant-pipeline-bin = { path = "../elephant-pipeline", package = "elephant-pipeline-bin" }
+elephant-storage = { path = "../../crates/storage" }
+elephant-types = { path = "../../crates/types" }
+elephant-embeddings = { path = "../../crates/embeddings" }
+elephant-knowledge-views = { path = "../../crates/knowledge-views" }
+elephant-pipeline = { path = "../../crates/pipeline" }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+walkdir = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+jsonwebtoken = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tempfile = "3"
+
+[features]
+rocksdb = ["elephant-storage/rocksdb"]
+default = ["meerkat-extraction"]
+meerkat-extraction = ["elephant-api/meerkat-extraction", "elephant-pipeline-bin/meerkat-extraction", "elephant-pipeline/meerkat-extraction", "elephant/meerkat-extraction"]
+fastembed = ["elephant-api/fastembed", "elephant-pipeline-bin/fastembed", "elephant/fastembed"]
+
+[lints]
+workspace = true

@@ -2197,8 +2197,7 @@ impl PlanningTruthMaintenanceStorage {
             };
             let mut audit = audit.clone();
             elephant_storage::canonical_commit::inherit_maintenance_audit_authority(
-                &plan,
-                &mut audit,
+                &plan, &mut audit,
             )?;
             plan.effects[index].after = Some(CanonicalRecord::AuditLog(audit));
         }

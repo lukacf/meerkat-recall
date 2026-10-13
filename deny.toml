@@ -30,8 +30,8 @@ ignore = [
     "RUSTSEC-2026-0173",  # proc-macro-error2
     # unsafe-libyaml 0.2.11 is unmaintained (no patched release), retained only
     # through serde_yaml -> meerkat-skills 0.8.51 for skill frontmatter parsing.
-    # Do not widen this exception to vulnerability advisories. Re-evaluate/remove
-    # with the Meerkat 0.9 dependency upgrade before the matching Recall release.
+    # Do not widen this exception to vulnerability advisories. Meerkat 0.9 also
+    # retains this chain; remove when upstream adopts a maintained safe parser.
     "RUSTSEC-2024-0449",  # unsafe-libyaml; tracked in SECURITY.md
 ]
 

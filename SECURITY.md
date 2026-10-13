@@ -59,7 +59,9 @@ classifies `unsafe-libyaml` as unmaintained and lists no patched version. The
 security audit permits this one advisory while that SDK remains pinned;
 this does not establish memory safety or suppress other vulnerability advisories.
 
-The Recall release owner must re-evaluate and remove or explicitly renew this
-exception when upgrading to the released Meerkat 0.9 SDK, before publishing the
-matching Recall version. Replacing the parser inside the pinned SDK requires a
-separate compatibility change; a lockfile upgrade cannot remove it.
+The Meerkat owner confirms that its 0.9 SDK also retains this dependency chain;
+the version upgrade alone will not resolve this maintenance advisory. The Recall
+release owner must re-evaluate this exception on SDK upgrades and remove it when
+Meerkat adopts a maintained safe Rust parser. Replacing the parser inside the
+pinned SDK requires a separate compatibility change; a lockfile upgrade cannot
+remove it.

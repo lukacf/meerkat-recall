@@ -11,30 +11,34 @@ use elephant_types::records::assertion::EvidenceSpan;
 use elephant_types::records::attribute::Literal;
 use elephant_types::records::base::Security;
 use elephant_types::records::doc::{DocMediaKind, DocMediaLocation};
+#[cfg(test)]
 use elephant_types::records::doc_node::DocNode;
-use elephant_types::records::doc_revision::{
-    DocRevision, RenderManifestAttachment, RenderManifestTimeRange,
-};
+#[cfg(test)]
+use elephant_types::records::doc_revision::DocRevision;
+use elephant_types::records::doc_revision::{RenderManifestAttachment, RenderManifestTimeRange};
 use elephant_types::records::event::TimePrecision;
 use elephant_types::records::work::{Determinism, PluginManifest, RetryPolicy};
-use elephant_types::{Link, RecordId};
+#[cfg(any(feature = "meerkat-extraction", test))]
+use elephant_types::Link;
+use elephant_types::RecordId;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 use crate::error::PipelineError;
 
-#[cfg(feature = "meerkat-extraction")]
+#[cfg(all(feature = "meerkat-extraction", not(test)))]
 use crate::extraction::{
     build_extraction_prompt, normalize_evidence_span, parse_llm_output_with_repair,
 };
-#[cfg(feature = "meerkat-extraction")]
-use crate::llm::run_anthropic_prompt;
+#[cfg(all(feature = "meerkat-extraction", not(test)))]
+use crate::llm::run_model_prompt;
 #[cfg(feature = "meerkat-extraction")]
 use std::future::Future;
 #[cfg(feature = "meerkat-extraction")]
 use std::time::Duration;
 
 /// Budget constraints for an extraction operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtractionBudget {
     /// Maximum tokens to use.
     pub max_tokens: u32,
@@ -138,6 +142,16 @@ pub struct ExtractionContext {
     pub source_timestamp: Option<DateTime<Utc>>,
     /// Media attachments relevant to this node span.
     pub media_attachments: Vec<ExtractionMediaAttachment>,
+    pub(crate) repair: Option<ExtractionRepairContext>,
+    pub(crate) work_run_id: Option<RecordId>,
+}
+
+/// Untrusted prior proposal, available only after the original authority and
+/// complete evidence checks. It grants no approval to the new proposal.
+#[derive(Debug, Clone)]
+pub(crate) struct ExtractionRepairContext {
+    pub proposal: serde_json::Value,
+    pub unsupported_indices: Vec<usize>,
 }
 
 impl ExtractionContext {
@@ -166,7 +180,16 @@ impl ExtractionContext {
             sidecar_text: None,
             source_timestamp: None,
             media_attachments: Vec::new(),
+            repair: None,
+            work_run_id: None,
         }
+    }
+
+    /// Whether this context is a governed reconsideration of a complete prior
+    /// rejected proposal. This flag grants no source or publication authority.
+    #[must_use]
+    pub fn is_repair(&self) -> bool {
+        self.repair.is_some()
     }
 
     /// Sets the storage client for managed asset lookups.
@@ -240,6 +263,8 @@ impl ExtractionContext {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::derive_partial_eq_without_eq)] // Contains f64
 pub struct RawAssertion {
+    /// Independent support verification; absent interpretations cannot promote.
+    pub support_verification: Option<super::SupportVerification>,
     /// Raw subject mention text.
     pub subject_text: String,
     /// Raw predicate text (uncanonicalized).
@@ -329,6 +354,12 @@ pub trait Extractor: Send + Sync {
     ///
     /// Returns an error if extraction fails.
     async fn extract(&self, ctx: ExtractionContext) -> Result<ExtractionResult, PipelineError>;
+
+    /// Report the actual hard extraction budget without dispatch. Unknown
+    /// budgets preserve ordinary extraction but cannot authorize automatic repair.
+    fn effective_budget(&self, _requested: &ExtractionBudget) -> Option<ExtractionBudget> {
+        None
+    }
 
     /// Optional health check.
     async fn health_check(&self) -> Result<bool, PipelineError> {
@@ -428,6 +459,7 @@ impl ExtractorRegistry {
 /// The active Elephant runtime no longer uses this as a semantic fallback.
 pub struct DefaultExtractor {
     manifest: PluginManifest,
+    #[cfg(any(feature = "meerkat-extraction", test))]
     model: String,
 }
 
@@ -441,6 +473,7 @@ impl DefaultExtractor {
     /// Creates a new default extractor.
     #[must_use]
     pub fn new() -> Self {
+        #[cfg(any(feature = "meerkat-extraction", test))]
         let model = "gpt-5.2".to_string();
         let manifest = PluginManifest {
             plugin_id: "elephant.extractor.default".to_string(),
@@ -466,9 +499,14 @@ impl DefaultExtractor {
             retry_policy: RetryPolicy::default(),
         };
 
-        Self { manifest, model }
+        Self {
+            manifest,
+            #[cfg(any(feature = "meerkat-extraction", test))]
+            model,
+        }
     }
 
+    #[cfg(test)]
     fn fallback_extract(&self, ctx: &ExtractionContext) -> ExtractionResult {
         let mut assertions = Vec::new();
         assertions.extend(extract_meeting_notes(ctx));
@@ -502,12 +540,23 @@ impl DefaultExtractor {
         }
     }
 
-    #[cfg(feature = "meerkat-extraction")]
+    #[cfg(all(feature = "meerkat-extraction", not(test)))]
     async fn llm_extract(
         &self,
         ctx: &ExtractionContext,
-        api_key: String,
     ) -> Result<ExtractionResult, PipelineError> {
+        let storage = ctx.storage.clone().ok_or_else(|| {
+            PipelineError::ConfigError(
+                "provider_authorization: extraction requires storage context".into(),
+            )
+        })?;
+        let context = crate::provider_dispatch::ProviderDispatchContext::new(
+            elephant_storage::SpaceConfigRepository::new(storage),
+            &ctx.space_id,
+        );
+        let (model, client, _provenance) = context
+            .model_client(elephant_types::provider_binding::ModelOperation::Extraction)
+            .await?;
         let prompt = build_extraction_prompt(
             &ctx.node_text,
             ctx.purpose.as_deref(),
@@ -520,13 +569,12 @@ impl DefaultExtractor {
         let run_result = self
             .run_with_wall_time_budget(
                 ctx.budget.max_wall_time_secs,
-                run_anthropic_prompt(
-                    api_key,
-                    self.model.clone(),
+                run_model_prompt(
+                    client,
+                    model,
                     Some("You are an information extraction system. Follow the user instructions and return only valid JSON."),
                     prompt,
                     max_tokens,
-                    None,
                 ),
             )
             .await?;
@@ -571,51 +619,37 @@ impl Extractor for DefaultExtractor {
     }
 
     async fn extract(&self, ctx: ExtractionContext) -> Result<ExtractionResult, PipelineError> {
-        #[cfg(feature = "meerkat-extraction")]
+        #[cfg(all(feature = "meerkat-extraction", not(test)))]
         {
-            match std::env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .map(|key| key.trim().to_string())
-            {
-                Some(api_key) if !api_key.is_empty() => match self.llm_extract(&ctx, api_key).await
-                {
-                    Ok(result) => {
-                        if !result.raw_assertions.is_empty() {
-                            return Ok(result);
-                        }
-                        tracing::warn!(
-                            "DefaultExtractor LLM returned 0 assertions; falling back to heuristic extraction"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "DefaultExtractor LLM call failed, falling back to heuristic extraction"
-                        );
-                    }
-                },
-                _ => {
-                    tracing::warn!(
-                        "ANTHROPIC_API_KEY not set, falling back to heuristic extraction"
-                    );
-                }
-            }
+            return self.llm_extract(&ctx).await;
         }
-
-        Ok(self.fallback_extract(&ctx))
+        #[cfg(all(not(feature = "meerkat-extraction"), not(test)))]
+        {
+            let _ = ctx;
+            Err(PipelineError::ConfigError(
+                "real extractor is unavailable".into(),
+            ))
+        }
+        #[cfg(test)]
+        {
+            Ok(self.fallback_extract(&ctx))
+        }
     }
 }
 
+#[cfg(test)]
 fn compute_quote_hash(quote: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(quote.as_bytes());
     hex::encode(hasher.finalize())
 }
 
+#[cfg(test)]
 fn trim_object_text(text: &str) -> &str {
     text.trim().trim_end_matches(['.', ',', ';']).trim()
 }
 
+#[cfg(test)]
 fn quote_span_for_text(ctx: &ExtractionContext, quote: &str) -> Option<(EvidenceSpan, String)> {
     let haystack = ctx.node_text.as_str();
     let quote_start = haystack.find(quote)?;
@@ -632,6 +666,7 @@ fn quote_span_for_text(ctx: &ExtractionContext, quote: &str) -> Option<(Evidence
     ))
 }
 
+#[cfg(test)]
 fn extract_meeting_notes(ctx: &ExtractionContext) -> Vec<RawAssertion> {
     let mut assertions = Vec::new();
 
@@ -745,6 +780,7 @@ fn extract_meeting_notes(ctx: &ExtractionContext) -> Vec<RawAssertion> {
     assertions
 }
 
+#[cfg(test)]
 fn extract_has_title(ctx: &ExtractionContext) -> Vec<RawAssertion> {
     let text = ctx.node_text.trim();
     let needle = " is ";
@@ -773,6 +809,7 @@ fn extract_has_title(ctx: &ExtractionContext) -> Vec<RawAssertion> {
     };
 
     vec![RawAssertion {
+        support_verification: None,
         subject_text: subject.to_string(),
         predicate_text: "has title".to_string(),
         object_text: None,
@@ -792,6 +829,7 @@ fn extract_has_title(ctx: &ExtractionContext) -> Vec<RawAssertion> {
     }]
 }
 
+#[cfg(test)]
 fn extract_joined_as(ctx: &ExtractionContext) -> Vec<RawAssertion> {
     let text = ctx.node_text.trim();
     let needle = " joined ";
@@ -832,6 +870,7 @@ fn extract_joined_as(ctx: &ExtractionContext) -> Vec<RawAssertion> {
 
     vec![
         RawAssertion {
+            support_verification: None,
             subject_text: subject.to_string(),
             predicate_text: "works at".to_string(),
             object_text: Some(org.to_string()),
@@ -850,6 +889,7 @@ fn extract_joined_as(ctx: &ExtractionContext) -> Vec<RawAssertion> {
             significance: None,
         },
         RawAssertion {
+            support_verification: None,
             subject_text: subject.to_string(),
             predicate_text: "has title".to_string(),
             object_text: None,
@@ -870,6 +910,7 @@ fn extract_joined_as(ctx: &ExtractionContext) -> Vec<RawAssertion> {
     ]
 }
 
+#[cfg(test)]
 fn extract_mentors(ctx: &ExtractionContext) -> Vec<RawAssertion> {
     let text = ctx.node_text.trim();
     let needle = " mentors ";
@@ -900,6 +941,7 @@ fn extract_mentors(ctx: &ExtractionContext) -> Vec<RawAssertion> {
     };
 
     vec![RawAssertion {
+        support_verification: None,
         subject_text: subject.to_string(),
         predicate_text: "mentors".to_string(),
         object_text: Some(object.to_string()),
@@ -920,11 +962,13 @@ fn extract_mentors(ctx: &ExtractionContext) -> Vec<RawAssertion> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum MeetingSection {
     Decisions,
     ActionItems,
 }
 
+#[cfg(test)]
 fn make_simple_assertion(
     ctx: &ExtractionContext,
     subject_text: String,
@@ -956,6 +1000,7 @@ fn make_simple_assertion(
     }
 
     RawAssertion {
+        support_verification: None,
         subject_text,
         predicate_text,
         object_text,
@@ -981,6 +1026,7 @@ fn make_simple_assertion(
     }
 }
 
+#[cfg(test)]
 fn lines_with_offsets(text: &str) -> impl Iterator<Item = (&str, usize, usize)> {
     text.split('\n').scan(0usize, |offset, line| {
         let start = *offset;
@@ -990,6 +1036,7 @@ fn lines_with_offsets(text: &str) -> impl Iterator<Item = (&str, usize, usize)> 
     })
 }
 
+#[cfg(test)]
 fn find_iso_date(text: &str) -> Option<String> {
     for raw in text.split_whitespace() {
         let token = raw
@@ -1002,6 +1049,7 @@ fn find_iso_date(text: &str) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn is_iso_date(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 10 {
@@ -1015,6 +1063,7 @@ fn is_iso_date(value: &str) -> bool {
             .all(|(idx, b)| idx == 4 || idx == 7 || b.is_ascii_digit())
 }
 
+#[cfg(test)]
 fn extract_works_at(ctx: &ExtractionContext) -> Option<RawAssertion> {
     let text = ctx.node_text.as_str();
     let needle = "works at";
@@ -1048,6 +1097,7 @@ fn extract_works_at(ctx: &ExtractionContext) -> Option<RawAssertion> {
     };
 
     Some(RawAssertion {
+        support_verification: None,
         subject_text: subject.to_string(),
         predicate_text: predicate,
         object_text: Some(object.to_string()),
@@ -1156,9 +1206,6 @@ mod tests {
         let extractor = DefaultExtractor::new();
         let ctx = make_context();
 
-        let original = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::remove_var("ANTHROPIC_API_KEY");
-
         let result = extractor.extract(ctx).await.expect("extract");
         assert_eq!(result.assertion_count(), 1);
         let assertion = result.raw_assertions.first().expect("assertion");
@@ -1167,10 +1214,6 @@ mod tests {
         assert_eq!(assertion.object_text.as_deref(), Some("Acme Corp"));
         assert_eq!(result.tokens_used, 0);
         assert_eq!(result.model, "gpt-5.2");
-
-        if let Some(value) = original {
-            std::env::set_var("ANTHROPIC_API_KEY", value);
-        }
     }
 
     #[tokio::test]
@@ -1196,9 +1239,6 @@ Action Items:
             "default".to_string(),
             Security::default(),
         );
-
-        let original = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::remove_var("ANTHROPIC_API_KEY");
 
         let result = extractor.extract(ctx).await.expect("extract");
         assert!(
@@ -1230,10 +1270,6 @@ Action Items:
         assert!(due_dates
             .iter()
             .all(|a| matches!(a.object_literal, Some(Literal::Date(_)))));
-
-        if let Some(value) = original {
-            std::env::set_var("ANTHROPIC_API_KEY", value);
-        }
     }
 
     #[tokio::test]
@@ -1247,9 +1283,6 @@ Action Items:
             Security::default(),
         );
 
-        let original = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::remove_var("ANTHROPIC_API_KEY");
-
         let result = extractor.extract(ctx).await.expect("extract");
         assert_eq!(result.assertion_count(), 1);
         let assertion = result.raw_assertions.first().expect("assertion");
@@ -1260,10 +1293,6 @@ Action Items:
             assertion.object_literal,
             Some(Literal::String(ref value)) if value == "CTO"
         ));
-
-        if let Some(value) = original {
-            std::env::set_var("ANTHROPIC_API_KEY", value);
-        }
     }
 
     #[tokio::test]
@@ -1276,9 +1305,6 @@ Action Items:
             "default".to_string(),
             Security::default(),
         );
-
-        let original = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::remove_var("ANTHROPIC_API_KEY");
 
         let result = extractor.extract(ctx).await.expect("extract");
         assert_eq!(result.assertion_count(), 2);
@@ -1298,10 +1324,6 @@ Action Items:
             }),
             "missing title assertion"
         );
-
-        if let Some(value) = original {
-            std::env::set_var("ANTHROPIC_API_KEY", value);
-        }
     }
 
     #[tokio::test]
@@ -1315,19 +1337,12 @@ Action Items:
             Security::default(),
         );
 
-        let original = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::remove_var("ANTHROPIC_API_KEY");
-
         let result = extractor.extract(ctx).await.expect("extract");
         assert_eq!(result.assertion_count(), 1);
         let assertion = result.raw_assertions.first().expect("assertion");
         assert_eq!(assertion.subject_text, "Alice Mentor");
         assert_eq!(assertion.predicate_text, "mentors");
         assert_eq!(assertion.object_text.as_deref(), Some("Bob Student"));
-
-        if let Some(value) = original {
-            std::env::set_var("ANTHROPIC_API_KEY", value);
-        }
     }
 
     #[cfg(feature = "meerkat-extraction")]
@@ -1361,6 +1376,7 @@ Action Items:
         };
 
         let raw_assertion = RawAssertion {
+            support_verification: None,
             subject_text: "Alice".to_string(),
             predicate_text: "joined".to_string(),
             object_text: Some("Acme".to_string()),
@@ -1397,6 +1413,7 @@ Action Items:
         };
 
         let raw_assertion = RawAssertion {
+            support_verification: None,
             subject_text: "Alice".to_string(),
             predicate_text: "works at".to_string(),
             object_text: Some("Acme".to_string()),

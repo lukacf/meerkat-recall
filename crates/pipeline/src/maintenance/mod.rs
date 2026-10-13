@@ -9,6 +9,8 @@
 //! - **Entity type sweep**: Reclassify entities with default/unknown types
 //! - **Predicate sweep**: Normalize semantic duplicate predicates
 
+mod atomic_graph;
+
 pub mod classification_backfill;
 pub mod failed_work_recovery;
 pub mod identity_sweep;
@@ -25,13 +27,14 @@ use elephant_types::records::assertion::{Assertion, ResolutionStatus};
 use elephant_types::records::entity::{Entity, EntityStatus};
 use elephant_types::records::rel::{ClaimStatus, EvidenceRef, Rel};
 use elephant_types::{RecordId, TableName};
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::entity_type_consolidation::{self, EntityTypeConsolidationConfig};
 use crate::predicate_hygiene::{self, PredicateHygieneConfig};
 
 /// Combined result of all maintenance sweeps.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MaintenanceSweepResult {
     /// Entity label hygiene results.
     pub entity_hygiene: EntityHygieneSweepResult,
@@ -50,11 +53,12 @@ pub struct MaintenanceSweepResult {
     /// Classification backfill results.
     pub classification_backfill: ClassificationBackfillStats,
     /// Failed-work recovery results.
+    #[serde(skip)]
     pub failed_work_recovery: FailedWorkRecoveryStats,
 }
 
 /// Result of an entity embedding sweep.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EntityEmbeddingSweepResult {
     /// Number of candidate entities scanned.
     pub scanned: usize,
@@ -69,7 +73,7 @@ pub struct EntityEmbeddingSweepResult {
 }
 
 /// Result of an entity label hygiene sweep.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EntityHygieneSweepResult {
     /// Number of active entities scanned.
     pub scanned: usize,
@@ -86,7 +90,7 @@ pub struct EntityHygieneSweepResult {
 }
 
 /// Result of an exact relationship slot dedupe sweep.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RelationshipSweepResult {
     /// Number of active relationships scanned.
     pub scanned: usize,
@@ -99,7 +103,7 @@ pub struct RelationshipSweepResult {
 }
 
 /// Result of an exact resolved assertion slot dedupe sweep.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssertionSweepResult {
     /// Number of active assertions scanned.
     pub scanned: usize,
@@ -110,7 +114,7 @@ pub struct AssertionSweepResult {
 }
 
 /// Result of an identity detection sweep.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IdentitySweepResult {
     /// Number of candidate pairs evaluated.
     pub candidates_evaluated: usize,
@@ -125,7 +129,7 @@ pub struct IdentitySweepResult {
 }
 
 /// Result of an entity type consolidation sweep.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EntityTypeSweepResult {
     /// Number of entities scanned.
     pub scanned: usize,
@@ -136,7 +140,7 @@ pub struct EntityTypeSweepResult {
 }
 
 /// Result of a predicate normalization sweep.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PredicateSweepResult {
     /// Number of predicates scanned.
     pub scanned: usize,
@@ -187,7 +191,7 @@ impl std::fmt::Display for MaintenanceSweepResult {
 }
 
 /// Configuration for maintenance sweeps.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaintenanceConfig {
     /// MCP URL for the maintenance agent profile.
     pub mcp_url: String,
@@ -229,226 +233,153 @@ pub(crate) fn backfill_flag_is_on(value: Option<&str>) -> bool {
     matches!(value, Some("true") | Some("1"))
 }
 
-/// Runs all maintenance sweeps for a space.
+/// Run the retained semantic phases in one canonical transaction, followed by
+/// the separately guarded vector-index and queue-recovery maintenance.
 ///
 /// # Errors
-///
-/// Returns an error if any sweep fails fatally. Individual candidate
-/// failures are logged and counted but don't abort the sweep.
+/// Any semantic preparation or transaction failure aborts the complete graph
+/// change. No successful earlier phase is published on a later phase failure.
 pub async fn run_maintenance_sweep(
     storage: &elephant_storage::StorageClient,
     space_id: &str,
     config: &MaintenanceConfig,
     predicate_embedding_provider: &dyn EmbeddingProvider,
 ) -> Result<MaintenanceSweepResult, crate::error::PipelineError> {
-    let mut result = MaintenanceSweepResult::default();
+    run_maintenance_sweep_with_attempt(
+        storage,
+        space_id,
+        config,
+        predicate_embedding_provider,
+        None,
+        None,
+    )
+    .await
+}
 
-    // 0. Entity label hygiene — old or low-quality extractors may have already
-    // materialized source fragments as graph nodes. Retire those nodes before
-    // dedupe so relationship/assertion projection stops keeping them alive.
-    info!("Starting entity hygiene sweep for space {space_id}");
-    match run_entity_hygiene_sweep(storage, space_id).await {
-        Ok(entity_hygiene) => {
-            result.entity_hygiene = entity_hygiene;
-            info!(
-                "Entity hygiene complete: {} scanned, {} retired, {} relationships deleted, {} relationships repointed, {} assertions superseded, {} assertions repointed",
-                result.entity_hygiene.scanned,
-                result.entity_hygiene.retired,
-                result.entity_hygiene.relationships_deleted,
-                result.entity_hygiene.relationships_repointed,
-                result.entity_hygiene.assertions_superseded,
-                result.entity_hygiene.assertions_repointed,
-            );
-        }
-        Err(e) => {
-            tracing::warn!("Entity hygiene sweep failed: {e}");
-        }
+/// Queue dispatch supplies the original attempt and its actual work run.
+/// The retained periodic standalone caller uses neither.
+pub async fn run_maintenance_sweep_with_attempt(
+    storage: &elephant_storage::StorageClient,
+    space_id: &str,
+    config: &MaintenanceConfig,
+    predicate_embedding_provider: &dyn EmbeddingProvider,
+    attempt: Option<elephant_types::publication::AttemptFence>,
+    work_run: Option<&RecordId>,
+) -> Result<MaintenanceSweepResult, crate::error::PipelineError> {
+    use crate::maintenance_commit::PlanningTruthMaintenanceStorage;
+    use crate::PipelineError;
+
+    // Native extension references belong to identity's owner registry. Install
+    // its epoch guards before capturing the first decision snapshot.
+    let registry = elephant_extensions::load_runtime_reference_registry_from_env()
+        .map_err(|error| PipelineError::ConfigError(error.to_string()))?;
+    let mut tables = registry.tables().map(str::to_owned).collect::<Vec<_>>();
+    tables.sort();
+    elephant_storage::canonical_commit::ensure_extension_epoch_guards(storage, &tables).await?;
+    let planning =
+        PlanningTruthMaintenanceStorage::new(storage.clone(), space_id, attempt.clone()).await?;
+    if let Some(fence) = &attempt {
+        let id = work_run.ok_or_else(|| {
+            PipelineError::InvalidState("Queued maintenance requires its original work run".into())
+        })?;
+        capture_maintenance_run(&planning, storage, space_id, fence, id).await?;
     }
-
-    // 1. Relationship dedupe — exact slot cleanup is deterministic and keeps
-    // repeated source evidence from bloating graph projection surfaces.
-    info!("Starting relationship dedupe sweep for space {space_id}");
-    match run_relationship_dedupe_sweep(storage, space_id).await {
-        Ok(relationships) => {
-            result.relationships = relationships;
-            info!(
-                "Relationship dedupe complete: {} scanned, {} duplicate slots, {} rows merged",
-                result.relationships.scanned,
-                result.relationships.duplicate_slots,
-                result.relationships.merged,
-            );
+    let backfill = classification_backfill_enabled();
+    let input = serde_json::json!({"config": config, "classification_backfill": backfill,
+        "predicate_embedding_model": predicate_embedding_provider.model(),
+        "predicate_embedding_dimensions": predicate_embedding_provider.dimensions()});
+    let mut result = if let Some(replayed) = planning
+        .replay("run_maintenance_sweep", space_id, &input)
+        .await?
+    {
+        replayed
+    } else {
+        let mut result = MaintenanceSweepResult::default();
+        // The opt-in repair runs first in the overlay so subsequent decisions
+        // consume its inherited security envelope, never historical public defaults.
+        if backfill {
+            result.classification_backfill =
+                classification_backfill::prepare_classification_backfill_sweep(
+                    &planning, storage, space_id,
+                )
+                .await?;
         }
-        Err(e) => {
-            tracing::warn!("Relationship dedupe sweep failed: {e}");
-        }
-    }
-
-    // 1b. Assertion dedupe — assertions are provenance-bearing claims, so keep
-    // duplicates for audit but mark repeated resolved semantic slots superseded.
-    info!("Starting assertion dedupe sweep for space {space_id}");
-    match run_assertion_dedupe_sweep(storage, space_id).await {
-        Ok(assertions) => {
-            result.assertions = assertions;
-            info!(
-                "Assertion dedupe complete: {} scanned, {} duplicate slots, {} rows superseded",
-                result.assertions.scanned,
-                result.assertions.duplicate_slots,
-                result.assertions.superseded,
-            );
-        }
-        Err(e) => {
-            tracing::warn!("Assertion dedupe sweep failed: {e}");
-        }
-    }
-
-    // 2. Identity sweep — this is the highest-impact semantic cleanup pass for
-    // graph quality. It must not be starved behind slower consolidation passes.
-    info!("Starting identity sweep for space {space_id}");
-    match identity_sweep::run_identity_sweep(storage, space_id, config).await {
-        Ok(identity) => {
-            result.identity = identity;
-            info!(
-                "Identity sweep complete: {} evaluated, {} merged, {} rejected",
-                result.identity.candidates_evaluated,
-                result.identity.auto_merged,
-                result.identity.rejected,
-            );
-        }
-        Err(e) => {
-            tracing::warn!("Identity sweep failed: {e}");
-        }
-    }
-
-    // 3. Entity type sweep — reclassify entities stuck on default "topic" type.
-    // Relationship lookups can be expensive on large live stores, so bound this
-    // pass and let the next maintenance tick continue rather than blocking
-    // identity cleanup indefinitely.
-    info!("Starting entity type sweep for space {space_id}");
-    let entity_repo = EntityRepository::new(storage.clone());
-    let rel_repo = RelRepository::new(storage.clone());
-    let type_config = EntityTypeConsolidationConfig::default();
-
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        entity_type_consolidation::execute_entity_type_sweep(
-            &entity_repo,
-            &rel_repo,
+        result.entity_hygiene = atomic_graph::hygiene(&planning, storage, space_id).await?;
+        result.relationships = atomic_graph::relationships(&planning, storage, space_id).await?;
+        result.assertions = atomic_graph::assertions(&planning, storage, space_id).await?;
+        result.identity =
+            identity_sweep::prepare_identity_sweep(&planning, storage, space_id, config).await?;
+        let consolidation = entity_type_consolidation::prepare_entity_type_sweep(
+            &planning,
+            storage,
             space_id,
-            &type_config,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(consolidation)) => {
-            result.entity_type = EntityTypeSweepResult {
-                scanned: consolidation.entities_scanned,
-                reclassified: consolidation.entities_classified,
-                skipped: consolidation.entities_skipped,
-            };
-            info!(
-                "Entity type sweep complete: {} scanned, {} reclassified",
-                result.entity_type.scanned, result.entity_type.reclassified,
-            );
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("Entity type sweep failed: {e}");
-        }
-        Err(_) => {
-            tracing::warn!("Entity type sweep timed out for space {space_id}");
-        }
-    }
+            &EntityTypeConsolidationConfig::default(),
+        )
+        .await?;
+        result.entity_type = EntityTypeSweepResult {
+            scanned: consolidation.entities_scanned,
+            reclassified: consolidation.entities_classified,
+            skipped: consolidation.entities_skipped,
+        };
+        result.predicate = prepare_predicate_sweep(
+            &planning,
+            storage,
+            space_id,
+            predicate_embedding_provider,
+            work_run,
+        )
+        .await?;
+        planning
+            .audit_pending_effects("run_maintenance_sweep")
+            .await?;
+        planning
+            .commit("run_maintenance_sweep", space_id, &input, &result)
+            .await?;
+        result
+    };
 
-    // 4. Predicate sweep — useful, but never let noisy alias proposal churn
-    // starve identity/type cleanup on a busy or messy live store.
-    info!("Starting predicate sweep for space {space_id}");
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        run_predicate_sweep(storage, space_id, predicate_embedding_provider),
-    )
-    .await
-    {
-        Ok(predicate) => {
-            result.predicate = predicate;
-            info!(
-                "Predicate sweep complete: {} scanned, {} aliased, {} proposed, {} registered",
-                result.predicate.scanned,
-                result.predicate.aliases_created,
-                result.predicate.proposals_created,
-                result.predicate.registered,
-            );
-        }
-        Err(_) => {
-            tracing::warn!("Predicate sweep timed out for space {space_id}");
-        }
-    }
-
-    // 5. Entity embedding sweep — keeps entity name/summary embeddings fresh
-    // so vector candidate generation and semantic search ranking have data.
-    // Same provider as the predicate sweep; per-entity-change, hash-gated.
-    info!("Starting entity embedding sweep for space {space_id}");
+    // These owners maintain derived search vectors and operational queue state.
+    // Neither is included in the semantic transaction's result receipt.
     match run_entity_embedding_sweep(storage, space_id, predicate_embedding_provider).await {
-        Ok(embeddings) => {
-            result.entity_embeddings = embeddings;
-            info!(
-                "Entity embedding sweep complete: {} scanned, {} embedded, {} skipped",
-                result.entity_embeddings.scanned,
-                result.entity_embeddings.embedded,
-                result.entity_embeddings.skipped,
-            );
-        }
-        Err(e) => {
-            tracing::warn!("Entity embedding sweep failed: {e}");
-        }
+        Ok(embeddings) => result.entity_embeddings = embeddings,
+        Err(error) => tracing::warn!("Entity embedding sweep failed: {error}"),
     }
-
-    // 6. Classification backfill — repairs records derived before the source
-    // document's security envelope was inherited. Runs last because it is a
-    // repair pass for historical data, not ongoing graph quality, and it must
-    // never starve the semantic sweeps above. Once the graph is fully classified
-    // this is a read-only pass that writes nothing.
-    //
-    // OPT-IN, and deliberately so. This is the one sweep that rewrites records
-    // wholesale rather than nudging graph quality, and switching itself on the
-    // moment a new binary lands has two bad consequences:
-    //
-    // 1. It can invalidate deployment checks that compare a candidate snapshot
-    //    with a quiesced export. A backfill during candidate boot changes the
-    //    content before the operator can verify that the upgrade preserved it.
-    // 2. It repairs the whole graph unobserved. A traversal bug would
-    //    misclassify everything before anyone looked.
-    //
-    // So the operator turns it on deliberately, watches one pass, and can leave
-    // it on afterwards: it converges to a read-only no-op.
-    if classification_backfill_enabled() {
-        info!("Starting classification backfill for space {space_id}");
-        match classification_backfill::run_classification_backfill_sweep(storage, space_id).await {
-            Ok(backfill) => {
-                result.classification_backfill = backfill;
-            }
-            Err(e) => {
-                tracing::warn!("Classification backfill failed: {e}");
-            }
-        }
-    }
-
-    // 7. Failed-work recovery — requeues terminally-failed items whose cause the
-    // operator has since fixed. Off unless PIPELINE_REQUEUE_FAILED_BEFORE names a
-    // cutoff, and self-limiting: requeuing moves updated_at past the cutoff, so
-    // the same cutoff cannot pick an item up twice.
     if let Some(cutoff) = failed_work_recovery::recovery_cutoff_from_env() {
-        // warn, not info: this is the only arming evidence under RUST_LOG=warn.
         tracing::warn!("Starting failed-work recovery for space {space_id} (cutoff {cutoff})");
         match failed_work_recovery::run_failed_work_recovery(storage, space_id, cutoff).await {
-            Ok(recovery) => {
-                result.failed_work_recovery = recovery;
-            }
-            Err(e) => {
-                tracing::warn!("Failed-work recovery failed: {e}");
-            }
+            Ok(recovery) => result.failed_work_recovery = recovery,
+            Err(error) => tracing::warn!("Failed-work recovery failed: {error}"),
         }
     }
-
+    info!("Maintenance complete for space {space_id}: {result}");
     Ok(result)
+}
+
+/// The actual run is a decision input, not just another run for this work ID.
+async fn capture_maintenance_run(
+    planning: &crate::maintenance_commit::PlanningTruthMaintenanceStorage,
+    storage: &elephant_storage::StorageClient,
+    space: &str,
+    fence: &elephant_types::publication::AttemptFence,
+    run_id: &RecordId,
+) -> Result<(), crate::PipelineError> {
+    let run = elephant_storage::WorkRunRepository::new(storage.clone())
+        .get(space, run_id)
+        .await?
+        .ok_or_else(|| crate::PipelineError::NotFound(run_id.to_string()))?;
+    let saved = run.metrics.custom.get("attempt_fence").and_then(|value| {
+        serde_json::from_value::<elephant_types::publication::AttemptFence>(value.clone()).ok()
+    });
+    if fence.space_id != space
+        || run.work_item.id() != &fence.work_item_id
+        || saved.as_ref() != Some(fence)
+        || run.base.deleted_at.is_some()
+    {
+        return Err(crate::PipelineError::InvalidState(
+            "Maintenance work run differs from the original attempt".into(),
+        ));
+    }
+    planning.observe(&run)
 }
 
 /// Maximum entities (re-)embedded per sweep cycle: bounds provider cost per
@@ -502,12 +433,19 @@ pub async fn run_entity_embedding_sweep(
     provider: &dyn EmbeddingProvider,
 ) -> Result<EntityEmbeddingSweepResult, crate::error::PipelineError> {
     let repo = EntityRepository::new(storage.clone());
-    let candidates = repo
-        .list_embedding_candidates(space_id, MAX_EMBED_CANDIDATES_PER_SWEEP)
-        .await
-        .map_err(crate::error::PipelineError::StorageError)?;
-
     let model = provider.model().to_string();
+    let candidates = if model.starts_with("recall:") {
+        repo.list_embedding_candidates_for_policy(
+            space_id,
+            &model,
+            provider.dimensions(),
+            MAX_EMBED_CANDIDATES_PER_SWEEP,
+        )
+        .await?
+    } else {
+        repo.list_embedding_candidates(space_id, MAX_EMBED_CANDIDATES_PER_SWEEP)
+            .await?
+    };
     let mut result = EntityEmbeddingSweepResult {
         scanned: candidates.len(),
         ..EntityEmbeddingSweepResult::default()
@@ -566,514 +504,72 @@ pub async fn run_entity_embedding_sweep(
     Ok(result)
 }
 
+#[cfg(test)]
 async fn run_entity_hygiene_sweep(
     storage: &elephant_storage::StorageClient,
     space_id: &str,
 ) -> Result<EntityHygieneSweepResult, crate::error::PipelineError> {
-    if let Some(store) = storage.embedded_store() {
-        let space_id = space_id.to_string();
-        return Ok(store
-            .mutate(move |mutation| {
-                let now = chrono::Utc::now();
-                let mut retired_ids = std::collections::HashSet::new();
-                let mut redirects = std::collections::HashMap::new();
-                let mut active_identity_keys = std::collections::HashMap::new();
-                let mut active_display_names = std::collections::HashMap::new();
-                let mut deleted_entities = Vec::new();
-                let mut result = EntityHygieneSweepResult::default();
-
-                for mut entity in mutation.scan::<Entity>()? {
-                    if entity.base.space_id != space_id {
-                        continue;
-                    }
-                    if entity.base.deleted_at.is_some() {
-                        if entity.status == EntityStatus::Merged {
-                            if let Some(redirect_to) = &entity.redirect_to {
-                                redirects.insert(entity.base.id.clone(), redirect_to.id().clone());
-                            }
-                        } else {
-                            deleted_entities.push(entity);
-                        }
-                        continue;
-                    }
-                    result.scanned += 1;
-                    if entity.status == EntityStatus::Merged {
-                        if let Some(redirect_to) = &entity.redirect_to {
-                            redirects.insert(entity.base.id.clone(), redirect_to.id().clone());
-                        }
-                        continue;
-                    }
-                    if should_retire_entity_label(&entity) {
-                        retired_ids.insert(entity.base.id.clone());
-                        entity.base.deleted_at = Some(now);
-                        entity.base.updated_at = now;
-                        let _ = mutation.replace(entity)?;
-                        result.retired += 1;
-                    } else {
-                        index_active_entity_for_deleted_survivor(
-                            &entity,
-                            &mut active_identity_keys,
-                            &mut active_display_names,
-                        );
-                    }
-                }
-
-                for entity in deleted_entities {
-                    if let Some(survivor_id) = deleted_entity_survivor(
-                        &entity,
-                        &active_identity_keys,
-                        &active_display_names,
-                    ) {
-                        redirects.insert(entity.base.id.clone(), survivor_id);
-                    } else {
-                        retired_ids.insert(entity.base.id.clone());
-                    }
-                }
-
-                if retired_ids.is_empty() && redirects.is_empty() {
-                    return Ok(result);
-                }
-
-                for mut rel in mutation.scan::<Rel>()? {
-                    if rel.base.space_id != space_id || rel.base.deleted_at.is_some() {
-                        continue;
-                    }
-                    let mut repointed = false;
-                    if let Some(survivor_id) = redirects.get(rel.subject.id()) {
-                        rel.subject = elephant_types::Link::new(survivor_id.clone());
-                        repointed = true;
-                    }
-                    if let Some(survivor_id) = redirects.get(rel.object.id()) {
-                        rel.object = elephant_types::Link::new(survivor_id.clone());
-                        repointed = true;
-                    }
-                    if repointed {
-                        rel.base.updated_at = now;
-                        let _ = mutation.replace(rel)?;
-                        result.relationships_repointed += 1;
-                        continue;
-                    }
-                    if retired_ids.contains(rel.subject.id())
-                        || retired_ids.contains(rel.object.id())
-                    {
-                        rel.base.deleted_at = Some(now);
-                        rel.base.updated_at = now;
-                        let _ = mutation.replace(rel)?;
-                        result.relationships_deleted += 1;
-                    }
-                }
-
-                for mut assertion in mutation.scan::<Assertion>()? {
-                    if assertion.base.space_id != space_id
-                        || assertion.base.deleted_at.is_some()
-                        || assertion.resolution_status == ResolutionStatus::Superseded
-                    {
-                        continue;
-                    }
-                    let references_retired_entity = assertion
-                        .subject_entity
-                        .as_ref()
-                        .is_some_and(|link| retired_ids.contains(link.id()))
-                        || assertion
-                            .object_entity
-                            .as_ref()
-                            .is_some_and(|link| retired_ids.contains(link.id()));
-                    if references_retired_entity {
-                        assertion.resolution_status = ResolutionStatus::Superseded;
-                        assertion.base.updated_at = now;
-                        let _ = mutation.replace(assertion)?;
-                        result.assertions_superseded += 1;
-                        continue;
-                    }
-
-                    let mut repointed = false;
-                    if let Some(link) = assertion.subject_entity.as_mut() {
-                        if let Some(survivor_id) = redirects.get(link.id()) {
-                            *link = elephant_types::Link::new(survivor_id.clone());
-                            repointed = true;
-                        }
-                    }
-                    if let Some(link) = assertion.object_entity.as_mut() {
-                        if let Some(survivor_id) = redirects.get(link.id()) {
-                            *link = elephant_types::Link::new(survivor_id.clone());
-                            repointed = true;
-                        }
-                    }
-                    for subject in &mut assertion.base.subjects {
-                        if let Some(survivor_id) = redirects.get(subject.id()) {
-                            *subject = elephant_types::Link::new(survivor_id.clone());
-                            repointed = true;
-                        }
-                    }
-                    if repointed {
-                        assertion.base.updated_at = now;
-                        let _ = mutation.replace(assertion)?;
-                        result.assertions_repointed += 1;
-                    }
-                }
-
-                Ok(result)
-            })
-            .await?);
-    }
-
-    let entity_repo = EntityRepository::new(storage.clone());
-    let rel_repo = RelRepository::new(storage.clone());
-    let assertion_repo = AssertionRepository::new(storage.clone());
-    let mut result = EntityHygieneSweepResult::default();
-    let mut retired_ids = std::collections::HashSet::new();
-    let mut redirects = std::collections::HashMap::new();
-    let mut active_identity_keys = std::collections::HashMap::new();
-    let mut active_display_names = std::collections::HashMap::new();
-    let mut deleted_entities = Vec::new();
-    let mut entity_cursor: Option<String> = None;
-
-    loop {
-        let page = entity_repo
-            .search(&SearchCriteria {
-                space_id: Some(space_id.to_string()),
-                include_deleted: true,
-                limit: 500,
-                cursor: entity_cursor.clone(),
-                ..SearchCriteria::default()
-            })
-            .await?;
-        if page.results.is_empty() {
-            break;
-        }
-        let has_more = page.has_more;
-        entity_cursor = page.cursor;
-        for entity in page.results {
-            if entity.base.deleted_at.is_some() {
-                if entity.status == EntityStatus::Merged {
-                    if let Some(redirect_to) = &entity.redirect_to {
-                        redirects.insert(entity.base.id.clone(), redirect_to.id().clone());
-                    }
-                } else {
-                    deleted_entities.push(entity);
-                }
-                continue;
-            }
-            result.scanned += 1;
-            if entity.status == EntityStatus::Merged {
-                if let Some(redirect_to) = &entity.redirect_to {
-                    redirects.insert(entity.base.id.clone(), redirect_to.id().clone());
-                }
-                continue;
-            }
-            if should_retire_entity_label(&entity) {
-                retired_ids.insert(entity.base.id.clone());
-                entity_repo.delete(space_id, &entity.base.id).await?;
-                result.retired += 1;
-            } else {
-                index_active_entity_for_deleted_survivor(
-                    &entity,
-                    &mut active_identity_keys,
-                    &mut active_display_names,
-                );
-            }
-        }
-        if !has_more {
-            break;
-        }
-    }
-
-    for entity in deleted_entities {
-        if let Some(survivor_id) =
-            deleted_entity_survivor(&entity, &active_identity_keys, &active_display_names)
-        {
-            redirects.insert(entity.base.id.clone(), survivor_id);
-        } else {
-            retired_ids.insert(entity.base.id.clone());
-        }
-    }
-
-    if retired_ids.is_empty() && redirects.is_empty() {
-        return Ok(result);
-    }
-
-    let mut cursor: Option<RecordId> = None;
-    loop {
-        let page = rel_repo.list(space_id, 500, cursor.as_ref()).await?;
-        if page.is_empty() {
-            break;
-        }
-        cursor = page.last().map(|rel| rel.base.id.clone());
-        for mut rel in page {
-            let mut repointed = false;
-            if let Some(survivor_id) = redirects.get(rel.subject.id()) {
-                rel.subject = elephant_types::Link::new(survivor_id.clone());
-                repointed = true;
-            }
-            if let Some(survivor_id) = redirects.get(rel.object.id()) {
-                rel.object = elephant_types::Link::new(survivor_id.clone());
-                repointed = true;
-            }
-            if repointed {
-                rel.base.updated_at = chrono::Utc::now();
-                let old_rel_id = rel.base.id.clone();
-                rel.base.id = RecordId::new_v4(TableName::Rel);
-                let _ = rel_repo.create(rel).await?;
-                rel_repo.delete(space_id, &old_rel_id).await?;
-                result.relationships_repointed += 1;
-                continue;
-            }
-            if retired_ids.contains(rel.subject.id()) || retired_ids.contains(rel.object.id()) {
-                rel_repo.delete(space_id, &rel.base.id).await?;
-                result.relationships_deleted += 1;
-            }
-        }
-    }
-
-    cursor = None;
-    loop {
-        let page = assertion_repo.list(space_id, 500, cursor.as_ref()).await?;
-        if page.is_empty() {
-            break;
-        }
-        cursor = page.last().map(|assertion| assertion.base.id.clone());
-        for mut assertion in page {
-            if assertion.resolution_status == ResolutionStatus::Superseded {
-                continue;
-            }
-            let references_retired_entity = assertion
-                .subject_entity
-                .as_ref()
-                .is_some_and(|link| retired_ids.contains(link.id()))
-                || assertion
-                    .object_entity
-                    .as_ref()
-                    .is_some_and(|link| retired_ids.contains(link.id()));
-            if references_retired_entity {
-                let assertion_id = assertion.base.id.clone();
-                assertion.resolution_status = ResolutionStatus::Superseded;
-                assertion.base.updated_at = chrono::Utc::now();
-                assertion_repo
-                    .update(space_id, &assertion_id, assertion)
-                    .await?;
-                result.assertions_superseded += 1;
-                continue;
-            }
-
-            let mut repointed = false;
-            if let Some(link) = assertion.subject_entity.as_mut() {
-                if let Some(survivor_id) = redirects.get(link.id()) {
-                    *link = elephant_types::Link::new(survivor_id.clone());
-                    repointed = true;
-                }
-            }
-            if let Some(link) = assertion.object_entity.as_mut() {
-                if let Some(survivor_id) = redirects.get(link.id()) {
-                    *link = elephant_types::Link::new(survivor_id.clone());
-                    repointed = true;
-                }
-            }
-            for subject in &mut assertion.base.subjects {
-                if let Some(survivor_id) = redirects.get(subject.id()) {
-                    *subject = elephant_types::Link::new(survivor_id.clone());
-                    repointed = true;
-                }
-            }
-            if repointed {
-                let assertion_id = assertion.base.id.clone();
-                assertion.base.updated_at = chrono::Utc::now();
-                assertion_repo
-                    .update(space_id, &assertion_id, assertion)
-                    .await?;
-                result.assertions_repointed += 1;
-            }
-        }
-    }
-
+    let planning = crate::maintenance_commit::PlanningTruthMaintenanceStorage::new(
+        storage.clone(),
+        space_id,
+        None,
+    )
+    .await?;
+    let result = atomic_graph::hygiene(&planning, storage, space_id).await?;
+    planning
+        .commit(
+            "run_entity_hygiene_sweep",
+            space_id,
+            &serde_json::json!({"space":space_id}),
+            &result,
+        )
+        .await?;
     Ok(result)
 }
 
+#[cfg(test)]
 async fn run_assertion_dedupe_sweep(
     storage: &elephant_storage::StorageClient,
     space_id: &str,
 ) -> Result<AssertionSweepResult, crate::error::PipelineError> {
-    if let Some(store) = storage.embedded_store() {
-        let space_id = space_id.to_string();
-        return Ok(store
-            .mutate(move |mutation| {
-                let mut by_slot: std::collections::BTreeMap<AssertionSlot, Vec<Assertion>> =
-                    std::collections::BTreeMap::new();
-                let mut result = AssertionSweepResult::default();
-
-                for assertion in mutation.scan::<Assertion>()? {
-                    if assertion.base.space_id != space_id
-                        || assertion.base.deleted_at.is_some()
-                        || assertion.resolution_status != ResolutionStatus::Resolved
-                    {
-                        continue;
-                    }
-                    result.scanned += 1;
-                    if let Some(slot) = AssertionSlot::from_assertion(&assertion) {
-                        by_slot.entry(slot).or_default().push(assertion);
-                    }
-                }
-
-                for mut assertions in by_slot.into_values().filter(|items| items.len() > 1) {
-                    assertions.sort_by(assertion_winner_order);
-                    let _winner = assertions.remove(0);
-                    result.duplicate_slots += 1;
-
-                    for mut duplicate in assertions {
-                        duplicate.resolution_status = ResolutionStatus::Superseded;
-                        duplicate.base.updated_at = chrono::Utc::now();
-                        let _ = mutation.replace(duplicate)?;
-                        result.superseded += 1;
-                    }
-                }
-
-                Ok(result)
-            })
-            .await?);
-    }
-
-    use elephant_storage::AssertionRepository;
-    let repo = AssertionRepository::new(storage.clone());
-    let mut by_slot: std::collections::BTreeMap<AssertionSlot, Vec<Assertion>> =
-        std::collections::BTreeMap::new();
-    let mut cursor: Option<RecordId> = None;
-    let mut result = AssertionSweepResult::default();
-
-    loop {
-        let page = repo.list(space_id, 500, cursor.as_ref()).await?;
-        if page.is_empty() {
-            break;
-        }
-        cursor = page.last().map(|assertion| assertion.base.id.clone());
-        for assertion in page {
-            if assertion.resolution_status != ResolutionStatus::Resolved {
-                continue;
-            }
-            result.scanned += 1;
-            if let Some(slot) = AssertionSlot::from_assertion(&assertion) {
-                by_slot.entry(slot).or_default().push(assertion);
-            }
-        }
-    }
-
-    for mut assertions in by_slot.into_values().filter(|items| items.len() > 1) {
-        assertions.sort_by(assertion_winner_order);
-        let _winner = assertions.remove(0);
-        result.duplicate_slots += 1;
-
-        for mut duplicate in assertions {
-            let duplicate_id = duplicate.base.id.clone();
-            duplicate.resolution_status = ResolutionStatus::Superseded;
-            duplicate.base.updated_at = chrono::Utc::now();
-            repo.update(space_id, &duplicate_id, duplicate).await?;
-            result.superseded += 1;
-        }
-    }
-
+    let planning = crate::maintenance_commit::PlanningTruthMaintenanceStorage::new(
+        storage.clone(),
+        space_id,
+        None,
+    )
+    .await?;
+    let result = atomic_graph::assertions(&planning, storage, space_id).await?;
+    planning
+        .commit(
+            "run_assertion_dedupe_sweep",
+            space_id,
+            &serde_json::json!({"space":space_id}),
+            &result,
+        )
+        .await?;
     Ok(result)
 }
 
+#[cfg(test)]
 async fn run_relationship_dedupe_sweep(
     storage: &elephant_storage::StorageClient,
     space_id: &str,
 ) -> Result<RelationshipSweepResult, crate::error::PipelineError> {
-    if let Some(store) = storage.embedded_store() {
-        let space_id = space_id.to_string();
-        return Ok(store
-            .mutate(move |mutation| {
-                let mut by_slot: std::collections::BTreeMap<RelationshipSlot, Vec<Rel>> =
-                    std::collections::BTreeMap::new();
-                let mut result = RelationshipSweepResult::default();
-
-                for rel in mutation.scan::<Rel>()? {
-                    if rel.base.space_id != space_id || rel.base.deleted_at.is_some() {
-                        continue;
-                    }
-                    result.scanned += 1;
-                    by_slot
-                        .entry(RelationshipSlot::from_rel(&rel))
-                        .or_default()
-                        .push(rel);
-                }
-
-                for mut rels in by_slot.into_values().filter(|rels| rels.len() > 1) {
-                    rels.sort_by(relationship_winner_order);
-                    let mut winner = rels.remove(0);
-                    result.duplicate_slots += 1;
-
-                    let mut evidence_keys: std::collections::HashSet<String> =
-                        winner.evidence.iter().map(evidence_identity_key).collect();
-
-                    for mut duplicate in rels {
-                        for evidence in &duplicate.evidence {
-                            if evidence_keys.insert(evidence_identity_key(evidence)) {
-                                winner.evidence.push(evidence.clone());
-                                result.evidence_added += 1;
-                            }
-                        }
-                        winner.confidence = winner.confidence.max(duplicate.confidence);
-                        winner.status = merged_claim_status(winner.status, duplicate.status);
-                        let now = chrono::Utc::now();
-                        duplicate.base.deleted_at = Some(now);
-                        duplicate.base.updated_at = now;
-                        let _ = mutation.replace(duplicate)?;
-                        result.merged += 1;
-                    }
-
-                    winner.base.updated_at = chrono::Utc::now();
-                    let _ = mutation.replace(winner)?;
-                }
-
-                Ok(result)
-            })
-            .await?);
-    }
-
-    let repo = RelRepository::new(storage.clone());
-    let mut by_slot: std::collections::BTreeMap<RelationshipSlot, Vec<Rel>> =
-        std::collections::BTreeMap::new();
-    let mut cursor: Option<RecordId> = None;
-    let mut result = RelationshipSweepResult::default();
-
-    loop {
-        let page = repo.list(space_id, 500, cursor.as_ref()).await?;
-        if page.is_empty() {
-            break;
-        }
-        result.scanned += page.len();
-        cursor = page.last().map(|rel| rel.base.id.clone());
-        for rel in page {
-            by_slot
-                .entry(RelationshipSlot::from_rel(&rel))
-                .or_default()
-                .push(rel);
-        }
-    }
-
-    for mut rels in by_slot.into_values().filter(|rels| rels.len() > 1) {
-        rels.sort_by(relationship_winner_order);
-        let mut winner = rels.remove(0);
-        result.duplicate_slots += 1;
-
-        let mut evidence_keys: std::collections::HashSet<String> =
-            winner.evidence.iter().map(evidence_identity_key).collect();
-
-        for duplicate in rels {
-            for evidence in duplicate.evidence {
-                if evidence_keys.insert(evidence_identity_key(&evidence)) {
-                    winner.evidence.push(evidence);
-                    result.evidence_added += 1;
-                }
-            }
-            winner.confidence = winner.confidence.max(duplicate.confidence);
-            winner.status = merged_claim_status(winner.status, duplicate.status);
-            repo.delete(space_id, &duplicate.base.id).await?;
-            result.merged += 1;
-        }
-
-        let winner_id = winner.base.id.clone();
-        repo.update(space_id, &winner_id, winner).await?;
-    }
-
+    let planning = crate::maintenance_commit::PlanningTruthMaintenanceStorage::new(
+        storage.clone(),
+        space_id,
+        None,
+    )
+    .await?;
+    let result = atomic_graph::relationships(&planning, storage, space_id).await?;
+    planning
+        .commit(
+            "run_relationship_dedupe_sweep",
+            space_id,
+            &serde_json::json!({"space":space_id}),
+            &result,
+        )
+        .await?;
     Ok(result)
 }
 
@@ -1480,128 +976,73 @@ fn should_retire_entity_label(entity: &Entity) -> bool {
     is_non_entity_composite_label(label) || canonical_scalar_slot_value(label).is_some()
 }
 
-/// Scans graph records for predicates, registers any unregistered ones, then
-/// runs the embedding-backed predicate hygiene worker.
+async fn prepare_predicate_sweep(
+    planning: &crate::maintenance_commit::PlanningTruthMaintenanceStorage,
+    storage: &elephant_storage::StorageClient,
+    space_id: &str,
+    provider: &dyn EmbeddingProvider,
+    work_run: Option<&RecordId>,
+) -> crate::PipelineResult<PredicateSweepResult> {
+    let mut result = atomic_graph::predicates(planning, storage, space_id).await?;
+    let hygiene = predicate_hygiene::prepare_predicate_hygiene_sweep(
+        planning,
+        storage,
+        space_id,
+        &PredicateHygieneConfig::default(),
+        provider,
+        work_run,
+    )
+    .await?;
+    result.scanned = hygiene.predicates_scanned;
+    result.aliases_created = hygiene.aliases_created;
+    result.proposals_created = hygiene.proposals_created;
+    Ok(result)
+}
+
+#[cfg(test)]
 async fn run_predicate_sweep(
     storage: &elephant_storage::StorageClient,
     space_id: &str,
-    embedding_provider: &dyn EmbeddingProvider,
-) -> PredicateSweepResult {
-    let mut result = sync_predicate_registry_from_graph(storage, space_id).await;
-
-    let hygiene_config = PredicateHygieneConfig::default();
-    match predicate_hygiene::execute_predicate_hygiene_sweep(
-        storage,
+    provider: &dyn EmbeddingProvider,
+) -> crate::PipelineResult<PredicateSweepResult> {
+    let planning = crate::maintenance_commit::PlanningTruthMaintenanceStorage::new(
+        storage.clone(),
         space_id,
-        &hygiene_config,
-        embedding_provider,
+        None,
     )
-    .await
-    {
-        Ok(hygiene) => {
-            result.scanned = hygiene.predicates_scanned;
-            result.aliases_created = hygiene.aliases_created;
-            result.proposals_created = hygiene.proposals_created;
-        }
-        Err(e) => {
-            tracing::warn!("Predicate hygiene sweep failed: {e}");
-        }
-    }
-
-    result
+    .await?;
+    let result = prepare_predicate_sweep(&planning, storage, space_id, provider, None).await?;
+    planning.audit_pending_effects("predicate_sweep").await?;
+    planning
+        .commit("predicate_sweep", space_id, &serde_json::json!({}), &result)
+        .await?;
+    Ok(result)
 }
 
-/// Scans assertions and relationships for predicates and registers any unregistered ones
-/// in the predicate registry. This ensures the registry stays in sync with
-/// what extraction and direct graph write paths actually produce.
+#[cfg(test)]
 async fn sync_predicate_registry_from_graph(
     storage: &elephant_storage::StorageClient,
     space_id: &str,
-) -> PredicateSweepResult {
-    use elephant_storage::{
-        AssertionRepository, PredicateRegistryRepository, RelRepository, Repository,
-    };
-
-    let assertion_repo = AssertionRepository::new(storage.clone());
-    let predicate_repo = PredicateRegistryRepository::new(storage.clone());
-    let rel_repo = RelRepository::new(storage.clone());
-
-    let mut result = PredicateSweepResult::default();
-    let mut seen = std::collections::HashSet::new();
-
-    // Load recent assertions to discover predicates in use
-    let assertions = match assertion_repo.list(space_id, 200, None).await {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::warn!("Predicate sweep: failed to load assertions: {e}");
-            return result;
-        }
-    };
-
-    for assertion in &assertions {
-        let predicate = assertion.predicate_raw.trim();
-        if !predicate.is_empty() {
-            seen.insert(predicate.to_string());
-        }
-    }
-
-    let rels = match rel_repo.list(space_id, 1000, None).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("Predicate sweep: failed to load relationships: {e}");
-            Vec::new()
-        }
-    };
-
-    for rel in &rels {
-        let predicate = rel.rel_type.trim();
-        if !predicate.is_empty() {
-            seen.insert(predicate.to_string());
-        }
-    }
-    result.scanned = seen.len();
-
-    // Register any that don't exist in the registry
-    for predicate_id in &seen {
-        let exists = predicate_repo
-            .find_by_predicate_id(space_id, predicate_id)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-
-        if !exists {
-            let registry_entry = elephant_types::records::predicate::PredicateRegistry {
-                base: elephant_types::records::base::BaseFields::new(
-                    elephant_types::ids::RecordId::new_v4(
-                        elephant_types::ids::TableName::PredicateRegistry,
-                    ),
-                    space_id.to_string(),
-                    "maintenance_worker".to_string(),
-                ),
-                predicate_id: predicate_id.to_string(),
-                description: None,
-                status: "active".to_string(),
-                semantics: None,
-                semantics_status: elephant_types::records::predicate::SemanticsStatus::Default,
-                first_seen_at: None,
-                usage_count: 0,
-                last_used_at: None,
-            };
-
-            match predicate_repo.create(registry_entry).await {
-                Ok(_) => {
-                    result.registered += 1;
-                    tracing::debug!(predicate_id, "Registered new predicate from assertions");
-                }
-                Err(e) => {
-                    tracing::debug!(predicate_id, error = %e, "Failed to register predicate (may already exist)");
-                }
-            }
-        }
-    }
-
-    result
+) -> crate::PipelineResult<PredicateSweepResult> {
+    let planning = crate::maintenance_commit::PlanningTruthMaintenanceStorage::new(
+        storage.clone(),
+        space_id,
+        None,
+    )
+    .await?;
+    let result = atomic_graph::predicates(&planning, storage, space_id).await?;
+    planning
+        .audit_pending_effects("predicate_registry_sync")
+        .await?;
+    planning
+        .commit(
+            "predicate_registry_sync",
+            space_id,
+            &serde_json::json!({}),
+            &result,
+        )
+        .await?;
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1615,7 +1056,7 @@ mod tests {
     };
     use elephant_types::ids::{RecordId, TableName};
     use elephant_types::records::assertion::EvidenceSpan;
-    use elephant_types::records::base::{BaseFields, Provenance, Security, SubjectsState};
+    use elephant_types::records::base::{BaseFields, Provenance, SubjectsState};
     use elephant_types::records::entity::{Entity, EntityType};
     use elephant_types::records::predicate::{PredicateRegistry, SemanticsStatus};
     use elephant_types::records::rel::{EvidenceRef, Rel, TimeBasis};
@@ -1667,22 +1108,37 @@ mod tests {
         }
     }
 
-    async fn setup_storage() -> StorageClient {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage
-            .query(
-                r"
-                DEFINE TABLE assertion SCHEMALESS;
-                DEFINE TABLE predicate_registry SCHEMALESS;
-                DEFINE TABLE predicate_alias SCHEMALESS;
-                DEFINE TABLE entity SCHEMALESS;
-                DEFINE TABLE rel SCHEMALESS;
-                DEFINE TABLE work_artifact SCHEMALESS;
-                ",
-            )
+    async fn setup_backend(space: &str, embedded: bool) -> StorageClient {
+        let storage = if embedded {
+            StorageClient::new_embedded().await.expect("storage")
+        } else {
+            let client = StorageClient::new_memory().await.expect("storage");
+            elephant_migrations::apply_schema(&client)
+                .await
+                .expect("schema");
+            client
+        };
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    space.into(),
+                    "test".into(),
+                ),
+                embedding_provider: "unconfigured".into(),
+                embedding_model: "unconfigured".into(),
+                embedding_dims: 3,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
             .await
-            .expect("schema");
+            .expect("space config");
         storage
+    }
+
+    async fn setup_storage(space: &str) -> StorageClient {
+        setup_backend(space, false).await
     }
 
     async fn insert_predicate(
@@ -1712,15 +1168,26 @@ mod tests {
     }
 
     fn test_entity(space_id: &str, name: &str, entity_type: &str) -> Entity {
-        Entity::new(
-            BaseFields::new(
-                RecordId::new_v4(TableName::Entity),
-                space_id.to_string(),
-                "maintenance_test".to_string(),
-            ),
-            EntityType::new(entity_type),
-            name.to_string(),
-        )
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::Entity),
+            space_id.into(),
+            "maintenance_test".into(),
+        );
+        base.subjects_state = SubjectsState::Complete;
+        Entity::new(base, EntityType::new(entity_type), name.into())
+    }
+
+    async fn persist_test_endpoints(storage: &StorageClient, space: &str) -> (RecordId, RecordId) {
+        let repo = EntityRepository::new(storage.clone());
+        let subject = repo
+            .create(test_entity(space, "Alice", "person"))
+            .await
+            .expect("actual subject");
+        let object = repo
+            .create(test_entity(space, "Acme", "organization"))
+            .await
+            .expect("actual object");
+        (subject.base.id, object.base.id)
     }
 
     fn test_rel(
@@ -1736,7 +1203,6 @@ mod tests {
             space_id.to_string(),
             "maintenance_test".to_string(),
         );
-        base.security = Security::default();
         base.provenance = Provenance::default();
         base.subjects = vec![Link::new(subject_id.clone())];
         base.subjects_state = SubjectsState::Complete;
@@ -1749,18 +1215,9 @@ mod tests {
             status,
             confidence,
             validity_window: None,
-            evidence: vec![EvidenceRef {
-                assertion: Link::new(RecordId::new_v4(TableName::Assertion)),
-                span: EvidenceSpan {
-                    revision: Link::new(RecordId::new_v4(TableName::DocRevision)),
-                    node: None,
-                    start: 0,
-                    end: 20,
-                    quote_hash: "sha256:test".to_string(),
-                },
-                time_basis: TimeBasis::ObservedAt,
-                time_value: chrono::Utc::now(),
-            }],
+            // Independently authored relationship; evidence is added only by
+            // tests that persist the actual supporting assertion.
+            evidence: vec![],
             temporal_audit: None,
         }
     }
@@ -1778,7 +1235,6 @@ mod tests {
             space_id.to_string(),
             "maintenance_test".to_string(),
         );
-        base.security = Security::default();
         base.provenance = Provenance::default();
         base.subjects = vec![Link::new(subject_id.clone()), Link::new(object_id.clone())];
         base.subjects_state = SubjectsState::Complete;
@@ -1823,8 +1279,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_predicate_sync_registers_relationship_predicates() {
-        let storage = setup_storage().await;
         let space_id = "maintenance_predicate_rel_space";
+        let storage = setup_storage(space_id).await;
         let entity_repo = EntityRepository::new(storage.clone());
         let rel_repo = RelRepository::new(storage.clone());
 
@@ -1849,7 +1305,9 @@ mod tests {
             .await
             .expect("create relationship");
 
-        let result = sync_predicate_registry_from_graph(&storage, space_id).await;
+        let result = sync_predicate_registry_from_graph(&storage, space_id)
+            .await
+            .expect("sync");
         assert_eq!(result.scanned, 1);
         assert_eq!(result.registered, 1);
 
@@ -1862,8 +1320,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_entity_hygiene_retires_non_entity_source_fragments() {
-        let storage = setup_storage().await;
         let space_id = "maintenance_entity_hygiene_space";
+        let storage = setup_storage(space_id).await;
         let entity_repo = EntityRepository::new(storage.clone());
         let rel_repo = RelRepository::new(storage.clone());
         let assertion_repo = AssertionRepository::new(storage.clone());
@@ -2087,8 +1545,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_entity_hygiene_repoints_merged_entity_references() {
-        let storage = setup_storage().await;
         let space_id = "maintenance_merged_reference_hygiene_space";
+        let storage = setup_storage(space_id).await;
         let entity_repo = EntityRepository::new(storage.clone());
         let rel_repo = RelRepository::new(storage.clone());
         let assertion_repo = AssertionRepository::new(storage.clone());
@@ -2157,8 +1615,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_predicate_sweep_runs_hygiene_not_only_registry_sync() {
-        let storage = setup_storage().await;
         let space_id = "maintenance_predicate_hygiene_space";
+        let storage = setup_storage(space_id).await;
         insert_predicate(
             &storage,
             space_id,
@@ -2181,7 +1639,9 @@ mod tests {
             ("Employment relationship", vec![1.0, 0.0, 0.0]),
         ]);
 
-        let result = run_predicate_sweep(&storage, space_id, &provider).await;
+        let result = run_predicate_sweep(&storage, space_id, &provider)
+            .await
+            .expect("predicate sweep");
 
         assert_eq!(result.scanned, 2);
         assert_eq!(result.aliases_created, 0);
@@ -2205,13 +1665,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_relationship_dedupe_merges_exact_slot_evidence() {
-        let storage = setup_storage().await;
         let space_id = "maintenance_rel_dedupe_space";
+        let storage = setup_storage(space_id).await;
         let rel_repo = RelRepository::new(storage.clone());
-        let subject_id = RecordId::new_v4(TableName::Entity);
-        let object_id = RecordId::new_v4(TableName::Entity);
+        let (subject_id, object_id) = persist_test_endpoints(&storage, space_id).await;
 
-        let candidate = test_rel(
+        let mut candidate = test_rel(
             space_id,
             &subject_id,
             &object_id,
@@ -2219,7 +1678,7 @@ mod tests {
             ClaimStatus::Candidate,
             0.7,
         );
-        let approved = test_rel(
+        let mut approved = test_rel(
             space_id,
             &subject_id,
             &object_id,
@@ -2236,6 +1695,29 @@ mod tests {
             0.8,
         );
 
+        for row in [&mut candidate, &mut approved] {
+            let mut support = test_assertion(
+                space_id,
+                &subject_id,
+                &object_id,
+                "attends",
+                1.0,
+                row.confidence,
+            );
+            support.base.security = row.base.security.clone();
+            support.base.subjects = row.base.subjects.clone();
+            support.base.subjects_state = row.base.subjects_state;
+            support = AssertionRepository::new(storage.clone())
+                .create(support)
+                .await
+                .expect("actual support");
+            row.evidence.push(EvidenceRef {
+                assertion: Link::new(support.base.id.clone()),
+                span: support.evidence,
+                time_basis: TimeBasis::ObservedAt,
+                time_value: support.observed_at,
+            });
+        }
         rel_repo.create(candidate).await.expect("create candidate");
         rel_repo.create(approved).await.expect("create approved");
         rel_repo
@@ -2271,8 +1753,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_assertion_dedupe_supersedes_resolved_duplicate_slots() {
-        let storage = setup_storage().await;
         let space_id = "maintenance_assertion_dedupe_space";
+        let storage = setup_storage(space_id).await;
         let assertion_repo = AssertionRepository::new(storage.clone());
         let subject_id = RecordId::new_v4(TableName::Entity);
         let object_id = RecordId::new_v4(TableName::Entity);
@@ -2345,8 +1827,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_assertion_dedupe_matches_scalar_entity_and_literal_objects() {
-        let storage = setup_storage().await;
         let space_id = "maintenance_assertion_scalar_dedupe_space";
+        let storage = setup_storage(space_id).await;
         let assertion_repo = AssertionRepository::new(storage.clone());
         let subject_id = RecordId::new_v4(TableName::Entity);
         let object_id = RecordId::new_v4(TableName::Entity);
@@ -2375,6 +1857,9 @@ mod tests {
         literal_object.object_text = None;
         literal_object.object_literal = Some(serde_json::json!("66.40.184.65"));
         literal_object.object_entity_type = None;
+        // Scalar representations may dedupe only inside the same authorization
+        // partition; the object shape must not accidentally change that scope.
+        literal_object.base.subjects = entity_object.base.subjects.clone();
 
         let mut real_entity = test_assertion(
             space_id,
@@ -2440,8 +1925,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_entity_embedding_sweep_embeds_then_skips_unchanged() {
-        let storage = setup_storage().await;
         let space_id = "maintenance_embedding_space";
+        let storage = setup_storage(space_id).await;
         let repo = EntityRepository::new(storage.clone());
 
         let mut researcher = test_entity(space_id, "Riley Kim", "person");
@@ -2521,5 +2006,443 @@ mod tests {
             "dims change re-embeds despite unchanged model string: {result:?}"
         );
         assert_eq!(result.skipped, 0);
+    }
+    #[tokio::test]
+    async fn semantic_phases_roll_back_together_after_late_transaction_fault() {
+        use crate::maintenance_commit::PlanningTruthMaintenanceStorage;
+        use elephant_storage::canonical_commit::{
+            CanonicalEffect, CanonicalRecord, CanonicalRepository,
+        };
+        for embedded in [true, false] {
+            let space = "maintenance_atomic_fault";
+            let storage = setup_backend(space, embedded).await;
+            let entities = EntityRepository::new(storage.clone());
+            let invalid = entities
+                .create(test_entity(space, "15:30", "topic"))
+                .await
+                .expect("invalid label");
+            let collision = entities
+                .create(test_entity(space, "Existing Person", "person"))
+                .await
+                .expect("collision");
+            let (subject, object) = persist_test_endpoints(&storage, space).await;
+            let rels = RelRepository::new(storage.clone());
+            for confidence in [0.7, 0.9] {
+                rels.create(test_rel(
+                    space,
+                    &subject,
+                    &object,
+                    "knows",
+                    ClaimStatus::Candidate,
+                    confidence,
+                ))
+                .await
+                .expect("rel");
+            }
+            let planning = PlanningTruthMaintenanceStorage::new(storage.clone(), space, None)
+                .await
+                .expect("capture");
+            assert_eq!(
+                atomic_graph::hygiene(&planning, &storage, space)
+                    .await
+                    .expect("hygiene")
+                    .retired,
+                1
+            );
+            assert_eq!(
+                atomic_graph::relationships(&planning, &storage, space)
+                    .await
+                    .expect("dedupe")
+                    .merged,
+                1
+            );
+            assert_eq!(
+                atomic_graph::predicates(&planning, &storage, space)
+                    .await
+                    .expect("registry")
+                    .registered,
+                1
+            );
+            planning
+                .audit_pending_effects("run_maintenance_sweep")
+                .await
+                .expect("audits");
+            assert_eq!(
+                entities.get(space, &invalid.base.id).await.expect("read"),
+                Some(invalid.clone())
+            );
+            assert_eq!(rels.list(space, 10, None).await.expect("rels").len(), 2);
+            assert!(PredicateRegistryRepository::new(storage.clone())
+                .list(space, 10, None)
+                .await
+                .expect("registry")
+                .is_empty());
+            let mut request = planning
+                .prepare_request("run_maintenance_sweep", space, &serde_json::json!({}), &())
+                .await
+                .expect("request");
+            let key = request.commit_id.clone();
+            request.plan.effects.push(CanonicalEffect {
+                before: None,
+                after: Some(CanonicalRecord::Entity(Box::new(collision))),
+            });
+            assert!(CanonicalRepository::new(storage.clone())
+                .commit(request)
+                .await
+                .is_err());
+            assert_eq!(
+                entities.get(space, &invalid.base.id).await.expect("read"),
+                Some(invalid)
+            );
+            assert_eq!(rels.list(space, 10, None).await.expect("rels").len(), 2);
+            assert!(PredicateRegistryRepository::new(storage.clone())
+                .list(space, 10, None)
+                .await
+                .expect("registry")
+                .is_empty());
+            assert!(elephant_storage::AuditLogRepository::new(storage.clone())
+                .list(space, 10, None)
+                .await
+                .expect("audit")
+                .is_empty());
+            assert!(
+                elephant_storage::SystemEventRepository::new(storage.clone())
+                    .list(space, 10, None)
+                    .await
+                    .expect("outbox")
+                    .is_empty()
+            );
+            assert!(CanonicalRepository::new(storage)
+                .receipt(space, &key)
+                .await
+                .expect("receipt")
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn dedupe_never_collapses_distinct_security_or_subject_partitions() {
+        use crate::maintenance_commit::PlanningTruthMaintenanceStorage;
+        for embedded in [true, false] {
+            let space = "maintenance_partitions";
+            let storage = setup_backend(space, embedded).await;
+            let (subject, object) = persist_test_endpoints(&storage, space).await;
+            let mut first = test_rel(
+                space,
+                &subject,
+                &object,
+                "knows",
+                ClaimStatus::Approved,
+                0.9,
+            );
+            let mut second = first.clone();
+            second.base.id = RecordId::new_v4(TableName::Rel);
+            second.base.security.level = 2;
+            let mut third = first.clone();
+            third.base.id = RecordId::new_v4(TableName::Rel);
+            third.base.subjects.push(Link::new(object));
+            first.base.security.labels = vec!["restricted".into()];
+            let repo = RelRepository::new(storage.clone());
+            for row in [first, second, third] {
+                repo.create(row).await.expect("create");
+            }
+            let planning = PlanningTruthMaintenanceStorage::new(storage.clone(), space, None)
+                .await
+                .expect("capture");
+            let result = atomic_graph::relationships(&planning, &storage, space)
+                .await
+                .expect("prepare");
+            assert_eq!(result.scanned, 3);
+            assert_eq!(result.merged, 0);
+            assert!(planning.prepared_plan().expect("plan").effects.is_empty());
+            assert_eq!(repo.list(space, 10, None).await.expect("rows").len(), 3);
+        }
+    }
+    #[tokio::test]
+    async fn relationship_dedupe_retains_distinct_validity_windows() {
+        use crate::maintenance_commit::PlanningTruthMaintenanceStorage;
+        for embedded in [true, false] {
+            let space = "maintenance_temporal_partitions";
+            let storage = setup_backend(space, embedded).await;
+            let (subject, object) = persist_test_endpoints(&storage, space).await;
+            let repo = RelRepository::new(storage.clone());
+            for days in [1, 2] {
+                let mut rel = test_rel(
+                    space,
+                    &subject,
+                    &object,
+                    "works_at",
+                    ClaimStatus::Approved,
+                    0.9,
+                );
+                rel.validity_window = Some(elephant_types::records::rel::ValidityWindow {
+                    start: Some(chrono::Utc::now() - chrono::Duration::days(days)),
+                    end: None,
+                });
+                repo.create(rel)
+                    .await
+                    .expect("actual temporal relationship");
+            }
+            let originals = repo.list(space, 10, None).await.expect("originals");
+            let planning = PlanningTruthMaintenanceStorage::new(storage.clone(), space, None)
+                .await
+                .expect("capture");
+            let result = atomic_graph::relationships(&planning, &storage, space)
+                .await
+                .expect("prepare");
+            assert_eq!(result.scanned, 2);
+            assert_eq!(result.merged, 0);
+            assert!(planning.prepared_plan().expect("plan").effects.is_empty());
+            assert_eq!(
+                repo.list(space, 10, None).await.expect("unchanged"),
+                originals
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn active_whole_sweep_commits_hygiene_dedupe_registry_and_audits() {
+        for embedded in [true, false] {
+            let space = "maintenance_whole_active";
+            let storage = setup_backend(space, embedded).await;
+            let invalid = EntityRepository::new(storage.clone())
+                .create(test_entity(space, "15:30", "topic"))
+                .await
+                .expect("entity");
+            let (subject, object) = persist_test_endpoints(&storage, space).await;
+            let rels = RelRepository::new(storage.clone());
+            for confidence in [0.7, 0.9] {
+                rels.create(test_rel(
+                    space,
+                    &subject,
+                    &object,
+                    "knows",
+                    ClaimStatus::Candidate,
+                    confidence,
+                ))
+                .await
+                .expect("rel");
+            }
+            // No candidate pairs and one predicate: the actual orchestration
+            // executes without any model or network work.
+            let config = MaintenanceConfig {
+                max_candidates_per_sweep: 0,
+                ..Default::default()
+            };
+            let result = run_maintenance_sweep(
+                &storage,
+                space,
+                &config,
+                &ControlledEmbeddingProvider::new(vec![]),
+            )
+            .await
+            .expect("whole sweep");
+            assert_eq!(result.entity_hygiene.retired, 1);
+            assert_eq!(result.relationships.merged, 1);
+            assert_eq!(result.predicate.registered, 1);
+            assert!(EntityRepository::new(storage.clone())
+                .get(space, &invalid.base.id)
+                .await
+                .expect("retired")
+                .is_none());
+            assert_eq!(rels.list(space, 10, None).await.expect("rels").len(), 1);
+            assert_eq!(
+                PredicateRegistryRepository::new(storage.clone())
+                    .list(space, 10, None)
+                    .await
+                    .expect("registry")
+                    .len(),
+                1
+            );
+            assert!(!elephant_storage::AuditLogRepository::new(storage.clone())
+                .list(space, 10, None)
+                .await
+                .expect("audits")
+                .is_empty());
+            assert!(!elephant_storage::SystemEventRepository::new(storage)
+                .list(space, 10, None)
+                .await
+                .expect("outbox")
+                .is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn queued_sweep_binds_original_run_fence_and_captures_its_read_set() {
+        use crate::maintenance_commit::PlanningTruthMaintenanceStorage;
+        use elephant_types::records::{WorkItem, WorkItemStatus, WorkRun, WorkRunMetrics};
+        for embedded in [true, false] {
+            let space = "maintenance_original_run";
+            let storage = setup_backend(space, embedded).await;
+            let entities = EntityRepository::new(storage.clone());
+            let original = entities
+                .create(test_entity(space, "15:30", "topic"))
+                .await
+                .expect("original");
+            let base =
+                |table| BaseFields::new(RecordId::new_v4(table), space.into(), "oracle".into());
+            let work_repo = elephant_storage::WorkItemRepository::new(storage.clone());
+            let work = work_repo
+                .create(WorkItem {
+                    base: base(TableName::WorkItem),
+                    kind: "maintenance_sweep".into(),
+                    payload: serde_json::json!({}),
+                    status: WorkItemStatus::Runnable,
+                    priority: 1,
+                    idempotency_key: "original-sweep".into(),
+                    attempts: 0,
+                    lease_expires_at: None,
+                    leased_by: None,
+                    run_after: None,
+                    last_error: None,
+                })
+                .await
+                .expect("work");
+            let claimed = work_repo
+                .claim_with_lease(
+                    space,
+                    &work.base.id,
+                    "sweep-oracle",
+                    chrono::Utc::now() + chrono::Duration::minutes(5),
+                )
+                .await
+                .expect("claim")
+                .expect("claimed");
+            let fence = elephant_storage::work_attempt_repository::fence_from_claim(&claimed)
+                .expect("fence");
+            let mut metrics = WorkRunMetrics::default();
+            metrics.custom.insert(
+                "attempt_fence".into(),
+                serde_json::to_value(&fence).expect("encode"),
+            );
+            let runs = elephant_storage::WorkRunRepository::new(storage.clone());
+            let run = runs
+                .create(WorkRun {
+                    base: base(TableName::WorkRun),
+                    work_item: Link::new(work.base.id),
+                    attempt: claimed.attempts,
+                    started_at: chrono::Utc::now(),
+                    completed_at: None,
+                    success: false,
+                    error: None,
+                    metrics,
+                    worker_id: fence.lease_token.clone(),
+                    worker_version: "oracle".into(),
+                    model_version: None,
+                    prompt_id: None,
+                    config_hash: None,
+                })
+                .await
+                .expect("actual run");
+            let config = MaintenanceConfig {
+                max_candidates_per_sweep: 0,
+                ..Default::default()
+            };
+            let provider = ControlledEmbeddingProvider::new(vec![]);
+            for missing in [true, false] {
+                let mut changed = run.clone();
+                if missing {
+                    changed.metrics.custom.remove("attempt_fence");
+                } else {
+                    let mut other = fence.clone();
+                    other.lease_token = "another-original-claim".into();
+                    changed.metrics.custom.insert(
+                        "attempt_fence".into(),
+                        serde_json::to_value(other).expect("encode"),
+                    );
+                }
+                runs.update(space, &run.base.id, changed)
+                    .await
+                    .expect("change run");
+                let result = Box::pin(run_maintenance_sweep_with_attempt(
+                    &storage,
+                    space,
+                    &config,
+                    &provider,
+                    Some(fence.clone()),
+                    Some(&run.base.id),
+                ))
+                .await;
+                assert!(
+                    matches!(result, Err(crate::PipelineError::InvalidState(_))),
+                    "{result:?}"
+                );
+                assert_eq!(
+                    entities
+                        .get(space, &original.base.id)
+                        .await
+                        .expect("unchanged"),
+                    Some(original.clone())
+                );
+                assert!(elephant_storage::AuditLogRepository::new(storage.clone())
+                    .list(space, 10, None)
+                    .await
+                    .expect("audits")
+                    .is_empty());
+            }
+            let current = runs
+                .update(space, &run.base.id, run.clone())
+                .await
+                .expect("restore real run");
+            let planning =
+                PlanningTruthMaintenanceStorage::new(storage.clone(), space, Some(fence.clone()))
+                    .await
+                    .expect("capture");
+            capture_maintenance_run(&planning, &storage, space, &fence, &run.base.id)
+                .await
+                .expect("bind original");
+            assert!(planning
+                .prepared_plan()
+                .expect("plan")
+                .dependencies
+                .iter()
+                .any(|row| row.base().id == run.base.id));
+            let mut after = original.clone();
+            after.display_name = "Changed".into();
+            planning
+                .stage(Some(original.clone()), after)
+                .expect("stage");
+            let mut raced = current;
+            raced
+                .metrics
+                .custom
+                .insert("changed_after_capture".into(), serde_json::json!(true));
+            runs.update(space, &run.base.id, raced)
+                .await
+                .expect("concurrent run update");
+            assert!(Box::pin(planning.commit(
+                "maintenance_run_oracle",
+                space,
+                &serde_json::json!({}),
+                &()
+            ))
+            .await
+            .is_err());
+            assert_eq!(
+                entities
+                    .get(space, &original.base.id)
+                    .await
+                    .expect("unchanged after race"),
+                Some(original.clone())
+            );
+            runs.update(space, &run.base.id, run.clone())
+                .await
+                .expect("restore original");
+            let result = Box::pin(run_maintenance_sweep_with_attempt(
+                &storage,
+                space,
+                &config,
+                &provider,
+                Some(fence),
+                Some(&run.base.id),
+            ))
+            .await
+            .expect("actual queued sweep");
+            assert_eq!(result.entity_hygiene.retired, 1);
+            assert!(entities
+                .get(space, &original.base.id)
+                .await
+                .expect("retired")
+                .is_none());
+        }
     }
 }

@@ -34,6 +34,45 @@ For a sequence with prerequisites and completion checks, follow
 
 ---
 
+## Versioned sources and scoped retrieval
+
+All these tools use the explicitly selected named space. Their permission and
+record-security checks remain independent of profile membership. Source PUT is
+an HTTP operation; retained MCP ingest adapters keep their own input contracts.
+
+### search_scoped
+**Profiles:** D, A, M, F
+
+Search with `query`, optional `limit` (1-50), explicit `ranking_mode`
+(`lexical`, `semantic`, `hybrid`), and optional `source_revision_constraints`.
+Returns `results`, `coverage`, `partial` and source-backed evidence.
+See [scoped retrieval](/guides/searching#search-an-exact-source-revision).
+
+### get_source_head
+**Profiles:** D, A, M, F
+
+Requires `external_source_id`. Returns current generation, desired/published
+revision, lifecycle and cleanup state under `read:source` authorization.
+
+### get_source_operation
+**Profiles:** D, A, M, F
+
+Requires the original `operation_id`. Returns that durable operation's state
+without substituting the current head's outcome.
+
+### retract_source
+**Profiles:** F
+
+Requires `external_source_id`, `expected_generation`; optional `idempotency_key`.
+Withdraws source support under `read:source` and `write:source` authorization.
+
+### erase_source
+**Profiles:** F
+
+Uses the same generation-bound arguments as retract. Physical cleanup and the
+independent recovery journal govern completion. Ordinary retry cannot recreate
+the erased source. See [source lifecycles](/api/sources#versioned-source-ingestion).
+
 ## Documents and local ingestion
 
 ### search_docs
@@ -272,10 +311,13 @@ reads client-side UTF-8 text and has a separate schema.
 | --- | --- | --- |
 | `path` | string; required | File path on disk |
 | `source_type` | string; optional | Content type hint (auto-detected from extension) |
+| `intake` | object; optional for creation; required for changed content | Explicit `revision_id`, `idempotency_key` and `expected_generation` for replacement |
 
 ```json
 { "path": "/ingest/doc.md" }
 ```
+
+A replacement uses the same source identity and preserves its security and subject restrictions. Supply all three fields under `intake` for changed content; Recall does not obtain the latest generation on the caller's behalf. Reusing the original intent key returns its original operation. File identity uses the canonical locator, so equal basenames in different directories remain distinct.
 
 ---
 
@@ -291,10 +333,31 @@ two filesystem boundaries.
 | `path` | string; required | Directory path on disk |
 | `pattern` | string; optional | Glob pattern (default: `**/*`) |
 | `source_type` | string; optional | Content type hint for all files |
+| `intake_by_path` | object; optional | Per-file revision, idempotency key and expected generation, keyed by normalized relative path |
 
 ```json
 { "path": "/path/to/docs", "pattern": "*.md" }
 ```
+
+For explicit replacements, use the exact relative paths returned by this tool:
+
+```json
+{
+  "path": "/path/to/docs",
+  "pattern": "**/*.md",
+  "intake_by_path": {
+    "daily/note.md": {
+      "revision_id": "notes-v2",
+      "idempotency_key": "notes-v2",
+      "expected_generation": "opaque-generation-from-prior-receipt"
+    }
+  }
+}
+```
+
+The map is limited to 1024 entries and 1,000,000 encoded UTF-8 bytes; each path key is at most 4096 bytes. Keys use forward slashes and must name selected files. Absolute paths, parent/dot segments, repeated separators and backslashes are invalid. The full map is validated before any file is accepted.
+
+Each successful `ingested` entry includes `path`, immutable `doc_id`, its original `operation` and nullable `work_item_id`. Unmapped changed files report a generation conflict. Stable intent keys replay original operations. Batches retain per-item outcomes, but a temporary erasure reservation aborts with retryable `not_ready`; files already accepted remain durable.
 
 ---
 
@@ -307,10 +370,13 @@ Fetch a URL and ingest its content. Text, image, and video URLs are normalized i
 | --- | --- | --- |
 | `url` | string; required | HTTP/HTTPS URL to fetch |
 | `source_type` | string; optional | Content type hint (overrides response header) |
+| `intake` | object; optional for creation; required for changed content | Explicit `revision_id`, `idempotency_key` and `expected_generation` for replacement |
 
 ```json
 { "url": "https://example.com/doc.txt" }
 ```
+
+Changed content at the same URL requires `intake.revision_id`, `intake.idempotency_key` and the exact `intake.expected_generation` from the prior receipt. The existing source's security, subjects and provenance are retained and inherited by the generated document/media. URL ingestion requests graph processing; acceptance does not prove publication is complete.
 
 
 
@@ -1418,34 +1484,41 @@ List work items that are pending or runnable (ready to be claimed).
 ### claim_work_item
 **Profiles:** P, F
 
-Claim a runnable work item with a lease for processing.
+Claim a runnable work item with a lease for processing. The selected space must be explicit. Both `read:work_item` and `write:work_item`, plus clearance for the actual stored work item, are required.
 
 | Parameter | Type and requirement | Description |
 | --- | --- | --- |
 | `id` | string; required | Work item ID |
 | `worker_id` | string; required | Identifier of the claiming worker |
-| `lease_duration_secs` | integer; optional; default 300 | Lease duration in seconds |
+| `lease_duration_secs` | integer; optional; default 300 | Positive lease duration that fits a valid expiration timestamp |
 
 ```json
 { "id": "work_item:550e8400-e29b-41d4-a716-446655440000", "worker_id": "worker-1", "lease_duration_secs": 300 }
 ```
+
+The successful tool response contains `data.id`, `status`, `claimed: true`, `worker_id`, `lease_token` and `lease_expires_at`. Save the exact opaque `lease_token` from this claim for completion. A later claim by the same worker has a different token; the worker name does not authorize completion. A concurrent authority change or unavailable claim returns `conflict_generation` and requires reconciliation.
 
 ---
 
 ### complete_work_item
 **Profiles:** P, F
 
-Mark a work item as completed (success or failure).
+Finish the original claimed attempt as success or failure. Both `read:work_item` and `write:work_item`, plus current clearance for the actual stored item, are required.
 
 | Parameter | Type and requirement | Description |
 | --- | --- | --- |
 | `id` | string; required | Work item ID |
+| `lease_token` | string; required | Exact opaque token returned by the original successful claim |
 | `success` | boolean; optional; default true | Whether the work item succeeded |
 | `error` | string; optional | Error message if failed |
 
 ```json
-{ "id": "work_item:550e8400-e29b-41d4-a716-446655440000", "success": true }
+{ "id": "work_item:550e8400-e29b-41d4-a716-446655440000", "lease_token": "opaque-token-from-original-claim", "success": true }
 ```
+
+Missing, null or blank `lease_token` is `invalid_request`. A stale token, worker-name substitute, lost lease or changed observed authority is `conflict_generation`, with `retryable: false`; it cannot finish a successor attempt. A successful result contains `data.id`, terminal `status` and `completed: true`. Repeating completion after the attempt is terminal conflicts. Temporary source erasure refusal remains `not_ready`, with `retryable: true`.
+
+Existing clients must retain and echo the claim token. Recall does not infer a token from the latest stored lease.
 
 ---
 

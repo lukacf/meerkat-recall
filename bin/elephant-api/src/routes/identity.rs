@@ -5,7 +5,7 @@
 //! - GET /v1/identity/candidates - List pending identity candidates
 //! - POST /v1/identity/merge - Merge two entities
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
@@ -13,22 +13,19 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use elephant_extensions::load_runtime_reference_registry_from_env;
-use elephant_identity::apply_entity_merge_rewrites;
+use elephant_storage::canonical_commit::CanonicalRecord;
+use elephant_storage::public_mutation::{inherit_public_envelope, PublicMutation};
 use elephant_storage::{
     parse_id, EntityIdentityKeyRepository, EntityMergeRepository, EntityRepository,
     IdentityCandidateRepository, RelRepository, Repository, SearchCriteria, SearchRepository,
     StorageClient, SystemEventRepository,
 };
-use elephant_types::ids::{RecordId, TableName};
-use elephant_types::records::base::{BaseFields, Provenance, Security, SubjectsState};
-use elephant_types::records::{
-    Entity, EntityMerge, IdentityCandidate, MergeStrategy, Rel, SystemEvent,
-};
-use elephant_types::Link;
+use elephant_types::ids::TableName;
+use elephant_types::records::base::{Security, SubjectsState};
+use elephant_types::records::{Entity, IdentityCandidate, MergeStrategy};
 
 use crate::routes::entities::ApiError;
 
@@ -51,55 +48,6 @@ fn remove_nulls(value: &mut serde_json::Value) {
             }
         }
         _ => {}
-    }
-}
-
-fn merge_security(a: &Security, b: &Security) -> Security {
-    let mut merged = a.clone();
-    merged.level = merged.level.max(b.level);
-    merged.labels.extend(b.labels.iter().cloned());
-    merged.labels.sort();
-    merged.labels.dedup();
-    merged.handling.extend(b.handling.iter().cloned());
-    merged.handling.sort();
-    merged.handling.dedup();
-    merged
-}
-
-fn merge_json_values(a: &serde_json::Value, b: &serde_json::Value) -> serde_json::Value {
-    match (a, b) {
-        (serde_json::Value::Object(a_obj), serde_json::Value::Object(b_obj)) => {
-            let mut merged = a_obj.clone();
-            for (k, b_val) in b_obj {
-                match merged.get(k) {
-                    Some(a_val) => {
-                        let merged_val = merge_json_values(a_val, b_val);
-                        merged.insert(k.clone(), merged_val);
-                    }
-                    None => {
-                        merged.insert(k.clone(), b_val.clone());
-                    }
-                }
-            }
-            serde_json::Value::Object(merged)
-        }
-        (serde_json::Value::Array(a_arr), serde_json::Value::Array(b_arr)) => {
-            let mut merged = a_arr.clone();
-            merged.extend(b_arr.iter().cloned());
-            merged.sort_by_key(std::string::ToString::to_string);
-            merged.dedup();
-            serde_json::Value::Array(merged)
-        }
-        _ => {
-            if a == b {
-                a.clone()
-            } else {
-                let mut arr = vec![a.clone(), b.clone()];
-                arr.sort_by_key(std::string::ToString::to_string);
-                arr.dedup();
-                serde_json::Value::Array(arr)
-            }
-        }
     }
 }
 
@@ -209,6 +157,38 @@ async fn create_candidate(
     let mut candidate = req.candidate;
     candidate.base.space_id = require_space_id(&principal)?;
 
+    let mut mutation = PublicMutation::begin(state.storage.clone(), &candidate.base.space_id)
+        .await
+        .map_err(crate::public_error::legacy_storage_failure)?;
+    for id in [candidate.entity_a.id(), candidate.entity_b.id()] {
+        let entity = state
+            .entity_repo
+            .get(&candidate.base.space_id, id)
+            .await
+            .map_err(crate::public_error::legacy_storage_failure)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiError::not_found("Identity target", &id.to_string())),
+                )
+            })?;
+        state
+            .authz
+            .authorize_record_read(&principal, &entity, "read:entity")
+            .map_err(|error| {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(ApiError::validation(error.message)),
+                )
+            })?;
+        inherit_public_envelope(&mut candidate.base, &entity.base).map_err(|error| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::validation(error.to_string())),
+            )
+        })?;
+        mutation.depend_on(CanonicalRecord::Entity(Box::new(entity)));
+    }
     state
         .authz
         .authorize_record_write(&principal, &candidate, "write:entity")
@@ -237,7 +217,7 @@ async fn create_candidate(
             )
         })?;
 
-    match state.candidate_repo.create(candidate).await {
+    match mutation.create(candidate, &principal.subject).await {
         Ok(candidate) => {
             state
                 .authz
@@ -255,10 +235,7 @@ async fn create_candidate(
 
             Ok((StatusCode::CREATED, Json(candidate)))
         }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(error) => Err(crate::public_error::legacy_storage_failure(error)),
     }
 }
 
@@ -345,380 +322,93 @@ async fn list_candidates(
 
 /// POST /v1/identity/merge - Merge two entities.
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+#[expect(
+    clippy::result_large_err,
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn merge_entities(
     State(state): State<Arc<IdentityState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(req): Json<MergeRequest>,
 ) -> ApiResult<MergeResponse> {
-    let Some(space_id) = principal
-        .space_id
-        .clone()
-        .filter(|space_id| !space_id.is_empty())
-    else {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ApiError {
-                code: "FORBIDDEN".to_string(),
-                message: "Access denied: missing space_id".to_string(),
-                details: None,
-            }),
-        ));
+    use elephant_storage::entity_merge_repository::MergeSelection;
+    let space_id = require_space_id(&principal)?;
+    let parse = |value: &str| {
+        parse_id(value, TableName::Entity).map_err(super::source_intake::storage_error)
     };
-    let rid_a = parse_id(&req.entity_a, TableName::Entity).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiError::validation(e.to_string())),
-        )
-    })?;
-    let rid_b = parse_id(&req.entity_b, TableName::Entity).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiError::validation(e.to_string())),
-        )
-    })?;
-
-    // Verify both entities exist
-    let entity_a = match state.entity_repo.get(&space_id, &rid_a).await {
-        Ok(Some(e)) => e,
-        Ok(None) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ApiError::not_found("Entity A", &req.entity_a)),
-            ))
-        }
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            ))
-        }
-    };
-
-    let entity_b = match state.entity_repo.get(&space_id, &rid_b).await {
-        Ok(Some(e)) => e,
-        Ok(None) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ApiError::not_found("Entity B", &req.entity_b)),
-            ))
-        }
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            ))
-        }
-    };
-
-    // Enforce tenant invariants (docs/spec.md §7.1).
-    if entity_a.base.space_id != entity_b.base.space_id {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiError::validation(
-                "Cannot merge entities from different spaces",
-            )),
-        ));
-    }
-
-    // Require authorization to modify both entities.
-    for entity in [&entity_a, &entity_b] {
-        state
-            .authz
-            .authorize_record_write(&principal, entity, "write:entity")
-            .map_err(|e| {
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(ApiError {
-                        code: e.code,
-                        message: e.message,
-                        details: None,
-                    }),
-                )
-            })?;
-        state
-            .authz
-            .authorize_record_read(&principal, entity, "read:entity")
-            .map_err(|e| {
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(ApiError {
-                        code: e.code,
-                        message: e.message,
-                        details: None,
-                    }),
-                )
-            })?;
-    }
-
-    let (survivor, merged_entity) = match req.strategy {
-        MergeStrategy::KeepA | MergeStrategy::Combine => (entity_a.clone(), entity_b.clone()),
-        MergeStrategy::KeepB => (entity_b.clone(), entity_a.clone()),
-    };
-
-    let now = Utc::now();
-
-    let (survivor_entity, merged_entities): (Entity, Vec<Entity>) = if req.strategy
-        == MergeStrategy::Combine
-    {
-        let new_id = RecordId::new_v4(TableName::Entity);
-        let mut base = BaseFields::new(
-            new_id,
-            survivor.base.space_id.clone(),
-            principal.subject.clone(),
-        );
-        base.security = merge_security(&survivor.base.security, &merged_entity.base.security);
-        base.provenance = Provenance::default();
-        base.subjects_state = SubjectsState::Complete;
-
-        let mut combined = Entity::new(base, survivor.entity_type, survivor.display_name.clone());
-
-        for alias in survivor
-            .aliases
-            .iter()
-            .chain(merged_entity.aliases.iter())
-            .chain([&survivor.display_name, &merged_entity.display_name].into_iter())
-        {
-            combined.add_alias(alias.clone());
-        }
-        combined.identity_keys = survivor
-            .identity_keys
-            .iter()
-            .chain(merged_entity.identity_keys.iter())
-            .cloned()
-            .collect();
-        combined.identity_keys.sort();
-        combined.identity_keys.dedup();
-
-        combined.metadata = merge_json_values(&survivor.metadata, &merged_entity.metadata);
-
-        combined.risk_level = match (survivor.risk_level, merged_entity.risk_level) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        combined.trust_level = match (survivor.trust_level, merged_entity.trust_level) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        combined.known_safe = survivor.known_safe || merged_entity.known_safe;
-
-        let created = state.entity_repo.create(combined).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-
-        (created, vec![entity_a.clone(), entity_b.clone()])
-    } else {
-        let mut updated_survivor = survivor.clone();
-
-        for alias in merged_entity
-            .aliases
-            .iter()
-            .chain(std::iter::once(&merged_entity.display_name))
-        {
-            updated_survivor.add_alias(alias.clone());
-        }
-
-        updated_survivor
-            .identity_keys
-            .extend(merged_entity.identity_keys.iter().cloned());
-        updated_survivor.identity_keys.sort();
-        updated_survivor.identity_keys.dedup();
-
-        updated_survivor.metadata =
-            merge_json_values(&updated_survivor.metadata, &merged_entity.metadata);
-
-        for handle in &merged_entity.handles {
-            let Some(existing) = updated_survivor
-                .handles
-                .iter_mut()
-                .find(|h| h.platform == handle.platform && h.username == handle.username)
-            else {
-                updated_survivor.handles.push(handle.clone());
-                continue;
-            };
-
-            let existing_conf = existing.confidence.unwrap_or(0.0);
-            let incoming_conf = handle.confidence.unwrap_or(0.0);
-            if incoming_conf > existing_conf {
-                existing.confidence = handle.confidence;
-                existing.verified = handle.verified;
-            }
-
-            existing.first_seen = match (existing.first_seen, handle.first_seen) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (None, Some(b)) => Some(b),
-                (Some(a), None) => Some(a),
-                (None, None) => None,
-            };
-            existing.last_seen = match (existing.last_seen, handle.last_seen) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (None, Some(b)) => Some(b),
-                (Some(a), None) => Some(a),
-                (None, None) => None,
-            };
-
-            existing.evidence.extend(handle.evidence.iter().cloned());
-            let mut seen: HashSet<RecordId> = HashSet::new();
-            existing.evidence.retain(|id| seen.insert(id.clone()));
-        }
-
-        updated_survivor.base.updated_at = now;
-
-        let rid = updated_survivor.base.id.clone();
-        let updated = state
-            .entity_repo
-            .update_preserving_security(&space_id, &rid, updated_survivor)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )
-            })?;
-
-        (updated, vec![merged_entity.clone()])
-    };
-
-    let mut relationships_to_repoint: Vec<Rel> = Vec::new();
-    for merged in &merged_entities {
-        let rid = merged.base.id.clone();
-        let outgoing = state
-            .rel_repo
-            .find_outgoing(&space_id, &rid)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )
-            })?;
-        let incoming = state
-            .rel_repo
-            .find_incoming(&space_id, &rid)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )
-            })?;
-        relationships_to_repoint.extend(outgoing);
-        relationships_to_repoint.extend(incoming);
-    }
-
-    let mut events_to_repoint: Vec<SystemEvent> = Vec::new();
-    for merged in &merged_entities {
-        let rid = merged.base.id.clone();
-        let events = state
-            .event_repo
-            .find_by_entity(&space_id, &rid)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )
-            })?;
-        events_to_repoint.extend(events);
-    }
-
-    let relationships_repointed_count = relationships_to_repoint.len();
-    let events_repointed_count = events_to_repoint.len();
-    let merged_entity_ids: Vec<RecordId> = merged_entities
-        .iter()
-        .map(|entity| entity.base.id.clone())
-        .collect();
-
-    let extension_registry = load_runtime_reference_registry_from_env().map_err(|e| {
+    let a = parse(&req.entity_a)?;
+    let b = parse(&req.entity_b)?;
+    let registry = load_runtime_reference_registry_from_env().map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(format!(
-                "Failed to load extension reference registry: {e}"
-            ))),
+            Json(ApiError::internal(error.to_string())),
         )
     })?;
-
-    apply_entity_merge_rewrites(
+    let selection = match req.strategy {
+        MergeStrategy::KeepA => MergeSelection::KeepA,
+        MergeStrategy::KeepB => MergeSelection::KeepB,
+        MergeStrategy::Combine => MergeSelection::Combine,
+    };
+    let prepared = elephant_identity::prepare_entity_merge(
         &state.storage,
         &space_id,
-        &survivor_entity.base.id,
-        &merged_entity_ids,
-        now,
-        &extension_registry,
+        &a,
+        &b,
+        selection,
+        &principal.subject,
+        &registry,
     )
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(format!("Merge transaction failed: {e}"))),
-        )
-    })?;
-
-    let mut merge_record_ids: Vec<String> = Vec::new();
-    for merged in &merged_entities {
-        let merge_id = RecordId::new_v4(TableName::EntityMerge);
-        let mut merge_base = BaseFields::new(
-            merge_id.clone(),
-            survivor_entity.base.space_id.clone(),
-            principal.subject.clone(),
-        );
-
-        let mut merge_security = survivor_entity.base.security.clone();
-        merge_security.level = merge_security.level.max(merged.base.security.level);
-        merge_security
-            .labels
-            .extend(merged.base.security.labels.iter().cloned());
-        merge_security.labels.sort();
-        merge_security.labels.dedup();
-        merge_security
-            .handling
-            .extend(merged.base.security.handling.iter().cloned());
-        merge_security.handling.sort();
-        merge_security.handling.dedup();
-        merge_base.security = merge_security;
-        merge_base.provenance = Provenance::default();
-        merge_base.subjects = vec![
-            Link::new(merged.base.id.clone()),
-            Link::new(survivor_entity.base.id.clone()),
-        ];
-        merge_base.subjects_state = SubjectsState::Complete;
-
-        let entity_merge = EntityMerge {
-            base: merge_base,
-            from: Link::new(merged.base.id.clone()),
-            into: Link::new(survivor_entity.base.id.clone()),
-            strategy: req.strategy,
-            decided_by: principal.subject.clone(),
-            decided_at: now,
-            run_id: None,
-        };
-
-        let merge_record = state.merge_repo.create(entity_merge).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(format!(
-                    "Failed to create merge record: {e}"
-                ))),
-            )
-        })?;
-
-        merge_record_ids.push(merge_record.base.id.to_string());
-    }
-
-    Ok(Json(MergeResponse {
-        entity: survivor_entity,
-        message: format!(
-            "Merge completed. {relationships_repointed_count} relationships and {events_repointed_count} events repointed."
+    .map_err(|error| match error {
+        elephant_identity::IdentityError::StorageError(error) => {
+            super::source_intake::storage_error(error)
+        }
+        other => (
+            StatusCode::CONFLICT,
+            Json(ApiError::validation(other.to_string())),
         ),
-        relationships_repointed: relationships_repointed_count,
-        events_repointed: events_repointed_count,
-        merge_record_ids,
+    })?;
+    for envelope in prepared
+        .authorizations()
+        .map_err(super::source_intake::storage_error)?
+    {
+        let denied = |error: crate::authz::AuthzError| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError {
+                    code: error.code,
+                    message: error.message,
+                    details: None,
+                }),
+            )
+        };
+        state
+            .authz
+            .authorize_record_read(&principal, &envelope, envelope.read_scope)
+            .map_err(denied)?;
+        state
+            .authz
+            .authorize_record_write(&principal, &envelope, envelope.write_scope)
+            .map_err(denied)?;
+    }
+    let outcome = prepared
+        .commit()
+        .await
+        .map_err(super::source_intake::storage_error)?;
+    Ok(Json(MergeResponse {
+        entity: outcome.survivor,
+        message: format!(
+            "Merge completed. {} relationships and {} events repointed.",
+            outcome.relationships_repointed, outcome.events_repointed
+        ),
+        relationships_repointed: outcome.relationships_repointed,
+        events_repointed: outcome.events_repointed,
+        merge_record_ids: outcome
+            .merge_record_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
     }))
 }
 
@@ -747,6 +437,27 @@ mod tests {
         clippy::cognitive_complexity
     )]
     use super::*;
+    use elephant_types::records::base::BaseFields;
+    use elephant_types::{Link, RecordId};
+
+    async fn register_merge_space(storage: &StorageClient, space: &str) {
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: elephant_types::records::base::BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    space.into(),
+                    "fixture".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn test_list_candidates_query_defaults() {
@@ -754,5 +465,92 @@ mod tests {
         let query: ListCandidatesQuery = serde_json::from_str(json).expect("deserialize");
         assert_eq!(query.limit, 50);
         assert!(!query.pending_only);
+    }
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
+    async fn merge_rejects_hidden_dependent_relationship_before_any_write() {
+        use elephant_types::records::{entity::EntityType, rel::ClaimStatus, Rel};
+        let storage = StorageClient::new_embedded().await.unwrap();
+        register_merge_space(&storage, "home").await;
+        let entities = EntityRepository::new(storage.clone());
+        let make = |name: &str| {
+            Entity::new(
+                BaseFields::new(
+                    RecordId::new_v4(TableName::Entity),
+                    "home".into(),
+                    "test".into(),
+                ),
+                EntityType::new("person"),
+                name.into(),
+            )
+        };
+        let a = entities.create(make("A")).await.unwrap();
+        let b = entities.create(make("B")).await.unwrap();
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::Rel),
+            "home".into(),
+            "test".into(),
+        );
+        base.security.level = 5;
+        let rel = RelRepository::new(storage.clone())
+            .create(Rel {
+                base,
+                subject: Link::new(b.base.id.clone()),
+                object: Link::new(a.base.id.clone()),
+                rel_type: "knows".into(),
+                status: ClaimStatus::Approved,
+                confidence: 1.0,
+                validity_window: None,
+                evidence: vec![],
+                temporal_audit: None,
+            })
+            .await
+            .unwrap();
+        let principal = AuthPrincipal {
+            subject: "test".into(),
+            space_id: Some("home".into()),
+            spaces: Some(vec!["home".into()]),
+            scopes: vec!["*".into()],
+            security_level: 0,
+            security_labels: vec![],
+            clearances: vec![],
+            subject_allowlist: None,
+            purpose: vec![],
+            bypass_abac: false,
+        };
+        let state = Arc::new(IdentityState::new(
+            storage.clone(),
+            Arc::new(crate::authz::AuthzService::new()),
+        ));
+        let error = merge_entities(
+            State(state),
+            axum::Extension(principal),
+            Json(MergeRequest {
+                entity_a: a.base.id.to_string(),
+                entity_b: b.base.id.to_string(),
+                strategy: MergeStrategy::KeepA,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert_eq!(entities.get("home", &a.base.id).await.unwrap().unwrap(), a);
+        assert_eq!(entities.get("home", &b.base.id).await.unwrap().unwrap(), b);
+        assert_eq!(
+            RelRepository::new(storage.clone())
+                .get("home", &rel.base.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            rel
+        );
+        assert!(SystemEventRepository::new(storage)
+            .list("home", 100, None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

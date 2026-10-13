@@ -1,0 +1,170 @@
+{
+  "format": "recall-installed-independent-contract/v2",
+  "authority": "qualification",
+  "execution_authorized": false,
+  "product_acceptance": false,
+  "producer_source_commit": "cd4de65a4df8913a8c69310aba638c33296c9866",
+  "predicate_document": "tests/recall_preview/INSTALLED_EVIDENCE_CONTRACT.md",
+  "original_expectations_sha256": "c791d9cdf2293e83ff393c8ece8811878c9d4cc915589d4ced2ff8b5cc890719",
+  "interface": "validate_installed(reviewed_static, installed_carrier, raw_evidence) -> dict",
+  "static_wrapper_fields": [
+    "review",
+    "raw_sha256",
+    "raw_bytes"
+  ],
+  "input_refs": {
+    "installed_plan": "installed-plan",
+    "installed_review": "installed-review",
+    "installed_cases": "installed-case-file",
+    "installed_corpus": "installed-corpus",
+    "installed_run_manifest": "installed-manifest"
+  },
+  "helper_sha256_keys": {
+    "installed_driver": "driver_sha256",
+    "installed_process_capture": "process_capture_sha256",
+    "installed_collector": "collector_sha256",
+    "installed_installer": "installer_sha256"
+  },
+  "carrier_format": "recall-installed-offline-evidence/v2",
+  "carrier_fields": [
+    "format",
+    "identity",
+    "reviewed_plan",
+    "artifact_manifest",
+    "observation",
+    "capture_inventory",
+    "command_inventory",
+    "controller",
+    "terminal_cleanup"
+  ],
+  "identity_fields": [
+    "source_commit",
+    "artifact_sha256",
+    "binary_sha256",
+    "backend"
+  ],
+  "identity_mapping": {
+    "artifact_sha256": "original allocation archive_sha256"
+  },
+  "output_fields": [
+    "identity",
+    "required_cases"
+  ],
+  "error_prefix": "dynamic_installed_",
+  "limits": {
+    "total_seconds": 300,
+    "http_calls": 128,
+    "http_seconds": 5,
+    "snapshot_http_seconds": 120,
+    "response_bytes": 262144,
+    "processes": 16,
+    "process_log_bytes": 1048576,
+    "http_capture_bytes": 67108864,
+    "metadata_bytes_within_capture": 2097152,
+    "process_events": 512
+  },
+  "cases": [
+    {
+      "case": "verified_installed_binary",
+      "original_evidence": "Original allocation, artifact provenance, actual executable hash observations, --version command and stdout",
+      "independent_predicate": "Exact original source/archive/binary/backend and Linux target; original archive verification provenance and command executable agree; exact version stdout; original process identity observed before reap. Version alone never suffices."
+    },
+    {
+      "case": "absent_service",
+      "original_evidence": "First GET /v1/health before service launch",
+      "independent_predicate": "Original ConnectionRefusedError, no response status/body, and chronology before original service process. This intentional transport failure is the sole absent-service exception, not a general successful-response exception."
+    },
+    {
+      "case": "bootstrap_unready",
+      "original_evidence": "Original service launch, health, GET /v1/readiness",
+      "independent_predicate": "Health 200 followed by authenticated readiness 503 with configured=false and ready=false before initialization. Original live owned process and monotonic interval required."
+    },
+    {
+      "case": "fresh_cli_auth",
+      "original_evidence": "service-token bootstrap and issue commands, original stdout/stderr, credential-role HTTP captures",
+      "independent_predicate": "Fresh original CLI issuance for operator/service/household and both named bootstrap roles, exact scope/space/issuer/audience arguments, no SKIP_AUTH. Hash/custody-check process evidence without recording secret/token values; later actual successful signed role calls are required."
+    },
+    {
+      "case": "runtime_initialized_without_workers",
+      "original_evidence": "MCP initialize_runtime/configure_runtime; native migrate command when selected; original saved configuration",
+      "independent_predicate": "Actual configured=true, storage_ready=true, exact backend; original request disables ingest and extractor-required. Match actual saved configuration and original command/environment-name recipe; do not infer workers disabled from a case flag or health alone."
+    },
+    {
+      "case": "two_named_spaces",
+      "original_evidence": "Both POST /v1/spaces, original current grants and GET configuration captures",
+      "independent_predicate": "Actual complete named configs match original corpus distinct policy/level/dimensions/purpose/skill and installed-unapproved models. Exact empty connections/profiles/bindings, no active embedding or pending reindex; generation=1/index_generation=0. Preserve full records for later comparisons."
+    },
+    {
+      "case": "http_auth_denied",
+      "original_evidence": "Positive household GET status, then absent-credential GET status",
+      "independent_predicate": "Positive 200 precedes unauthenticated 401 with typed unauthorized and bounded sanitized error body. Credential-role metadata is checked against actual original command identity; no secret extraction."
+    },
+    {
+      "case": "mcp_auth_denied",
+      "original_evidence": "Absent-credential POST /mcp/full tools/list",
+      "independent_predicate": "Transport 401 and typed unauthorized from exact original body, with valid bounded complete capture. No MCP success envelope invented for denied transport."
+    },
+    {
+      "case": "wrong_space_denied",
+      "original_evidence": "Two original GET business/status with household/business and service/household selections",
+      "independent_predicate": "Both 403 with typed forbidden_space, following valid single-space positive control. Later foreign business source and MCP controls remain required in input_bounds chronology."
+    },
+    {
+      "case": "mcp_positive",
+      "original_evidence": "Both spaces initialize and tools/list using service role",
+      "independent_predicate": "Actual protocol success with original JSON-RPC id, exact framing/content parsing, search_scoped in actual tools; no errors/isError substituted for success."
+    },
+    {
+      "case": "grant_revocation",
+      "original_evidence": "Home grant active=false CAS, status denial, active=true CAS",
+      "independent_predicate": "Original prior generation bound to revoke, returned new generation bound to restoration; real signed home request denied 403 forbidden_space between them. Restore succeeds; a manufactured or stale generation is not accepted."
+    },
+    {
+      "case": "source_acceptance_and_idempotence",
+      "original_evidence": "Two PUTs per original baseline, original heads and operation GETs",
+      "independent_predicate": "Exact independent corpus request bodies and original same request key; both 202 full receipts byte-decoded equality and nonempty operation/source/generation identities; desired baseline revision, published_revision null. Original head and operation linkage retained per space."
+    },
+    {
+      "case": "pending_is_not_complete",
+      "original_evidence": "Prior acceptance-case original heads/operations, HTTP search and MCP search_scoped",
+      "independent_predicate": "No new request required under this case marker. Both actual states pending; baseline-constrained lexical result partial=true, results=[], coverage[source].state=pending. Entire decoded MCP data equals HTTP body with original request/id and space linkage; acceptance is not publication."
+    },
+    {
+      "case": "input_bounds",
+      "original_evidence": "Foreign head and MCP search; home limit=51 lexical search",
+      "independent_predicate": "Foreign actual source and MCP transport 403 forbidden_space, invalid limit original51 yields 400 invalid_request without silent clamp. Preserve complete bounded typed bodies and original selected spaces."
+    },
+    {
+      "case": "named_export",
+      "original_evidence": "POST /v1/system/snapshot/export",
+      "independent_predicate": "Original registered path baseline/name installed-baseline, retention_seconds=3600, quiesce_timeout_seconds=30; 200 success=true and actual manifest. Bind that actual manifest/path to later restore. This alone does not prove physical deletion or backup expiry."
+    },
+    {
+      "case": "replacement_accepted",
+      "original_evidence": "Original replacement PUT per space after export",
+      "independent_predicate": "202 desired exact independently frozen replacement revision, no claimed published revision, expected_generation equal original baseline head generation. Both source identities remain bound; no reconstructed acceptance receipt."
+    },
+    {
+      "case": "restore_original_heads",
+      "original_evidence": "POST registered snapshot restore, both head/operation/config GETs",
+      "independent_predicate": "Actual 200 success=true then full original baseline head and original operation equality for each space, full originally captured configuration equality. Replacement acceptance must precede restore; all original typed fields preserved."
+    },
+    {
+      "case": "graceful_restart",
+      "original_evidence": "Original owned SIGTERM/reap, new owned serve process, both head/operation/config GETs",
+      "independent_predicate": "Original service exits zero with complete logs, no kill escalation; new process has distinct original identity and same executable/recipe/store. Actual full baseline heads/operations/configurations survive reopen unchanged."
+    },
+    {
+      "case": "read_only_capabilities",
+      "original_evidence": "MCP configure_runtime read_only, tools/list, retract_source, final home head",
+      "independent_predicate": "Actual read-only configuration succeeds; search_scoped present/retract_source absent in list; direct retract call isError with typed capability_disabled; original desired baseline remains readable. Final owned process cleanup and executable identity must pass separately."
+    }
+  ],
+  "proof_limits": [
+    "Offline Metadata recipe intentionally unapproved; no semantic/provider acceptance.",
+    "Original installed manifest has no runtime/paired archive/paired executable/run nonce; do not manufacture those identities.",
+    "Current runtime independently verifies its own runtime/paired/controller identities; reuse of installed evidence does not prove offline paired-server execution.",
+    "Case marker order differs from frozen inventory order (fresh_cli_auth precedes bootstrap_unready); require actual dependency chronology, exact unique inventory membership, not list-order equality.",
+    "Current exact artifact execution, complete cleanup and independent raw predicate replay still required."
+  ]
+}

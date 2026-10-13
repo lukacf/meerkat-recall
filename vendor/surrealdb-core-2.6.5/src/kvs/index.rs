@@ -1,0 +1,1373 @@
+use super::KeyDecode;
+use crate::cnf::{INDEXING_BATCH_SIZE, NORMAL_FETCH_SIZE};
+use crate::ctx::{Context, MutableContext};
+use crate::dbs::Options;
+use crate::doc::{CursorDoc, Document};
+use crate::err::Error;
+use crate::idx::index::IndexOperation;
+use crate::key::index::df::Df;
+use crate::key::index::ib;
+use crate::key::index::ib::Ib;
+use crate::key::index::ip::Ip;
+use crate::key::thing;
+use crate::kvs::ds::TransactionFactory;
+use crate::kvs::LockType::Optimistic;
+use crate::kvs::{Key, Transaction, TransactionType, Val};
+use crate::sql::statements::DefineIndexStatement;
+use crate::sql::{Id, Object, Thing, Value};
+use ahash::{HashMap, HashMapExt};
+use futures::channel::oneshot::{channel, Receiver, Sender};
+use reblessive::TreeStack;
+use revision::revisioned;
+use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map::Entry;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+#[cfg(not(target_family = "wasm"))]
+use tokio::spawn;
+use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::time::sleep;
+use tracing::warn;
+#[cfg(target_family = "wasm")]
+use wasm_bindgen_futures::spawn_local as spawn;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BuildingStatus {
+	/// The indexing process has started
+	Started,
+	/// The index is being cleaned
+	Cleaning,
+	/// The index is currently being built
+	Indexing {
+		/// The number of initial records indexed
+		initial: Option<usize>,
+		/// The number of records updated since the initial indexing
+		updated: Option<usize>,
+		/// The number of records pending in the appending queue
+		pending: Option<usize>,
+	},
+	/// The index is ready and fully up-to-date
+	Ready {
+		/// The number of initial records indexed
+		initial: Option<usize>,
+		/// The number of records updated since the initial indexing
+		updated: Option<usize>,
+		/// The number of records pending in the appending queue
+		pending: Option<usize>,
+	},
+	/// The indexing process was aborted
+	Aborted,
+	/// An error occurred during the indexing process
+	Error(String),
+}
+
+impl Default for BuildingStatus {
+	fn default() -> Self {
+		Self::Ready {
+			initial: None,
+			updated: None,
+			pending: None,
+		}
+	}
+}
+pub(crate) enum ConsumeResult {
+	/// The document has been enqueued to be indexed
+	Enqueued,
+	/// The index has been built, the document can be indexed normally
+	Ignored(Option<Vec<Value>>, Option<Vec<Value>>),
+}
+
+impl BuildingStatus {
+	fn is_error(&self) -> bool {
+		matches!(self, Self::Error(_))
+	}
+
+	fn is_ready(&self) -> bool {
+		matches!(self, Self::Ready { .. })
+	}
+}
+
+impl From<BuildingStatus> for Value {
+	fn from(st: BuildingStatus) -> Self {
+		let mut o = Object::default();
+		let s = match st {
+			BuildingStatus::Started => "started",
+			BuildingStatus::Cleaning => "cleaning",
+			BuildingStatus::Indexing {
+				initial,
+				pending,
+				updated,
+			} => {
+				if let Some(c) = initial {
+					o.insert("initial".to_string(), c.into());
+				}
+				if let Some(c) = pending {
+					o.insert("pending".to_string(), c.into());
+				}
+				if let Some(c) = updated {
+					o.insert("updated".to_string(), c.into());
+				}
+				"indexing"
+			}
+			BuildingStatus::Ready {
+				initial,
+				pending,
+				updated,
+			} => {
+				if let Some(c) = initial {
+					o.insert("initial".to_string(), c.into());
+				}
+				if let Some(c) = pending {
+					o.insert("pending".to_string(), c.into());
+				}
+				if let Some(c) = updated {
+					o.insert("updated".to_string(), c.into());
+				}
+				"ready"
+			}
+			BuildingStatus::Aborted => "aborted",
+			BuildingStatus::Error(error) => {
+				o.insert("error".to_string(), error.to_string().into());
+				"error"
+			}
+		};
+		o.insert("status".to_string(), s.into());
+		o.into()
+	}
+}
+
+type IndexBuilding = Arc<Building>;
+
+pub(super) type SharedIndexKey = Arc<IndexKey>;
+
+/// A unique key for an index building process
+#[derive(Hash, PartialEq, Eq, Clone)]
+pub(super) struct IndexKey {
+	ns: String,
+	db: String,
+	tb: String,
+	ix: String,
+}
+
+impl IndexKey {
+	fn new(ns: &str, db: &str, tb: &str, ix: &str) -> Self {
+		Self {
+			ns: ns.to_owned(),
+			db: db.to_owned(),
+			tb: tb.to_owned(),
+			ix: ix.to_owned(),
+		}
+	}
+}
+
+/// The builder for background index creation
+#[derive(Clone)]
+pub(crate) struct IndexBuilder {
+	tf: TransactionFactory,
+	indexes: Arc<RwLock<HashMap<SharedIndexKey, IndexBuilding>>>,
+	physical_paused: Arc<AtomicBool>,
+	// Removed builders remain owned until their tasks have actually terminated.
+	retired: Arc<std::sync::Mutex<Vec<IndexBuilding>>>,
+}
+
+impl IndexBuilder {
+	/// Create a new IndexBuilder
+	pub(super) fn new(tf: TransactionFactory) -> Self {
+		Self {
+			tf,
+			indexes: Default::default(),
+			physical_paused: Arc::default(),
+			retired: Arc::default(),
+		}
+	}
+
+	fn physical_admission(&self) -> Result<(), Error> {
+		if self.physical_paused.load(Ordering::Acquire) {
+			return Err(Error::Ds(
+				"index admission closed for physical maintenance".into(),
+			));
+		}
+		Ok(())
+	}
+
+	/// Stop new builders and queue producers before waiting for worker termination.
+	/// No transaction admission gate is held here: workers need it to finish.
+	pub(super) async fn pause_for_physical(&self) -> Result<Vec<SharedIndexKey>, Error> {
+		let (old, retired) = {
+			let mut indexes = self.indexes.write().await;
+			self.physical_admission()?;
+			self.physical_paused.store(true, Ordering::Release);
+			let mut retired = self
+				.retired
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner);
+			(std::mem::take(&mut *indexes), std::mem::take(&mut *retired))
+		};
+		let mut unfinished = Vec::new();
+		for (key, building) in &old {
+			if !building.ix.defer && !building.is_finished() {
+				unfinished.push(key.clone());
+			}
+			building.abort();
+		}
+		for building in &retired {
+			building.abort();
+		}
+		for building in old.values().chain(retired.iter()) {
+			building.wait_for_completion().await;
+		}
+		// Drop old contexts/query executors before the exclusive transaction drain.
+		drop(old);
+		drop(retired);
+		Ok(unfinished)
+	}
+
+	/// Resume deferred and previously unfinished workers from the promoted store.
+	/// The fresh datastore context contains none of their old cached index Arcs.
+	pub(super) async fn resume_after_physical(
+		&self,
+		ctx: &Context,
+		options: &Options,
+		unfinished: Vec<SharedIndexKey>,
+		restart_view: &TransactionFactory,
+	) -> Result<(), Error> {
+		let mut pending = Vec::new();
+		{
+			let tx = restart_view
+				.transaction(TransactionType::Read, Optimistic)
+				.await?;
+			for ns in tx.all_ns().await?.iter() {
+				for db in tx.all_db(&ns.name).await?.iter() {
+					for tb in tx.all_tb(&ns.name, &db.name, None).await?.iter() {
+						for ix in tx
+							.all_tb_indexes(&ns.name, &db.name, &tb.name)
+							.await?
+							.iter()
+						{
+							let key =
+								Arc::new(IndexKey::new(&ns.name, &db.name, &tb.name, &ix.name));
+							if !ix.defer && !unfinished.contains(&key) {
+								continue;
+							}
+							let ready = if ix.defer {
+								match tx
+									.get(Df::new(&ns.name, &db.name, &tb.name, &ix.name), None)
+									.await?
+								{
+									Some(value) => revision::from_slice::<bool>(&value)?,
+									None => false,
+								}
+							} else {
+								false
+							};
+							let opt = options
+								.clone()
+								.with_ns(Some(Arc::from(ns.name.as_str())))
+								.with_db(Some(Arc::from(db.name.as_str())));
+							pending.push((key, Arc::new(ix.clone()), opt, ready));
+						}
+					}
+				}
+			}
+			tx.cancel().await?;
+		}
+		let mut indexes = self.indexes.write().await;
+		for (key, ix, opt, ready) in pending {
+			// Only this synchronous recovery read uses the temporary view. Every
+			// spawned worker keeps self.tf, which is fenced by the original owner.
+			let building = Arc::new(Building::new(ctx, self.tf.clone(), opt, ix, key.clone())?);
+			building.recover_queue_with_factory(restart_view).await?;
+			if ready {
+				building
+					.initial_build_complete
+					.store(true, Ordering::Relaxed);
+				Self::spawn_deferred_daemon(building.clone());
+			} else {
+				Self::spawn_initial_build(building.clone(), None);
+			}
+			indexes.insert(key, building);
+		}
+		self.physical_paused.store(false, Ordering::Release);
+		Ok(())
+	}
+
+	/// Restart deferred indexes after database startup
+	pub(super) async fn restart_deferred_index(
+		&self,
+		ctx: &Context,
+		opt: &Options,
+		tb: &str,
+		ix: &DefineIndexStatement,
+	) -> Result<(), Error> {
+		if !ix.defer {
+			return Ok(());
+		}
+		let (ns, db) = opt.ns_db()?;
+		let tx = ctx.tx();
+		let df = Df::new(ns, db, tb, &ix.name);
+		let key = Arc::new(IndexKey::new(ns, db, df.tb, df.ix));
+		let initial_build_done = match tx.get(df, None).await? {
+			None => false,
+			Some(v) => revision::from_slice::<bool>(&v)?,
+		};
+		let ix = Arc::new(ix.clone());
+		let mut indexes = self.indexes.write().await;
+		self.physical_admission()?;
+		if let Entry::Vacant(e) = indexes.entry(key.clone()) {
+			let building = if initial_build_done {
+				self.start_deferred_index(ctx, opt.clone(), ix, key).await?
+			} else {
+				self.start_building(ctx, opt.clone(), ix, key, None, true)
+					.await?
+			};
+			e.insert(building);
+		}
+		Ok(())
+	}
+
+	/// Start building an index in the background
+	async fn start_building(
+		&self,
+		ctx: &Context,
+		opt: Options,
+		ix: Arc<DefineIndexStatement>,
+		ix_key: SharedIndexKey,
+		sdr: Option<Sender<Result<(), Error>>>,
+		recover_queue: bool,
+	) -> Result<IndexBuilding, Error> {
+		let building = Arc::new(Building::new(ctx, self.tf.clone(), opt, ix, ix_key)?);
+		if recover_queue {
+			building.recover_queue().await?;
+		};
+		Self::spawn_initial_build(building.clone(), sdr);
+		Ok(building)
+	}
+
+	fn spawn_initial_build(building: IndexBuilding, sdr: Option<Sender<Result<(), Error>>>) {
+		let b = building.clone();
+		// Own completion even if the task is dropped before its first poll.
+		let initial_guard = InitialBuildGuard(b.clone());
+		spawn(async move {
+			let r = b.run().await;
+			if let Err(err) = &r {
+				b.set_status(BuildingStatus::Error(err.to_string())).await;
+			}
+			let is_err = r.is_err();
+			if let Some(s) = sdr {
+				if s.send(r).is_err() {
+					warn!("Failed to send index building result to the consumer");
+				}
+			}
+			if is_err {
+				return;
+			}
+			if b.ix.defer {
+				// If it is a deferred indexing, start the daemon and return
+				Self::spawn_deferred_daemon(b.clone());
+			}
+			drop(initial_guard);
+		});
+	}
+
+	/// Start a deferred index that has already completed its initial build.
+	/// This is used when restarting the server to resume deferred index processing.
+	/// The method recovers the queue state and spawns the deferred daemon.
+	async fn start_deferred_index(
+		&self,
+		ctx: &Context,
+		opt: Options,
+		ix: Arc<DefineIndexStatement>,
+		ix_key: SharedIndexKey,
+	) -> Result<IndexBuilding, Error> {
+		let building = Arc::new(Building::new(ctx, self.tf.clone(), opt, ix, ix_key)?);
+		building.recover_queue().await?;
+		building
+			.initial_build_complete
+			.store(true, Ordering::Relaxed);
+		Self::spawn_deferred_daemon(building.clone());
+		Ok(building)
+	}
+
+	/// Spawn the background daemon for a deferred index.
+	/// The daemon continuously processes queued document updates in a loop,
+	/// indexing them asynchronously. It runs until the index is aborted or an error occurs.
+	fn spawn_deferred_daemon(building: IndexBuilding) {
+		// Reserve the daemon before spawning: a waiter must not observe a false
+		// finished state while this task has not received its first poll.
+		building
+			.deferred_daemon_running
+			.store(true, Ordering::Release);
+		let daemon_guard = DeferredDaemonGuard(building.clone());
+		spawn(async move {
+			loop {
+				if building.is_aborted().await {
+					building.set_status(BuildingStatus::Aborted).await;
+					break;
+				}
+				if let Err(e) = building.index_appending_loop(None).await {
+					error!("Index appending loop error: {}", e);
+					building
+						.set_status(BuildingStatus::Error(e.to_string()))
+						.await;
+					break;
+				}
+				sleep(Duration::from_millis(100)).await;
+			}
+			drop(daemon_guard);
+		});
+	}
+
+	/// Build an index
+	pub(crate) async fn build(
+		&self,
+		ctx: &Context,
+		opt: Options,
+		ix: Arc<DefineIndexStatement>,
+		blocking: bool,
+	) -> Result<Option<Receiver<Result<(), Error>>>, Error> {
+		let (ns, db) = opt.ns_db()?;
+		let key = Arc::new(IndexKey::new(ns, db, &ix.what, &ix.name));
+		let (rcv, sdr) = if blocking {
+			let (s, r) = channel();
+			(Some(r), Some(s))
+		} else {
+			(None, None)
+		};
+		let mut indexes = self.indexes.write().await;
+		self.physical_admission()?;
+		match indexes.entry(key.clone()) {
+			Entry::Occupied(mut e) => {
+				// If the building is currently running, we need to wait for it to finish
+				let old_builder = e.get();
+				// Abort the old builder to signal it should stop
+				old_builder.abort();
+				// Wait for the old builder to fully stop
+				old_builder.wait_for_completion().await;
+				// Start building the index
+				let ib = self.start_building(ctx, opt, ix, key, sdr, false).await?;
+				e.insert(ib);
+			}
+			Entry::Vacant(e) => {
+				// No index is currently building, we can start building it
+				let ib = self.start_building(ctx, opt, ix, key, sdr, false).await?;
+				e.insert(ib);
+			}
+		}
+		Ok(rcv)
+	}
+
+	/// Consume a document update for indexing
+	pub(crate) async fn consume(
+		&self,
+		ctx: &Context,
+		opt: &Options,
+		ix: &DefineIndexStatement,
+		old_values: Option<Vec<Value>>,
+		new_values: Option<Vec<Value>>,
+		rid: &Thing,
+	) -> Result<ConsumeResult, Error> {
+		let (ns, db) = opt.ns_db()?;
+		let key = IndexKey::new(ns, db, &ix.what, &ix.name);
+		// This is the normal path
+		let indexes = self.indexes.read().await;
+		self.physical_admission()?;
+		if let Some(building) = indexes.get(&key) {
+			// An index is currently building, or is a deferred index
+			return building
+				.maybe_consume(ctx, old_values, new_values, rid)
+				.await;
+		}
+		// There is no index building process (defer or initial building)
+		Ok(ConsumeResult::Ignored(old_values, new_values))
+	}
+
+	/// Get the status of an index building process
+	pub(crate) async fn get_status(
+		&self,
+		ns: &str,
+		db: &str,
+		ix: &DefineIndexStatement,
+	) -> BuildingStatus {
+		let key = IndexKey::new(ns, db, &ix.what, &ix.name);
+		if let Some(b) = self.indexes.read().await.get(&key) {
+			b.status.read().await.clone()
+		} else {
+			BuildingStatus::default()
+		}
+	}
+
+	/// Remove an index building process
+	pub(crate) async fn remove_index(
+		&self,
+		ns: &str,
+		db: &str,
+		tb: &str,
+		ix: &str,
+	) -> Result<(), Error> {
+		let key = IndexKey::new(ns, db, tb, ix);
+		let mut indexes = self.indexes.write().await;
+		self.physical_admission()?;
+		if let Some(b) = indexes.remove(&key) {
+			b.abort();
+			// No await between unregistering and transferring task custody. The
+			// removing query may still own a transaction needed by the worker.
+			let mut retired = self
+				.retired
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner);
+			retired.retain(|building| !building.is_finished());
+			retired.push(b);
+		}
+		Ok(())
+	}
+}
+
+/// A document update enqueued for background indexing
+#[revisioned(revision = 1)]
+#[derive(Serialize, Deserialize, Debug)]
+#[non_exhaustive]
+struct Appending {
+	/// The old values of the document
+	old_values: Option<Vec<Value>>,
+	/// The new values of the document
+	new_values: Option<Vec<Value>>,
+	/// The ID of the document
+	id: Id,
+}
+
+/// Identifies the primary appending entry for a record.
+#[revisioned(revision = 2)]
+#[derive(Serialize, Deserialize, Debug)]
+#[non_exhaustive]
+struct PrimaryAppending(
+	/// Appending id within the queue.
+	AppendingId,
+	/// Batch id owning the append.
+	#[revision(start = 2)]
+	BatchId,
+);
+
+pub(crate) type BatchId = u32;
+pub(crate) type AppendingId = u32;
+
+/// Manages sequence numbers and batch tracking for the background indexing queue.
+struct QueueSequences {
+	/// The number of pending appends.
+	pending: u32,
+	/// The next appending id to assign.
+	next_appending: AppendingId,
+	/// The next batch id to assign.
+	next_batch: BatchId,
+	/// Tracked appending ids per batch for cleanup on cancel.
+	batches: HashMap<BatchId, RoaringBitmap>,
+}
+
+/// Batch IDs queued for deferred cleanup after rollback (cancel or failed commit).
+pub(super) type BatchIdsCleanQueue = Arc<Mutex<Vec<BatchId>>>;
+
+impl Default for QueueSequences {
+	fn default() -> Self {
+		Self {
+			pending: 0,
+			next_appending: 0,
+			// Batch IDs are 1-based; 0 is reserved for legacy/missing batch ids.
+			next_batch: 1,
+			batches: Default::default(),
+		}
+	}
+}
+
+impl QueueSequences {
+	const DEFAULT_NEXT_BATCH_ID: u32 = 1;
+	const LEGACY_BATCH_ID: u32 = 0;
+
+	fn is_empty(&self) -> bool {
+		self.pending == 0
+	}
+
+	fn new_batch(&mut self) -> u32 {
+		let batch_id = self.next_batch;
+		self.batches.insert(batch_id, RoaringBitmap::new());
+		self.next_batch += 1;
+		batch_id
+	}
+
+	fn add_update(&mut self, batch_id: BatchId) -> Result<AppendingId, Error> {
+		if let Some(batch) = self.batches.get_mut(&batch_id) {
+			let appending_id = self.next_appending;
+			batch.insert(appending_id);
+			self.next_appending += 1;
+			self.pending += 1;
+			Ok(appending_id)
+		} else {
+			Err(Error::Internal(format!(
+				"The batch does not exists: {}",
+				batch_id
+			)))
+		}
+	}
+
+	/// Returns the number of updates pending in the queue
+	fn pending(&self) -> u32 {
+		self.pending
+	}
+
+	fn clean(&mut self, to_clean: HashMap<BatchId, Vec<AppendingId>>) {
+		for (batch_id, appending_ids) in to_clean {
+			if let Entry::Occupied(mut e) = self.batches.entry(batch_id) {
+				let batch = e.get_mut();
+				for appending_id in appending_ids {
+					if batch.remove(appending_id) {
+						self.pending -= 1;
+					}
+				}
+				if batch.is_empty() {
+					e.remove();
+				}
+			}
+		}
+	}
+
+	fn clean_batch_ids(&mut self, batch_ids: Vec<BatchId>) {
+		for batch_id in batch_ids {
+			if let Some(v) = self.batches.remove(&batch_id) {
+				self.pending -= v.len() as u32;
+			}
+		}
+	}
+}
+
+/// A building process for a specific index
+struct Building {
+	/// The context used for the building process
+	ctx: Context,
+	/// The options used for the building process
+	opt: Options,
+	/// The transaction factory used to create transactions
+	tf: TransactionFactory,
+	/// The statement that defines the index
+	ix: Arc<DefineIndexStatement>,
+	/// The table name
+	tb: String,
+	/// The index key
+	ix_key: SharedIndexKey,
+	/// The current status of the building process
+	status: RwLock<BuildingStatus>,
+	/// The queue of records that need to be indexed
+	queue: RwLock<QueueSequences>,
+	/// Batch IDs scheduled for deferred cleanup after rollback (cancel or failed commit).
+	clean_queue: BatchIdsCleanQueue,
+	/// Whether the building process has been aborted
+	aborted: AtomicBool,
+	/// Whether the initial building process (run()) has completed
+	initial_build_complete: AtomicBool,
+	/// Whether the deferred daemon is currently running (for deferred indexes only)
+	deferred_daemon_running: AtomicBool,
+	/// Notifier for signaling completion (initial build or daemon shutdown)
+	completion_notify: Notify,
+}
+
+impl Building {
+	/// Create a new building process for the given index definition.
+	fn new(
+		ctx: &Context,
+		tf: TransactionFactory,
+		opt: Options,
+		ix: Arc<DefineIndexStatement>,
+		ix_key: SharedIndexKey,
+	) -> Result<Self, Error> {
+		Ok(Self {
+			ctx: MutableContext::new_concurrent(ctx).freeze(),
+			opt,
+			tf,
+			tb: ix.what.to_raw(),
+			ix,
+			ix_key,
+			status: RwLock::new(BuildingStatus::Started),
+			queue: Default::default(),
+			clean_queue: Default::default(),
+			aborted: AtomicBool::new(false),
+			initial_build_complete: AtomicBool::new(false),
+			deferred_daemon_running: AtomicBool::new(false),
+			completion_notify: Notify::new(),
+		})
+	}
+
+	/// Set the status of the building process
+	async fn set_status(&self, status: BuildingStatus) {
+		let mut s = self.status.write().await;
+		if status.ne(&s) {
+			debug!("{}: set_status: {:?}", self.ix.name, status);
+		}
+		// We want to keep only the first error
+		if !s.is_error() {
+			*s = status;
+		}
+	}
+
+	/// Recovers the index queue from the storage.
+	/// This is used when the server is restarted during an indexing process.
+	async fn recover_queue(&self) -> Result<(), Error> {
+		self.recover_queue_with_factory(&self.tf).await
+	}
+
+	async fn recover_queue_with_factory(&self, factory: &TransactionFactory) -> Result<(), Error> {
+		let (ns, db) = self.opt.ns_db()?;
+		let (beg, end) = ib::range(ns, db, &self.ix.what, &self.ix.name)?;
+		let mut next = Some(beg..end);
+		let mut max_appending_id: Option<u32> = None;
+		let mut max_batch_id: Option<u32> = None;
+		let mut batches = HashMap::new();
+		let mut pending = 0;
+		while let Some(rng) = next {
+			let tx = factory
+				.transaction(TransactionType::Read, Optimistic)
+				.await?;
+			let batch = catch!(tx, tx.batch_keys(rng, *NORMAL_FETCH_SIZE, None).await);
+			tx.cancel().await?;
+			next = batch.next;
+			for key in batch.result {
+				let ib = Ib::decode(&key)?;
+				batches
+					.entry(ib.batch_id)
+					.or_insert(RoaringBitmap::new())
+					.insert(ib.appending_id);
+				max_appending_id = Some(
+					max_appending_id
+						.map_or(ib.appending_id, |current| current.max(ib.appending_id)),
+				);
+				max_batch_id =
+					Some(max_batch_id.map_or(ib.batch_id, |current| current.max(ib.batch_id)));
+				pending += 1;
+			}
+		}
+		let mut queue = self.queue.write().await;
+		queue.next_appending = max_appending_id.map_or(0, |v| v + 1);
+		queue.next_batch = max_batch_id.map_or(QueueSequences::DEFAULT_NEXT_BATCH_ID, |v| v + 1);
+		queue.batches = batches;
+		queue.pending = pending;
+		Ok(())
+	}
+
+	/// Try to consume a document update.
+	/// If the index is currently building, the update is enqueued to be indexed asynchronously.
+	/// If the index is already built and not deferred, the update is ignored and the document can be updated normally.
+	async fn maybe_consume(
+		&self,
+		ctx: &Context,
+		old_values: Option<Vec<Value>>,
+		new_values: Option<Vec<Value>>,
+		rid: &Thing,
+	) -> Result<ConsumeResult, Error> {
+		let mut queue = self.queue.write().await;
+		// Now that the queue is locked, we have the possibility to assess if the asynchronous build is done.
+		// If the appending queue is empty and the index is built, and it is not a deferred index:
+		if queue.is_empty() && !self.ix.defer && self.status.read().await.is_ready() {
+			// ... we return the values back, so the document can be updated the usual way
+			return Ok(ConsumeResult::Ignored(old_values, new_values));
+		}
+
+		let tx = ctx.tx();
+		let appending = Appending {
+			old_values,
+			new_values,
+			id: rid.id.clone(),
+		};
+
+		// Get the batch_id for the current transaction
+		let mut pending_index_batches = tx.lock_pending_index_batches().await;
+		let batch_id = if let Some((batch_id, _)) = pending_index_batches.get(&self.ix_key) {
+			*batch_id
+		} else {
+			let batch_id = queue.new_batch();
+			pending_index_batches.insert(self.ix_key.clone(), (batch_id, self.clean_queue.clone()));
+			batch_id
+		};
+
+		// Get the appending_id of this appended record from the sequence
+		let appending_id = queue.add_update(batch_id)?;
+		// Store the appending
+		let ib = self.new_ib_key(appending_id, batch_id)?;
+		tx.set(ib, revision::to_vec(&appending)?, None).await?;
+		// The ip (primary appending) key is only needed during the initial build phase,
+		// where `check_existing_primary_appending` uses it to find the latest appending
+		// for a record being initially indexed. Once the initial build is complete
+		// (appending phase), we skip setting ip to avoid write-write conflicts with the
+		// deferred daemon which deletes ip keys.
+		if !self.initial_build_complete.load(Ordering::Relaxed) {
+			let ip = self.new_ip_key(rid.id.clone())?;
+			let v = tx.get(ip.clone(), None).await?;
+			let pa: Option<PrimaryAppending> = if let Some(v) = v {
+				Some(revision::from_slice(&v)?)
+			} else {
+				None
+			};
+			// We ignore legacy primary indexing.
+			// The initial batch is responsible for removing them, if any,
+			// and reporting their presence in the logs.
+			let is_pa = if let Some(pa) = pa {
+				pa.1 != QueueSequences::LEGACY_BATCH_ID
+			} else {
+				false
+			};
+			if !is_pa {
+				// If not, we set it
+				tx.set(
+					ip,
+					revision::to_vec(&PrimaryAppending(appending_id, batch_id))?,
+					None,
+				)
+				.await?;
+			}
+		}
+		// Free the queue
+		drop(queue);
+		Ok(ConsumeResult::Enqueued)
+	}
+
+	/// Create a new index appending key for the given appending and batch ids.
+	fn new_ib_key(&self, appending_id: AppendingId, batch_id: BatchId) -> Result<Ib<'_>, Error> {
+		let (ns, db) = self.opt.ns_db()?;
+		Ok(Ib::new(
+			ns,
+			db,
+			&self.ix.what,
+			&self.ix.name,
+			appending_id,
+			batch_id,
+		))
+	}
+
+	/// Create a new index primary appending key for the given document ID.
+	fn new_ip_key(&self, id: Id) -> Result<Ip<'_>, Error> {
+		let (ns, db) = self.opt.ns_db()?;
+		Ok(Ip::new(ns, db, &self.ix.what, &self.ix.name, id))
+	}
+
+	/// Create a new read-only transaction.
+	async fn new_read_tx(&self) -> Result<Transaction, Error> {
+		self.tf.transaction(TransactionType::Read, Optimistic).await
+	}
+
+	/// Create a new context with a write transaction.
+	async fn new_write_tx_ctx(&self) -> Result<Context, Error> {
+		let tx = self
+			.tf
+			.transaction(TransactionType::Write, Optimistic)
+			.await?
+			.into();
+		let mut ctx = MutableContext::new(&self.ctx);
+		ctx.set_transaction(tx);
+		Ok(ctx.freeze())
+	}
+
+	/// Run the initial building process
+	async fn run(&self) -> Result<(), Error> {
+		if self.is_aborted().await {
+			return Ok(());
+		}
+		let (ns, db) = self.opt.ns_db()?;
+		// Remove the index data
+		{
+			self.set_status(BuildingStatus::Cleaning).await;
+			let key = crate::key::index::all::new(ns, db, &self.tb, &self.ix.name);
+			let ctx = self.new_write_tx_ctx().await?;
+			let tx = ctx.tx();
+			catch!(tx, tx.delp(&key).await);
+			if self.ix.defer {
+				// We need to know we have started building a deferred index
+				// and that the initial build is not done
+				catch!(tx, tx.set(key, revision::to_vec(&false)?, None).await);
+			}
+			catch!(tx, tx.commit().await);
+		}
+
+		// First iteration, we index every keys
+		let beg = thing::prefix(ns, db, &self.tb)?;
+		let end = thing::suffix(ns, db, &self.tb)?;
+		let mut next = Some(beg..end);
+		let mut initial_count = 0;
+		let mut v1_appending_sentinel = false;
+		// Set the initial status
+		self.set_status(BuildingStatus::Indexing {
+			initial: Some(initial_count),
+			pending: Some(self.queue.read().await.pending() as usize),
+			updated: None,
+		})
+		.await;
+		while let Some(rng) = next {
+			if self.is_aborted().await {
+				return Ok(());
+			}
+			// Get the next batch of records
+			let batch = {
+				let tx = self.new_read_tx().await?;
+				let batch = catch!(
+					tx,
+					tx.batch_keys_vals(rng, *INDEXING_BATCH_SIZE, None).await
+				);
+				tx.cancel().await?;
+				batch
+			};
+			// Set the next scan range
+			next = batch.next;
+			// Check there are records
+			if batch.result.is_empty() {
+				// If not, we are done with the initial indexing
+				break;
+			}
+			// Create a new context with a write transaction
+			{
+				let ctx = self.new_write_tx_ctx().await?;
+				let tx = ctx.tx();
+				// Index the batch
+				catch!(
+					tx,
+					self.index_initial_batch(
+						&ctx,
+						&tx,
+						batch.result,
+						&mut initial_count,
+						&mut v1_appending_sentinel
+					)
+					.await
+				);
+				catch!(tx, tx.commit().await);
+			}
+		}
+		self.set_status(BuildingStatus::Indexing {
+			initial: Some(initial_count),
+			pending: Some(self.queue.read().await.pending() as usize),
+			updated: None,
+		})
+		.await;
+		if !self.ix.defer {
+			// Second iteration, we index/remove any records that have been added or removed since the initial indexing
+			self.index_appending_loop(Some(initial_count)).await?;
+		} else {
+			self.set_df_status(true).await?;
+		}
+		Ok(())
+	}
+
+	/// Persist the deferred index status to storage.
+	/// This records whether the initial build phase has completed, allowing
+	/// the index to be properly restored after a server restart.
+	async fn set_df_status(&self, initial_build_done: bool) -> Result<(), Error> {
+		let (ns, db) = self.opt.ns_db()?;
+		// confirm that the initial build has been successful
+		let key = Df::new(ns, db, &self.ix.what, &self.ix.name);
+		let ctx = self.new_write_tx_ctx().await?;
+		let tx = ctx.tx();
+		catch!(
+			tx,
+			tx.set(key, revision::to_vec(&initial_build_done)?, None)
+				.await
+		);
+		catch!(tx, tx.commit().await);
+		Ok(())
+	}
+
+	/// Loop through the appending queue and index the records.
+	/// This drains stored appends in batches until the queue is empty.
+	async fn index_appending_loop(&self, initial_count: Option<usize>) -> Result<(), Error> {
+		trace!(
+			"{}: index_appending_loop: {:?}",
+			self.ix.name,
+			initial_count
+		);
+		let mut updates_count = initial_count.map(|_| 0);
+		let (ns, db) = self.opt.ns_db()?;
+		let (beg, end) = ib::range(ns, db, &self.ix.what, &self.ix.name)?;
+		let rng = beg..end;
+		loop {
+			if self.is_aborted().await {
+				break;
+			}
+			let keys = {
+				let mut queue = self.queue.write().await;
+				let clean_queue = {
+					let mut batch_ids_to_clean = self.clean_queue.lock().await;
+					std::mem::take(&mut *batch_ids_to_clean)
+				};
+				// Clean batch IDs from cancelled or failed transactions before checking pending
+				// state.
+				queue.clean_batch_ids(clean_queue);
+
+				let keys = {
+					let tx = self.new_read_tx().await?;
+					let keys = catch!(tx, tx.keys(rng.clone(), *NORMAL_FETCH_SIZE, None).await);
+					tx.cancel().await?;
+					keys
+				};
+
+				let pending = queue.pending() as usize;
+
+				if keys.is_empty() && pending == 0 {
+					// If the batch is empty, we are done.
+					// Due to the lock on self.queue, we know that no external process can add an item to the queue.
+					self.set_status(BuildingStatus::Ready {
+						initial: initial_count,
+						pending: Some(queue.pending() as usize),
+						updated: updates_count,
+					})
+					.await;
+					// This is here to be sure the lock on the queue is not released early.
+					drop(queue);
+					break;
+				}
+				keys
+			};
+			if !keys.is_empty() {
+				// Create a new context with a write transaction
+				{
+					let ctx = self.new_write_tx_ctx().await?;
+					let tx = ctx.tx();
+					let indexed = catch!(
+						tx,
+						self.index_appending_range(
+							&ctx,
+							&tx,
+							keys,
+							initial_count,
+							&mut updates_count
+						)
+						.await
+					);
+					catch!(tx, tx.commit().await);
+					if !indexed.is_empty() {
+						{
+							let mut clean_queue = self.clean_queue.lock().await;
+							for batch_id in indexed.keys() {
+								if let Some(idx) =
+									clean_queue.iter().position(|&id| id == *batch_id)
+								{
+									clean_queue.remove(idx);
+								}
+							}
+						}
+						self.queue.write().await.clean(indexed);
+					}
+				}
+			} else {
+				// No committed appends yet, but updates are in-flight; wait.
+				sleep(Duration::from_millis(100)).await;
+			}
+		}
+		Ok(())
+	}
+
+	/// Index a batch of records from the table
+	async fn index_initial_batch(
+		&self,
+		ctx: &Context,
+		tx: &Transaction,
+		values: Vec<(Key, Val)>,
+		count: &mut usize,
+		v1_appending_sentinel: &mut bool,
+	) -> Result<(), Error> {
+		let mut rc = false;
+		let mut stack = TreeStack::new();
+		// Index the records
+		for (k, v) in values.into_iter() {
+			if self.is_aborted().await {
+				return Ok(());
+			}
+			let key = thing::Thing::decode(&k)?;
+			// Parse the value
+			let val: Value = revision::from_slice(&v)?;
+			let rid: Arc<Thing> = Thing::from((key.tb, key.id)).into();
+
+			// Do we already have an appended value?
+			let opt_values = if let Some(a) = self
+				.check_existing_primary_appending(tx, &rid.id, v1_appending_sentinel)
+				.await?
+			{
+				a.old_values
+			} else {
+				// Otherwise, we normally proceed to the indexing
+				let doc = CursorDoc::new(Some(rid.clone()), None, val);
+				let opt_values = stack
+					.enter(|stk| Document::build_opt_values(stk, ctx, &self.opt, &self.ix, &doc))
+					.finish()
+					.await?;
+				opt_values
+			};
+
+			// Index the record
+			let mut io =
+				IndexOperation::new(ctx, &self.opt, &self.ix, None, opt_values.clone(), &rid);
+			stack.enter(|stk| io.compute(stk, &mut rc)).finish().await?;
+
+			// Increment the count and update the status
+			*count += 1;
+			self.set_status(BuildingStatus::Indexing {
+				initial: Some(*count),
+				pending: Some(self.queue.read().await.pending() as usize),
+				updated: None,
+			})
+			.await;
+		}
+		// Check if we trigger the compaction
+		self.check_index_compaction(tx, &mut rc).await?;
+		// We're done
+		Ok(())
+	}
+
+	async fn check_existing_primary_appending(
+		&self,
+		tx: &Transaction,
+		id: &Id,
+		v1_appending_sentinel: &mut bool,
+	) -> Result<Option<Appending>, Error> {
+		let ip = self.new_ip_key(id.clone())?;
+		let Some(v) = tx.get(&ip, None).await? else {
+			return Ok(None);
+		};
+		// Then we take the old value of the appending value as the initial indexing value
+		let pa: PrimaryAppending = revision::from_slice(&v)?;
+		if pa.1 == QueueSequences::LEGACY_BATCH_ID {
+			// Legacy v1 primary appending entry (no batch id; queue stored under !ia).
+			// We can't resolve it to a v2 !ib record, so drop the marker and ignore the legacy queue.
+			tx.del(ip).await?;
+			if !*v1_appending_sentinel {
+				*v1_appending_sentinel = true;
+				warn!("Found legacy v1 primary appending entry from an older version; legacy queued updates will be ignored. Consider rebuilding index {} on table {}.", self.ix.name, self.ix.what);
+			}
+			return Ok(None);
+		}
+		let ib = self.new_ib_key(pa.0, pa.1)?;
+		let v = tx
+			.get(ib, None)
+			.await?
+			.ok_or_else(|| Error::CorruptedIndex("Appending record is missing"))?;
+		let a: Appending = revision::from_slice(&v)?;
+		Ok(Some(a))
+	}
+
+	/// Index a batch of records from the appending queue.
+	/// Returns the indexed appending ids grouped by batch so the caller can clean queue tracking.
+	async fn index_appending_range(
+		&self,
+		ctx: &Context,
+		tx: &Transaction,
+		keys: Vec<Key>,
+		initial: Option<usize>,
+		count: &mut Option<usize>,
+	) -> Result<HashMap<u32, Vec<u32>>, Error> {
+		let mut rc = false;
+		let mut stack = TreeStack::new();
+		let mut indexed = HashMap::new();
+		trace!(
+			"{}: index_appending_range STARTS- len: {}",
+			self.ix.name,
+			keys.len()
+		);
+		for k in keys {
+			if self.is_aborted().await {
+				return Ok(indexed);
+			}
+			let ib = Ib::decode(&k)?;
+			if let Some(v) = tx.get(ib.clone(), None).await? {
+				let a: Appending = revision::from_slice(&v)?;
+				let rid = Thing::from((self.tb.clone(), a.id));
+				let mut io =
+					IndexOperation::new(ctx, &self.opt, &self.ix, a.old_values, a.new_values, &rid);
+				stack.enter(|stk| io.compute(stk, &mut rc)).finish().await?;
+
+				// Delete the ip (primary appending) key if any
+				let ip = self.new_ip_key(rid.id)?;
+				tx.del(ip).await?;
+			}
+			if let Some(c) = count {
+				*c += 1;
+			}
+			self.set_status(BuildingStatus::Indexing {
+				initial,
+				pending: Some(self.queue.read().await.pending() as usize),
+				updated: *count,
+			})
+			.await;
+			indexed
+				.entry(ib.batch_id)
+				.or_insert(vec![])
+				.push(ib.appending_id);
+			tx.del(ib).await?;
+		}
+		trace!(
+			"{}: index_appending_range EXIT: {:?}",
+			self.ix.name,
+			indexed
+		);
+		// Check if we trigger the compaction
+		self.check_index_compaction(tx, &mut rc).await?;
+		// We're done
+		Ok(indexed)
+	}
+
+	/// Check if the index needs compaction and trigger it if necessary
+	async fn check_index_compaction(&self, tx: &Transaction, rc: &mut bool) -> Result<(), Error> {
+		if !*rc {
+			return Ok(());
+		}
+		let (ns, db) = self.opt.ns_db()?;
+		IndexOperation::put_trigger_compaction(
+			ns,
+			db,
+			&self.ix.what,
+			&self.ix.name,
+			tx,
+			self.opt.id()?,
+		)
+		.await?;
+		*rc = false;
+		Ok(())
+	}
+
+	/// Abort the current indexing process.
+	fn abort(&self) {
+		// We use `Ordering::Relaxed` as the called does not require to be synchronized.
+		// We just want the current builder to eventually stop.
+		self.aborted.store(true, Ordering::Relaxed);
+	}
+
+	/// Check if the indexing process is aborting.
+	async fn is_aborted(&self) -> bool {
+		// We use `Ordering::Relaxed` as there are no shared data that would require any synchronization.
+		// This method is only called by the single thread building the index.
+		if self.aborted.load(Ordering::Relaxed) {
+			self.set_status(BuildingStatus::Aborted).await;
+			true
+		} else {
+			false
+		}
+	}
+
+	/// Check if the building process has fully completed.
+	/// For regular indexes, this returns true once the initial build is done.
+	/// For deferred indexes, this returns true only after both the initial build
+	/// and the deferred daemon have stopped.
+	fn is_finished(&self) -> bool {
+		// Check if initial build is complete
+		// Use Acquire ordering to synchronize with Release in guards
+		if !self.initial_build_complete.load(Ordering::Acquire) {
+			return false;
+		}
+		// For deferred indexes, we're not finished while the daemon is running
+		if self.deferred_daemon_running.load(Ordering::Acquire) {
+			return false;
+		}
+		true
+	}
+
+	/// Wait for the builder to finish (both initial build and deferred daemon if applicable)
+	async fn wait_for_completion(&self) {
+		// Wait for notification, but re-check condition after each wake
+		// (handles spurious wakeups and race conditions)
+		while !self.is_finished() {
+			// Use notified() future - this registers interest before checking condition
+			let notified = self.completion_notify.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+			// Re-check after registering (avoids race condition)
+			if self.is_finished() {
+				return;
+			}
+			// Wait for notification
+			notified.await;
+		}
+	}
+}
+
+/// Guard to mark the initial build as complete when dropped
+struct InitialBuildGuard(IndexBuilding);
+
+impl Drop for InitialBuildGuard {
+	fn drop(&mut self) {
+		self.0.initial_build_complete.store(true, Ordering::Release);
+		self.0.completion_notify.notify_waiters();
+	}
+}
+
+/// Guard to track the deferred daemon lifecycle
+struct DeferredDaemonGuard(IndexBuilding);
+
+impl Drop for DeferredDaemonGuard {
+	fn drop(&mut self) {
+		self.0
+			.deferred_daemon_running
+			.store(false, Ordering::Release);
+		self.0.completion_notify.notify_waiters();
+	}
+}
+
+#[cfg(all(test, feature = "kv-mem"))]
+mod recall_physical_tests {
+	use super::*;
+	use crate::kvs::Datastore;
+
+	#[tokio::test]
+	async fn removed_unpolled_builder_remains_owned_until_physical_drain() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let context = ds.setup_ctx().unwrap().freeze();
+		let builder = context.get_index_builder().unwrap();
+		let ix = Arc::new(DefineIndexStatement {
+			name: "index".into(),
+			what: "table".into(),
+			..Default::default()
+		});
+		let key = Arc::new(IndexKey::new("ns", "db", "table", "index"));
+		let options = Options::default()
+			.with_ns(Some("ns".into()))
+			.with_db(Some("db".into()));
+		let building = builder
+			.start_building(&context, options, ix, key.clone(), None, false)
+			.await
+			.unwrap();
+		builder.indexes.write().await.insert(key, building.clone());
+		assert!(!building.initial_build_complete.load(Ordering::Acquire));
+		builder
+			.remove_index("ns", "db", "table", "index")
+			.await
+			.unwrap();
+		assert!(builder.indexes.read().await.is_empty());
+		assert!(!building.is_finished());
+		assert_eq!(builder.retired.lock().unwrap().len(), 1);
+		tokio::time::timeout(Duration::from_secs(1), builder.pause_for_physical())
+			.await
+			.unwrap()
+			.unwrap();
+		assert!(building.is_finished());
+		assert!(builder.retired.lock().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn unpolled_deferred_daemon_is_reserved_until_actual_worker_drop() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let context = ds.setup_ctx().unwrap().freeze();
+		let ix = Arc::new(DefineIndexStatement {
+			name: "index".into(),
+			what: "table".into(),
+			defer: true,
+			..Default::default()
+		});
+		let key = Arc::new(IndexKey::new("ns", "db", "table", "index"));
+		let builder = context.get_index_builder().unwrap();
+		let building = Arc::new(
+			Building::new(&context, builder.tf.clone(), Options::default(), ix, key).unwrap(),
+		);
+		building
+			.initial_build_complete
+			.store(true, Ordering::Release);
+		building.abort();
+		IndexBuilder::spawn_deferred_daemon(building.clone());
+		// Current-thread runtime has not polled the spawned daemon at this point.
+		assert!(!building.is_finished());
+		tokio::time::timeout(Duration::from_secs(1), building.wait_for_completion())
+			.await
+			.unwrap();
+		assert!(building.is_finished());
+	}
+}

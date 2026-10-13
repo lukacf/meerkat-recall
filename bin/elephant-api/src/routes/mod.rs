@@ -1,17 +1,26 @@
 //! API routes.
 
 pub mod assertions;
+pub mod current_read;
+mod doc_revisions;
 pub mod docs;
 pub mod entities;
 pub mod events;
+pub mod grants;
 pub mod health;
 pub mod identity;
 pub(crate) mod ingest_guard;
 pub mod knowledge_views;
 pub mod predicates;
+pub mod processing;
+pub mod public_sources;
+pub mod readiness;
 pub mod relationships;
 pub mod runtime;
+pub mod scoped_search;
+mod source_intake;
 pub mod sources;
+pub mod space_status;
 pub mod spaces;
 pub mod system;
 pub mod timeline;

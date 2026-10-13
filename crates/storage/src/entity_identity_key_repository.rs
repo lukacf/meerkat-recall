@@ -658,6 +658,39 @@ impl SearchRepository<EntityIdentityKey> for EntityIdentityKeyRepository {
     }
 }
 
+impl EntityIdentityKeyRepository {
+    /// Reads physical row state for atomic source lifecycle inverse preparation.
+    pub(crate) async fn get_including_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<EntityIdentityKey>> {
+        if let Some(store) = self.client.embedded_store() {
+            return store.get::<EntityIdentityKey>(space_id, id, true).await;
+        }
+
+        let mut response = self
+            .client
+            .query_bind(
+                &format!(
+                    "SELECT {ENTITY_IDENTITY_KEY_PROJECTION} FROM entity_identity_key WHERE id = $id AND space_id = $space_id"
+                ),
+                crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
+            )
+            .await?;
+
+        let records: Vec<EntityIdentityKeyDb> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse entity_identity_key: {e}"))
+        })?;
+
+        records
+            .into_iter()
+            .next()
+            .map(EntityIdentityKey::try_from)
+            .transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -731,6 +764,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_and_find_by_key() -> Result<(), Box<dyn std::error::Error>> {
         let repo = setup_test_repo().await?;
         let entity_id = RecordId::new_v4(TableName::Entity);
@@ -749,6 +786,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_create_rejects_duplicate_key() {
         let repo = setup_embedded_test_repo().await;
         let first = make_key(

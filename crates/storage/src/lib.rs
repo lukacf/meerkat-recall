@@ -16,14 +16,29 @@
 
 // Core infrastructure
 pub mod backend;
+pub mod canonical_commit;
+pub mod canonical_definition;
+pub mod canonical_extension;
+mod canonical_reprocess_control;
 pub mod client;
+mod durability_io;
 pub mod embedded;
+mod embedded_durability;
+pub mod erasure_journal;
 pub mod error;
+pub mod event_sequence;
+pub mod exclusive_store_lock;
+pub mod initialization_diagnostic;
+pub mod outbox_checkpoint_repository;
 pub mod pool;
+pub mod recovery_barrier;
+pub(crate) mod reference_fence;
 pub mod repository;
 /// Required-field decoding helpers for storage repositories.
 pub mod require;
 mod response;
+pub mod snapshot;
+pub mod snapshot_inspection;
 /// `SurrealQL` query building and native driver bridge.
 pub mod surreal;
 #[cfg(any(test, feature = "test-utils"))]
@@ -36,17 +51,48 @@ pub mod chunk_embedding_repository;
 pub mod doc_repository;
 pub mod entity_identity_key_repository;
 pub mod entity_merge_repository;
+pub mod entity_profile_embedding_repository;
 pub mod entity_repository;
 pub mod event_repository;
 pub mod fake_embedding_repair;
 pub mod identity_candidate_repository;
 pub mod lifecycle_guard;
 pub mod media_asset_repository;
+mod private_control_read;
+/// Disabled-by-default, capability-bound local qualification evidence exchange.
+///
+pub mod private_primary_evidence;
+pub mod public_mutation;
+pub mod read_eligibility;
+pub mod reindex_guard;
 pub mod rel_repository;
+pub mod source_contact_intake;
+mod source_contact_lineage;
+mod source_contact_publication;
+mod source_contact_survival;
+mod source_contact_survival_proof;
+pub mod source_decision;
+pub mod source_document_guards;
+mod source_history_authority;
+mod source_history_controls;
+mod source_history_restore;
+pub use source_document_guards::standing_dispatch_inputs;
 pub mod source_ingest;
+pub mod source_intake;
+/// Read-only physical source inventory paging.
+pub mod source_inventory;
+pub mod source_lifecycle;
+pub mod source_producer;
+pub mod source_publication;
+pub mod source_publication_manifest;
 pub mod source_repository;
+mod source_retraction_proof;
+pub mod source_watch_producer;
+pub mod source_watch_registration;
 pub mod source_watch_repository;
 pub mod space_config_repository;
+pub mod space_grant_repository;
+pub mod standing_watch_repository;
 pub mod system_event_repository;
 
 // Ingestion-to-Graph repositories (formerly v08)
@@ -62,12 +108,16 @@ pub mod knowledge_view_definition_repository;
 pub mod knowledge_view_repository;
 pub mod predicate_alias_repository;
 pub mod predicate_registry_repository;
+pub mod provider_usage_repository;
 pub mod reprocess_job_repository;
 pub mod truth_slot_repository;
+mod unmanaged_embedding;
 pub mod work_artifact_repository;
+pub mod work_attempt_repository;
 pub mod work_deadletter_repository;
 pub mod work_edge_repository;
 pub mod work_item_repository;
+pub mod work_producer_repository;
 pub mod work_retention;
 pub mod work_run_repository;
 
@@ -85,6 +135,9 @@ pub use chunk_embedding_repository::NodeEmbeddingVectorHit;
 pub use chunk_embedding_repository::{semantic_window_settled, PartitionWindow};
 pub use client::{StorageBackendKind, StorageClient, StorageConfig};
 pub use doc_repository::DocRepository;
+#[cfg(any(test, feature = "test-utils"))]
+pub use durability_io::configuration_write_test_support;
+pub use durability_io::{write_private_configuration, ConfigWriteError};
 pub use embedded::{
     cosine_similarity, hashed_text_embedding, lexical_score, EmbeddedMutation, EmbeddedRecord,
     EmbeddedStore,
@@ -101,6 +154,7 @@ pub use event_repository::{
 };
 pub use identity_candidate_repository::IdentityCandidateRepository;
 pub use media_asset_repository::MediaAssetRepository;
+pub use outbox_checkpoint_repository::OutboxCheckpointRepository;
 pub use pool::{ConnectionPool, PoolConfig, PoolStats, ServerStats, SessionKey};
 pub use rel_repository::{GraphNeighbor, RelRepository};
 pub use repository::{PaginatedResult, Repository, SearchCriteria, SearchRepository};
@@ -111,6 +165,7 @@ pub use source_ingest::{
     rollback_persisted_manual_doc, rollback_persisted_source, update_existing_source_for_reingest,
     PersistedManualDoc,
 };
+pub use source_publication::{AcceptSourceRevision, SourceMutation, SourcePublicationRepository};
 pub use source_repository::SourceRepository;
 pub use source_watch_repository::SourceWatchRepository;
 pub use space_config_repository::SpaceConfigRepository;
@@ -137,7 +192,7 @@ pub use doc_revision_repository::DocRevisionRepository;
 pub use freshness_repository::FreshnessRepository;
 pub use ingest_decision_repository::IngestDecisionRepository;
 pub use knowledge_view_definition_repository::KnowledgeViewDefinitionRepository;
-pub use knowledge_view_repository::KnowledgeViewRepository;
+pub use knowledge_view_repository::{KnowledgeViewRepository, PreparedKnowledgeViewAuthority};
 pub use lifecycle_guard::base_envelope_unchanged;
 pub use predicate_alias_repository::PredicateAliasRepository;
 pub use predicate_registry_repository::PredicateRegistryRepository;
@@ -200,3 +255,26 @@ mod tests {
         assert_eq!(config.database, "test");
     }
 }
+
+mod canonical_id_map;
+
+#[cfg(test)]
+mod source_index_visibility_tests;
+
+#[cfg(test)]
+mod native_value_compute_tests;
+
+#[cfg(test)]
+mod native_reference_token_tests;
+
+#[cfg(test)]
+mod native_physical_rpc_tests;
+
+#[cfg(test)]
+mod private_membership_native_tests;
+
+#[cfg(test)]
+mod native_physical_history_rpc_tests;
+
+#[cfg(all(test, any(feature = "surrealkv", feature = "rocksdb")))]
+mod native_physical_index_tests;

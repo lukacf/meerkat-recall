@@ -1,0 +1,100 @@
+{
+  "format": "recall-public-graph-fixture/v1",
+  "source_request": {
+    "source": {
+      "id": "source:68d64c6b-d3c1-5b91-bfe2-86b0cd152a04",
+      "space_id": "qualification-business",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "business-policy",
+        "level": 7,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "type": "manual",
+      "hash": "1ed29a8007106e12c91d02c37234a81b39f31812faf41ce8ebabd65d0b013922",
+      "external_id": "full/shared/b",
+      "uri": "https://example.invalid/recall-graph/full/shared/b",
+      "metadata": {}
+    },
+    "doc": {
+      "id": "doc:d0365de9-48a1-5b72-8902-e393161419f9",
+      "space_id": "qualification-business",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "business-policy",
+        "level": 7,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "title": "full/shared/b",
+      "text": "Mira maintains the Helios shared notebook. The notebook access code is violet-47.",
+      "source": null,
+      "sidecar_text": null,
+      "media_attachments": [],
+      "rendition_key": "d28/text/full/shared/b/full-shared-r1",
+      "metadata": {}
+    },
+    "ingest_mode": "graph",
+    "intake": {
+      "revision_id": "full-shared-r1",
+      "idempotency_key": "literal-9ae31f9670506c6de9e7f51041fb77c67435ff3e634eb0e486cbf58d47e5d3b6"
+    }
+  },
+  "rendered_text": "Mira maintains the Helios shared notebook. The notebook access code is violet-47.\n",
+  "rendered_sha256": "cee9215b8f42b229532be36e1080ccbea927ef118938001c422190fd687380a2",
+  "expected_assertions": [
+    {
+      "subject_text": "Mira",
+      "predicate_raw": "maintains",
+      "object_text": "Helios shared notebook",
+      "object_literal": null,
+      "subject_entity_type": "person",
+      "object_entity_type": "document",
+      "confidence": 1.0,
+      "significance": "medium",
+      "source_event_time": null,
+      "start": 0,
+      "end": 42,
+      "quote": "Mira maintains the Helios shared notebook.",
+      "quote_hash": "ba97f45120dae8f902b939af664e615d8c42f9457592bb0f1c22aa44247a03f3"
+    },
+    {
+      "subject_text": "Helios shared notebook",
+      "predicate_raw": "access_code",
+      "object_text": null,
+      "object_literal": {
+        "type": "string",
+        "value": "violet-47"
+      },
+      "subject_entity_type": "document",
+      "object_entity_type": null,
+      "confidence": 1.0,
+      "significance": "medium",
+      "source_event_time": null,
+      "start": 43,
+      "end": 81,
+      "quote": "The notebook access code is violet-47.",
+      "quote_hash": "2a0b95e0218a14fb700debf99224087c263dd60e38a6fbbf8cf0c08539a33d01"
+    }
+  ],
+  "extract_rule_id": "business-shared-extract"
+}

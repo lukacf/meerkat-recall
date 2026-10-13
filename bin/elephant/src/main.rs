@@ -11,12 +11,15 @@ use elephant_api::runtime::RuntimeManager;
 use elephant_api::AuthConfig;
 use elephant_pipeline_bin::config::PipelineConfig;
 use elephant_storage::{StorageBackendKind, StorageClient, StorageConfig};
-use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use walkdir::WalkDir;
 
 mod data_migrate;
+mod service_token;
+mod snapshot;
+use snapshot::SnapshotCommand;
+mod status;
 mod wiki_demo;
 
 #[derive(Parser, Debug)]
@@ -35,8 +38,11 @@ struct ApiTarget {
     #[arg(long, global = true)]
     api_url: Option<String>,
     /// Bearer token for admin API calls.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, conflicts_with = "token_file")]
     token: Option<String>,
+    /// Read the bearer from a private file; useful for service probes.
+    #[arg(long, global = true)]
+    token_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -47,15 +53,22 @@ enum Commands {
     Worker,
     /// Apply the `SurrealDB` schema and optional extension SQL.
     Migrate(MigrateArgs),
-    /// Import or export a live embedded snapshot through the running API.
+    /// Export/restore named backups, verify bundles and enforce retention.
     Snapshot {
         #[command(subcommand)]
         command: SnapshotCommand,
     },
     /// One-time data migration: embedded snapshot -> `SurrealDB` backend.
     DataMigrate(data_migrate::DataMigrateArgs),
+    /// Explicitly erase a partial target left by a failed data-migrate command.
+    DataMigrateDiscard(data_migrate::DataMigrateDiscardArgs),
     /// Show health and managed runtime status for a running Meerkat Recall API.
     Status(StatusArgs),
+    /// Provision local signing secrets and explicitly scoped service tokens.
+    ServiceToken {
+        #[command(subcommand)]
+        command: service_token::ServiceTokenCommand,
+    },
     /// Launch an embedded, evidence-backed Living Wiki demonstration.
     DemoWiki(DemoWikiArgs),
 }
@@ -65,6 +78,9 @@ struct ServeArgs {
     /// Run only HTTP/MCP server routes; do not start managed workers.
     #[arg(long)]
     server_only: bool,
+    /// Total shutdown deadline; must exceed the managed worker drain deadline.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(31..=300))]
+    shutdown_timeout_seconds: u64,
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -74,22 +90,17 @@ struct MigrateArgs {
     extension_dir: Option<PathBuf>,
 }
 
-#[derive(Subcommand, Debug)]
-enum SnapshotCommand {
-    /// Export the live embedded snapshot to a file on the Meerkat Recall host.
-    Export { path: PathBuf },
-    /// Import a snapshot file into the live embedded store.
-    Import { path: PathBuf },
-}
-
 #[derive(Args, Debug, Clone, Default)]
 struct StatusArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
-    /// Exit unsuccessfully unless health and semantic ingestion are ready.
+    /// Exit with a stable readiness category unless the authenticated service is ready.
     #[arg(long)]
     require_ready: bool,
+    /// Select one authorized named space for runtime readiness.
+    #[arg(long)]
+    space: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -97,51 +108,9 @@ struct DemoWikiArgs {
     /// HTTP port for the demonstration browser.
     #[arg(long, default_value_t = 3000)]
     port: u16,
-}
-
-#[derive(Clone, Copy)]
-enum SnapshotAction {
-    Export,
-    Import,
-}
-
-impl SnapshotAction {
-    const fn endpoint(self) -> &'static str {
-        match self {
-            Self::Export => "/v1/system/snapshot/export",
-            Self::Import => "/v1/system/snapshot/import",
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Export => "export",
-            Self::Import => "import",
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct SnapshotRequest {
-    path: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct SnapshotResponse {
-    success: bool,
-    backend: String,
-    path: String,
-    message: String,
-}
-
-#[derive(Serialize)]
-struct StatusResponse {
-    health: serde_json::Value,
-    runtime: Option<serde_json::Value>,
-    #[serde(skip)]
-    health_success: bool,
-    #[serde(skip)]
-    health_status: reqwest::StatusCode,
+    /// Explicit approved `SpaceProcessingConfig` JSON for this isolated model-backed demo.
+    #[arg(long)]
+    processing_config: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -153,22 +122,22 @@ async fn main() -> Result<()> {
         Commands::Serve(args) => run_serve(args).await,
         Commands::Worker => run_worker().await,
         Commands::Migrate(args) => apply_schema(args.extension_dir).await,
-        Commands::Snapshot { command } => match command {
-            SnapshotCommand::Export { path } => {
-                run_snapshot_command(&cli.api, SnapshotAction::Export, path).await
-            }
-            SnapshotCommand::Import { path } => {
-                run_snapshot_command(&cli.api, SnapshotAction::Import, path).await
-            }
-        },
-        Commands::Status(args) => run_status_command(&cli.api, args).await,
+        Commands::Snapshot { command } => snapshot::run(&cli.api, command).await,
+        Commands::Status(args) => status::run(&cli.api, args).await,
+        Commands::ServiceToken { command } => service_token::run(command),
         Commands::DataMigrate(args) => data_migrate::run(args).await,
-        Commands::DemoWiki(args) => Box::pin(wiki_demo::run(args.port)).await,
+        Commands::DataMigrateDiscard(args) => data_migrate::discard(args).await,
+        Commands::DemoWiki(args) => {
+            Box::pin(wiki_demo::run(args.port, args.processing_config)).await
+        }
     };
 
     if let Err(err) = result {
         error!("{err:#}");
-        std::process::exit(1);
+        std::process::exit(
+            err.downcast_ref::<status::StatusFailure>()
+                .map_or(1, |error| error.0),
+        );
     }
 
     Ok(())
@@ -186,7 +155,13 @@ fn init_tracing() -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    clippy::single_match_else,
+    reason = "Preserve runtime ownership through bounded shutdown, drain, and snapshot persistence."
+)]
 async fn run_serve(args: ServeArgs) -> Result<()> {
+    let mut signals = ShutdownSignals::install()?;
     validate_backend_env()?;
     let config = ApiConfig::from_env()?;
     let auth_config = AuthConfig::from_env()?;
@@ -204,7 +179,6 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         "Starting Meerkat Recall server"
     );
     let runtime = Arc::new(runtime);
-    let snapshot_autosave_path = snapshot_autosave_path(&config);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let api_runtime = runtime.clone();
     let mut api_task = tokio::spawn(async move {
@@ -222,45 +196,70 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             result.context("Meerkat Recall API task panicked")??;
             Ok(())
         }
-        signal = tokio::signal::ctrl_c() => {
-            signal.context("failed to listen for Ctrl-C")?;
-            info!("Shutdown requested; draining Meerkat Recall runtime");
-            runtime.shutdown().await;
-            if let Some(path) = snapshot_autosave_path {
-                if let Some(storage) = runtime.current_storage().await {
-                    match storage.export_snapshot(path.clone()).await {
-                        Ok(()) => info!(path = %path.display(), "Exported embedded snapshot on shutdown"),
-                        Err(err) => warn!(path = %path.display(), error = %err, "Failed to export embedded snapshot on shutdown"),
-                    }
+        signal = signals.wait() => {
+            signal?;
+            info!("Shutdown requested; withdrawing readiness and draining runtime");
+            runtime.begin_shutdown().await;
+            let drain = async {
+                let workers = runtime.shutdown().await;
+                let _ = shutdown_tx.send(true);
+                workers?;
+                (&mut api_task).await.context("Meerkat Recall API task panicked")??;
+                runtime.persist_shutdown_snapshot().await?;
+                Ok::<(), anyhow::Error>(())
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(args.shutdown_timeout_seconds), drain).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = shutdown_tx.send(true);
+                    api_task.abort();
+                    anyhow::bail!("shutdown deadline expired; clean drain and persistence were not established")
                 }
             }
-            let _ = shutdown_tx.send(true);
-            api_task.await.context("Meerkat Recall API task panicked")??;
-            Ok(())
         }
     }
 }
 
-fn snapshot_autosave_path(config: &ApiConfig) -> Option<PathBuf> {
-    if config.db_backend != StorageBackendKind::ElephantDb {
-        return None;
-    }
-
-    if env_flag_disabled("ELEPHANT_DB_SNAPSHOT_AUTOSAVE") {
-        return None;
-    }
-
-    env::var("ELEPHANT_DB_SNAPSHOT_SAVE")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .or_else(|| config.db_snapshot_load.clone())
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
 }
 
-fn env_flag_disabled(name: &str) -> bool {
-    env::var(name)
-        .map(|value| matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
-        .unwrap_or(false)
+impl ShutdownSignals {
+    fn install() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                interrupt:
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                        .context("install SIGINT handler")?,
+                terminate:
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .context("install SIGTERM handler")?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    async fn wait(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => {},
+                _ = self.terminate.recv() => {},
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.context("listen for shutdown")
+        }
+    }
 }
 
 async fn run_worker() -> Result<()> {
@@ -289,28 +288,18 @@ async fn run_worker() -> Result<()> {
     elephant_pipeline_bin::run_pipeline_with_client(config, storage).await
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the storage client alive through the complete explicit migration operation."
+)]
 async fn apply_schema(extension_dir: Option<PathBuf>) -> Result<()> {
     use elephant_migrations::apply_schema;
     use std::fs;
 
-    let backend = configured_backend_from_env()?;
-    if backend == StorageBackendKind::ElephantDb {
+    let config = elephant_api::runtime::resolve_storage_config_for_cli()?;
+    if config.backend == StorageBackendKind::ElephantDb {
         anyhow::bail!("`elephant migrate` is only supported with ELEPHANT_DB=surreal-db");
     }
-
-    let config = StorageConfig {
-        backend,
-        url: env::var("SURREALDB_URL").unwrap_or_else(|_| "ws://localhost:8000".to_string()),
-        username: env::var("SURREALDB_USER").unwrap_or_else(|_| "root".to_string()),
-        password: env::var("SURREALDB_PASS").unwrap_or_else(|_| "root".to_string()),
-        namespace: env::var("SURREALDB_NAMESPACE").unwrap_or_else(|_| "elephant".to_string()),
-        database: env::var("SURREALDB_DATABASE").unwrap_or_else(|_| "main".to_string()),
-        snapshot_load: env::var("ELEPHANT_DB_SNAPSHOT_LOAD")
-            .ok()
-            .map(PathBuf::from),
-        ..StorageConfig::default()
-    }
-    .with_env_timeouts()?;
     let client = StorageClient::new(config).await?;
 
     apply_schema(&client)
@@ -334,7 +323,7 @@ async fn apply_schema(extension_dir: Option<PathBuf>) -> Result<()> {
             let sql = fs::read_to_string(path)?;
             info!("Applying extension: {name}");
             client
-                .query(&sql)
+                .query_checked(&sql)
                 .await
                 .map_err(|err| anyhow::anyhow!("failed to apply {name}: {err}"))?;
         }
@@ -359,153 +348,17 @@ async fn apply_schema(extension_dir: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn run_snapshot_command(
-    target: &ApiTarget,
-    action: SnapshotAction,
-    path: PathBuf,
-) -> Result<()> {
-    let client = reqwest::Client::new();
-    let url = format!("{}{}", api_base_url_from_target(target), action.endpoint());
-    let mut request = client.post(url).json(&SnapshotRequest {
-        path: path.to_string_lossy().into_owned(),
-    });
-    if let Some(token) = api_token_from_target(target) {
-        request = request.bearer_auth(token);
-    }
-
-    let response = request.send().await.map_err(|err| {
-        anyhow::anyhow!("failed to call snapshot {} endpoint: {err}", action.label())
-    })?;
-    let status = response.status();
-
-    if status.is_success() {
-        let payload: SnapshotResponse = response.json().await.map_err(|err| {
-            anyhow::anyhow!(
-                "snapshot {} succeeded but response decoding failed: {err}",
-                action.label()
-            )
-        })?;
-        if !payload.success {
-            anyhow::bail!(
-                "snapshot {} reported failure for {}",
-                action.label(),
-                payload.path
-            );
-        }
-        println!("{} [{}]", payload.message, payload.backend);
-        return Ok(());
-    }
-
-    let error_body: serde_json::Value = response
-        .json()
-        .await
-        .unwrap_or_else(|_| serde_json::json!({ "message": format!("HTTP {}", status.as_u16()) }));
-    let message = error_body
-        .get("message")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("Snapshot request failed");
-    anyhow::bail!(
-        "snapshot {} failed ({}): {}",
-        action.label(),
-        status,
-        message
-    );
-}
-
-async fn run_status_command(target: &ApiTarget, args: StatusArgs) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("build status client")?;
-    let payload = fetch_status(target, &client).await?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else {
-        print_status(&payload);
-    }
-    if args.require_ready {
-        require_ready(&payload)?;
-    }
-    Ok(())
-}
-
-async fn fetch_status(target: &ApiTarget, client: &reqwest::Client) -> Result<StatusResponse> {
-    let base_url = api_base_url_from_target(target);
-    let mut health_request = client.get(format!("{base_url}/v1/health"));
-    let mut runtime_request = client.get(format!("{base_url}/v1/runtime/status"));
-    if let Some(token) = api_token_from_target(target) {
-        health_request = health_request.bearer_auth(token.clone());
-        runtime_request = runtime_request.bearer_auth(token);
-    }
-
-    let health_response = health_request
-        .send()
-        .await
-        .context("failed to call health endpoint")?;
-    let health_status = health_response.status();
-    let health: serde_json::Value = health_response
-        .json()
-        .await
-        .map_err(|err| anyhow::anyhow!("failed to decode health response: {err}"))?;
-
-    let runtime = match runtime_request.send().await {
-        Ok(response) if response.status().is_success() => response.json().await.ok(),
-        _ => None,
-    };
-
-    Ok(StatusResponse {
-        health,
-        runtime,
-        health_success: health_status.is_success(),
-        health_status,
-    })
-}
-
-fn require_ready(payload: &StatusResponse) -> Result<()> {
-    if !payload.health_success
-        || payload
-            .health
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            != Some("healthy")
-    {
-        anyhow::bail!("server health is not ready");
-    }
-    let runtime: elephant_api::runtime::RuntimeStatus = serde_json::from_value(
-        payload
-            .runtime
-            .clone()
-            .context("runtime status is unavailable")?,
-    )
-    .context("runtime status is malformed")?;
-    if !runtime.semantic_ingest_ready {
-        anyhow::bail!("semantic ingestion is not ready");
-    }
-    Ok(())
-}
-
-fn print_status(payload: &StatusResponse) {
-    let health_label = payload
-        .health
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_else(|| payload.health_status.as_str());
-    println!("health: {health_label}");
-    if let Some(runtime) = &payload.runtime {
-        println!(
-            "runtime: configured={}, bootstrap={}, backend={}, worker_ready={}, semantic_ingest_ready={}",
-            json_bool(runtime, "configured"),
-            json_bool(runtime, "bootstrap_mode"),
-            runtime
-                .get("backend")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unconfigured"),
-            json_bool(runtime, "worker_ready"),
-            json_bool(runtime, "semantic_ingest_ready")
+/// Bound management responses without trusting Content-Length.
+async fn bounded_json(mut response: reqwest::Response) -> Result<serde_json::Value> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            bytes.len() + chunk.len() <= 1_048_576,
+            "management response exceeds 1 MiB"
         );
-    } else {
-        println!("runtime: unavailable");
+        bytes.extend_from_slice(&chunk);
     }
+    serde_json::from_slice(&bytes).context("invalid management JSON response")
 }
 
 fn api_base_url_from_target(target: &ApiTarget) -> String {
@@ -519,13 +372,24 @@ fn api_base_url_from_target(target: &ApiTarget) -> String {
     )
 }
 
-fn api_token_from_target(target: &ApiTarget) -> Option<String> {
-    target
+fn api_token_from_target(target: &ApiTarget) -> Result<Option<String>> {
+    let token = target
         .token
         .clone()
         .or_else(|| env::var("ELEPHANT_API_BEARER_TOKEN").ok())
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
+        .filter(|value| !value.trim().is_empty());
+    let path = target
+        .token_file
+        .clone()
+        .or_else(|| env::var_os("ELEPHANT_API_BEARER_TOKEN_FILE").map(PathBuf::from));
+    anyhow::ensure!(
+        token.is_none() || path.is_none(),
+        "provide only one API bearer token source"
+    );
+    if let Some(path) = path {
+        return Ok(Some(elephant_auth::service_token::read_secret_file(&path)?));
+    }
+    Ok(token.map(|value| value.trim().to_owned()))
 }
 
 fn api_base_url(api_url: Option<&str>, host: Option<&str>, port: Option<&str>) -> String {
@@ -545,13 +409,6 @@ fn api_base_url(api_url: Option<&str>, host: Option<&str>, port: Option<&str>) -
     format!("http://{host}:{port}")
 }
 
-fn json_bool(value: &serde_json::Value, key: &str) -> bool {
-    value
-        .get(key)
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
 fn validate_backend_env() -> Result<()> {
     if let Ok(value) = env::var("ELEPHANT_DB") {
         value
@@ -562,75 +419,11 @@ fn validate_backend_env() -> Result<()> {
     Ok(())
 }
 
-fn configured_backend_from_env() -> Result<StorageBackendKind> {
-    match env::var("ELEPHANT_DB") {
-        Ok(value) => value
-            .parse()
-            .map_err(|err| anyhow::anyhow!("invalid ELEPHANT_DB `{value}`: {err}")),
-        Err(env::VarError::NotPresent) => Ok(StorageBackendKind::SurrealDb),
-        Err(err) => Err(anyhow::anyhow!("failed to read ELEPHANT_DB: {err}")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-
-    #[tokio::test]
-    async fn stalled_status_endpoints_fail_readiness_within_the_request_timeout() {
-        use axum::{routing::get, Json, Router};
-        use std::time::Duration;
-
-        for stalled_endpoint in ["/v1/health", "/v1/runtime/status"] {
-            let stall_health = stalled_endpoint == "/v1/health";
-            let app = Router::new()
-                .route(
-                    "/v1/health",
-                    get(move || async move {
-                        if stall_health {
-                            std::future::pending::<()>().await;
-                        }
-                        Json(serde_json::json!({"status": "healthy"}))
-                    }),
-                )
-                .route(
-                    "/v1/runtime/status",
-                    get(move || async move {
-                        if !stall_health {
-                            std::future::pending::<()>().await;
-                        }
-                        Json(serde_json::json!({}))
-                    }),
-                );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let target = ApiTarget {
-                api_url: Some(format!("http://{}", listener.local_addr().unwrap())),
-                token: Some("fixture".into()),
-            };
-            let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_millis(100))
-                .build()
-                .unwrap();
-            let result =
-                tokio::time::timeout(Duration::from_secs(2), fetch_status(&target, &client))
-                    .await
-                    .unwrap();
-            if stalled_endpoint == "/v1/health" {
-                assert!(result.is_err());
-            } else {
-                let payload = result.unwrap();
-                assert!(payload.runtime.is_none());
-                assert!(require_ready(&payload).is_err());
-            }
-            server.abort();
-            let _ = server.await;
-        }
-    }
 
     #[test]
     fn parses_command_tree() {
@@ -642,6 +435,31 @@ mod tests {
         Cli::try_parse_from(["elephant", "snapshot", "export", "state.json"]).unwrap();
         Cli::try_parse_from(["elephant", "snapshot", "import", "state.json"]).unwrap();
         Cli::try_parse_from(["elephant", "status", "--json"]).unwrap();
+    }
+
+    #[test]
+    fn discarding_transfer_requires_separate_explicit_confirmation() {
+        let digest = "a".repeat(64);
+        assert!(Cli::try_parse_from([
+            "elephant",
+            "data-migrate-discard",
+            "--source-sha256",
+            &digest
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["elephant", "data-migrate-discard", "--discard-target"]).is_err()
+        );
+        Cli::try_parse_from([
+            "elephant",
+            "data-migrate-discard",
+            "--source-sha256",
+            &digest,
+            "--discard-target",
+            "--url",
+            "memory",
+        ])
+        .unwrap();
     }
 
     #[test]
@@ -666,21 +484,5 @@ mod tests {
             api_base_url(None, Some("::"), Some("3000")),
             "http://[::1]:3000"
         );
-    }
-
-    #[test]
-    fn snapshot_autosave_defaults_to_loaded_embedded_snapshot() {
-        let mut config = ApiConfig {
-            db_backend: StorageBackendKind::ElephantDb,
-            db_snapshot_load: Some(PathBuf::from("state.snapshot")),
-            ..ApiConfig::default()
-        };
-        assert_eq!(
-            snapshot_autosave_path(&config),
-            Some(PathBuf::from("state.snapshot"))
-        );
-
-        config.db_backend = StorageBackendKind::SurrealDb;
-        assert_eq!(snapshot_autosave_path(&config), None);
     }
 }

@@ -16,6 +16,111 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 use crate::require::required_field;
 
+/// Original input observations for a check which finds already accepted bytes.
+/// This is read-set evidence only and carries no source publication authority.
+#[derive(Debug, Clone)]
+pub struct PreparedSourceWatchObservation {
+    source: Source,
+    watch: SourceWatch,
+    head_payload: String,
+}
+
+impl PreparedSourceWatchObservation {
+    /// Preserve the exact original raw head before fetching. A changed head is
+    /// refused rather than substituted for the caller's earlier observation.
+    pub async fn capture(
+        storage: &StorageClient,
+        watch: &SourceWatch,
+        source: &Source,
+        head: &elephant_types::publication::SourceHead,
+    ) -> StorageResult<Self> {
+        use crate::source_publication::{head_key, SourcePublicationRepository, HEAD_TABLE};
+        if source.base.deleted_at.is_some()
+            || watch.base.deleted_at.is_some()
+            || source.base.space_id != watch.base.space_id
+            || source.base.id != *watch.source.id()
+            || head.space_id != source.base.space_id
+            || head.source_id != source.base.id
+            || head.lifecycle != elephant_types::publication::SourceVisibility::Active
+            || head.desired_revision.is_none()
+        {
+            return Err(StorageError::Conflict(
+                "watch_original_input_changed".into(),
+            ));
+        }
+        let payload = SourcePublicationRepository::new(storage.clone())
+            .read_control_payload(
+                HEAD_TABLE,
+                &head_key(&head.space_id, &head.source_id),
+                &head.space_id,
+            )
+            .await?
+            .ok_or_else(|| StorageError::Conflict("watch_original_head_missing".into()))?;
+        let actual: elephant_types::publication::SourceHead =
+            crate::source_publication::decode_payload(&payload)?;
+        if actual != *head {
+            return Err(StorageError::Conflict("watch_original_head_changed".into()));
+        }
+        Ok(Self {
+            source: source.clone(),
+            watch: watch.clone(),
+            head_payload: payload,
+        })
+    }
+
+    fn check_tx(&self, tx: &crate::EmbeddedMutation<'_>) -> StorageResult<()> {
+        use crate::source_publication::{head_key, read_control_payload_tx, HEAD_TABLE};
+        let space = &self.source.base.space_id;
+        if tx
+            .get::<Source>(space, &self.source.base.id, false)?
+            .as_ref()
+            != Some(&self.source)
+            || tx
+                .get::<SourceWatch>(space, &self.watch.base.id, false)?
+                .as_ref()
+                != Some(&self.watch)
+            || read_control_payload_tx(
+                tx,
+                HEAD_TABLE,
+                &head_key(space, &self.source.base.id),
+                space,
+            )?
+            .as_deref()
+                != Some(self.head_payload.as_str())
+        {
+            return Err(StorageError::Conflict(
+                "watch_original_input_changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_guard_sql(
+        &self,
+        sql: &mut String,
+        bindings: &mut std::collections::BTreeMap<String, Value>,
+    ) -> StorageResult<()> {
+        use crate::canonical_commit::{append_row_guard, native_expected_fields, CanonicalRecord};
+        use crate::source_publication::{control_thing, head_key, HEAD_TABLE};
+        bindings.extend(crate::bindings! {
+            "space" => self.source.base.space_id.clone(),
+            "watch_input_head" => control_thing(HEAD_TABLE, &head_key(&self.source.base.space_id, &self.source.base.id)),
+            "watch_input_head_payload" => self.head_payload.clone(),
+            "watch_input_watch" => crate::surreal::thing_from_record_id(&self.watch.base.id),
+            "watch_input_watch_snapshot" => native_expected_fields(SourceWatchRepository::watch_to_value(&self.watch)?),
+        });
+        sql.push_str("IF (SELECT VALUE payload FROM ONLY $watch_input_head) != $watch_input_head_payload { THROW 'publication:watch_original_input_changed'; };\nUPDATE $watch_input_head SET canonical_read_nonce=<string>rand::uuid();\nLET $watch_input_watch_current = SELECT * FROM ONLY $watch_input_watch;\nIF $watch_input_watch_current = NONE { THROW 'publication:watch_original_input_changed'; };\nFOR $entry IN object::entries($watch_input_watch_snapshot) { IF $watch_input_watch_current[$entry[0]] != $entry[1] { THROW 'publication:watch_original_input_changed'; }; };\n");
+        let source = CanonicalRecord::Source(Box::new(self.source.clone()));
+        append_row_guard(sql, bindings, "watch_input_source", &source, Some(&source))?;
+        // SurrealDB elides unchanged row updates. Use the actual shared Source
+        // writer revision, preserving every domain field and erasure barrier.
+        sql.push_str(
+            "fn::recall_reference_guard({id:$watch_input_source_id,space_id:$space},false);\n",
+        );
+        Ok(())
+    }
+}
+
 const WATCH_PROJECTION: &str = r"
     id, space_id, created_at, updated_at, created_by, deleted_at, security,
     IF provenance IS NOT NONE THEN {
@@ -212,7 +317,7 @@ impl SourceWatchRepository {
         Self { client }
     }
 
-    fn watch_to_value(watch: &SourceWatch) -> StorageResult<Value> {
+    pub(crate) fn watch_to_value(watch: &SourceWatch) -> StorageResult<Value> {
         let mut object = crate::surreal::base_fields_to_object(&watch.base)?;
         object.insert(
             "source".to_string(),
@@ -384,8 +489,87 @@ impl SourceWatchRepository {
     /// Atomically appends an immutable check and advances the mutable watch.
     pub async fn record_check(
         &self,
+        watch: SourceWatch,
+        check: SourceWatchCheck,
+    ) -> StorageResult<(SourceWatch, SourceWatchCheck)> {
+        self.record_check_mode(watch, check, None, None).await
+    }
+
+    /// Advance an observation only under its original watch and live execution.
+    ///
+    /// The exact guard is shared with source acceptance; a replaced attempt or
+    /// edited watch cannot append a receipt or overwrite its successor's state.
+    ///
+    /// # Errors
+    /// Refuses mismatched scope, changed original observations or a stale lease.
+    pub async fn record_check_with_watch_producer(
+        &self,
+        watch: SourceWatch,
+        check: SourceWatchCheck,
+        producer: &crate::source_watch_producer::PreparedSourceWatchProducer,
+    ) -> StorageResult<(SourceWatch, SourceWatchCheck)> {
+        let original = producer.original_watch();
+        if producer.watch_id() != &watch.base.id
+            || producer.space_id() != watch.base.space_id
+            || original.base != watch.base
+            || original.source != watch.source
+            || original.requested_uri != watch.requested_uri
+            || original.interval_seconds != watch.interval_seconds
+            || check.base.id.table() != TableName::SourceWatchCheck
+            || check.base.security != original.base.security
+            || check.base.subjects != original.base.subjects
+            || check.base.subjects_state != original.base.subjects_state
+            || check.base.provenance != original.base.provenance
+            || check.requested_uri != original.requested_uri
+        {
+            return Err(StorageError::DataIntegrityError(
+                "watch observation differs from original producer scope".into(),
+            ));
+        }
+        self.record_check_mode(watch, check, Some(producer), None)
+            .await
+    }
+
+    /// Record an observation of bytes already accepted as the desired input.
+    ///
+    /// The original Source/raw head and Watch are checked in this same write,
+    /// together with the original live attempt when called by a worker.
+    pub async fn record_check_with_input_observation(
+        &self,
+        watch: SourceWatch,
+        check: SourceWatchCheck,
+        producer: Option<&crate::source_watch_producer::PreparedSourceWatchProducer>,
+        observation: &PreparedSourceWatchObservation,
+    ) -> StorageResult<(SourceWatch, SourceWatchCheck)> {
+        let original = &observation.watch;
+        if producer.is_some_and(|producer| {
+            producer.watch_id() != &watch.base.id || producer.space_id() != watch.base.space_id
+        }) || check.base.id.table() != TableName::SourceWatchCheck
+            || watch.base != original.base
+            || watch.source != original.source
+            || watch.requested_uri != original.requested_uri
+            || watch.interval_seconds != original.interval_seconds
+            || check.outcome != SourceWatchOutcome::HashUnchanged
+            || check.base.security != original.base.security
+            || check.base.subjects != original.base.subjects
+            || check.base.subjects_state != original.base.subjects_state
+            || check.base.provenance != original.base.provenance
+            || check.requested_uri != original.requested_uri
+        {
+            return Err(StorageError::DataIntegrityError(
+                "watch input observation scope changed".into(),
+            ));
+        }
+        self.record_check_mode(watch, check, producer, Some(observation))
+            .await
+    }
+
+    async fn record_check_mode(
+        &self,
         mut watch: SourceWatch,
         check: SourceWatchCheck,
+        producer: Option<&crate::source_watch_producer::PreparedSourceWatchProducer>,
+        observation: Option<&PreparedSourceWatchObservation>,
     ) -> StorageResult<(SourceWatch, SourceWatchCheck)> {
         if check.watch.id() != &watch.base.id || check.source.id() != watch.source.id() {
             return Err(StorageError::DataIntegrityError(
@@ -397,6 +581,24 @@ impl SourceWatchRepository {
                 "source watch check crosses spaces".to_string(),
             ));
         }
+        let standing_records = if let Some(producer) = producer {
+            let source = crate::SourceRepository::new(self.client.clone())
+                .get(producer.space_id(), producer.original_watch().source.id())
+                .await?
+                .ok_or_else(|| StorageError::Conflict("standing_watch_source_missing".into()))?;
+            let records =
+                crate::source_watch_registration::PreparedSourceWatchRegistration::prepare(
+                    &self.client,
+                    &source,
+                    Some(producer.original_watch()),
+                    producer.original_watch().clone(),
+                )
+                .await?;
+            records.authorize(producer.principal())?;
+            Some(records)
+        } else {
+            None
+        };
         watch.latest_check = Some(check.base.id.clone());
         watch.base.updated_at = check.completed_at;
 
@@ -407,6 +609,15 @@ impl SourceWatchRepository {
             let check_result = check.clone();
             return store
                 .mutate(|mutation| {
+                    if let Some(producer) = producer {
+                        producer.check_tx(mutation)?;
+                    }
+                    if let Some(observation) = observation {
+                        observation.check_tx(mutation)?;
+                    }
+                    if let Some(records) = &standing_records {
+                        records.check_tx(mutation)?;
+                    }
                     mutation
                         .get::<SourceWatch>(&space_id, &watch_id, false)?
                         .ok_or_else(|| {
@@ -419,17 +630,55 @@ impl SourceWatchRepository {
                 .await;
         }
 
-        self.client.query_bind_checked(
-            "BEGIN TRANSACTION; CREATE $check_id CONTENT $check; UPDATE $watch_id CONTENT $watch WHERE space_id = $space_id AND deleted_at IS NONE; COMMIT TRANSACTION;",
-            crate::bindings! {
+        let mut bindings = crate::bindings! {
                 "check_id" => crate::surreal::thing_from_record_id(&check.base.id),
                 "check" => Self::check_to_value(&check)?,
                 "watch_id" => crate::surreal::thing_from_record_id(&watch.base.id),
                 "watch" => Self::watch_to_value(&watch)?,
                 "space_id" => watch.base.space_id.clone(),
-            },
-        ).await?;
+        };
+        let mut guard = String::new();
+        if let Some(producer) = producer {
+            producer.append_guard_sql(&mut guard, &mut bindings)?;
+        }
+        if let Some(observation) = observation {
+            observation.append_guard_sql(&mut guard, &mut bindings)?;
+        }
+        if let Some(records) = &standing_records {
+            records.append_guard_sql(&mut guard, &mut bindings)?;
+        }
+        self.client.query_bind_checked(
+            &format!("BEGIN TRANSACTION; {guard} CREATE $check_id CONTENT $check; UPDATE $watch_id CONTENT $watch WHERE space_id = $space_id AND deleted_at IS NONE; COMMIT TRANSACTION;"),
+            bindings,
+        ).await.map_err(crate::source_publication::publication_error)?;
         Ok((watch, check))
+    }
+
+    /// Reads one immutable observation receipt under the current space boundary.
+    pub async fn get_check(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<SourceWatchCheck>> {
+        if id.table() != TableName::SourceWatchCheck {
+            return Err(StorageError::TypeError(
+                elephant_types::TypeError::InvalidRecordId(id.to_string()),
+            ));
+        }
+        if let Some(store) = self.client.embedded_store() {
+            return store.get::<SourceWatchCheck>(space_id, id, false).await;
+        }
+        let mut response = self.client.query_bind(
+            &format!("SELECT {CHECK_PROJECTION} FROM $id WHERE space_id = $space_id AND deleted_at IS NONE"),
+            crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
+        ).await?;
+        let rows: Vec<SourceWatchCheckDb> = response.take(0).map_err(|error| {
+            StorageError::QueryError(format!("Failed to parse source watch receipt: {error}"))
+        })?;
+        rows.into_iter()
+            .next()
+            .map(SourceWatchCheck::try_from)
+            .transpose()
     }
 
     /// Returns recent immutable receipts for a watch.
@@ -647,6 +896,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn exercise_repository(client: StorageClient) {
         let repository = SourceWatchRepository::new(client);
         let watch = repository
@@ -682,6 +935,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn embedded_watch_and_receipt_roundtrip() {
         let client = StorageClient::new_embedded()
             .await
@@ -690,6 +947,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn surreal_watch_and_receipt_roundtrip() {
         let client = StorageClient::new_memory().await.expect("memory storage");
         client

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Package already selected local model files under an immutable content version.
+
+No downloads, model calls, credentials, provider approval changes or service start.
+Review the origin and license of model inputs before approving the emitted version.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import shutil
+import tempfile
+
+DIMENSIONS = {
+    'all-minilm-l6-v2': 384, 'all-minilm-l6-v2-q': 384,
+    'all-minilm-l12-v2': 384, 'all-minilm-l12-v2-q': 384,
+    'all-mpnet-base-v2': 768,
+    'bge-small-en-v1.5': 384, 'bge-small-en-v1.5-q': 384,
+    'bge-base-en-v1.5': 768, 'bge-base-en-v1.5-q': 768,
+    'bge-large-en-v1.5': 1024, 'bge-large-en-v1.5-q': 1024,
+}
+TOKENIZER_FILES = {
+    'tokenizer': 'tokenizer.json', 'config': 'config.json',
+    'special_tokens_map': 'special_tokens_map.json', 'tokenizer_config': 'tokenizer_config.json',
+}
+PREPROCESSING = ('text-v1', 'text-full-v2', 'bge-en-retrieval-v1')
+BGE_EN_RETRIEVAL_MODELS = frozenset({
+    'bge-small-en-v1.5', 'bge-small-en-v1.5-q',
+    'bge-base-en-v1.5', 'bge-base-en-v1.5-q',
+    'bge-large-en-v1.5', 'bge-large-en-v1.5-q',
+})
+
+
+def install_assets(root: Path, model: str, onnx: Path, tokenizer_dir: Path,
+                   external: dict[str, Path], *, preprocessing: str = 'text-v1') -> dict:
+    if model not in DIMENSIONS:
+        raise ValueError('unsupported model')
+    if preprocessing not in PREPROCESSING:
+        raise ValueError('unsupported preprocessing')
+    if preprocessing == 'bge-en-retrieval-v1' and model not in BGE_EN_RETRIEVAL_MODELS:
+        raise ValueError('BGE retrieval preprocessing requires an English BGE v1.5 model')
+    root.mkdir(parents=True, exist_ok=True)
+    root = root.resolve()
+    with tempfile.TemporaryDirectory(prefix='.recall-model-', dir=root) as temporary:
+        stage = Path(temporary) / 'bundle'
+        stage.mkdir(mode=0o700)
+        total = 0
+
+        def copy_asset(source: Path, relative: str, limit: int) -> dict:
+            nonlocal total
+            if not source.is_file() or not 0 < source.stat().st_size <= limit:
+                raise ValueError(f'asset must be a bounded regular file: {source.name}')
+            destination = stage / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            # Hash copied bytes, so concurrent input changes cannot label different bytes.
+            shutil.copyfile(source, destination)
+            length = destination.stat().st_size
+            total += length
+            if length > limit or total > 4 * 1024**3:
+                raise ValueError('copied assets exceed size limits')
+            with destination.open('rb') as stream:
+                checksum = hashlib.file_digest(stream, 'sha256').hexdigest()
+            destination.chmod(0o600)
+            return {'path': relative, 'sha256': checksum, 'bytes': length}
+
+        manifest = {
+            'format': 'meerkat-recall-fastembed-assets/v1', 'model': model,
+            'dimensions': DIMENSIONS[model], 'preprocessing': preprocessing,
+            'onnx': copy_asset(onnx, 'model.onnx', 2 * 1024**3),
+        }
+        for key, name in TOKENIZER_FILES.items():
+            manifest[key] = copy_asset(tokenizer_dir / name, name, 32 * 1024**2)
+        if len(external) > 16:
+            raise ValueError('too many external initializers')
+        manifest['external_initializers'] = {}
+        for index, (name, source) in enumerate(sorted(external.items())):
+            path = PurePosixPath(name)
+            if not name or '\\' in name or path.is_absolute() or '..' in path.parts or str(path) != name:
+                raise ValueError('external initializer name must be a relative ONNX filename')
+            manifest['external_initializers'][name] = copy_asset(source, f'external/{index}.bin', 2 * 1024**3)
+        encoded = (json.dumps(manifest, sort_keys=True, separators=(',', ':')) + '\n').encode()
+        version = hashlib.sha256(encoded).hexdigest()
+        (stage / 'manifest.json').write_bytes(encoded)
+        destination = root / version
+        # Fresh immutable version directories only; never overwrite approved assets.
+        if destination.exists() or destination.is_symlink():
+            raise ValueError('model version already exists; verify it or use a fresh asset root')
+        os.rename(stage, destination)
+    return {'endpoint': root.as_uri(), 'model': model, 'model_version': f'sha256:{version}',
+            'dimensions': DIMENSIONS[model], 'preprocessing': preprocessing,
+            'asset_directory': str(destination),
+            'qualification': 'provisioned bytes only; no inference, origin verification or provider approval'}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, required=True)
+    parser.add_argument('--model', choices=sorted(DIMENSIONS), required=True)
+    parser.add_argument('--preprocessing', choices=PREPROCESSING, default='text-v1')
+    parser.add_argument('--onnx', type=Path, required=True)
+    parser.add_argument('--tokenizer-dir', type=Path, required=True)
+    parser.add_argument('--external-initializer', action='append', default=[], metavar='ONNX_NAME=LOCAL_FILE')
+    args = parser.parse_args()
+    try:
+        external = {}
+        for item in args.external_initializer:
+            name, separator, path = item.partition('=')
+            if not separator or not path or name in external:
+                raise ValueError('external initializer names must be unique with a local file')
+            external[name] = Path(path)
+        print(json.dumps(install_assets(args.root, args.model, args.onnx, args.tokenizer_dir, external,
+                                       preprocessing=args.preprocessing), indent=2))
+    except (ValueError, OSError) as error:
+        parser.exit(1, f'provision-fastembed: {error}\n')
+
+
+if __name__ == '__main__':
+    main()

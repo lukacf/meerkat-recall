@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use crate::error::PipelineError;
 
 #[cfg(feature = "meerkat-extraction")]
-use crate::llm::run_anthropic_prompt;
+use crate::llm::run_model_prompt;
 
 #[cfg(feature = "meerkat-extraction")]
 const SUMMARIZATION_PROMPT_TEMPLATE: &str = include_str!("../../prompts/summarization.txt");
@@ -133,13 +133,25 @@ impl Summarizer for NoOpSummarizer {
 
 /// Agentic summarizer using LLM (Meerkat).
 #[derive(Debug, Default)]
-pub struct AgenticSummarizer;
+pub struct AgenticSummarizer {
+    provider_context: Option<crate::provider_dispatch::ProviderDispatchContext>,
+}
 
 impl AgenticSummarizer {
+    /// Bind summaries to current approvals for one explicit named space.
+    #[must_use]
+    pub fn with_provider_context(
+        mut self,
+        context: crate::provider_dispatch::ProviderDispatchContext,
+    ) -> Self {
+        self.provider_context = Some(context);
+        self
+    }
+
     /// Creates a new agentic summarizer instance.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
     fn fallback(&self, ctx: &SummarizationContext) -> Result<SummaryResult, PipelineError> {
@@ -172,13 +184,14 @@ impl Summarizer for AgenticSummarizer {
 
         #[cfg(feature = "meerkat-extraction")]
         {
-            let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-                Ok(key) => key,
-                Err(_) => {
-                    tracing::warn!("ANTHROPIC_API_KEY not set, falling back to truncation");
-                    return self.fallback(ctx);
-                }
-            };
+            let context = self.provider_context.as_ref().ok_or_else(|| {
+                PipelineError::ConfigError(
+                    "provider_authorization: summary requires a space context".into(),
+                )
+            })?;
+            let (model, client, _provenance) = context
+                .model_client(elephant_types::provider_binding::ModelOperation::Summary)
+                .await?;
 
             let max_chars = max_summary_chars(&ctx.budget);
             let prompt = self.build_prompt(ctx, max_chars);
@@ -191,17 +204,17 @@ impl Summarizer for AgenticSummarizer {
             );
 
             let max_tokens = ctx.budget.max_output_tokens.max(1);
-            let result = run_anthropic_prompt(
-                api_key,
-                ctx.options.model.clone(),
+            let result = run_model_prompt(
+                client,
+                model,
                 Some("You are a concise summarizer. Produce clear, accurate summaries."),
                 prompt,
                 max_tokens,
-                None,
             )
             .await;
 
             return match result {
+                Err(error) if error.to_string().contains("provider_authorization:") => Err(error),
                 Ok(run_result) => {
                     let summary = run_result.text.trim().to_string();
                     let mut summary_text = summary.clone();

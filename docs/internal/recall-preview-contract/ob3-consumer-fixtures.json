@@ -1,0 +1,425 @@
+{
+  "format": "recall-ob3-consumer-fixtures/v1",
+  "recall_contract_version": "recall-preview-1",
+  "evidence_status": "source contract fixtures; not executed; no artifact, deployment or qualification receipt",
+  "binding_rules": "$name.field references exact captured actual responses. request_ref repeats the referenced request with explicit overrides only; values here are synthetic fixture inputs, not actual returned identifiers. Use fresh isolated fixture space and keys per run.",
+  "headers": {
+    "Authorization": "Bearer <ordinary named-space service token>",
+    "X-Space-Id": "ob3-fixture",
+    "Content-Type": "application/json"
+  },
+  "limits": {
+    "source_text_decoded_utf8_bytes": 2000000,
+    "search_response_encoded_json_bytes": 262144,
+    "search_limit_initial": 20,
+    "search_limit_size_retry": 10,
+    "consumer_size_retries_per_logical_read": 1
+  },
+  "cases": [
+    {
+      "id": "create_A",
+      "request": {
+        "method": "PUT",
+        "path": "/v1/spaces/ob3-fixture/sources/initiative-42",
+        "headers": {
+          "Idempotency-Key": "ob3-fixture-A-create"
+        },
+        "body": {
+          "revision": "A",
+          "text": "The trial began in June.",
+          "media_type": "text/plain",
+          "source_url": "https://example.test/ob3/initiative-42",
+          "observed_at": "2026-10-07T00:00:00Z",
+          "labels": {
+            "initiative_id": "42"
+          },
+          "expected_generation": null
+        }
+      },
+      "expect": {
+        "status": 202,
+        "capture": "accepted_A",
+        "assert": [
+          "generation and operation_id are actual returned opaque values",
+          "202 establishes acceptance only; do not set recall_current from it"
+        ]
+      },
+      "followup": {
+        "method": "GET",
+        "path": "/v1/spaces/ob3-fixture/sources/initiative-42/head",
+        "capture": "head_A"
+      }
+    },
+    {
+      "id": "uncertain_A_retry",
+      "request_ref": "create_A",
+      "expect": {
+        "status": 202,
+        "assert": [
+          "persist original key, exact body and expected_generation before first send",
+          "retry identical persisted intent after lost/timeout response",
+          "same operation_id and generation as accepted_A, if first send committed",
+          "no new acceptance on an already committed retry"
+        ]
+      }
+    },
+    {
+      "id": "replace_with_B",
+      "precondition": "actual current head for A captured; await A completion if testing publication contrast",
+      "request": {
+        "method": "PUT",
+        "path": "/v1/spaces/ob3-fixture/sources/initiative-42",
+        "headers": {
+          "Idempotency-Key": "ob3-fixture-B-from-A"
+        },
+        "body": {
+          "revision": "B",
+          "text": "The trial began in July.",
+          "media_type": "text/plain",
+          "source_url": "https://example.test/ob3/initiative-42",
+          "observed_at": "2026-10-07T00:00:00Z",
+          "labels": {
+            "initiative_id": "42"
+          },
+          "expected_generation": "$head_A.generation"
+        }
+      },
+      "expect": {
+        "status": 202,
+        "capture": "accepted_B",
+        "assert": [
+          "new operation_id/generation",
+          "post-PUT GET head, do not assume historical receipt equals current head"
+        ]
+      }
+    },
+    {
+      "id": "replay_old_A_after_B",
+      "request_ref": "create_A",
+      "expect": {
+        "status": 202,
+        "assert": [
+          "operation_id and generation equal historical accepted_A",
+          "current head remains B; identical replay is not a revert",
+          "GET current head after PUT establishes the current state separately"
+        ]
+      }
+    },
+    {
+      "id": "return_to_A_new_intent",
+      "precondition": "GET head_B; retain exact returned generation",
+      "request": {
+        "method": "PUT",
+        "path": "/v1/spaces/ob3-fixture/sources/initiative-42",
+        "headers": {
+          "Idempotency-Key": "ob3-fixture-A-from-B"
+        },
+        "body": {
+          "revision": "A",
+          "text": "The trial began in June.",
+          "media_type": "text/plain",
+          "source_url": "https://example.test/ob3/initiative-42",
+          "observed_at": "2026-10-07T00:00:00Z",
+          "labels": {
+            "initiative_id": "42"
+          },
+          "expected_generation": "$head_B.generation"
+        }
+      },
+      "expect": {
+        "status": 202,
+        "capture": "accepted_A2",
+        "assert": [
+          "new operation_id and generation distinct from accepted_A",
+          "unchanged immutable A semantic input; same physical source incarnation",
+          "retry this persisted new key unchanged after uncertainty",
+          "poll accepted_A2, not historical accepted_A"
+        ]
+      }
+    },
+    {
+      "id": "new_intent_stale_generation",
+      "request_ref": "return_to_A_new_intent",
+      "override": {
+        "headers": {
+          "Idempotency-Key": "ob3-fixture-unseen-stale"
+        },
+        "body.expected_generation": "$head_A.generation"
+      },
+      "expect": {
+        "status": 409,
+        "error_code": "conflict_generation",
+        "retryable": false,
+        "assert": [
+          "head unchanged",
+          "reconcile actual head before choosing a separate new intent; never auto-regenerate a retry key"
+        ]
+      }
+    },
+    {
+      "id": "same_revision_changed_input",
+      "request_ref": "return_to_A_new_intent",
+      "override": {
+        "headers": {
+          "Idempotency-Key": "ob3-fixture-unseen-changed-A"
+        },
+        "body.text": "This changes immutable A.",
+        "body.expected_generation": "$head_A2.generation"
+      },
+      "expect": {
+        "status": 409,
+        "error_code": "conflict_generation",
+        "retryable": false,
+        "assert": [
+          "current head and operation remain unchanged",
+          "generation is current, so refusal isolates changed immutable A input rather than stale CAS"
+        ]
+      },
+      "precondition": "GET and capture current head_A2 after return_to_A_new_intent; this negative must use its exact current generation"
+    },
+    {
+      "id": "current_A2_coverage",
+      "precondition": "actual A2 accepted but its own processing unfinished; an older A may remain published",
+      "request": {
+        "method": "POST",
+        "path": "/v1/spaces/ob3-fixture/search",
+        "body": {
+          "query": "When did the trial begin?",
+          "limit": 20,
+          "filters": {
+            "labels": {
+              "initiative_id": "42"
+            }
+          },
+          "source_revision_constraints": {
+            "initiative-42": "A"
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "assert": [
+          "coverage[initiative-42].requested_revision is A",
+          "coverage follows current A2 operation when desired_revision is A, even if old published_revision is also A",
+          "unfinished current A2 is partial:true and pending/running/failed state as actually observed",
+          "old A evidence can remain readable; that does not prove current A2 complete",
+          "after real A2 completion the same constrained query can report complete and partial:false"
+        ]
+      }
+    },
+    {
+      "id": "external_and_immutable_evidence_identity",
+      "request_ref": "current_A2_coverage",
+      "expect": {
+        "status": 200,
+        "assert": [
+          "evidence.source_id is external initiative-42, not internal_source_id",
+          "evidence.revision is external opaque A",
+          "internal_doc_revision_id is the actual typed doc_revision identity",
+          "span is half-open UTF-8 bytes; quote is complete exact immutable rendered support",
+          "never invent an evidence_id response field; retain the full citation identity tuple",
+          "never substitute a newer head or text for the cited immutable revision"
+        ]
+      }
+    },
+    {
+      "id": "bounded_response_one_size_retry",
+      "request_ref": "current_A2_coverage",
+      "precondition": "selected complete results plus coverage exceed 262144 encoded JSON bytes at limit20",
+      "expect": {
+        "first_status": 413,
+        "first_error_code": "payload_too_large",
+        "first_retryable": false,
+        "consumer_action": "one explicitly smaller request: change only limit20 to limit10",
+        "assert": [
+          "server does not truncate claims/quotes or return partial JSON",
+          "count exactly one size_retry for the logical read",
+          "if limit10 still refuses, fail open once with error fallback; no recursive retry",
+          "a selected response within262144 bytes is accepted unchanged",
+          "search result bound differs from source 2000000 decoded UTF8 bytes; source oversize is not this size-retry case"
+        ]
+      }
+    },
+    {
+      "id": "no_expected_sources",
+      "precondition": "consumer has no expected external source/revision mapping",
+      "expect": {
+        "consumer_action": "retain ordinary source/POR path; record no_expected_sources once for the logical Recall read decision",
+        "assert": [
+          "do not run unconstrained search and label unrelated evidence current",
+          "do not infer deletion from missing inventory rows"
+        ]
+      }
+    },
+    {
+      "id": "outage_fallback",
+      "precondition": "consumer review/analysis worker read path is actually wired and configured; Recall endpoint down/refused/timeout",
+      "expect": {
+        "consumer_action": "bounded attempt, record exactly one terminal fallback per logical read, continue original work",
+        "assert": [
+          "configured fixture must show positive read_total.reads",
+          "all requested workers complete with failed_workers=0",
+          "no Recall evidence used on failed reads",
+          "POR failed/degraded counts equal no-Recall baseline",
+          "actual external twin-run receipt required; this fixture is not evidence of execution",
+          "count refused distinctly from unavailable and timeout",
+          "participating_workers distinct IDs exactly match the original independently frozen expected participating set, which can be a subset of requested workers",
+          "every expected participant has a positive actual read-attempt count; candidate receipts cannot choose their own participant set"
+        ]
+      }
+    },
+    {
+      "id": "removed_source_retract",
+      "precondition": "consumer has an explicit removed-link/POR lifecycle event and exact current generation",
+      "request": {
+        "method": "POST",
+        "path": "/v1/spaces/ob3-fixture/sources/initiative-42:retract",
+        "body": {
+          "expected_generation": "$current_head.generation"
+        }
+      },
+      "expect": {
+        "status": 202,
+        "assert": [
+          "poll actual operation/head; lifecycle retracted suppresses evidence",
+          "if consumer has no removal-event seam, report retract integration UNMET; do not claim implemented"
+        ]
+      }
+    },
+    {
+      "id": "physical_erase_gate",
+      "precondition": "separate explicitly authorized erase plus actual bounded backup retention policy",
+      "request": {
+        "method": "POST",
+        "path": "/v1/spaces/ob3-fixture/sources/initiative-42:erase",
+        "body": {
+          "expected_generation": "$current_head.generation"
+        }
+      },
+      "expect": {
+        "status": 202,
+        "assert": [
+          "202/hidden search/tombstone alone does not prove physical deletion",
+          "poll cleanup and require physical source deletion plus bounded backup retention evidence for OB3 gate",
+          "journal/restore barrier remains required product behavior; replay is recommended, not substituted as OB3 gate",
+          "no automatic recreate/reactivate; preserve explicit lifecycle authority"
+        ]
+      }
+    }
+  ],
+  "external_outage_receipt": {
+    "receipt_version": "ob3-recall-outage-1",
+    "producer_schema_path": "tests/fixtures/recall/ob3-outage-receipt-schema.json",
+    "producer_schema_custody": "OB3 original schema commit/raw SHA pending root relay; preserve original producer bytes and independently reviewed recipe.",
+    "identity_fields": [
+      "receipt_version",
+      "run_id",
+      "ob3_git_sha",
+      "recall_contract_version",
+      "recall_endpoint_state"
+    ],
+    "recall_endpoint_state": [
+      "down",
+      "refused",
+      "timeout"
+    ],
+    "groups": [
+      "batch",
+      "expected_participating_workers",
+      "participating_workers",
+      "read_total",
+      "workers",
+      "por_push",
+      "verdict"
+    ],
+    "batch_fields": [
+      "kind",
+      "requested_workers",
+      "completed_workers",
+      "failed_workers",
+      "started_at",
+      "finished_at"
+    ],
+    "batch_kind": [
+      "review",
+      "analysis"
+    ],
+    "per_worker_read_fields": [
+      "reads",
+      "evidence",
+      "fallbacks"
+    ],
+    "read_total_fields": [
+      "reads",
+      "evidence",
+      "fallbacks",
+      "size_retries"
+    ],
+    "fallback_fields": [
+      "unavailable",
+      "timeout",
+      "refused",
+      "transport",
+      "stale_revision",
+      "partial",
+      "forbidden",
+      "error",
+      "no_expected_sources"
+    ],
+    "por_push": {
+      "baseline": [
+        "failed",
+        "degraded",
+        "fetched",
+        "inserted"
+      ],
+      "with_recall": [
+        "failed",
+        "degraded",
+        "fetched",
+        "inserted"
+      ],
+      "recall": [
+        "pushed",
+        "current",
+        "conflicts",
+        "errors",
+        "tombstoned",
+        "payload_too_large",
+        "retracted",
+        "retract_conflicts",
+        "retract_errors",
+        "retract_skipped_incomplete",
+        "retract_cap_exceeded"
+      ]
+    },
+    "verdict": {
+      "status": [
+        "PASS",
+        "FAIL",
+        "INCONCLUSIVE"
+      ],
+      "checks": [
+        "reads_positive",
+        "participating_equals_expected",
+        "accounting_total",
+        "accounting_per_worker",
+        "all_requested_completed",
+        "por_counts_equal_baseline"
+      ]
+    },
+    "expected_participant_authority": "The original independently reviewed outage recipe/controller freezes expected_participating_workers before execution; the candidate receipt cannot choose or shrink that set.",
+    "required_predicates": [
+      "batch.completed_workers == batch.requested_workers and batch.failed_workers == 0",
+      "participating_workers contains distinct IDs and equals the original independently frozen expected participating worker set",
+      "every expected participating worker has reads > 0 in the configured outage fixture",
+      "each reported worker ID belongs to the original requested worker set and occurs once; all expected participants are included",
+      "evidence + sum(fallbacks.values()) == reads for each worker and read_total",
+      "read_total counters equal sums of corresponding original worker counters",
+      "read_total.reads > 0 for the configured outage fixture",
+      "por_push.with_recall equals por_push.baseline for failed/degraded/fetched/inserted",
+      "independent validator recomputes checks; producer verdict status alone is not acceptance"
+    ],
+    "custody": "Actual OB3-owned twin run on a fresh production data clone; retain external original receipts, exact source, independent requested/expected-participant sets and timestamps. C does not execute or authorize the external run."
+  }
+}

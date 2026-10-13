@@ -9,7 +9,13 @@ pub mod error;
 pub mod ids;
 pub mod mcp_simple;
 pub mod pipeline_status;
+pub mod provider_binding;
+pub mod public_error;
+pub mod publication;
+pub mod publication_wire;
 pub mod records;
+pub mod rendered_text;
+pub mod space_grant;
 pub mod validation;
 
 pub use base_fields::BaseFieldsBuilder;

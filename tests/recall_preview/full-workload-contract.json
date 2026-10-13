@@ -1,0 +1,224 @@
+{
+  "format": "recall-full-workload-source-contract/v1",
+  "execution_authorized": false,
+  "provider_dispatch_authorized": false,
+  "product_acceptance": false,
+  "source_custody": {
+    "expectations": "qualification",
+    "new_driver": "grounding",
+    "consumer_implementations": [
+      "OB3",
+      "HomeCore"
+    ],
+    "no_product_schema_edits": true
+  },
+  "baseline_corpus": {
+    "path": "workload-corpus.json",
+    "sha256": "2192437954109fc17ebbea5b3960eb6b398a2ee91a725ce70666b119e86179dc",
+    "accepted_sources": 50,
+    "per_space": 25,
+    "immutable": true
+  },
+  "spaces": [
+    {
+      "id": "qualification-household",
+      "policy_id": "household-policy",
+      "level": 3,
+      "provider": "openai",
+      "model": "text-embedding-3-small",
+      "dimensions": 1536
+    },
+    {
+      "id": "qualification-business",
+      "policy_id": "business-policy",
+      "level": 7,
+      "provider": "openai",
+      "model": "text-embedding-3-large",
+      "dimensions": 3072
+    }
+  ],
+  "typed_preparation_contract_sha256": "b1fd4c43e1c8c506ca13e261a29d65a7d06246bf11ef53c02e97945cd3ef56d1",
+  "full_fixture": {
+    "baseline_sources": 50,
+    "large_sources": 2,
+    "shared_sources": 4,
+    "total_distinct_accepted_sources": 56,
+    "per_space": 28,
+    "over_limit_refusals": 2,
+    "same_external_keys_are_space_scoped": true,
+    "large_recipe": {
+      "encoding": "utf-8",
+      "target_bytes": 2000000,
+      "prefix": "Helios large source. The custodian is Mira. The approved capacity is 47.\n",
+      "filler": "The synthetic catalogue lists labelled shelves and blank paper covers.\n",
+      "suffix": "\nHelios final original evidence: Mira keeps the violet key; capacity is 47.\n",
+      "rule": "prefix + filler repeated and ASCII-byte truncated to target_bytes-len(prefix)-len(suffix) + suffix",
+      "sha256": "fdae2b405d6f3123836e3dc6b6aef46de8cf41342349265ff06a403d1f1af613",
+      "over_limit_rule": "exact accepted bytes followed by one ASCII X",
+      "over_limit_sha256": "03065ded29e4a5d77d1f0b71e4b5f95adecd627450840a56ba16b4182b6e280b"
+    },
+    "large_keys": [
+      "full/large"
+    ],
+    "shared_keys": [
+      "full/shared/a",
+      "full/shared/b"
+    ],
+    "shared_text": "Mira maintains the Helios shared notebook. The notebook access code is violet-47.",
+    "shared_revision": "full-shared-r1"
+  },
+  "phase_inventory": [
+    {
+      "id": "FW01",
+      "phase": "classified_named_configuration",
+      "expectation": "Read back both intended policy3/7 named configurations and current grants; wrong-space and known-ID calls denied. Actual config, source and Doc envelopes must agree; no default0 substitution."
+    },
+    {
+      "id": "FW02",
+      "phase": "baseline_fifty",
+      "expectation": "Accept original frozen50 inputs once with explicit typed envelopes on a fresh owned store. Capture actual original source/op/generation/revision and published evidence. Original50 corpus bytes unchanged."
+    },
+    {
+      "id": "FW03",
+      "phase": "exact_large_input",
+      "expectation": "One extra2,000,000-byte source per space uses frozen recipe in Retrieval mode. Original accepted bytes/hash and complete current publication required. Separate fresh limit+1 input refused without head/op/work/provider dispatch."
+    },
+    {
+      "id": "FW04",
+      "phase": "shared_support",
+      "expectation": "Two additional sources per space independently state the fixed shared fact. Use actual accepted Graph publication and original evidence; shared claim remains after retract/erase of one support. Other-space same external keys and independent fullB payload remain unchanged."
+    },
+    {
+      "id": "FW05",
+      "phase": "no_op_original_retry",
+      "expectation": "Repeat exact original source/key/revision/idempotency intent after drain. Exact original operation/head/receipt/status and actual provider send inventory unchanged; no new work or acceptance authority. A fresh idempotency key is not this case."
+    },
+    {
+      "id": "FW06",
+      "phase": "replacement_while_extracting",
+      "expectation": "Start explicitGraph replacement of baseline atlas-01 and hold original extractor request through owned spy. Pending replacement exposes only previously published revision with honest coverage. Complete allowed replacement atomically; no mixed-revision hit/spans."
+    },
+    {
+      "id": "FW07",
+      "phase": "retract_while_extracting",
+      "expectation": "Repeat held replacement on atlas-02; actualpublic retraction while originalattempt is blocked hides source immediately. Release owned original response; stale finalization cannot publish. Actual operation error/category retained, not fabricatedcompletion."
+    },
+    {
+      "id": "FW08",
+      "phase": "competing_revision_cas",
+      "expectation": "Two explicitly different replacements of atlas-03 use same observed generation. Exactly one new desired head wins; loser typed conflict; original/current publication identities never mixed. Calls bounded; no automaticCAS retry."
+    },
+    {
+      "id": "FW09",
+      "phase": "backlog_ingest_search",
+      "expectation": "While atlas-04 replacement is blockedRunning, atlas-05 replacement is pending, and atlas-06 controlled provider failure is observablefailed_retryable, issue fixed original queries and one boundednew revision intake. Capture actualpublic originaloperation states and complete/partialcoverage. If those distinct states cannot be observed viaactualroutes, caseUNMET; do not raw-editqueue or inferstate fromspy."
+    },
+    {
+      "id": "FW10",
+      "phase": "permission_is_not_retraction",
+      "expectation": "Revoke currentgrant for a separate data principal, keep originalsourceactive. HTTP/MCP refuse immediately; sourcehead/op/content baseline unchanged whenreadbyindependentauthorizedprincipal. Restoregrant explicitlyandverifyoriginalrevision.403 doesnotmeanretracted."
+    },
+    {
+      "id": "FW11",
+      "phase": "provider_revocation",
+      "expectation": "Revoke actualspace binding/profile while a pinned original retry is pending. Subsequent dispatch observes currentrevocation and emitszeroadditionalownedspyrequests. Keep actualoriginalattempt/error. Restoringpermission isexplicit separateintent."
+    },
+    {
+      "id": "FW12",
+      "phase": "large_caller_protocol",
+      "expectation": "Exactly140readycallers, each2sequentialsearches, total280/backend, no retries/warmups. Controlledofflinefixture useslexicalroute and measures actualinflightintervals; cannotqualify semanticlatency. Futuresemanticmode staysdisabled until separate allocation/threshold review."
+    },
+    {
+      "id": "FW13",
+      "phase": "consumer_size_fallback",
+      "expectation": "Separate requestcount inventory for defaultlimit20, exactlyone payload_too_large retryat10, then authorizedconsumer fallback. CoreRecall capture canchecktypedresponse; onlyOB3ownedconsumer proves withholding degradedrendering or reviewbatchcompletion."
+    },
+    {
+      "id": "FW14",
+      "phase": "recall_outage",
+      "expectation": "Ownedservice absent/unready response capturedwithoriginaltimeouts. OB3owned reviewbatch mustcompleteits existingauthorizedpathwithdegradationcount; HomeCore optionalstartup separate. Recallharness never assertsconsumercompletion from itsown cannedresponse."
+    }
+  ],
+  "controlled_fixture_limits": {
+    "backends": [
+      "elephant-db",
+      "surreal-db"
+    ],
+    "backend_order": "sequential",
+    "seconds_per_backend": 1800,
+    "seconds_total": 3600,
+    "public_http_calls_per_backend": 8000,
+    "mutation_concurrency": 1,
+    "search_callers": 140,
+    "requests_per_caller": 2,
+    "load_requests_per_backend": 280,
+    "query_warmups": 0,
+    "harness_retries": 0,
+    "request_seconds": 10,
+    "load_seconds": 180,
+    "raw_source_response_bytes": 3145728,
+    "search_response_bytes": 262144,
+    "request_body_bytes": 3145728,
+    "capture_bytes_per_backend": 1073741824,
+    "owned_spy_dispatches_per_backend": 4096,
+    "owned_spy_request_bytes": 8388608,
+    "owned_spy_response_bytes": 8388608,
+    "owned_spy_concurrency": 160,
+    "held_response_seconds": 120,
+    "external_provider_sends": 0,
+    "paid_model_calls": 0
+  },
+  "controlled_provider_scope": "Only deterministic owned loopback spies inside approved isolation. Actual signed public routes and workers. No externallyroutableendpoint, realcredential, rawstateinjection, productionfaultflag or semanticqualityclaim. Actualzeroexternaldispatch proof is a prerequisite; failuresstayUNMET.",
+  "public_observability": {
+    "required": [
+      "original acceptedSource/operation/generation/revision",
+      "actual sourcehead and operation status",
+      "current fullclassified config/grants",
+      "original fullUTF8evidence spans/hash",
+      "complete publicHTTP/MCPframing/status/error/retryability",
+      "actualownedspyphysicalsend IDs and zero-send negatives",
+      "independentBfullpayload baseline"
+    ],
+    "not_inferred": [
+      "private originalpublicationmanifest",
+      "raw physicalvectorinventory",
+      "full privateSourceEffectSupport receiptchain",
+      "physicalerasure frompublic404",
+      "serverexecutionoverlap fromclientrequestlifetimes",
+      "consumerbatchsuccess fromRecallfixtureoutput"
+    ]
+  },
+  "future_semantic_load": {
+    "execution_authorized": false,
+    "provider_dispatch_authorized": false,
+    "mode": "semantic",
+    "callers": 140,
+    "requests_per_caller": 2,
+    "requests_per_backend": 280,
+    "query_limit": 20,
+    "warmups": 0,
+    "harness_retries": 0,
+    "peak_sent_waiting_response_required": 140,
+    "server_execution_concurrency_claim": false,
+    "latency_thresholds": "UNMET: separatelyfreezebeforeanyrun; current50callerprequalificationthresholdsnotautomaticallyanallocation",
+    "physical_attempt_budget": null,
+    "cost_budget_nano_usd": null,
+    "allocation_reuse_forbidden": [
+      "original432primary",
+      "D28separate2100"
+    ]
+  },
+  "stop_rules": [
+    "stopdependentphaseonmissingprerequisiteorfailedcase; recordremainingunexecuted",
+    "alloriginalcohorts/spyrequests remainbounded after cancellation; release onlyownedblockedfixtures",
+    "do not resubmit uncertainacceptedPOST or recreateoriginalledger",
+    "no source output qualifiesitself; D evaluatesactualcaptures",
+    "free-space floor250GiB forfuturecentralscheduling; noforeignresourcecleanup"
+  ],
+  "acceptance_limits": [
+    "controlledspiesproveprotocol/orderonly",
+    "FW13/FW14consumerverdict externallyowned",
+    "physical erasure/backup TTL and restorejournalremainD10/D11independentgates",
+    "frozen50sourceD28 corpus and allocation unchanged"
+  ]
+}

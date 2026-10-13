@@ -101,6 +101,10 @@ mod tests {
     use elephant_types::records::WorkItemStatus;
     use elephant_types::{RecordId, TableName};
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn history_after_archive(client: StorageClient) {
         let repo = WorkItemRepository::new(client.clone());
         let cutoff = Utc::now() - Duration::days(30);

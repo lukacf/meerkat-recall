@@ -1,0 +1,28 @@
+{
+  "version": "recall-preview-independent-v1",
+  "source_limit_bytes": 2000000,
+  "source_limit_status": "surface-wire-contract-1-decimal-utf8-bytes",
+  "spaces": [
+    {"id": "qualification-household", "policy_id": "household-policy", "level": 3, "provider": "fixture-processor-a", "model": "fixture-model-a-v1", "dimensions": 384, "extraction_purpose": "Household evidence", "extraction_skill": "household-facts"},
+    {"id": "qualification-business", "policy_id": "business-policy", "level": 7, "provider": "fixture-processor-b", "model": "fixture-model-b-v2", "dimensions": 768, "extraction_purpose": "Business evidence", "extraction_skill": "business-facts"}
+  ],
+  "sources": [
+    {"key": "home/heat", "space": "qualification-household", "revision": "heat-v1", "text": "The conservatory radiator is controlled by the brass valve beside the north window. The boiler service appointment is 12 October 2026.", "kind": "authoritative"},
+    {"key": "home/heat", "space": "qualification-household", "revision": "heat-v2", "text": "The conservatory radiator is controlled by the brass valve beside the north window. The boiler service appointment moved to 19 October 2026.", "kind": "authoritative"},
+    {"key": "business/oriole", "space": "qualification-business", "revision": "oriole-v1", "text": "Élodie opened the Oriole laboratory on 5 October 2026. Oriole's safety review is owned by Priya. The launch budget is EUR 42000.", "kind": "authoritative"},
+    {"key": "business/oriole", "space": "qualification-business", "revision": "oriole-v2", "text": "Élodie opened the Oriole laboratory on 5 October 2026. Oriole's safety review is now owned by Mateo. The launch budget is EUR 42000.", "kind": "authoritative"},
+    {"key": "business/oriole-minutes", "space": "qualification-business", "revision": "minutes-v1", "text": "The independent board minutes confirm that Élodie opened the Oriole laboratory on 5 October 2026. The budget vote was unanimous.", "kind": "independent-support"},
+    {"key": "shared/safety", "space": "qualification-household", "revision": "safety-v1", "text": "The shared safety handbook identifies the cobalt cabinet as the first-aid storage location.", "kind": "authoritative"},
+    {"key": "shared/safety", "space": "qualification-business", "revision": "safety-v1", "text": "The shared safety handbook identifies the cobalt cabinet as the first-aid storage location.", "kind": "authoritative"},
+    {"key": "business/distractor", "space": "qualification-business", "revision": "distractor-v1", "text": "The Oriole bird identification guide describes a yellow bird. A radiator-shaped sculpture appeared at the autumn exhibition.", "kind": "distractor"},
+    {"key": "business/oriole", "space": "qualification-business", "revision": "oriole-snippet", "text": "Oriole laboratory ... safety review ...", "kind": "degraded-withheld"}
+  ],
+  "queries": [
+    {"id": "home-service", "space": "qualification-household", "query": "When is the boiler technician coming?", "k": 3, "required": [{"key": "home/heat", "revision": "heat-v2"}], "forbidden": [{"key": "home/heat", "revision": "heat-v1"}], "min_precision": 0.3333333333333333},
+    {"id": "business-review", "space": "qualification-business", "query": "Who is responsible for the laboratory safety assessment?", "k": 3, "required": [{"key": "business/oriole", "revision": "oriole-v2"}], "forbidden": [{"key": "business/oriole", "revision": "oriole-v1"}, {"key": "business/distractor", "revision": "distractor-v1"}], "min_precision": 0.3333333333333333},
+    {"id": "business-opening", "space": "qualification-business", "query": "Who established the Oriole research facility and when?", "k": 3, "required": [{"key": "business/oriole", "revision": "oriole-v2"}, {"key": "business/oriole-minutes", "revision": "minutes-v1"}], "forbidden": [{"key": "business/distractor", "revision": "distractor-v1"}], "min_precision": 0.6666666666666666},
+    {"id": "negative-no-support", "space": "qualification-household", "query": "What is the confirmed opening date of the Helios lunar refinery?", "k": 3, "required": [], "forbidden": [], "min_precision": 0, "expect_empty": true}
+  ],
+  "workload": {"synthetic_structured_sources_per_space": 50, "reported_ob3_workers": 140, "reported_ob3_elapsed_seconds": 3060, "reported_simultaneous_requests": null, "agreed_request_count": null, "agreed_minimum_peak_in_flight": null, "max_source_fixture_bytes": [1999999, 2000000, 2000001], "character_fixture": 1100000, "latency_budget_ms": null, "output_budget_bytes": null, "measured": false},
+  "negative_claims": ["Élodie closed the Oriole laboratory", "Priya remains the current safety review owner after oriole-v2", "The Oriole launch budget is EUR 420000", "The Helios lunar refinery has a confirmed opening date"]
+}

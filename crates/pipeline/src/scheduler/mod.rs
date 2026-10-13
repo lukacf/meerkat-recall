@@ -14,12 +14,17 @@ pub mod budget;
 pub mod dag_executor;
 pub mod deadletter;
 pub mod evidence_work_kinds;
+pub mod execution_contract;
+pub mod extraction_repair;
 pub mod extraction_work_kinds;
+pub mod grounding;
 pub mod ingest_work_kinds;
 pub mod inline_promotion;
 pub mod plugin_config;
 pub mod plugin_security;
 pub mod promotion_disambiguation;
+mod promotion_plan;
+pub mod source_stage;
 pub mod staged_commit;
 pub mod triage;
 pub mod work_queue;
@@ -52,8 +57,8 @@ pub use evidence_work_kinds::{
 };
 pub use extraction_work_kinds::{
     execute_extract_assertions, execute_plan_extraction, resolve_extraction_guidance_status,
-    ExtractAssertionsResult, ExtractionPlanConfig, PlanExtractionResult, EXTRACT_ASSERTIONS_KIND,
-    PLAN_EXTRACTION_KIND,
+    validate_extraction_guidance_assets, ExtractAssertionsResult, ExtractionPlanConfig,
+    PlanExtractionResult, EXTRACT_ASSERTIONS_KIND, PLAN_EXTRACTION_KIND,
 };
 pub use ingest_work_kinds::{
     execute_ingest_metadata, execute_ingest_source_stub, execute_triage_source,

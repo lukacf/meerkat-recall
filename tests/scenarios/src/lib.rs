@@ -19,6 +19,10 @@ mod embedded_elephant_db;
 mod fast_scenarios;
 
 #[cfg(test)]
+#[path = "../../e2e/src/grounded_source_fixture.rs"]
+pub mod grounded_source_fixture;
+
+#[cfg(test)]
 #[path = "../../e2e/src/pipeline_driver.rs"]
 pub mod pipeline_driver;
 
@@ -30,7 +34,6 @@ pub mod scenario;
 /// Shared test harness for E2E scenarios.
 pub struct Harness {
     pub client: StorageClient,
-    pub db: Surreal<Any>,
     pub ns: String,
     pub db_name: String,
 }
@@ -60,7 +63,6 @@ impl Harness {
 
         Ok(Self {
             client: client.clone(),
-            db: client.db().expect("surreal test harness db").clone(),
             ns,
             db_name,
         })
@@ -71,7 +73,3 @@ impl Harness {
 use elephant_migrations::apply_schema;
 #[cfg(test)]
 use elephant_storage::{StorageClient, StorageConfig};
-#[cfg(test)]
-use surrealdb::engine::any::Any;
-#[cfg(test)]
-use surrealdb::Surreal;

@@ -10,13 +10,19 @@ use crate::store::Core;
 #[derive(Clone)]
 pub(crate) struct Indexer {
     pub(crate) index: VartIndex<VariableSizeKey, IndexValue>,
+    // A physically rebuilt generation may have deleted its newest key. Keep
+    // that committed clock even when no surviving value carries its version.
+    pub(crate) version_floor: u64,
 }
 
 impl Indexer {
     /// Creates a new `Indexer` instance.
     pub(crate) fn new() -> Self {
         let index = VartIndex::new();
-        Self { index }
+        Self {
+            index,
+            version_floor: 0,
+        }
     }
 
     /// Creates a snapshot of the current state of the index.
@@ -63,7 +69,7 @@ impl Indexer {
 
     /// Returns the current version of the index.
     pub fn version(&self) -> u64 {
-        self.index.version()
+        self.index.version().max(self.version_floor)
     }
 }
 

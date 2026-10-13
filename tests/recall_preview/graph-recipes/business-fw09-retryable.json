@@ -1,0 +1,82 @@
+{
+  "format": "recall-public-graph-fixture/v1",
+  "source_request": {
+    "source": {
+      "id": "source:0d5a937f-8569-543a-96f4-3de9969adcd6",
+      "space_id": "qualification-business",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "business-policy",
+        "level": 7,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "type": "manual",
+      "hash": "3f3e44e78ebad2911f2602ee9f9bbe96cca0b34095cac821502e60998d825c0f",
+      "external_id": "workload/atlas-06",
+      "uri": "https://example.invalid/recall-workload/business/06",
+      "metadata": {}
+    },
+    "doc": {
+      "id": "doc:fadd7a33-db3c-5b03-a9ef-76d315a2a030",
+      "space_id": "qualification-business",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "business-policy",
+        "level": 7,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "title": "workload/atlas-06",
+      "text": "For business project Atlas-06, the responsible custodian is Bruno-06. Its approved supply limit is 137 units. This record applies only to business scope.\nBruno-06 now maintains the Atlas-06 retryable backlog notebook.",
+      "source": null,
+      "sidecar_text": null,
+      "media_attachments": [],
+      "rendition_key": "d28/text/workload/atlas-06/full-fw09-retryable-r2",
+      "metadata": {}
+    },
+    "ingest_mode": "graph",
+    "intake": {
+      "revision_id": "full-fw09-retryable-r2",
+      "idempotency_key": "literal-0c226759d4df456c556884c98257c4057b7f68485bf2efbc0b3c787cd908eb36"
+    }
+  },
+  "rendered_text": "For business project Atlas-06, the responsible custodian is Bruno-06. Its approved supply limit is 137 units. This record applies only to business scope.\nBruno-06 now maintains the Atlas-06 retryable backlog notebook.\n",
+  "rendered_sha256": "02c52f01fc08976f79abf1f332a0725ce84cd31a31d6e6f2e8de03cf0d0d7719",
+  "expected_assertions": [
+    {
+      "subject_text": "Bruno-06",
+      "predicate_raw": "maintains",
+      "object_text": "Atlas-06 retryable backlog notebook",
+      "object_literal": null,
+      "subject_entity_type": "person",
+      "object_entity_type": "document",
+      "confidence": 1.0,
+      "significance": "medium",
+      "source_event_time": null,
+      "start": 154,
+      "end": 217,
+      "quote": "Bruno-06 now maintains the Atlas-06 retryable backlog notebook.",
+      "quote_hash": "dedb64ae664c3836d68b8c852357cc7f94633850bec72ebdefa326bec7a084cc"
+    }
+  ],
+  "extract_rule_id": "business-fw09-retryable-extract"
+}

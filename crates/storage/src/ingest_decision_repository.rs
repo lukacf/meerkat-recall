@@ -125,28 +125,62 @@ impl IngestDecisionRepository {
     }
 
     /// Converts an IngestDecision to a SurrealDB value for insertion.
-    fn ingest_decision_to_value(item: &IngestDecision) -> StorageResult<surrealdb::sql::Value> {
-        crate::surreal::json_to_surreal(serde_json::json!({
-            "space_id": item.base.space_id,
-            "created_at": item.base.created_at,
-            "updated_at": item.base.updated_at,
-            "created_by": item.base.created_by,
-            "deleted_at": item.base.deleted_at,
-            "provenance": item.base.provenance,
-            "security": item.base.security,
-            "subjects": item.base.subjects,
-            "subjects_state": item.base.subjects_state,
-            "source": item.source,
-            "decision": item.decision,
-            "reason_codes": item.reason_codes,
-            "confidence": item.confidence,
-            "estimated_cost": item.estimated_cost,
-            "cost_ledger_id": item.cost_ledger_id,
-            "budget_snapshot": item.budget_snapshot,
-            "policy_version": item.policy_version,
-            "downgrade_reason": item.downgrade_reason,
-            "original_mode": item.original_mode,
-        }))
+    pub(crate) fn ingest_decision_to_value(
+        item: &IngestDecision,
+    ) -> StorageResult<surrealdb::sql::Value> {
+        use surrealdb::sql::Value;
+        let mut object = crate::surreal::base_fields_to_object(&item.base)?;
+        object.insert(
+            "source".into(),
+            crate::surreal::thing_from_record_id(item.source.id()).into(),
+        );
+        object.insert(
+            "decision".into(),
+            crate::surreal::enum_to_surreal(&item.decision)?,
+        );
+        object.insert(
+            "reason_codes".into(),
+            Value::Array(item.reason_codes.clone().into()),
+        );
+        object.insert("confidence".into(), Value::from(f64::from(item.confidence)));
+        object.insert("estimated_cost".into(), Value::from(item.estimated_cost));
+        object.insert(
+            "cost_ledger_id".into(),
+            item.cost_ledger_id.as_ref().map_or(Value::None, |id| {
+                crate::surreal::thing_from_record_id(id).into()
+            }),
+        );
+        object.insert(
+            "budget_snapshot".into(),
+            match &item.budget_snapshot {
+                Some(snapshot) => crate::surreal::json_to_surreal(
+                    serde_json::to_value(snapshot)
+                        .map_err(|error| StorageError::SerializationError(error.to_string()))?,
+                )?,
+                None => Value::None,
+            },
+        );
+        object.insert(
+            "policy_version".into(),
+            item.policy_version
+                .as_ref()
+                .map_or(Value::None, |value| Value::from(value.clone())),
+        );
+        object.insert(
+            "downgrade_reason".into(),
+            item.downgrade_reason
+                .as_ref()
+                .map_or(Value::None, |value| Value::from(value.clone())),
+        );
+        object.insert(
+            "original_mode".into(),
+            item.original_mode
+                .as_ref()
+                .map(crate::surreal::enum_to_surreal)
+                .transpose()?
+                .unwrap_or(Value::None),
+        );
+        Ok(Value::Object(object))
     }
 }
 
@@ -412,6 +446,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_ingest_decision() {
         let repo = setup_test_repo().await;
         let item = create_test_ingest_decision();
@@ -423,6 +461,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_ingest_decision() {
         let repo = setup_test_repo().await;
         let item = create_test_ingest_decision();
@@ -435,6 +477,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_latest_by_source() {
         let repo = setup_test_repo().await;
         let first = create_test_ingest_decision();
@@ -459,6 +505,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_ingest_decision_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_ingest_decision();
@@ -486,6 +536,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_ingest_decision() {
         let repo = setup_test_repo().await;
         let item = create_test_ingest_decision();
@@ -506,6 +560,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_ingest_decision() {
         let repo = setup_test_repo().await;
         let item = create_test_ingest_decision();

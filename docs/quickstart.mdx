@@ -8,7 +8,7 @@ Choose the credential-free source demo to explore existing evidence and
 projections. Choose the persistent stack to submit new evidence and run model
 extraction. The HTTP examples below require `curl` and `jq`.
 
-For a supplied candidate executable, follow [binary installation](/installation).
+For a released native executable, follow [binary installation](/installation).
 That default-feature binary runs the model-backed `demo-wiki` and needs provider
 credentials. The credential-free command below compiles a different feature
 set; it is not a runtime switch on the distributed binary.
@@ -54,14 +54,21 @@ stop the demo first so port 3000 is available.
 
 ## Start a persistent local stack
 
-Install Docker with Compose, then copy `.env.example` to `.env`. The default
-Compose configuration uses OpenAI embeddings and an Anthropic extraction
-model. Set `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` in `.env` before starting;
-model calls can incur charges.
+Install Docker with Compose, then build and load the matching patched server
+using the [paired server recipe](https://github.com/lukacf/meerkat-recall/blob/main/packaging/recall-surreal/README.md). Set
+`RECALL_SURREAL_IMAGE` to its actual local tag or digest; an upstream SurrealDB
+image lacks the required capability. Compose refuses to start without this
+explicit selection.
+
+Copy `.env.example` to `.env`. The default Compose configuration uses OpenAI
+embeddings and an Anthropic extraction model. Set `OPENAI_API_KEY` and
+`ANTHROPIC_API_KEY` in `.env` before starting; model calls can incur charges.
+Credentials do not create per-space processing approvals.
 
 ```bash
 cp .env.example .env
 # Edit .env with your provider credentials.
+export RECALL_SURREAL_IMAGE=recall-surreal:REVIEWED_SOURCE
 docker compose up -d surrealdb
 docker compose run --rm elephant meerkat-recall migrate
 docker compose up -d elephant
@@ -69,7 +76,11 @@ docker compose up -d elephant
 
 Migrations must run against the same namespace and database as the server.
 Running the migration inside the Compose service uses that service's settings.
-Meerkat Recall runs managed workers in the server process by default.
+Meerkat Recall runs managed workers in the server process by default. Create the
+named space and its approved query/document embedding, extraction and support
+verification bindings before semantic ingestion. See the
+[service setup](/operations/service-setup#approve-processing)
+for the current named-space setup; environment keys alone do not make it ready.
 
 <Warning>
 Compose is a local development configuration with authentication bypass.

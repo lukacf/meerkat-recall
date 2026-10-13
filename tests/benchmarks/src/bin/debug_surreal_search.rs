@@ -27,6 +27,10 @@ use uuid::Uuid;
 
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain search repository, dispatcher and embedding worker ownership and drop order"
+)]
 async fn main() -> Result<()> {
     let namespace = std::env::var("SURREALDB_NAMESPACE")
         .unwrap_or_else(|_| format!("debug_search_{}", Uuid::new_v4().simple()));
@@ -257,6 +261,7 @@ fn space_config(space_id: &str, dims: usize) -> SpaceConfig {
     base.subjects_state = SubjectsState::Complete;
 
     SpaceConfig {
+        processing: None,
         base,
         embedding_provider: "hashed".to_string(),
         embedding_model: "hashed-bow-v1".to_string(),

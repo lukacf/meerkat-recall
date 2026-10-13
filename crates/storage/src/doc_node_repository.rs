@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::Deserialize;
+use std::fmt::Write as _;
 
 use elephant_types::records::base::{BaseFields, Provenance, Security, SubjectsState};
 use elephant_types::records::doc_node::{DocNode, NodeRole, TextSpan};
@@ -295,7 +296,7 @@ impl DocNodeRepository {
     }
 
     /// Converts a DocNode to a SurrealDB value for insertion.
-    fn doc_node_to_value(item: &DocNode) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn doc_node_to_value(item: &DocNode) -> StorageResult<surrealdb::sql::Value> {
         let mut obj = crate::surreal::base_fields_to_object(&item.base)?;
         obj.insert(
             "revision".to_string(),
@@ -561,6 +562,102 @@ impl DocNodeRepository {
         space_id: &str,
         limit: usize,
     ) -> StorageResult<Vec<DocNode>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut selected = Vec::with_capacity(limit);
+        let mut offset = 0usize;
+        loop {
+            let candidates = self.pending_embedding_page(space_id, limit, offset).await?;
+            let count = candidates.len();
+            for node in candidates {
+                if crate::unmanaged_embedding::is_unmanaged(&self.client, space_id, &node).await? {
+                    selected.push(node);
+                    if selected.len() == limit {
+                        return Ok(selected);
+                    }
+                }
+            }
+            if count < limit {
+                return Ok(selected);
+            }
+            offset = offset.checked_add(count).ok_or_else(|| {
+                StorageError::DataIntegrityError("pending embedding cursor overflow".into())
+            })?;
+        }
+    }
+
+    /// Recheck generic embedding ownership after text resolution and immediately
+    /// before dispatch. Source-managed nodes require their original claimed job.
+    pub async fn require_unmanaged_embedding_inputs(
+        &self,
+        space_id: &str,
+        nodes: &[DocNode],
+    ) -> StorageResult<()> {
+        crate::unmanaged_embedding::require_unmanaged(&self.client, space_id, nodes).await
+    }
+
+    /// Mark irrecoverable standalone inputs without changing their text or links.
+    /// Source-owned nodes must be repaired by their original publication worker.
+    pub async fn mark_unmanaged_embedding_failed(
+        &self,
+        space_id: &str,
+        node_ids: &[RecordId],
+        sentinel: &str,
+    ) -> StorageResult<()> {
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+        let guards = crate::unmanaged_embedding::prepare(&self.client, space_id, node_ids).await?;
+        let now = Utc::now();
+        if let Some(store) = self.client.embedded_store() {
+            return store
+                .mutate(|tx| {
+                    crate::unmanaged_embedding::check_tx(tx, space_id, &guards)?;
+                    for id in node_ids {
+                        let mut node =
+                            tx.get::<DocNode>(space_id, id, false)?.ok_or_else(|| {
+                                StorageError::Conflict(
+                                    "source_embedding_requires_original_claim".into(),
+                                )
+                            })?;
+                        node.embedding_model = Some(sentinel.to_owned());
+                        node.base.updated_at = now;
+                        tx.replace(node)?;
+                    }
+                    Ok(())
+                })
+                .await;
+        }
+        let mut sql = String::from("BEGIN TRANSACTION;\n");
+        let mut bindings = std::collections::BTreeMap::new();
+        crate::unmanaged_embedding::append_sql(&mut sql, &mut bindings, space_id, &guards);
+        bindings.insert("failed_embedding_sentinel".into(), sentinel.into());
+        bindings.insert(
+            "failed_embedding_updated".into(),
+            crate::surreal::datetime_from_chrono(now).into(),
+        );
+        for (index, id) in node_ids.iter().enumerate() {
+            let name = format!("failed_embedding_node_{index}");
+            bindings.insert(
+                name.clone(),
+                crate::surreal::thing_from_record_id(id).into(),
+            );
+            let _ = writeln!(sql, "UPDATE ${name} SET embedding_model=$failed_embedding_sentinel, updated_at=$failed_embedding_updated;");
+        }
+        sql.push_str("COMMIT TRANSACTION;");
+        self.client
+            .query_bind_checked(&sql, bindings)
+            .await
+            .map(|_| ())
+    }
+
+    async fn pending_embedding_page(
+        &self,
+        space_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> StorageResult<Vec<DocNode>> {
         if let Some(store) = self.client.embedded_store() {
             let mut items: Vec<_> = store
                 .scan::<DocNode>()
@@ -576,11 +673,13 @@ impl DocNodeRepository {
                         && item.embedding_model.is_none()
                 })
                 .collect();
-            items.sort_by_key(|item| item.base.created_at);
-            if items.len() > limit {
-                items.truncate(limit);
-            }
-            return Ok(items);
+            items.sort_by(|left, right| {
+                left.base
+                    .created_at
+                    .cmp(&right.base.created_at)
+                    .then_with(|| left.base.id.cmp(&right.base.id))
+            });
+            return Ok(items.into_iter().skip(offset).take(limit).collect());
         }
 
         let mut response = self
@@ -592,8 +691,8 @@ impl DocNodeRepository {
                        AND role IN ['chunk', 'paragraph', 'summary'] \
                        AND embedding_model IS NONE \
                        AND deleted_at IS NONE \
-                     ORDER BY created_at \
-                     LIMIT {limit}"
+                     ORDER BY created_at, id \
+                     LIMIT {limit} START {offset}"
                 ),
                 crate::bindings! { "space_id" => space_id },
             )
@@ -759,6 +858,39 @@ impl Repository<DocNode> for DocNodeRepository {
     }
 }
 
+impl DocNodeRepository {
+    /// Reads physical row state for atomic source lifecycle inverse preparation.
+    pub(crate) async fn get_including_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<DocNode>> {
+        if let Some(store) = self.client.embedded_store() {
+            return store.get::<DocNode>(space_id, id, true).await;
+        }
+
+        // Record access (`FROM ONLY $id`): the planner has no id-equality
+        // fast path, so the `FROM doc_node WHERE id = $id` form scanned the
+        // whole table on each point lookup (issue #34). The space_id/
+        // deleted_at WHERE clause preserves space isolation.
+        let mut response = self
+            .client
+            .query_bind(
+                &format!(
+                    "SELECT {DOC_NODE_PROJECTION} FROM ONLY $id WHERE space_id = $space_id"
+                ),
+                crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
+            )
+            .await?;
+
+        let item: Option<DocNodeDb> = response
+            .take(0)
+            .map_err(|e| StorageError::QueryError(format!("Failed to parse doc_node: {e}")))?;
+
+        item.map(DocNode::try_from).transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -887,6 +1019,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_doc_node() {
         let repo = setup_test_repo().await;
         let item = create_test_doc_node();
@@ -898,6 +1034,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_doc_node() {
         let repo = setup_test_repo().await;
         let item = create_test_doc_node();
@@ -911,6 +1051,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_doc_node_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_doc_node();
@@ -929,6 +1073,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_doc_node() {
         let repo = setup_test_repo().await;
         let item = create_test_doc_node();
@@ -944,6 +1092,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_doc_node() {
         let repo = setup_test_repo().await;
         let item = create_test_doc_node();
@@ -957,6 +1109,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_parent_chain_three_levels() {
         let repo = setup_test_repo().await;
         let revision_id = RecordId::new_v4(TableName::DocRevision);
@@ -1012,6 +1168,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_parent_chain_root_node_returns_empty() {
         let repo = setup_test_repo().await;
 
@@ -1027,6 +1187,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_parent_chain_nonexistent_node() {
         let repo = setup_test_repo().await;
         let fake_id = RecordId::new_v4(TableName::DocNode);
@@ -1039,6 +1203,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_pending_embedding() {
         let repo = setup_test_repo().await;
         let revision_id = RecordId::new_v4(TableName::DocRevision);
@@ -1143,6 +1311,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_find_by_revision_and_chunks_do_not_require_active_revision_row() {
         let repo = setup_embedded_repo().await;
         let revision_id = RecordId::new_v4(TableName::DocRevision);

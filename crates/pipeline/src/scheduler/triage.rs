@@ -12,7 +12,7 @@ use elephant_types::records::work::PluginManifest;
 use crate::error::PipelineError;
 
 #[cfg(feature = "meerkat-extraction")]
-use crate::llm::run_anthropic_prompt;
+use crate::llm::run_model_prompt;
 #[cfg(feature = "meerkat-extraction")]
 use serde::Deserialize;
 #[cfg(feature = "meerkat-extraction")]
@@ -643,6 +643,7 @@ impl TriagePlugin for RuleBasedTriage {
 /// Per spec §6.3: Plugin can use LLM for complex triage decisions.
 #[derive(Debug, Clone)]
 pub struct AgenticTriage {
+    provider_context: Option<crate::provider_dispatch::ProviderDispatchContext>,
     manifest: PluginManifest,
     source_types: Vec<String>,
     /// Fallback to rule-based triage when LLM is unavailable.
@@ -656,10 +657,21 @@ pub struct AgenticTriage {
 }
 
 impl AgenticTriage {
+    /// Bind optional model triage to one explicit space.
+    #[must_use]
+    pub fn with_provider_context(
+        mut self,
+        context: crate::provider_dispatch::ProviderDispatchContext,
+    ) -> Self {
+        self.provider_context = Some(context);
+        self
+    }
+
     /// Creates a new agentic triage plugin.
     #[must_use]
     pub fn new() -> Self {
         Self {
+            provider_context: None,
             manifest: PluginManifest {
                 plugin_id: "agentic_triage".to_string(),
                 version: "1.0.0".to_string(),
@@ -829,13 +841,19 @@ impl TriagePlugin for AgenticTriage {
                 return self.fallback.triage(ctx).await;
             }
 
-            let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-                Ok(key) => key,
-                Err(_) => {
-                    tracing::warn!("ANTHROPIC_API_KEY not set, falling back to rule-based triage");
-                    return self.fallback.triage(ctx).await;
-                }
-            };
+            let context = self.provider_context.as_ref().ok_or_else(|| {
+                PipelineError::ConfigError(
+                    "provider_authorization: triage requires a space context".into(),
+                )
+            })?;
+            if context.space_id != ctx.space_id || ctx.source.base.space_id != ctx.space_id {
+                return Err(PipelineError::ConfigError(
+                    "provider_authorization: wrong triage space".into(),
+                ));
+            }
+            let (model, client, _provenance) = context
+                .model_client(elephant_types::provider_binding::ModelOperation::Triage)
+                .await?;
 
             let prompt = self.build_prompt(&ctx);
             let max_tokens = self.manifest.max_tokens.unwrap_or(500);
@@ -847,19 +865,21 @@ impl TriagePlugin for AgenticTriage {
                 "AgenticTriage calling LLM for triage decision"
             );
 
-            let call = run_anthropic_prompt(
-                api_key,
-                self.model.clone(),
+            let call = run_model_prompt(
+                client,
+                model,
                 Some("You are a careful ingestion triage assistant."),
                 prompt,
                 max_tokens.max(1),
-                None,
             );
 
             let result = tokio::time::timeout(Duration::from_secs(timeout_secs), call).await;
 
             let run_result = match result {
                 Ok(Ok(run_result)) => run_result,
+                Ok(Err(err)) if err.to_string().contains("provider_authorization:") => {
+                    return Err(err)
+                }
                 Ok(Err(err)) => {
                     tracing::warn!("AgenticTriage LLM call failed ({err}), falling back to rules");
                     return self.fallback.triage(ctx).await;

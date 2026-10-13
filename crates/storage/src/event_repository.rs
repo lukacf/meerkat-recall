@@ -438,7 +438,7 @@ impl EventRepository {
         Ok((normalized, removed))
     }
 
-    fn event_to_value(item: &Event) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn event_to_value(item: &Event) -> StorageResult<surrealdb::sql::Value> {
         use surrealdb::sql::Value;
 
         let mut obj = crate::surreal::base_fields_to_object(&item.base)?;
@@ -1267,6 +1267,10 @@ mod tests {
         event
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep entity_repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn create_test_entity(
         client: &StorageClient,
         space_id: &str,
@@ -1386,6 +1390,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_event_crud_roundtrip() {
         let repo = setup_test_repo().await;
         let space_id = "space_a";
@@ -1424,6 +1432,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_event_list_with_cursor() {
         let repo = setup_test_repo().await;
         let space_id = "space_a";
@@ -1457,6 +1469,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_event_search_by_query_and_entities() {
         let repo = setup_test_repo().await;
         let space_id = "space_a";
@@ -1500,6 +1516,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep entity_repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_prunes_missing_subject_links() {
         let (repo, _) = setup_migrated_test_repo().await;
         let space_id = "space_a";
@@ -1529,6 +1549,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep entity_repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_rewrites_merged_subject_links() {
         use elephant_types::records::entity::{Entity, EntityStatus, EntityType};
 
@@ -1572,6 +1596,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_event_search_filtered_by_status_in_db_query() {
         let repo = setup_test_repo().await;
         let space_id = "space_a";
@@ -1609,6 +1637,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_event_recent_and_upcoming_queries() {
         let repo = setup_test_repo().await;
         let space_id = "space_a";
@@ -1789,6 +1821,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_update_enforce_event_invariants() {
         let repo = setup_test_repo().await;
         let space_id = "space_a";
@@ -1820,6 +1856,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_wrong_space_does_not_leak_existing_event() {
         let repo = setup_test_repo().await;
         let source_space = "space_a";
@@ -2094,6 +2134,10 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "boundary-mode: validates time range behavior for event queries"]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn boundary_mode_time_range_query_respects_window() {
         let repo = setup_test_repo().await;
         let space_id = "space_a";
@@ -2186,6 +2230,10 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "boundary-mode: validates status filter behavior for event queries"]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn boundary_mode_status_filter_query_respects_statuses() {
         let repo = setup_test_repo().await;
         let space_id = "space_a";

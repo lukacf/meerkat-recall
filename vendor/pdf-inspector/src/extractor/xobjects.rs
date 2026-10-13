@@ -45,6 +45,7 @@ pub(crate) struct FormWalkBudget {
     max_invocations: usize,
     max_operations: usize,
     truncated: bool,
+    pub(crate) require_complete: bool,
 }
 
 impl FormWalkBudget {
@@ -59,6 +60,7 @@ impl FormWalkBudget {
             max_invocations,
             max_operations,
             truncated: false,
+            require_complete: false,
         }
     }
 
@@ -328,32 +330,55 @@ fn extract_form_xobject_text_inner(
     // inflating past it is skipped, as a page over it is, before anything
     // is allocated for it. A stream that fails to decode for another
     // reason is read raw, if that fits the bound too.
-    let content_data = match stream
-        .decompressed_content_with_limit(super::content_decode::MAX_PAGE_CONTENT_BYTES)
-    {
-        Ok(data) => data,
-        Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })) => {
-            log::warn!(
+    let content_data = if budget.require_complete {
+        match super::content_stream::complete_content_stream(
+            stream,
+            super::content_decode::MAX_PAGE_CONTENT_BYTES,
+        ) {
+            Ok(data) => data,
+            Err(error) => {
+                log::warn!(
+                    "form xobject {:?}: incomplete content stream: {}",
+                    form_id,
+                    error
+                );
+                budget.truncated = true;
+                return extracted;
+            }
+        }
+    } else {
+        match stream.decompressed_content_with_limit(
+            super::content_decode::MAX_PAGE_CONTENT_BYTES,
+        ) {
+            Ok(data) => data,
+            Err(lopdf::Error::Decompress(
+                lopdf::DecompressError::MemoryLimitExceeded { .. },
+            )) => {
+                log::warn!(
                 "form xobject {:?}: skipping — content stream exceeds {} decompressed bytes",
                 form_id,
                 super::content_decode::MAX_PAGE_CONTENT_BYTES
             );
-            budget.truncated = true;
-            return extracted;
-        }
-        Err(_) if stream.content.len() > super::content_decode::MAX_PAGE_CONTENT_BYTES => {
-            log::warn!(
-                "form xobject {:?}: skipping — raw content stream exceeds {} bytes",
-                form_id,
-                super::content_decode::MAX_PAGE_CONTENT_BYTES
-            );
-            budget.truncated = true;
-            return extracted;
-        }
-        Err(_) if stream.dict.get(b"Filter").is_err() => stream.content.clone(),
-        Err(_) => {
-            budget.truncated = true;
-            stream.content.clone()
+                budget.truncated = true;
+                return extracted;
+            }
+            Err(_)
+                if stream.content.len()
+                    > super::content_decode::MAX_PAGE_CONTENT_BYTES =>
+            {
+                log::warn!(
+                    "form xobject {:?}: skipping — raw content stream exceeds {} bytes",
+                    form_id,
+                    super::content_decode::MAX_PAGE_CONTENT_BYTES
+                );
+                budget.truncated = true;
+                return extracted;
+            }
+            Err(_) if stream.dict.get(b"Filter").is_err() => stream.content.clone(),
+            Err(_) => {
+                budget.truncated = true;
+                stream.content.clone()
+            }
         }
     };
 

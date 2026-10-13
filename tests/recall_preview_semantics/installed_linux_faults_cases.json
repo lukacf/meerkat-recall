@@ -1,0 +1,28 @@
+{
+  "format": "recall-installed-fault-cases/v1",
+  "required_cases": [
+    "prior_good_checkpoint_and_wal",
+    "configuration_os_enospc",
+    "checkpoint_os_enospc_and_reopen",
+    "installed_sigkill_acknowledged_wal",
+    "backend_unavailable",
+    "unsupported_preview_transfer",
+    "bad_backend_credentials"
+  ],
+  "limits": {"total_seconds": 600, "tmpfs_bytes": 67108864, "max_processes": 32, "max_http_calls": 150},
+  "expectations": {
+    "full_filesystem": "Actual fixed-quota private tmpfs reaches errno 28. Installed candidate write/pwrite64 to the exact configuration/checkpoint directory independently returns kernel ENOSPC in its owned syscall trace.",
+    "configuration": "The previous complete TOML bytes remain identical after failed configuration publication.",
+    "checkpoint": "The previous committed checkpoint and acknowledged WAL bytes remain identical after failed shutdown checkpoint. Remove only owned filler, reopen the same configured path with original independent journal, and recover exact acknowledged entities.",
+    "kill": "SIGKILL after an observed public acknowledgment with unchanged checkpoint and changed WAL; same destination and journal reopen recovers acknowledged rows. This does not establish interruption inside a save syscall.",
+    "negative_cli": "Actual specific diagnostic, nonzero exit, absent success message, and no initialized runtime configuration. Preview transfer must additionally leave actual source digest and absent target unchanged.",
+    "credentials": "A matching reviewed paired native bundle runs an owned isolated in-memory server; wrong synthetic credentials fail. Missing matching bundle is an unmet prerequisite, never pass."
+  },
+  "separate_evidence_required": [
+    "D22 deterministic tests of the actual shared atomic writer before rename and after rename/directory-sync uncertainty; not an installed OS-fault result.",
+    "D22 actual production storage tests of phase-specific interrupted checkpoint and WAL recovery; installed kill case states only its observed phase.",
+    "D23 actual canonical apply_files fresh-engine valid/invalid-file rollback suite; ordinary CLI refusal cannot establish canonical transaction rollback.",
+    "Optional extension failure after canonical schema commit is not evidence that canonical schema rolled back."
+  ],
+  "unqualified": ["semantic retrieval", "providers", "OB3 acceptance", "production cutover", "Darwin", "power-loss hardware guarantees"]
+}

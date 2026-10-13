@@ -20,22 +20,25 @@ command syntax.
 | `worker` | Run a standalone pipeline worker | Shared SurrealDB configuration; rejects ElephantDB |
 | `migrate` | Apply SurrealDB schema migrations | Local SurrealDB configuration |
 | `status [--json] [--require-ready]` | Read health and optionally require semantic readiness | Running server API |
-| `snapshot export <path>` | Export the live embedded store | Running server API; path is on the server |
-| `snapshot import <path>` | Import into the live embedded store | Running server API; path is on the server |
+| `snapshot export --output <directory>` | Export a quiescent named backup | Running server API; path is on the server |
+| `snapshot restore --input <directory>` | Restore a verified named backup (`import` is an alias) | Running server API; original recovery journal required |
+| `snapshot verify/inspect --input <directory>` | Verify or inspect a local backup offline | No database or model connection |
+| `snapshot prune --journal-directory <directory>` | Enforce owned backup retention | Local original recovery journal |
+| `service-token bootstrap/issue` | Create signing material or issue explicit bounded credentials | Local private files; no API required |
 | `data-migrate --snapshot <path>` | Copy an embedded snapshot into an empty SurrealDB target | Local snapshot and target database |
-| `demo-wiki [--port <port>]` | Run an isolated Living Wiki demonstration | Embedded demo runtime; default port 3000 |
+| `demo-wiki --processing-config <file> [--port <port>]` | Run an isolated Living Wiki demonstration | Embedded demo runtime; default port 3000 |
 
 See [deployment](/operations/deployment) for environment settings and
 [quickstart](/quickstart) for a credential-free demo or persistent local stack.
-The distributed candidate includes Meerkat extraction by default. Its
+The distributed release includes Meerkat extraction by default. Its
 `demo-wiki` command needs a configured model provider before it can plan and
 write articles. See [binary demo prerequisites](/installation#run-the-model-backed-demo).
 The separate `--no-default-features` source build exposes evidence and context
 projections without generated articles. There is no runtime feature toggle
-that converts the candidate binary into that credential-free build.
+that converts the released binary into that credential-free build.
 
 `meerkat-recall --version` reports the package version. Use the bundled
-`provenance.json` and executable checksum to identify the exact candidate;
+`provenance.json` and executable checksum to identify the exact artifact;
 neither `--help` nor `--version` makes model calls.
 
 The 0.1 compatibility contract retains `.elephant/elephant_config.toml`, all
@@ -45,12 +48,13 @@ precedence. Internal Rust crates retain their existing names.
 
 ## Target a running server
 
-The `status` and `snapshot` commands accept two global options:
+The `status` and online `snapshot` commands accept these global options:
 
 | Option | Environment fallback | Default |
 | --- | --- | --- |
 | `--api-url <url>` | `ELEPHANT_API_URL` | HTTP URL built from `ELEPHANT_HOST` and `ELEPHANT_PORT`, otherwise `http://127.0.0.1:3000` |
 | `--token <token>` | `ELEPHANT_API_BEARER_TOKEN` | No token |
+| `--token-file <path>` | No fallback | Read a private bearer file; conflicts with `--token` |
 
 An explicit option takes precedence over the corresponding environment
 variable. A wildcard bind host (`0.0.0.0` or `::`) is translated to a loopback
@@ -62,19 +66,22 @@ where `serve` listens or where `migrate` writes.
 meerkat-recall --api-url http://127.0.0.1:3000 status --json
 ```
 
-The JSON output contains `health` and `runtime`. `runtime` can be `null` when
-its request fails. Plain `status` retains its diagnostic exit behavior; use
-`--require-ready` when a script must stop unless the server is ready.
+The JSON output contains `health`, `runtime` and `readiness`, each with
+`http_status`, `body` and a bounded error category. Plain status reports diagnostics;
+use `--require-ready` to require authenticated role readiness:
 
 ```bash
-meerkat-recall status --json --require-ready
+meerkat-recall --token-file /private/recall/probe.token \
+  status --json --require-ready --space research
 ```
 
-This exits zero only when health succeeds with `status: "healthy"` and a valid
-successful runtime response reports `semantic_ingest_ready: true`. Unavailable,
-unauthorized, unhealthy, incomplete or malformed responses fail. Each of the
-two HTTP requests has a 10-second timeout. Received diagnostic JSON remains on
-stdout when readiness fails; errors go to stderr.
+`--space` selects the authorized named space. Each of the three concurrent
+requests has a ten-second timeout and a bounded response. Exit 0 means the
+readiness endpoint returned HTTP 200 with `ready:true`; 3 means not ready,
+4 means unavailable, malformed or inconsistent, and 5 means authorization was
+refused. Exit 1 is another operational error and 2 is argument misuse.
+Diagnostic JSON remains available on readiness failure. Role readiness does not
+establish completion or searchability of a specific source revision.
 
 ## Apply schema migrations
 
@@ -87,50 +94,94 @@ Configure the same SurrealDB URL, namespace, and database used by the server.
 files from a local directory. It is a database schema operation, separate from
 running queued document processing.
 
-## Export and import embedded snapshots
+## Export, verify and restore named backups
 
 ```bash
-meerkat-recall snapshot export /backups/elephant.snapshot.json
+meerkat-recall --token-file /private/recall/backup-operator.token \
+  snapshot export --output /backups/recall-nightly --name nightly \
+  --retention-days 7 --quiesce-timeout-seconds 30 --json
+meerkat-recall snapshot verify --input /backups/recall-nightly --json
+meerkat-recall --token-file /private/recall/backup-operator.token \
+  snapshot restore --input /backups/recall-nightly --json
 ```
 
-The path is resolved by the **server process**. It must be writable by that
-process; this command does not download a file to the CLI machine. Snapshot
-operations require an embedded ElephantDB runtime and the relevant system
-permissions. See [snapshot API](/api/system) for the operation contract.
+Export/restore paths belong to the server; verify/inspect paths belong to the
+CLI host. Named backups work with both retained backends. Export requires global
+`read:system`; restore requires global `write:system`. Export pauses admission,
+drains work and refuses Running work rather than manufacturing a consistent
+receipt. It creates a new immutable directory containing `manifest.json` and
+`data.snapshot`. Retention defaults to seven days and is capped at thirty days.
 
-```bash
-meerkat-recall snapshot import /backups/elephant.snapshot.json
-```
+Restore replaces the store under a durable recovery barrier. Keep the original
+independent erasure journal outside replaceable data and backup trees; missing,
+foreign or interrupted recovery keeps readiness closed. `import` remains a
+compatibility alias for restore. See [snapshot durability](../snapshot-durability.md).
 
-Import changes the live store. Preserve a recovery copy and verify the intended
-server and snapshot before importing. Do not treat an in-memory store or a
-successful export as a continuously durable database.
-
-For graceful `serve` shutdown, `ELEPHANT_DB_SNAPSHOT_SAVE` selects an autosave
-path, falling back to `ELEPHANT_DB_SNAPSHOT_LOAD` when set. The Ctrl-C handler
-attempts export unless `ELEPHANT_DB_SNAPSHOT_AUTOSAVE` is disabled (`0`,
-`false`, `FALSE`, `off`, or `OFF`). Forced termination cannot rely on that path.
+Managed embedded storage with a persistent destination synchronizes acknowledged
+mutations to its WAL. Shutdown snapshots are separate from that commit boundary;
+explicitly ephemeral library/test stores remain volatile. See
+[embedded durability](../embedded-durable-commits.md).
 
 ## Migrate a snapshot to SurrealDB
 
-`data-migrate` reads a snapshot from the CLI machine and copies typed records
-into an isolated empty SurrealDB target. Before schema or data writes, it
-rejects occupied tables (including archives and custom tables), unavailable or
-malformed target metadata, and any nonempty source table without a migration
-path. This operation is separate from the live snapshot API. No other process
-may write the destination during preflight or copying.
+`data-migrate` retains a bounded, one-time copy of supported legacy ElephantDB
+JSON snapshots into a completely fresh SurrealDB target. Stop every other
+client of a remote target; local persistent destinations also enforce an OS
+writer lock. A completed transfer is not an application cutover.
+
+```bash
+meerkat-recall data-migrate --snapshot /input/legacy.json \
+  --url rocksdb:///isolated/target --namespace elephant --database imported \
+  --report /receipts/transfer.json
+```
+
+The source is read once and identified by SHA256. Before schema/data writes,
+preflight refuses NUL content, malformed or incomplete embeddings, duplicate
+embedding partition/node mappings, dangling event subjects, unknown typed
+fields, noncanonical archives, and source tables without a preservation path.
+`id_map` lacks a typed preservation/readback path and is explicitly refused.
+Inputs are never silently repaired. This is not a generic historical migration
+framework.
+
+Erasure-aware named bundles and live snapshot envelopes must use journal-aware
+`snapshot restore --input`; they cannot be transferred by extracting or passing
+their data through this legacy command. The original recovery journal is
+required for restoration. Backend transfer of these snapshots is not
+supported by this command.
 
 | Option | Required | Fallback |
 | --- | --- | --- |
 | `--snapshot <path>` | Yes | None |
 | `--url <url>` | Unless environment set | `SURREALDB_URL` |
-| `--namespace <name>` | No | `SURREALDB_NS`, then `elephant` |
+| `--namespace <name>` | No | `SURREALDB_NAMESPACE`, legacy `SURREALDB_NS`, then `elephant` |
 | `--database <name>` | No | `SURREALDB_DATABASE`, then `elephant` |
 | `--report <path>` | No | No report file; an existing path is refused |
 
-Use an isolated empty target and preserve the source snapshot. Verify row
-counts and representative evidence, graph, and policy reads before pointing an
-application at the destination. Failures after copying begins return a nonzero
-exit and can leave a partial target; the operation is not a whole-database
-transaction and does not automatically roll back. The input snapshot is read
-only. A completed copy is not an application cutover.
+Target credentials use `SURREALDB_USER` and `SURREALDB_PASS`. Preserve the same
+`ELEPHANT_DURABILITY_PATH` through copy, startup and recovery. The storage helper
+rechecks the fresh destination under its exclusive maintenance gate and persists
+`transfer-pending.json` outside the database before mutation. Interrupted or
+failed copies remain unready across restart. The command clears this marker only
+after typed readback, complete row inventories and native destination
+fingerprints reconcile, journal identity verifies, and local persistence succeeds.
+
+The optional receipt records `recall-legacy-transfer-v1`, source file SHA256,
+source row and destination fingerprint digests, and table inventories. Its
+`reconciled` state describes row validation; successful command exit additionally
+confirms the storage helper completed durability and cleared the pending entry.
+The two row digests describe different backend representations and need not be
+equal. Receipt creation failures also leave the transfer incomplete.
+
+There is no automatic rollback or retry into a partial target. To deliberately
+erase only a matching failed destination, use its original source file digest:
+
+```bash
+meerkat-recall data-migrate-discard --url rocksdb:///isolated/target \
+  --namespace elephant --database imported \
+  --source-sha256 ORIGINAL_64_HEX_SHA256 --discard-target
+```
+
+Discard requires a matching durable pending entry; it refuses completed targets,
+mismatched digests and pending restores. It never changes the input snapshot.
+After discard, rerun against the fresh target and verify representative evidence,
+graph and policy reads before any separately authorized application cutover.

@@ -1,0 +1,587 @@
+{
+  "format": "recall-independent-graph-recipes/v1",
+  "review_status": "pending_qualification_owner",
+  "execution_authorized": false,
+  "provider_dispatch_authorized": false,
+  "product_acceptance": false,
+  "frozen_contracts": {
+    "workload-corpus.json": "2192437954109fc17ebbea5b3960eb6b398a2ee91a725ce70666b119e86179dc",
+    "full-workload-contract.json": "44a91b9f0ae4c2ae32d2f8aec9eb783a48ccca63eeee010ff2427ef1ec4a0c0b",
+    "workload-preparation-contract.json": "b1fd4c43e1c8c506ca13e261a29d65a7d06246bf11ef53c02e97945cd3ef56d1",
+    "container-boundary-contract.json": "0d52b048b31b2389dc942f13727dba1b157f3d38b108c1eece7cba711bd20dc7"
+  },
+  "recipe_format": "recall-public-graph-fixture/v1",
+  "source_profile": {
+    "source_commit": "3001399bb082d926b2179efc06372566024ab1e2",
+    "renderer": "elephant.renderer.text",
+    "renderer_version": "1.0.0",
+    "planner_max_window_bytes": 12000,
+    "synthetic_provider_credential": "synthetic-controlled-provider-key",
+    "extraction_support_model": "gpt-5.6-sol",
+    "provider_path": "/v1/responses",
+    "tree_summaries_enabled": false
+  },
+  "recipes": [
+    {
+      "path": "household-fw04-a.json",
+      "file_sha256": "6c01acc8ad173421e1dba4ba656122882f8f97a7368deb876be6c9ad00112bca",
+      "canonical_sha256": "4571ea38a14525686d45ef484aaafa53d4e3a4c7c055f0bbca6f1c93846194d7",
+      "bytes": 3228,
+      "id": "household-fw04-a",
+      "cases": [
+        "FW04"
+      ],
+      "space": "qualification-household",
+      "external_key": "full/shared/a",
+      "revision": "full-shared-r1",
+      "original_generation": "must_be_absent",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 81,
+      "rendered_bytes": 82,
+      "assertion_count": 2
+    },
+    {
+      "path": "household-fw04-b.json",
+      "file_sha256": "4a0d6801eb97f622598b19ccb5756fc374916dc4755ad99527cb1602db96b043",
+      "canonical_sha256": "5376b539e2f9a1bd90dfb1da6c6673a60e36c438b07620c93479e04300c1eadc",
+      "bytes": 3228,
+      "id": "household-fw04-b",
+      "cases": [
+        "FW04"
+      ],
+      "space": "qualification-household",
+      "external_key": "full/shared/b",
+      "revision": "full-shared-r1",
+      "original_generation": "must_be_absent",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 81,
+      "rendered_bytes": 82,
+      "assertion_count": 2
+    },
+    {
+      "path": "household-fw06.json",
+      "file_sha256": "1044f9e7b1fff47d0fe7b972e2104b580561f8f457f3410a1037630e83de4bb4",
+      "canonical_sha256": "5cbd5ab99d2be2e7e503e0bcd33bb3e2065dec8c6a687093aa973c982635af98",
+      "bytes": 2974,
+      "id": "household-fw06",
+      "cases": [
+        "FW06"
+      ],
+      "space": "qualification-household",
+      "external_key": "workload/atlas-01",
+      "revision": "full-fw06-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 214,
+      "rendered_bytes": 215,
+      "assertion_count": 1
+    },
+    {
+      "path": "household-fw07.json",
+      "file_sha256": "b69e5a84fe8ac914cf271591ac045b7bcba1a4b3f56440dd6f7749feb3434fa8",
+      "canonical_sha256": "03d93dd27fde961ba2c8ea036fc5351efe2f1c0d4e355a1fa18f234be0741dfd",
+      "bytes": 2970,
+      "id": "household-fw07",
+      "cases": [
+        "FW07"
+      ],
+      "space": "qualification-household",
+      "external_key": "workload/atlas-02",
+      "revision": "full-fw07-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 213,
+      "rendered_bytes": 214,
+      "assertion_count": 1
+    },
+    {
+      "path": "household-fw08-a.json",
+      "file_sha256": "658f98c6ae0f47011b5a64c4a4297294759957f350c38cb3cbc0f8ba5c3e9641",
+      "canonical_sha256": "d7d7562cc591660f46c5841cef63e2ab978deddcb4a78544b1ff9885237fc295",
+      "bytes": 3004,
+      "id": "household-fw08-a",
+      "cases": [
+        "FW08"
+      ],
+      "space": "qualification-household",
+      "external_key": "workload/atlas-03",
+      "revision": "full-fw08-a-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 220,
+      "rendered_bytes": 221,
+      "assertion_count": 1
+    },
+    {
+      "path": "household-fw08-b.json",
+      "file_sha256": "7a797a81ffd31dffb31567d52cba1ae85b3a85b6ddc397d32b3899e457770553",
+      "canonical_sha256": "8a0c0b8ccad32d600faec47576a2221ff46362c176c2e5ac7183cd8e998d8e3b",
+      "bytes": 3008,
+      "id": "household-fw08-b",
+      "cases": [
+        "FW08"
+      ],
+      "space": "qualification-household",
+      "external_key": "workload/atlas-03",
+      "revision": "full-fw08-b-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 221,
+      "rendered_bytes": 222,
+      "assertion_count": 1
+    },
+    {
+      "path": "household-fw09-running.json",
+      "file_sha256": "1e18bba6edee951a657ea7e49d771b800ac85138a59f2d81566eafbf78d9f61c",
+      "canonical_sha256": "de0348e688c4d17a0d88fe75d71bd4c2d44e55f9d232be134bea35af09f5272f",
+      "bytes": 3014,
+      "id": "household-fw09-running",
+      "cases": [
+        "FW09"
+      ],
+      "space": "qualification-household",
+      "external_key": "workload/atlas-04",
+      "revision": "full-fw09-running-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 218,
+      "rendered_bytes": 219,
+      "assertion_count": 1
+    },
+    {
+      "path": "household-fw09-pending.json",
+      "file_sha256": "faaf43d404074bc7e0edd179b570d66d2711f1866d6529eeb072155720648b62",
+      "canonical_sha256": "d4606d32a148b720239f56dd67def4e047bbbc56864fd7e9af0e4ac2c27f323e",
+      "bytes": 3014,
+      "id": "household-fw09-pending",
+      "cases": [
+        "FW09"
+      ],
+      "space": "qualification-household",
+      "external_key": "workload/atlas-05",
+      "revision": "full-fw09-pending-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 218,
+      "rendered_bytes": 219,
+      "assertion_count": 1
+    },
+    {
+      "path": "household-fw09-retryable.json",
+      "file_sha256": "bb8c299de99ac0f2c0dd85d1d0f63fae24ea406bf9ad804caa4681550443c643",
+      "canonical_sha256": "36c775d620cddde107e9dfbd0843694f16026aebb9ecd7ee6bf4ab8ff1641a6d",
+      "bytes": 3028,
+      "id": "household-fw09-retryable",
+      "cases": [
+        "FW09"
+      ],
+      "space": "qualification-household",
+      "external_key": "workload/atlas-06",
+      "revision": "full-fw09-retryable-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 220,
+      "rendered_bytes": 221,
+      "assertion_count": 1
+    },
+    {
+      "path": "household-fw09-intake.json",
+      "file_sha256": "25b8183f8471ff03fd00cebc021a880c2e5624acf381d53416f977d444a2a489",
+      "canonical_sha256": "284806e2cd0899c880abe6df82ed8452b1d3b0de88370fa0b6d6a701c1462ef8",
+      "bytes": 2991,
+      "id": "household-fw09-intake",
+      "cases": [
+        "FW09"
+      ],
+      "space": "qualification-household",
+      "external_key": "workload/atlas-07",
+      "revision": "full-fw09-intake-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 213,
+      "rendered_bytes": 214,
+      "assertion_count": 1
+    },
+    {
+      "path": "household-fw11.json",
+      "file_sha256": "6b642edf68cc8b4b3858a2407df79de5a82c0359b481e57d4d73640337855628",
+      "canonical_sha256": "bc8aad5dd82b18f83e68202ed9394f17d9535f229da8e14f9abefa3377bec35e",
+      "bytes": 2970,
+      "id": "household-fw11",
+      "cases": [
+        "FW11"
+      ],
+      "space": "qualification-household",
+      "external_key": "workload/atlas-08",
+      "revision": "full-fw11-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 213,
+      "rendered_bytes": 214,
+      "assertion_count": 1
+    },
+    {
+      "path": "household-large-graph.json",
+      "file_sha256": "a08925e9e2d4f724c63e700c3e788fabafcaad082cd5f088ce9a7d376437d699",
+      "canonical_sha256": "2264a8072c80d79cb81d5c167ea45d0a3be00e65bb952b5aab59ab55825b6778",
+      "bytes": 4059455,
+      "id": "household-large-graph",
+      "cases": [
+        "FW03_graph_capacity"
+      ],
+      "space": "qualification-household",
+      "external_key": "full/large",
+      "revision": "full-large-graph-r2",
+      "original_generation": "captured_original_full_large_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 2000000,
+      "rendered_bytes": 2000000,
+      "assertion_count": 2
+    },
+    {
+      "path": "business-fw04-a.json",
+      "file_sha256": "b2e452499e58af56e96a39c9ccf85bb51d3caab5d132ff1154170568d0a62394",
+      "canonical_sha256": "3145d22aac8e42c5903d47bccfe3643dd9e1077cd7067a8e2154e20422565a13",
+      "bytes": 3223,
+      "id": "business-fw04-a",
+      "cases": [
+        "FW04"
+      ],
+      "space": "qualification-business",
+      "external_key": "full/shared/a",
+      "revision": "full-shared-r1",
+      "original_generation": "must_be_absent",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 81,
+      "rendered_bytes": 82,
+      "assertion_count": 2
+    },
+    {
+      "path": "business-fw04-b.json",
+      "file_sha256": "f740329c22868bcbd4e4d26a7f38cffdc0d34f235d9340a373c995d0b5001a6f",
+      "canonical_sha256": "31134e938daab9de6835c38b92c07ccb7efe4953f4c2ba42ca43d1e550302376",
+      "bytes": 3223,
+      "id": "business-fw04-b",
+      "cases": [
+        "FW04"
+      ],
+      "space": "qualification-business",
+      "external_key": "full/shared/b",
+      "revision": "full-shared-r1",
+      "original_generation": "must_be_absent",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 81,
+      "rendered_bytes": 82,
+      "assertion_count": 2
+    },
+    {
+      "path": "business-fw06.json",
+      "file_sha256": "b9b1008d0ef12502302734501866960d554f20d6af6d3f6c250babb60adba010",
+      "canonical_sha256": "460c209d5795a3bbf054371a25278046a9c802ebf93ef2f4d872ff68ffb7ff47",
+      "bytes": 2960,
+      "id": "business-fw06",
+      "cases": [
+        "FW06"
+      ],
+      "space": "qualification-business",
+      "external_key": "workload/atlas-01",
+      "revision": "full-fw06-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 211,
+      "rendered_bytes": 212,
+      "assertion_count": 1
+    },
+    {
+      "path": "business-fw07.json",
+      "file_sha256": "4cd3198eda6a9546b9b80fdcdfdc0b67a68d3c5b6df997e49dcf1c9f4d4164dc",
+      "canonical_sha256": "d7b73dde144996a070f5aae646ca4a8c2c85d8c97f8c6fe3fb73ab9dbd9f47c9",
+      "bytes": 2956,
+      "id": "business-fw07",
+      "cases": [
+        "FW07"
+      ],
+      "space": "qualification-business",
+      "external_key": "workload/atlas-02",
+      "revision": "full-fw07-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 210,
+      "rendered_bytes": 211,
+      "assertion_count": 1
+    },
+    {
+      "path": "business-fw08-a.json",
+      "file_sha256": "c32ad496e7b20aff876962522c2cf041717d571d726719e5040a0e81db57fad2",
+      "canonical_sha256": "f1a5bf3d9b6d4dae1408c4135b4a1ce2ad37473970ff16bc867aa633bf54dc89",
+      "bytes": 2990,
+      "id": "business-fw08-a",
+      "cases": [
+        "FW08"
+      ],
+      "space": "qualification-business",
+      "external_key": "workload/atlas-03",
+      "revision": "full-fw08-a-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 217,
+      "rendered_bytes": 218,
+      "assertion_count": 1
+    },
+    {
+      "path": "business-fw08-b.json",
+      "file_sha256": "f485192fbefc0a344de6a2dfa26e505a4bc350c0b404137e4d859b2b22c51505",
+      "canonical_sha256": "e7ccc5678d63c599a02b1fe76919390ecf119db3b005d533d7f39ce75f0dbe02",
+      "bytes": 2994,
+      "id": "business-fw08-b",
+      "cases": [
+        "FW08"
+      ],
+      "space": "qualification-business",
+      "external_key": "workload/atlas-03",
+      "revision": "full-fw08-b-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 218,
+      "rendered_bytes": 219,
+      "assertion_count": 1
+    },
+    {
+      "path": "business-fw09-running.json",
+      "file_sha256": "2d0a3887a1e92beba9d7000cacbc29020c333fe856f12ce48d58e05b0cdfb0e1",
+      "canonical_sha256": "6f02cd49d16763f2f10eb30c376e3b75ea85fb31bd789720bbc232ba78eec05e",
+      "bytes": 3000,
+      "id": "business-fw09-running",
+      "cases": [
+        "FW09"
+      ],
+      "space": "qualification-business",
+      "external_key": "workload/atlas-04",
+      "revision": "full-fw09-running-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 215,
+      "rendered_bytes": 216,
+      "assertion_count": 1
+    },
+    {
+      "path": "business-fw09-pending.json",
+      "file_sha256": "4ab201b215fa2e9aa79d3a2a675447bfca6147b2f0a3fe120778acfaa9d1d87d",
+      "canonical_sha256": "7ad5fd82cdefd774c9c164449777a7e00a99a85c9e4a46240820ed25f7804b8a",
+      "bytes": 3000,
+      "id": "business-fw09-pending",
+      "cases": [
+        "FW09"
+      ],
+      "space": "qualification-business",
+      "external_key": "workload/atlas-05",
+      "revision": "full-fw09-pending-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 215,
+      "rendered_bytes": 216,
+      "assertion_count": 1
+    },
+    {
+      "path": "business-fw09-retryable.json",
+      "file_sha256": "ac8783cc56c4e030911eb00efb66c2cfc8408eabedc3539c0cf01904be38328a",
+      "canonical_sha256": "e77fb4fee547796253bcfa9d7b3e5514e29e16795e74466e36a132c09c89612e",
+      "bytes": 3014,
+      "id": "business-fw09-retryable",
+      "cases": [
+        "FW09"
+      ],
+      "space": "qualification-business",
+      "external_key": "workload/atlas-06",
+      "revision": "full-fw09-retryable-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 217,
+      "rendered_bytes": 218,
+      "assertion_count": 1
+    },
+    {
+      "path": "business-fw09-intake.json",
+      "file_sha256": "72ee776fd0aaadca45e0922518ba44ae106ab5ffe8e2a716ad693bf3d2ebd443",
+      "canonical_sha256": "d0034fb4160740c4121f5f3b64746abc5632a70573df20bc0f2991611058df05",
+      "bytes": 2977,
+      "id": "business-fw09-intake",
+      "cases": [
+        "FW09"
+      ],
+      "space": "qualification-business",
+      "external_key": "workload/atlas-07",
+      "revision": "full-fw09-intake-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 210,
+      "rendered_bytes": 211,
+      "assertion_count": 1
+    },
+    {
+      "path": "business-fw11.json",
+      "file_sha256": "6637c20adb1b071e68e27ebb2d17241d27af87d9fb8df1c4a161e83c5de6dc66",
+      "canonical_sha256": "f8004c1fd77a1506e922146eefd1016254eea7671cef8a969bdab3190f5dab0e",
+      "bytes": 2956,
+      "id": "business-fw11",
+      "cases": [
+        "FW11"
+      ],
+      "space": "qualification-business",
+      "external_key": "workload/atlas-08",
+      "revision": "full-fw11-r2",
+      "original_generation": "captured_original_head_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 210,
+      "rendered_bytes": 211,
+      "assertion_count": 1
+    },
+    {
+      "path": "business-large-graph.json",
+      "file_sha256": "13a1c0408c06784c62331de02bd370e59e93ab50f02757a590d3cd27f6c5452a",
+      "canonical_sha256": "a754959e681a91eb6ca7bb7e31f63a0cb0cfb6340b0e4013fb3da9a7e1a703e0",
+      "bytes": 4059450,
+      "id": "business-large-graph",
+      "cases": [
+        "FW03_graph_capacity"
+      ],
+      "space": "qualification-business",
+      "external_key": "full/large",
+      "revision": "full-large-graph-r2",
+      "original_generation": "captured_original_full_large_generation",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 2000000,
+      "rendered_bytes": 2000000,
+      "assertion_count": 2
+    },
+    {
+      "path": "container-positive.json",
+      "file_sha256": "a07db1a00388968b2fdc37f467b704c5ff938fa3862d3dfec308553479df7964",
+      "canonical_sha256": "24083e488bcf5311076b0fa47449dad87da221997c497403b0ccd3c0e0c9b95d",
+      "bytes": 2603,
+      "id": "container-positive",
+      "cases": [
+        "CB09",
+        "CC04"
+      ],
+      "space": "default",
+      "external_key": "boundary/graph-positive",
+      "revision": "boundary-graph-r1",
+      "original_generation": "must_be_absent",
+      "eligibility": "requires_actual_publication",
+      "raw_source_bytes": 46,
+      "rendered_bytes": 47,
+      "assertion_count": 1
+    },
+    {
+      "path": "container-oversized-unmet.json",
+      "file_sha256": "2b5b46d98107956a939a688d926d6b85b1e70a5444a7a536566db0c28648e8dd",
+      "canonical_sha256": "85728acfb45647ec57e43a157661f0bb70fbaf25a86826769a1218576ecd264b",
+      "bytes": 788918,
+      "id": "container-oversized-unmet",
+      "cases": [
+        "CB07"
+      ],
+      "space": "default",
+      "external_key": "boundary/graph-oversized",
+      "revision": "boundary-oversized-r1",
+      "original_generation": "must_be_absent",
+      "eligibility": "unmet_default_extraction_window_12000_bytes",
+      "raw_source_bytes": 262145,
+      "rendered_bytes": 262146,
+      "assertion_count": 1
+    },
+    {
+      "path": "container-response-budget-0.json",
+      "file_sha256": "5d84a9e4640ea6cfea18d03b7bde2859f31775b9efa4a812e3d799b0fc6ed667",
+      "canonical_sha256": "bbb0508a0adfa26276f25a404fddeebfa97d81ba8aa7e34cd8bea2ad112f7b6d",
+      "bytes": 651974,
+      "id": "container-response-budget-0",
+      "cases": [
+        "CB07_revised"
+      ],
+      "space": "default",
+      "external_key": "boundary/graph-response-budget-0",
+      "revision": "boundary-response-r1",
+      "original_generation": "must_be_absent",
+      "eligibility": "requires_actual_publication_and_selected_response_arithmetic",
+      "raw_source_bytes": 65018,
+      "rendered_bytes": 65019,
+      "assertion_count": 10
+    },
+    {
+      "path": "container-response-budget-1.json",
+      "file_sha256": "40698c876b7d43e913858ee43f307102413712e60c7c59f1d2b6aafcaad3fda7",
+      "canonical_sha256": "b92aee9b1470b354e902120b602e90f5da3c7d089d5bcac51479523e621cfb2d",
+      "bytes": 651974,
+      "id": "container-response-budget-1",
+      "cases": [
+        "CB07_revised"
+      ],
+      "space": "default",
+      "external_key": "boundary/graph-response-budget-1",
+      "revision": "boundary-response-r1",
+      "original_generation": "must_be_absent",
+      "eligibility": "requires_actual_publication_and_selected_response_arithmetic",
+      "raw_source_bytes": 65018,
+      "rendered_bytes": 65019,
+      "assertion_count": 10
+    }
+  ],
+  "spy_recipes": [
+    {
+      "path": "workload-spy.json",
+      "file_sha256": "00811c4f6edcf14a1d301cca81e2aaf698c8d069efed94a3d4cf1993acd98f60",
+      "canonical_sha256": "649c40b322372367f27dad39bec9f87a52afc48055bf676b3c23d6f3c1f9b965",
+      "bytes": 82743
+    },
+    {
+      "path": "container-spy.json",
+      "file_sha256": "606431839d1e23c217fb055a72b2d968cbf3b8754c3f411027b62874a23fd2f1",
+      "canonical_sha256": "45ae985e19d80585c497387186d514bfd2b39e6227bdef31dd3c9957c1ae48c9",
+      "bytes": 1330832
+    }
+  ],
+  "source_capacity": {
+    "maximum_recipe_bytes": 8388608,
+    "workload_recipe_file_count": 24,
+    "distinct_workload_extra_source_keys_per_space": [
+      "full/large",
+      "full/shared/a",
+      "full/shared/b"
+    ],
+    "corpus_source_count_unchanged": 50,
+    "workload_distinct_accepted_sources": 56
+  },
+  "dynamic_bindings": {
+    "expected_generation": "Only from the exact original public head; absent for new source. Preserve the pinned template and capture the separately bound physical request. Never derive semantic facts or future record IDs from candidate output.",
+    "accepted_ids": "Actual original public acceptance/operation/head and immutable revision endpoint only. Input UUIDs are placeholders, never output oracles.",
+    "large_final_local_offset": "Fixed unique final quote uses supported exact-quote normalization within actual selected window; global expectation remains literal. No dynamic semantic output or global expected-span generation."
+  },
+  "case_requirements": {
+    "FW04": "Four separately admitted sources, both independently fixed maintained-notebook relation and violet-47 access-code literal each. Exact same-space relation supports must survive deleting one source; full other-space baseline unchanged.",
+    "FW06": "Hold exact first extraction physical call, observe old complete publication, then release and require exact r2 complete.",
+    "FW07": "Hold exact first call, retract original source before release, stale finalization never publishes.",
+    "FW08": "Both distinct recipe requests bind the SAME captured generation; exactly one acceptance, loser typed conflict; no automatic CAS retry.",
+    "FW09": "Need actual public Running, pending, failed_retryable operation states, not inferred spy states. Empty backlog phase remains unmet.",
+    "FW11": "First exact extraction response held then503; revoke actual current binding while original request held, release once, no subsequent physical sends. Explicit restoration is separate intent.",
+    "CC04": "Actual positive lexical exact-revision hit for Boundary positive notebook before fixed absent-token same-constraint query.",
+    "CB09": "Actually completed indexed positive source, then current query profile revocation and zero further spy sends.",
+    "CB07": "UNMET under ordinary installed 12000-byte extraction window. Retained literal262145-byte source/quote is a requested prerequisite, not runnable preparation or accepted publication.",
+    "CB07_revised": "Root explicitly approved alternate whole-response gate: 20real grounded<=12000bytequoteclaims, actuallimit20typed413 andactualnewlimit10full200. D must freeze revisedcontract and literal independentarithmetic; oldsinglelargequote remainsunmet."
+  },
+  "unmet_prerequisites": [
+    "D independent final semantics/filehash/casecount approval",
+    "Actual public Graph pipeline completion and exact immutable revision readback",
+    "Actual supported extraction/promotion/resolution calls conform to frozen rules; unmatched calls refuse",
+    "CB07 single supported quote exceeds actual installed planner window",
+    "Original public expected_generation binding seam preserves pinned template",
+    "Full private manifest/vector/physical erasure and consumer fallback gates remain separate"
+  ],
+  "response_budget_arithmetic": {
+    "path": "container-response-budget-arithmetic.json",
+    "file_sha256": "f90aab89f3bcec4362a3d623f90bc22dbb39763548637054388ad2fdf3f010bc",
+    "canonical_sha256": "5c32c06b17b919e41e168423db93dee1c07ed36776d01d53559d97ed090eed58",
+    "bytes": 5070
+  }
+}

@@ -1,0 +1,1989 @@
+{
+  "format": "recall-ignored-source-disposition/v1",
+  "source_commit": "d3e8f8852981b19366e18d696e248b83976aecba",
+  "runtime_receipt": "integration-workspace-tests-2/summary.json",
+  "source_only": true,
+  "execution_authorized_by_this_file": false,
+  "scope": "Exact101 ignored lib/bin cases counted in central runtime2; reconstructed from frozen source module inclusion, not a new compiled listing.",
+  "counts": {
+    "total": 101,
+    "offline_candidates": 89,
+    "excluded_live": 12,
+    "by_disposition": {
+      "excluded-live-media": 6,
+      "excluded-live-provider": 6,
+      "offline-event-boundary": 3,
+      "offline-inprocess-api": 14,
+      "offline-local-spy": 6,
+      "offline-memory": 58,
+      "offline-pure": 2,
+      "offline-scale": 4,
+      "offline-storage-fixture": 2
+    }
+  },
+  "duplicate_source_inclusion": "39 scenario test functions appear in both elephant-e2e::scenarios and elephant-scenarios::scenario.",
+  "outside_run_scope": [
+    {
+      "source": "tests/calibration/tests/calibration_llm.rs",
+      "cases": 2,
+      "reason": "Ignored live Anthropic integration targets not selected by runtime2 --lib --bins; do not add to101."
+    }
+  ],
+  "helper_source_sha256": {
+    "tests/e2e/src/lib.rs": "44061141d88d678ba0d12e2a62fcd976711ffc2d100841a159630da1900fe4e0",
+    "tests/scenarios/src/lib.rs": "74bda0f7694a4acef739c175e7a19ee609d3b9b3c16cbf4bccf54d1368594b7a",
+    "tests/e2e/src/scenarios/mod.rs": "376a726ebc74798cf216da5792ef92d49d3caae50774510e9e1c47cf2f6f74f9",
+    "crates/storage/src/client.rs": "f0d9b18b20a96e65c5fef98ea4598add467293701e9445a18b8f74bd55cbf3e6",
+    "tests/e2e/src/grounded_source_fixture.rs": "99ca9710ffbbbca04c65ef5f473c614f40c33ca9956c61ce921dbe2abf90b22b",
+    "tests/recall_preview_semantics/provider_spy.rs": "751708b5e58739a4f1552b6b319375955fa3c7d1b41e91e6948a815e63f6215e"
+  },
+  "central_scheduling": "Root0011/00:30 authorized audited offline E2E and queue-scale after current combined gate. D performs no Cargo, binary list, service, benchmark or test execution.",
+  "cases": [
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::docs_test::tests::test_batch_docs",
+      "fully_qualified": "elephant-e2e api::docs_test::tests::test_batch_docs",
+      "source": "tests/e2e/src/api/docs_test.rs",
+      "line": 584,
+      "source_sha256": "75aaa93fa83a655b4124c95e36799b235ce5e523fb818d756ce9763eeeb4bd71",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::docs_test::tests::test_delete_doc_returns_204",
+      "fully_qualified": "elephant-e2e api::docs_test::tests::test_delete_doc_returns_204",
+      "source": "tests/e2e/src/api/docs_test.rs",
+      "line": 413,
+      "source_sha256": "75aaa93fa83a655b4124c95e36799b235ce5e523fb818d756ce9763eeeb4bd71",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::docs_test::tests::test_get_collections",
+      "fully_qualified": "elephant-e2e api::docs_test::tests::test_get_collections",
+      "source": "tests/e2e/src/api/docs_test.rs",
+      "line": 565,
+      "source_sha256": "75aaa93fa83a655b4124c95e36799b235ce5e523fb818d756ce9763eeeb4bd71",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::docs_test::tests::test_get_doc_returns_document",
+      "fully_qualified": "elephant-e2e api::docs_test::tests::test_get_doc_returns_document",
+      "source": "tests/e2e/src/api/docs_test.rs",
+      "line": 353,
+      "source_sha256": "75aaa93fa83a655b4124c95e36799b235ce5e523fb818d756ce9763eeeb4bd71",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::docs_test::tests::test_get_nonexistent_doc_returns_404",
+      "fully_qualified": "elephant-e2e api::docs_test::tests::test_get_nonexistent_doc_returns_404",
+      "source": "tests/e2e/src/api/docs_test.rs",
+      "line": 394,
+      "source_sha256": "75aaa93fa83a655b4124c95e36799b235ce5e523fb818d756ce9763eeeb4bd71",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::docs_test::tests::test_ingest_doc_creates_chunks_and_embeddings",
+      "fully_qualified": "elephant-e2e api::docs_test::tests::test_ingest_doc_creates_chunks_and_embeddings",
+      "source": "tests/e2e/src/api/docs_test.rs",
+      "line": 204,
+      "source_sha256": "75aaa93fa83a655b4124c95e36799b235ce5e523fb818d756ce9763eeeb4bd71",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::docs_test::tests::test_ingest_doc_returns_201",
+      "fully_qualified": "elephant-e2e api::docs_test::tests::test_ingest_doc_returns_201",
+      "source": "tests/e2e/src/api/docs_test.rs",
+      "line": 168,
+      "source_sha256": "75aaa93fa83a655b4124c95e36799b235ce5e523fb818d756ce9763eeeb4bd71",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::docs_test::tests::test_restore_deleted_doc",
+      "fully_qualified": "elephant-e2e api::docs_test::tests::test_restore_deleted_doc",
+      "source": "tests/e2e/src/api/docs_test.rs",
+      "line": 454,
+      "source_sha256": "75aaa93fa83a655b4124c95e36799b235ce5e523fb818d756ce9763eeeb4bd71",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::docs_test::tests::test_search_docs",
+      "fully_qualified": "elephant-e2e api::docs_test::tests::test_search_docs",
+      "source": "tests/e2e/src/api/docs_test.rs",
+      "line": 508,
+      "source_sha256": "75aaa93fa83a655b4124c95e36799b235ce5e523fb818d756ce9763eeeb4bd71",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::docs_test::tests::test_search_docs_respects_k",
+      "fully_qualified": "elephant-e2e api::docs_test::tests::test_search_docs_respects_k",
+      "source": "tests/e2e/src/api/docs_test.rs",
+      "line": 289,
+      "source_sha256": "75aaa93fa83a655b4124c95e36799b235ce5e523fb818d756ce9763eeeb4bd71",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::identity_test::tests::test_identity_merge_combine_preserves_metadata",
+      "fully_qualified": "elephant-e2e api::identity_test::tests::test_identity_merge_combine_preserves_metadata",
+      "source": "tests/e2e/src/api/identity_test.rs",
+      "line": 372,
+      "source_sha256": "75f3157f9f47d8101cb0ace282fca82f82d4b10c41cd76af8492d7f8d9ec5664",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::identity_test::tests::test_identity_merge_keep_a_creates_tombstone_redirect",
+      "fully_qualified": "elephant-e2e api::identity_test::tests::test_identity_merge_keep_a_creates_tombstone_redirect",
+      "source": "tests/e2e/src/api/identity_test.rs",
+      "line": 220,
+      "source_sha256": "75f3157f9f47d8101cb0ace282fca82f82d4b10c41cd76af8492d7f8d9ec5664",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::identity_test::tests::test_identity_merge_keep_a_moves_identity_keys_to_survivor",
+      "fully_qualified": "elephant-e2e api::identity_test::tests::test_identity_merge_keep_a_moves_identity_keys_to_survivor",
+      "source": "tests/e2e/src/api/identity_test.rs",
+      "line": 278,
+      "source_sha256": "75f3157f9f47d8101cb0ace282fca82f82d4b10c41cd76af8492d7f8d9ec5664",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "api::identity_test::tests::test_identity_merge_keep_a_preserves_metadata",
+      "fully_qualified": "elephant-e2e api::identity_test::tests::test_identity_merge_keep_a_preserves_metadata",
+      "source": "tests/e2e/src/api/identity_test.rs",
+      "line": 432,
+      "source_sha256": "75f3157f9f47d8101cb0ace282fca82f82d4b10c41cd76af8492d7f8d9ec5664",
+      "ignore_reason": null,
+      "disposition": "offline-inprocess-api",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "StorageConfig default mem:// (explicitly confirmed)",
+        "Axum oneshot routes and injected synthetic principal",
+        "current named-space/accepted-source and retained route fixture compatibility"
+      ],
+      "evidence_limit": "No external server; injected auth and optional FakeEmbeddingProvider are not signed installed-artifact or semantic acceptance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m10_work_queue::scenario_m10_1_work_item_creation",
+      "fully_qualified": "elephant-e2e scenarios::m10_work_queue::scenario_m10_1_work_item_creation",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 43,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m10_work_queue::scenario_m10_2_runnable_item_replaces_stale_lease_metadata",
+      "fully_qualified": "elephant-e2e scenarios::m10_work_queue::scenario_m10_2_runnable_item_replaces_stale_lease_metadata",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 178,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m10_work_queue::scenario_m10_2_work_item_lease_acquisition",
+      "fully_qualified": "elephant-e2e scenarios::m10_work_queue::scenario_m10_2_work_item_lease_acquisition",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 112,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m10_work_queue::scenario_m10_3_retry_with_exponential_backoff",
+      "fully_qualified": "elephant-e2e scenarios::m10_work_queue::scenario_m10_3_retry_with_exponential_backoff",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 233,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m10_work_queue::scenario_m10_4_work_runs_track_execution",
+      "fully_qualified": "elephant-e2e scenarios::m10_work_queue::scenario_m10_4_work_runs_track_execution",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 319,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m10_work_queue::scenario_m10_5_dead_letter_after_max_retries",
+      "fully_qualified": "elephant-e2e scenarios::m10_work_queue::scenario_m10_5_dead_letter_after_max_retries",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 399,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m10_work_queue::scenario_m10_6_idempotency_prevents_duplicates",
+      "fully_qualified": "elephant-e2e scenarios::m10_work_queue::scenario_m10_6_idempotency_prevents_duplicates",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 482,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m1_tenant_isolation::scenario_m1_tenant_isolation_leaks",
+      "fully_qualified": "elephant-e2e scenarios::m1_tenant_isolation::scenario_m1_tenant_isolation_leaks",
+      "source": "tests/e2e/src/scenarios/m1_tenant_isolation.rs",
+      "line": 25,
+      "source_sha256": "3b0d21273df3ef64ff4af973d021d3a46f118dad5dae3de394af947edaf91579",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m2_startup_ordering::scenario_m2_startup_ordering",
+      "fully_qualified": "elephant-e2e scenarios::m2_startup_ordering::scenario_m2_startup_ordering",
+      "source": "tests/e2e/src/scenarios/m2_startup_ordering.rs",
+      "line": 21,
+      "source_sha256": "e612bf786b2bdf2e4d395111a1a272cf44ca94a23e278b23256add2bca7b55a2",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m4_cursor_stability::scenario_m4_cursor_stability_authorized_total",
+      "fully_qualified": "elephant-e2e scenarios::m4_cursor_stability::scenario_m4_cursor_stability_authorized_total",
+      "source": "tests/e2e/src/scenarios/m4_cursor_stability.rs",
+      "line": 42,
+      "source_sha256": "5ffc53df1c538fdd753c9bfc1900492e4c9ecfe7101fa035169497b791c03f16",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m6_outbox_monotonicity::scenario_m6_outbox_monotonicity",
+      "fully_qualified": "elephant-e2e scenarios::m6_outbox_monotonicity::scenario_m6_outbox_monotonicity",
+      "source": "tests/e2e/src/scenarios/m6_outbox_monotonicity.rs",
+      "line": 35,
+      "source_sha256": "2a770080cc15834949a683d9b4f7053229db861f1db7dbd721e4f93f87eaa1c4",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m7_space_embedding_policy::scenario_m7_space_embeddings_isolated",
+      "fully_qualified": "elephant-e2e scenarios::m7_space_embedding_policy::scenario_m7_space_embeddings_isolated",
+      "source": "tests/e2e/src/scenarios/m7_space_embedding_policy.rs",
+      "line": 184,
+      "source_sha256": "7579c1cbb3f3a627e24d427e73847686cfd09e9884ae4f88f950464732074263",
+      "ignore_reason": null,
+      "disposition": "offline-storage-fixture",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem schema",
+        "FakeEmbeddingProvider and direct document/node fixture",
+        "current original-source/profile guard compatibility audit"
+      ],
+      "evidence_limit": "Fake vectors and direct fixture rows never prove actual provider relevance or complete source publication.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m8_assertion_pipeline::scenario_m8_1_doc_produces_assertions",
+      "fully_qualified": "elephant-e2e scenarios::m8_assertion_pipeline::scenario_m8_1_doc_produces_assertions",
+      "source": "tests/e2e/src/scenarios/m8_assertion_pipeline.rs",
+      "line": 48,
+      "source_sha256": "d19b83c3b8726aaf1917763abdc94342f1adc7c55ab836768b5fa8cae4591ee1",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m8_assertion_pipeline::scenario_m8_2_assertions_resolve_to_entities",
+      "fully_qualified": "elephant-e2e scenarios::m8_assertion_pipeline::scenario_m8_2_assertions_resolve_to_entities",
+      "source": "tests/e2e/src/scenarios/m8_assertion_pipeline.rs",
+      "line": 208,
+      "source_sha256": "d19b83c3b8726aaf1917763abdc94342f1adc7c55ab836768b5fa8cae4591ee1",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m8_assertion_pipeline::scenario_m8_3_resolved_assertions_produce_facts",
+      "fully_qualified": "elephant-e2e scenarios::m8_assertion_pipeline::scenario_m8_3_resolved_assertions_produce_facts",
+      "source": "tests/e2e/src/scenarios/m8_assertion_pipeline.rs",
+      "line": 318,
+      "source_sha256": "d19b83c3b8726aaf1917763abdc94342f1adc7c55ab836768b5fa8cae4591ee1",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m8_assertion_pipeline::scenario_m8_4_partial_resolution_tracked",
+      "fully_qualified": "elephant-e2e scenarios::m8_assertion_pipeline::scenario_m8_4_partial_resolution_tracked",
+      "source": "tests/e2e/src/scenarios/m8_assertion_pipeline.rs",
+      "line": 434,
+      "source_sha256": "d19b83c3b8726aaf1917763abdc94342f1adc7c55ab836768b5fa8cae4591ee1",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m9_truth_maintenance::scenario_m9_1_conflicting_claims_create_conflict_group",
+      "fully_qualified": "elephant-e2e scenarios::m9_truth_maintenance::scenario_m9_1_conflicting_claims_create_conflict_group",
+      "source": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "line": 43,
+      "source_sha256": "9a093d71778e026dbc3200e8cce39e797a8443008f67817b86177063dae44521",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m9_truth_maintenance::scenario_m9_2_truth_slot_stores_current_answer",
+      "fully_qualified": "elephant-e2e scenarios::m9_truth_maintenance::scenario_m9_2_truth_slot_stores_current_answer",
+      "source": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "line": 152,
+      "source_sha256": "9a093d71778e026dbc3200e8cce39e797a8443008f67817b86177063dae44521",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m9_truth_maintenance::scenario_m9_3_conflict_resolution_updates_slot",
+      "fully_qualified": "elephant-e2e scenarios::m9_truth_maintenance::scenario_m9_3_conflict_resolution_updates_slot",
+      "source": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "line": 232,
+      "source_sha256": "9a093d71778e026dbc3200e8cce39e797a8443008f67817b86177063dae44521",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m9_truth_maintenance::scenario_m9_4_staleness_tracked_on_version_change",
+      "fully_qualified": "elephant-e2e scenarios::m9_truth_maintenance::scenario_m9_4_staleness_tracked_on_version_change",
+      "source": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "line": 331,
+      "source_sha256": "9a093d71778e026dbc3200e8cce39e797a8443008f67817b86177063dae44521",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::m9_truth_maintenance::scenario_m9_5_allow_parallel_keeps_all_claims",
+      "fully_qualified": "elephant-e2e scenarios::m9_truth_maintenance::scenario_m9_5_allow_parallel_keeps_all_claims",
+      "source": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "line": 402,
+      "source_sha256": "9a093d71778e026dbc3200e8cce39e797a8443008f67817b86177063dae44521",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s1_1_entity_lifecycle::scenario_s1_1_entity_lifecycle",
+      "fully_qualified": "elephant-e2e scenarios::s1_1_entity_lifecycle::scenario_s1_1_entity_lifecycle",
+      "source": "tests/e2e/src/scenarios/s1_1_entity_lifecycle.rs",
+      "line": 25,
+      "source_sha256": "397be1b99a4ff91c39aefd5f30d047a529c8c2d7d8f2f7f2657415cef195da6c",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s1_2_rel_traversal::scenario_s1_2_ghost_edges",
+      "fully_qualified": "elephant-e2e scenarios::s1_2_rel_traversal::scenario_s1_2_ghost_edges",
+      "source": "tests/e2e/src/scenarios/s1_2_rel_traversal.rs",
+      "line": 27,
+      "source_sha256": "facab13e2fcdf89863b0f679f8892f641cbeac830b7fa275cf13005e7209ae38",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s1_4_identity_key_sot::scenario_s1_4_identity_key_uniqueness",
+      "fully_qualified": "elephant-e2e scenarios::s1_4_identity_key_sot::scenario_s1_4_identity_key_uniqueness",
+      "source": "tests/e2e/src/scenarios/s1_4_identity_key_sot.rs",
+      "line": 27,
+      "source_sha256": "3ee52dcb3acd59f6632c7d426aba014df1c66ecd01c44a04959847f0cce7a1fd",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s1_8_audit_inheritance::scenario_s1_8_audit_security_inheritance",
+      "fully_qualified": "elephant-e2e scenarios::s1_8_audit_inheritance::scenario_s1_8_audit_security_inheritance",
+      "source": "tests/e2e/src/scenarios/s1_8_audit_inheritance.rs",
+      "line": 28,
+      "source_sha256": "5ce3e00ef020ec35e00c94c7d0833de029e58a7ca9af8f73755ff65bbc45b6a5",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s2_1_zombie_key::scenario_s2_1_zombie_key",
+      "fully_qualified": "elephant-e2e scenarios::s2_1_zombie_key::scenario_s2_1_zombie_key",
+      "source": "tests/e2e/src/scenarios/s2_1_zombie_key.rs",
+      "line": 27,
+      "source_sha256": "108dfdc0115bf9323778ba237125407328b0dfd46fe2e794e9bd36a93f9927f4",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s2_2_amnesia_merge::scenario_s2_2_amnesia_merge",
+      "fully_qualified": "elephant-e2e scenarios::s2_2_amnesia_merge::scenario_s2_2_amnesia_merge",
+      "source": "tests/e2e/src/scenarios/s2_2_amnesia_merge.rs",
+      "line": 25,
+      "source_sha256": "450c000a217bfaa77a3e5c4f5d5b1dada7f68c91fc1e5956c4c116f09e986493",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s2_4_partial_success::scenario_s2_4_partial_success_rollback",
+      "fully_qualified": "elephant-e2e scenarios::s2_4_partial_success::scenario_s2_4_partial_success_rollback",
+      "source": "tests/e2e/src/scenarios/s2_4_partial_success.rs",
+      "line": 25,
+      "source_sha256": "82560d82f0611aae95d096ba6d19d982c4c00c8d16d035b41973d96f2ecc5a49",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s2_5_masked_truth::scenario_s2_5_masked_truth_redaction",
+      "fully_qualified": "elephant-e2e scenarios::s2_5_masked_truth::scenario_s2_5_masked_truth_redaction",
+      "source": "tests/e2e/src/scenarios/s2_5_masked_truth.rs",
+      "line": 24,
+      "source_sha256": "97ed8c252d1ba47b9348d9b5f6b1aaf6753eca4e6dde6955b5e8feedb728b509",
+      "ignore_reason": null,
+      "disposition": "offline-pure",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "no database or socket; in-memory principal/document redaction"
+      ],
+      "evidence_limit": "Pure redaction example, not signed transport authorization.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s3_1_manifest_repointing::scenario_s3_1_manifest_repointing",
+      "fully_qualified": "elephant-e2e scenarios::s3_1_manifest_repointing::scenario_s3_1_manifest_repointing",
+      "source": "tests/e2e/src/scenarios/s3_1_manifest_repointing.rs",
+      "line": 36,
+      "source_sha256": "7693e808163ec0200a33f11d1e292e757a4808953ba0e511ddded000bb27f475",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s3_1_manifest_repointing::scenario_s3_1_scoped_manifest_repointing_preserves_other_space",
+      "fully_qualified": "elephant-e2e scenarios::s3_1_manifest_repointing::scenario_s3_1_scoped_manifest_repointing_preserves_other_space",
+      "source": "tests/e2e/src/scenarios/s3_1_manifest_repointing.rs",
+      "line": 134,
+      "source_sha256": "7693e808163ec0200a33f11d1e292e757a4808953ba0e511ddded000bb27f475",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s5_13_alice_in_wonderland::scenario_s5_13_alice_in_wonderland_live_llm",
+      "fully_qualified": "elephant-e2e scenarios::s5_13_alice_in_wonderland::scenario_s5_13_alice_in_wonderland_live_llm",
+      "source": "tests/e2e/src/scenarios/s5_13_alice_in_wonderland.rs",
+      "line": 320,
+      "source_sha256": "6da6b59d6080f9bc598913d51d24c9817193205550cf43e8903d870db46b778b",
+      "ignore_reason": "requires live LLM credentials; run cargo test-e2e-live",
+      "disposition": "excluded-live-provider",
+      "offline_selection_candidate": false,
+      "prerequisites": [
+        "explicit approved processing/account/profile/credential configuration",
+        "separate finite paid allocation and original provider captures"
+      ],
+      "evidence_limit": "Live known-answer model quality; absent credentials or early return cannot pass.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s5_15_wizard_of_oz::scenario_s5_15_wizard_of_oz_live_llm",
+      "fully_qualified": "elephant-e2e scenarios::s5_15_wizard_of_oz::scenario_s5_15_wizard_of_oz_live_llm",
+      "source": "tests/e2e/src/scenarios/s5_15_wizard_of_oz.rs",
+      "line": 326,
+      "source_sha256": "e61518e1238d4954f253b0bd909338b71e9e1eb1152247fb0087997b02497cd3",
+      "ignore_reason": "requires live LLM credentials; run cargo test-e2e-live",
+      "disposition": "excluded-live-provider",
+      "offline_selection_candidate": false,
+      "prerequisites": [
+        "explicit approved processing/account/profile/credential configuration",
+        "separate finite paid allocation and original provider captures"
+      ],
+      "evidence_limit": "Live known-answer model quality; absent credentials or early return cannot pass.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s5_18_multimodal_real_media::scenario_s5_18_real_example_frame_multimodal_e2e_across_models",
+      "fully_qualified": "elephant-e2e scenarios::s5_18_multimodal_real_media::scenario_s5_18_real_example_frame_multimodal_e2e_across_models",
+      "source": "tests/e2e/src/scenarios/s5_18_multimodal_real_media.rs",
+      "line": 758,
+      "source_sha256": "1b4fbdd78e406eeb7b8e7bbce6005677a66a4eadb5a266a1cbf6483c3b847006",
+      "ignore_reason": "local real-media multimodal benchmark",
+      "disposition": "excluded-live-media",
+      "offline_selection_candidate": false,
+      "prerequisites": [
+        "actual separately approved media inputs and local metadata tools",
+        "approved Gemini/model configuration and finite paid allocation"
+      ],
+      "evidence_limit": "Real-media model benchmark excluded from offline allocation; no file/credential presence was probed.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s5_18_multimodal_real_media::scenario_s5_18_real_example_video_multimodal_e2e_across_models",
+      "fully_qualified": "elephant-e2e scenarios::s5_18_multimodal_real_media::scenario_s5_18_real_example_video_multimodal_e2e_across_models",
+      "source": "tests/e2e/src/scenarios/s5_18_multimodal_real_media.rs",
+      "line": 779,
+      "source_sha256": "1b4fbdd78e406eeb7b8e7bbce6005677a66a4eadb5a266a1cbf6483c3b847006",
+      "ignore_reason": "local real-media multimodal benchmark",
+      "disposition": "excluded-live-media",
+      "offline_selection_candidate": false,
+      "prerequisites": [
+        "actual separately approved media inputs and local metadata tools",
+        "approved Gemini/model configuration and finite paid allocation"
+      ],
+      "evidence_limit": "Real-media model benchmark excluded from offline allocation; no file/credential presence was probed.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s5_19_truth_adjudication::scenario_s5_19_truth_adjudication_real_llm",
+      "fully_qualified": "elephant-e2e scenarios::s5_19_truth_adjudication::scenario_s5_19_truth_adjudication_real_llm",
+      "source": "tests/e2e/src/scenarios/s5_19_truth_adjudication.rs",
+      "line": 1112,
+      "source_sha256": "9ed69d00b85cfdb30351336ddc5b81fe312ae6b7e19550c0217d731c525e1359",
+      "ignore_reason": "live providers; requires explicit RECALL_E2E_PROCESSING_CONFIG and approved credentials",
+      "disposition": "excluded-live-provider",
+      "offline_selection_candidate": false,
+      "prerequisites": [
+        "explicit approved processing/account/profile/credential configuration",
+        "separate finite paid allocation and original provider captures"
+      ],
+      "evidence_limit": "Live known-answer model quality; absent credentials or early return cannot pass.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s5_4_extraction_pipeline::scenario_s5_4_extraction_pipeline",
+      "fully_qualified": "elephant-e2e scenarios::s5_4_extraction_pipeline::scenario_s5_4_extraction_pipeline",
+      "source": "tests/e2e/src/scenarios/s5_4_extraction_pipeline.rs",
+      "line": 134,
+      "source_sha256": "ccc190da130e00508d04f602ba78e077b6b03d5ed377902849fc247914272207",
+      "ignore_reason": null,
+      "disposition": "offline-local-spy",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem schema",
+        "actual accepted-publication fixture and loopback embedding spy",
+        "joined current source/attempt/renderer repairs"
+      ],
+      "evidence_limit": "Fixed interpretation and synthetic embedding transport prove composition only; no paid provider or semantic relevance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s5_5_manual_extraction::scenario_s5_5_manual_extraction",
+      "fully_qualified": "elephant-e2e scenarios::s5_5_manual_extraction::scenario_s5_5_manual_extraction",
+      "source": "tests/e2e/src/scenarios/s5_5_manual_extraction.rs",
+      "line": 8,
+      "source_sha256": "86e1934b657a3b3816711839b348ff13c54d5f9c098df73d6f64145744a6f3a6",
+      "ignore_reason": null,
+      "disposition": "offline-local-spy",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem schema",
+        "actual accepted-publication fixture and loopback embedding spy",
+        "joined current source/attempt/renderer repairs"
+      ],
+      "evidence_limit": "Fixed interpretation and synthetic embedding transport prove composition only; no paid provider or semantic relevance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-e2e",
+      "target_kind": "lib",
+      "test": "scenarios::s5_6_pipeline_status::scenario_s5_6_pipeline_status",
+      "fully_qualified": "elephant-e2e scenarios::s5_6_pipeline_status::scenario_s5_6_pipeline_status",
+      "source": "tests/e2e/src/scenarios/s5_6_pipeline_status.rs",
+      "line": 8,
+      "source_sha256": "cc0be3c0301449f1b2198cd6911bab2911f66557115ca87ade7972715b3d3e4a",
+      "ignore_reason": null,
+      "disposition": "offline-local-spy",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem schema",
+        "actual accepted-publication fixture and loopback embedding spy",
+        "joined current source/attempt/renderer repairs"
+      ],
+      "evidence_limit": "Fixed interpretation and synthetic embedding transport prove composition only; no paid provider or semantic relevance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-pipeline",
+      "target_kind": "lib",
+      "test": "renderer::multimodal::tests::test_multimodal_renderer_real_example_frame_across_models",
+      "fully_qualified": "elephant-pipeline renderer::multimodal::tests::test_multimodal_renderer_real_example_frame_across_models",
+      "source": "crates/pipeline/src/renderer/multimodal.rs",
+      "line": 864,
+      "source_sha256": "d4ffedb49ae33a27c1d93682b3567c2b608b15d4aa9f16dce250525203d0a099",
+      "ignore_reason": "local real-media multimodal benchmark",
+      "disposition": "excluded-live-media",
+      "offline_selection_candidate": false,
+      "prerequisites": [
+        "real /tmp/elephant-example-media fixtures",
+        "approved model credentials/configuration and finite paid allocation"
+      ],
+      "evidence_limit": "Real multi-model frame/video probes excluded from offline selection; no assets or credentials inspected.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-pipeline",
+      "target_kind": "lib",
+      "test": "renderer::multimodal::tests::test_multimodal_renderer_real_example_video_across_models",
+      "fully_qualified": "elephant-pipeline renderer::multimodal::tests::test_multimodal_renderer_real_example_video_across_models",
+      "source": "crates/pipeline/src/renderer/multimodal.rs",
+      "line": 900,
+      "source_sha256": "d4ffedb49ae33a27c1d93682b3567c2b608b15d4aa9f16dce250525203d0a099",
+      "ignore_reason": "local real-media multimodal benchmark",
+      "disposition": "excluded-live-media",
+      "offline_selection_candidate": false,
+      "prerequisites": [
+        "real /tmp/elephant-example-media fixtures",
+        "approved model credentials/configuration and finite paid allocation"
+      ],
+      "evidence_limit": "Real multi-model frame/video probes excluded from offline selection; no assets or credentials inspected.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m10_work_queue::scenario_m10_1_work_item_creation",
+      "fully_qualified": "elephant-scenarios scenario::m10_work_queue::scenario_m10_1_work_item_creation",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 43,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m10_work_queue::scenario_m10_2_runnable_item_replaces_stale_lease_metadata",
+      "fully_qualified": "elephant-scenarios scenario::m10_work_queue::scenario_m10_2_runnable_item_replaces_stale_lease_metadata",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 178,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m10_work_queue::scenario_m10_2_work_item_lease_acquisition",
+      "fully_qualified": "elephant-scenarios scenario::m10_work_queue::scenario_m10_2_work_item_lease_acquisition",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 112,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m10_work_queue::scenario_m10_3_retry_with_exponential_backoff",
+      "fully_qualified": "elephant-scenarios scenario::m10_work_queue::scenario_m10_3_retry_with_exponential_backoff",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 233,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m10_work_queue::scenario_m10_4_work_runs_track_execution",
+      "fully_qualified": "elephant-scenarios scenario::m10_work_queue::scenario_m10_4_work_runs_track_execution",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 319,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m10_work_queue::scenario_m10_5_dead_letter_after_max_retries",
+      "fully_qualified": "elephant-scenarios scenario::m10_work_queue::scenario_m10_5_dead_letter_after_max_retries",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 399,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m10_work_queue::scenario_m10_6_idempotency_prevents_duplicates",
+      "fully_qualified": "elephant-scenarios scenario::m10_work_queue::scenario_m10_6_idempotency_prevents_duplicates",
+      "source": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "line": 482,
+      "source_sha256": "ebd3716d004b80ac13ab90250d8ec66530a60f13eb4514d13bcdc58fc6232c59",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m1_tenant_isolation::scenario_m1_tenant_isolation_leaks",
+      "fully_qualified": "elephant-scenarios scenario::m1_tenant_isolation::scenario_m1_tenant_isolation_leaks",
+      "source": "tests/e2e/src/scenarios/m1_tenant_isolation.rs",
+      "line": 25,
+      "source_sha256": "3b0d21273df3ef64ff4af973d021d3a46f118dad5dae3de394af947edaf91579",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m2_startup_ordering::scenario_m2_startup_ordering",
+      "fully_qualified": "elephant-scenarios scenario::m2_startup_ordering::scenario_m2_startup_ordering",
+      "source": "tests/e2e/src/scenarios/m2_startup_ordering.rs",
+      "line": 21,
+      "source_sha256": "e612bf786b2bdf2e4d395111a1a272cf44ca94a23e278b23256add2bca7b55a2",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m4_cursor_stability::scenario_m4_cursor_stability_authorized_total",
+      "fully_qualified": "elephant-scenarios scenario::m4_cursor_stability::scenario_m4_cursor_stability_authorized_total",
+      "source": "tests/e2e/src/scenarios/m4_cursor_stability.rs",
+      "line": 42,
+      "source_sha256": "5ffc53df1c538fdd753c9bfc1900492e4c9ecfe7101fa035169497b791c03f16",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m6_outbox_monotonicity::scenario_m6_outbox_monotonicity",
+      "fully_qualified": "elephant-scenarios scenario::m6_outbox_monotonicity::scenario_m6_outbox_monotonicity",
+      "source": "tests/e2e/src/scenarios/m6_outbox_monotonicity.rs",
+      "line": 35,
+      "source_sha256": "2a770080cc15834949a683d9b4f7053229db861f1db7dbd721e4f93f87eaa1c4",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m7_space_embedding_policy::scenario_m7_space_embeddings_isolated",
+      "fully_qualified": "elephant-scenarios scenario::m7_space_embedding_policy::scenario_m7_space_embeddings_isolated",
+      "source": "tests/e2e/src/scenarios/m7_space_embedding_policy.rs",
+      "line": 184,
+      "source_sha256": "7579c1cbb3f3a627e24d427e73847686cfd09e9884ae4f88f950464732074263",
+      "ignore_reason": null,
+      "disposition": "offline-storage-fixture",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem schema",
+        "FakeEmbeddingProvider and direct document/node fixture",
+        "current original-source/profile guard compatibility audit"
+      ],
+      "evidence_limit": "Fake vectors and direct fixture rows never prove actual provider relevance or complete source publication.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m8_assertion_pipeline::scenario_m8_1_doc_produces_assertions",
+      "fully_qualified": "elephant-scenarios scenario::m8_assertion_pipeline::scenario_m8_1_doc_produces_assertions",
+      "source": "tests/e2e/src/scenarios/m8_assertion_pipeline.rs",
+      "line": 48,
+      "source_sha256": "d19b83c3b8726aaf1917763abdc94342f1adc7c55ab836768b5fa8cae4591ee1",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m8_assertion_pipeline::scenario_m8_2_assertions_resolve_to_entities",
+      "fully_qualified": "elephant-scenarios scenario::m8_assertion_pipeline::scenario_m8_2_assertions_resolve_to_entities",
+      "source": "tests/e2e/src/scenarios/m8_assertion_pipeline.rs",
+      "line": 208,
+      "source_sha256": "d19b83c3b8726aaf1917763abdc94342f1adc7c55ab836768b5fa8cae4591ee1",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m8_assertion_pipeline::scenario_m8_3_resolved_assertions_produce_facts",
+      "fully_qualified": "elephant-scenarios scenario::m8_assertion_pipeline::scenario_m8_3_resolved_assertions_produce_facts",
+      "source": "tests/e2e/src/scenarios/m8_assertion_pipeline.rs",
+      "line": 318,
+      "source_sha256": "d19b83c3b8726aaf1917763abdc94342f1adc7c55ab836768b5fa8cae4591ee1",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m8_assertion_pipeline::scenario_m8_4_partial_resolution_tracked",
+      "fully_qualified": "elephant-scenarios scenario::m8_assertion_pipeline::scenario_m8_4_partial_resolution_tracked",
+      "source": "tests/e2e/src/scenarios/m8_assertion_pipeline.rs",
+      "line": 434,
+      "source_sha256": "d19b83c3b8726aaf1917763abdc94342f1adc7c55ab836768b5fa8cae4591ee1",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m9_truth_maintenance::scenario_m9_1_conflicting_claims_create_conflict_group",
+      "fully_qualified": "elephant-scenarios scenario::m9_truth_maintenance::scenario_m9_1_conflicting_claims_create_conflict_group",
+      "source": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "line": 43,
+      "source_sha256": "9a093d71778e026dbc3200e8cce39e797a8443008f67817b86177063dae44521",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m9_truth_maintenance::scenario_m9_2_truth_slot_stores_current_answer",
+      "fully_qualified": "elephant-scenarios scenario::m9_truth_maintenance::scenario_m9_2_truth_slot_stores_current_answer",
+      "source": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "line": 152,
+      "source_sha256": "9a093d71778e026dbc3200e8cce39e797a8443008f67817b86177063dae44521",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m9_truth_maintenance::scenario_m9_3_conflict_resolution_updates_slot",
+      "fully_qualified": "elephant-scenarios scenario::m9_truth_maintenance::scenario_m9_3_conflict_resolution_updates_slot",
+      "source": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "line": 232,
+      "source_sha256": "9a093d71778e026dbc3200e8cce39e797a8443008f67817b86177063dae44521",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m9_truth_maintenance::scenario_m9_4_staleness_tracked_on_version_change",
+      "fully_qualified": "elephant-scenarios scenario::m9_truth_maintenance::scenario_m9_4_staleness_tracked_on_version_change",
+      "source": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "line": 331,
+      "source_sha256": "9a093d71778e026dbc3200e8cce39e797a8443008f67817b86177063dae44521",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::m9_truth_maintenance::scenario_m9_5_allow_parallel_keeps_all_claims",
+      "fully_qualified": "elephant-scenarios scenario::m9_truth_maintenance::scenario_m9_5_allow_parallel_keeps_all_claims",
+      "source": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "line": 402,
+      "source_sha256": "9a093d71778e026dbc3200e8cce39e797a8443008f67817b86177063dae44521",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s1_1_entity_lifecycle::scenario_s1_1_entity_lifecycle",
+      "fully_qualified": "elephant-scenarios scenario::s1_1_entity_lifecycle::scenario_s1_1_entity_lifecycle",
+      "source": "tests/e2e/src/scenarios/s1_1_entity_lifecycle.rs",
+      "line": 25,
+      "source_sha256": "397be1b99a4ff91c39aefd5f30d047a529c8c2d7d8f2f7f2657415cef195da6c",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s1_2_rel_traversal::scenario_s1_2_ghost_edges",
+      "fully_qualified": "elephant-scenarios scenario::s1_2_rel_traversal::scenario_s1_2_ghost_edges",
+      "source": "tests/e2e/src/scenarios/s1_2_rel_traversal.rs",
+      "line": 27,
+      "source_sha256": "facab13e2fcdf89863b0f679f8892f641cbeac830b7fa275cf13005e7209ae38",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s1_4_identity_key_sot::scenario_s1_4_identity_key_uniqueness",
+      "fully_qualified": "elephant-scenarios scenario::s1_4_identity_key_sot::scenario_s1_4_identity_key_uniqueness",
+      "source": "tests/e2e/src/scenarios/s1_4_identity_key_sot.rs",
+      "line": 27,
+      "source_sha256": "3ee52dcb3acd59f6632c7d426aba014df1c66ecd01c44a04959847f0cce7a1fd",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s1_8_audit_inheritance::scenario_s1_8_audit_security_inheritance",
+      "fully_qualified": "elephant-scenarios scenario::s1_8_audit_inheritance::scenario_s1_8_audit_security_inheritance",
+      "source": "tests/e2e/src/scenarios/s1_8_audit_inheritance.rs",
+      "line": 28,
+      "source_sha256": "5ce3e00ef020ec35e00c94c7d0833de029e58a7ca9af8f73755ff65bbc45b6a5",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s2_1_zombie_key::scenario_s2_1_zombie_key",
+      "fully_qualified": "elephant-scenarios scenario::s2_1_zombie_key::scenario_s2_1_zombie_key",
+      "source": "tests/e2e/src/scenarios/s2_1_zombie_key.rs",
+      "line": 27,
+      "source_sha256": "108dfdc0115bf9323778ba237125407328b0dfd46fe2e794e9bd36a93f9927f4",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s2_2_amnesia_merge::scenario_s2_2_amnesia_merge",
+      "fully_qualified": "elephant-scenarios scenario::s2_2_amnesia_merge::scenario_s2_2_amnesia_merge",
+      "source": "tests/e2e/src/scenarios/s2_2_amnesia_merge.rs",
+      "line": 25,
+      "source_sha256": "450c000a217bfaa77a3e5c4f5d5b1dada7f68c91fc1e5956c4c116f09e986493",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s2_4_partial_success::scenario_s2_4_partial_success_rollback",
+      "fully_qualified": "elephant-scenarios scenario::s2_4_partial_success::scenario_s2_4_partial_success_rollback",
+      "source": "tests/e2e/src/scenarios/s2_4_partial_success.rs",
+      "line": 25,
+      "source_sha256": "82560d82f0611aae95d096ba6d19d982c4c00c8d16d035b41973d96f2ecc5a49",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s2_5_masked_truth::scenario_s2_5_masked_truth_redaction",
+      "fully_qualified": "elephant-scenarios scenario::s2_5_masked_truth::scenario_s2_5_masked_truth_redaction",
+      "source": "tests/e2e/src/scenarios/s2_5_masked_truth.rs",
+      "line": 24,
+      "source_sha256": "97ed8c252d1ba47b9348d9b5f6b1aaf6753eca4e6dde6955b5e8feedb728b509",
+      "ignore_reason": null,
+      "disposition": "offline-pure",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "no database or socket; in-memory principal/document redaction"
+      ],
+      "evidence_limit": "Pure redaction example, not signed transport authorization.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s3_1_manifest_repointing::scenario_s3_1_manifest_repointing",
+      "fully_qualified": "elephant-scenarios scenario::s3_1_manifest_repointing::scenario_s3_1_manifest_repointing",
+      "source": "tests/e2e/src/scenarios/s3_1_manifest_repointing.rs",
+      "line": 36,
+      "source_sha256": "7693e808163ec0200a33f11d1e292e757a4808953ba0e511ddded000bb27f475",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s3_1_manifest_repointing::scenario_s3_1_scoped_manifest_repointing_preserves_other_space",
+      "fully_qualified": "elephant-scenarios scenario::s3_1_manifest_repointing::scenario_s3_1_scoped_manifest_repointing_preserves_other_space",
+      "source": "tests/e2e/src/scenarios/s3_1_manifest_repointing.rs",
+      "line": 134,
+      "source_sha256": "7693e808163ec0200a33f11d1e292e757a4808953ba0e511ddded000bb27f475",
+      "ignore_reason": null,
+      "disposition": "offline-memory",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem unique test namespace/schema",
+        "source fixture compatibility with current canonical/space guards"
+      ],
+      "evidence_limit": "Repository/in-process fixture; failures require real source review, not blanket external-service deferral.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s5_13_alice_in_wonderland::scenario_s5_13_alice_in_wonderland_live_llm",
+      "fully_qualified": "elephant-scenarios scenario::s5_13_alice_in_wonderland::scenario_s5_13_alice_in_wonderland_live_llm",
+      "source": "tests/e2e/src/scenarios/s5_13_alice_in_wonderland.rs",
+      "line": 320,
+      "source_sha256": "6da6b59d6080f9bc598913d51d24c9817193205550cf43e8903d870db46b778b",
+      "ignore_reason": "requires live LLM credentials; run cargo test-e2e-live",
+      "disposition": "excluded-live-provider",
+      "offline_selection_candidate": false,
+      "prerequisites": [
+        "explicit approved processing/account/profile/credential configuration",
+        "separate finite paid allocation and original provider captures"
+      ],
+      "evidence_limit": "Live known-answer model quality; absent credentials or early return cannot pass.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s5_15_wizard_of_oz::scenario_s5_15_wizard_of_oz_live_llm",
+      "fully_qualified": "elephant-scenarios scenario::s5_15_wizard_of_oz::scenario_s5_15_wizard_of_oz_live_llm",
+      "source": "tests/e2e/src/scenarios/s5_15_wizard_of_oz.rs",
+      "line": 326,
+      "source_sha256": "e61518e1238d4954f253b0bd909338b71e9e1eb1152247fb0087997b02497cd3",
+      "ignore_reason": "requires live LLM credentials; run cargo test-e2e-live",
+      "disposition": "excluded-live-provider",
+      "offline_selection_candidate": false,
+      "prerequisites": [
+        "explicit approved processing/account/profile/credential configuration",
+        "separate finite paid allocation and original provider captures"
+      ],
+      "evidence_limit": "Live known-answer model quality; absent credentials or early return cannot pass.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s5_18_multimodal_real_media::scenario_s5_18_real_example_frame_multimodal_e2e_across_models",
+      "fully_qualified": "elephant-scenarios scenario::s5_18_multimodal_real_media::scenario_s5_18_real_example_frame_multimodal_e2e_across_models",
+      "source": "tests/e2e/src/scenarios/s5_18_multimodal_real_media.rs",
+      "line": 758,
+      "source_sha256": "1b4fbdd78e406eeb7b8e7bbce6005677a66a4eadb5a266a1cbf6483c3b847006",
+      "ignore_reason": "local real-media multimodal benchmark",
+      "disposition": "excluded-live-media",
+      "offline_selection_candidate": false,
+      "prerequisites": [
+        "actual separately approved media inputs and local metadata tools",
+        "approved Gemini/model configuration and finite paid allocation"
+      ],
+      "evidence_limit": "Real-media model benchmark excluded from offline allocation; no file/credential presence was probed.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s5_18_multimodal_real_media::scenario_s5_18_real_example_video_multimodal_e2e_across_models",
+      "fully_qualified": "elephant-scenarios scenario::s5_18_multimodal_real_media::scenario_s5_18_real_example_video_multimodal_e2e_across_models",
+      "source": "tests/e2e/src/scenarios/s5_18_multimodal_real_media.rs",
+      "line": 779,
+      "source_sha256": "1b4fbdd78e406eeb7b8e7bbce6005677a66a4eadb5a266a1cbf6483c3b847006",
+      "ignore_reason": "local real-media multimodal benchmark",
+      "disposition": "excluded-live-media",
+      "offline_selection_candidate": false,
+      "prerequisites": [
+        "actual separately approved media inputs and local metadata tools",
+        "approved Gemini/model configuration and finite paid allocation"
+      ],
+      "evidence_limit": "Real-media model benchmark excluded from offline allocation; no file/credential presence was probed.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s5_19_truth_adjudication::scenario_s5_19_truth_adjudication_real_llm",
+      "fully_qualified": "elephant-scenarios scenario::s5_19_truth_adjudication::scenario_s5_19_truth_adjudication_real_llm",
+      "source": "tests/e2e/src/scenarios/s5_19_truth_adjudication.rs",
+      "line": 1112,
+      "source_sha256": "9ed69d00b85cfdb30351336ddc5b81fe312ae6b7e19550c0217d731c525e1359",
+      "ignore_reason": "live providers; requires explicit RECALL_E2E_PROCESSING_CONFIG and approved credentials",
+      "disposition": "excluded-live-provider",
+      "offline_selection_candidate": false,
+      "prerequisites": [
+        "explicit approved processing/account/profile/credential configuration",
+        "separate finite paid allocation and original provider captures"
+      ],
+      "evidence_limit": "Live known-answer model quality; absent credentials or early return cannot pass.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s5_4_extraction_pipeline::scenario_s5_4_extraction_pipeline",
+      "fully_qualified": "elephant-scenarios scenario::s5_4_extraction_pipeline::scenario_s5_4_extraction_pipeline",
+      "source": "tests/e2e/src/scenarios/s5_4_extraction_pipeline.rs",
+      "line": 134,
+      "source_sha256": "ccc190da130e00508d04f602ba78e077b6b03d5ed377902849fc247914272207",
+      "ignore_reason": null,
+      "disposition": "offline-local-spy",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem schema",
+        "actual accepted-publication fixture and loopback embedding spy",
+        "joined current source/attempt/renderer repairs"
+      ],
+      "evidence_limit": "Fixed interpretation and synthetic embedding transport prove composition only; no paid provider or semantic relevance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s5_5_manual_extraction::scenario_s5_5_manual_extraction",
+      "fully_qualified": "elephant-scenarios scenario::s5_5_manual_extraction::scenario_s5_5_manual_extraction",
+      "source": "tests/e2e/src/scenarios/s5_5_manual_extraction.rs",
+      "line": 8,
+      "source_sha256": "86e1934b657a3b3816711839b348ff13c54d5f9c098df73d6f64145744a6f3a6",
+      "ignore_reason": null,
+      "disposition": "offline-local-spy",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem schema",
+        "actual accepted-publication fixture and loopback embedding spy",
+        "joined current source/attempt/renderer repairs"
+      ],
+      "evidence_limit": "Fixed interpretation and synthetic embedding transport prove composition only; no paid provider or semantic relevance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-scenarios",
+      "target_kind": "lib",
+      "test": "scenario::s5_6_pipeline_status::scenario_s5_6_pipeline_status",
+      "fully_qualified": "elephant-scenarios scenario::s5_6_pipeline_status::scenario_s5_6_pipeline_status",
+      "source": "tests/e2e/src/scenarios/s5_6_pipeline_status.rs",
+      "line": 8,
+      "source_sha256": "cc0be3c0301449f1b2198cd6911bab2911f66557115ca87ade7972715b3d3e4a",
+      "ignore_reason": null,
+      "disposition": "offline-local-spy",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem schema",
+        "actual accepted-publication fixture and loopback embedding spy",
+        "joined current source/attempt/renderer repairs"
+      ],
+      "evidence_limit": "Fixed interpretation and synthetic embedding transport prove composition only; no paid provider or semantic relevance.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-storage",
+      "target_kind": "lib",
+      "test": "cost_ledger_daily_repository::index_tests::budget_reads_stay_indexed_past_fifty_thousand_historical_ledgers",
+      "fully_qualified": "elephant-storage cost_ledger_daily_repository::index_tests::budget_reads_stay_indexed_past_fifty_thousand_historical_ledgers",
+      "source": "crates/storage/src/cost_ledger_daily_index_tests.rs",
+      "line": 314,
+      "source_sha256": "4c71b5112eb66d6762bab4f061f4ad658a71023dad66dd6a736e8e64c7d286b3",
+      "ignore_reason": "explicit 50k-history budget ledger scale lane",
+      "disposition": "offline-scale",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "centrally scheduled isolated native kv-mem scale lane",
+        "50,000 historical synthetic ledger rows and actual index queries",
+        "serial scale execution and shared250GiB free-space floor"
+      ],
+      "evidence_limit": "Index/read budget scaling, not actual provider billing.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-storage",
+      "target_kind": "lib",
+      "test": "event_repository::tests::boundary_mode_status_filter_query_respects_statuses",
+      "fully_qualified": "elephant-storage event_repository::tests::boundary_mode_status_filter_query_respects_statuses",
+      "source": "crates/storage/src/event_repository.rs",
+      "line": 2004,
+      "source_sha256": "4239a11a453fbf5a30fd5370b561fb4cb19f0338dbe6cbfcb4b14f4c1a4d29b4",
+      "ignore_reason": "boundary-mode: validates status filter behavior for event queries",
+      "disposition": "offline-event-boundary",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem",
+        "minimal schema or explicitly included migrations001..010",
+        "actual wall-clock captured once per fixture"
+      ],
+      "evidence_limit": "Time/status query boundaries; not installed service or full current-schema gate.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-storage",
+      "target_kind": "lib",
+      "test": "event_repository::tests::boundary_mode_time_range_query_respects_window",
+      "fully_qualified": "elephant-storage event_repository::tests::boundary_mode_time_range_query_respects_window",
+      "source": "crates/storage/src/event_repository.rs",
+      "line": 1912,
+      "source_sha256": "4239a11a453fbf5a30fd5370b561fb4cb19f0338dbe6cbfcb4b14f4c1a4d29b4",
+      "ignore_reason": "boundary-mode: validates time range behavior for event queries",
+      "disposition": "offline-event-boundary",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem",
+        "minimal schema or explicitly included migrations001..010",
+        "actual wall-clock captured once per fixture"
+      ],
+      "evidence_limit": "Time/status query boundaries; not installed service or full current-schema gate.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-storage",
+      "target_kind": "lib",
+      "test": "event_repository::tests::boundary_mode_time_range_query_respects_window_on_migrated_schema",
+      "fully_qualified": "elephant-storage event_repository::tests::boundary_mode_time_range_query_respects_window_on_migrated_schema",
+      "source": "crates/storage/src/event_repository.rs",
+      "line": 1958,
+      "source_sha256": "4239a11a453fbf5a30fd5370b561fb4cb19f0338dbe6cbfcb4b14f4c1a4d29b4",
+      "ignore_reason": "boundary-mode: validates time range behavior for event queries on migrated schema",
+      "disposition": "offline-event-boundary",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "native kv-mem",
+        "minimal schema or explicitly included migrations001..010",
+        "actual wall-clock captured once per fixture"
+      ],
+      "evidence_limit": "Time/status query boundaries; not installed service or full current-schema gate.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-storage",
+      "target_kind": "lib",
+      "test": "work_item_repository::queue_index_tests::dependency_promotion_stays_bounded_with_fifty_thousand_cold_items",
+      "fully_qualified": "elephant-storage work_item_repository::queue_index_tests::dependency_promotion_stays_bounded_with_fifty_thousand_cold_items",
+      "source": "crates/storage/src/work_queue_index_tests.rs",
+      "line": 599,
+      "source_sha256": "f122aba305b0f3e4f81a3578469e7d64260e03771fa5505175ec5da3874e1124",
+      "ignore_reason": "explicit 50k-cold-history dependency scale lane",
+      "disposition": "offline-scale",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "centrally scheduled isolated native kv-mem scale lane",
+        "50,000+ synthetic historical rows; some cases70,000+ total",
+        "serial scale execution and shared250GiB free-space floor"
+      ],
+      "evidence_limit": "Queue/history/index/retention measurement only; no live model or OB3 workload equivalence.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-storage",
+      "target_kind": "lib",
+      "test": "work_item_repository::queue_index_tests::queue_indexes_scale_past_fifty_thousand_and_counts_are_exact",
+      "fully_qualified": "elephant-storage work_item_repository::queue_index_tests::queue_indexes_scale_past_fifty_thousand_and_counts_are_exact",
+      "source": "crates/storage/src/work_queue_index_tests.rs",
+      "line": 345,
+      "source_sha256": "f122aba305b0f3e4f81a3578469e7d64260e03771fa5505175ec5da3874e1124",
+      "ignore_reason": "explicit 50k-history queue scale lane",
+      "disposition": "offline-scale",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "centrally scheduled isolated native kv-mem scale lane",
+        "50,000+ synthetic historical rows; some cases70,000+ total",
+        "serial scale execution and shared250GiB free-space floor"
+      ],
+      "evidence_limit": "Queue/history/index/retention measurement only; no live model or OB3 workload equivalence.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-storage",
+      "target_kind": "lib",
+      "test": "work_item_repository::queue_index_tests::retention_pass_stays_bounded_with_fifty_thousand_completed_attempts",
+      "fully_qualified": "elephant-storage work_item_repository::queue_index_tests::retention_pass_stays_bounded_with_fifty_thousand_completed_attempts",
+      "source": "crates/storage/src/work_queue_index_tests.rs",
+      "line": 734,
+      "source_sha256": "f122aba305b0f3e4f81a3578469e7d64260e03771fa5505175ec5da3874e1124",
+      "ignore_reason": "explicit 50k-completed-attempt retention scale lane",
+      "disposition": "offline-scale",
+      "offline_selection_candidate": true,
+      "prerequisites": [
+        "centrally scheduled isolated native kv-mem scale lane",
+        "50,000+ synthetic historical rows; some cases70,000+ total",
+        "serial scale execution and shared250GiB free-space floor"
+      ],
+      "evidence_limit": "Queue/history/index/retention measurement only; no live model or OB3 workload equivalence.",
+      "observed_runtime2_verdict": "skipped",
+      "executed_by_qualification": false
+    }
+  ]
+}

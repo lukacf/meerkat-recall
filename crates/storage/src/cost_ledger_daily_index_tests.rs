@@ -127,6 +127,10 @@ async fn assert_budget_plans(client: &StorageClient, id: &RecordId) {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+)]
 async fn direct_ledger_reads_preserve_table_space_deletion_and_integrity_boundaries() {
     let client = StorageClient::new_memory().await.expect("Surreal memory");
     let repo = CostLedgerDailyRepository::new(client.clone());
@@ -189,6 +193,10 @@ async fn direct_ledger_reads_preserve_table_space_deletion_and_integrity_boundar
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+)]
 async fn daily_ledger_index_backfills_and_preserves_exact_aggregate_filters() {
     let client = StorageClient::new_memory().await.expect("Surreal memory");
     let repo = CostLedgerDailyRepository::new(client.clone());
@@ -312,6 +320,10 @@ async fn measure_budget_reads(repo: &CostLedgerDailyRepository, history: usize) 
 
 #[tokio::test]
 #[ignore = "explicit 50k-history budget ledger scale lane"]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+)]
 async fn budget_reads_stay_indexed_past_fifty_thousand_historical_ledgers() {
     let client = StorageClient::new_memory().await.expect("Surreal memory");
     client.query_checked(INDEXES).await.expect("ledger index");

@@ -18,23 +18,26 @@ Most HTTP and MCP record handlers invoke the policy engine. Lower-level Rust
 storage repositories do not carry a request principal; an embedding
 application must authorize their use at its own boundary.
 
-Administrative routes require particular care. The current REST space
-configuration handlers authenticate requests but do not perform per-record
-space or clearance checks. Keep that administrative surface restricted by
-the deployment boundary rather than treating every authenticated caller as
-an ordinary tenant. The MCP space tools do perform record authorization.
+REST and MCP space configuration operations require `read:space_config` or
+`write:space_config`, as appropriate, plus record authorization. A tenant token
+can manage only its own named space. Wildcard operation scopes do not grant
+access to another space. Updates that return a configuration also require read
+access, and compare the authorized envelope at the storage write.
 
-The Default MCP `get_provenance` handler is another exception: it performs
-scope preflight and space-scoped lookups, but does not authorize each returned
-relationship, attribute, assertion, revision, node, or document. A caller can
-therefore receive evidence outside their record clearance by known ID. Restrict
-this tool to trusted callers authorized for all content in the selected space;
-it is not suitable for serving readers with different record clearances.
+The Default MCP `get_provenance` handler authorizes the claim, each assertion,
+revision, node and parent document before returning the chain. Missing, deleted,
+foreign-space or inaccessible evidence fails the request without returning a
+partial chain. Raw document authority is required for excerpts and node text.
 
-REST `POST /v1/work-items/{id}/retry` likewise checks the authenticated space
-and failed status, but currently omits operation-scope and record read/write
-checks. Restrict it to trusted operators entitled to all work records in the
-space. Authentication alone must not authorize a reader to invoke retries.
+REST work-item reads use `read:work_item`. Retrying a failed item additionally
+requires `write:work_item` and record authorization. The retry compares the
+observed state at the atomic write and preserves that check when reactivating
+archived work. A concurrent status or security change returns a conflict.
+
+Managed REST data routes enforce the current runtime mode in shared middleware.
+In `read_only`, mutations are rejected even for wildcard and development bypass
+principals. Existing searches, batch entity reads and authorized snapshot export
+remain available. Runtime capabilities are separate from caller permissions.
 
 The explicit local-development bypass disables record ABAC. Use it only with
 isolated development data and loopback access.
@@ -138,8 +141,11 @@ complete security/subject envelope at the atomic storage write, so a stale
 content edit cannot undo a concurrent classification or subject change. A rejected update does not restore a
 deleted entity. These ordinary interfaces expose no declassification permission;
 trusted internal maintenance remains responsible for intentional security changes.
-Other domain mutations and trusted pipeline writers retain their own contracts;
-this boundary does not claim universal release enforcement.
+REST relationship replacement, upsert and batch writes use the same ordinary
+security-envelope rule, requiring read/write authority on both versions. The
+atomic write also compares the observed endpoints, lifecycle and timestamp.
+Rejected replacements cannot revive protected tombstones. Trusted pipeline
+writers retain their own contracts.
 
 The REST timeline update, `PUT /v1/timeline/{id}`, also preserves the existing
 `security` fields. A payload that changes them returns `403`, even when the
@@ -150,16 +156,17 @@ a content edit.
 ## Raw content and redaction
 
 The policy vocabulary separates document metadata access from raw-text access.
-MCP document response helpers clear `doc.text` when `read:doc:raw` is missing
-and return a `RedactionEnvelope` listing the affected field in `redactions`.
-The current REST document handlers return authorized records directly and do
-not apply that helper. Treat REST document access as access to the returned
-text; a metadata scope alone does not guarantee a text-free REST response.
+Without `read:doc:raw`, REST document projections clear `text`, `sidecar_text`
+and `media_attachments`. This applies to get/search and legacy space document
+routes, as well as returned mutation records. The existing REST response shape
+is preserved. Document chunks require raw access to the parent document and
+revision, and authorize each returned node.
 
-A redaction receipt describes that response path. It is not a general
-scrubber for arbitrary `metadata`, sidecar fields, or application-defined
-content. Classify the whole record appropriately when those fields contain
-sensitive information.
+MCP document response helpers clear `doc.text` without raw authority and return
+a `RedactionEnvelope` listing affected fields. These receipts describe that
+specific projection. Neither helper is a general scrubber for arbitrary
+application-defined `metadata`; classify the whole record appropriately when
+those fields contain sensitive information.
 
 The current source handlers return authorized source records directly. Do not
 assume the `read:source:raw` scope automatically hides `source.uri` or

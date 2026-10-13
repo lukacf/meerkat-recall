@@ -26,7 +26,7 @@ POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-4}"
 SCENARIO_LIMIT="${SCENARIO_LIMIT:-0}"
 SCENARIO_OFFSET="${SCENARIO_OFFSET:-0}"
 PIPELINE_FORCE_DEFAULT_EXTRACTOR="${PIPELINE_FORCE_DEFAULT_EXTRACTOR:-false}"
-WAIT_FOR_EMBEDDINGS="${WAIT_FOR_EMBEDDINGS:-false}"
+WAIT_FOR_EMBEDDINGS="${WAIT_FOR_EMBEDDINGS:-true}"
 DATASET_FETCH_MAX_TIME_SECS="${DATASET_FETCH_MAX_TIME_SECS:-35}"
 DATASET_FETCH_RETRIES="${DATASET_FETCH_RETRIES:-2}"
 DATASET_FETCH_RETRY_DELAY_SECS="${DATASET_FETCH_RETRY_DELAY_SECS:-2}"
@@ -36,14 +36,14 @@ JUDGE_MODEL="${JUDGE_MODEL:-gpt-4o-mini}"
 JUDGE_MIN_OVERALL="${JUDGE_MIN_OVERALL:-0.55}"
 JUDGE_MAX_DOCS="${JUDGE_MAX_DOCS:-12}"
 JUDGE_MAX_EVENTS="${JUDGE_MAX_EVENTS:-20}"
-JUDGE_MAX_ASSERTIONS="${JUDGE_MAX_ASSERTIONS:-30}"
-JUDGE_MAX_TRUTH_SLOTS="${JUDGE_MAX_TRUTH_SLOTS:-10}"
 HTTP_CONNECT_TIMEOUT_SECS="${HTTP_CONNECT_TIMEOUT_SECS:-5}"
 HTTP_MAX_TIME_SECS="${HTTP_MAX_TIME_SECS:-45}"
 JUDGE_HTTP_MAX_TIME_SECS="${JUDGE_HTTP_MAX_TIME_SECS:-120}"
 JUDGE_HTTP_RETRIES="${JUDGE_HTTP_RETRIES:-2}"
 
-STRICT=0
+STRICT=1
+RUN_MODE=acceptance
+ALLOW_PAID_PROVIDERS=0
 FAIL_FAST=0
 TEARDOWN=0
 NO_DOCKER=0
@@ -65,7 +65,9 @@ usage() {
 Usage: tests/golden_scenarios/run_golden_scenarios.sh [options]
 
 Options:
-  --strict            Exit non-zero if any scenario fails.
+  --strict            Acceptance mode; fail non-zero (the default).
+  --exploratory       Diagnostic-only run; never emits an acceptance pass.
+  --allow-paid-providers  Explicitly permit this future live run to spend model tokens.
   --fail-fast         Stop immediately after the first scenario-level failure.
   --teardown          Stop docker compose services at end.
   --no-docker         Assume services already running; do not start docker compose.
@@ -104,11 +106,15 @@ is_truthy() {
   [[ "$value" == "1" || "$value" == "true" || "$value" == "yes" || "$value" == "on" ]]
 }
 
-normalize_search_query() {
-  local value="${1:-}"
-  printf '%s' "$value" \
-    | tr '[:upper:]' '[:lower:]' \
-    | sed -E 's/[^a-z0-9]+/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
+unmet_prerequisite() {
+  local message="$1"
+  mkdir -p "$RUN_DIR"
+  jq -n --arg message "$message" --arg mode "$RUN_MODE" '{
+    status: "unmet_prerequisite", evidence_class: "unexecuted",
+    run_mode: $mode, semantic_acceptance: false, reason: $message
+  }' > "${RUN_DIR}/prerequisite.json"
+  printf '[%s] UNMET PREREQUISITE: %s\n' "$(date -u +%H:%M:%S)" "$message" >&2
+  exit 2
 }
 
 parse_args() {
@@ -116,6 +122,16 @@ parse_args() {
     case "$1" in
       --strict)
         STRICT=1
+        RUN_MODE=acceptance
+        shift
+        ;;
+      --exploratory)
+        STRICT=0
+        RUN_MODE=exploratory
+        shift
+        ;;
+      --allow-paid-providers)
+        ALLOW_PAID_PROVIDERS=1
         shift
         ;;
       --fail-fast)
@@ -161,12 +177,23 @@ setup() {
   [[ -f "$SCENARIOS_FILE" ]] || die "Missing scenarios file: $SCENARIOS_FILE"
   [[ -f "$DATASETS_FILE" ]] || die "Missing datasets file: $DATASETS_FILE"
 
+  if (( ALLOW_PAID_PROVIDERS != 1 )); then
+    unmet_prerequisite "Live execution requires separately authorized --allow-paid-providers"
+  fi
   if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-    die "ANTHROPIC_API_KEY is required for live extraction runs"
+    unmet_prerequisite "ANTHROPIC_API_KEY is required for live extraction"
   fi
   if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-    die "OPENAI_API_KEY is required for embedding runs"
+    unmet_prerequisite "OPENAI_API_KEY is required for live embeddings and the independent judge"
   fi
+  if [[ "$RUN_MODE" == "acceptance" ]]; then
+    is_truthy "$JUDGE_ENABLED" || unmet_prerequisite "Acceptance requires the independent semantic judge"
+    is_truthy "$WAIT_FOR_EMBEDDINGS" || unmet_prerequisite "Acceptance requires completed real embeddings"
+  fi
+  jq -en --arg minimum "$JUDGE_MIN_OVERALL" '
+    ($minimum | tonumber) as $value | $value >= 0 and $value <= 1
+  ' >/dev/null || unmet_prerequisite "JUDGE_MIN_OVERALL must be a number in [0,1] fixed before execution"
+
 
   mkdir -p "$RUN_DIR" "$RAW_DIR" "$NORM_DIR" "$LOG_DIR"
   : > "$RESULTS_JSONL"
@@ -213,7 +240,7 @@ start_services() {
     return
   fi
 
-  log "Starting docker services (surrealdb + elephant-api/supervisor)"
+  log "Starting docker services (surrealdb + managed elephant service)"
   (
     cd "$ROOT_DIR"
     export SURREALDB_DATABASE
@@ -221,7 +248,7 @@ start_services() {
     export OPENAI_API_KEY
     export ANTHROPIC_API_KEY
     export PIPELINE_FORCE_DEFAULT_EXTRACTOR
-    "${DOCKER_COMPOSE_CMD[@]}" up -d --build --force-recreate surrealdb elephant-api
+    "${DOCKER_COMPOSE_CMD[@]}" up -d --build --force-recreate surrealdb elephant
   )
 
   wait_for_endpoint "${SURREALDB_HTTP_URL}/health" 120 "SurrealDB"
@@ -259,7 +286,9 @@ reset_and_migrate() {
       SURREALDB_DATABASE="$SURREALDB_DATABASE" \
       SURREALDB_USER="$SURREALDB_USER" \
       SURREALDB_PASS="$SURREALDB_PASS" \
-      "$REPO_CARGO" run -p elephant-cli -- migrate >/dev/null
+      CARGO_BUILD_JOBS=16 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+      BINARYEN_CORES=8 TLC_WORKERS=8 \
+      chrt --idle 0 ionice -c3 "$REPO_CARGO" run -p meerkat-recall-bin -- migrate >/dev/null
   )
 }
 
@@ -557,12 +586,9 @@ run_llm_judge() {
   local scenario_json="$2"
   local space_id="$3"
   local query="$4"
-  local assertions_file="$5"
-  local timeline_query_file="$6"
-  local timeline_all_file="$7"
-  local docs_search_file="$8"
-  local truth_slots_file="$9"
-  local judge_output_file="${10}"
+  local timeline_query_file="$5"
+  local docs_search_file="$6"
+  local judge_output_file="$7"
 
   if ! is_truthy "$JUDGE_ENABLED"; then
     jq -n '{
@@ -592,13 +618,8 @@ run_llm_judge() {
     --arg space_id "$space_id" \
     --argjson max_docs "$JUDGE_MAX_DOCS" \
     --argjson max_events "$JUDGE_MAX_EVENTS" \
-    --argjson max_assertions "$JUDGE_MAX_ASSERTIONS" \
-    --argjson max_truth "$JUDGE_MAX_TRUTH_SLOTS" \
     --slurpfile docs "$docs_search_file" \
-    --slurpfile timeline_all "$timeline_all_file" \
     --slurpfile timeline "$timeline_query_file" \
-    --slurpfile assertions "$assertions_file" \
-    --slurpfile truth "$truth_slots_file" \
     '
       def rows(o): (o.items // o.results // []);
       {
@@ -608,8 +629,7 @@ run_llm_judge() {
           complexity: $scenario.complexity,
           query: $query,
           min_assertions: $scenario.min_assertions,
-          min_events: $scenario.min_events,
-          ingestions: $scenario.ingestions
+          min_events: $scenario.min_events
         },
         retrieval: {
           docs: (
@@ -624,19 +644,6 @@ run_llm_judge() {
               id: (.doc.base.id // .base.id // "")
             })
           ),
-          events_all: (
-            ($timeline_all[0] // {})
-            | rows(.)
-            | .[:$max_events]
-            | map({
-              title: (.title // ""),
-              status: (.status // ""),
-              confidence: (.confidence // null),
-              time_start: (.time_start // null),
-              time_end: (.time_end // null),
-              assertion_refs: (.assertion_refs // [])
-            })
-          ),
           events: (
             ($timeline[0] // {})
             | rows(.)
@@ -648,30 +655,6 @@ run_llm_judge() {
               time_start: (.time_start // null),
               time_end: (.time_end // null),
               assertion_refs: (.assertion_refs // [])
-            })
-          ),
-          assertions: (
-            ($assertions[0] // {})
-            | rows(.)
-            | .[:$max_assertions]
-            | map({
-              subject_text: (.subject_text // ""),
-              predicate_text: (.predicate_text // ""),
-              object_text: (.object_text // ""),
-              confidence: (.confidence // null),
-              source_event_time: (.source_event_time // null),
-              significance: (.significance // null)
-            })
-          ),
-          truth_slots: (
-            ($truth[0] // {})
-            | rows(.)
-            | .[:$max_truth]
-            | map({
-              subject_entity: (.subject_entity // null),
-              predicate_id: (.predicate_id // ""),
-              confidence: (.confidence // null),
-              claim_status: (.claim_status // "")
             })
           )
         }
@@ -700,17 +683,18 @@ Return JSON with this exact shape:
 }
 
 Scoring guidance:
-- relevance_score: are retrieved docs/events/assertions aligned to scenario query and ingestion notes?
+- relevance_score: are the original-query retrieved docs/events relevant to the original query?
 - grounding_score: do results appear evidence-backed and specific (not generic boilerplate)?
 - temporal_score: timeline/event ordering and time fields make sense for scenario intent.
 - contradiction_score: conflicting updates are represented sensibly (not collapsed into nonsense).
 - overall_score: conservative aggregate; fail if major retrieval irrelevance or grounding collapse.
 - verdict rule: "pass" if overall_score >= ${JUDGE_MIN_OVERALL}; otherwise "fail".
 
-Important nuance:
-- 'retrieval.events' is query-filtered timeline output.
-- 'retrieval.events_all' is unfiltered timeline output.
-- Do NOT fail solely because query-filtered events are sparse; consider docs/assertions relevance and all-events context together.
+Evidence boundary:
+- Only the unchanged original-query results are evidence for this judgment.
+- Missing or irrelevant retrieval must reduce relevance; do not supply knowledge from outside these results.
+- Stored graph counts, scenario titles and ingestion expectations are not retrieved evidence.
+- Unsupported or missing evidence is a failure, even if other pipeline diagnostics look healthy.
 
 Scenario context JSON:
 $(cat "$judge_input_file")
@@ -809,6 +793,18 @@ EOF
       issues: ["judge_invalid_json"],
       recommended_actions: [("Raw preview: " + $raw)]
     }' > "$judge_output_file"
+    return 0
+  fi
+
+  if ! jq -e '
+    type == "object" and
+    ([.overall_score, .relevance_score, .grounding_score, .temporal_score, .contradiction_score]
+      | all(.[]; type == "number" and . >= 0 and . <= 1)) and
+    (.verdict == "pass" or .verdict == "fail")
+  ' >/dev/null 2>&1 <<<"$content"; then
+    jq -n '{enabled:true, overall_score:null, verdict:"unavailable",
+      summary:"Judge response has missing, nonnumeric or out-of-range scores.",
+      issues:["judge_invalid_schema"], strengths:[], recommended_actions:[]}' > "$judge_output_file"
     return 0
   fi
 
@@ -1071,7 +1067,7 @@ run_scenario() {
   local ing_count
   ing_count="$(jq '.ingestions | length' <<<"$scenario_json")"
 
-  local -a doc_ids
+  local -a doc_ids=()
   local ingestion_failures=0
   local step
   for (( step=0; step<ing_count; step++ )); do
@@ -1245,116 +1241,33 @@ run_scenario() {
     done
   fi
 
-  local assertions_file timeline_file timeline_approved_file timeline_query_file timeline_query_fallback_file
-  local timeline_query_scenario_file docs_search_file docs_search_fallback_file docs_search_scenario_file
+  local assertions_file timeline_file timeline_approved_file timeline_query_file docs_search_file
   local docs_search_control_file truth_slots_file work_failed_file judge_output_file
-  local timeline_judge_file docs_judge_file docs_judge_fallback_file docs_judge_rows_file
   assertions_file="${RUN_DIR}/${scenario_id}_assertions.json"
   timeline_file="${RUN_DIR}/${scenario_id}_timeline_all.json"
   timeline_approved_file="${RUN_DIR}/${scenario_id}_timeline_approved.json"
   timeline_query_file="${RUN_DIR}/${scenario_id}_timeline_query.json"
-  timeline_query_fallback_file="${RUN_DIR}/${scenario_id}_timeline_query_fallback.json"
-  timeline_query_scenario_file="${RUN_DIR}/${scenario_id}_timeline_query_scenario.json"
-  timeline_judge_file="$timeline_query_file"
   docs_search_file="${RUN_DIR}/${scenario_id}_docs_search.json"
-  docs_search_fallback_file="${RUN_DIR}/${scenario_id}_docs_search_fallback.json"
-  docs_search_scenario_file="${RUN_DIR}/${scenario_id}_docs_search_scenario.json"
-  docs_judge_file="$docs_search_file"
-  docs_judge_fallback_file="${RUN_DIR}/${scenario_id}_docs_judge_fallback.json"
-  docs_judge_rows_file="${RUN_DIR}/${scenario_id}_docs_judge_rows.jsonl"
   docs_search_control_file="${RUN_DIR}/${scenario_id}_docs_search_control.json"
   truth_slots_file="${RUN_DIR}/${scenario_id}_truth_slots.json"
   work_failed_file="${RUN_DIR}/${scenario_id}_work_failed.json"
   judge_output_file="${RUN_DIR}/${scenario_id}_judge.json"
 
+  # Preserve these exact requests and response files. No normalization, scenario
+  # anchor, known-ID read or unfiltered graph scan may replace judge evidence.
+  jq -n --arg query "$query" --arg space "$space_id" '{
+    query: $query, space: $space, query_rewrites: 0, fallback_fetches: 0
+  }' > "${RUN_DIR}/${scenario_id}_original_query.json"
   api_post_json "$space_id" "/v1/assertions/search" '{"limit": 500}' "$assertions_file" >/dev/null || true
   api_post_json "$space_id" "/v1/timeline/search" '{"include_candidates":true,"limit":300}' "$timeline_file" >/dev/null || true
   api_post_json "$space_id" "/v1/timeline/search" '{"include_candidates":false,"limit":300}' "$timeline_approved_file" >/dev/null || true
   api_post_json "$space_id" "/v1/timeline/search" "$(jq -n --arg q "$query" '{query:$q, include_candidates:true, limit:300}')" "$timeline_query_file" >/dev/null || true
   api_post_json "$space_id" "/v1/docs/search" "$(jq -n --arg q "$query" --arg space "$space_id" '{query:$q, space_id:$space, limit:50}')" "$docs_search_file" >/dev/null || true
 
-  local normalized_query
-  normalized_query="$(normalize_search_query "$query")"
-  if [[ -n "$normalized_query" && "$normalized_query" != "$query" ]]; then
-    api_post_json "$space_id" "/v1/timeline/search" "$(jq -n --arg q "$normalized_query" '{query:$q, include_candidates:true, limit:300}')" "$timeline_query_fallback_file" >/dev/null || true
-    api_post_json "$space_id" "/v1/docs/search" "$(jq -n --arg q "$normalized_query" --arg space "$space_id" '{query:$q, space_id:$space, limit:50}')" "$docs_search_fallback_file" >/dev/null || true
-
-    local timeline_query_total_primary timeline_query_total_fallback
-    local docs_search_total_primary docs_search_total_fallback
-    timeline_query_total_primary="$(jq -r '.total // (.results | length) // (.items | length) // 0' "$timeline_query_file" 2>/dev/null || echo 0)"
-    timeline_query_total_fallback="$(jq -r '.total // (.results | length) // (.items | length) // 0' "$timeline_query_fallback_file" 2>/dev/null || echo 0)"
-    docs_search_total_primary="$(jq -r '.total // (.results | length) // (.items | length) // 0' "$docs_search_file" 2>/dev/null || echo 0)"
-    docs_search_total_fallback="$(jq -r '.total // (.results | length) // (.items | length) // 0' "$docs_search_fallback_file" 2>/dev/null || echo 0)"
-
-    if (( timeline_query_total_fallback > timeline_query_total_primary )); then
-      cp "$timeline_query_fallback_file" "$timeline_query_file"
-      log "  scenario ${scenario_id}: using normalized timeline query '${normalized_query}' (primary=${timeline_query_total_primary}, fallback=${timeline_query_total_fallback})"
-    fi
-
-    if (( docs_search_total_fallback > docs_search_total_primary )); then
-      cp "$docs_search_fallback_file" "$docs_search_file"
-      log "  scenario ${scenario_id}: using normalized docs query '${normalized_query}' (primary=${docs_search_total_primary}, fallback=${docs_search_total_fallback})"
-    fi
-  fi
-
-  local timeline_query_total_current docs_search_total_current
-  timeline_query_total_current="$(jq -r '.total // (.results | length) // (.items | length) // 0' "$timeline_query_file" 2>/dev/null || echo 0)"
-  docs_search_total_current="$(jq -r '.total // (.results | length) // (.items | length) // 0' "$docs_search_file" 2>/dev/null || echo 0)"
-  if (( timeline_query_total_current == 0 || docs_search_total_current == 0 )); then
-    local scenario_query
-    scenario_query="$(normalize_search_query "${scenario_id} ${query}")"
-    if [[ -n "$scenario_query" ]]; then
-      api_post_json "$space_id" "/v1/timeline/search" "$(jq -n --arg q "$scenario_query" '{query:$q, include_candidates:true, limit:300}')" "$timeline_query_scenario_file" >/dev/null || true
-      api_post_json "$space_id" "/v1/docs/search" "$(jq -n --arg q "$scenario_query" --arg space "$space_id" '{query:$q, space_id:$space, limit:50}')" "$docs_search_scenario_file" >/dev/null || true
-
-      local timeline_query_total_scenario docs_search_total_scenario
-      timeline_query_total_scenario="$(jq -r '.total // (.results | length) // (.items | length) // 0' "$timeline_query_scenario_file" 2>/dev/null || echo 0)"
-      docs_search_total_scenario="$(jq -r '.total // (.results | length) // (.items | length) // 0' "$docs_search_scenario_file" 2>/dev/null || echo 0)"
-
-      if (( timeline_query_total_scenario > timeline_query_total_current )); then
-        cp "$timeline_query_scenario_file" "$timeline_query_file"
-        log "  scenario ${scenario_id}: using scenario-anchored timeline query '${scenario_query}' (current=${timeline_query_total_current}, scenario=${timeline_query_total_scenario})"
-      fi
-
-      if (( docs_search_total_scenario > docs_search_total_current )); then
-        cp "$docs_search_scenario_file" "$docs_search_file"
-        log "  scenario ${scenario_id}: using scenario-anchored docs query '${scenario_query}' (current=${docs_search_total_current}, scenario=${docs_search_total_scenario})"
-      fi
-    fi
-  fi
-
-  docs_search_total_current="$(jq -r '.total // (.results | length) // (.items | length) // 0' "$docs_search_file" 2>/dev/null || echo 0)"
-  if (( docs_search_total_current < 3 )) && (( docs_ingested > 0 )); then
-    : > "$docs_judge_rows_file"
-    local docs_judge_count=0
-    local judge_doc_id
-    for judge_doc_id in "${doc_ids[@]}"; do
-      local judge_doc_encoded judge_doc_file judge_doc_code
-      judge_doc_encoded="$(printf '%s' "$judge_doc_id" | jq -sRr @uri)"
-      judge_doc_file="${RUN_DIR}/${scenario_id}_doc_${judge_doc_encoded}_for_judge.json"
-      judge_doc_code="$(api_get "$space_id" "/v1/docs/${judge_doc_encoded}" "$judge_doc_file" || true)"
-      if [[ "$judge_doc_code" == "200" ]]; then
-        jq -c . "$judge_doc_file" >> "$docs_judge_rows_file"
-        docs_judge_count=$((docs_judge_count + 1))
-      fi
-    done
-    if (( docs_judge_count > 0 )); then
-      jq -s '{results: ., total: length, cursor: null, has_more: false}' "$docs_judge_rows_file" > "$docs_judge_fallback_file"
-      docs_judge_file="$docs_judge_fallback_file"
-      log "  scenario ${scenario_id}: docs search returned ${docs_search_total_current}; using ${docs_judge_count} ingested docs as judge context fallback"
-    fi
-  fi
-
-  timeline_query_total_current="$(jq -r '.total // (.results | length) // (.items | length) // 0' "$timeline_query_file" 2>/dev/null || echo 0)"
-  if (( timeline_query_total_current == 0 )); then
-    timeline_judge_file="$timeline_file"
-    log "  scenario ${scenario_id}: timeline query returned 0; using timeline_all as judge timeline context fallback"
-  fi
-
   api_post_json "$space_id" "/v1/docs/search" "$(jq -n --arg q "$CONTROL_QUERY" --arg space "$space_id" '{query:$q, space_id:$space, limit:50}')" "$docs_search_control_file" >/dev/null || true
   api_get "$space_id" "/v1/truth-slots?limit=500" "$truth_slots_file" >/dev/null || true
   api_get "$space_id" "/v1/work-items?status=failed&limit=500" "$work_failed_file" >/dev/null || true
-  run_llm_judge "$scenario_id" "$scenario_json" "$space_id" "$query" "$assertions_file" "$timeline_judge_file" "$timeline_file" "$docs_judge_file" "$truth_slots_file" "$judge_output_file"
+  run_llm_judge "$scenario_id" "$scenario_json" "$space_id" "$query" "$timeline_query_file" "$docs_search_file" "$judge_output_file"
 
   local assertions_total events_total events_approved timeline_query_total docs_search_total docs_search_control_total truth_slots_total failed_work_items_total
   local judge_enabled judge_overall_score judge_verdict judge_summary judge_issues judge_score_below
@@ -1378,7 +1291,7 @@ run_scenario() {
     fi
   fi
 
-  local -a issues
+  local -a issues=()
   if (( ingestion_failures > 0 )); then
     issues+=("${ingestion_failures} ingestion steps failed")
   fi
@@ -1386,14 +1299,7 @@ run_scenario() {
     issues+=("${docs_failed} docs reached extraction_state=failed")
   fi
   if (( docs_timeout > 0 )); then
-    if (( docs_timeout <= 2 )) \
-      && (( docs_completed + docs_timeout >= docs_ingested )) \
-      && (( assertions_total >= min_assertions )) \
-      && (( events_total >= min_events )); then
-      warn "Scenario ${scenario_id}: ${docs_timeout} trailing extraction timeout with strong coverage; treating as advisory"
-    else
-      issues+=("${docs_timeout} docs timed out waiting for extraction")
-    fi
+    issues+=("${docs_timeout} docs timed out waiting for extraction")
   fi
   if (( docs_embed_failed > 0 )); then
     issues+=("${docs_embed_failed} docs hit failed state before embedding completed")
@@ -1411,34 +1317,22 @@ run_scenario() {
     issues+=("control query returned no document hits")
   fi
   if (( failed_work_items_total > 0 )); then
-    if (( failed_work_items_total <= 2 )) \
-      && (( docs_timeout <= 2 )) \
-      && (( assertions_total >= min_assertions )) \
-      && (( events_total >= min_events )); then
-      warn "Scenario ${scenario_id}: ${failed_work_items_total} trailing failed work item with strong coverage; treating as advisory"
-    else
-      issues+=("${failed_work_items_total} failed work items present")
-    fi
+    issues+=("${failed_work_items_total} failed work items present")
   fi
-  if [[ "$judge_enabled" == "true" ]]; then
-    if [[ "$judge_verdict" == "unavailable" ]]; then
-      issues+=("LLM judge unavailable")
+  if (( docs_search_total == 0 )); then
+    issues+=("original query returned no document evidence")
+  fi
+  if [[ "$judge_enabled" != "true" ]]; then
+    issues+=("semantic evaluation unavailable: judge disabled")
+  else
+    if [[ "$judge_overall_score" == "null" ]]; then
+      issues+=("semantic evaluation unavailable: no numeric judge score")
     fi
     if (( judge_score_below > 0 )); then
-      if (( docs_failed == 0 )) \
-        && (( docs_timeout <= 2 )) \
-        && (( failed_work_items_total <= 2 )) \
-        && (( assertions_total >= min_assertions )) \
-        && (( events_total >= min_events )) \
-        && (( docs_search_total <= 2 )) \
-        && (( timeline_query_total <= 2 )); then
-        warn "Scenario ${scenario_id}: judge score ${judge_overall_score} below threshold but deterministic pipeline checks passed and query-filtered retrieval is sparse; treating as advisory"
-      else
-        issues+=("LLM judge overall_score ${judge_overall_score} < min ${JUDGE_MIN_OVERALL}")
-      fi
+      issues+=("LLM judge overall_score ${judge_overall_score} < min ${JUDGE_MIN_OVERALL}")
     fi
-    if [[ "$judge_verdict" == "fail" && $judge_score_below -eq 0 ]]; then
-      warn "Scenario ${scenario_id}: judge verdict=fail but score ${judge_overall_score} >= threshold ${JUDGE_MIN_OVERALL}; treating verdict as advisory"
+    if [[ "$judge_verdict" != "pass" ]]; then
+      issues+=("LLM judge verdict ${judge_verdict} is not pass")
     fi
   fi
 
@@ -1446,6 +1340,8 @@ run_scenario() {
   scenario_status="pass"
   if (( ${#issues[@]} > 0 )); then
     scenario_status="fail"
+  elif [[ "$RUN_MODE" == "exploratory" ]]; then
+    scenario_status="exploratory_observation"
   fi
 
   local issues_json
@@ -1459,6 +1355,8 @@ run_scenario() {
     --arg id "$scenario_id" \
     --arg name "$scenario_name" \
     --arg status "$scenario_status" \
+    --arg run_mode "$RUN_MODE" \
+    --arg minimum "$JUDGE_MIN_OVERALL" \
     --arg query "$query" \
     --arg space_id "$space_id" \
     --argjson complexity "$complexity" \
@@ -1487,6 +1385,12 @@ run_scenario() {
       id: $id,
       name: $name,
       status: $status,
+      run_mode: $run_mode,
+      semantic_acceptance: ($run_mode == "acceptance" and $status == "pass"),
+      evidence_scope: "legacy-live-scenario-checks-not-preview-qualification",
+      judge_minimum: ($minimum | tonumber),
+      query_rewrites: 0,
+      fallback_fetches: 0,
       complexity: $complexity,
       query: $query,
       space_id: $space_id,
@@ -1526,6 +1430,8 @@ write_summary() {
 
   {
     printf '# Golden Scenarios Report\n\n'
+    printf -- '- Mode: %s (exploratory never grants acceptance)\n' "$RUN_MODE"
+    printf 'This legacy live corpus is not the independently versioned preview acceptance corpus.\n\n'
     printf -- '- Run timestamp (UTC): %s\n' "$RUN_TS"
     printf -- '- API URL: `%s`\n' "$API_URL"
     printf -- '- SurrealDB namespace/database: `%s/%s`\n' "$SURREALDB_NAMESPACE" "$SURREALDB_DATABASE"
@@ -1558,7 +1464,7 @@ write_summary() {
 
     printf '\n## Failures and Gaps\n\n'
     if [[ "$fail" -eq 0 ]]; then
-      printf 'No scenario-level failures detected under current thresholds.\n\n'
+      printf 'No selected scenario-check failures; consult mode and evidence scope before interpreting this result.\n\n'
     else
       while IFS= read -r row; do
         local id name issues
@@ -1654,4 +1560,6 @@ main() {
   log "Artifacts available in ${RUN_DIR}"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

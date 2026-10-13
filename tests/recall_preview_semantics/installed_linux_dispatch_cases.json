@@ -1,0 +1,18 @@
+{
+  "format": "recall-installed-linux-dispatch-expectations/v1",
+  "scope": "installed controlled query transport only; deterministic spies are not provider relevance",
+  "backends": ["elephant-db", "surreal-db"],
+  "spaces": ["qualification-household", "qualification-business"],
+  "queries": ["home-service", "business-review"],
+  "required_cases": ["verified_installed_binary", "fresh_cli_auth", "two_distinct_profiles", "approved_dispatch", "wrong_space_zero_dispatch", "missing_approval_zero_dispatch", "revoked_approval_zero_dispatch", "credential_rotation_distinct"],
+  "expected_outbound": [
+    {"space": "qualification-household", "credential_generation": 1},
+    {"space": "qualification-business", "credential_generation": 1},
+    {"space": "qualification-household", "credential_generation": 2}
+  ],
+  "unqualified_gates": ["provider relevance", "grounding and extraction quality", "installed document embedding and generation dispatch", "source publication", "erasure and restore", "load and latency", "Darwin", "consumer adoption"],
+  "limits": {"total_seconds": 300, "http_calls": 128, "http_seconds": 5,
+    "snapshot_http_seconds": 120, "response_bytes": 262144, "processes": 16,
+    "process_log_bytes": 1048576, "http_capture_bytes": 67108864,
+    "spy_request_bytes": 16384, "spy_request_seconds": 2, "physical_embedding_calls": 3}
+}

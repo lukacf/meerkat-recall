@@ -1,0 +1,28 @@
+{
+  "format": "recall-workload-preparation-cases/v1",
+  "classification": "source proposal for D review; no execution or qualification",
+  "cases": [
+    "Bind exact installed binary/source/runtime configuration, corpus, allocation, credentials and G bridge before requests.",
+    "Bind original allocation plus D typed preparation-contract/delta hashes and explicit provider_phase=preparation; reject normalized/default-policy activation.",
+    "Read both distinct stored space configurations and prove all 50 external source heads absent before any submission.",
+    "Submit each frozen typed Source+Doc Retrieval request once with explicit record envelopes; retain uncertain POST failure without retry.",
+    "Persist and fsync a private original request intent plus directory entries before connection; recording failure or insufficient bounded capture reserve permits zero sends. Link every response/error capture to that original intent hash without storing credentials.",
+    "Poll only original durable operation identities; reject changed source, generation, revision or terminal failure.",
+    "Bind D's independently reviewed rendered-map hash without changing the original corpus, typed contract or allocation; refuse missing, foreign, duplicated or tampered rendered rows.",
+    "Observe original complete head and raw source hash separately from exact D-mapped rendered document bytes/hash; root includes final LF and paragraph/chunk spans exclude it, with actual profile markers via retained public APIs.",
+    "Preserve unknown subject state and exact distinct record policies; require actual accepted source and immutable revision in derived node lineage.",
+    "Read each original full immutable DocRevision through the authorized public GET; require exact document/revision/space, fresh active status, source lineage, classified envelope, rendered text/hash and default renderer metadata. Count all 50 additive reads inside the original HTTP/capture/deadline caps.",
+    "Require complete short-source chunk coverage and matching pipeline node/embedding marker counts within the frozen 64-node bound.",
+    "Recheck the original stored space authority after publication, allowing only storage-owned index epoch and updated_at changes.",
+    "Close the original exclusive G cohort on success, failure, cancellation or partial begin; retain unresolved liability.",
+    "Never claim private publication manifests, raw physical vector inventory, paid relevance or independent fixture qualification from these observations."
+  ],
+  "public_accepts_per_backend": 50,
+  "source_distribution": [
+    25,
+    25
+  ],
+  "query_warmups": 0,
+  "harness_retries": 0,
+  "qualified": false
+}

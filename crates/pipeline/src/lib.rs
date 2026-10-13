@@ -32,23 +32,34 @@
 )]
 
 pub mod embed;
+pub mod embedding_reindex;
 pub mod entity_type_consolidation;
 pub mod error;
 pub mod extraction;
 pub mod freshness;
+#[cfg(all(test, feature = "meerkat-extraction"))]
+mod governed_request_test_fixture;
 #[cfg(feature = "meerkat-extraction")]
 mod llm;
 pub mod maintenance;
+/// Atomic preparation of retained truth-maintenance and resolution effects.
+pub mod maintenance_commit;
 pub mod media;
+pub mod outbox_delivery;
 pub mod predicate;
 pub mod predicate_hygiene;
 pub(crate) mod provenance;
+pub mod provider_dispatch;
+pub mod provider_usage;
+pub mod public_predicate_proposal;
 pub mod remote_source;
 pub mod renderer;
 pub mod reprocess;
 pub mod resolution;
 pub mod retention;
 pub mod scheduler;
+pub mod source_finalization;
+pub mod source_queue;
 pub mod source_watch;
 pub mod summarizer;
 pub mod truth_maintenance;

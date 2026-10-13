@@ -19,6 +19,9 @@ use crate::provider::{
 /// but `FakeEmbeddingProvider` ramps labelled `text-embedding-3-large`.
 #[must_use]
 pub fn provider_for_policy(policy: &EmbeddingPolicy) -> Arc<dyn EmbeddingProvider> {
+    if policy.model.starts_with("recall:") {
+        return unavailable(policy, "governed policy requires a current space binding");
+    }
     match policy.provider.as_str() {
         "openai" => match OpenAIConfig::from_env() {
             Ok(config) => Arc::new(OpenAIEmbeddingProvider::new(

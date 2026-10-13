@@ -19,6 +19,14 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 use crate::require::required_field;
 
+#[path = "reprocess_creation.rs"]
+mod reprocess_creation;
+#[path = "reprocess_queue.rs"]
+mod reprocess_queue;
+pub use reprocess_creation::PreparedReprocessJobCreation;
+pub(crate) use reprocess_queue::intended_work;
+pub use reprocess_queue::verify_reprocess_handoff;
+
 const REPROCESS_JOB_PROJECTION: &str = r"
     id,
     space_id,
@@ -134,7 +142,9 @@ impl ReprocessJobRepository {
     }
 
     /// Converts a ReprocessJob to a SurrealDB value for insertion.
-    fn reprocess_job_to_value(item: &ReprocessJob) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn reprocess_job_to_value(
+        item: &ReprocessJob,
+    ) -> StorageResult<surrealdb::sql::Value> {
         let mut obj = crate::surreal::base_fields_to_object(&item.base)?;
         obj.insert("name".to_string(), item.name.clone().into());
 
@@ -282,21 +292,27 @@ impl ReprocessJobRepository {
 impl Repository<ReprocessJob> for ReprocessJobRepository {
     async fn create(&self, record: ReprocessJob) -> StorageResult<ReprocessJob> {
         if let Some(store) = self.client.embedded_store() {
-            return store.create(record).await;
+            return store
+                .mutate(|tx| {
+                    tx.create(record.clone())?;
+                    crate::work_producer_repository::initialize_reprocess_intent_tx(tx, &record)?;
+                    Ok(record)
+                })
+                .await;
         }
-
-        let record_value = Self::reprocess_job_to_value(&record)?;
-        let write_response = self
-            .client
-            .query_bind(
-                "CREATE $id CONTENT $record;",
-                crate::bindings! {
-                    "id" => crate::surreal::thing_from_record_id(&record.base.id),
-                    "record" => record_value,
-                },
-            )
-            .await?;
-        write_response.check()?;
+        let mut sql = "BEGIN TRANSACTION; CREATE $id CONTENT $record;\n".to_string();
+        let mut bindings = crate::bindings! {
+            "id" => crate::surreal::thing_from_record_id(&record.base.id),
+            "record" => Self::reprocess_job_to_value(&record)?,
+        };
+        crate::work_producer_repository::append_reprocess_intent_sql(
+            &mut sql,
+            &mut bindings,
+            "new_job",
+            &record,
+        )?;
+        sql.push_str("COMMIT TRANSACTION;");
+        self.client.query_bind_checked(&sql, bindings).await?;
 
         let mut response = self
             .client
@@ -440,6 +456,27 @@ impl Repository<ReprocessJob> for ReprocessJobRepository {
     }
 }
 
+impl ReprocessJobRepository {
+    /// Complete physical before-image for canonical progress/intent transactions.
+    pub(crate) async fn get_including_deleted(
+        &self,
+        space: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<ReprocessJob>> {
+        if let Some(store) = self.client.embedded_store() {
+            return store.get::<ReprocessJob>(space, id, true).await;
+        }
+        let mut response = self.client.query_bind_checked(&format!("SELECT {REPROCESS_JOB_PROJECTION} FROM reprocess_job WHERE id=$id AND space_id=$space"),crate::bindings!{"id"=>crate::surreal::thing_from_record_id(id),"space"=>space}).await?;
+        let rows: Vec<ReprocessJobDb> = response
+            .take(0)
+            .map_err(|error| StorageError::QueryError(error.to_string()))?;
+        rows.into_iter()
+            .next()
+            .map(ReprocessJob::try_from)
+            .transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -538,6 +575,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_reprocess_job() {
         let repo = setup_test_repo().await;
         let item = create_test_reprocess_job();
@@ -550,6 +591,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_reprocess_job() {
         let repo = setup_test_repo().await;
         let item = create_test_reprocess_job();
@@ -562,6 +607,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_reprocess_job_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_reprocess_job();
@@ -586,6 +635,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_reprocess_job() {
         let repo = setup_test_repo().await;
         let item = create_test_reprocess_job();
@@ -605,6 +658,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_if_status_in_matches() {
         let repo = setup_test_repo().await;
         let item = create_test_reprocess_job();
@@ -632,6 +689,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_if_status_in_mismatch_returns_none() {
         let repo = setup_test_repo().await;
         let item = create_test_reprocess_job();
@@ -670,6 +731,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_if_status_in_uses_target_id_not_payload_id() {
         let repo = setup_test_repo().await;
         let target = repo.create(create_test_reprocess_job()).await.unwrap();
@@ -708,6 +773,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_reprocess_job() {
         let repo = setup_test_repo().await;
         let item = create_test_reprocess_job();

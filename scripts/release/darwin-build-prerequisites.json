@@ -1,0 +1,145 @@
+{
+  "format": "recall-darwin-builder-prerequisites/v1",
+  "source_only": true,
+  "cargo_metadata_executed": false,
+  "builder_observed": false,
+  "source_sha256": {
+    "Cargo.toml": "69b3f802005b09d63a6749aa2828e72bfe5fce18e131235ea4a18421aafc3f82",
+    "Cargo.lock": "5d93e9fdd9005a35c6e5bec38d2a7e7a8c4af358496338f518eee56fd21d511e",
+    "rust-toolchain.toml": "b8cc9f68b8e047df92ff16f576b6886480a61e38900368f71d52115ced6ea2ca",
+    "bin/elephant/Cargo.toml": "0b58a72b5c56187c7d768d83a8ba8d06cd58f3b67d7442a9bf5b397a4a9ee858",
+    "crates/storage/Cargo.toml": "b330e261a07daf438c9daa6f2fc3d0249f574b43de474879c2a4f64cd02e580c",
+    "crates/embeddings/Cargo.toml": "0666efe1a015e1b5dab911cf9ca7d95fbd011f24b3598918f23f587e88810356",
+    "scripts/repo-cargo": "8b2d74ebc81b3ff4c822fc9dd69b2382ca56b09d7d64cc93f2a81d3338f73fdc",
+    "scripts/release/build-native": "319b20d405bbbb3534a462a262065924771293b72f4f769d0b2a3e9217e7185f",
+    "scripts/release/static_ort_receipt.py": "563bc184cbd7f464d659bd9aa0989bc0d563b01750ac0a876abc067b093e8931",
+    "scripts/release/supervise_darwin_build.py": "07167f8af6a9e856578cb590e6b49d46b96aa6e2d2b6785e497d4b317f6efc72",
+    "scripts/release/darwin_bootstrap.py": "456dbf999fd09f37a6dc365bebf28774f2084eaf9b850d843d86ec76f485cfca",
+    "scripts/release/darwin_build_process.py": "103010c45487c8b46bb86bb0e7d69641fc7626f8c104aad95c191784851cf2dc"
+  },
+  "reviewed_locked_packages": {
+    "bindgen": {
+      "version": "0.72.1",
+      "cargo_checksum": "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+    },
+    "bzip2-sys": {
+      "version": "0.1.13+1.0.8",
+      "cargo_checksum": "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
+    },
+    "cc": {
+      "version": "1.2.66",
+      "cargo_checksum": "f5d6cac793997bd970000024b2934968efe83b382de4fdcf4fcb46b6ee4ad996"
+    },
+    "clang-sys": {
+      "version": "1.8.1",
+      "cargo_checksum": "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
+    },
+    "fastembed": {
+      "version": "5.17.2",
+      "cargo_checksum": "545e4fb17fc48768ff36c2a3854aa5b0b809d0ed595ab5530fa8ac94f31bd0ea"
+    },
+    "libsqlite3-sys": {
+      "version": "0.35.0",
+      "cargo_checksum": "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
+    },
+    "libz-sys": {
+      "version": "1.1.25",
+      "cargo_checksum": "d52f4c29e2a68ac30c9087e1b772dc9f44a2b66ed44edf2266cf2be9b03dafc1"
+    },
+    "lz4-sys": {
+      "version": "1.11.1+lz4-1.10.0",
+      "cargo_checksum": "6bd8c0d6c6ed0cd30b3652886bb8711dc4bb01d637a68105a3d5158039b418e6"
+    },
+    "lzma-sys": {
+      "version": "0.1.20",
+      "cargo_checksum": "5fda04ab3764e6cde78b9974eec4f779acaba7c4e84b36eca3cf77c581b85d27"
+    },
+    "native-tls": {
+      "version": "0.2.18",
+      "cargo_checksum": "465500e14ea162429d264d44189adc38b199b62b1c21eea9f69e4b73cb03bbf2"
+    },
+    "onig_sys": {
+      "version": "69.9.3",
+      "cargo_checksum": "1e68317604e77e53b85896388e1a803c1d21b74c899ec9e5e1112db90735edd7"
+    },
+    "ort-sys": {
+      "version": "2.0.0-rc.12",
+      "cargo_checksum": "d7b497d21a8b6fbb4b5a544f8fadb77e801a09ae0add9e411d31c6f89e3c1e90"
+    },
+    "ring": {
+      "version": "0.17.14",
+      "cargo_checksum": "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
+    },
+    "surrealdb-librocksdb-sys": {
+      "version": "0.18.3+11.0.0-4",
+      "cargo_checksum": "25b82a18c7fa4b57206784a1a31e7b942ae1d3e24493e0c733019a409b2b4bea"
+    },
+    "zstd-sys": {
+      "version": "2.0.16+zstd.1.5.7",
+      "cargo_checksum": "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+    }
+  },
+  "cached_dependency_source_sha256": {
+    "bindgen/Cargo.toml": "f72dfce465f8e986f51506cda6090d754057b55318712c6c13ef96230d9b1a42",
+    "bindgen/build.rs": "f7a10af0a21662e104e0058da7e3471a20be328eef6c7c41988525be90fdfe92",
+    "bzip2-sys/Cargo.toml": "a4c184b25d61fa988423fd3282c0da7637980ab92f81e8b14067f850e822ea0f",
+    "bzip2-sys/build.rs": "b114f9e57458c18d9dcd601064b1b74807ce02aeff230a3f68d117cee7b0de35",
+    "cc/Cargo.toml": "a671b5a305fd25f0fce300271ef1c58926322cac369299936ce961623505eadb",
+    "clang-sys/Cargo.toml": "db6730e270afa1f936b6f14264be0b0aaa506b88d91ab4805cf270595f3b568b",
+    "clang-sys/build.rs": "321ac62c88932a3831be9c96f526a21f65ea22df01639946bd0033d1bcf8900e",
+    "fastembed/Cargo.toml": "340bab21cafbbdfb4b4f1b107e18719b34be706ba86ed14e5d283108990db14a",
+    "libsqlite3-sys/Cargo.toml": "54d98d6bef7f15016cb6ffcf64fe7ab239e609d5ead0d8fdfa05384c57dcce29",
+    "libsqlite3-sys/build.rs": "5f1984827787b3e4777d89fb6626a4a0a3889fac875443cd074ebe5141ed7259",
+    "libz-sys/Cargo.toml": "c8487afe8697b099f2f96564b240c670fd3f501ab03e6727f053f828ea97e79f",
+    "libz-sys/build.rs": "f45e6fb4838dc8cad1611ff1f1c2dde3b5d39fe33afb0f131448995fe9aa0dd5",
+    "lz4-sys/Cargo.toml": "1acf81d8bef849aa6c9b814dba8063465f945ac600d32f31d56685ea90678be6",
+    "lz4-sys/build.rs": "1592aae45eff1403059337a9e81eedd5e7d48114b4e296936db011441cf90382",
+    "lzma-sys/Cargo.toml": "218151aecd8cf5073863c32a5ac2382d2d69cdfbea5f92b7bc08441016ea608c",
+    "lzma-sys/build.rs": "052d600babd2f95d9549f2b846e6dcf1e39b1c15d4fa6a293797ce1c85199e24",
+    "native-tls/Cargo.toml": "3cdcd2f06ca3cd71aac96d88f7048ce1dbd72440b5a76edc528054cdbb1db6dc",
+    "native-tls/build.rs": "cced9508b412b57c2a53478cd8dcf9ef39a945bab314e85e825a0f3adda22f14",
+    "onig_sys/Cargo.toml": "7915b8ec54838f11c7c66d26dfebe3d106e1ce5d8032690a45a5efe909062b85",
+    "onig_sys/build.rs": "7833a2821c019f9b972c9171331ccda59e5abab05d62e637517eb0747c737180",
+    "ort-sys/Cargo.toml": "9bb7e3dc7114adf359963906dcabe1c48483d44dc0e16774b81a60d0453eecb5",
+    "ort-sys/build/main.rs": "2262426efdf952d2e8b99aa4146316e586f28fc0a8c574de8ad551c8684a6f50",
+    "ort-sys/build/download/resolve.rs": "8b1ddc2680dffaa0d4c73820a1e64e7464c8d84bc64b9abe0621fbeecfb3fa5d",
+    "ort-sys/src/internal/dirs.rs": "3b879127a8fa86269783d0dd885e2416e4e1daa6a79f16abe2edd939006a2958",
+    "ring/Cargo.toml": "b81a19b27cc744410b056eb1d1195ecd41e25a163acadfca3c6457e96b797d3f",
+    "ring/build.rs": "9d1928ffb1d8e15766c1c1b9ead73e4b81a21703dd25f7c27b87842a2e6e9cee",
+    "surrealdb-librocksdb-sys/Cargo.toml": "545ac957aa097c0070d373603a005965db7578bb1863d663ed8bca8b8c4a9933",
+    "surrealdb-librocksdb-sys/build.rs": "ffa2814f774231384f8c348606a51af11e927e26c88dc53e8c430a90dfd5cb88",
+    "zstd-sys/Cargo.toml": "3f400eeb43f176bc78c2ec01d56125c1ccfea814f7c7ff81199573bdbd8d1f1a",
+    "zstd-sys/build.rs": "d92ade96b5f7c04496b1e928c564fcf52bb7d59439f56262407da77c5628458d"
+  },
+  "selected_recipe": {
+    "target": "aarch64-apple-darwin",
+    "package": "meerkat-recall-bin",
+    "default_features": true,
+    "features": [
+      "rocksdb",
+      "fastembed"
+    ],
+    "profile": "deploy",
+    "rust": "1.94.0",
+    "python": "3.12.12"
+  },
+  "onnx_download": {
+    "runtime": "1.24.2",
+    "url": "https://cdn.pyke.io/0/pyke:ort-rs/ms@1.24.2/aarch64-apple-darwin.tar.lzma2",
+    "sha256": "612739f75438dc0a075461e1fb454226b4a1eb175e60a7271ba966bbbb972cd4"
+  },
+  "not_installed_or_downloaded": [
+    "Rust1.94.0ARM64",
+    "Python3.12.12ARM64",
+    "nativeONNX",
+    "AppleCLT"
+  ],
+  "outstanding": [
+    "actual existing uv/rustup executable provenance and selected tool download URLs/hashes",
+    "actual Rust/Python/clang/Cargo executable hashes",
+    "actual selected CLT SDK/libclang/tool paths",
+    "source identity after final composition",
+    "original Mac START grant, ledger/device set and lane lock",
+    "actual Mach-O+ONNX minimum load commands and native build/resource observations"
+  ]
+}

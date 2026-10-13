@@ -1,0 +1,73 @@
+{
+  "format": "recall-gateway-proposal-delta/v1",
+  "status": "proposal-not-authorized",
+  "base_proposal_file": "primary-provider-proposal.json",
+  "base_proposal_sha256": "2745c63cd9826ddcb702565d1c0d97cac86056fda465525f2f07a12da879cc12",
+  "gateway_source_sha": "41cf48fc7caa5d64106644861bbb03b4e44a1215",
+  "corpus_canonical_sha256": "fa6a84149483d3511fd559ac9a13e89d6c1c041ae97d6f15084b52b7d7f21c1b",
+  "physical_provider_endpoint": "http://127.0.0.1:43129/v1",
+  "fixed_upstream_endpoint": "https://api.openai.com/v1",
+  "direct_endpoint_parity_claim": false,
+  "partition_configuration_records_physical_endpoint": true,
+  "output_cap_transform": {
+    "strict_default": "reject",
+    "proposed_opt_in_mode": "cap_at_16384",
+    "effective_output_token_ceiling": 16384,
+    "actual_extractor_requested_cap": 64000,
+    "separate_run_approval_reference_required": true,
+    "preserve_original_and_forwarded_bodies": true,
+    "record_requested_effective_caps_and_transform": true,
+    "repair_malformed_caps": false,
+    "change_product_default": false,
+    "relax_quality_when_truncated": false
+  },
+  "authenticated_quotas_per_backend": {
+    "embedding": 76,
+    "triage": 0,
+    "extraction": 56,
+    "support_verification": 56,
+    "summary": 8,
+    "promotion_and_identity_disambiguation": 4,
+    "truth_maintenance": 4,
+    "wiki_planner_writer_verifier": 12
+  },
+  "embedding_capability": {
+    "operations": ["document_embedding", "query_embedding"],
+    "one_active_profile_per_backend_and_space": true,
+    "separate_operation_quota_enforcement_claim": false,
+    "required_completed_dispatches_per_backend": {
+      "document_embedding": 28,
+      "query_embedding": 48
+    },
+    "coverage_evidence": "Original-operation worker receipts plus actual captured inputs; the combined budget counter cannot establish separate document/query coverage."
+  },
+  "capture": {
+    "synthetic_corpus_only": true,
+    "request_bytes_each": 131072,
+    "upstream_response_bytes_each": 8388608,
+    "request_copies_each": 2,
+    "maximum_body_bytes_both_backends": 3737124864,
+    "public_search_response_bytes": 262144,
+    "directories_mode": "0700",
+    "files_mode": "0600",
+    "retain_credential_headers": false,
+    "oversize_is_incomplete": true,
+    "completed_receipt_requires_body_fsync": true
+  },
+  "unchanged_global_limits": {
+    "dispatches_both_backends": 432,
+    "usd_stop_cap": "75.00",
+    "maximum_reserved_usd": "68.97467392",
+    "wall_time_seconds": 5400,
+    "max_concurrent_dispatches": 2,
+    "model_deadline_seconds": 120
+  },
+  "readiness": {
+    "token_framing_bound_qualified": false,
+    "installed_isolation_qualified": false,
+    "actual_role_binding_mapping_qualified": false,
+    "sdk_continuations_qualified": false,
+    "real_semantics_qualified": false
+  },
+  "execution_authorized": false
+}

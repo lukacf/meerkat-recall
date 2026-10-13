@@ -27,6 +27,7 @@ use crate::routes::entities::ApiError;
 /// State shared by the Living Wiki REST and browser routes.
 #[derive(Clone)]
 pub struct KnowledgeViewsState {
+    storage: StorageClient,
     views: KnowledgeViewRepository,
     definitions: KnowledgeViewDefinitionRepository,
     source_compiler: SourceViewCompiler,
@@ -38,6 +39,7 @@ impl KnowledgeViewsState {
     #[must_use]
     pub fn new(storage: StorageClient, authz: AuthzState) -> Self {
         Self {
+            storage: storage.clone(),
             views: KnowledgeViewRepository::new(storage.clone()),
             definitions: KnowledgeViewDefinitionRepository::new(storage.clone()),
             source_compiler: SourceViewCompiler::new(storage),
@@ -94,6 +96,9 @@ async fn list_views(
         .into_iter()
         .filter(|view| authorize_view(&state, &principal, view).is_ok())
         .collect::<Vec<_>>();
+    let views = current_views(&state, &principal, views)
+        .await
+        .map_err(|error| internal_error(&error))?;
     Ok(Json(KnowledgeViewList {
         total: views.len(),
         results: views,
@@ -130,6 +135,9 @@ async fn browse_index(
         .filter(is_published_wiki)
         .filter(|view| authorize_view(&state, &principal, view).is_ok())
         .collect::<Vec<_>>();
+    views = current_views(&state, &principal, views)
+        .await
+        .map_err(|error| html_internal_error(&error))?;
     let navigation = load_wiki_navigation(&state, &principal, &space_id)
         .await
         .map_err(|error| html_internal_error(&error))?;
@@ -236,10 +244,22 @@ async fn render_wiki_index_sections(
         {
             continue;
         }
-        let lead = state
-            .views
-            .get_current_revision(view)
-            .await?
+        let revision = state.views.get_current_revision(view).await?;
+        let revision = if let Some(revision) = revision {
+            elephant_storage::read_eligibility::ReadEligibility::new(state.storage.clone())
+                .project(revision, &|base| {
+                    super::current_read::authorized(
+                        &state.authz,
+                        principal,
+                        base,
+                        read_scope(view.kind),
+                    )
+                })
+                .await?
+        } else {
+            None
+        };
+        let lead = revision
             .filter(|revision| {
                 state
                     .authz
@@ -337,6 +357,9 @@ async fn browse_evidence_index(
         .filter(|view| view.kind == KnowledgeViewKind::Source)
         .filter(|view| authorize_view(&state, &principal, view).is_ok())
         .collect::<Vec<_>>();
+    let views = current_views(&state, &principal, views)
+        .await
+        .map_err(|error| html_internal_error(&error))?;
     let mut body = String::new();
     for view in &views {
         let _ = write!(
@@ -396,9 +419,18 @@ async fn browse_evidence_view(
         )
         .map_err(authz_error)
         .map_err(api_error_to_html)?;
+    let revision = super::current_read::require(
+        Some(&state.storage),
+        &state.authz,
+        &principal,
+        compiled.revision,
+        read_scope(compiled.view.kind),
+    )
+    .await
+    .map_err(api_error_to_html)?;
     document = KnowledgeViewDocument {
         view: compiled.view,
-        revision: compiled.revision,
+        revision,
     };
     let view = &document.view;
     let evidence_blocks = document
@@ -431,6 +463,9 @@ async fn browse_inspector_index(
         .into_iter()
         .filter(|view| authorize_view(&state, &principal, view).is_ok())
         .collect::<Vec<_>>();
+    let views = current_views(&state, &principal, views)
+        .await
+        .map_err(|error| html_internal_error(&error))?;
     let mut body = String::new();
     for view in &views {
         let _ = write!(
@@ -534,7 +569,44 @@ async fn load_document(
         .authz
         .authorize_record_read(principal, &revision, read_scope(view.kind))
         .map_err(authz_error)?;
+    let revision = super::current_read::require(
+        Some(&state.storage),
+        &state.authz,
+        principal,
+        revision,
+        read_scope(view.kind),
+    )
+    .await?;
     Ok(KnowledgeViewDocument { view, revision })
+}
+
+async fn current_views(
+    state: &KnowledgeViewsState,
+    principal: &AuthPrincipal,
+    views: Vec<KnowledgeView>,
+) -> elephant_storage::StorageResult<Vec<KnowledgeView>> {
+    let reader = elephant_storage::read_eligibility::ReadEligibility::new(state.storage.clone());
+    let mut current = Vec::new();
+    for view in views {
+        let Some(revision) = state.views.get_current_revision(&view).await? else {
+            continue;
+        };
+        if reader
+            .project(revision, &|base| {
+                super::current_read::authorized(
+                    &state.authz,
+                    principal,
+                    base,
+                    read_scope(view.kind),
+                )
+            })
+            .await?
+            .is_some()
+        {
+            current.push(view);
+        }
+    }
+    Ok(current)
 }
 
 #[allow(clippy::result_large_err)]
@@ -917,6 +989,7 @@ async fn load_planned_related_articles(
             related.push(target_view.clone());
         }
     }
+    let mut related = current_views(state, principal, related).await?;
     related.truncate(24);
     Ok(related)
 }
@@ -1126,11 +1199,33 @@ mod tests {
     use super::{escape_html, is_semantic_block, plain_statement_text};
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn source_http_document_requires_raw_scope() {
         use super::*;
         use elephant_storage::{Repository, SourceRepository};
         use elephant_types::records::{BaseFields, Source, SourceType};
         let storage = StorageClient::new_embedded().await.expect("storage");
+        let mut value = serde_json::to_value(BaseFields::new(
+            RecordId::new_v4(TableName::SpaceConfig),
+            "space".into(),
+            "fixture".into(),
+        ))
+        .expect("space fields");
+        value["embedding_provider"] = serde_json::json!("not-dispatched");
+        value["embedding_model"] = serde_json::json!("fixture");
+        value["embedding_dims"] = serde_json::json!(8);
+        value["processing"] = serde_json::Value::Null;
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(
+                serde_json::from_value::<elephant_types::records::SpaceConfig>(value)
+                    .expect("space config"),
+            )
+            .await
+            .expect("register fixture space");
+
         let source = Source::new(
             BaseFields::new(
                 RecordId::new_v4(TableName::Source),
@@ -1187,6 +1282,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn navigation_authorizes_complete_definition_and_rejects_legacy_scope() {
         use super::*;
         use elephant_types::records::base::Extractor;

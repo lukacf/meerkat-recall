@@ -484,33 +484,26 @@ impl BudgetEnforcer {
 
         let ledger_mode = ledger.mode;
         let ledger_date = ledger.date;
-        let mut updated = ledger;
-        updated.total_euros = actual_cost;
-        updated.total_tokens = actual_tokens;
-        updated.total_items = 1;
-        updated.total_runs = 1;
-        updated.total_failures = if success { 0 } else { 1 };
-        updated.reserved_euros = 0.0;
-        updated.reconciled_euros = actual_cost;
-
-        self.ledger_repo
-            .update(&self.space_id, ledger_id, updated)
-            .await
-            .map_err(PipelineError::StorageError)?;
-
         let guard_id = self.budget_guard_id(ledger_date, ledger_mode);
-        self.ledger_repo
-            .reconcile_budget_guard(
-                &guard_id,
+        let applied = self
+            .ledger_repo
+            .reconcile_attempt(
                 &self.space_id,
-                ledger_date,
-                ledger_mode,
-                reserved,
+                ledger_id,
+                &guard_id,
                 actual_cost,
+                actual_tokens,
                 success,
             )
             .await
             .map_err(PipelineError::StorageError)?;
+        if !applied {
+            return Ok(CostReconciliation {
+                reserved: 0.0,
+                actual: ledger.reconciled_euros,
+                overrun: None,
+            });
+        }
 
         if overrun > 0.0 {
             let totals = self
@@ -1583,6 +1576,53 @@ mod tests {
         assert!((reconciliation.reserved - 5.0).abs() < f64::EPSILON);
         assert!((reconciliation.actual - 4.5).abs() < f64::EPSILON);
         assert!(reconciliation.overrun.is_none());
+    }
+
+    async fn reconciliation_replay_contract(storage: StorageClient) {
+        let enforcer =
+            BudgetEnforcer::new(storage.clone(), make_budget(), "accounting".to_string());
+        let ledger = enforcer
+            .reserve_cost(IngestMode::Retrieval, "attempt", 5.0)
+            .await
+            .expect("reserve");
+        enforcer
+            .reconcile_cost(&ledger, 0.0, 0, false)
+            .await
+            .expect("zero usage");
+        enforcer
+            .reconcile_cost(&ledger, 0.0, 0, false)
+            .await
+            .expect("replay");
+        let repo = CostLedgerDailyRepository::new(storage);
+        let row = repo
+            .get("accounting", &ledger)
+            .await
+            .expect("ledger")
+            .expect("row");
+        assert_eq!(row.reserved_euros, 0.0);
+        assert_eq!(row.total_tokens, 0);
+        assert_eq!(row.total_runs, 1);
+        assert_eq!(row.total_failures, 1);
+        let guard_id = enforcer.budget_guard_id(row.date, row.mode);
+        let guard = repo
+            .get("accounting", &guard_id)
+            .await
+            .expect("guard")
+            .expect("guard row");
+        assert_eq!(guard.reserved_euros, 0.0);
+        assert_eq!(guard.total_runs, 1, "replay cannot charge guard twice");
+        assert_eq!(guard.total_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn embedded_zero_usage_reconciliation_is_atomic_and_idempotent() {
+        reconciliation_replay_contract(StorageClient::new_embedded().await.expect("embedded"))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn surreal_zero_usage_reconciliation_is_atomic_and_idempotent() {
+        reconciliation_replay_contract(StorageClient::new_memory().await.expect("surreal")).await;
     }
 
     #[tokio::test]

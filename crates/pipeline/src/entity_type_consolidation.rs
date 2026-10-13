@@ -7,15 +7,16 @@
 use std::collections::HashMap;
 
 use elephant_storage::{
-    EntityRepository, RelRepository, Repository, SearchCriteria, SearchRepository,
+    EntityRepository, RelRepository, SearchCriteria, SearchRepository, StorageClient,
 };
 use elephant_types::records::entity::EntityType;
 use elephant_types::records::rel::Rel;
 
 use crate::error::PipelineResult;
+use crate::maintenance_commit::{contains_authorization, PlanningTruthMaintenanceStorage};
 
 /// Configuration for entity type consolidation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EntityTypeConsolidationConfig {
     /// Maximum entities to process per sweep.
     pub max_entities: usize,
@@ -33,7 +34,7 @@ impl Default for EntityTypeConsolidationConfig {
 }
 
 /// Result of an entity type consolidation sweep.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConsolidationResult {
     /// Number of entities scanned.
     pub entities_scanned: usize,
@@ -48,59 +49,99 @@ pub struct ConsolidationResult {
 /// 1. Finds entities where entity_type is Topic (the default/unknown type).
 /// 2. For each entity, loads its relationships (outgoing + incoming).
 /// 3. Classifies based on relationship patterns.
-/// 4. Updates entity type via EntityRepository.
+/// 4. Commits classifications with their observed relationships atomically.
 ///
 /// # Errors
 ///
 /// Returns an error if storage operations fail.
 pub async fn execute_entity_type_sweep(
     entity_repo: &EntityRepository,
-    rel_repo: &RelRepository,
+    _rel_repo: &RelRepository,
     space_id: &str,
     config: &EntityTypeConsolidationConfig,
 ) -> PipelineResult<ConsolidationResult> {
-    // Find entities with entity_type = Topic (the catch-all/default type).
-    // These are candidates for reclassification.
+    // The retained repository-shaped entry uses the entity's owning store for
+    // every read and the one canonical commit, preventing cross-client writes.
+    let storage = entity_repo.storage_client();
+    let planning = PlanningTruthMaintenanceStorage::new(storage.clone(), space_id, None).await?;
+    let result = prepare_entity_type_sweep(&planning, storage, space_id, config).await?;
+    planning
+        .commit(
+            "entity_type_sweep",
+            space_id,
+            &serde_json::json!(config),
+            &result,
+        )
+        .await?;
+    Ok(result)
+}
+
+/// Stage classifications in the caller's original maintenance epoch.
+/// This helper neither writes live records nor commits the shared plan.
+pub(crate) async fn prepare_entity_type_sweep(
+    planning: &PlanningTruthMaintenanceStorage,
+    storage: &StorageClient,
+    space_id: &str,
+    config: &EntityTypeConsolidationConfig,
+) -> PipelineResult<ConsolidationResult> {
     let criteria = SearchCriteria::new()
         .with_space_id(space_id)
         .with_entity_type(EntityType::new("topic"))
         .with_limit(config.max_entities);
-
-    let search_result = entity_repo.search(&criteria).await?;
-
+    let live = EntityRepository::new(storage.clone())
+        .search(&criteria)
+        .await?
+        .results;
+    let entities = planning.current_rows(live, |row| {
+        row.entity_type == EntityType::new("topic")
+            && row.status == elephant_types::records::entity::EntityStatus::Active
+            && row.redirect_to.is_none()
+    })?;
+    let rel_repo = RelRepository::new(storage.clone());
     let mut result = ConsolidationResult {
-        entities_scanned: search_result.results.len(),
+        entities_scanned: 0,
         entities_classified: 0,
         entities_skipped: 0,
     };
-
-    for entity in search_result.results {
+    for entity in entities.into_iter().take(config.max_entities) {
+        result.entities_scanned += 1;
         let entity_id = &entity.base.id;
-
-        // Load outgoing and incoming relationships
-        let outgoing = rel_repo.find_outgoing(space_id, entity_id).await?;
-        let incoming = rel_repo.find_incoming(space_id, entity_id).await?;
-
-        let total_rels = outgoing.len() + incoming.len();
-        if total_rels < config.min_rels_for_classification {
+        let mut live = rel_repo.find_outgoing(space_id, entity_id).await?;
+        live.extend(rel_repo.find_incoming(space_id, entity_id).await?);
+        let relationships = planning.current_rows(live, |rel| {
+            rel.subject.id() == entity_id || rel.object.id() == entity_id
+        })?;
+        // A type inferred from a stricter partition must not become visible
+        // through a less restricted entity. Classification does not reclassify
+        // the entity's opaque policy; only authorized evidence contributes.
+        let mut outgoing = Vec::new();
+        let mut incoming = Vec::new();
+        for rel in relationships {
+            if !contains_authorization(&entity.base, &rel.base)? {
+                continue;
+            }
+            if rel.subject.id() == entity_id {
+                outgoing.push(rel.clone());
+            }
+            if rel.object.id() == entity_id {
+                incoming.push(rel);
+            }
+        }
+        if outgoing.len() + incoming.len() < config.min_rels_for_classification {
             result.entities_skipped += 1;
             continue;
         }
-
         match classify_from_relationships(&outgoing, &incoming) {
             Some(new_type) if new_type != entity.entity_type => {
-                // Update the entity type
                 let mut updated = entity.clone();
                 updated.entity_type = new_type;
-                entity_repo.update(space_id, entity_id, updated).await?;
+                updated.base.updated_at = chrono::Utc::now();
+                planning.stage(Some(entity), updated)?;
                 result.entities_classified += 1;
             }
-            _ => {
-                result.entities_skipped += 1;
-            }
+            _ => result.entities_skipped += 1,
         }
     }
-
     Ok(result)
 }
 
@@ -241,6 +282,131 @@ mod tests {
     use elephant_types::records::base::{BaseFields, Provenance, Security, SubjectsState};
     use elephant_types::records::rel::ClaimStatus;
     use elephant_types::{Link, RecordId};
+
+    async fn atomic_type_preparation(embedded: bool, stale: bool) {
+        use elephant_storage::{Repository, SpaceConfigRepository, SystemEventRepository};
+        use elephant_types::records::{Entity, SpaceConfig};
+        let storage = if embedded {
+            StorageClient::new_embedded().await
+        } else {
+            StorageClient::new_memory().await
+        }
+        .unwrap();
+        if !embedded {
+            storage
+                .query_checked(include_str!(
+                    "../../migrations/sql/031_source_publication.surql"
+                ))
+                .await
+                .unwrap();
+        }
+        SpaceConfigRepository::new(storage.clone())
+            .create(SpaceConfig {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    "test_space".into(),
+                    "test".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .unwrap();
+        let entities = EntityRepository::new(storage.clone());
+        let rels = RelRepository::new(storage.clone());
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::Entity),
+            "test_space".into(),
+            "test".into(),
+        );
+        base.subjects_state = SubjectsState::Complete;
+        let entity = entities
+            .create(Entity::new(
+                base,
+                EntityType::new("topic"),
+                "Type target".into(),
+            ))
+            .await
+            .unwrap();
+        let mut rel = make_rel("unclassified_relation");
+        rel.subject = Link::new(entity.base.id.clone());
+        let rel = rels.create(rel).await.unwrap();
+        let planning = PlanningTruthMaintenanceStorage::new(storage.clone(), "test_space", None)
+            .await
+            .unwrap();
+        let mut pending = rel.clone();
+        pending.rel_type = "works_at".into();
+        planning.stage(Some(rel.clone()), pending).unwrap();
+        let result = prepare_entity_type_sweep(
+            &planning,
+            &storage,
+            "test_space",
+            &EntityTypeConsolidationConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.entities_classified, 1,
+            "type pass must see earlier relation overlay"
+        );
+        assert_eq!(
+            entities
+                .get("test_space", &entity.base.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .entity_type,
+            EntityType::new("topic")
+        );
+        if stale {
+            let mut changed = rel.clone();
+            changed.rel_type = "later_concurrent_relation".into();
+            rels.update("test_space", &rel.base.id, changed)
+                .await
+                .unwrap();
+        }
+        let committed = planning
+            .commit(
+                "entity_type_sweep",
+                "test_space",
+                &serde_json::json!({"fixture":true}),
+                &result,
+            )
+            .await;
+        let persisted = entities
+            .get("test_space", &entity.base.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let events = SystemEventRepository::new(storage)
+            .list("test_space", 100, None)
+            .await
+            .unwrap();
+        if stale {
+            assert!(committed.is_err());
+            assert_eq!(persisted.entity_type, EntityType::new("topic"));
+            assert!(events.is_empty());
+        } else {
+            committed.unwrap();
+            assert_eq!(persisted.entity_type, EntityType::new("person"));
+            assert!(!events.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_type_sweep_uses_overlay_and_rejects_stale_commit() {
+        atomic_type_preparation(true, false).await;
+        atomic_type_preparation(true, true).await;
+    }
+    #[tokio::test]
+    async fn surreal_type_sweep_uses_overlay_and_rejects_stale_commit() {
+        atomic_type_preparation(false, false).await;
+        atomic_type_preparation(false, true).await;
+    }
 
     fn make_rel(rel_type: &str) -> Rel {
         let id = RecordId::new_v4(TableName::Rel);

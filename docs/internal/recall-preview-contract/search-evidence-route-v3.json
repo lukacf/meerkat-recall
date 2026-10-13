@@ -1,0 +1,55 @@
+{
+  "format": "recall-citation-route-literals/v3",
+  "source_review_only": true,
+  "product_acceptance": false,
+  "predecessor": {
+    "path": "examples-coordinate-v2.json",
+    "sha256": "efba2b27934b29439019a3896f4dd5cc8ed1dafcbc4f52d8f5f89e721a5f76b4"
+  },
+  "accepted_source_text": "The trial began in June.",
+  "accepted_source_sha256": "5ebe53800bbaf8c55ccacb174fd65bd20d3032cc78a872c1ea3abc0f7a3efaa3",
+  "citation": {
+    "source_id": "report-42",
+    "revision": "capture-42",
+    "internal_doc_revision_id": "doc_revision:22222222-2222-4222-8222-222222222222",
+    "span": {
+      "start": 0,
+      "end": 24
+    },
+    "quote": "The trial began in June.",
+    "rendered_span": {
+      "start": 0,
+      "end": 24
+    },
+    "rendered_quote_sha256": "5ebe53800bbaf8c55ccacb174fd65bd20d3032cc78a872c1ea3abc0f7a3efaa3",
+    "rendered_text_sha256": "bc8bf27049dafc2afb4137a8f049fbee2f1891934900b3e6ce3979548b0dd34d",
+    "doc_id": "doc:11111111-1111-4111-8111-111111111111"
+  },
+  "immutable_revision_expected_field_projection": {
+    "id": "doc_revision:22222222-2222-4222-8222-222222222222",
+    "doc": "doc:11111111-1111-4111-8111-111111111111",
+    "space_id": "research",
+    "text": "The trial began in June.\n",
+    "text_hash": "bc8bf27049dafc2afb4137a8f049fbee2f1891934900b3e6ce3979548b0dd34d",
+    "renderer": {
+      "name": "elephant.renderer.text",
+      "version": "1.0.0",
+      "config_hash": null
+    }
+  },
+  "immutable_revision_projection_is_complete_response": false,
+  "get": {
+    "method": "GET",
+    "path": "/v1/docs/doc:11111111-1111-4111-8111-111111111111/revisions/doc_revision:22222222-2222-4222-8222-222222222222",
+    "headers": {
+      "X-Space-Id": "research"
+    }
+  },
+  "limits": {
+    "http_search_response_json_bytes": 262144,
+    "mcp_inner_tool_response_json_bytes": 262144,
+    "mcp_outer_wire_limit_is_262144": false,
+    "qualification_collector_wire_bytes": 270336,
+    "immutable_revision_json_bytes": 12065536
+  }
+}

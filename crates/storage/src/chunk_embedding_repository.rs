@@ -137,6 +137,36 @@ pub struct NodeEmbeddingRepository {
     partition_manager: PartitionManager,
 }
 
+fn embedding_record_id(embedding: &NodeEmbedding) -> RecordId {
+    embedding_record_id_for(
+        embedding.node.id(),
+        &embedding.base.space_id,
+        &embedding.base.security,
+        &embedding.model,
+    )
+}
+
+/// Deterministic storage key shared by staged writes and publication coverage.
+#[must_use]
+pub(crate) fn embedding_record_id_for(
+    node: &RecordId,
+    space: &str,
+    security: &elephant_types::records::base::Security,
+    model: &str,
+) -> RecordId {
+    if !model.starts_with("recall:") {
+        return node.clone();
+    }
+    let identity = format!(
+        "{}:{}:{}:{}",
+        space, security.policy_id, security.level, model
+    );
+    RecordId::new(
+        elephant_types::TableName::ChunkEmbedding,
+        uuid::Uuid::new_v5(&node.id(), identity.as_bytes()),
+    )
+}
+
 impl NodeEmbeddingRepository {
     /// Creates a new chunk embedding repository.
     #[must_use]
@@ -222,7 +252,7 @@ impl NodeEmbeddingRepository {
                     let now = Utc::now();
                     let mut stored = Vec::with_capacity(embeddings.len());
                     for mut embedding in embeddings {
-                        embedding.base.id = embedding.node.id().clone();
+                        embedding.base.id = embedding_record_id(&embedding);
                         embedding.base.updated_at = now;
                         if mutation
                             .get::<NodeEmbedding>(
@@ -357,7 +387,196 @@ impl NodeEmbeddingRepository {
             return Ok(());
         }
 
+        self.store_embeddings_transaction(
+            space_id, node_ids, model, updated_at, embeddings, None, None, None,
+        )
+        .await
+    }
+
+    /// Persist active source-ingest vectors and node markers only under the
+    /// sealed manifest and original queue claim captured before inference.
+    ///
+    /// # Errors
+    /// Rejects superseded claims, changed source/configuration/manifest identity,
+    /// undeclared nodes, or vectors that do not match their captured partitions.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_source_embeddings_and_mark_nodes(
+        &self,
+        space_id: &str,
+        node_ids: &[RecordId],
+        model: &str,
+        updated_at: DateTime<Utc>,
+        embeddings: Vec<NodeEmbedding>,
+        authority: &crate::source_publication_manifest::SourceEmbeddingWriteAuthority,
+    ) -> StorageResult<()> {
+        if authority.space_id() != space_id {
+            return Err(StorageError::Conflict(
+                "source embedding belongs to another space".into(),
+            ));
+        }
+        // A sibling publication join may record pending dependencies while
+        // inference or partition preparation runs. A refused atomic commit can
+        // reconcile proven live progress without repeating inference. Every
+        // attempt retains the original whole-payload and authority fences.
+        authority
+            .commit_with_source_progress(&self.client, |authority| {
+                let embeddings = embeddings.clone();
+                async move {
+                    self.store_embeddings_transaction(
+                        space_id,
+                        node_ids,
+                        model,
+                        updated_at,
+                        embeddings,
+                        None,
+                        None,
+                        Some(&authority),
+                    )
+                    .await
+                }
+            })
+            .await
+            .map(|_| ())
+    }
+
+    // Deterministic tests inject sibling progress after the retry runner has
+    // reconciled and then enter this same atomic write path without reconciling
+    // a second time. This entry point is absent from production builds.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn store_source_embedding_transaction_for_test(
+        &self,
+        space_id: &str,
+        node_ids: &[RecordId],
+        model: &str,
+        updated_at: DateTime<Utc>,
+        embeddings: Vec<NodeEmbedding>,
+        authority: &crate::source_publication_manifest::SourceEmbeddingWriteAuthority,
+    ) -> StorageResult<()> {
+        self.store_embeddings_transaction(
+            space_id,
+            node_ids,
+            model,
+            updated_at,
+            embeddings,
+            None,
+            None,
+            Some(authority),
+        )
+        .await
+    }
+
+    /// Store target vectors without changing active node markers. Current content
+    /// epoch and pending profile are checked in the same transaction as the rows.
+    ///
+    /// # Errors
+    /// Rejects stale configuration, missing nodes or invalid target vectors.
+    pub async fn store_reindex_embeddings(
+        &self,
+        observed: &elephant_types::records::SpaceConfig,
+        embeddings: Vec<NodeEmbedding>,
+    ) -> StorageResult<()> {
+        self.store_reindex_embeddings_inner(observed, embeddings, None)
+            .await
+    }
+
+    /// Persist staged vectors only while the original reindex claim remains valid.
+    ///
+    /// # Errors
+    /// Also rejects expired, superseded or differently targeted queue claims.
+    pub async fn store_reindex_embeddings_with_attempt(
+        &self,
+        observed: &elephant_types::records::SpaceConfig,
+        embeddings: Vec<NodeEmbedding>,
+        attempt: &elephant_types::publication::AttemptFence,
+    ) -> StorageResult<()> {
+        self.store_reindex_embeddings_inner(observed, embeddings, Some(attempt))
+            .await
+    }
+
+    async fn store_reindex_embeddings_inner(
+        &self,
+        observed: &elephant_types::records::SpaceConfig,
+        embeddings: Vec<NodeEmbedding>,
+        attempt: Option<&elephant_types::publication::AttemptFence>,
+    ) -> StorageResult<()> {
+        let Some(first) = embeddings.first() else {
+            return Ok(());
+        };
+        let model = first.model.clone();
+        let processing = observed
+            .processing
+            .clone()
+            .ok_or_else(|| StorageError::Conflict("reindex processing missing".into()))?;
+        let resolved = elephant_types::provider_binding::ResolvedSpaceConfig {
+            token: elephant_types::provider_binding::SpaceConfigToken {
+                space_id: observed.base.space_id.clone(),
+                config_id: observed.base.id.to_string(),
+                generation: processing.generation,
+                policy_id: processing.policy_id.clone(),
+            },
+            processing,
+            purpose: observed.purpose.clone(),
+            skill: observed.skill.clone(),
+        };
+        let binding = resolved
+            .authorize(
+                &observed.base.space_id,
+                elephant_types::provider_binding::ModelOperation::ReindexEmbedding,
+                None,
+            )
+            .map_err(|error| StorageError::Conflict(error.to_string()))?;
+        let policy = elephant_embeddings::governed::policy_for_binding(&binding)
+            .map_err(|error| StorageError::Conflict(error.to_string()))?;
+        if model != policy.model
+            || embeddings.iter().any(|embedding| {
+                embedding.vector.len() != policy.dims
+                    || embedding.vector.iter().any(|value| !value.is_finite())
+            })
+        {
+            return Err(StorageError::Conflict(
+                "reindex vectors do not match target profile".into(),
+            ));
+        }
+        let ids: Vec<_> = embeddings
+            .iter()
+            .map(|embedding| embedding.node.id().clone())
+            .collect();
+        self.store_embeddings_transaction(
+            &observed.base.space_id,
+            &ids,
+            &model,
+            Utc::now(),
+            embeddings,
+            Some(observed),
+            attempt,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep source, reindex and unmanaged guards adjacent to all atomic vector/node writes on both backends."
+    )]
+    async fn store_embeddings_transaction(
+        &self,
+        space_id: &str,
+        node_ids: &[RecordId],
+        model: &str,
+        updated_at: DateTime<Utc>,
+        embeddings: Vec<NodeEmbedding>,
+        reindex: Option<&elephant_types::records::SpaceConfig>,
+        attempt: Option<&elephant_types::publication::AttemptFence>,
+        source: Option<&crate::source_publication_manifest::SourceEmbeddingWriteAuthority>,
+    ) -> StorageResult<()> {
         Self::validate_embedding_batch(space_id, node_ids, model, &embeddings)?;
+        let unmanaged = if source.is_none() && reindex.is_none() {
+            crate::unmanaged_embedding::prepare(&self.client, space_id, node_ids).await?
+        } else {
+            Vec::new()
+        };
 
         if let Some(store) = self.client.embedded_store() {
             let space_id = space_id.to_string();
@@ -365,6 +584,36 @@ impl NodeEmbeddingRepository {
             let model = model.to_string();
             return store
                 .mutate(|mutation| {
+                    crate::unmanaged_embedding::check_tx(mutation, &space_id, &unmanaged)?;
+                    if let Some(source) = source {
+                        crate::source_publication_manifest::check_embedding_write_tx(
+                            mutation,
+                            source,
+                            &node_ids,
+                            &model,
+                            &embeddings,
+                        )?;
+                    }
+                    if let Some(observed) = reindex {
+                        if let Some(attempt) = attempt {
+                            crate::reindex_guard::check(mutation, observed, attempt)?;
+                        }
+                        let current = mutation
+                            .get::<elephant_types::records::SpaceConfig>(
+                                space_id.as_str(),
+                                &observed.base.id,
+                                false,
+                            )?
+                            .ok_or_else(|| {
+                                StorageError::Conflict("reindex space removed".into())
+                            })?;
+                        if current.processing != observed.processing {
+                            return Err(StorageError::Conflict(
+                                "reindex configuration/content changed".into(),
+                            ));
+                        }
+                    }
+
                     for (node_id, mut embedding) in node_ids.into_iter().zip(embeddings) {
                         let Some(mut node) = mutation.get::<DocNode>(&space_id, &node_id, true)?
                         else {
@@ -378,11 +627,13 @@ impl NodeEmbeddingRepository {
                             )));
                         }
 
-                        node.embedding_model = Some(model.clone());
-                        node.base.updated_at = updated_at;
-                        let _ = mutation.replace(node)?;
+                        if reindex.is_none() {
+                            node.embedding_model = Some(model.clone());
+                            node.base.updated_at = updated_at;
+                            let _ = mutation.replace(node)?;
+                        }
 
-                        embedding.base.id = embedding.node.id().clone();
+                        embedding.base.id = embedding_record_id(&embedding);
                         embedding.base.updated_at = updated_at;
                         if mutation
                             .get::<NodeEmbedding>(
@@ -402,6 +653,19 @@ impl NodeEmbeddingRepository {
                 .await;
         }
 
+        let mut sql = String::from("BEGIN TRANSACTION;\n");
+        let mut bindings = BTreeMap::<String, surrealdb::sql::Value>::new();
+        crate::unmanaged_embedding::append_sql(&mut sql, &mut bindings, space_id, &unmanaged);
+        if let Some(source) = source {
+            crate::source_publication_manifest::append_embedding_write_sql(
+                &mut sql,
+                &mut bindings,
+                source,
+                node_ids,
+                model,
+                &embeddings,
+            )?;
+        }
         let mut ensured_partitions = HashSet::new();
         let mut prepared = Vec::with_capacity(embeddings.len());
 
@@ -441,13 +705,11 @@ impl NodeEmbeddingRepository {
                 table_name,
                 surrealdb::sql::Id::Uuid(embedding.node.id().id().into()),
             ));
-            embedding.base.id = embedding.node.id().clone();
+            embedding.base.id = embedding_record_id(&embedding);
             embedding.base.updated_at = updated_at;
             prepared.push((embedding, embedding_id, f64::from(vector_norm)));
         }
 
-        let mut sql = String::from("BEGIN TRANSACTION;\n");
-        let mut bindings = BTreeMap::<String, surrealdb::sql::Value>::new();
         bindings.insert(
             "space_id".to_string(),
             surrealdb::sql::Value::from(space_id.to_string()),
@@ -461,16 +723,46 @@ impl NodeEmbeddingRepository {
             surrealdb::sql::Value::from(crate::surreal::datetime_from_chrono(updated_at)),
         );
 
+        if let Some(observed) = reindex {
+            if let Some(attempt) = attempt {
+                crate::reindex_guard::append(&mut sql, &mut bindings, observed, attempt)?;
+            }
+            let processing = observed
+                .processing
+                .as_ref()
+                .ok_or_else(|| StorageError::Conflict("reindex configuration missing".into()))?;
+            bindings.insert(
+                "reindex_config_id".into(),
+                crate::surreal::thing_from_record_id(&observed.base.id).into(),
+            );
+            bindings.insert(
+                "reindex_processing".into(),
+                crate::surreal::stored_native_value(crate::surreal::json_to_surreal(
+                    serde_json::to_value(processing)
+                        .map_err(|error| StorageError::SerializationError(error.to_string()))?,
+                )?),
+            );
+            // Dynamic emb__ partitions have no canonical-predicate event. A
+            // no-op config UPDATE can skip the native KV write, so it cannot
+            // fence concurrent approval/content changes. Share the existing
+            // epoch writer used by real space-config changes in migration 031.
+            sql.push_str("LET $reindex_guard = (SELECT * FROM ONLY $reindex_config_id WHERE space_id = $space_id AND processing = $reindex_processing AND deleted_at IS NONE);\nIF $reindex_guard = NONE { THROW 'reindex configuration/content changed'; };\nLET $reindex_epoch_guard = (UPDATE ONLY type::thing('canonical_epoch', $space_id) SET epoch = <string>rand::uuid() WHERE space_id = $space_id RETURN AFTER);\nIF $reindex_epoch_guard = NONE { THROW 'reindex canonical epoch missing'; };\n");
+        }
+
         for (idx, (node_id, (embedding, embedding_id, vector_norm))) in
             node_ids.iter().zip(prepared.into_iter()).enumerate()
         {
             let prefix = format!("embedding_{idx}");
             let node_id_key = format!("node_id_{idx}");
             let updated_key = format!("updated_node_{idx}");
-            let _ = writeln!(
-                sql,
-                "LET ${updated_key} = (UPDATE ONLY ${node_id_key} MERGE {{ embedding_model: $model, updated_at: $updated_at }} RETURN AFTER);"
-            );
+            if reindex.is_some() {
+                let _ = writeln!(
+                    sql,
+                    "LET ${updated_key} = (SELECT * FROM ONLY ${node_id_key});"
+                );
+            } else {
+                let _ = writeln!(sql, "LET ${updated_key} = (UPDATE ONLY ${node_id_key} MERGE {{ embedding_model: $model, updated_at: $updated_at }} RETURN AFTER);");
+            }
             let _ = writeln!(
                 sql,
                 "IF ${updated_key} = NONE OR ${updated_key}.space_id != $space_id OR ${updated_key}.deleted_at != NONE {{ THROW 'DocNode not found in space: {node_id}'; }};"
@@ -1033,6 +1325,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep revision_repo, node_repo, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn exercise_partition_vector_search(client: StorageClient) {
         let revision_repo = DocRevisionRepository::new(client.clone());
         let node_repo = DocNodeRepository::new(client.clone());
@@ -1178,6 +1474,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_partition_vector_search_plan_uses_the_hnsw_index() {
         let client = StorageClient::new_memory()
             .await
@@ -1224,6 +1524,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_hit_lookups_fetch_records_without_scanning_tables() {
         let client = StorageClient::new_memory()
             .await
@@ -1267,6 +1571,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_orphan_rows_still_count_toward_a_full_window() {
         let client = StorageClient::new_memory()
             .await
@@ -1299,6 +1607,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, revision_repo, node_repo, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_fake_embedding_purge_resets_only_ramp_vectors_once() {
         use elephant_embeddings::{EmbeddingProvider, FakeEmbeddingProvider};
 
@@ -1391,6 +1703,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, revision_repo, node_repo, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_store_embeddings_and_mark_nodes_rejects_mismatched_node_ids() {
         let client = crate::StorageClient::new_embedded()
             .await
@@ -1433,6 +1749,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, revision_repo, node_repo, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_store_embeddings_and_mark_nodes_rejects_space_mismatch() {
         let client = crate::StorageClient::new_embedded()
             .await
@@ -1471,6 +1791,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, revision_repo, node_repo, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_store_embeddings_and_mark_nodes_rejects_model_mismatch() {
         let client = crate::StorageClient::new_embedded()
             .await
@@ -1509,5 +1833,34 @@ mod tests {
             .expect("load node")
             .expect("node exists");
         assert!(node_after.embedding_model.is_none());
+    }
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repository in the original fixture scope through assertions and cleanup."
+    )]
+    async fn embedded_staging_keeps_distinct_profiles_for_the_same_node() {
+        let client = StorageClient::new_embedded().await.unwrap();
+        let repository = NodeEmbeddingRepository::new(client.clone(), PartitionManager::new());
+        let node_id = RecordId::new_v4(TableName::DocNode);
+        let mut original = make_test_embedding("space", &node_id);
+        original.model = "recall:old-profile".into();
+        let mut replacement = original.clone();
+        replacement.model = "recall:new-profile".into();
+        replacement.vector = vec![0.0, 1.0, 0.0];
+        repository.store_embedding(original.clone()).await.unwrap();
+        repository.store_embedding(replacement).await.unwrap();
+        let rows = client
+            .embedded_store()
+            .unwrap()
+            .scan::<NodeEmbedding>()
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|row| row.model == original.model && row.vector == original.vector));
+        assert_ne!(rows[0].base.id, rows[1].base.id);
+        assert_eq!(rows[0].node.id(), rows[1].node.id());
     }
 }

@@ -1,0 +1,48 @@
+{
+  "format": "recall-ignored-offline-source-delta/v1",
+  "from_source": "d3e8f8852981b19366e18d696e248b83976aecba",
+  "to_source": "988af6f38bd773127d0ea7d0f2044191cae897c8",
+  "source_only": true,
+  "executed_by_qualification": false,
+  "original_inventory_sha256": "709b2826cf35d8ad1e3af76e2da8ff6d5d134f26d26f4a56de05ba4d2cfbaab8",
+  "regular_filter_sha256": "a8a5ac9f51fc593e5635069e21a961f9bc6b8ebb326d4d8f533dbfc1e7840c7c",
+  "scale_filter_sha256": "3e694202e4f76d9fe80668d785b8eef36b4aed6fc76982c5138ad85e34595405",
+  "counts_unchanged": {
+    "regular": 85,
+    "scale": 4,
+    "excluded_live": 12
+  },
+  "changed_files": [
+    {
+      "path": "crates/storage/src/client.rs",
+      "old_sha256": "f0d9b18b20a96e65c5fef98ea4598add467293701e9445a18b8f74bd55cbf3e6",
+      "new_sha256": "006b262ceed05941b6db83a629f0ce52d9bdb31b77568fc7fdb98a678b5b7b1e"
+    },
+    {
+      "path": "tests/e2e/src/api/identity_test.rs",
+      "old_sha256": "75f3157f9f47d8101cb0ace282fca82f82d4b10c41cd76af8492d7f8d9ec5664",
+      "new_sha256": "b3751abc4b59c9aef48c7efd639cdaab4011a2a5d172e368745ccbb2b97a1ee6"
+    },
+    {
+      "path": "tests/e2e/src/grounded_source_fixture.rs",
+      "old_sha256": "99ca9710ffbbbca04c65ef5f473c614f40c33ca9956c61ce921dbe2abf90b22b",
+      "new_sha256": "c249895baa23a77c15941806e9ef3b40516b1a08e2ee7e88101f16e2a3b4e95b"
+    },
+    {
+      "path": "tests/e2e/src/pipeline_driver.rs",
+      "old_sha256": "e93b06c92fd4e5913755977441ddfd847a3740e0b70641e5413702d5f040375d",
+      "new_sha256": "1f0ad23bf25e41c9f5d665390dd81dbb36a83249212c5e32f92ec387631f080d"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/mod.rs",
+      "old_sha256": "376a726ebc74798cf216da5792ef92d49d3caae50774510e9e1c47cf2f6f74f9",
+      "new_sha256": "0d25d36b840fefa27c3006d2f8798add6d7834db66f8718a26a6be03eb055904"
+    },
+    {
+      "path": "tests/recall_preview_semantics/provider_spy.rs",
+      "old_sha256": "751708b5e58739a4f1552b6b319375955fa3c7d1b41e91e6948a815e63f6215e",
+      "new_sha256": "39a92937901578cdcf1fae4c0dfc2e01ac47fe8495392b6ca2efe677e857425b"
+    }
+  ],
+  "review": "Six changed selected sources/helpers retain only in-process memory/local-spy behavior: client adds native restore module; identity extension fixture adds original envelope; shared grounded fixture separates actual acceptance/claimed execution and tightens support; pipeline_driver retains original claim/run and bounded passes; scenario helper registers explicit fake metadata config; provider spy records all local wrong-path/malformed requests and validates explicit terminal failure. The local generation endpoint is normalized for SDK Anthropic path, not changed to an external provider. No selected ignored methods or test attributes changed. Existing synthetic vectors are never semantic quality proof. No new required external credential/server."
+}

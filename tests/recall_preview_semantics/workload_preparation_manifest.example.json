@@ -1,0 +1,43 @@
+{
+  "format": "recall-workload-preparation/v1",
+  "execution_authorized": false,
+  "provider_dispatch_authorized": false,
+  "phase": "preparation",
+  "backend": "REPLACE_BACKEND",
+  "nonce": "REPLACE_FRESH_COHORT_NONCE",
+  "fixture_timestamp": "2026-10-07T00:00:00Z",
+  "endpoint": "http://127.0.0.1:REPLACE_ALLOCATED_PORT",
+  "source_commit": "REPLACE_EXACT_SOURCE_SHA",
+  "artifact_sha256": "REPLACE_EXACT_ARCHIVE_SHA256",
+  "binary_sha256": "REPLACE_EXACT_BINARY_SHA256",
+  "output_directory": "/absolute/new-private-preparation-captures",
+  "space_credentials": {
+    "qualification-household": "service",
+    "qualification-business": "service"
+  },
+  "credential_files": {
+    "service": "/absolute/private/service-token"
+  },
+  "review_path": "/absolute/D-preparation-review.json",
+  "review_sha256": "REPLACE_EXACT_SHA256",
+  "contract_path": "/absolute/D-workload-contract.json",
+  "contract_sha256": "REPLACE_EXACT_SHA256",
+  "corpus_path": "/absolute/D-workload-corpus.json",
+  "corpus_sha256": "REPLACE_EXACT_SHA256",
+  "rendered_map_path": "/absolute/D-workload-rendered-map.json",
+  "rendered_map_sha256": "9dbcade15daa3fb504838c2fe4f743b4b5fc37da20b2c0f29e2e3aea49ad57ab",
+  "provider_allocation_path": "/absolute/SEPARATE-G-D28-allocation.json",
+  "provider_allocation_sha256": "REPLACE_EXACT_SHA256",
+  "provider_bridge_path": "/absolute/joined-source/tests/recall_preview_semantics/gateway/cohort_bridge.py",
+  "provider_bridge_sha256": "REPLACE_INDEPENDENTLY_REVIEWED_G_SHA256",
+  "installed_runtime_evidence_path": "/absolute/independently-qualified-installed-runtime-evidence.json",
+  "installed_runtime_evidence_sha256": "REPLACE_EXACT_SHA256",
+  "expected_configurations_path": "/absolute/D-reviewed-exact-configurations-and-input-envelopes.json",
+  "expected_configurations_sha256": "REPLACE_EXACT_SHA256",
+  "expires_at": "REPLACE_ORIGINAL_ALLOCATION_DEADLINE",
+  "provider_phase": "preparation",
+  "preparation_contract_path": "/absolute/D-workload-preparation-contract.json",
+  "preparation_contract_sha256": "b1fd4c43e1c8c506ca13e261a29d65a7d06246bf11ef53c02e97945cd3ef56d1",
+  "typed_delta_path": "/absolute/D-workload-allocation-typed-delta.json",
+  "typed_delta_sha256": "51b34aec951d783a93b903a1468fba9a8833ba2f31f705bd784c66c9b26688f8"
+}

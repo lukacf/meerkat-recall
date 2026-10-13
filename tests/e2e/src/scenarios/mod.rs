@@ -62,3 +62,31 @@ pub mod s5_6_pipeline_status;
 pub mod s5_7_search_all;
 pub mod s5_8_file_ingestion;
 pub mod s5_9_tool_introspection;
+
+/// Explicit named-space fixture for scenarios that exercise public admission.
+/// Production admission must continue to refuse unregistered spaces.
+#[cfg(test)]
+pub(crate) async fn register_scenario_space(
+    storage: &elephant_storage::StorageClient,
+    space: &str,
+) -> anyhow::Result<()> {
+    use elephant_storage::Repository;
+    use elephant_types::records::{base::BaseFields, SpaceConfig};
+    use elephant_types::{RecordId, TableName};
+    elephant_storage::SpaceConfigRepository::new(storage.clone())
+        .create(SpaceConfig {
+            base: BaseFields::new(
+                RecordId::new_v4(TableName::SpaceConfig),
+                space.into(),
+                "scenario-fixture".into(),
+            ),
+            embedding_provider: "fake".into(),
+            embedding_model: "fixture".into(),
+            embedding_dims: 8,
+            processing: None,
+            purpose: None,
+            skill: None,
+        })
+        .await?;
+    Ok(())
+}

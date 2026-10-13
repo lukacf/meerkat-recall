@@ -200,6 +200,47 @@ mod tests {
     use crate::ids::{RecordId, TableName};
 
     #[test]
+    fn revision_authorization_preserves_its_own_subject_completeness() {
+        use crate::records::{HasSecurity, SubjectsState};
+
+        let subject = Link::new(RecordId::new_v4(TableName::Entity));
+        for state in [
+            SubjectsState::Unknown,
+            SubjectsState::Partial,
+            SubjectsState::Complete,
+        ] {
+            let mut base = BaseFields::new(
+                RecordId::new_v4(TableName::DocRevision),
+                "classified-space".into(),
+                "renderer".into(),
+            );
+            base.security.level = 7;
+            base.security.labels = vec!["private".into()];
+            base.subjects = vec![subject.clone()];
+            base.subjects_state = state;
+            let revision = DocRevision {
+                base,
+                doc: Link::new(RecordId::new_v4(TableName::Doc)),
+                text: "private revision".into(),
+                text_hash: "fixture".into(),
+                renderer: RendererMetadata {
+                    name: "fixture".into(),
+                    version: "1".into(),
+                    config_hash: None,
+                },
+                manifest: None,
+                supersedes: None,
+                status: RevisionStatus::Active,
+                rendered_at: Utc::now(),
+            };
+            assert_eq!(revision.space_id(), "classified-space");
+            assert_eq!(revision.security(), &revision.base.security);
+            assert_eq!(revision.subjects(), vec![subject.clone()]);
+            assert_eq!(revision.subjects_state(), state);
+        }
+    }
+
+    #[test]
     fn test_revision_status_roundtrip() {
         for status in [
             RevisionStatus::Active,

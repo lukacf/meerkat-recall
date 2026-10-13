@@ -15,9 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use elephant_storage::canonical_commit::CanonicalRecord;
+use elephant_storage::public_mutation::{inherit_public_envelope, PublicMutation};
 use elephant_storage::{
-    parse_id, AssertionRepository, PredicateAliasRepository, PredicateRegistryRepository,
-    RelRepository, Repository, StorageClient, StorageError,
+    parse_id, PredicateAliasRepository, PredicateRegistryRepository, RelRepository, Repository,
+    StorageClient,
 };
 use elephant_types::ids::{RecordId, TableName};
 use elephant_types::records::assertion::{
@@ -34,6 +36,112 @@ use crate::error::{McpError, McpResult};
 use crate::tools::ToolResponse;
 
 use super::{BatchError, ToolContext, ToolHandler};
+
+fn mutation_actor(ctx: &ToolContext) -> &str {
+    ctx.verified_caller()
+        .map_or("trusted:mcp", |caller| caller.claims().sub.as_str())
+}
+
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original handler ownership, future shape, and call ordering."
+)]
+async fn authorize_relationship_endpoints(
+    ctx: &ToolContext,
+    mutation: &mut PublicMutation,
+    rel: &mut Rel,
+    inherit: bool,
+) -> McpResult<()> {
+    let original = rel.base.clone();
+    let mut candidate = rel.base.clone();
+    let repo = elephant_storage::EntityRepository::new(ctx.storage.clone());
+    for (index, id) in [rel.subject.id(), rel.object.id()].into_iter().enumerate() {
+        let entity = repo
+            .get(&ctx.principal.space_id, id)
+            .await?
+            .ok_or_else(|| {
+                McpError::InvalidParameters(
+                    "relationship endpoint is not live in selected space".into(),
+                )
+            })?;
+        ctx.authz
+            .authorize_record_read(&ctx.principal, &entity, "read:entity")
+            .map_err(McpError::ExecutionError)?;
+        if inherit && index == 0 && rel.evidence.is_empty() {
+            candidate.security = entity.base.security.clone();
+        }
+        inherit_public_envelope(&mut candidate, &entity.base)?;
+        mutation.depend_on(CanonicalRecord::Entity(Box::new(entity)));
+    }
+    for evidence in &rel.evidence {
+        let assertion = if let Some(assertion) = mutation.staged_assertion(evidence.assertion.id())
+        {
+            assertion.clone()
+        } else {
+            let assertion = elephant_storage::AssertionRepository::new(ctx.storage.clone())
+                .get(&ctx.principal.space_id, evidence.assertion.id())
+                .await?
+                .ok_or_else(|| {
+                    McpError::InvalidParameters(
+                        "relationship assertion is not live in selected space".into(),
+                    )
+                })?;
+            mutation.depend_on(CanonicalRecord::Assertion(Box::new(assertion.clone())));
+            assertion
+        };
+        ctx.authz
+            .authorize_record_read(&ctx.principal, &assertion, "read:assertion")
+            .map_err(McpError::ExecutionError)?;
+        if assertion.evidence != evidence.span {
+            return Err(McpError::InvalidParameters(
+                "relationship span differs from referenced assertion".into(),
+            ));
+        }
+        mutation
+            .observe_relationship_assertion(rel, &assertion)
+            .await
+            .map_err(|error| McpError::InvalidParameters(error.to_string()))?;
+        let (doc, revision, node) = mutation.observe_evidence(&evidence.span).await?;
+        ctx.authz
+            .authorize_record_read(&ctx.principal, &doc, "read:doc:raw")
+            .map_err(McpError::ExecutionError)?;
+        ctx.authz
+            .authorize_record_read(&ctx.principal, &revision, "read:doc:raw")
+            .map_err(McpError::ExecutionError)?;
+        inherit_public_envelope(&mut candidate, &assertion.base)?;
+        inherit_public_envelope(&mut candidate, &doc.base)?;
+        inherit_public_envelope(&mut candidate, &revision.base)?;
+        if let Some(node) = &node {
+            ctx.authz
+                .authorize_record_read(&ctx.principal, node, "read:doc:raw")
+                .map_err(McpError::ExecutionError)?;
+            inherit_public_envelope(&mut candidate, &node.base)?;
+        }
+        if let Some(source) = &doc.source {
+            if !candidate.provenance.sources.contains(source.id()) {
+                candidate.provenance.sources.push(source.id().clone());
+            }
+        }
+    }
+    if inherit {
+        rel.base = candidate;
+    } else if original.security != candidate.security
+        || original.subjects != candidate.subjects
+        || original.subjects_state != candidate.subjects_state
+    {
+        return Err(McpError::InvalidParameters(
+            "relationship envelope does not cover endpoint restrictions".into(),
+        ));
+    }
+    ensure_predicate_registered(
+        &ctx.storage,
+        &ctx.principal.space_id,
+        &rel.rel_type,
+        &rel.base,
+        mutation,
+    )
+    .await
+}
 
 // ============================================================================
 // Input/Output Types
@@ -66,7 +174,7 @@ pub struct RelateEntitiesInput {
     /// Evidence quote text supporting this relationship (optional).
     #[serde(default)]
     pub evidence_text: Option<String>,
-    /// Evidence source record ID (e.g., `source:...`) or external reference (optional).
+    /// Immutable document revision ID containing the exact evidence quote (optional).
     #[serde(default)]
     pub evidence_source: Option<String>,
     /// Space ID.
@@ -84,10 +192,15 @@ fn sha256_hex_prefixed(input: &str) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
-async fn canonicalize_and_register_rel_type(
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original handler ownership, future shape, and call ordering."
+)]
+async fn canonicalize_rel_type(
     storage: &StorageClient,
     space_id: &str,
     rel_type: &str,
+    mutation: &mut PublicMutation,
 ) -> McpResult<String> {
     let trimmed = rel_type.trim();
     if trimmed.is_empty() {
@@ -97,38 +210,48 @@ async fn canonicalize_and_register_rel_type(
     }
 
     let alias_repo = PredicateAliasRepository::new(storage.clone());
-    let canonical = alias_repo
+    let alias = alias_repo
         .find_active_by_raw(space_id, trimmed)
         .await
-        .map_err(|e| McpError::ExecutionError(e.to_string()))?
-        .map_or_else(|| trimmed.to_string(), |alias| alias.predicate_id);
-
-    ensure_predicate_registered(storage, space_id, &canonical).await?;
-    Ok(canonical)
+        .map_err(McpError::StorageError)?;
+    if let Some(alias) = alias {
+        let canonical = alias.predicate_id.clone();
+        mutation.depend_on(CanonicalRecord::PredicateAlias(Box::new(alias)));
+        Ok(canonical)
+    } else {
+        Ok(trimmed.to_owned())
+    }
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original handler ownership, future shape, and call ordering."
+)]
 async fn ensure_predicate_registered(
     storage: &StorageClient,
     space_id: &str,
     predicate_id: &str,
+    envelope: &BaseFields,
+    mutation: &mut PublicMutation,
 ) -> McpResult<()> {
     let predicate_repo = PredicateRegistryRepository::new(storage.clone());
-    if predicate_repo
+    if let Some(predicate) = predicate_repo
         .find_by_predicate_id(space_id, predicate_id)
         .await
-        .map_err(|e| McpError::ExecutionError(e.to_string()))?
-        .is_some()
+        .map_err(McpError::StorageError)?
     {
+        mutation.depend_on(CanonicalRecord::PredicateRegistry(Box::new(predicate)));
         return Ok(());
     }
 
     let now = Utc::now();
+    let mut base = envelope.clone();
+    base.id = RecordId::new_v4(TableName::PredicateRegistry);
+    base.created_at = now;
+    base.updated_at = now;
+    base.deleted_at = None;
     let predicate = PredicateRegistry {
-        base: BaseFields::new(
-            RecordId::new_v4(TableName::PredicateRegistry),
-            space_id.to_string(),
-            "mcp_relationship_write".to_string(),
-        ),
+        base,
         predicate_id: predicate_id.to_string(),
         description: None,
         status: "active".to_string(),
@@ -139,10 +262,8 @@ async fn ensure_predicate_registered(
         last_used_at: Some(now),
     };
 
-    match predicate_repo.create(predicate).await {
-        Ok(_) | Err(StorageError::Conflict(_)) => Ok(()),
-        Err(e) => Err(McpError::ExecutionError(e.to_string())),
-    }
+    mutation.stage_create(CanonicalRecord::PredicateRegistry(Box::new(predicate)))?;
+    Ok(())
 }
 
 /// Input for `upsert_relationship` tool.
@@ -200,76 +321,111 @@ fn make_entity_link(id: &str) -> Link<elephant_types::records::Entity> {
     Link::new(record_id)
 }
 
-fn revision_id_for_evidence_source(source: Option<&str>) -> RecordId {
-    let Some(source) = source else {
-        return RecordId::new_v4(TableName::DocRevision);
-    };
-
-    source
-        .parse::<RecordId>()
-        .ok()
-        .filter(|rid| rid.table() == TableName::DocRevision)
-        .unwrap_or_else(|| RecordId::new_v4(TableName::DocRevision))
-}
-
-fn evidence_span_for_manual_quote(
+async fn evidence_span_for_manual_quote(
+    ctx: &ToolContext,
+    mutation: &mut PublicMutation,
     evidence_source: Option<&str>,
     evidence_text: &str,
-) -> McpResult<EvidenceSpan> {
-    let end: u32 = evidence_text
-        .len()
-        .try_into()
-        .map_err(|_| McpError::InvalidParameters("evidence_text too large".to_string()))?;
-
-    Ok(EvidenceSpan {
-        revision: Link::new(revision_id_for_evidence_source(evidence_source)),
-        node: None,
-        start: 0,
-        end,
-        quote_hash: sha256_hex_prefixed(evidence_text),
-    })
+) -> McpResult<(EvidenceSpan, BaseFields)> {
+    let source = evidence_source.ok_or_else(|| {
+        McpError::InvalidParameters(
+            "evidence_source must identify an immutable document revision".into(),
+        )
+    })?;
+    let revision_id = parse_id(source, TableName::DocRevision)
+        .map_err(|error| McpError::InvalidParameters(error.to_string()))?;
+    let revision = elephant_storage::DocRevisionRepository::new(ctx.storage.clone())
+        .get(&ctx.principal.space_id, &revision_id)
+        .await?
+        .ok_or_else(|| {
+            McpError::InvalidParameters("evidence revision not found in selected space".into())
+        })?;
+    let doc = elephant_storage::DocRepository::new(ctx.storage.clone())
+        .get(&ctx.principal.space_id, revision.doc.id())
+        .await?
+        .ok_or_else(|| McpError::InvalidParameters("evidence document is not live".into()))?;
+    ctx.authz
+        .authorize_record_read(&ctx.principal, &revision, "read:doc:raw")
+        .map_err(McpError::ExecutionError)?;
+    ctx.authz
+        .authorize_record_read(&ctx.principal, &doc, "read:doc:raw")
+        .map_err(McpError::ExecutionError)?;
+    if evidence_text.is_empty() {
+        return Err(McpError::InvalidParameters(
+            "evidence quote must be nonempty".into(),
+        ));
+    }
+    let mut matches = revision.text.match_indices(evidence_text);
+    let (start, _) = matches.next().ok_or_else(|| {
+        McpError::InvalidParameters("quote is absent from immutable evidence".into())
+    })?;
+    if matches.next().is_some() {
+        return Err(McpError::InvalidParameters(
+            "quote is ambiguous; provide a unique immutable passage".into(),
+        ));
+    }
+    let end = start
+        .checked_add(evidence_text.len())
+        .ok_or_else(|| McpError::InvalidParameters("evidence span overflow".into()))?;
+    let mut base = revision.base.clone();
+    inherit_public_envelope(&mut base, &doc.base)?;
+    if let Some(source) = &doc.source {
+        if !base.provenance.sources.contains(source.id()) {
+            base.provenance.sources.push(source.id().clone());
+        }
+    }
+    mutation.depend_on(CanonicalRecord::Doc(Box::new(doc)));
+    mutation.depend_on(CanonicalRecord::DocRevision(Box::new(revision)));
+    Ok((
+        EvidenceSpan {
+            revision: Link::new(revision_id),
+            node: None,
+            start: start
+                .try_into()
+                .map_err(|_| McpError::InvalidParameters("evidence offset too large".into()))?,
+            end: end
+                .try_into()
+                .map_err(|_| McpError::InvalidParameters("evidence offset too large".into()))?,
+            quote_hash: sha256_hex_prefixed(evidence_text),
+        },
+        base,
+    ))
 }
 
 #[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::assigning_clones,
+    reason = "Keep the original owned field replacement and mutation ordering."
+)]
 async fn create_evidence_assertion(
-    repo: &AssertionRepository,
+    ctx: &ToolContext,
+    mutation: &mut PublicMutation,
     space_id: &str,
     input: &RelateEntitiesInput,
 ) -> McpResult<Assertion> {
     let now = Utc::now();
 
-    let mut base = BaseFields::new(
-        RecordId::new_v4(TableName::Assertion),
-        space_id.to_string(),
-        "mcp_tool".to_string(),
-    );
-    base.security = Security {
-        policy_id: "default".to_string(),
-        level: 0,
-        labels: vec![],
-        handling: vec![],
-    };
-    base.provenance = Provenance {
-        sources: input
-            .evidence_source
-            .as_deref()
-            .and_then(|s| s.parse::<RecordId>().ok())
-            .map(|rid| vec![rid])
-            .unwrap_or_default(),
-        extractor: None,
-        work_run_id: None,
-        run_id: None,
-        prompt_id: None,
-        config_id: None,
-        chain: Vec::new(),
-    };
-    base.subjects_state = SubjectsState::Unknown;
-
     let evidence_text = input
         .evidence_text
         .as_deref()
-        .ok_or_else(|| McpError::InvalidParameters("evidence_text required".to_string()))?;
-    let evidence = evidence_span_for_manual_quote(input.evidence_source.as_deref(), evidence_text)?;
+        .ok_or_else(|| McpError::InvalidParameters("evidence_text required".into()))?;
+    let (evidence, mut base) = evidence_span_for_manual_quote(
+        ctx,
+        mutation,
+        input.evidence_source.as_deref(),
+        evidence_text,
+    )
+    .await?;
+    if base.space_id != space_id {
+        return Err(McpError::InvalidParameters(
+            "evidence belongs to another space".into(),
+        ));
+    }
+    base.id = RecordId::new_v4(TableName::Assertion);
+    base.created_at = now;
+    base.updated_at = now;
+    base.created_by = mutation_actor(ctx).to_owned();
+    base.deleted_at = None;
 
     let key_material = format!(
         "manual_rel:{}:{}:{}:{}:{}",
@@ -305,9 +461,14 @@ async fn create_evidence_assertion(
         lifecycle_tier: "active".to_string(),
     };
 
-    repo.create(assertion)
-        .await
-        .map_err(|e| McpError::ExecutionError(e.to_string()))
+    ctx.authz
+        .authorize_record_read(&ctx.principal, &assertion, "read:assertion")
+        .map_err(McpError::ExecutionError)?;
+    ctx.authz
+        .authorize_record_write(&ctx.principal, &assertion, "write:assertion")
+        .map_err(McpError::ExecutionError)?;
+    mutation.stage_create(CanonicalRecord::Assertion(Box::new(assertion.clone())))?;
+    Ok(assertion)
 }
 
 /// Helper to create a Rel from input.
@@ -342,17 +503,13 @@ fn create_rel_from_input(input: &RelateEntitiesInput, evidence: Vec<EvidenceRef>
 // ============================================================================
 
 /// Handler for `relate_entities` tool.
-pub struct RelateEntitiesHandler {
-    repo: RelRepository,
-}
+pub struct RelateEntitiesHandler {}
 
 impl RelateEntitiesHandler {
     /// Creates a new handler.
     #[must_use]
-    pub const fn new(storage: StorageClient) -> Self {
-        Self {
-            repo: RelRepository::new(storage),
-        }
+    pub fn new(_storage: StorageClient) -> Self {
+        Self {}
     }
 }
 
@@ -418,7 +575,7 @@ impl ToolHandler for RelateEntitiesHandler {
                 },
                 "evidence_source": {
                     "type": "string",
-                    "description": "Optional evidence source record ID (e.g., source:..., doc:...)"
+                    "description": "Immutable doc_revision:... containing the exact evidence_text quote"
                 },
                 "space_id": {
                     "type": "string",
@@ -443,18 +600,28 @@ impl ToolHandler for RelateEntitiesHandler {
             return serde_json::to_value(response)
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
-        input.rel_type =
-            canonicalize_and_register_rel_type(&ctx.storage, &input.space_id, &input.rel_type)
-                .await?;
+        parse_id(&input.from_id, TableName::Entity)
+            .map_err(|error| McpError::InvalidParameters(error.to_string()))?;
+        parse_id(&input.to_id, TableName::Entity)
+            .map_err(|error| McpError::InvalidParameters(error.to_string()))?;
+        let mut mutation = PublicMutation::begin(ctx.storage.clone(), &input.space_id).await?;
+        input.rel_type = canonicalize_rel_type(
+            &ctx.storage,
+            &input.space_id,
+            &input.rel_type,
+            &mut mutation,
+        )
+        .await?;
 
-        let assertion_repo = AssertionRepository::new(ctx.storage.clone());
+        let mut evidence_base = None;
         let evidence = if input
             .evidence_text
             .as_deref()
             .is_some_and(|t| !t.trim().is_empty())
         {
             let assertion =
-                create_evidence_assertion(&assertion_repo, &input.space_id, &input).await?;
+                create_evidence_assertion(ctx, &mut mutation, &input.space_id, &input).await?;
+            evidence_base = Some(assertion.base.clone());
             vec![EvidenceRef {
                 assertion: Link::new(assertion.base.id.clone()),
                 span: assertion.evidence.clone(),
@@ -465,8 +632,15 @@ impl ToolHandler for RelateEntitiesHandler {
             Vec::new()
         };
 
-        let rel = create_rel_from_input(&input, evidence);
+        let mut rel = create_rel_from_input(&input, evidence);
+        if let Some(base) = evidence_base {
+            rel.base.security = base.security;
+            rel.base.subjects = base.subjects;
+            rel.base.subjects_state = base.subjects_state;
+            rel.base.provenance = base.provenance;
+        }
 
+        authorize_relationship_endpoints(ctx, &mut mutation, &mut rel, true).await?;
         if let Err(reason) =
             ctx.authz
                 .authorize_record_write(&ctx.principal, &rel, "write:relationship")
@@ -486,7 +660,7 @@ impl ToolHandler for RelateEntitiesHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        match self.repo.create(rel).await {
+        match mutation.create(rel, mutation_actor(ctx)).await {
             Ok(created) => {
                 if let Err(reason) =
                     ctx.authz
@@ -500,7 +674,7 @@ impl ToolHandler for RelateEntitiesHandler {
                 let response = ToolResponse::success(created);
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
@@ -572,19 +746,20 @@ impl ToolHandler for UpsertRelationshipHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
+        let mut mutation = PublicMutation::begin(ctx.storage.clone(), &space_id).await?;
         let rid_from = parse_id(&input.from_id, TableName::Entity)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
         let rid_to = parse_id(&input.to_id, TableName::Entity)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
         input.rel_type =
-            canonicalize_and_register_rel_type(&ctx.storage, &space_id, &input.rel_type).await?;
+            canonicalize_rel_type(&ctx.storage, &space_id, &input.rel_type, &mut mutation).await?;
 
         // Try to find existing relationship using find_between
         let existing = self
             .repo
             .find_between(&space_id, &rid_from, &rid_to)
             .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+            .map_err(McpError::StorageError)?;
 
         // Filter by rel_type
         let matching_rel = existing.into_iter().find(|r| r.rel_type == input.rel_type);
@@ -625,9 +800,10 @@ impl ToolHandler for UpsertRelationshipHandler {
                 .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
             let mut updated = updated;
             updated.rel_type =
-                canonicalize_and_register_rel_type(&ctx.storage, &space_id, &updated.rel_type)
+                canonicalize_rel_type(&ctx.storage, &space_id, &updated.rel_type, &mut mutation)
                     .await?;
 
+            authorize_relationship_endpoints(ctx, &mut mutation, &mut updated, false).await?;
             if let Err(reason) =
                 ctx.authz
                     .authorize_record_write(&ctx.principal, &updated, "write:relationship")
@@ -647,8 +823,10 @@ impl ToolHandler for UpsertRelationshipHandler {
                     .map_err(|e| McpError::ExecutionError(e.to_string()));
             }
 
-            let rid = rel.base.id.clone();
-            match self.repo.update(&space_id, &rid, updated).await {
+            match mutation
+                .replace(&rel, updated, false, mutation_actor(ctx))
+                .await
+            {
                 Ok(rel) => {
                     if let Err(reason) =
                         ctx.authz
@@ -663,7 +841,7 @@ impl ToolHandler for UpsertRelationshipHandler {
                     serde_json::to_value(response)
                         .map_err(|e| McpError::ExecutionError(e.to_string()))
                 }
-                Err(e) => Err(McpError::ExecutionError(e.to_string())),
+                Err(e) => Err(McpError::StorageError(e)),
             }
         } else {
             // Create new
@@ -680,7 +858,8 @@ impl ToolHandler for UpsertRelationshipHandler {
                 evidence_source: None,
                 space_id: ctx.principal.space_id.clone(),
             };
-            let rel = create_rel_from_input(&rel_input, Vec::new());
+            let mut rel = create_rel_from_input(&rel_input, Vec::new());
+            authorize_relationship_endpoints(ctx, &mut mutation, &mut rel, true).await?;
 
             if let Err(reason) =
                 ctx.authz
@@ -701,7 +880,7 @@ impl ToolHandler for UpsertRelationshipHandler {
                     .map_err(|e| McpError::ExecutionError(e.to_string()));
             }
 
-            match self.repo.create(rel).await {
+            match mutation.create(rel, mutation_actor(ctx)).await {
                 Ok(created) => {
                     if let Err(reason) = ctx.authz.authorize_record_read(
                         &ctx.principal,
@@ -717,7 +896,7 @@ impl ToolHandler for UpsertRelationshipHandler {
                     serde_json::to_value(response)
                         .map_err(|e| McpError::ExecutionError(e.to_string()))
                 }
-                Err(e) => Err(McpError::ExecutionError(e.to_string())),
+                Err(e) => Err(McpError::StorageError(e)),
             }
         }
     }
@@ -782,6 +961,7 @@ impl ToolHandler for UpdateRelationshipHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
+        let mut mutation = PublicMutation::begin(ctx.storage.clone(), &space_id).await?;
         let rid = parse_id(&input.id, TableName::Rel)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
         // Get existing relationship
@@ -793,7 +973,7 @@ impl ToolHandler for UpdateRelationshipHandler {
                 return serde_json::to_value(response)
                     .map_err(|e| McpError::ExecutionError(e.to_string()));
             }
-            Err(e) => return Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => return Err(McpError::StorageError(e)),
         };
 
         if let Err(reason) =
@@ -831,8 +1011,10 @@ impl ToolHandler for UpdateRelationshipHandler {
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
         let mut updated = updated;
         updated.rel_type =
-            canonicalize_and_register_rel_type(&ctx.storage, &space_id, &updated.rel_type).await?;
+            canonicalize_rel_type(&ctx.storage, &space_id, &updated.rel_type, &mut mutation)
+                .await?;
 
+        authorize_relationship_endpoints(ctx, &mut mutation, &mut updated, false).await?;
         if let Err(reason) =
             ctx.authz
                 .authorize_record_write(&ctx.principal, &updated, "write:relationship")
@@ -852,7 +1034,10 @@ impl ToolHandler for UpdateRelationshipHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        match self.repo.update(&space_id, &rid, updated).await {
+        match mutation
+            .replace(&existing, updated, false, mutation_actor(ctx))
+            .await
+        {
             Ok(rel) => {
                 if let Err(reason) =
                     ctx.authz
@@ -866,7 +1051,7 @@ impl ToolHandler for UpdateRelationshipHandler {
                 let response = ToolResponse::success(rel);
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
@@ -913,6 +1098,10 @@ impl ToolHandler for DeleteRelationshipHandler {
         })
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
         let input: RelIdInput = serde_json::from_value(params)
@@ -925,6 +1114,7 @@ impl ToolHandler for DeleteRelationshipHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
+        let mutation = PublicMutation::begin(ctx.storage.clone(), &space_id).await?;
         let rid = parse_id(&input.id, TableName::Rel)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
         // Check if relationship exists
@@ -939,10 +1129,10 @@ impl ToolHandler for DeleteRelationshipHandler {
                     return serde_json::to_value(response)
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
-                self.repo
-                    .delete(&space_id, &rid)
+                mutation
+                    .delete(&rel, mutation_actor(ctx))
                     .await
-                    .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+                    .map_err(McpError::StorageError)?;
 
                 let response = ToolResponse::success(json!({ "deleted": true, "id": input.id }));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
@@ -952,7 +1142,7 @@ impl ToolHandler for DeleteRelationshipHandler {
                     ToolResponse::error(format!("Relationship not found: {}", input.id));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
@@ -999,6 +1189,10 @@ impl ToolHandler for RestoreRelationshipHandler {
         })
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
         let input: RelIdInput = serde_json::from_value(params)
@@ -1011,10 +1205,19 @@ impl ToolHandler for RestoreRelationshipHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
+        let mut mutation = PublicMutation::begin(ctx.storage.clone(), &space_id).await?;
         let rid = parse_id(&input.id, TableName::Rel)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
         match self.repo.get_with_deleted(&space_id, &rid).await {
             Ok(Some(rel)) => {
+                let mut restored_candidate = rel.clone();
+                authorize_relationship_endpoints(
+                    ctx,
+                    &mut mutation,
+                    &mut restored_candidate,
+                    false,
+                )
+                .await?;
                 if let Err(reason) =
                     ctx.authz
                         .authorize_record_write(&ctx.principal, &rel, "write:relationship")
@@ -1034,11 +1237,10 @@ impl ToolHandler for RestoreRelationshipHandler {
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
 
-                let restored = self
-                    .repo
-                    .restore(&space_id, &rid)
+                let restored = mutation
+                    .restore(&rel, mutation_actor(ctx))
                     .await
-                    .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+                    .map_err(McpError::StorageError)?;
 
                 if let Err(reason) =
                     ctx.authz
@@ -1058,23 +1260,19 @@ impl ToolHandler for RestoreRelationshipHandler {
                     ToolResponse::error(format!("Relationship not found: {}", input.id));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
 
 /// Handler for `batch_relationships` tool.
-pub struct BatchRelationshipsHandler {
-    repo: RelRepository,
-}
+pub struct BatchRelationshipsHandler {}
 
 impl BatchRelationshipsHandler {
     /// Creates a new handler.
     #[must_use]
-    pub const fn new(storage: StorageClient) -> Self {
-        Self {
-            repo: RelRepository::new(storage),
-        }
+    pub fn new(_storage: StorageClient) -> Self {
+        Self {}
     }
 }
 
@@ -1140,10 +1338,27 @@ impl ToolHandler for BatchRelationshipsHandler {
                 });
                 continue;
             }
-            match canonicalize_and_register_rel_type(&ctx.storage, &item.space_id, &item.rel_type)
+            if let Err(error) = parse_id(&item.from_id, TableName::Entity)
+                .and_then(|_| parse_id(&item.to_id, TableName::Entity))
+            {
+                failed.push(BatchError {
+                    index,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+            let mut mutation = PublicMutation::begin(ctx.storage.clone(), &item.space_id).await?;
+            match canonicalize_rel_type(&ctx.storage, &item.space_id, &item.rel_type, &mut mutation)
                 .await
             {
                 Ok(canonical) => item.rel_type = canonical,
+                Err(
+                    error @ McpError::StorageError(
+                        elephant_storage::StorageError::ErasureInProgress,
+                    ),
+                ) => {
+                    return Err(error);
+                }
                 Err(e) => {
                     failed.push(BatchError {
                         index,
@@ -1152,7 +1367,22 @@ impl ToolHandler for BatchRelationshipsHandler {
                     continue;
                 }
             }
-            let rel = create_rel_from_input(&item, Vec::new());
+            let mut rel = create_rel_from_input(&item, Vec::new());
+            if let Err(error) =
+                authorize_relationship_endpoints(ctx, &mut mutation, &mut rel, true).await
+            {
+                if matches!(
+                    error,
+                    McpError::StorageError(elephant_storage::StorageError::ErasureInProgress)
+                ) {
+                    return Err(error);
+                }
+                failed.push(BatchError {
+                    index,
+                    error: error.to_string(),
+                });
+                continue;
+            }
 
             if let Err(reason) =
                 ctx.authz
@@ -1175,7 +1405,7 @@ impl ToolHandler for BatchRelationshipsHandler {
                 continue;
             }
 
-            match self.repo.create(rel).await {
+            match mutation.create(rel, mutation_actor(ctx)).await {
                 Ok(created) => {
                     if let Err(reason) = ctx.authz.authorize_record_read(
                         &ctx.principal,
@@ -1189,6 +1419,9 @@ impl ToolHandler for BatchRelationshipsHandler {
                     } else {
                         succeeded.push(created);
                     }
+                }
+                Err(error @ elephant_storage::StorageError::ErasureInProgress) => {
+                    return Err(McpError::StorageError(error));
                 }
                 Err(e) => failed.push(BatchError {
                     index,
@@ -1237,7 +1470,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_canonicalize_and_register_rel_type_uses_active_alias() {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn test_canonicalize_rel_type_uses_active_alias() {
         use elephant_storage::PredicateAliasRepository;
         use elephant_types::records::predicate::{AliasScope, AliasStatus, AliasType};
 
@@ -1252,6 +1489,21 @@ mod tests {
             .await
             .expect("schema");
 
+        storage
+            .query_checked(include_str!(
+                "../../../migrations/sql/031_source_publication.surql"
+            ))
+            .await
+            .expect("canonical schema");
+        let config: elephant_types::records::SpaceConfig = serde_json::from_value(json!({
+            "id": RecordId::new_v4(TableName::SpaceConfig), "space_id":"test_space", "created_at":Utc::now(), "updated_at":Utc::now(), "created_by":"test",
+            "security":{"policy_id":"default","level":0,"labels":[],"handling":[]}, "provenance":{},"subjects":[],"subjects_state":"complete",
+            "embedding_provider":"fake","embedding_model":"test","embedding_dims":8
+        })).expect("space fixture");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(config)
+            .await
+            .expect("space");
         let alias_repo = PredicateAliasRepository::new(storage.clone());
         alias_repo
             .create(elephant_types::records::predicate::PredicateAlias {
@@ -1273,15 +1525,46 @@ mod tests {
             .await
             .expect("create alias");
 
-        let canonical = canonicalize_and_register_rel_type(&storage, "test_space", " employed by ")
+        let mut mutation = PublicMutation::begin(storage.clone(), "test_space")
             .await
-            .expect("canonical rel type");
+            .expect("mutation");
+        let canonical =
+            canonicalize_rel_type(&storage, "test_space", " employed by ", &mut mutation)
+                .await
+                .expect("canonical rel type");
 
         assert_eq!(canonical, "works_at");
         assert!(PredicateRegistryRepository::new(storage.clone())
             .find_by_predicate_id("test_space", "works_at")
             .await
             .expect("find predicate")
+            .is_none());
+        let entity = elephant_types::records::Entity::new(
+            BaseFields::new(
+                RecordId::new_v4(TableName::Entity),
+                "test_space".into(),
+                "test".into(),
+            ),
+            elephant_types::records::entity::EntityType::new("topic"),
+            "staged write".into(),
+        );
+        ensure_predicate_registered(
+            &storage,
+            "test_space",
+            &canonical,
+            &entity.base,
+            &mut mutation,
+        )
+        .await
+        .expect("stage predicate under final envelope");
+        mutation
+            .create(entity, "test")
+            .await
+            .expect("atomic registry and entity");
+        assert!(PredicateRegistryRepository::new(storage.clone())
+            .find_by_predicate_id("test_space", "works_at")
+            .await
+            .expect("predicate after commit")
             .is_some());
         assert!(PredicateRegistryRepository::new(storage)
             .find_by_predicate_id("test_space", "employed by")

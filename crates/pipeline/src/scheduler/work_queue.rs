@@ -18,14 +18,20 @@ use std::str::FromStr;
 use crate::error::PipelineError;
 use crate::scheduler::budget::BudgetEnforcer;
 
-/// Default space ID for single-space deployments.
-#[allow(dead_code)]
-const DEFAULT_SPACE_ID: &str = "default";
-
 /// Default lease duration in seconds.
 const DEFAULT_LEASE_DURATION_SECS: i64 = 300;
 const SELECTOR_SCAN_MULTIPLIER: usize = 20;
 const SELECTOR_SCAN_MIN_LIMIT: usize = 10_000;
+
+fn lease_deadline(now: DateTime<Utc>, seconds: i64) -> Result<DateTime<Utc>, PipelineError> {
+    let invalid =
+        || PipelineError::ConfigError("Lease duration must be positive and fit a timestamp".into());
+    if seconds <= 0 {
+        return Err(invalid());
+    }
+    let duration = Duration::try_seconds(seconds).ok_or_else(invalid)?;
+    now.checked_add_signed(duration).ok_or_else(invalid)
+}
 
 /// Configuration for the work queue.
 #[derive(Debug, Clone)]
@@ -142,19 +148,12 @@ impl WorkQueue {
             return Ok(Vec::new());
         }
         let now = Utc::now();
-        let lease_expires = now + Duration::seconds(self.config.lease_duration_secs);
+        let lease_expires = lease_deadline(now, self.config.lease_duration_secs)?;
 
-        // Find runnable items across all spaces, ordered by priority
-        let mut candidates = self.find_runnable(&now).await?;
-
-        // Recover expired leases for spaces that have candidates, plus the
-        // default space. Re-fetch only when recovery actually released items.
-        let mut recovery_spaces: std::collections::HashSet<String> =
-            candidates.iter().map(|c| c.base.space_id.clone()).collect();
-        recovery_spaces.insert(DEFAULT_SPACE_ID.to_string());
-        if self.recover_leases_for_spaces(&recovery_spaces).await {
-            candidates = self.find_runnable(&now).await?;
-        }
+        // Recovery is independent of runnable candidates and the request space.
+        // A quiet named space can contain only an expired Running item.
+        self.recover_all_expired_leases().await?;
+        let candidates = self.find_runnable(&now).await?;
 
         let mut claimed = Vec::new();
         for candidate in candidates {
@@ -164,8 +163,10 @@ impl WorkQueue {
             if !selector(&candidate) {
                 continue;
             }
-            if let Ok(item) = self.try_claim(&candidate, &lease_expires).await {
-                claimed.push(item);
+            match self.try_claim(&candidate, &lease_expires).await {
+                Ok(item) => claimed.push(item),
+                Err(PipelineError::LeaseConflict(_)) => {}
+                Err(error) => return Err(error),
             }
             // Claim conflict: another worker beat us, try next candidate
         }
@@ -223,36 +224,21 @@ impl WorkQueue {
             return Ok(Vec::new());
         }
         let now = Utc::now();
-        let lease_expires = now + Duration::seconds(self.config.lease_duration_secs);
+        let lease_expires = lease_deadline(now, self.config.lease_duration_secs)?;
         let preferred_quota = max_preferred.min(max_total);
 
         let mut claimed: Vec<WorkItem> = Vec::new();
         let mut claimed_ids: std::collections::HashSet<RecordId> = std::collections::HashSet::new();
-        let mut recovered_spaces: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        self.recover_all_expired_leases().await?;
 
         // Phase 1: fill the scarce preferred lane from a cheap by-kind scan.
         if preferred_quota > 0 {
             let scan_limit = preferred_quota.max(self.config.batch_size);
-            let mut preferred = self
+            let preferred = self
                 .repo
                 .find_runnable_by_kind_all_spaces(preferred_kind, scan_limit)
                 .await
                 .map_err(PipelineError::StorageError)?;
-
-            let spaces: std::collections::HashSet<String> = preferred
-                .iter()
-                .map(|c| c.base.space_id.clone())
-                .filter(|space| !recovered_spaces.contains(space))
-                .collect();
-            recovered_spaces.extend(spaces.iter().cloned());
-            if self.recover_leases_for_spaces(&spaces).await {
-                preferred = self
-                    .repo
-                    .find_runnable_by_kind_all_spaces(preferred_kind, scan_limit)
-                    .await
-                    .map_err(PipelineError::StorageError)?;
-            }
 
             for candidate in preferred {
                 if claimed.len() >= preferred_quota {
@@ -261,9 +247,13 @@ impl WorkQueue {
                 if !fallback_selector(&candidate) {
                     continue;
                 }
-                if let Ok(item) = self.try_claim(&candidate, &lease_expires).await {
-                    claimed_ids.insert(item.base.id.clone());
-                    claimed.push(item);
+                match self.try_claim(&candidate, &lease_expires).await {
+                    Ok(item) => {
+                        claimed_ids.insert(item.base.id.clone());
+                        claimed.push(item);
+                    }
+                    Err(PipelineError::LeaseConflict(_)) => {}
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -272,18 +262,7 @@ impl WorkQueue {
         // order, respecting the preferred lane's remaining quota.
         if claimed.len() < max_total {
             let mut preferred_claimed = claimed.len();
-            let mut candidates = self.find_runnable(&now).await?;
-
-            let spaces: std::collections::HashSet<String> = candidates
-                .iter()
-                .map(|c| c.base.space_id.clone())
-                .chain(std::iter::once(DEFAULT_SPACE_ID.to_string()))
-                .filter(|space| !recovered_spaces.contains(space))
-                .collect();
-            recovered_spaces.extend(spaces.iter().cloned());
-            if self.recover_leases_for_spaces(&spaces).await {
-                candidates = self.find_runnable(&now).await?;
-            }
+            let candidates = self.find_runnable(&now).await?;
 
             for candidate in candidates {
                 if claimed.len() >= max_total {
@@ -298,12 +277,16 @@ impl WorkQueue {
                 if !fallback_selector(&candidate) {
                     continue;
                 }
-                if let Ok(item) = self.try_claim(&candidate, &lease_expires).await {
-                    if item.kind == preferred_kind {
-                        preferred_claimed += 1;
+                match self.try_claim(&candidate, &lease_expires).await {
+                    Ok(item) => {
+                        if item.kind == preferred_kind {
+                            preferred_claimed += 1;
+                        }
+                        claimed_ids.insert(item.base.id.clone());
+                        claimed.push(item);
                     }
-                    claimed_ids.insert(item.base.id.clone());
-                    claimed.push(item);
+                    Err(PipelineError::LeaseConflict(_)) => {}
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -311,18 +294,33 @@ impl WorkQueue {
         Ok(claimed)
     }
 
-    /// Recovers expired leases for the given spaces; returns true when any
-    /// lease was actually recovered (i.e. new items may now be runnable).
-    async fn recover_leases_for_spaces(&self, spaces: &std::collections::HashSet<String>) -> bool {
-        let mut any_recovered = false;
-        for space_id in spaces {
-            if let Ok(recovered) = self.recover_expired_leases(space_id).await {
-                if !recovered.is_empty() {
-                    any_recovered = true;
-                }
-            }
+    /// Recovers expired or malformed Running leases across every durable space.
+    /// Errors propagate so a failed sweep never looks like an empty queue.
+    pub async fn recover_all_expired_leases(&self) -> Result<usize, PipelineError> {
+        self.repo
+            .recover_expired_leases_all_spaces()
+            .await
+            .map_err(PipelineError::StorageError)
+    }
+
+    /// Binds mutations to the unique owner of a claimed attempt. Never create
+    /// this handle by rereading a work item after execution: keep the claim.
+    pub fn for_attempt(&self, item: &WorkItem) -> Result<Self, PipelineError> {
+        if item.status != WorkItemStatus::Running {
+            return Err(PipelineError::LeaseConflict(item.base.id.to_string()));
         }
-        any_recovered
+        let fence = elephant_storage::work_attempt_repository::fence_from_claim(item)
+            .map_err(PipelineError::StorageError)?;
+        let owner = &fence.lease_token;
+        let mut config = self.config.clone();
+        config.worker_id.clone_from(owner);
+        Ok(Self::new(self.storage.clone(), config))
+    }
+
+    /// Unique lease owner of this attempt-scoped queue handle.
+    #[must_use]
+    pub fn lease_owner(&self) -> &str {
+        &self.config.worker_id
     }
 
     /// Counts work items that are runnable right now.
@@ -386,7 +384,8 @@ impl WorkQueue {
         let space_id = &item.base.space_id;
         let id = &item.base.id;
 
-        // Use atomic conditional update: only claim if still in Runnable state
+        // Every claim gets a fresh owner, including a retry in the same process.
+        // The retry counter may reset administratively; this fence never repeats.
         let claimed = self
             .repo
             .claim_with_lease(space_id, id, &self.config.worker_id, *lease_expires)
@@ -407,7 +406,7 @@ impl WorkQueue {
     pub async fn release(&self, space_id: &str, id: &RecordId) -> Result<WorkItem, PipelineError> {
         let released = self
             .repo
-            .release_expired_lease(space_id, id)
+            .requeue_with_delay(space_id, id, &self.config.worker_id, 0, None)
             .await
             .map_err(PipelineError::StorageError)?
             .ok_or_else(|| PipelineError::LeaseConflict(id.to_string()))?;
@@ -428,22 +427,13 @@ impl WorkQueue {
         lease_duration_secs: u64,
     ) -> Result<WorkItem, PipelineError> {
         let lease_seconds = i64::try_from(lease_duration_secs).map_err(|error| {
-            PipelineError::ValidationError(format!(
+            PipelineError::ConfigError(format!(
                 "Invalid lease duration {lease_duration_secs}: {error}"
             ))
         })?;
-        let lease_duration = Duration::try_seconds(lease_seconds).ok_or_else(|| {
-            PipelineError::ValidationError(format!(
-                "Invalid lease duration {lease_duration_secs}: out of range"
-            ))
-        })?;
+        let expires = lease_deadline(Utc::now(), lease_seconds)?;
         self.repo
-            .renew_lease(
-                space_id,
-                id,
-                &self.config.worker_id,
-                Utc::now() + lease_duration,
-            )
+            .renew_lease(space_id, id, &self.config.worker_id, expires)
             .await
             .map_err(PipelineError::StorageError)?
             .ok_or_else(|| PipelineError::LeaseConflict(id.to_string()))
@@ -451,8 +441,8 @@ impl WorkQueue {
 
     /// Marks a work item as completed successfully.
     ///
-    /// If the lease was lost (e.g. recovered by another worker's expired-lease sweep),
-    /// attempts a force-complete since the work was already done.
+    /// Requires this exact claim to still own an unexpired lease. A stale
+    /// attempt cannot complete a newer attempt or promote its successors.
     ///
     /// # Errors
     ///
@@ -475,19 +465,7 @@ impl WorkQueue {
             return Ok(completed);
         }
 
-        // Lease lost — the item may have been released back to runnable.
-        // Force-complete it since the work was actually done.
-        tracing::warn!(work_item = %id, "Lease lost during completion, attempting force-complete");
-        let force_completed = self
-            .repo
-            .force_complete(space_id, id)
-            .await
-            .map_err(PipelineError::StorageError)?
-            .ok_or_else(|| PipelineError::LeaseConflict(id.to_string()))?;
-
-        self.reconcile_cost_if_needed(&force_completed, true)
-            .await?;
-        Ok(force_completed)
+        Err(PipelineError::LeaseConflict(id.to_string()))
     }
 
     /// Marks a work item as failed.
@@ -519,6 +497,31 @@ impl WorkQueue {
         Ok(failed)
     }
 
+    /// Finish the exact public caller-authorized work snapshot using this
+    /// handle's originally supplied lease token, then reconcile durable usage.
+    ///
+    /// # Errors
+    /// Returns a lease conflict for replaced authority or a lost original claim.
+    pub async fn finish_authorized(
+        &self,
+        observed: &WorkItem,
+        success: bool,
+        error: Option<String>,
+    ) -> Result<WorkItem, PipelineError> {
+        let status = if success {
+            WorkItemStatus::Done
+        } else {
+            WorkItemStatus::Failed
+        };
+        let result = self
+            .repo
+            .finish_authorized(observed, &self.config.worker_id, status, error)
+            .await?
+            .ok_or_else(|| PipelineError::LeaseConflict(observed.base.id.to_string()))?;
+        self.reconcile_cost_if_needed(&result, success).await?;
+        Ok(result)
+    }
+
     async fn reconcile_cost_if_needed(
         &self,
         item: &WorkItem,
@@ -541,33 +544,13 @@ impl WorkQueue {
             return Ok(());
         };
 
-        if ledger.reconciled_euros > 0.0 || ledger.reserved_euros <= 0.0 {
+        if ledger.total_runs > 0 {
             return Ok(());
         }
 
-        let (mut actual_cost, actual_tokens) = self.estimate_actuals(item, success).await?;
-        if actual_cost <= 0.0 && actual_tokens == 0 {
-            // Banking the reservation for an item that recorded no usage is only
-            // defensible when the work actually ran: a completed item whose
-            // metrics went missing did consume something we failed to measure. A
-            // FAILED item with no metrics is the opposite — most failures here
-            // are fail-fast (a model the vendored catalog cannot resolve, a
-            // rejected guard), so charging the full reservation bills the budget
-            // for work that never reached a provider. That failure mode is
-            // self-amplifying: the cheapest failures charge the most relative to
-            // what they used, so a single misconfiguration drains the whole
-            // day's ceiling and stops the pipeline.
-            //
-            // Charge zero rather than returning early — reconcile_cost is what
-            // releases the reservation, both on the ledger row and on the guard
-            // that enforces the ceiling. Skipping it would leave the reservation
-            // held for the rest of the day, which is the very thing being fixed.
-            actual_cost = if success {
-                ledger.reserved_euros.max(0.0)
-            } else {
-                0.0
-            };
-        }
+        let Some((actual_cost, actual_tokens)) = self.estimate_actuals(item).await? else {
+            return Ok(());
+        };
 
         let budget_enforcer = BudgetEnforcer::new(
             self.storage.clone(),
@@ -582,51 +565,83 @@ impl WorkQueue {
         Ok(())
     }
 
-    async fn estimate_actuals(
-        &self,
-        item: &WorkItem,
-        success: bool,
-    ) -> Result<(f64, u64), PipelineError> {
-        let run_repo = WorkRunRepository::new(self.storage.clone());
-        let runs = run_repo
+    async fn estimate_actuals(&self, item: &WorkItem) -> Result<Option<(f64, u64)>, PipelineError> {
+        let runs = WorkRunRepository::new(self.storage.clone())
             .find_by_work_item(&item.base.id)
             .await
             .map_err(PipelineError::StorageError)?;
-
-        let latest_metrics = runs.last().map(|run| run.metrics.clone());
-        let mut tokens_used = latest_metrics
-            .as_ref()
-            .map(|metrics| metrics.tokens_used)
-            .unwrap_or(0);
-
-        // The payload's token count is what the extraction plan INTENDED to
-        // send, not what was sent. Treating it as consumption is a fair proxy
-        // for completed work whose metrics went missing, but for a failed item
-        // it invents usage that may never have happened — so only successful
-        // work may fall back to the plan. A failure that genuinely burned tokens
-        // is still charged, via the recorded metrics above; the residual gap is
-        // a failure that spent tokens and recorded none, which we under-charge
-        // deliberately rather than over-charge every fail-fast item.
-        if tokens_used == 0 && success {
-            tokens_used = estimated_tokens_from_payload(&item.payload).unwrap_or(0);
+        let latest = runs
+            .iter()
+            .filter(|run| {
+                run.base.space_id == item.base.space_id
+                    && (item.payload.get("_attempt_fence").is_none()
+                        || run.metrics.custom.get("attempt_fence")
+                            == item.payload.get("_attempt_fence"))
+            })
+            .max_by_key(|run| run.started_at);
+        let Some(run) = latest.filter(|run| run.completed_at.is_some()) else {
+            return Ok(None);
+        };
+        let Some(usage) =
+            crate::scheduler::execution_contract::AttemptUsage::from_metrics(&run.metrics)
+                .map_err(|error| PipelineError::ValidationError(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let Some(captured) = run.metrics.custom.get("attempt_fence") else {
+            return Ok(None);
+        };
+        let attempt: elephant_types::publication::AttemptFence =
+            serde_json::from_value(captured.clone())
+                .map_err(|error| PipelineError::ValidationError(error.to_string()))?;
+        if attempt.space_id != item.base.space_id || attempt.work_item_id != item.base.id {
+            return Err(PipelineError::InvalidState(
+                "Accounting attempt identity mismatch".into(),
+            ));
         }
-
-        let mut actual_cost = latest_metrics
-            .as_ref()
-            .map(|metrics| metrics.estimated_cost_euros)
-            .unwrap_or(0.0);
-
-        if actual_cost <= 0.0 && tokens_used > 0 {
-            actual_cost = estimate_cost_from_tokens(tokens_used);
+        let usage = crate::provider_usage::DurableUsageObserver::for_attempt(
+            self.storage.clone(),
+            &run.base.id,
+            attempt,
+        )
+        .summarize(usage)
+        .await?;
+        if matches!(
+            usage.basis,
+            crate::scheduler::execution_contract::UsageBasis::Unknown
+                | crate::scheduler::execution_contract::UsageBasis::Estimated
+        ) {
+            return Ok(None);
         }
-
-        Ok((actual_cost, u64::from(tokens_used)))
+        Ok(Some((
+            usage.accounted_units(),
+            usage.measured_tokens.unwrap_or(0),
+        )))
     }
 
     async fn resolve_cost_ledger_id(
         &self,
         item: &WorkItem,
     ) -> Result<Option<RecordId>, elephant_storage::error::StorageError> {
+        let runs = WorkRunRepository::new(self.storage.clone())
+            .find_by_work_item(&item.base.id)
+            .await?;
+        for run in runs.into_iter().filter(|run| {
+            run.base.space_id == item.base.space_id
+                && run.metrics.custom.get("attempt_fence") == item.payload.get("_attempt_fence")
+        }) {
+            if let Some(value) = run
+                .metrics
+                .custom
+                .get("cost_ledger_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                return RecordId::from_str(value).map(Some).map_err(|error| {
+                    elephant_storage::StorageError::DataIntegrityError(error.to_string())
+                });
+            }
+        }
+
         if let Some(id) = record_id_from_payload(&item.payload, &["cost_ledger_id", "ledger_id"]) {
             return Ok(Some(id));
         }
@@ -636,14 +651,6 @@ impl WorkQueue {
         {
             let decision_repo = IngestDecisionRepository::new(self.storage.clone());
             let decision = decision_repo.get(&item.base.space_id, &decision_id).await?;
-            return Ok(decision.and_then(|d| d.cost_ledger_id));
-        }
-
-        if let Some(source_id) = record_id_from_payload(&item.payload, &["source_id"]) {
-            let decision_repo = IngestDecisionRepository::new(self.storage.clone());
-            let decision = decision_repo
-                .find_latest_by_source(&item.base.space_id, &source_id)
-                .await?;
             return Ok(decision.and_then(|d| d.cost_ledger_id));
         }
 
@@ -673,7 +680,10 @@ impl WorkQueue {
         let mut recovered = Vec::new();
         for item in running {
             if let Some(lease_expires) = item.lease_expires_at {
-                if lease_expires + grace_period < now {
+                if lease_expires
+                    .checked_add_signed(grace_period)
+                    .is_some_and(|deadline| deadline < now)
+                {
                     if let Some(released) = self
                         .repo
                         .release_expired_lease(space_id, &item.base.id)
@@ -708,17 +718,6 @@ fn record_id_from_payload(payload: &Value, keys: &[&str]) -> Option<RecordId> {
     None
 }
 
-fn estimated_tokens_from_payload(payload: &Value) -> Option<u32> {
-    let obj = payload.as_object()?;
-    obj.get("estimated_tokens")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-}
-
-fn estimate_cost_from_tokens(tokens: u32) -> f64 {
-    f64::from(tokens) * 0.000_001
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -751,6 +750,74 @@ mod tests {
             leased_by: None,
             run_after: None,
             last_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_lease_deadlines_never_claim_or_replace_an_existing_lease() {
+        use crate::scheduler::execution_contract::{classify_failure, FailureClass};
+        for storage in [
+            StorageClient::new_embedded().await.expect("embedded"),
+            StorageClient::new_memory().await.expect("native"),
+        ] {
+            let queue = WorkQueue::with_defaults(storage.clone());
+            let item = queue
+                .enqueue(make_work_item("deadline", 1))
+                .await
+                .expect("enqueue");
+            for seconds in [-1, 0, i64::MAX, 100_000_000_000_000] {
+                let invalid = WorkQueue::new(
+                    storage.clone(),
+                    WorkQueueConfig {
+                        lease_duration_secs: seconds,
+                        ..Default::default()
+                    },
+                );
+                let error = invalid
+                    .claim()
+                    .await
+                    .expect_err("unrepresentable claim deadline");
+                assert_eq!(
+                    classify_failure(&error.into()),
+                    FailureClass::ConfigurationBlocked
+                );
+                assert!(invalid
+                    .claim_prefer_kind("deadline", |_| true)
+                    .await
+                    .is_err());
+                assert_eq!(
+                    queue
+                        .repository()
+                        .get(TEST_SPACE, &item.base.id)
+                        .await
+                        .expect("read"),
+                    Some(item.clone())
+                );
+            }
+            let original = queue.claim().await.expect("valid claim").expect("original");
+            let owner = queue.for_attempt(&original).expect("owner");
+            for seconds in [0, u64::MAX, 100_000_000_000_000] {
+                let error = owner
+                    .renew_lease(TEST_SPACE, &item.base.id, seconds)
+                    .await
+                    .expect_err("unrepresentable renewal");
+                assert_eq!(
+                    classify_failure(&error.into()),
+                    FailureClass::ConfigurationBlocked
+                );
+                assert_eq!(
+                    queue
+                        .repository()
+                        .get(TEST_SPACE, &item.base.id)
+                        .await
+                        .expect("read"),
+                    Some(original.clone())
+                );
+            }
+            assert!(owner
+                .renew_lease(TEST_SPACE, &item.base.id, 300)
+                .await
+                .is_ok());
         }
     }
 
@@ -804,17 +871,21 @@ mod tests {
         let enqueued = queue.enqueue(item).await.expect("enqueue");
         let claimed = queue.claim().await.expect("claim").expect("claimed item");
         assert_eq!(claimed.base.id, enqueued.base.id);
-        assert_eq!(claimed.leased_by.as_deref(), Some("worker-1"));
-
-        let mut crashed = claimed.clone();
-        crashed.lease_expires_at = Some(Utc::now() - Duration::seconds(60));
-        crashed.status = WorkItemStatus::Running;
-        let crashed_id = crashed.base.id.clone();
+        let fence = elephant_storage::work_attempt_repository::fence_from_claim(&claimed)
+            .expect("original fence");
+        assert!(fence.lease_token.starts_with("worker-1:"));
         queue
             .repository()
-            .update(TEST_SPACE, &crashed_id, crashed)
+            .renew_lease(
+                TEST_SPACE,
+                &claimed.base.id,
+                &fence.lease_token,
+                Utc::now() + Duration::milliseconds(40),
+            )
             .await
-            .expect("update crashed item");
+            .expect("owner short renewal")
+            .expect("owned");
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
         let config2 = WorkQueueConfig {
             worker_id: "worker-2".to_string(),
@@ -829,7 +900,10 @@ mod tests {
             .expect("reclaimed item");
         assert_eq!(reclaimed.base.id, claimed.base.id);
         assert_eq!(reclaimed.status, WorkItemStatus::Running);
-        assert_eq!(reclaimed.leased_by.as_deref(), Some("worker-2"));
+        assert!(reclaimed
+            .leased_by
+            .as_deref()
+            .is_some_and(|owner| owner.starts_with("worker-2:")));
         assert!(reclaimed.lease_expires_at.is_some());
     }
 
@@ -845,6 +919,8 @@ mod tests {
         assert_eq!(claimed.status, WorkItemStatus::Running);
 
         let completed = queue
+            .for_attempt(&claimed)
+            .expect("attempt handle")
             .complete(TEST_SPACE, &enqueued.base.id)
             .await
             .expect("complete");
@@ -885,11 +961,43 @@ mod tests {
 
         let mut item = make_work_item("test", 10);
         item.payload = serde_json::json!({
-            "cost_ledger_id": ledger_id.to_string()
-        });
+            "cost_ledger_id": RecordId::new_v4(TableName::CostLedgerDaily).to_string()
+        }); // Original WorkRun's real ledger must win over this older reference.
         let enqueued = queue.enqueue(item).await.expect("enqueue");
 
-        let _claimed = queue.claim().await.expect("claim").unwrap();
+        let claimed = queue.claim().await.expect("claim").unwrap();
+        let queue = queue.for_attempt(&claimed).expect("attempt handle");
+        let run_id = RecordId::new_v4(TableName::WorkRun);
+        let mut metrics = elephant_types::records::work::WorkRunMetrics::default();
+        crate::scheduler::execution_contract::AttemptUsage::reserved(1000, 3.0)
+            .write_metrics(&mut metrics)
+            .expect("no-dispatch evidence");
+        metrics.custom.insert(
+            "attempt_fence".into(),
+            claimed.payload["_attempt_fence"].clone(),
+        );
+        metrics.custom.insert(
+            "cost_ledger_id".into(),
+            serde_json::json!(ledger_id.to_string()),
+        );
+        WorkRunRepository::new(storage.clone())
+            .create(elephant_types::records::work::WorkRun {
+                base: BaseFields::new(run_id, TEST_SPACE.into(), "fixture".into()),
+                work_item: Link::new(claimed.base.id.clone()),
+                attempt: claimed.attempts,
+                started_at: Utc::now(),
+                completed_at: Some(Utc::now()),
+                success: true,
+                error: None,
+                metrics,
+                worker_id: "fixture".into(),
+                worker_version: "fixture".into(),
+                model_version: None,
+                prompt_id: None,
+                config_hash: None,
+            })
+            .await
+            .expect("closed no-dispatch attempt");
         queue
             .complete(TEST_SPACE, &enqueued.base.id)
             .await
@@ -902,7 +1010,10 @@ mod tests {
             .expect("ledger");
 
         assert_eq!(updated.reserved_euros, 0.0);
-        assert!(updated.reconciled_euros > 0.0);
+        assert_eq!(
+            updated.reconciled_euros, 0.0,
+            "reservation is not measured usage"
+        );
     }
 
     #[tokio::test]
@@ -966,7 +1077,8 @@ mod tests {
         });
         let enqueued = queue.enqueue(item).await.expect("enqueue");
 
-        let _claimed = queue.claim().await.expect("claim").unwrap();
+        let claimed = queue.claim().await.expect("claim").unwrap();
+        let queue = queue.for_attempt(&claimed).expect("attempt handle");
         queue
             .complete(TEST_SPACE, &enqueued.base.id)
             .await
@@ -978,8 +1090,14 @@ mod tests {
             .expect("get ledger")
             .expect("ledger");
 
-        assert_eq!(updated.reserved_euros, 0.0);
-        assert!(updated.reconciled_euros > 0.0);
+        assert_eq!(
+            updated.reserved_euros, 4.0,
+            "missing execution evidence retains reservation"
+        );
+        assert_eq!(
+            updated.reconciled_euros, 0.0,
+            "reservation is not measured usage"
+        );
     }
 
     #[tokio::test]
@@ -1019,7 +1137,8 @@ mod tests {
         });
         let enqueued = queue.enqueue(item).await.expect("enqueue");
 
-        let _claimed = queue.claim().await.expect("claim").unwrap();
+        let claimed = queue.claim().await.expect("claim").unwrap();
+        let queue = queue.for_attempt(&claimed).expect("attempt handle");
         queue
             .fail(TEST_SPACE, &enqueued.base.id, "boom".to_string())
             .await
@@ -1031,56 +1150,33 @@ mod tests {
             .expect("get ledger")
             .expect("ledger");
 
-        // The reservation is RELEASED (so it stops occupying the daily ceiling)
-        // but nothing is billed: this item failed without any recorded token
-        // usage, so there is no evidence a provider was ever reached. Charging
-        // it here is what let 434 fail-fast extraction failures exhaust the
-        // daily graph budget on 2026-07-30 and halt the pipeline.
-        assert_eq!(updated.reserved_euros, 0.0, "reservation must be released");
         assert_eq!(
-            updated.reconciled_euros, 0.0,
-            "a failure with no recorded usage must not be billed"
+            updated.reserved_euros, 2.0,
+            "missing execution evidence retains reservation"
         );
+        assert_eq!(updated.reconciled_euros, 0.0, "unknown usage is not billed");
         assert_eq!(updated.total_euros, 0.0);
-        assert_eq!(updated.total_failures, 1, "but it is still counted");
+        assert_eq!(
+            updated.total_failures, 0,
+            "no accounting settlement was fabricated"
+        );
     }
 
-    /// The planned-token fallback is what turned fail-fast failures into
-    /// full-price charges. It must apply to completed work only.
-    ///
-    /// This tests estimate_actuals directly because that is where the gate sits:
-    /// recorded run metrics are read BEFORE the fallback, so a failure that
-    /// genuinely burned tokens is still billed from its metrics regardless.
+    /// Reservations describe intent, never evidence of provider consumption.
     #[tokio::test]
-    async fn test_planned_tokens_are_only_charged_for_completed_work() {
+    async fn test_planned_tokens_never_become_measured_consumption() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        let queue = WorkQueue::with_defaults(storage.clone());
-
+        let queue = WorkQueue::with_defaults(storage);
         let mut item = make_work_item("test", 10);
         item.payload = serde_json::json!({ "estimated_tokens": 50_000 });
-
-        // Completed: the plan is a fair proxy for usage we failed to measure.
-        let (cost, tokens) = queue
-            .estimate_actuals(&item, true)
-            .await
-            .expect("estimate for completed item");
-        assert_eq!(tokens, 50_000);
-        assert!(
-            cost > 0.0,
-            "completed work with no metrics should still be charged, got {cost}"
-        );
-
-        // Failed: nothing recorded, so there is no evidence a provider was
-        // reached. The plan describes what we INTENDED to send, not what we sent.
-        let (cost, tokens) = queue
-            .estimate_actuals(&item, false)
-            .await
-            .expect("estimate for failed item");
-        assert_eq!(
-            tokens, 0,
-            "planned tokens must not be counted as usage on failure"
-        );
-        assert_eq!(cost, 0.0, "a fail-fast item must not be billed");
+        for status in [WorkItemStatus::Done, WorkItemStatus::Failed] {
+            item.status = status;
+            let actuals = queue.estimate_actuals(&item).await.expect("read receipts");
+            assert_eq!(
+                actuals, None,
+                "missing execution evidence is unknown, not measured zero"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1432,5 +1528,144 @@ mod tests {
 
         // Exactly one should have claimed
         assert_eq!([claim1, claim2].into_iter().flatten().count(), 1);
+    }
+    async fn all_space_attempt_contract(storage: StorageClient) {
+        use elephant_storage::work_attempt_repository::fence_from_claim;
+        let queue = WorkQueue::with_defaults(storage.clone());
+        let mut orphan = make_work_item("quiet_work", 1);
+        orphan.base.space_id = "quiet_named_space".to_string();
+        orphan.status = WorkItemStatus::Running;
+        orphan.leased_by = Some("crashed_process".to_string());
+        orphan.lease_expires_at = Some(Utc::now() - Duration::minutes(2));
+        let orphan = queue.enqueue(orphan).await.expect("orphan");
+        // The only row in this database is Running in a non-default space.
+        let first = queue
+            .claim_prefer_kind("quiet_work", |_| true)
+            .await
+            .expect("recover")
+            .expect("first claim");
+        assert_eq!(first.base.id, orphan.base.id);
+        let first_fence = fence_from_claim(&first).expect("fence");
+        let first_owner = queue.for_attempt(&first).expect("first owner");
+        queue
+            .repository()
+            .renew_lease(
+                &first.base.space_id,
+                &first.base.id,
+                &first_fence.lease_token,
+                Utc::now() + Duration::milliseconds(40),
+            )
+            .await
+            .expect("owner short renewal")
+            .expect("owned");
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let second = queue
+            .claim()
+            .await
+            .expect("recover second")
+            .expect("second claim");
+        let second_fence = fence_from_claim(&second).expect("second fence");
+        assert!(second_fence.generation > first_fence.generation);
+        assert_ne!(second_fence.lease_token, first_fence.lease_token);
+        assert!(first_owner
+            .complete(&first.base.space_id, &first.base.id)
+            .await
+            .is_err());
+        assert!(first_owner
+            .renew_lease(&first.base.space_id, &first.base.id, 60)
+            .await
+            .is_err());
+        assert!(first_owner
+            .fail(
+                &first.base.space_id,
+                &first.base.id,
+                "late failure".to_string()
+            )
+            .await
+            .is_err());
+        let second_owner = queue.for_attempt(&second).expect("second owner");
+        let failed = second_owner
+            .fail(
+                &second.base.space_id,
+                &second.base.id,
+                "fixture".to_string(),
+            )
+            .await
+            .expect("fail current");
+        // Archive/retry and an administrative retry-counter reset cannot reuse
+        // the durable generation or revive either previous token.
+        let archived = elephant_storage::work_retention::archive_terminal_work(
+            &storage,
+            Utc::now() + Duration::seconds(1),
+            10,
+        )
+        .await
+        .expect("archive");
+        assert_eq!(archived.items_archived, 1);
+        let mut retry = failed.clone();
+        retry.status = WorkItemStatus::Runnable;
+        retry.attempts = 0;
+        queue
+            .repository()
+            .update(&retry.base.space_id.clone(), &retry.base.id.clone(), retry)
+            .await
+            .expect("restore retry");
+        let third = queue.claim().await.expect("claim third").expect("third");
+        let third_fence = fence_from_claim(&third).expect("third fence");
+        assert!(third_fence.generation > second_fence.generation);
+        assert_eq!(third.attempts, 1);
+        assert!(second_owner
+            .complete(&third.base.space_id, &third.base.id)
+            .await
+            .is_err());
+        assert!(queue.claim().await.expect("no duplicate").is_none());
+        queue
+            .for_attempt(&third)
+            .expect("third owner")
+            .complete(&third.base.space_id, &third.base.id)
+            .await
+            .expect("complete latest");
+    }
+
+    #[tokio::test]
+    async fn embedded_quiet_space_and_attempt_fencing_survive_archive_retry() {
+        all_space_attempt_contract(StorageClient::new_embedded().await.expect("embedded")).await;
+    }
+
+    #[tokio::test]
+    async fn surreal_quiet_space_and_attempt_fencing_survive_archive_retry() {
+        all_space_attempt_contract(StorageClient::new_memory().await.expect("surreal")).await;
+    }
+
+    #[tokio::test]
+    async fn configuration_blockage_preserves_execution_retry_allowance() {
+        let storage = StorageClient::new_embedded().await.expect("store");
+        let queue = WorkQueue::with_defaults(storage);
+        queue
+            .enqueue(make_work_item("configured_work", 1))
+            .await
+            .expect("enqueue");
+        let claim = queue.claim().await.expect("claim").expect("work");
+        let fence =
+            elephant_storage::work_attempt_repository::fence_from_claim(&claim).expect("fence");
+        let blocked = queue
+            .repository()
+            .requeue_configuration_blocked(
+                &claim.base.space_id,
+                &claim.base.id,
+                &fence.lease_token,
+                30,
+                "binding revoked".to_string(),
+            )
+            .await
+            .expect("block")
+            .expect("owned");
+        assert_eq!(blocked.attempts, 0);
+        assert!(blocked.run_after.is_some());
+        assert!(blocked
+            .last_error
+            .expect("reason")
+            .starts_with("configuration_blocked:"));
+        assert!(queue.claim().await.expect("not due").is_none());
     }
 }

@@ -19,16 +19,17 @@ The default Docker deployment starts `meerkat-recall serve` and `surrealdb`; sta
 |---------|--------|--------------|-------------|
 | `elephant` | `meerkat-recall serve` | 3000 | HTTP API server (Axum), MCP endpoints, and managed workers |
 | `elephant-worker` | `meerkat-recall worker` | N/A | Optional standalone background workers |
-| `surrealdb` | SurrealDB v2.4.1 | 8000 | Default persistent backend |
+| `surrealdb` | Paired Recall SurrealDB 2.6.5 | 8000 | Persistent remote backend with the required reference-fence capability |
 
 The API owns the managed runtime by default, including background worker loops. The pipeline can also run as a separate advanced worker deployment.
 
 ## Release binaries
 
 For archive layout, checksum verification, installation, and model-backed demo
-prerequisites, see [binary installation](/installation). The candidate matrix
-and build instructions below describe intended artifacts; they do not establish
-that a public download or clean-machine acceptance receipt exists.
+prerequisites, see [binary installation](/installation). Download released
+artifacts from [lukacf/meerkat-recall](https://github.com/lukacf/meerkat-recall/releases).
+Use the selected release record for actual platform acceptance. The build
+workflow below prepares future candidates; it does not rebuild published assets.
 
 The **Build release candidates** workflow is started manually for a selected
 commit or ref. It validates the source, then builds native Linux x86-64 and
@@ -36,7 +37,7 @@ macOS ARM64 binaries with the `rocksdb` feature and default Meerkat extraction
 support. Builds use Rust 1.94.0, the repository Cargo wrapper, `--locked`, and the
 `deploy` profile. Linux uses Ubuntu 22.04 for compatibility with Debian 12.
 
-Each candidate archive contains `elephant`, both license texts, and
+Each candidate archive contains `meerkat-recall`, its `elephant` alias, both license texts, and
 `provenance.json` with the source commit/tree, build command, workflow run, and
 binary SHA256. Its adjacent checksum file names the archive without directory
 prefixes. The workflow attests its archives and uploads candidates; it does not
@@ -65,14 +66,212 @@ For builds promoted outside the candidate workflow, record their actual build
 commands and validation rather than claiming workflow attestations. Publishing
 release binaries does not publish Rust crates or the local-helper npm package.
 
+## Independent native and container recipes
+
+The source includes `scripts/release/build-native` and
+`scripts/release/build-container`. Both prepare candidate artifacts from an exact
+clean source identity without publishing or deploying. Native packaging uses
+`meerkat-recall-native/v1`; the image contains
+`/usr/share/meerkat-recall/provenance.json` in
+`meerkat-recall-container/v1` format. Artifact creation is separate from target
+qualification. Darwin ARM64 must be built and checked on a native ARM64 host;
+Linux acceptance does not establish Darwin behavior.
+
+`deploy/native/` contains launchd and systemd templates plus an environment
+example. Install the complete verified archive, create private service-owned
+state directories, and substitute absolute paths before service registration.
+Configure the same backend, namespace and database for explicit `migrate` and
+`serve`. The server verifies schema; it does not silently migrate a store.
+
+`deploy/kubernetes/recall.yaml` contains a single-replica StatefulSet with separate
+RWOP data, recovery-journal and backup claims. It uses an explicit schema init
+container, authenticated readiness and a rotating scoped probe token. Render
+its image placeholder to the exact qualified registry digest with
+`scripts/release/render-container`. The recipe needs a CSI driver that supports
+ReadWriteOncePod and a `meerkat-recall-auth` Secret; its adjacent README describes
+bootstrap and grant creation. No cluster resources are created by the renderer.
+
+Exclusive store ownership is enforced when opening local persistent storage,
+through a stable sibling OS lock held by the shared store lifetime. Kubernetes
+volume exclusivity and `OnDelete` updates provide additional protection. Do not
+delete the lock inode or force a second writer while an old pod may still run.
+Remote SurrealDB and embedded ElephantDB remain available; these templates
+select embedded RocksDB for a concrete independent deployment.
+
+## Noninteractive authentication and rotation
+
+Create a signing key once in a private directory:
+
+```bash
+meerkat-recall service-token bootstrap --secret-file /private/recall/signing-key
+```
+
+For first-space/grant creation, deliberately issue a short-lived bootstrap
+administrator with only management scopes:
+
+```bash
+meerkat-recall service-token issue --secret-file /private/recall/signing-key \
+  --global-admin --subject bootstrap-admin --expires-in 900 \
+  --scope manage:grant --scope read:space_config --scope write:space_config \
+  --scope read:status --output /private/recall/bootstrap.token
+```
+
+Global administration is a distinct opt-in: it conflicts with `--space`, refuses
+ordinary data/wildcard scopes and is limited to one hour. The complete permitted
+scope list is `manage:grant`, `manage:provider`, `read:space_config`, `write:space_config`,
+`read:status`, `read:system`, and `write:system`. Snapshot operators use the last
+two as needed. This token does not create grants or acquire ordinary data access.
+
+Set `JWT_SECRET_FILE` for the service, or provide `JWT_SECRET` from a secret
+manager. Supplying both is an error. Keep issuer/audience identical for issuance
+and validation. Bootstrap refuses to overwrite an existing key and prints only
+the output path. Issuance requires explicit scopes and space grants:
+
+```bash
+meerkat-recall service-token issue --secret-file /private/recall/signing-key \
+  --subject report-reader --space business-a --space business-b \
+  --scope read:entity --scope read:doc --read-only --expires-in 3600 \
+  --output /private/recall/report-reader.token
+```
+
+`--space` is repeatable. Multi-space tokens do not select a default or first
+space: callers choose an authorized path space or `X-Space-Id`. Signed claims
+are an upper bound; current service grants remain authoritative. Administrative
+creation/revocation of those grants is separate from local token issuance.
+`--clearances-file` and `--subject-allowlist-file` accept explicit JSON arrays.
+An empty subject array stays restrictive. Read-only issuance refuses write or
+wildcard scopes. Token lifetime is bounded to thirty-one days.
+
+Use `--output` to write a new private bearer file, or `--json` for a deliberate
+secret-bearing stdout response. Neither overwrites existing files. Rotation
+issues a second token for the same subject, verifies it, then atomically replaces
+the client's file. Existing tokens remain valid until expiry unless current
+grants are revoked. A signing-key change invalidates prior tokens; retain the
+key separately in a secret manager or plan explicit reissuance after recovery.
+Do not include signing keys or token bytes in artifact/qualification records.
+
+## Liveness, readiness and shutdown
+
+`GET /v1/health` reports process liveness without probing storage or providers.
+`GET /v1/readiness` requires `read:status` (or applicable system administration)
+and returns `ready: true` with HTTP 200, or HTTP 503 while unready. Restore replay,
+failed recovery, missing required capabilities and drain keep readiness false.
+The CLI preserves bounded diagnostic JSON even when readiness fails:
+
+```bash
+meerkat-recall --api-url http://127.0.0.1:3000 \
+  --token-file /private/recall/probe.token \
+  status --json --require-ready --space business-a
+```
+
+| Exit | Meaning |
+|---|---|
+| 0 | Ready, or a successful non-strict diagnostic command |
+| 1 | Operational failure outside the readiness categories |
+| 2 | Invalid command arguments |
+| 3 | Reachable but not ready |
+| 4 | Unavailable, malformed or inconsistent readiness response |
+| 5 | Readiness authorization refused |
+
+Status requests run concurrently, each with a ten-second timeout and a 1 MiB
+response limit. Readiness is a service capability check, not proof that a
+requested source revision is current. Consumers retain their own optional
+startup and authorized fallback behavior.
+
+SIGTERM and SIGINT withdraw readiness and reject new mutations before draining
+workers and requests. The default total shutdown deadline is sixty seconds;
+service-manager templates allow seventy-five seconds before forced kill. A
+worker-drain or snapshot-flush failure exits unsuccessfully. Managed embedded
+storage with a persistent destination synchronizes acknowledged mutations to its
+write-ahead log and replays it before admission; shutdown autosave is separate
+from that commit durability boundary. Explicitly ephemeral library/test stores
+remain volatile. See [managed embedded commit durability](../embedded-durable-commits.md).
+
+## Named backup, verification and restore
+
+Set `ELEPHANT_SNAPSHOT_DIR` to the permitted backup root and use a global
+operator token with `read:system` for export and `write:system` for restore.
+Export/restore paths are on the server; offline verify/prune paths are local to
+the command. These commands never prompt:
+
+```bash
+meerkat-recall --token-file /private/recall/backup-operator.token \
+  snapshot export --output /backups/nightly-2026-10-06 --name nightly \
+  --retention-days 7 --quiesce-timeout-seconds 30 --json
+meerkat-recall snapshot verify --input /backups/nightly-2026-10-06 --json
+meerkat-recall --token-file /private/recall/backup-operator.token \
+  snapshot restore --input /backups/nightly-2026-10-06 --json
+```
+
+Export pauses admissions/scheduling and drains active work for a bounded
+quiesce window (default thirty seconds, maximum sixty). The storage barrier
+refuses a capture with Running work in any space. Failure reports refusal;
+it does not label an inconsistent file as a successful backup. A successful
+immutable directory contains `manifest.json` and `data.snapshot`, with format
+`recall-snapshot-v1`, version, backend, UUID, name, creation/expiry, byte length
+and SHA256. Existing output directories are refused. The CLI management request
+has a 120-second deadline; a timeout is an uncertain result requiring status
+inspection before retry, not permission to overwrite a previous backup.
+
+Verification checks format, expiry, length, digest and backend payload before
+any store replacement. Restore uses the independently retained erasure journal
+and leaves a durable barrier on interruption or failure. Readiness stays false
+until replay, restored attempt fencing and final persistence complete. SurrealDB restore replaces the selected database under the same exclusive
+barrier; it is not restricted to an empty destination. Embedded restore replaces
+the embedded store. Both require the original independent journal and a matching
+backend. The `snapshot import` spelling remains an alias for restore.
+
+Retention defaults to seven days and is bounded to thirty days. The durability
+registry tracks owned generations, incomplete exports and prior live snapshots;
+cleanup runs at startup and every sixty seconds. For an existing store-specific
+journal, an independent maintenance timer can invoke:
+
+```bash
+meerkat-recall snapshot prune --journal-directory /recovery/STORE_ID --json
+```
+
+Keep the recovery journal outside the replaced data store, including on a
+separate persistent volume in the container recipe. Never restore an older
+journal with a data backup. Ensure retention maintenance continues while the
+service is stopped, and give external backup copies/cloud disk snapshots their
+own finite deletion policy. Processor-side retention follows the approved
+provider's account policy; Recall's live deletion cannot erase remote processor
+copies. Backup keys, runtime configuration and provider credentials are managed
+separately from source payloads and must have an explicit recovery/reissuance
+procedure. A successful restore rehearsal and digest receipt qualify a backup;
+a file's existence does not.
+
+## Paired remote database image
+
+Both retained development Compose files require `RECALL_SURREAL_IMAGE` to name
+an already built and loaded paired image. The source recipe is
+`packaging/recall-surreal/README.md`: it pins server 2.6.5 and copies the reviewed
+Recall core, SDK and repaired SurrealKV sources. Preserve its source/build
+receipts and image identity. No qualified image download is implied by this
+example. Vanilla SurrealDB cannot pass Recall's reference-fence readiness check.
+
+```bash
+export RECALL_SURREAL_IMAGE=recall-surreal:REVIEWED_SOURCE
+```
+
+Substitute the actual local tag or digest. Compose refuses an unset image and
+uses `pull_policy: never`. Database health only establishes that the paired
+process responds; Recall verifies capability, schema and recovery separately.
+The paired image owns its data directory as UID/GID 65532; the Recall image
+owns its state directories as UID/GID 10001. Fresh named volumes inherit these
+image directory permissions. Existing volumes retain their ownership and must
+be reviewed before reuse; this example does not reset or migrate old volumes.
+
 ## Deployment Modes
 
 <Tabs>
   <Tab title="Managed workers (default)">
-    The default `docker compose up` runs `meerkat-recall serve` with managed workers in the same container. Storage is still SurrealDB by default.
+    After explicit migration, `docker compose up -d elephant` runs `meerkat-recall serve` with managed workers in the same container. Storage is the paired remote SurrealDB backend.
 
     ```bash
-    docker compose up -d
+    docker compose up -d --wait surrealdb
+    docker compose run --build --rm elephant meerkat-recall migrate
+    docker compose up -d elephant
     ```
   </Tab>
   <Tab title="Separate workers">
@@ -90,7 +289,7 @@ release binaries does not publish Rust crates or the local-helper npm package.
 
     ```bash
     # 1. Start SurrealDB
-    docker compose up -d surrealdb
+    docker compose up -d --wait surrealdb
 
     # 2. Use one explicit database configuration for migrations and runtime
     export SURREALDB_URL=ws://localhost:8000
@@ -100,6 +299,8 @@ release binaries does not publish Rust crates or the local-helper npm package.
     export SURREALDB_PASS=root
     export SKIP_AUTH=true  # Local development only
     export ELEPHANT_HOST=127.0.0.1
+    export ELEPHANT_DURABILITY_PATH="$PWD/.elephant/manual-recovery"
+    export ELEPHANT_SNAPSHOT_DIR="$PWD/.elephant/manual-backups"
     ./scripts/repo-cargo run -p meerkat-recall-bin -- migrate
 
     # 3. Start API server
@@ -128,15 +329,16 @@ release binaries does not publish Rust crates or the local-helper npm package.
     ```
 
     The supplied Compose file selects OpenAI embeddings and an Anthropic
-    extractor, so this setup needs both `OPENAI_API_KEY` and
-    `ANTHROPIC_API_KEY`. A directly launched binary uses the provider selected
+    extractor. Credentials and explicit approved per-space processing bindings
+    are required before those roles can dispatch; environment defaults do not
+    constitute provider approval. A directly launched binary uses the provider selected
     by its own model and embedding settings. For a credential-free starting
     point, use the [local demo](/quickstart).
   </Step>
   <Step title="Start the database and apply schema">
     ```bash
-    docker compose up -d surrealdb
-    docker compose run --rm elephant meerkat-recall migrate
+    docker compose up -d --wait surrealdb
+    docker compose run --build --rm elephant meerkat-recall migrate
     ```
 
     This applies schema using the same service configuration as the server.
@@ -236,25 +438,36 @@ requires an explicit entry. Host/origin checks do not replace JWT or ABAC.
 For example, use `MCP_ALLOWED_HOSTS=elephant.example.com` behind a reverse proxy
 and forward the corresponding host header.
 
-### Embedded snapshots
+### Managed snapshots
 
-Snapshot import/export is available only when `ELEPHANT_DB=elephant-db`.
+CLI and HTTP snapshot export/restore support both `elephant-db` and retained
+`surreal-db`. MCP snapshot tool advertisement remains embedded-only and globally
+administrative; this does not remove the remote backend's CLI/HTTP operations.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ELEPHANT_SNAPSHOT_DIR` | _(none)_ | Optional base directory used to constrain snapshot import/export paths |
+| `ELEPHANT_SNAPSHOT_DIR` | Server working directory's `.elephant-snapshots` | Required containment root for snapshot directories |
 
-Operational helpers:
+Use the running server and a global operator token with `read:system` for export
+or `write:system` for restore, without a named-space restriction:
 
 ```bash
-meerkat-recall snapshot export /tmp/elephant.json
-meerkat-recall snapshot import /tmp/elephant.json
+meerkat-recall --api-url http://127.0.0.1:3000 --token-file /private/backup-operator.token \
+  snapshot export --output /backups/nightly-UNIQUE --name nightly \
+  --retention-days 7 --quiesce-timeout-seconds 30 --json
+meerkat-recall snapshot verify --input /local/nightly-copy --json
+meerkat-recall --api-url http://127.0.0.1:3000 --token-file /private/restore-operator.token \
+  snapshot restore --input /backups/nightly-UNIQUE --json
 ```
 
-Paths are on the server host, not the CLI client's filesystem. Import replaces
-the entire embedded store across all spaces. Follow the authentication and
-whole-store scope requirements in the [snapshot reference](/api/system#embedded-snapshots)
-and keep a verified export before replacing data.
+Export/restore paths are directories on the server host within its configured
+root. Verification is local to the CLI. Preserve both `manifest.json` and
+`data.snapshot` in each `recall-snapshot-v1` bundle; this is not the old single
+JSON-file format. Positional `snapshot export PATH` and `snapshot import PATH`
+spellings remain accepted, with the directory format and same guarded runtime
+semantics. Whole-store restore replaces every space, requires a matching backend
+and the original independent erasure journal, and stays unready through replay.
+See the [snapshot reference](/api/system#managed-snapshots).
 
 ### Pipeline: Embed Worker
 
@@ -383,7 +596,7 @@ Meerkat Recall uses SurrealQL migrations managed by `meerkat-recall migrate`:
 ```bash
 # Use the same database environment as the running server.
 # With Compose, inherit it from the elephant service:
-docker compose run --rm elephant meerkat-recall migrate
+docker compose run --build --rm elephant meerkat-recall migrate
 ```
 
 <Warning>
@@ -394,8 +607,8 @@ docker compose run --rm elephant meerkat-recall migrate
 
 The `docker-compose.yml` defines two services:
 
-- **`surrealdb`** -- SurrealDB v2.4.1 with file-based persistence (`surrealdb_data` volume). Health check via `/surreal is-ready`.
-- **`elephant`** -- API server with managed pipeline workers. Health check via `GET /v1/health`.
+- **`surrealdb`** -- Explicit paired image with file persistence in `surrealdb_data`. Health check via `/usr/local/bin/recall-surreal is-ready`.
+- **`elephant`** -- API server with managed workers. The `recall_state` volume retains its original journal and managed snapshots under `/var/lib/meerkat-recall`; explicit migration uses that same volume. `GET /v1/health` is liveness only.
 
 The local ports bind to loopback. The skills directory is mounted read-only at
 `/skills` in the Meerkat Recall container. Configure a separate production deployment
@@ -407,7 +620,11 @@ access; publishing the development ports is not a production configuration.
 ```bash
 # Stop services (preserves data)
 docker compose down
-
-# Stop and remove all data volumes
-docker compose down -v
 ```
+
+The database and its original Recall recovery journal must remain paired.
+Stop the Recall process before running the one-shot migration; its journal lock
+prevents a second live owner. Normal Compose shutdown retains both volumes.
+Deleting the recovery volume while retaining a database or backup is not a
+schema repair and prevents safe replay of erased sources. Backup retention is
+managed by Recall's snapshot coordinator, not by deleting that original journal.

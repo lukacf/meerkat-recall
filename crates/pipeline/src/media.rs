@@ -28,6 +28,64 @@ pub(crate) async fn load_media_bytes(
     space_id: &str,
     attachment: &DocMediaAttachment,
 ) -> Result<(Vec<u8>, u64), PipelineError> {
+    let loaded = load_media_input(storage, space_id, attachment).await?;
+    Ok((loaded.bytes, loaded.duration_ms))
+}
+
+/// The exact asset read that supplied model bytes. Keep this with the input
+/// until dispatch; a later metadata-only lookup cannot establish its custody.
+#[cfg(feature = "meerkat-extraction")]
+pub(crate) struct LoadedMediaInput {
+    pub bytes: Vec<u8>,
+    pub duration_ms: u64,
+    pub asset: Option<elephant_types::records::MediaAsset>,
+}
+
+#[cfg(feature = "meerkat-extraction")]
+pub(crate) async fn load_media_input(
+    storage: Option<&StorageClient>,
+    space_id: &str,
+    attachment: &DocMediaAttachment,
+) -> Result<LoadedMediaInput, PipelineError> {
+    let (bytes, asset) = read_media_payload(storage, space_id, attachment).await?;
+    let duration_ms = match attachment.kind {
+        DocMediaKind::Image => 0,
+        DocMediaKind::Video => attachment.duration_ms.unwrap_or_else(|| {
+            let extension_hint = media_extension_hint(&attachment.media_type);
+            match &attachment.location {
+                DocMediaLocation::Path { path } => probe_video_duration_ms(path),
+                DocMediaLocation::ManagedAsset { .. } => {
+                    probe_video_duration_ms_from_bytes(&bytes, extension_hint)
+                }
+                DocMediaLocation::Uri { .. } => Ok(0),
+            }
+            .unwrap_or(0)
+        }),
+    };
+
+    if attachment.kind == DocMediaKind::Video && duration_ms == 0 {
+        return Err(PipelineError::InvalidInput(format!(
+            "Could not determine duration for video attachment {}",
+            attachment.attachment_id
+        )));
+    }
+
+    Ok(LoadedMediaInput {
+        bytes,
+        duration_ms,
+        asset,
+    })
+}
+
+/// Read payload and its original row together, without re-running duration
+/// probes during dispatch revalidation. No payload-bearing Debug projection.
+#[cfg(feature = "meerkat-extraction")]
+pub(crate) async fn read_media_payload(
+    storage: Option<&StorageClient>,
+    space_id: &str,
+    attachment: &DocMediaAttachment,
+) -> Result<(Vec<u8>, Option<elephant_types::records::MediaAsset>), PipelineError> {
+    let mut original_asset = None;
     let bytes = match &attachment.location {
         DocMediaLocation::Path { path } => tokio::fs::read(path).await.map_err(|e| {
             PipelineError::InvalidInput(format!("Failed to read media path {path}: {e}"))
@@ -59,7 +117,7 @@ pub(crate) async fn load_media_bytes(
                         "Managed media asset {asset_id} was not found in space {space_id}"
                     ))
                 })?;
-            if let Some(payload_base64) = asset.payload_base64 {
+            let bytes = if let Some(payload_base64) = &asset.payload_base64 {
                 BASE64_STANDARD.decode(payload_base64).map_err(|e| {
                     PipelineError::InvalidInput(format!(
                         "Managed media asset {asset_id} contains invalid base64 payload: {e}"
@@ -73,33 +131,12 @@ pub(crate) async fn load_media_bytes(
                         path.display()
                     ))
                 })?
-            }
+            };
+            original_asset = Some(asset);
+            bytes
         }
     };
-
-    let duration_ms = match attachment.kind {
-        DocMediaKind::Image => 0,
-        DocMediaKind::Video => attachment.duration_ms.unwrap_or_else(|| {
-            let extension_hint = media_extension_hint(&attachment.media_type);
-            match &attachment.location {
-                DocMediaLocation::Path { path } => probe_video_duration_ms(path),
-                DocMediaLocation::ManagedAsset { .. } => {
-                    probe_video_duration_ms_from_bytes(&bytes, extension_hint)
-                }
-                DocMediaLocation::Uri { .. } => Ok(0),
-            }
-            .unwrap_or(0)
-        }),
-    };
-
-    if attachment.kind == DocMediaKind::Video && duration_ms == 0 {
-        return Err(PipelineError::InvalidInput(format!(
-            "Could not determine duration for video attachment {}",
-            attachment.attachment_id
-        )));
-    }
-
-    Ok((bytes, duration_ms))
+    Ok((bytes, original_asset))
 }
 
 #[cfg(feature = "meerkat-extraction")]

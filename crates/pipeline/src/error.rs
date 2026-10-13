@@ -94,6 +94,18 @@ pub enum PipelineError {
     #[error("Validation error: {0}")]
     ValidationError(String),
 
+    /// A complete structurally grounded proposal needs one bounded fresh extraction.
+    #[error("grounding_repair_required")]
+    GroundingRepairRequired,
+
+    /// Automatic repair cannot remain within its original authority or hard limits.
+    #[error("grounding_repair_exhausted")]
+    GroundingRepairExhausted,
+
+    /// A nonempty rejected proposal cannot be replaced by an empty repair.
+    #[error("grounding_repair_empty")]
+    GroundingRepairEmpty,
+
     /// Invalid state (for state machine violations).
     #[error("Invalid state: {0}")]
     InvalidState(String),

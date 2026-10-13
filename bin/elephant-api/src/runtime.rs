@@ -23,6 +23,10 @@ use tracing::{info, warn};
 #[cfg(feature = "meerkat-extraction")]
 use elephant_pipeline::extraction::{AgenticExtractor, AgenticExtractorConfig, Extractor};
 
+#[path = "runtime_recipe.rs"]
+mod recipe;
+use recipe::ManagedWorkerRecipe;
+
 const CONFIG_DIR: &str = ".elephant";
 const CONFIG_FILE: &str = "elephant_config.toml";
 const DEFAULT_SNAPSHOT_PATH: &str = ".elephant/state.snapshot";
@@ -400,12 +404,24 @@ impl RuntimeConfigPatch {
 }
 
 struct ManagedPipeline {
+    recipe: Option<ManagedWorkerRecipe>,
     shutdown_tx: watch::Sender<bool>,
     handle: thread::JoinHandle<anyhow::Result<()>>,
     stopped: StdArc<AtomicBool>,
     last_error: StdArc<StdMutex<Option<String>>>,
 }
 
+impl ManagedPipeline {
+    /// Early builder errors and unwinding may finish before the normal stop flag.
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst) || self.handle.is_finished()
+    }
+}
+
+#[expect(
+    clippy::missing_fields_in_debug,
+    reason = "Preserve the existing runtime diagnostic fields with the worker recipe omitted"
+)]
 impl std::fmt::Debug for ManagedPipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManagedPipeline")
@@ -444,6 +460,10 @@ pub struct RuntimeManager {
     readiness_refresh: Mutex<()>,
     /// Last computed conveyor status and when. See [`CONVEYOR_STATUS_TTL`].
     conveyor_cache: Mutex<Option<(std::time::Instant, ConveyorStatus)>>,
+    listener_bound: AtomicBool,
+    shutting_down: AtomicBool,
+    workers_drained: AtomicBool,
+    snapshot_paused: AtomicBool,
 }
 
 /// How long a computed conveyor status is reused.
@@ -513,6 +533,10 @@ impl RuntimeManager {
             reconfigure: Mutex::new(()),
             readiness_refresh: Mutex::new(()),
             conveyor_cache: Mutex::new(None),
+            listener_bound: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            workers_drained: AtomicBool::new(false),
+            snapshot_paused: AtomicBool::new(false),
         })
     }
 
@@ -526,14 +550,30 @@ impl RuntimeManager {
                 config: Some(ElephantConfig {
                     runtime: RuntimeSection {
                         mode: RuntimeMode::LocalMemory,
-                        ingest_enabled: true,
+                        ingest_enabled: false,
                     },
                     storage: StorageSection {
                         backend: storage.backend(),
                         ..StorageSection {
                             backend: storage.backend(),
-                            elephant_db: EmbeddedStorageSection::default(),
-                            surreal_db: SurrealStorageSection::default(),
+                            elephant_db: EmbeddedStorageSection {
+                                snapshot_path: storage
+                                    .effective_snapshot_destination()
+                                    .map(Path::to_path_buf)
+                                    .unwrap_or_default(),
+                            },
+                            surreal_db: SurrealStorageSection {
+                                url: storage.config().url.clone(),
+                                namespace: storage.config().namespace.clone(),
+                                database: storage.config().database.clone(),
+                                username: storage.config().username.clone(),
+                                password: storage.config().password.clone(),
+                                query_timeout_secs: storage.config().query_timeout.as_secs(),
+                                transaction_timeout_secs: storage
+                                    .config()
+                                    .transaction_timeout
+                                    .as_secs(),
+                            },
                         }
                     },
                     extractor: ExtractorSection::default(),
@@ -549,8 +589,8 @@ impl RuntimeManager {
                     backend: Some(storage.backend().as_str().to_string()),
                     storage_ready: true,
                     worker_ready: false,
-                    extractor_ready: true,
-                    semantic_ingest_ready: true,
+                    extractor_ready: false,
+                    semantic_ingest_ready: false,
                     conveyor: None,
                     issues: Vec::new(),
                 },
@@ -558,6 +598,10 @@ impl RuntimeManager {
             reconfigure: Mutex::new(()),
             readiness_refresh: Mutex::new(()),
             conveyor_cache: Mutex::new(None),
+            listener_bound: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            workers_drained: AtomicBool::new(false),
+            snapshot_paused: AtomicBool::new(false),
         }
     }
 
@@ -565,15 +609,59 @@ impl RuntimeManager {
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
     pub fn new_with_storage_for_tests(storage: StorageClient) -> Self {
-        Self::new_preconfigured(storage)
+        let mut runtime = Self::new_preconfigured(storage);
+        let inner = runtime.inner.get_mut();
+        inner.status.extractor_ready = true;
+        inner.status.semantic_ingest_ready = true;
+        runtime
     }
 
     /// Readiness only: configured, storage/worker/ingest readiness, mode and
     /// issues. No database work, so it is safe on every request path. This is
     /// what tool gating needs; it never reads the conveyor.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain guard, repository and runtime owners through the original response or state transition scope"
+    )]
     pub async fn get_readiness(&self) -> RuntimeStatus {
         self.refresh_pipeline_liveness().await;
-        self.inner.read().await.status.clone()
+        let inner = self.inner.read().await;
+        let mut status = inner.status.clone();
+        if self.snapshot_paused.load(Ordering::SeqCst) {
+            status.storage_ready = false;
+            status.semantic_ingest_ready = false;
+            status.issues.push("snapshot_quiesce".into());
+        }
+        if inner
+            .storage
+            .as_ref()
+            .is_some_and(|storage| !storage.recovery_status().ready)
+        {
+            status.storage_ready = false;
+            status.semantic_ingest_ready = false;
+            status.issues.push("recovery_barrier".into());
+        }
+        status
+    }
+
+    pub async fn workers_required(&self) -> bool {
+        self.inner
+            .read()
+            .await
+            .config
+            .as_ref()
+            .is_some_and(|config| {
+                config.runtime.mode.is_write_capable() && config.runtime.ingest_enabled
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_mode_for_tests(&self, mode: RuntimeMode) {
+        let mut inner = self.inner.write().await;
+        inner.status.runtime_mode = mode;
+        if let Some(config) = &mut inner.config {
+            config.runtime.mode = mode;
+        }
     }
 
     /// Full status: readiness plus the conveyor diagnostic (cached, see
@@ -627,6 +715,10 @@ impl RuntimeManager {
     ///
     /// Returns `None` when storage or config is not up yet, since there is
     /// nothing meaningful to say about the queue then.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain guard, repository and runtime owners through the original response or state transition scope"
+    )]
     async fn conveyor_status(&self) -> Option<ConveyorStatus> {
         // Release the read guard before touching the queue: counting runnable
         // items hits the database, and holding the lock across it would make a
@@ -661,12 +753,28 @@ impl RuntimeManager {
         })
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain guard, repository and runtime owners through the original response or state transition scope"
+    )]
     pub async fn get_config_redacted(&self) -> Option<toml::Value> {
+        self.refresh_pipeline_liveness().await;
         let inner = self.inner.read().await;
-        inner
-            .config
-            .clone()
-            .and_then(|config| toml::Value::try_from(redact_config(config)).ok())
+        let config = inner.config.clone()?;
+        let mut value = toml::Value::try_from(redact_config(config)).ok()?;
+        if let Some(recipe) = inner.pipeline.as_ref().and_then(|pipeline| {
+            (!pipeline.is_stopped())
+                .then_some(pipeline.recipe.as_ref())
+                .flatten()
+        }) {
+            // Authorized global configuration inspection only. This value is
+            // neither persisted configuration nor public health/readiness data.
+            value.as_table_mut()?.insert(
+                "managed_worker_recipe".into(),
+                toml::Value::try_from(recipe).ok()?,
+            );
+        }
+        Some(value)
     }
 
     pub async fn current_storage(&self) -> Option<StorageClient> {
@@ -680,8 +788,16 @@ impl RuntimeManager {
     ///
     /// Returns an error if the runtime is already configured, if the config
     /// cannot be written, or if storage/worker startup fails.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain guard, repository and runtime owners through the original response or state transition scope"
+    )]
     pub async fn initialize_runtime(&self, patch: RuntimeConfigPatch) -> Result<RuntimeStatus> {
         let _guard = self.reconfigure.lock().await;
+        anyhow::ensure!(
+            !self.shutting_down.load(Ordering::SeqCst),
+            "runtime is draining"
+        );
         let config_path = {
             let inner = self.inner.read().await;
             if inner.config.is_some() {
@@ -691,8 +807,9 @@ impl RuntimeManager {
         };
 
         let config = patch.apply_to(ElephantConfig::default());
-        save_config(&config_path, &config)?;
-        let prepared = prepare_runtime(config, None).await?;
+        let prepared = prepare_runtime_with_schema(config.clone(), None, true).await?;
+        self.persist_configuration_or_drain(&config_path, &config)
+            .await?;
 
         let old_pipeline = {
             let mut inner = self.inner.write().await;
@@ -701,13 +818,20 @@ impl RuntimeManager {
             }
             inner.pipeline.take()
         };
-        stop_pipeline_handle(old_pipeline).await;
+        if stop_pipeline_handle(old_pipeline).await.is_err() {
+            self.drain_after_configuration_failure("configuration_activation_failed", true)
+                .await;
+            return Err(anyhow!("configuration was saved but the previous workers did not stop; runtime is draining and restart is required"));
+        }
 
         let mut inner = self.inner.write().await;
         if inner.config.is_some() {
             return Err(anyhow!("runtime is already configured"));
         }
         apply_prepared_runtime(&mut inner, prepared);
+        if self.listener_bound.load(Ordering::SeqCst) {
+            start_prepared_workers(&mut inner)?;
+        }
         Ok(inner.status.clone())
     }
 
@@ -717,8 +841,16 @@ impl RuntimeManager {
     ///
     /// Returns an error if the runtime is not configured, if the config
     /// cannot be written, or if storage/worker restart fails.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain guard, repository and runtime owners through the original response or state transition scope"
+    )]
     pub async fn configure_runtime(&self, patch: RuntimeConfigPatch) -> Result<RuntimeStatus> {
         let _guard = self.reconfigure.lock().await;
+        anyhow::ensure!(
+            !self.shutting_down.load(Ordering::SeqCst),
+            "runtime is draining"
+        );
         let (current, current_storage, config_path) = {
             let inner = self.inner.read().await;
             let current = inner
@@ -747,9 +879,10 @@ impl RuntimeManager {
                 ));
             }
         }
-        save_config(&config_path, &config)?;
         let reused_storage = current_storage.filter(|_| storage_config_matches(&current, &config));
-        let prepared = prepare_runtime(config, reused_storage).await?;
+        let prepared = prepare_runtime(config.clone(), reused_storage).await?;
+        self.persist_configuration_or_drain(&config_path, &config)
+            .await?;
 
         let old_pipeline = {
             let mut inner = self.inner.write().await;
@@ -759,7 +892,11 @@ impl RuntimeManager {
                 .ok_or_else(|| anyhow!("runtime is not configured"))?;
             inner.pipeline.take()
         };
-        stop_pipeline_handle(old_pipeline).await;
+        if stop_pipeline_handle(old_pipeline).await.is_err() {
+            self.drain_after_configuration_failure("configuration_activation_failed", true)
+                .await;
+            return Err(anyhow!("configuration was saved but the previous workers did not stop; runtime is draining and restart is required"));
+        }
 
         let mut inner = self.inner.write().await;
         inner
@@ -767,13 +904,280 @@ impl RuntimeManager {
             .as_ref()
             .ok_or_else(|| anyhow!("runtime is not configured"))?;
         apply_prepared_runtime(&mut inner, prepared);
+        if self.listener_bound.load(Ordering::SeqCst) {
+            start_prepared_workers(&mut inner)?;
+        }
         Ok(inner.status.clone())
     }
 
-    pub async fn shutdown(&self) {
+    // The caller already holds reconfigure. Never call shutdown() here:
+    // shutdown acquires that same lock.
+    async fn persist_configuration_or_drain(
+        &self,
+        path: &Path,
+        config: &ElephantConfig,
+    ) -> Result<()> {
+        match save_config(path, config) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if matches!(
+                    error.downcast_ref::<elephant_storage::ConfigWriteError>(),
+                    Some(elephant_storage::ConfigWriteError::CommitUncertain(_))
+                ) {
+                    self.drain_after_configuration_failure(
+                        "configuration_persistence_uncertain",
+                        false,
+                    )
+                    .await;
+                    return Err(error.context("configuration replacement durability is uncertain; runtime is draining and restart is required"));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn drain_after_configuration_failure(
+        &self,
+        issue: &'static str,
+        prior_drain_failed: bool,
+    ) {
+        self.begin_shutdown().await;
+        self.workers_drained.store(false, Ordering::SeqCst);
+        let pipeline = {
+            let mut inner = self.inner.write().await;
+            if !inner.status.issues.iter().any(|existing| existing == issue) {
+                inner.status.issues.push(issue.into());
+            }
+            if !inner
+                .status
+                .issues
+                .iter()
+                .any(|existing| existing == "configuration_restart_required")
+            {
+                inner
+                    .status
+                    .issues
+                    .push("configuration_restart_required".into());
+            }
+            inner.pipeline.take()
+        };
+        let drained = stop_pipeline_handle(pipeline).await.is_ok() && !prior_drain_failed;
+        self.workers_drained.store(drained, Ordering::SeqCst);
+        if !drained {
+            let mut inner = self.inner.write().await;
+            if !inner
+                .status
+                .issues
+                .iter()
+                .any(|existing| existing == "worker_drain_failed")
+            {
+                inner.status.issues.push("worker_drain_failed".into());
+            }
+        }
+    }
+
+    /// Stops accepting writes before waiting for the worker drain.
+    pub async fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let mut inner = self.inner.write().await;
+        inner.status.semantic_ingest_ready = false;
+        inner.status.worker_ready = false;
+        inner.status.storage_ready = false;
+        if !inner
+            .status
+            .issues
+            .iter()
+            .any(|issue| issue == "runtime_draining")
+        {
+            inner.status.issues.push("runtime_draining".into());
+        }
+    }
+
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    /// Starts workers only after the managed API has bound its listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime is draining or prepared workers cannot start.
+    pub async fn start_workers_after_bind(&self) -> Result<()> {
+        let _guard = self.reconfigure.lock().await;
+        anyhow::ensure!(!self.is_draining(), "runtime is draining");
+        self.listener_bound.store(true, Ordering::SeqCst);
+        let mut inner = self.inner.write().await;
+        start_prepared_workers(&mut inner)
+    }
+
+    /// Online snapshot operations run to completion even if the HTTP caller disconnects.
+    /// The storage barrier drains admitted HTTP/MCP and worker activities after workers stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid retention, unavailable or draining runtime,
+    /// failed worker quiescence, snapshot or restore failure, or worker restart
+    /// and snapshot task failures.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain guard, repository and runtime owners through the original response or state transition scope"
+    )]
+    pub async fn snapshot_operation(
+        self: &std::sync::Arc<Self>,
+        path: PathBuf,
+        name: String,
+        retention: elephant_storage::snapshot::SnapshotRetention,
+        restore: bool,
+    ) -> Result<elephant_storage::snapshot::SnapshotManifest> {
+        anyhow::ensure!(
+            (1..=60).contains(&retention.quiesce_timeout_seconds),
+            "quiesce timeout must be 1..=60 seconds"
+        );
+        anyhow::ensure!(
+            (1..=2_592_000).contains(&retention.retention_seconds),
+            "retention must be 1..=2592000 seconds"
+        );
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let _guard = runtime.reconfigure.lock().await;
+            anyhow::ensure!(!runtime.is_draining(), "runtime is draining");
+            let (storage, pipeline) = {
+                let mut inner = runtime.inner.write().await;
+                anyhow::ensure!(
+                    !inner
+                        .status
+                        .issues
+                        .iter()
+                        .any(|issue| issue == "worker_drain_failed"),
+                    "previous worker drain failed"
+                );
+                let storage = inner
+                    .storage
+                    .clone()
+                    .ok_or_else(|| anyhow!("runtime storage unavailable"))?;
+                runtime.snapshot_paused.store(true, Ordering::SeqCst);
+                (storage, inner.pipeline.take())
+            };
+            let started = std::time::Instant::now();
+            let budget = Duration::from_secs(retention.quiesce_timeout_seconds);
+            if let Err(error) = stop_pipeline_handle_with_timeout(pipeline, budget).await {
+                runtime
+                    .inner
+                    .write()
+                    .await
+                    .status
+                    .issues
+                    .push("worker_drain_failed".into());
+                // Keep admission closed: a timed-out worker might still be running.
+                return Err(error);
+            }
+            let remaining = budget.saturating_sub(started.elapsed());
+            let result = if remaining.as_secs() == 0 {
+                Err(anyhow!(
+                    "snapshot quiesce budget exhausted before storage barrier"
+                ))
+            } else if restore {
+                match storage.erasure_journal() {
+                    Ok(journal) => elephant_storage::snapshot::restore_named_with_timeout(
+                        &storage, &path, journal, remaining,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from),
+                    Err(error) => Err(error.into()),
+                }
+            } else if started.elapsed() >= budget {
+                Err(anyhow!(
+                    "snapshot quiesce budget exhausted before storage barrier"
+                ))
+            } else {
+                let remaining = remaining.as_secs();
+                let retention = elephant_storage::snapshot::SnapshotRetention {
+                    quiesce_timeout_seconds: remaining,
+                    ..retention
+                };
+                elephant_storage::snapshot::export_named(&storage, &path, &name, &retention)
+                    .await
+                    .map_err(anyhow::Error::from)
+            };
+            if storage.recovery_status().ready && !runtime.is_draining() {
+                let mut inner = runtime.inner.write().await;
+                inner.status.storage_ready = true;
+                if runtime.listener_bound.load(Ordering::SeqCst) {
+                    start_prepared_workers(&mut inner)?;
+                }
+                runtime.snapshot_paused.store(false, Ordering::SeqCst);
+            }
+            result
+        })
+        .await
+        .context("snapshot task failed")?
+    }
+
+    /// The effective configuration owns both snapshot loading and autosave.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain guard, repository and runtime owners through the original response or state transition scope"
+    )]
+    pub async fn snapshot_autosave_path(&self) -> Option<PathBuf> {
+        let inner = self.inner.read().await;
+        let config = inner.config.as_ref()?;
+        (config.storage.backend == StorageBackendKind::ElephantDb
+            && !config
+                .storage
+                .elephant_db
+                .snapshot_path
+                .as_os_str()
+                .is_empty())
+        .then(|| config.storage.elephant_db.snapshot_path.clone())
+    }
+
+    /// Persists only after a successful worker drain; a timeout is not quiescence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if workers have not drained, storage is unavailable,
+    /// or the configured shutdown snapshot cannot be persisted.
+    pub async fn persist_shutdown_snapshot(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.is_draining() && self.workers_drained.load(Ordering::SeqCst),
+            "snapshot requires a completed worker drain"
+        );
+        let Some(path) = self.snapshot_autosave_path().await else {
+            return Ok(());
+        };
+        let storage = self
+            .inner
+            .read()
+            .await
+            .storage
+            .clone()
+            .ok_or_else(|| anyhow!("runtime storage unavailable"))?;
+        storage
+            .export_snapshot(path)
+            .await
+            .context("persist shutdown snapshot")
+    }
+
+    /// Stops admission and drains the managed workers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a prior worker drain failed or the current workers
+    /// cannot be drained successfully.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.begin_shutdown().await;
         let _guard = self.reconfigure.lock().await;
         let pipeline = {
             let mut inner = self.inner.write().await;
+            anyhow::ensure!(
+                !inner
+                    .status
+                    .issues
+                    .iter()
+                    .any(|issue| issue == "worker_drain_failed"),
+                "prior worker drain failed; restart before exporting a snapshot"
+            );
             inner.status.worker_ready = false;
             inner.status.semantic_ingest_ready = false;
             inner
@@ -792,7 +1196,17 @@ impl RuntimeManager {
             }
             inner.pipeline.take()
         };
-        stop_pipeline_handle(pipeline).await;
+        if let Err(error) = stop_pipeline_handle(pipeline).await {
+            self.inner
+                .write()
+                .await
+                .status
+                .issues
+                .push("worker_drain_failed".into());
+            return Err(error);
+        }
+        self.workers_drained.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn schedule_post_bind_readiness_refresh(self: std::sync::Arc<Self>) -> JoinHandle<()> {
@@ -880,7 +1294,8 @@ impl RuntimeManager {
                 let Some(config) = inner.config.clone() else {
                     return Ok(ExtractorRefreshOutcome::NotApplicable);
                 };
-                if inner.status.extractor_ready
+                if self.is_draining()
+                    || inner.status.extractor_ready
                     || !config.runtime.ingest_enabled
                     || !config.extractor.required
                     || config.extractor.provider != "meerkat-agentic"
@@ -900,8 +1315,9 @@ impl RuntimeManager {
                     .is_some_and(|current| extractor_config_matches(current, &config))
                 {
                     inner.status.extractor_ready = true;
-                    inner.status.semantic_ingest_ready =
-                        inner.status.storage_ready && inner.status.worker_ready;
+                    inner.status.semantic_ingest_ready = !self.is_draining()
+                        && inner.status.storage_ready
+                        && inner.status.worker_ready;
                     inner.status.issues.retain(|issue| {
                         issue != ISSUE_SEMANTIC_EXTRACTOR_UNAVAILABLE
                             && issue != ISSUE_SEMANTIC_EXTRACTOR_FEATURE_UNAVAILABLE
@@ -948,7 +1364,7 @@ impl RuntimeManager {
             .await
             .pipeline
             .as_ref()
-            .is_some_and(|pipeline| pipeline.stopped.load(Ordering::SeqCst));
+            .is_some_and(ManagedPipeline::is_stopped);
         if !stopped {
             return;
         }
@@ -956,12 +1372,11 @@ impl RuntimeManager {
         let Some(pipeline) = inner.pipeline.as_ref() else {
             return;
         };
-        let stopped = pipeline.stopped.load(Ordering::SeqCst);
-        let last_error = pipeline
+        let stopped = pipeline.is_stopped();
+        let failed = pipeline
             .last_error
             .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+            .is_ok_and(|guard| guard.is_some());
 
         if !stopped {
             return;
@@ -980,11 +1395,17 @@ impl RuntimeManager {
                 .issues
                 .push("worker_runtime_unavailable".to_string());
         }
-        if let Some(err) = last_error {
-            let detailed = format!("worker_runtime_stopped:{err}");
-            if !inner.status.issues.iter().any(|issue| issue == &detailed) {
-                inner.status.issues.push(detailed);
-            }
+        // Readiness is available to scoped callers. Detailed worker failures
+        // may contain another space's data or provider diagnostics; keep those
+        // in the private pipeline handle, never in public status strings.
+        if failed
+            && !inner
+                .status
+                .issues
+                .iter()
+                .any(|issue| issue == "worker_runtime_stopped")
+        {
+            inner.status.issues.push("worker_runtime_stopped".into());
         }
     }
 }
@@ -1094,6 +1515,28 @@ impl ElephantConfig {
     }
 }
 
+/// Resolves the same file/environment storage authority used by serve without
+/// opening storage, applying schema, starting workers, or changing config.
+///
+/// # Errors
+///
+/// Returns an error when the current directory or configuration cannot be
+/// read, runtime configuration is absent, or storage timeouts are invalid.
+pub fn resolve_storage_config_for_cli() -> Result<StorageConfig> {
+    let root = find_project_root(env::current_dir().context("current dir")?);
+    let path = root.join(CONFIG_DIR).join(CONFIG_FILE);
+    let mut config = if path.exists() {
+        let mut config = load_config_from_path(&path)?;
+        apply_env_overrides_to_loaded_config(&mut config);
+        config
+    } else if env_runtime_config_present() {
+        ElephantConfig::from_env()
+    } else {
+        return Err(anyhow!("runtime is unconfigured; initialize a configuration or set explicit storage environment before migration"));
+    };
+    resolve_storage_config(&mut config)
+}
+
 fn resolve_storage_config(config: &mut ElephantConfig) -> Result<StorageConfig> {
     let storage_config = storage_config_from_runtime(config).with_env_timeouts()?;
     if config.storage.backend == StorageBackendKind::SurrealDb {
@@ -1105,8 +1548,16 @@ fn resolve_storage_config(config: &mut ElephantConfig) -> Result<StorageConfig> 
 }
 
 async fn prepare_runtime(
+    config: ElephantConfig,
+    existing_storage: Option<StorageClient>,
+) -> Result<PreparedRuntime> {
+    prepare_runtime_with_schema(config, existing_storage, false).await
+}
+
+async fn prepare_runtime_with_schema(
     mut config: ElephantConfig,
     existing_storage: Option<StorageClient>,
+    initialize_schema: bool,
 ) -> Result<PreparedRuntime> {
     let storage_config = resolve_storage_config(&mut config)?;
     let existing_storage = existing_storage.filter(|storage| {
@@ -1117,21 +1568,37 @@ async fn prepare_runtime(
     let storage_client = if let Some(storage) = existing_storage {
         storage
     } else {
-        StorageClient::new(storage_config)
+        let destination = (config.storage.backend == StorageBackendKind::ElephantDb)
+            .then(|| config.storage.elephant_db.snapshot_path.clone());
+        StorageClient::new_with_snapshot_destination_diagnosed(storage_config, destination)
             .await
             .context("failed to initialize configured storage")?
     };
-    let extractor_ready = extractor_ready(&config).await;
-    let pipeline = if config.runtime.mode.is_write_capable() && config.runtime.ingest_enabled {
-        Some(start_pipeline(&config, &storage_client)?)
-    } else {
-        None
-    };
-    let worker_ready = pipeline.is_some();
+    let recovery_ready = storage_client.recovery_status().ready;
+    if recovery_ready && initialize_schema {
+        elephant_migrations::apply_schema(&storage_client)
+            .await
+            .map_err(|error| anyhow!("explicit schema initialization failed: {error}"))?;
+    }
+    if recovery_ready {
+        elephant_migrations::verify_schema(&storage_client)
+            .await
+            .map_err(|error| {
+                anyhow!("schema verification failed; run migrate explicitly: {error}")
+            })?;
+    }
+    // Preparing storage must not start workers or probe an MCP endpoint that
+    // cannot accept connections yet. The API explicitly starts both after bind.
+    let extractor_ready = !config.extractor.required;
+    let pipeline = None;
+    let worker_ready = false;
 
     let backend = config.storage.backend.as_str().to_string();
     let semantic_ingest_ready = config.runtime.ingest_enabled && worker_ready && extractor_ready;
     let mut issues = Vec::new();
+    if !recovery_ready {
+        issues.push("recovery_barrier".into());
+    }
     if !worker_ready && config.runtime.ingest_enabled {
         issues.push("worker_runtime_unavailable".to_string());
     }
@@ -1145,7 +1612,7 @@ async fn prepare_runtime(
             bootstrap_mode: false,
             runtime_mode: config.runtime.mode,
             backend: Some(backend),
-            storage_ready: true,
+            storage_ready: recovery_ready,
             worker_ready,
             extractor_ready,
             semantic_ingest_ready,
@@ -1156,6 +1623,45 @@ async fn prepare_runtime(
         storage: storage_client,
         pipeline,
     })
+}
+
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Retain guard, repository and runtime owners through the original response or state transition scope"
+)]
+fn start_prepared_workers(inner: &mut RuntimeInner) -> Result<()> {
+    if inner
+        .storage
+        .as_ref()
+        .is_some_and(|storage| !storage.recovery_status().ready)
+    {
+        return Ok(());
+    }
+    let Some(config) = inner.config.as_ref() else {
+        return Ok(());
+    };
+    if inner.pipeline.is_some()
+        || !config.runtime.mode.is_write_capable()
+        || !config.runtime.ingest_enabled
+    {
+        return Ok(());
+    }
+    let storage = inner
+        .storage
+        .as_ref()
+        .ok_or_else(|| anyhow!("storage unavailable"))?;
+    anyhow::ensure!(
+        storage.recovery_status().ready,
+        "storage recovery barrier is not ready"
+    );
+    inner.pipeline = Some(start_pipeline(config, storage)?);
+    inner.status.worker_ready = true;
+    inner.status.semantic_ingest_ready = inner.status.storage_ready && inner.status.extractor_ready;
+    inner
+        .status
+        .issues
+        .retain(|issue| issue != "worker_runtime_unavailable");
+    Ok(())
 }
 
 fn apply_prepared_runtime(inner: &mut RuntimeInner, prepared: PreparedRuntime) {
@@ -1170,6 +1676,7 @@ fn start_pipeline(
     storage_client: &StorageClient,
 ) -> Result<ManagedPipeline> {
     let pipeline_config = pipeline_config_from_runtime(config);
+    let recipe = ManagedWorkerRecipe::capture(&pipeline_config);
     let extractor_mcp_url = config.extractor.mcp_url.clone();
     let extractor_model = config.extractor.model.clone();
     let multimodal = config.multimodal.clone();
@@ -1256,6 +1763,7 @@ fn start_pipeline(
         })
         .context("spawn managed pipeline thread")?;
     Ok(ManagedPipeline {
+        recipe: Some(recipe),
         shutdown_tx,
         handle,
         stopped,
@@ -1334,16 +1842,24 @@ const fn agentic_extractor_supported() -> bool {
     false
 }
 
-async fn stop_pipeline_handle(pipeline: Option<ManagedPipeline>) {
+async fn stop_pipeline_handle(pipeline: Option<ManagedPipeline>) -> Result<()> {
+    stop_pipeline_handle_with_timeout(pipeline, Duration::from_secs(30)).await
+}
+
+async fn stop_pipeline_handle_with_timeout(
+    pipeline: Option<ManagedPipeline>,
+    timeout: Duration,
+) -> Result<()> {
     if let Some(pipeline) = pipeline {
         let _ = pipeline.shutdown_tx.send(true);
         let handle = pipeline.handle;
-        let _ = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || handle.join()),
-        )
-        .await;
+        tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || handle.join()))
+            .await
+            .context("worker drain timed out; snapshot is unsafe")?
+            .context("worker join failed")?
+            .map_err(|_| anyhow!("worker thread panicked"))??;
     }
+    Ok(())
 }
 
 fn storage_config_from_runtime(config: &ElephantConfig) -> StorageConfig {
@@ -1445,13 +1961,14 @@ fn find_project_root(start: PathBuf) -> PathBuf {
 }
 
 fn save_config(path: &Path, config: &ElephantConfig) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("invalid runtime config path"))?;
-    fs::create_dir_all(parent).context("create config dir")?;
     let content = toml::to_string_pretty(config).context("serialize config")?;
-    fs::write(path, content).context("write config file")
+    elephant_storage::write_private_configuration(path, content.as_bytes())
+        .context("publish runtime configuration")
 }
+
+#[cfg(test)]
+#[path = "runtime_config_save_tests.rs"]
+mod config_save_tests;
 
 fn load_config_from_path(path: &Path) -> Result<ElephantConfig> {
     let content = fs::read_to_string(path).context("read runtime config")?;
@@ -1520,9 +2037,8 @@ mod tests {
     }
 
     use super::*;
-    use elephant_pipeline::scheduler::ingest_work_kinds::enqueue_triage_source_work_item;
     use elephant_storage::work_item_repository::WorkItemRepository;
-    use elephant_storage::{DocRepository, EmbeddedStore, Repository, SourceRepository};
+    use elephant_storage::{DocRepository, Repository};
     use elephant_types::ids::TableName;
     use elephant_types::records::base::BaseFields;
     use elephant_types::records::doc::Doc;
@@ -1531,6 +2047,144 @@ mod tests {
     use elephant_types::RecordId;
     use std::ffi::OsString;
     use std::sync::{Mutex as StdMutex, OnceLock};
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn finished_worker_without_stop_flag_cannot_supply_live_recipe() -> Result<()> {
+        for unwind in [false, true] {
+            let storage = StorageClient::new_embedded().await?;
+            let mut runtime = RuntimeManager::new_preconfigured(storage);
+            let (release, wait) = std::sync::mpsc::channel();
+            let handle = thread::spawn(move || -> anyhow::Result<()> {
+                wait.recv()?;
+                if unwind {
+                    std::panic::resume_unwind(Box::new("PRIVATE WORKER PANIC"));
+                }
+                Err(anyhow!("PRIVATE EARLY WORKER BUILDER ERROR"))
+            });
+            let stopped = StdArc::new(AtomicBool::new(false));
+            let (shutdown_tx, _) = watch::channel(false);
+            let inner = runtime.inner.get_mut();
+            inner.status.worker_ready = true;
+            inner.status.semantic_ingest_ready = true;
+            inner.pipeline = Some(ManagedPipeline {
+                recipe: Some(ManagedWorkerRecipe::capture(&PipelineConfig::default())),
+                shutdown_tx,
+                handle,
+                stopped: StdArc::clone(&stopped),
+                last_error: StdArc::new(StdMutex::new(None)),
+            });
+            let live = runtime
+                .get_config_redacted()
+                .await
+                .ok_or_else(|| anyhow!("missing config"))?;
+            assert!(live.get("managed_worker_recipe").is_some());
+            release.send(())?;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let finished = runtime
+                        .inner
+                        .read()
+                        .await
+                        .pipeline
+                        .as_ref()
+                        .is_some_and(|pipeline| pipeline.handle.is_finished());
+                    if finished {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            assert!(!stopped.load(Ordering::SeqCst));
+            let config = runtime
+                .get_config_redacted()
+                .await
+                .ok_or_else(|| anyhow!("lost config"))?;
+            assert!(config.get("managed_worker_recipe").is_none());
+            assert!(!config.to_string().contains("PRIVATE"));
+            let status = runtime.get_readiness().await;
+            assert!(!status.worker_ready && !status.semantic_ingest_ready);
+            assert!(status
+                .issues
+                .iter()
+                .any(|issue| issue == "worker_runtime_unavailable"));
+            assert!(!serde_json::to_string(&status)?.contains("PRIVATE"));
+            let pipeline = runtime
+                .inner
+                .write()
+                .await
+                .pipeline
+                .take()
+                .ok_or_else(|| anyhow!("worker handle lost"))?;
+            let joined = pipeline.handle.join();
+            if unwind {
+                assert!(joined.is_err());
+            } else {
+                assert!(joined
+                    .map_err(|_| anyhow!("unexpected fixture panic"))?
+                    .is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn stopped_worker_readiness_keeps_private_error_details_out_of_public_status(
+    ) -> Result<()> {
+        let storage = StorageClient::new_embedded().await?;
+        let mut runtime = RuntimeManager::new_preconfigured(storage);
+        let private_error = "PRIVATE OTHER SPACE CONTENT AND PROVIDER DIAGNOSTIC";
+        let last_error = StdArc::new(StdMutex::new(Some(private_error.to_string())));
+        let (shutdown_tx, _) = watch::channel(false);
+        let inner = runtime.inner.get_mut();
+        inner.status.worker_ready = true;
+        inner.status.semantic_ingest_ready = true;
+        inner.pipeline = Some(ManagedPipeline {
+            recipe: None,
+            shutdown_tx,
+            handle: thread::spawn(|| -> anyhow::Result<()> { Ok(()) }),
+            stopped: StdArc::new(AtomicBool::new(true)),
+            last_error: StdArc::clone(&last_error),
+        });
+
+        let status = runtime.get_readiness().await;
+        assert!(!status.worker_ready);
+        assert!(!status.semantic_ingest_ready);
+        assert!(status
+            .issues
+            .iter()
+            .any(|issue| issue == "worker_runtime_stopped"));
+        assert!(!serde_json::to_string(&status)?.contains(private_error));
+        assert_eq!(
+            last_error
+                .lock()
+                .map_err(|_| anyhow!("private error lock poisoned"))?
+                .as_deref(),
+            Some(private_error)
+        );
+        let repeated = runtime.get_readiness().await;
+        assert_eq!(repeated.issues, status.issues);
+        let pipeline = runtime
+            .inner
+            .write()
+            .await
+            .pipeline
+            .take()
+            .ok_or_else(|| anyhow!("private worker handle lost"))?;
+        pipeline
+            .handle
+            .join()
+            .map_err(|_| anyhow!("fixture worker panicked"))??;
+        Ok(())
+    }
 
     const RUNTIME_CONFIG_ENV_VARS: &[&str] = &[
         "ELEPHANT_DB",
@@ -1592,7 +2246,9 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         );
-        std::env::temp_dir().join(unique)
+        fs::canonicalize(std::env::temp_dir())
+            .expect("canonical test root")
+            .join(unique)
     }
 
     #[serial_test::serial(cwd_env)]
@@ -1669,6 +2325,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(cwd_env)]
     #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
     async fn test_database_timeouts_require_restart_before_live_config_is_saved() {
         let _guard = env_lock().lock().expect("env lock");
         let _env_guard = EnvVarGuard::clear(RUNTIME_CONFIG_ENV_VARS);
@@ -1698,6 +2358,10 @@ mod tests {
             reconfigure: tokio::sync::Mutex::new(()),
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
+            listener_bound: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            workers_drained: AtomicBool::new(false),
+            snapshot_paused: AtomicBool::new(false),
         };
         env::set_var("SURREALDB_QUERY_TIMEOUT_SECS", "31");
         let patch: RuntimeConfigPatch = serde_json::from_value(serde_json::json!({
@@ -1772,6 +2436,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(cwd_env)]
     #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
     async fn test_initialize_runtime_bootstrap_writes_config_and_reports_status() {
         let _guard = env_lock().lock().expect("env lock");
         let _env_guard = EnvVarGuard::clear(RUNTIME_CONFIG_ENV_VARS);
@@ -1824,7 +2492,7 @@ mod tests {
         assert!(!status.semantic_ingest_ready);
         assert!(root.join(CONFIG_DIR).join(CONFIG_FILE).exists());
 
-        runtime.shutdown().await;
+        runtime.shutdown().await.expect("worker shutdown");
         env::set_current_dir(prior_cwd).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
@@ -1832,6 +2500,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(cwd_env)]
     #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
     async fn test_snapshot_load_env_overrides_persisted_embedded_config() {
         let _guard = env_lock().lock().expect("env lock");
         let _env_guard = EnvVarGuard::clear(RUNTIME_CONFIG_ENV_VARS);
@@ -1842,8 +2514,30 @@ mod tests {
 
         let stale_snapshot = root.join("stale.snapshot");
         let fresh_snapshot = root.join("fresh.snapshot");
-        let stale_store = EmbeddedStore::new();
-        let fresh_store = EmbeddedStore::new();
+        let stale_storage = StorageClient::new_with_snapshot_destination(
+            StorageConfig {
+                backend: StorageBackendKind::ElephantDb,
+                ..StorageConfig::default()
+            },
+            Some(stale_snapshot.clone()),
+        )
+        .await
+        .expect("stale live store and independent journal");
+        let fresh_storage = StorageClient::new_with_snapshot_destination(
+            StorageConfig {
+                backend: StorageBackendKind::ElephantDb,
+                ..StorageConfig::default()
+            },
+            Some(fresh_snapshot.clone()),
+        )
+        .await
+        .expect("fresh live store and independent journal");
+        elephant_migrations::apply_schema(&stale_storage)
+            .await
+            .expect("stale canonical schema");
+        elephant_migrations::apply_schema(&fresh_storage)
+            .await
+            .expect("fresh canonical schema");
         let fresh_doc = Doc {
             base: BaseFields::new(
                 RecordId::new_v4(TableName::Doc),
@@ -1859,18 +2553,22 @@ mod tests {
             metadata: serde_json::json!({}),
         };
         let fresh_doc_id = fresh_doc.base.id.clone();
-        fresh_store
+        DocRepository::new(fresh_storage.clone())
             .create(fresh_doc)
             .await
             .expect("create fresh doc");
-        stale_store
+        stale_storage
             .export_snapshot(&stale_snapshot)
             .await
             .expect("export stale snapshot");
-        fresh_store
+        fresh_storage
             .export_snapshot(&fresh_snapshot)
             .await
             .expect("export fresh snapshot");
+        // Reopening must retain the original independent journals and release
+        // the original store writer locks, just like a real process restart.
+        drop(stale_storage);
+        drop(fresh_storage);
 
         let mut config = ElephantConfig::default();
         config.storage.backend = StorageBackendKind::ElephantDb;
@@ -1890,7 +2588,7 @@ mod tests {
             .expect("fresh snapshot doc should load");
         assert_eq!(loaded_doc.title, "Fresh env-selected snapshot doc");
 
-        runtime.shutdown().await;
+        runtime.shutdown().await.expect("worker shutdown");
         env::set_current_dir(prior_cwd).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
@@ -1983,6 +2681,10 @@ mod tests {
     #[serial_test::serial(cwd_env)]
     #[allow(clippy::await_holding_lock)]
     #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
     async fn test_configure_runtime_reuses_embedded_storage_when_only_extractor_changes() {
         let _guard = env_lock().lock().expect("env lock");
         let prior_cwd = env::current_dir().expect("cwd");
@@ -2022,6 +2724,10 @@ mod tests {
             reconfigure: tokio::sync::Mutex::new(()),
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
+            listener_bound: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            workers_drained: AtomicBool::new(false),
+            snapshot_paused: AtomicBool::new(false),
         };
 
         runtime
@@ -2100,13 +2806,17 @@ mod tests {
             Some("alert_only")
         );
 
-        runtime.shutdown().await;
+        runtime.shutdown().await.expect("worker shutdown");
         env::set_current_dir(prior_cwd).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(feature = "meerkat-extraction")]
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
     async fn test_retry_extractor_readiness_promotes_runtime_when_checker_recovers() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc as StdArc;
@@ -2140,6 +2850,10 @@ mod tests {
             reconfigure: tokio::sync::Mutex::new(()),
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
+            listener_bound: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            workers_drained: AtomicBool::new(false),
+            snapshot_paused: AtomicBool::new(false),
         };
 
         let attempts = StdArc::new(AtomicUsize::new(0));
@@ -2166,6 +2880,10 @@ mod tests {
 
     #[cfg(feature = "meerkat-extraction")]
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
     async fn test_refresh_extractor_readiness_until_ready_keeps_retrying_until_recovered() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc as StdArc;
@@ -2199,6 +2917,10 @@ mod tests {
             reconfigure: tokio::sync::Mutex::new(()),
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
+            listener_bound: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            workers_drained: AtomicBool::new(false),
+            snapshot_paused: AtomicBool::new(false),
         };
 
         let attempts = StdArc::new(AtomicUsize::new(0));
@@ -2274,6 +2996,10 @@ mod tests {
             reconfigure: tokio::sync::Mutex::new(()),
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
+            listener_bound: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            workers_drained: AtomicBool::new(false),
+            snapshot_paused: AtomicBool::new(false),
         };
 
         let refreshed = runtime
@@ -2298,6 +3024,10 @@ mod tests {
 
     #[serial_test::serial(cwd_env)]
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
     async fn test_managed_pipeline_thread_starts_and_stops_on_embedded_storage() {
         let storage = StorageClient::new(StorageConfig {
             backend: StorageBackendKind::ElephantDb,
@@ -2311,7 +3041,9 @@ mod tests {
 
         let pipeline = start_pipeline(&config, &storage).expect("start pipeline");
         tokio::time::sleep(Duration::from_millis(50)).await;
-        stop_pipeline_handle(Some(pipeline)).await;
+        stop_pipeline_handle(Some(pipeline))
+            .await
+            .expect("worker shutdown");
     }
 
     #[test]
@@ -2375,320 +3107,341 @@ mod tests {
         );
     }
 
-    #[serial_test::serial(cwd_env)]
-    #[tokio::test]
-    async fn test_managed_pipeline_thread_claims_runnable_work_items_on_embedded_storage() {
-        let storage = StorageClient::new(StorageConfig {
-            backend: StorageBackendKind::ElephantDb,
-            ..StorageConfig::default()
-        })
-        .await
-        .expect("embedded storage");
+    const RUNTIME_TEST_SPACE: &str = "runtime-fixture";
 
-        let mut config = ElephantConfig::default();
-        config.runtime.ingest_enabled = true;
+    #[expect(
+        clippy::default_trait_access,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn prepare_worker_fixture_space(storage: &StorageClient) {
+        elephant_migrations::apply_schema(storage)
+            .await
+            .expect("explicit fixture schema migration");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    RUNTIME_TEST_SPACE.into(),
+                    "tester".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                // The real dispatcher resolves an explicit processing policy
+                // even for metadata/unknown work. No model binding is approved.
+                processing: Some(elephant_types::provider_binding::SpaceProcessingConfig {
+                    generation: 1,
+                    index_generation: 0,
+                    policy_id: "runtime-fixture-no-model-approval".into(),
+                    connections: Default::default(),
+                    profiles: Default::default(),
+                    bindings: Default::default(),
+                    active_embedding_profile_id: None,
+                    pending_reindex: None,
+                }),
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .expect("explicit named worker space");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .resolve_space(RUNTIME_TEST_SPACE)
+            .await
+            .expect("dispatcher can resolve the explicit processing policy");
+    }
 
-        let pipeline = start_pipeline(&config, &storage).expect("start pipeline");
-
-        let repo = WorkItemRepository::new(storage.clone());
-        let item = WorkItem {
+    fn unknown_worker_fixture(stale_lease: bool) -> WorkItem {
+        WorkItem {
             base: BaseFields::new(
                 RecordId::new_v4(TableName::WorkItem),
-                "default".to_string(),
-                "tester".to_string(),
+                RUNTIME_TEST_SPACE.into(),
+                "tester".into(),
             ),
-            kind: "unknown_work_kind".to_string(),
+            kind: "unknown_work_kind".into(),
             payload: serde_json::json!({}),
             status: WorkItemStatus::Runnable,
             priority: 10,
             idempotency_key: format!("runtime-claim-{}", uuid::Uuid::new_v4()),
             attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
+            lease_expires_at: stale_lease
+                .then(|| chrono::Utc::now() + chrono::Duration::minutes(10)),
+            leased_by: stale_lease.then(|| "old-worker".into()),
             run_after: None,
             last_error: None,
-        };
-        let item_id = item.base.id.clone();
-        repo.create(item).await.expect("create work item");
-
-        let mut transitioned = None;
-        for _ in 0..40 {
-            let fetched: WorkItem = repo
-                .get("default", &item_id)
-                .await
-                .expect("get work item")
-                .expect("work item exists");
-            if fetched.attempts > 0 || fetched.status != WorkItemStatus::Runnable {
-                transitioned = Some(fetched);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
         }
-
-        let fetched = transitioned.expect("managed pipeline should claim runnable work item");
-        assert!(fetched.attempts > 0, "work item should have been attempted");
-        assert_ne!(
-            fetched.status,
-            WorkItemStatus::Runnable,
-            "work item should not remain runnable forever"
-        );
-
-        stop_pipeline_handle(Some(pipeline)).await;
     }
 
-    #[serial_test::serial(cwd_env)]
-    #[tokio::test]
-    async fn test_managed_pipeline_thread_claims_runnable_item_with_stale_lease_fields() {
-        let storage = StorageClient::new(StorageConfig {
-            backend: StorageBackendKind::ElephantDb,
-            ..StorageConfig::default()
-        })
-        .await
-        .expect("embedded storage");
-
-        let mut config = ElephantConfig::default();
-        config.runtime.ingest_enabled = true;
-
-        let pipeline = start_pipeline(&config, &storage).expect("start pipeline");
-
-        let repo = WorkItemRepository::new(storage.clone());
-        let item = WorkItem {
-            base: BaseFields::new(
-                RecordId::new_v4(TableName::WorkItem),
-                "default".to_string(),
-                "tester".to_string(),
-            ),
-            kind: "unknown_work_kind".to_string(),
-            payload: serde_json::json!({}),
-            status: WorkItemStatus::Runnable,
-            priority: 10,
-            idempotency_key: format!("runtime-stale-lease-{}", uuid::Uuid::new_v4()),
-            attempts: 0,
-            lease_expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(10)),
-            leased_by: Some("old-worker".to_string()),
-            run_after: None,
-            last_error: None,
-        };
-        let item_id = item.base.id.clone();
-        repo.create(item).await.expect("create work item");
-
-        let mut transitioned = None;
-        for _ in 0..40 {
-            let fetched: WorkItem = repo
-                .get("default", &item_id)
-                .await
-                .expect("get work item")
-                .expect("work item exists");
-            if fetched.attempts > 0 || fetched.status != WorkItemStatus::Runnable {
-                transitioned = Some(fetched);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-
-        let fetched = transitioned.expect("managed pipeline should claim stale runnable work item");
-        assert!(fetched.attempts > 0, "work item should have been attempted");
-        assert_ne!(
-            fetched.status,
-            WorkItemStatus::Runnable,
-            "stale leased runnable work item should not remain runnable forever"
-        );
-
-        stop_pipeline_handle(Some(pipeline)).await;
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(cwd_env)]
-    #[allow(clippy::await_holding_lock)]
-    async fn test_runtime_manager_from_config_starts_managed_pipeline_on_embedded_storage() {
-        let _guard = env_lock().lock().expect("env lock");
-        let root = temp_test_dir("runtime-manager-managed-pipeline");
-        let prior_cwd = env::current_dir().expect("current dir");
-        fs::create_dir_all(&root).expect("create temp root");
-        env::set_current_dir(&root).expect("switch cwd");
-
-        let config_path = root.join(CONFIG_DIR).join(CONFIG_FILE);
-        save_config(&config_path, &ElephantConfig::default()).expect("save config");
-
-        let runtime = RuntimeManager::new().await.expect("runtime manager");
-        let storage = runtime.current_storage().await.expect("runtime storage");
-        let repo = WorkItemRepository::new(storage);
-
-        let item = WorkItem {
-            base: BaseFields::new(
-                RecordId::new_v4(TableName::WorkItem),
-                "default".to_string(),
-                "tester".to_string(),
-            ),
-            kind: "unknown_work_kind".to_string(),
-            payload: serde_json::json!({}),
-            status: WorkItemStatus::Runnable,
-            priority: 10,
-            idempotency_key: format!("runtime-manager-claim-{}", uuid::Uuid::new_v4()),
-            attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
-            run_after: None,
-            last_error: None,
-        };
-        let item_id = item.base.id.clone();
-        repo.create(item).await.expect("create work item");
-
-        let mut transitioned = None;
-        for _ in 0..40 {
-            let fetched: WorkItem = repo
-                .get("default", &item_id)
-                .await
-                .expect("get work item")
-                .expect("work item exists");
-            if fetched.attempts > 0 || fetched.status != WorkItemStatus::Runnable {
-                transitioned = Some(fetched);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-
-        let fetched =
-            transitioned.expect("runtime-managed pipeline should claim runnable work item");
-        assert!(fetched.attempts > 0, "work item should have been attempted");
-        assert_ne!(
-            fetched.status,
-            WorkItemStatus::Runnable,
-            "work item should not remain runnable forever"
-        );
-
-        runtime.shutdown().await;
-        env::set_current_dir(prior_cwd).expect("restore cwd");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(cwd_env)]
-    #[allow(clippy::await_holding_lock)]
-    async fn test_runtime_manager_claims_real_triage_source_work_item_on_embedded_storage() {
-        let _guard = env_lock().lock().expect("env lock");
-        let root = temp_test_dir("runtime-manager-triage-claim");
-        let prior_cwd = env::current_dir().expect("current dir");
-        fs::create_dir_all(&root).expect("create temp root");
-        env::set_current_dir(&root).expect("switch cwd");
-
-        let config_path = root.join(CONFIG_DIR).join(CONFIG_FILE);
-        save_config(&config_path, &ElephantConfig::default()).expect("save config");
-
-        let runtime = RuntimeManager::new().await.expect("runtime manager");
-        let storage = runtime.current_storage().await.expect("runtime storage");
+    async fn accepted_metadata_fixture(storage: &StorageClient, name: &str) -> RecordId {
+        use elephant_storage::source_intake::{IntakeControl, PreparedSourceIntake};
         let mut source = Source::new(
             BaseFields::new(
                 RecordId::new_v4(TableName::Source),
-                "default".to_string(),
-                "tester".to_string(),
+                RUNTIME_TEST_SPACE.into(),
+                "tester".into(),
             ),
             SourceType::Manual,
-            "runtime-triage-claim".to_string(),
+            name.into(),
         );
-        source.uri = Some("example://runtime-manager/triage-claim".to_string());
-        let source = SourceRepository::new(storage.clone())
-            .create(source)
+        source.external_id = Some(name.into());
+        source.set_requested_ingest_mode(elephant_types::records::ingest::IngestMode::Metadata);
+        let accepted = PreparedSourceIntake::prepare(storage, source, IntakeControl::default())
             .await
-            .expect("create source");
-
-        let work_item_id = enqueue_triage_source_work_item(&storage, &source, "tester", 5)
+            .expect("prepare real accepted metadata")
+            .accept(storage)
             .await
-            .expect("enqueue triage_source");
+            .expect("durable source acceptance");
+        let id = elephant_pipeline::source_queue::enqueue_accepted_source(
+            storage,
+            &accepted.source,
+            &accepted.publication,
+            "tester",
+        )
+        .await
+        .expect("enqueue original accepted source fence");
+        let work = WorkItemRepository::new(storage.clone())
+            .get(RUNTIME_TEST_SPACE, &id)
+            .await
+            .expect("read work")
+            .expect("work exists");
+        assert_eq!(
+            elephant_pipeline::source_queue::publication_from_work(&work).expect("original fence"),
+            Some(accepted.publication),
+        );
+        assert_eq!(work.status, WorkItemStatus::Runnable);
+        assert_eq!(work.attempts, 0);
+        id
+    }
 
-        let repo = WorkItemRepository::new(storage);
-        let mut transitioned = None;
-        for _ in 0..40 {
-            let fetched = repo
-                .get("default", &work_item_id)
-                .await
-                .expect("get work item")
-                .expect("work item exists");
-            if fetched.attempts > 0 || fetched.status != WorkItemStatus::Runnable {
-                transitioned = Some(fetched);
-                break;
+    // Return observations on timeout so callers always join workers before
+    // asserting. A failed fixture must not leak background workers to later tests.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn observe_worker_claims(
+        storage: &StorageClient,
+        ids: &[RecordId],
+        timeout: Duration,
+    ) -> Result<Vec<Option<WorkItem>>> {
+        let repo = WorkItemRepository::new(storage.clone());
+        let mut observed = vec![None; ids.len()];
+        let started = tokio::time::Instant::now();
+        loop {
+            for (index, id) in ids.iter().enumerate() {
+                let item = repo
+                    .get(RUNTIME_TEST_SPACE, id)
+                    .await?
+                    .ok_or_else(|| anyhow!("fixture work disappeared"))?;
+                if item.attempts > 0 && item.status != WorkItemStatus::Runnable {
+                    observed[index] = Some(item);
+                }
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            if observed.iter().all(Option::is_some) || started.elapsed() >= timeout {
+                return Ok(observed);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
 
-        let fetched = transitioned.expect("managed pipeline should claim triage_source work item");
-        assert!(
-            fetched.attempts > 0,
-            "triage_source should have been attempted"
-        );
-        assert_ne!(
-            fetched.status,
-            WorkItemStatus::Runnable,
-            "triage_source should not remain runnable forever"
-        );
+    struct WorkerFixtureDirectory {
+        root: PathBuf,
+        previous: PathBuf,
+    }
 
-        env::set_current_dir(prior_cwd).expect("restore cwd");
-        let _ = fs::remove_dir_all(root);
+    impl WorkerFixtureDirectory {
+        fn enter(name: &str) -> Self {
+            let previous = env::current_dir().expect("current directory");
+            let root = temp_test_dir(name);
+            fs::create_dir_all(&root).expect("create fixture root");
+            let root = fs::canonicalize(root).expect("canonical owned fixture root");
+            env::set_current_dir(&root).expect("enter fixture directory");
+            Self { root, previous }
+        }
+    }
+
+    impl Drop for WorkerFixtureDirectory {
+        fn drop(&mut self) {
+            env::set_current_dir(&self.previous).expect("restore fixture directory");
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    async fn configured_worker_fixture(root: &Path) -> RuntimeManager {
+        let mut config = ElephantConfig::default();
+        config.runtime.ingest_enabled = true;
+        config.extractor.required = false;
+        save_config(&root.join(CONFIG_DIR).join(CONFIG_FILE), &config).expect("save config");
+        let runtime = RuntimeManager::new().await.expect("runtime manager");
+        assert!(runtime.inner.read().await.pipeline.is_none());
+        assert!(!runtime.get_readiness().await.worker_ready);
+        let storage = runtime.current_storage().await.expect("runtime storage");
+        prepare_worker_fixture_space(&storage).await;
+        runtime
+    }
+
+    async fn bind_worker_fixture(runtime: &RuntimeManager) -> tokio::net::TcpListener {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture listener first");
+        runtime
+            .start_workers_after_bind()
+            .await
+            .expect("start after listener bind");
+        assert!(runtime.inner.read().await.pipeline.is_some());
+        listener
+    }
+
+    #[serial_test::serial(cwd_env)]
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn test_managed_pipeline_thread_claims_runnable_work_items_on_embedded_storage() {
+        let _env_guard = EnvVarGuard::clear(RUNTIME_CONFIG_ENV_VARS);
+        let storage = StorageClient::new_embedded()
+            .await
+            .expect("embedded storage");
+        prepare_worker_fixture_space(&storage).await;
+        let item = unknown_worker_fixture(false);
+        let id = item.base.id.clone();
+        WorkItemRepository::new(storage.clone())
+            .create(item)
+            .await
+            .expect("create work");
+        let mut config = ElephantConfig::default();
+        config.runtime.ingest_enabled = true;
+        let pipeline = start_pipeline(&config, &storage).expect("start pipeline");
+        let observations = observe_worker_claims(&storage, &[id], Duration::from_secs(10)).await;
+        stop_pipeline_handle(Some(pipeline))
+            .await
+            .expect("worker shutdown");
+        let observations = observations.expect("observe claim");
+        let fetched = observations[0]
+            .as_ref()
+            .expect("managed pipeline claimed runnable work");
+        assert!(fetched.attempts > 0);
+        assert_ne!(fetched.status, WorkItemStatus::Runnable);
+    }
+
+    #[serial_test::serial(cwd_env)]
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn test_managed_pipeline_thread_claims_runnable_item_with_stale_lease_fields() {
+        let _env_guard = EnvVarGuard::clear(RUNTIME_CONFIG_ENV_VARS);
+        let storage = StorageClient::new_embedded()
+            .await
+            .expect("embedded storage");
+        prepare_worker_fixture_space(&storage).await;
+        let item = unknown_worker_fixture(true);
+        let id = item.base.id.clone();
+        WorkItemRepository::new(storage.clone())
+            .create(item)
+            .await
+            .expect("create stale work");
+        let mut config = ElephantConfig::default();
+        config.runtime.ingest_enabled = true;
+        let pipeline = start_pipeline(&config, &storage).expect("start pipeline");
+        let observations = observe_worker_claims(&storage, &[id], Duration::from_secs(10)).await;
+        stop_pipeline_handle(Some(pipeline))
+            .await
+            .expect("worker shutdown");
+        let observations = observations.expect("observe claim");
+        let fetched = observations[0]
+            .as_ref()
+            .expect("managed pipeline claimed stale runnable work");
+        assert!(fetched.attempts > 0);
+        assert_ne!(fetched.status, WorkItemStatus::Runnable);
+        assert_ne!(fetched.leased_by.as_deref(), Some("old-worker"));
     }
 
     #[tokio::test]
     #[serial_test::serial(cwd_env)]
     #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn test_runtime_manager_from_config_starts_managed_pipeline_on_embedded_storage() {
+        let _guard = env_lock().lock().expect("env lock");
+        let _env_guard = EnvVarGuard::clear(RUNTIME_CONFIG_ENV_VARS);
+        let directory = WorkerFixtureDirectory::enter("runtime-manager-managed-pipeline");
+        let runtime = configured_worker_fixture(&directory.root).await;
+        let storage = runtime.current_storage().await.expect("runtime storage");
+        let item = unknown_worker_fixture(false);
+        let id = item.base.id.clone();
+        WorkItemRepository::new(storage.clone())
+            .create(item)
+            .await
+            .expect("create work");
+        let _listener = bind_worker_fixture(&runtime).await;
+        let observations = observe_worker_claims(&storage, &[id], Duration::from_secs(10)).await;
+        runtime.shutdown().await.expect("worker shutdown");
+        let observations = observations.expect("observe claim");
+        let fetched = observations[0]
+            .as_ref()
+            .expect("runtime-managed pipeline claimed runnable work");
+        assert!(fetched.attempts > 0);
+        assert_ne!(fetched.status, WorkItemStatus::Runnable);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cwd_env)]
+    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn test_runtime_manager_claims_real_triage_source_work_item_on_embedded_storage() {
+        let _guard = env_lock().lock().expect("env lock");
+        let _env_guard = EnvVarGuard::clear(RUNTIME_CONFIG_ENV_VARS);
+        let directory = WorkerFixtureDirectory::enter("runtime-manager-triage-claim");
+        let runtime = configured_worker_fixture(&directory.root).await;
+        let storage = runtime.current_storage().await.expect("runtime storage");
+        let id = accepted_metadata_fixture(&storage, "runtime-triage-claim").await;
+        let _listener = bind_worker_fixture(&runtime).await;
+        let observations = observe_worker_claims(&storage, &[id], Duration::from_secs(10)).await;
+        runtime.shutdown().await.expect("worker shutdown");
+        let observations = observations.expect("observe claim");
+        let fetched = observations[0]
+            .as_ref()
+            .expect("runtime-managed pipeline claimed accepted triage");
+        assert!(fetched.attempts > 0);
+        assert_ne!(fetched.status, WorkItemStatus::Runnable);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cwd_env)]
+    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
     async fn test_runtime_manager_claims_burst_of_triage_items_within_single_poll_window() {
         let _guard = env_lock().lock().expect("env lock");
-        let root = temp_test_dir("runtime-manager-burst-triage-claim");
-        let prior_cwd = env::current_dir().expect("current dir");
-        fs::create_dir_all(&root).expect("create temp root");
-        env::set_current_dir(&root).expect("switch cwd");
-
-        let config_path = root.join(CONFIG_DIR).join(CONFIG_FILE);
-        save_config(&config_path, &ElephantConfig::default()).expect("save config");
-
-        let runtime = RuntimeManager::new().await.expect("runtime manager");
+        let _env_guard = EnvVarGuard::clear(RUNTIME_CONFIG_ENV_VARS);
+        let directory = WorkerFixtureDirectory::enter("runtime-manager-burst-triage-claim");
+        let runtime = configured_worker_fixture(&directory.root).await;
         let storage = runtime.current_storage().await.expect("runtime storage");
-        let source_repo = SourceRepository::new(storage.clone());
-        let work_item_repo = WorkItemRepository::new(storage.clone());
-
-        let mut work_item_ids = Vec::new();
-        for idx in 0..4 {
-            let mut source = Source::new(
-                BaseFields::new(
-                    RecordId::new_v4(TableName::Source),
-                    "default".to_string(),
-                    "tester".to_string(),
-                ),
-                SourceType::Manual,
-                format!("runtime-burst-triage-{idx}"),
-            );
-            source.uri = Some(format!("example://runtime-manager/burst/{idx}"));
-            let source = source_repo.create(source).await.expect("create source");
-            let work_item_id = enqueue_triage_source_work_item(&storage, &source, "tester", 5)
-                .await
-                .expect("enqueue triage_source");
-            work_item_ids.push(work_item_id);
+        let mut ids = Vec::new();
+        for index in 0..4 {
+            ids.push(accepted_metadata_fixture(&storage, &format!("runtime-burst-{index}")).await);
         }
-
-        let started = tokio::time::Instant::now();
-        let mut claimed = vec![false; work_item_ids.len()];
-        loop {
-            for (idx, work_item_id) in work_item_ids.iter().enumerate() {
-                let fetched = work_item_repo
-                    .get("default", work_item_id)
-                    .await
-                    .expect("get work item")
-                    .expect("work item exists");
-                if fetched.attempts > 0 || fetched.status != WorkItemStatus::Runnable {
-                    claimed[idx] = true;
-                }
-            }
-            if claimed.iter().all(|done| *done) {
-                break;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(8),
-                "expected all burst triage items to be claimed on the first poll tick, claimed={claimed:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let _listener = bind_worker_fixture(&runtime).await;
+        let observations = observe_worker_claims(&storage, &ids, Duration::from_secs(8)).await;
+        runtime.shutdown().await.expect("worker shutdown");
+        let observations = observations.expect("observe burst");
+        assert!(
+            observations.iter().all(Option::is_some),
+            "all four original triage items must be claimed within one poll window: {observations:?}",
+        );
+        for item in observations.into_iter().flatten() {
+            assert!(item.attempts > 0);
+            assert_ne!(item.status, WorkItemStatus::Runnable);
         }
-
-        runtime.shutdown().await;
-        env::set_current_dir(prior_cwd).expect("restore cwd");
-        let _ = fs::remove_dir_all(root);
     }
 
     fn embedded_test_runtime(storage: StorageClient) -> RuntimeManager {
@@ -2714,6 +3467,10 @@ mod tests {
             reconfigure: tokio::sync::Mutex::new(()),
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
+            listener_bound: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            workers_drained: AtomicBool::new(false),
+            snapshot_paused: AtomicBool::new(false),
         }
     }
 
@@ -2722,6 +3479,10 @@ mod tests {
     /// Readiness must not compute the conveyor, and the full status must reuse
     /// a recent computation instead of scanning again.
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
     async fn readiness_skips_the_conveyor_and_status_reuses_it() {
         let storage = StorageClient::new(StorageConfig {
             backend: StorageBackendKind::ElephantDb,
@@ -2765,3 +3526,149 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod startup_order_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn prepare_does_not_start_workers_or_probe_a_self_dial_endpoint() -> Result<()> {
+        let config = ElephantConfig::default();
+        let prepared = prepare_runtime(config, Some(StorageClient::new_embedded().await?)).await?;
+        assert!(prepared.pipeline.is_none());
+        assert!(!prepared.status.worker_ready);
+        assert!(!prepared.status.semantic_ingest_ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn draining_precedes_worker_wait_and_prevents_premature_snapshot() -> Result<()> {
+        let runtime =
+            RuntimeManager::new_with_storage_for_tests(StorageClient::new_embedded().await?);
+        assert!(runtime.persist_shutdown_snapshot().await.is_err());
+        runtime.begin_shutdown().await;
+        assert!(runtime.is_draining());
+        let status = runtime.get_readiness().await;
+        assert!(!status.storage_ready);
+        assert!(!status.semantic_ingest_ready);
+        assert!(runtime.persist_shutdown_snapshot().await.is_err());
+        runtime.shutdown().await?;
+        assert!(runtime.workers_drained.load(Ordering::SeqCst));
+        Ok(())
+    }
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn online_snapshot_bounds_do_not_pause_the_runtime_on_invalid_input() -> Result<()> {
+        let runtime = std::sync::Arc::new(RuntimeManager::new_with_storage_for_tests(
+            StorageClient::new_embedded().await?,
+        ));
+        let result = runtime
+            .snapshot_operation(
+                PathBuf::from("unused"),
+                "test".into(),
+                elephant_storage::snapshot::SnapshotRetention {
+                    retention_seconds: 1,
+                    quiesce_timeout_seconds: 0,
+                },
+                false,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!runtime.snapshot_paused.load(Ordering::SeqCst));
+        assert!(runtime.get_readiness().await.storage_ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn failed_worker_drain_cannot_be_cleared_by_a_later_export() -> Result<()> {
+        let runtime = std::sync::Arc::new(RuntimeManager::new_with_storage_for_tests(
+            StorageClient::new_embedded().await?,
+        ));
+        runtime
+            .inner
+            .write()
+            .await
+            .status
+            .issues
+            .push("worker_drain_failed".into());
+        let result = runtime
+            .snapshot_operation(
+                PathBuf::from("unused"),
+                "test".into(),
+                elephant_storage::snapshot::SnapshotRetention::default(),
+                false,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!runtime.workers_drained.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn online_named_snapshot_returns_manifest_and_reopens_admission() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("recall-online-snapshot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory)?;
+        let storage = StorageClient::new_with_snapshot_destination(
+            StorageConfig {
+                backend: StorageBackendKind::ElephantDb,
+                ..StorageConfig::default()
+            },
+            Some(directory.join("live.snapshot")),
+        )
+        .await?;
+        let runtime = std::sync::Arc::new(RuntimeManager::new_preconfigured(storage));
+        assert_eq!(
+            runtime.snapshot_autosave_path().await,
+            Some(directory.join("live.snapshot"))
+        );
+        let snapshot = directory.join("backup");
+        let manifest = runtime
+            .snapshot_operation(
+                snapshot.clone(),
+                "manual".into(),
+                elephant_storage::snapshot::SnapshotRetention::default(),
+                false,
+            )
+            .await?;
+        let verified = elephant_storage::snapshot::verify(&snapshot).await?;
+        assert_eq!(manifest.sha256, verified.sha256);
+        assert_eq!(manifest.name, "manual");
+        assert!(!runtime.snapshot_paused.load(Ordering::SeqCst));
+        assert!(runtime.get_readiness().await.storage_ready);
+        drop(runtime);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn explicit_ephemeral_client_has_no_invented_snapshot_destination() -> Result<()> {
+        let runtime = RuntimeManager::new_preconfigured(StorageClient::new_embedded().await?);
+        assert!(runtime.snapshot_autosave_path().await.is_none());
+        assert!(!runtime.workers_required().await);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "runtime_configuration_failure_tests.rs"]
+mod configuration_failure_tests;

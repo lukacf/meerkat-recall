@@ -151,10 +151,18 @@ async fn scenario_m10_2_work_item_lease_acquisition() -> anyhow::Result<()> {
         WorkItemStatus::Running,
         "Claimed item should be running"
     );
+    let fence = elephant_storage::work_attempt_repository::fence_from_claim(&claimed)?;
+    assert_eq!(fence.space_id, space_id);
+    assert_eq!(fence.work_item_id, work_id);
+    assert_eq!(fence.generation, 1);
     assert_eq!(
-        claimed.leased_by,
-        Some(worker_id.to_string()),
-        "Should record worker ID"
+        claimed.leased_by.as_deref(),
+        Some(fence.lease_token.as_str())
+    );
+    assert!(fence.lease_token.starts_with(&format!("{worker_id}:")));
+    assert_ne!(
+        fence.lease_token, worker_id,
+        "worker identity alone is not ownership"
     );
     assert!(
         claimed.lease_expires_at.is_some(),
@@ -209,7 +217,15 @@ async fn scenario_m10_2_runnable_item_replaces_stale_lease_metadata() -> anyhow:
     // metadata, which must not strand an item that has returned to the queue.
     let claimed = claimed.expect("runnable item should be reclaimed");
     assert_eq!(claimed.status, WorkItemStatus::Running);
-    assert_eq!(claimed.leased_by.as_deref(), Some("worker-002"));
+    let fence = elephant_storage::work_attempt_repository::fence_from_claim(&claimed)?;
+    assert_eq!(
+        claimed.leased_by.as_deref(),
+        Some(fence.lease_token.as_str())
+    );
+    assert!(fence.lease_token.starts_with("worker-002:"));
+    assert_ne!(fence.lease_token, "worker-001");
+    assert_eq!(fence.work_item_id, work_id);
+    assert!(fence.generation > 0);
     assert_eq!(claimed.lease_expires_at, Some(new_lease_expires));
     assert_eq!(claimed.attempts, 2);
     assert!(
@@ -232,80 +248,141 @@ async fn scenario_m10_2_runnable_item_replaces_stale_lease_metadata() -> anyhow:
 #[tokio::test]
 #[ignore]
 async fn scenario_m10_3_retry_with_exponential_backoff() -> anyhow::Result<()> {
+    use elephant_pipeline::scheduler::execution_contract::{
+        retry_action, FailureClass, RetryAction,
+    };
+    use elephant_storage::work_attempt_repository::fence_from_claim;
     let harness = Harness::new().await?;
     let space_id = "test_space";
-
     let work_repo = WorkItemRepository::new(harness.client.clone());
-
-    // Create a work item that will fail
     let work_id = RecordId::new_v4(TableName::WorkItem);
-    let work_base = BaseFields::new(work_id.clone(), space_id.to_string(), "P_sys".to_string());
-    let work_item = WorkItem {
-        base: work_base,
-        kind: "extract".to_string(),
-        payload: serde_json::json!({"source_id": "source:bad"}),
-        status: WorkItemStatus::Running,
-        priority: 50,
-        idempotency_key: format!("extract-bad-{}", uuid::Uuid::new_v4()),
-        attempts: 1,
-        lease_expires_at: Some(Utc::now() + Duration::try_minutes(5).unwrap()),
-        leased_by: Some("worker-001".to_string()),
-        run_after: None,
-        last_error: None,
+    work_repo
+        .create(WorkItem {
+            base: BaseFields::new(work_id.clone(), space_id.into(), "P_sys".into()),
+            kind: "extract".into(),
+            payload: serde_json::json!({"source_id": "source:bad"}),
+            status: WorkItemStatus::Runnable,
+            priority: 50,
+            idempotency_key: format!("extract-bad-{}", uuid::Uuid::new_v4()),
+            attempts: 0,
+            lease_expires_at: None,
+            leased_by: None,
+            run_after: None,
+            last_error: None,
+        })
+        .await?;
+    let first = work_repo
+        .claim_with_lease(
+            space_id,
+            &work_id,
+            "worker-001",
+            Utc::now() + Duration::minutes(5),
+        )
+        .await?
+        .expect("first actual claim");
+    let original = fence_from_claim(&first)?;
+    // A one-second configured base keeps this integration oracle bounded while
+    // exercising the production exponential policy and actual due-time guard.
+    let RetryAction::Retry {
+        delay_secs: first_delay,
+    } = retry_action(FailureClass::Timeout, first.attempts, 3, 1, 120)
+    else {
+        anyhow::bail!("first timeout must retry");
     };
-    work_repo.create(work_item).await?;
-
-    // Simulate first failure with backoff
-    let retrieved = work_repo.get(space_id, &work_id).await?;
-    let mut failed = retrieved.unwrap();
-    failed.status = WorkItemStatus::Pending;
-    failed.last_error = Some("Connection timeout".to_string());
-    failed.leased_by = None;
-    failed.lease_expires_at = None;
-    // Exponential backoff: 60 * 2^(attempts-1) = 60 seconds for first retry
-    failed.run_after = Some(Utc::now() + Duration::try_seconds(60).unwrap());
-
-    let updated1 = work_repo.update(space_id, &work_id, failed).await?;
-
-    assert_eq!(
-        updated1.status,
-        WorkItemStatus::Pending,
-        "Should be pending for retry"
-    );
+    assert_eq!(first_delay, 1);
+    assert!(work_repo
+        .requeue_with_delay(
+            space_id,
+            &work_id,
+            "worker-001",
+            first_delay,
+            Some("unfenced actor".into())
+        )
+        .await?
+        .is_none());
+    let before_first = Utc::now();
+    let updated1 = work_repo
+        .requeue_with_delay(
+            space_id,
+            &work_id,
+            &original.lease_token,
+            first_delay,
+            Some("Connection timeout".into()),
+        )
+        .await?
+        .expect("original owner requeues");
+    assert_eq!(updated1.status, WorkItemStatus::Runnable);
+    assert_eq!(updated1.attempts, 1);
+    assert_eq!(updated1.last_error.as_deref(), Some("Connection timeout"));
+    assert!(updated1.leased_by.is_none() && updated1.lease_expires_at.is_none());
+    let first_due = updated1.run_after.expect("first due time");
+    assert!(first_due >= before_first + Duration::seconds(first_delay));
     assert!(
-        updated1.run_after.is_some(),
-        "Should have run_after for backoff"
+        work_repo
+            .claim_with_lease(
+                space_id,
+                &work_id,
+                "worker-001",
+                Utc::now() + Duration::minutes(5)
+            )
+            .await?
+            .is_none(),
+        "backoff must prevent immediate claim"
     );
-    assert!(updated1.last_error.is_some(), "Should record error");
-
-    // Simulate second failure with longer backoff
-    let mut failed2 = updated1.clone();
-    failed2.attempts = 2;
-    failed2.last_error = Some("Connection timeout (attempt 2)".to_string());
-    // 60 * 2^1 = 120 seconds
-    failed2.run_after = Some(Utc::now() + Duration::try_seconds(120).unwrap());
-
-    let updated2 = work_repo.update(space_id, &work_id, failed2).await?;
-
+    let wait = (first_due - Utc::now()).to_std().unwrap_or_default();
+    tokio::time::sleep(wait + std::time::Duration::from_millis(20)).await;
+    let second = work_repo
+        .claim_with_lease(
+            space_id,
+            &work_id,
+            "worker-001",
+            Utc::now() + Duration::minutes(5),
+        )
+        .await?
+        .expect("due original work can retry");
+    let successor = fence_from_claim(&second)?;
+    assert!(successor.generation > original.generation);
+    assert_ne!(successor.lease_token, original.lease_token);
+    assert_eq!(second.attempts, 2);
+    assert!(work_repo
+        .requeue_with_delay(
+            space_id,
+            &work_id,
+            &original.lease_token,
+            120,
+            Some("stale original retry".into())
+        )
+        .await?
+        .is_none());
+    let RetryAction::Retry {
+        delay_secs: second_delay,
+    } = retry_action(FailureClass::Timeout, second.attempts, 3, 1, 120)
+    else {
+        anyhow::bail!("second timeout must retry");
+    };
+    assert_eq!(second_delay, 2 * first_delay);
+    let before_second = Utc::now();
+    let updated2 = work_repo
+        .requeue_with_delay(
+            space_id,
+            &work_id,
+            &successor.lease_token,
+            second_delay,
+            Some("Connection timeout (attempt 2)".into()),
+        )
+        .await?
+        .expect("successor owner requeues");
+    assert_eq!(updated2.status, WorkItemStatus::Runnable);
     assert_eq!(updated2.attempts, 2);
-    // Verify backoff increases
-    let backoff1 = updated1
-        .run_after
-        .unwrap()
-        .signed_duration_since(Utc::now())
-        .num_seconds();
-    let backoff2 = updated2
-        .run_after
-        .unwrap()
-        .signed_duration_since(Utc::now())
-        .num_seconds();
+    assert!(updated2.leased_by.is_none() && updated2.lease_expires_at.is_none());
     assert!(
-        backoff2 > backoff1,
-        "Backoff should increase: {} vs {}",
-        backoff1,
-        backoff2
+        updated2.run_after.expect("second due time")
+            >= before_second + Duration::seconds(second_delay)
     );
-
+    assert!(matches!(
+        retry_action(FailureClass::Timeout, 3, 3, 1, 120),
+        RetryAction::Fail
+    ));
     Ok(())
 }
 

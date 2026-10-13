@@ -1,0 +1,370 @@
+{
+  "scope": "selected_source_review_and_independent_static_literal_recomputation",
+  "product_acceptance": false,
+  "plan_independently_approved": false,
+  "workload_executed": false,
+  "helpers_imported_or_executed": false,
+  "owner_plan_commit": "ca15d8af10c02ec1762cdac93fa18ed87aaad2b5",
+  "driver_commit": "dbdb897930ef92bdffbffabb6f6d537a0f92d282",
+  "graph_manifest_commit": "b39341b7fc087e1912906c200b2d6e177acf90eb",
+  "components": {
+    "transport": {
+      "root": "components",
+      "path": "tests/recall_preview_semantics/full_workload_transport.py",
+      "sha256": "cf4a61f41b44477bdaf017bd139dd0a904ffde653da1c689e41e57dacbb9c01a",
+      "bytes": 14983,
+      "source_commit": "b7c09aa508ec82897f97c40e87e0a1d58a0a707e"
+    },
+    "spy": {
+      "root": "components",
+      "path": "tests/recall_preview_semantics/full_workload_spy.py",
+      "sha256": "604086b12a5cc349121d25bbccebeec13ae2c6e318ae25617abcce5344828284",
+      "bytes": 21797,
+      "source_commit": "4aa344d2a044d8d10543e64cb52cb84ad36b46e4"
+    },
+    "graph": {
+      "root": "components",
+      "path": "tests/recall_preview_semantics/full_workload_graph.py",
+      "sha256": "a2b04bfc33eb065aa7cd77f10362d8da92f7f28e4da4a8e89ff353184d3b45b9",
+      "bytes": 17275,
+      "source_commit": "fbd4bc447bd6332a17fb41355fbb9aee3ae2b947"
+    },
+    "load": {
+      "root": "components",
+      "path": "tests/recall_preview_semantics/full_workload_load.py",
+      "sha256": "a4baf66f7d64ba0306c6a7d504e36b25a7d63df9d4f35153b214cd379d916947",
+      "bytes": 10934,
+      "source_commit": "408731c022314b6a7b9402df3f707293d0e34fb8"
+    },
+    "driver": {
+      "root": "components",
+      "path": "tests/recall_preview_semantics/full_workload_driver.py",
+      "sha256": "afcbc8a83459a576cef7661374040842d9faf0972a77dad7e183b707909e3104",
+      "bytes": 80225,
+      "source_commit": "dbdb897930ef92bdffbffabb6f6d537a0f92d282"
+    },
+    "cli": {
+      "root": "components",
+      "path": "scripts/qualification/full_workload.py",
+      "sha256": "0dbb7163fb40943768214f021f7028067ee0f00257df5fafdc455fec26793f58",
+      "bytes": 17242,
+      "source_commit": "6e907409a26fb75c9843d9d103b1ef1a74b2f675"
+    },
+    "ob3_oracle": {
+      "root": "components",
+      "path": "scripts/qualification/ob3_outage_oracle.py",
+      "sha256": "b3263d6cec8880929c769b24397975bdc1683123612492cee71324e58bdc5bbf",
+      "bytes": 10839,
+      "source_commit": "d205e42f7517e1d3b063b64aace00dc0bdfe2baa"
+    }
+  },
+  "input_pins": {
+    "contract": {
+      "root": "qualification",
+      "path": "tests/recall_preview/full-workload-contract.json",
+      "sha256": "44a91b9f0ae4c2ae32d2f8aec9eb783a48ccca63eeee010ff2427ef1ec4a0c0b",
+      "bytes": 10652
+    },
+    "corpus": {
+      "root": "qualification",
+      "path": "tests/recall_preview/workload-corpus.json",
+      "sha256": "2192437954109fc17ebbea5b3960eb6b398a2ee91a725ce70666b119e86179dc",
+      "bytes": 138934
+    },
+    "rendered": {
+      "root": "qualification",
+      "path": "tests/recall_preview/workload-rendered-map.json",
+      "sha256": "9dbcade15daa3fb504838c2fe4f743b4b5fc37da20b2c0f29e2e3aea49ad57ab",
+      "bytes": 43131
+    },
+    "preparation": {
+      "root": "qualification",
+      "path": "tests/recall_preview/workload-preparation-contract.json",
+      "sha256": "b1fd4c43e1c8c506ca13e261a29d65a7d06246bf11ef53c02e97945cd3ef56d1",
+      "bytes": 3508
+    },
+    "graph_manifest": {
+      "root": "recipes",
+      "path": "tests/recall_preview/graph-recipes/manifest.json",
+      "sha256": "1676812ec959f62700f46e38158143f07f00a317e79b64f616d7ab0391695da8",
+      "bytes": 23758
+    }
+  },
+  "candidate_sha256": "438476e49d7ef1ff1db079d7049f8c2ba8a76279210b2cf3fc50c037f8c3cdc0",
+  "literal_checks": {
+    "frozen_input_files": 5,
+    "source_components": 7,
+    "recipe_and_spy_files": 30,
+    "workload_graph_recipes": 24,
+    "baseline_sources": 50,
+    "total_source_identities": 56,
+    "sources_per_space": 28,
+    "large_source_bytes_each": 2000000,
+    "load_intents": 280,
+    "load_per_space": {
+      "qualification-household": 140,
+      "qualification-business": 140
+    },
+    "callers": 140,
+    "requests_per_caller": 2,
+    "claim_required_load_requests": 48,
+    "load_map_sha256": "09ba111bcdcc8f9d91c6b2df44c2d17c619f45c76b039e5bc17797f49826d5d4"
+  },
+  "driver_test_source": {
+    "sha256": "41cb9b0918ee7d49870ee5be0c69a38f91f5bb6f2a118b13363976f80f592387",
+    "test_methods": [
+      "test_literal_oracle_is_typed_and_does_not_learn_candidate_output",
+      "test_original_large_recipe_and_typed_request_are_exact",
+      "test_query_evidence_binds_original_bytes_revision_and_actual_immutable_identity",
+      "test_seven_independent_raw_rendered_coordinate_literals",
+      "test_evidence_parent_document_is_required_and_bound_to_original_publication",
+      "test_equal_quote_wrong_occurrence_and_generated_only_support_refuse",
+      "test_complete_immutable_renderer_source_and_publication_proof_are_required",
+      "test_actual_load_helper_invokes_full_driver_proof_for_all_original_280_intents",
+      "test_named_credentials_share_one_client_budget_without_mutation",
+      "test_uncertain_original_source_submission_is_never_retried",
+      "test_graph_generation_binding_retains_original_template_and_actual_head",
+      "test_substituted_generation_fails_before_graph_mutation",
+      "test_accepted_and_polling_identity_use_actual_distinct_wire_shapes",
+      "test_completed_noop_keeps_original_identity_and_current_status_without_new_work",
+      "test_completed_noop_new_work_or_generation_does_not_pass",
+      "test_failed_phase_records_all_remaining_cases_and_owned_cleanup",
+      "test_expired_original_clock_never_dispatches_and_still_closes_owned_spy",
+      "test_external_consumer_is_original_evidence_not_local_acceptance",
+      "test_public_cleanup_keeps_original_terminal_distinct_and_fences_future_dispatch",
+      "test_cleanup_refuses_changed_current_source_before_any_mutation",
+      "test_backlog_failure_is_observed_first_and_retracted_before_release",
+      "test_provider_failure_cleanup_precedes_restoration_and_preserves_actual_category",
+      "test_ob3_adapter_passes_exact_raw_pair_to_independent_oracle_without_acceptance",
+      "test_missing_consumers_do_not_invent_receipts_or_hide_other_receipt_case",
+      "test_actual_outage_uses_owner_stop_and_observed_transport_failure",
+      "test_same_named_principal_mcp_head_positive_and_revoked_typed_denial",
+      "test_mcp_success_transport_is_not_a_revocation_denial",
+      "test_literal_two_space_cases_and_observation_bounds_are_not_optional",
+      "test_incomplete_independent_case_plan_refuses_before_any_product_request",
+      "test_capture_event_reservation_exhaustion_writes_no_overbudget_intent",
+      "test_cli_inventory_is_inert_and_cannot_authorize_execution",
+      "test_cli_original_source_input_hash_and_private_token_custody"
+    ],
+    "executed": false
+  },
+  "original_recipe_files": [
+    {
+      "path": "tests/recall_preview/graph-recipes/household-fw04-a.json",
+      "sha256": "6c01acc8ad173421e1dba4ba656122882f8f97a7368deb876be6c9ad00112bca",
+      "bytes": 3228
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/household-fw04-b.json",
+      "sha256": "4a0d6801eb97f622598b19ccb5756fc374916dc4755ad99527cb1602db96b043",
+      "bytes": 3228
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/household-fw06.json",
+      "sha256": "1044f9e7b1fff47d0fe7b972e2104b580561f8f457f3410a1037630e83de4bb4",
+      "bytes": 2974
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/household-fw07.json",
+      "sha256": "b69e5a84fe8ac914cf271591ac045b7bcba1a4b3f56440dd6f7749feb3434fa8",
+      "bytes": 2970
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/household-fw08-a.json",
+      "sha256": "658f98c6ae0f47011b5a64c4a4297294759957f350c38cb3cbc0f8ba5c3e9641",
+      "bytes": 3004
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/household-fw08-b.json",
+      "sha256": "7a797a81ffd31dffb31567d52cba1ae85b3a85b6ddc397d32b3899e457770553",
+      "bytes": 3008
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/household-fw09-running.json",
+      "sha256": "1e18bba6edee951a657ea7e49d771b800ac85138a59f2d81566eafbf78d9f61c",
+      "bytes": 3014
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/household-fw09-pending.json",
+      "sha256": "faaf43d404074bc7e0edd179b570d66d2711f1866d6529eeb072155720648b62",
+      "bytes": 3014
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/household-fw09-retryable.json",
+      "sha256": "bb8c299de99ac0f2c0dd85d1d0f63fae24ea406bf9ad804caa4681550443c643",
+      "bytes": 3028
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/household-fw09-intake.json",
+      "sha256": "25b8183f8471ff03fd00cebc021a880c2e5624acf381d53416f977d444a2a489",
+      "bytes": 2991
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/household-fw11.json",
+      "sha256": "6b642edf68cc8b4b3858a2407df79de5a82c0359b481e57d4d73640337855628",
+      "bytes": 2970
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/household-large-graph.json",
+      "sha256": "a08925e9e2d4f724c63e700c3e788fabafcaad082cd5f088ce9a7d376437d699",
+      "bytes": 4059455
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/business-fw04-a.json",
+      "sha256": "b2e452499e58af56e96a39c9ccf85bb51d3caab5d132ff1154170568d0a62394",
+      "bytes": 3223
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/business-fw04-b.json",
+      "sha256": "f740329c22868bcbd4e4d26a7f38cffdc0d34f235d9340a373c995d0b5001a6f",
+      "bytes": 3223
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/business-fw06.json",
+      "sha256": "b9b1008d0ef12502302734501866960d554f20d6af6d3f6c250babb60adba010",
+      "bytes": 2960
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/business-fw07.json",
+      "sha256": "4cd3198eda6a9546b9b80fdcdfdc0b67a68d3c5b6df997e49dcf1c9f4d4164dc",
+      "bytes": 2956
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/business-fw08-a.json",
+      "sha256": "c32ad496e7b20aff876962522c2cf041717d571d726719e5040a0e81db57fad2",
+      "bytes": 2990
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/business-fw08-b.json",
+      "sha256": "f485192fbefc0a344de6a2dfa26e505a4bc350c0b404137e4d859b2b22c51505",
+      "bytes": 2994
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/business-fw09-running.json",
+      "sha256": "2d0a3887a1e92beba9d7000cacbc29020c333fe856f12ce48d58e05b0cdfb0e1",
+      "bytes": 3000
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/business-fw09-pending.json",
+      "sha256": "4ab201b215fa2e9aa79d3a2a675447bfca6147b2f0a3fe120778acfaa9d1d87d",
+      "bytes": 3000
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/business-fw09-retryable.json",
+      "sha256": "ac8783cc56c4e030911eb00efb66c2cfc8408eabedc3539c0cf01904be38328a",
+      "bytes": 3014
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/business-fw09-intake.json",
+      "sha256": "72ee776fd0aaadca45e0922518ba44ae106ab5ffe8e2a716ad693bf3d2ebd443",
+      "bytes": 2977
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/business-fw11.json",
+      "sha256": "6637c20adb1b071e68e27ebb2d17241d27af87d9fb8df1c4a161e83c5de6dc66",
+      "bytes": 2956
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/business-large-graph.json",
+      "sha256": "13a1c0408c06784c62331de02bd370e59e93ab50f02757a590d3cd27f6c5452a",
+      "bytes": 4059450
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/container-positive.json",
+      "sha256": "a07db1a00388968b2fdc37f467b704c5ff938fa3862d3dfec308553479df7964",
+      "bytes": 2603
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/container-oversized-unmet.json",
+      "sha256": "2b5b46d98107956a939a688d926d6b85b1e70a5444a7a536566db0c28648e8dd",
+      "bytes": 788918
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/container-response-budget-0.json",
+      "sha256": "5d84a9e4640ea6cfea18d03b7bde2859f31775b9efa4a812e3d799b0fc6ed667",
+      "bytes": 651974
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/container-response-budget-1.json",
+      "sha256": "40698c876b7d43e913858ee43f307102413712e60c7c59f1d2b6aafcaad3fda7",
+      "bytes": 651974
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/workload-spy.json",
+      "sha256": "00811c4f6edcf14a1d301cca81e2aaf698c8d069efed94a3d4cf1993acd98f60",
+      "bytes": 82743
+    },
+    {
+      "path": "tests/recall_preview/graph-recipes/container-spy.json",
+      "sha256": "606431839d1e23c217fb055a72b2d968cbf3b8754c3f411027b62874a23fd2f1",
+      "bytes": 1330832
+    }
+  ],
+  "findings": [
+    {
+      "id": "I-FW-01",
+      "severity": "source_custody_gap",
+      "owner": [
+        "integrity",
+        "semantics"
+      ],
+      "locations": [
+        "tests/recall_preview_semantics/full_workload_driver.py:241",
+        "scripts/qualification/full_workload.py:23",
+        "scripts/qualification/full_workload.py:140"
+      ],
+      "detail": "The driver reopens the OB3 oracle with SourceFileLoader. The CLI imports helper modules before separately hashing their on-disk files. The recorded seven-file inventory does not bind the exact executed original code bytes. Preserve verified original bytes for helper/oracle execution; do not bless a later filesystem or pyc read."
+    },
+    {
+      "id": "I-FW-02",
+      "severity": "runtime_prerequisite_not_satisfied_by_this_source",
+      "owner": [
+        "surface",
+        "packaging",
+        "qualification"
+      ],
+      "locations": [
+        "scripts/qualification/full_workload.py:186",
+        "scripts/qualification/full_workload.py:220"
+      ],
+      "detail": "Startup validation binds artifact/nonce/backend and workers_enabled, but does not consume or validate the actual effective worker concurrency/retry/embedding recipe required for FW09. The source package marks this prerequisite pending. Actual owner process evidence and independent expected values remain required before activation; a bool or spy idleness cannot supply them."
+    },
+    {
+      "id": "I-FW-03",
+      "severity": "declared_unmet_external_owner_seams",
+      "owner": [
+        "packaging",
+        "qualification",
+        "external_consumers"
+      ],
+      "locations": [
+        "tests/recall_preview_semantics/full_workload_driver.py:619",
+        "tests/recall_preview_semantics/full_workload_driver.py:1037",
+        "scripts/qualification/full_workload.py:226"
+      ],
+      "detail": "The CLI does not supply capacity_capture or service_control. The driver explicitly records absent export capacity and always leaves external physical fallback/outage acceptance unmet. Existing optional callbacks and original receipt imports are not evidence that actual installed export/service-stop/consumer runs occurred."
+    },
+    {
+      "id": "I-FW-04",
+      "severity": "review_disposition_required",
+      "owner": [
+        "grounding",
+        "qualification"
+      ],
+      "locations": [
+        "tests/recall_preview_semantics/full_workload_load.py:48",
+        "tests/recall_preview_semantics/full_workload_driver.py:399"
+      ],
+      "detail": "All 280 required same-space evidence results are strictly checked, but successful_response matches only each expected coverage member and does not reject extra coverage keys. This review does not treat that predicate as proof that no extraneous coverage key is exposed. D should decide exact-key enforcement against the frozen scoped response contract."
+    }
+  ],
+  "selected_source_disposition": {
+    "evidence_coordinates": "supported_by_selected_actual_methods",
+    "failed_source_cleanup": "supported_by_selected_actual_methods",
+    "load_evidence_callback": "supported_for_every_successful_original_280_intent",
+    "population_and_caps": "literal_recomputation_matches_original_pins",
+    "whole_execution_custody": "hold_for_I-FW-01_and_actual_owner_prerequisites",
+    "candidate_plan_approval": "independent_qualification_pending",
+    "author_controls": "32_methods_authored_not_executed_by_this_review"
+  }
+}

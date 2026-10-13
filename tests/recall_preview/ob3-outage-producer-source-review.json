@@ -1,0 +1,33 @@
+{
+  "format": "recall-ob3-outage-producer-source-review/v1",
+  "source_commit": "d2e45817117d67d23bcdc8e33a021b6c0c56f184",
+  "receipt_version": "ob3-recall-outage-2",
+  "source_review_only": true,
+  "execution_authorized": false,
+  "product_acceptance": false,
+  "reviewed_original_sha256": {
+    "ob3-outage-receipt-schema-v2.json": "101dac0cd5ce984df7987cf85708a6c5bb63004bc6a856dc8a463b97ef2c4121",
+    "receipt.rs": "9bd02e63ba5a7487da688af16d6690ce066da2d730ff50e34f56821b642a2320",
+    "ob3-outage-receipt-schema.json": "9a324f5c9a13a1fdda418fff908e4cc981707789a1ef3c10ea18a6cc965fd0ce"
+  },
+  "closed_selected_v1_defects": [
+    "Checked worker reads/evidence and every normalized reason now sum exactly to original total. Overflow refuses.",
+    "Positive-read worker IDs must equal declared participating IDs, and every declared expected participant must have positive reads.",
+    "Original participating/expected arrays are checked for duplicates before set conversion."
+  ],
+  "independent_requirements": [
+    "Original expected/requested worker sets and baseline come from a separately frozen recipe/controller; producer candidate lists and PASS are not authority.",
+    "Original raw JSON duplicate keys, unknown fallback reason/fields, identity/source/interval/read bounds and complete requested worker outcome remain independently checked.",
+    "Actual original v2 raw bytes/hash must be retained; v1 remains historical and cannot satisfy new receipt acceptance."
+  ],
+  "consumer_limits": [
+    "Fourteen consumer fixture cases are authored with CI pending; this review does not establish their execution.",
+    "Consumer content-hash revision design makes changed-text/same-revision unreachable normally; the service-side immutability oracle remains separate, not falsely exercised by the consumer.",
+    "Consumer stale-generation negative uses a distinct revision because unchanged revision is a local no-op; that is compatible with the original CAS purpose.",
+    "Actual consumer labels/source-id filters need not use illustrative fixture initiative_id labels. Current-head confirmation is separate from historical acceptance; no operation polling is implied.",
+    "Consumer has no physical erase caller and no real outage twin-run receipt here; those gates remain UNMET."
+  ],
+  "independent_oracle": "scripts/qualification/ob3_outage_oracle.py",
+  "control_methods_authored": 15,
+  "controls_executed_by_qualification": false
+}

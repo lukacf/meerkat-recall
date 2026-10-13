@@ -112,6 +112,31 @@ pub fn json_to_surreal(val: serde_json::Value) -> StorageResult<Value> {
     json_to_surreal_checked(val, "json_to_surreal")
 }
 
+/// Match the native value shape retained by SurrealDB's field cleanup.
+///
+/// `NONE` object members are absent on disk. Array positions, `NULL`, and native
+/// primitive types remain unchanged. When comparing a row field by field, call
+/// this on each expected field value so top-level absence is still checked.
+pub(crate) fn stored_native_value(value: Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(Object::from(
+            object
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    (!matches!(value, Value::None)).then(|| (key, stored_native_value(value)))
+                })
+                .collect::<BTreeMap<_, _>>(),
+        )),
+        Value::Array(array) => Value::Array(Array::from(
+            array
+                .into_iter()
+                .map(stored_native_value)
+                .collect::<Vec<_>>(),
+        )),
+        other => other,
+    }
+}
+
 fn json_to_surreal_fallible<T: Serialize>(value: &T, context: &str) -> StorageResult<Value> {
     value
         .serialize(FiniteCheckSerializer { context })
@@ -472,7 +497,7 @@ impl<'a> serde::Serializer for FiniteCheckSerializer<'a> {
 
 fn json_to_surreal_checked(val: serde_json::Value, context: &str) -> StorageResult<Value> {
     match val {
-        serde_json::Value::Null => Ok(Value::None),
+        serde_json::Value::Null => Ok(Value::Null),
         serde_json::Value::Bool(b) => Ok(Value::from(b)),
         serde_json::Value::Number(n) => number_to_surreal_checked(&n, context),
         serde_json::Value::String(s) => Ok(Value::from(s)),
@@ -536,7 +561,7 @@ pub fn surreal_to_json(val: Value) -> StorageResult<serde_json::Value> {
                 "surreal_to_json.number: unsupported number variant".to_string(),
             )),
         },
-        Value::Strand(s) => Ok(serde_json::Value::String(s.to_string())),
+        Value::Strand(s) => Ok(serde_json::Value::String(s.as_string())),
         Value::Uuid(u) => Ok(serde_json::Value::String(u.to_string())),
         Value::Array(arr) => {
             let mut values = Vec::with_capacity(arr.len());
@@ -1010,7 +1035,10 @@ pub fn entity_merge_to_value(r: &EntityMerge) -> StorageResult<Value> {
 /// Shorthand macro for creating `SurrealDB` query bindings.
 #[macro_export]
 macro_rules! bindings {
-    ($($key:expr => $value:expr),* $(,)?) => {{
+    () => {
+        std::collections::BTreeMap::<String, surrealdb::sql::Value>::new()
+    };
+    ($($key:expr => $value:expr),+ $(,)?) => {{
         let mut map = std::collections::BTreeMap::<String, surrealdb::sql::Value>::new();
         $(
             map.insert($key.to_string(), $value.into());
@@ -1045,6 +1073,15 @@ pub fn rel_evidence_to_value(r: &RelEvidence) -> StorageResult<Value> {
 /// Converts a `SpaceConfig` record into a `SurrealDB` `Value`.
 pub fn space_config_to_value(r: &SpaceConfig) -> StorageResult<Value> {
     let mut obj = base_fields_to_object(&r.base)?;
+    obj.insert(
+        "processing".to_string(),
+        match &r.processing {
+            Some(processing) => {
+                json_to_surreal_fallible(processing, "space processing configuration")?
+            }
+            None => Value::None,
+        },
+    );
     obj.insert(
         "embedding_provider".to_string(),
         Value::from(r.embedding_provider.clone()),
@@ -1086,6 +1123,50 @@ mod tests {
         clippy::cognitive_complexity
     )]
     use super::*;
+
+    #[test]
+    fn native_string_bridge_preserves_payload_without_sql_quoting() {
+        for text in ["home", "after", "O'Reilly", "quoted \"text\"", "å\nraw"] {
+            let native = surrealdb::sql::Value::from(text);
+            assert_eq!(
+                super::surreal_to_json(native).unwrap(),
+                serde_json::json!(text)
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."
+    )]
+    async fn native_audit_images_preserve_explicit_json_nulls() {
+        use crate::{AuditLogRepository, Repository, StorageClient};
+        let storage = StorageClient::new_memory().await.unwrap();
+        let mut base = elephant_types::records::base::BaseFields::new(
+            RecordId::new_v4(TableName::AuditLog),
+            "home".into(),
+            "test".into(),
+        );
+        base.subjects_state = elephant_types::records::base::SubjectsState::Complete;
+        let audit = AuditLog {
+            base,
+            action: elephant_types::records::AuditAction::Create,
+            actor: "test".into(),
+            record: RecordId::new_v4(TableName::Entity),
+            before: None,
+            after: Some(
+                serde_json::json!({"nullable":null,"nested":{"only":null},"items":[null,"value"],"type":"consumer-field"}),
+            ),
+            timestamp: chrono::Utc::now(),
+            reason: None,
+        };
+        let repo = AuditLogRepository::new(storage);
+        repo.create(audit.clone()).await.unwrap();
+        let stored = repo.get("home", &audit.base.id).await.unwrap().unwrap();
+        assert_eq!(stored.after, audit.after);
+        assert_eq!(stored.before, audit.before);
+    }
 
     fn normalize_thing_id_part(s: &str) -> &str {
         let normalized = s
@@ -1131,5 +1212,72 @@ mod tests {
         let expected = format!("rel:{}", id.id().simple());
         assert_eq!(thing.to_string(), expected);
         assert!(!thing.to_string().contains('-'));
+    }
+}
+
+#[cfg(test)]
+mod stored_native_value_tests {
+    use super::*;
+
+    fn object(fields: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+        Value::Object(Object::from(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect::<BTreeMap<_, _>>(),
+        ))
+    }
+
+    #[test]
+    fn persisted_shape_removes_only_object_none_and_keeps_native_values() {
+        let primitives = vec![
+            Value::None,
+            Value::Null,
+            Value::from(false),
+            Value::from(42_i64),
+            Value::from(1.25_f64),
+            Value::from("quote ' and Unicode λ"),
+            Value::Thing(Thing::from(("native_identity", "42"))),
+            Value::Thing(Thing::from((
+                "native_identity",
+                surrealdb::sql::Id::Number(42),
+            ))),
+            Value::Uuid(uuid::Uuid::new_v4().into()),
+            Value::Datetime(datetime_from_chrono(chrono::Utc::now())),
+        ];
+        let expected_nested = object([("explicit_null", Value::Null)]);
+        let nested = object([("absent", Value::None), ("explicit_null", Value::Null)]);
+        let actual = object([
+            ("absent", Value::None),
+            ("explicit_null", Value::Null),
+            ("nested", nested.clone()),
+            (
+                "array",
+                Value::Array(Array::from(vec![
+                    Value::None,
+                    Value::Null,
+                    nested,
+                    Value::Array(Array::from(primitives.clone())),
+                ])),
+            ),
+        ]);
+        let expected = object([
+            ("explicit_null", Value::Null),
+            ("nested", expected_nested.clone()),
+            (
+                "array",
+                Value::Array(Array::from(vec![
+                    Value::None,
+                    Value::Null,
+                    expected_nested,
+                    Value::Array(Array::from(primitives.clone())),
+                ])),
+            ),
+        ]);
+        assert_eq!(stored_native_value(actual), expected);
+        assert_eq!(stored_native_value(expected.clone()), expected);
+        for primitive in primitives {
+            assert_eq!(stored_native_value(primitive.clone()), primitive);
+        }
     }
 }

@@ -57,19 +57,44 @@ mod tests {
 
     async fn setup_test_app() -> (Router, StorageClient) {
         let authz = Arc::new(AuthzService::new());
-        let source_repo = Arc::new(MockSourceRepository::empty());
-        let storage = StorageClient::new_memory().await.expect("storage");
-        let state = Arc::new(SourcesState::new_with_repo(
-            source_repo,
-            storage.clone(),
-            authz,
-        ));
+        let storage = configured_storage().await;
+        let state = Arc::new(SourcesState::new(storage.clone(), authz));
         (
             source_routes()
                 .layer(middleware::from_fn(mock_auth))
                 .with_state(state),
             storage,
         )
+    }
+
+    async fn configured_storage() -> StorageClient {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    "test_space".into(),
+                    "fixture".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .expect("named space");
+        storage
+    }
+
+    async fn generation(storage: &StorageClient, id: &str) -> String {
+        elephant_storage::SourcePublicationRepository::new(storage.clone())
+            .head("test_space", &RecordId::from_str(id).expect("source id"))
+            .await
+            .expect("source head")
+            .expect("accepted source")
+            .generation
     }
 
     async fn mock_auth(req: Request<Body>, next: Next) -> impl IntoResponse {
@@ -122,7 +147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_source_returns_201() {
+    async fn test_create_source_returns_accepted_operation() {
         let (app, _storage) = setup_test_app().await;
         let source = create_test_source("hash123");
 
@@ -138,28 +163,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
     async fn test_get_source_returns_source() {
-        let (app, _storage) = setup_test_app().await;
+        let (app, storage) = setup_test_app().await;
         let source = create_test_source("hash456");
         let source_id = source.base.id.to_string();
 
-        // Create
-        let _ = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/sources")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&source).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        // An intrinsic source without a pending publication head remains
+        // readable. Acceptance/publication visibility is exercised separately.
+        let repository = elephant_storage::SourceRepository::new(storage);
+        Repository::create(&repository, source).await.unwrap();
 
         // Get
         let response = app
@@ -195,8 +211,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_source_returns_204() {
-        let (app, _storage) = setup_test_app().await;
+    async fn test_delete_source_returns_retraction_receipt() {
+        let (app, storage) = setup_test_app().await;
         let source = create_test_source("hash789");
         let source_id = source.base.id.to_string();
 
@@ -219,19 +235,22 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri(format!("/v1/sources/{source_id}"))
+                    .uri(format!(
+                        "/v1/sources/{source_id}?expected_generation={}&idempotency_key=delete",
+                        generation(&storage, &source_id).await
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
     async fn test_restore_deleted_source() {
-        let (app, _storage) = setup_test_app().await;
+        let (app, storage) = setup_test_app().await;
         let source = create_test_source("hashabc");
         let source_id = source.base.id.to_string();
 
@@ -255,7 +274,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri(format!("/v1/sources/{source_id}"))
+                    .uri(format!(
+                        "/v1/sources/{source_id}?expected_generation={}&idempotency_key=delete",
+                        generation(&storage, &source_id).await
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -267,7 +289,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/v1/sources/{source_id}/restore"))
+                    .uri(format!("/v1/sources/{source_id}/restore?revision_id=restored&expected_generation={}&idempotency_key=restore", generation(&storage, &source_id).await))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -322,8 +344,12 @@ mod tests {
     /// Regression test: verify that `space_id` in request body is overridden by principal's `space_id`.
     /// This prevents records from being created in a space the principal cannot access.
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_create_source_overrides_space_id_with_principal_space() {
-        let (app, _storage) = setup_test_app().await;
+        let (app, storage) = setup_test_app().await;
 
         // Create a source with a DIFFERENT space_id than the principal's ("test_space")
         let id = RecordId::new_v4(TableName::Source);
@@ -373,13 +399,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
 
         // Parse the response to verify the space_id was overridden
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let created: Source = serde_json::from_slice(&body).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let created: Source = serde_json::from_value(payload["source"].clone()).unwrap();
 
         // The space_id should be the principal's space_id, not the one we provided
         assert_eq!(
@@ -387,7 +414,24 @@ mod tests {
             "space_id should be overridden to principal's space"
         );
 
-        // Verify the source can be found via search (proving it's in the correct space)
+        let authority = elephant_storage::SourcePublicationRepository::new(storage);
+        let head = authority
+            .head("test_space", &created.base.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            head.operation_id,
+            payload["operation"]["operation_id"].as_str().unwrap()
+        );
+        assert!(head.published_revision.is_none());
+        assert!(authority
+            .head("wrong_space", &created.base.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Durable acceptance does not publish the source into ordinary search.
         let search_req = serde_json::json!({
             "space_id": "test_space",
             "limit": 50
@@ -412,14 +456,15 @@ mod tests {
             .unwrap();
         let search_result: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        // Should find at least one result
-        assert!(
-            search_result["total"].as_u64().unwrap() >= 1,
-            "Should find the created source via search"
-        );
+        assert_eq!(search_result["total"], 0);
+        assert!(search_result["results"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_ingest_source_enqueues_triage_work_item() {
         use elephant_storage::work_item_repository::WorkItemRepository;
 
@@ -458,25 +503,36 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(result["doc_id"], doc_id.to_string());
+        let accepted_doc_id =
+            RecordId::from_str(result["doc_id"].as_str().expect("immutable doc ID"))
+                .expect("parse doc ID");
+        assert_ne!(accepted_doc_id, doc_id);
         assert_eq!(result["lifecycle_status"], "discovered");
         let source_id = result["source_id"].as_str().expect("source id");
 
         let repo = WorkItemRepository::new(storage.clone());
         let item = repo
-            .find_by_idempotency_key("test_space", &format!("triage_source:{source_id}"))
+            .find_by_idempotency_key(
+                "test_space",
+                &format!(
+                    "triage_source:{source_id}:{}",
+                    result["operation"]["source_generation"]
+                        .as_str()
+                        .expect("generation")
+                ),
+            )
             .await
             .expect("find triage work item");
         assert!(item.is_some(), "triage_source should be enqueued");
 
         let doc_repo = DocRepository::new(storage);
         let persisted = doc_repo
-            .get("test_space", &doc_id)
+            .get("test_space", &accepted_doc_id)
             .await
             .expect("load doc")
             .expect("persisted doc");
@@ -537,7 +593,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -612,7 +668,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ingest_source_restores_soft_deleted_doc() {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
+    async fn test_ingest_source_keeps_prior_unaccepted_doc_tombstone() {
         let (app, storage) = setup_test_app().await;
         let source = create_test_source("hash-ingest-conflict");
         let doc_id = RecordId::new_v4(TableName::Doc);
@@ -673,10 +733,24 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
 
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let actual = RecordId::from_str(receipt["doc_id"].as_str().unwrap()).unwrap();
+        assert_ne!(actual, doc_id);
+        assert!(DocRepository::new(storage.clone())
+            .get_with_deleted("test_space", &doc_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .base
+            .deleted_at
+            .is_some());
         let restored = DocRepository::new(storage.clone())
-            .get("test_space", &doc_id)
+            .get("test_space", &actual)
             .await
             .expect("load restored doc")
             .expect("restored doc");
@@ -685,8 +759,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_ingest_source_inherits_doc_security_before_create() {
-        let (app, _storage) = setup_test_app().await;
+        let (app, storage) = setup_test_app().await;
         let mut source = create_test_source("hash-ingest-security");
         source.base.security.level = 1;
         let doc_id = RecordId::new_v4(TableName::Doc);
@@ -721,7 +799,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -738,13 +816,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let stored: Source = serde_json::from_slice(&body).unwrap();
+        // Accepted source classification is persisted before queue work,
+        // while ordinary GET remains unavailable until publication.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let repository = elephant_storage::SourceRepository::new(storage);
+        let stored = Repository::get(
+            &repository,
+            "test_space",
+            &RecordId::from_str(source_id).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(stored.base.security.level, 5);
+        assert_eq!(stored.base.space_id, "test_space");
     }
 
     async fn mock_write_only_auth(req: Request<Body>, next: Next) -> impl IntoResponse {
@@ -761,14 +846,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_restore_source_requires_read_authorization() {
         let authz = Arc::new(AuthzService::new());
-        let storage = StorageClient::new_memory().await.expect("storage");
-        let state = Arc::new(SourcesState::new_with_repo(
-            Arc::new(MockSourceRepository::empty()),
-            storage,
-            authz,
-        ));
+        let storage = configured_storage().await;
+        let state = Arc::new(SourcesState::new(storage.clone(), authz));
         let full = source_routes()
             .layer(middleware::from_fn(mock_auth))
             .with_state(state.clone());
@@ -803,7 +888,10 @@ mod tests {
             .clone()
             .oneshot(send(
                 "DELETE",
-                format!("/v1/sources/{deleted_id}"),
+                format!(
+                    "/v1/sources/{deleted_id}?expected_generation={}&idempotency_key=delete",
+                    generation(&storage, &deleted_id).await
+                ),
                 Body::empty(),
             ))
             .await
@@ -844,7 +932,7 @@ mod tests {
         let restored = full
             .oneshot(send(
                 "POST",
-                format!("/v1/sources/{deleted_id}/restore"),
+                format!("/v1/sources/{deleted_id}/restore?revision_id=restored&expected_generation={}&idempotency_key=restore", generation(&storage, &deleted_id).await),
                 Body::empty(),
             ))
             .await

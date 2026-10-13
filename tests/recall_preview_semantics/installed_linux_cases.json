@@ -1,0 +1,27 @@
+{
+  "format": "recall-installed-linux-expectations/v1",
+  "scope": "installed Linux native auth and acknowledged metadata durability; no model or semantic acceptance",
+  "backends": ["elephant-db", "surreal-db"],
+  "spaces": ["qualification-household", "qualification-business"],
+  "sources": [
+    {"space": "qualification-household", "key": "home/heat", "baseline_revision": "heat-v1", "replacement_revision": "heat-v2", "query_id": "home-service"},
+    {"space": "qualification-business", "key": "business/oriole", "baseline_revision": "oriole-v1", "replacement_revision": "oriole-v2", "query_id": "business-review"}
+  ],
+  "required_cases": [
+    "verified_installed_binary", "absent_service", "bootstrap_unready", "fresh_cli_auth",
+    "runtime_initialized_without_workers", "two_named_spaces", "http_auth_denied",
+    "mcp_auth_denied", "wrong_space_denied", "mcp_positive", "grant_revocation",
+    "source_acceptance_and_idempotence", "pending_is_not_complete", "input_bounds",
+    "named_export", "replacement_accepted", "restore_original_heads",
+    "graceful_restart", "read_only_capabilities"
+  ],
+  "unqualified_gates": [
+    "source rendering and whole-source graph/vector publication", "provider semantic relevance",
+    "installed controlled provider dispatch", "physical erasure and old-backup journal replay",
+    "read admission during restore", "SIGKILL recovery", "remote patched SurrealDB",
+    "container persistent volume", "native Darwin", "HomeCore and OB3 adoption", "load and latency"
+  ],
+  "limits": {"total_seconds": 300, "http_calls": 128, "http_seconds": 5,
+    "snapshot_http_seconds": 120, "response_bytes": 262144,
+    "processes": 16, "process_log_bytes": 1048576, "http_capture_bytes": 67108864}
+}

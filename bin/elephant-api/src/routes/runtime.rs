@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{extract::State, routing::get, Extension, Json, Router};
 
 use crate::runtime::{RuntimeManager, RuntimeStatus};
 
@@ -18,8 +18,12 @@ impl RuntimeState {
     }
 }
 
-async fn get_runtime_status(State(state): State<Arc<RuntimeState>>) -> Json<RuntimeStatus> {
-    Json(state.runtime.get_status().await)
+async fn get_runtime_status(
+    State(state): State<Arc<RuntimeState>>,
+    Extension(principal): Extension<crate::auth::Principal>,
+) -> Result<Json<RuntimeStatus>, crate::public_error::ApiFailure> {
+    super::readiness::authorize_status(&principal)?;
+    Ok(Json(state.runtime.get_readiness().await))
 }
 
 pub fn runtime_routes() -> Router<Arc<RuntimeState>> {

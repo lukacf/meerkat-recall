@@ -1,0 +1,58 @@
+{
+  "format": "recall-container-cases/v1",
+  "backends": [
+    "elephant-db",
+    "surreal-db"
+  ],
+  "spaces": [
+    "container-home",
+    "container-business"
+  ],
+  "source_key": "synthetic/offline-metadata",
+  "required_cases": [
+    "immutable_images",
+    "owned_topology_auth",
+    "two_spaces_auth",
+    "pending_metadata_restart",
+    "cold_clone_missing_journal",
+    "clean_registered_restore",
+    "original_journal_replay",
+    "bounded_backup_retention"
+  ],
+  "limits": {
+    "total_seconds_per_backend": 1500,
+    "cleanup_seconds": 90,
+    "docker_commands": 400,
+    "cleanup_additional_commands": 128,
+    "owned_resources": 64,
+    "command_seconds": 90,
+    "command_output_bytes": 1048576,
+    "single_stopped_binary_copy_bytes": 536870912,
+    "command_capture_total_bytes": 33554432,
+    "http_calls": 640,
+    "http_response_bytes": 262144,
+    "http_seconds": 10,
+    "snapshot_http_seconds": 90,
+    "container_memory_bytes": 4294967296,
+    "container_cpu_limit": 2,
+    "container_pids": 256,
+    "container_tmpfs_bytes": 67108864,
+    "free_space_floor_bytes": 268435456000,
+    "short_retention_seconds": 5
+  },
+  "claims": {
+    "immutable_images": "Exact supplied LOCAL images, stopped-container binary/provenance copies and trusted digest comparison; no pull/build.",
+    "owned_topology_auth": "New nonce-labelled internal network and private volumes, real synthetic CLI auth; only verified owned identities cleaned.",
+    "two_spaces_auth": "Actual named configs/current grants and persisted GET baseline (security/provider/model/dimensions/purpose/skill/processing) compared after pending reopen, clone fallback, restore, replay and retention; same-token own-space positive and unauthenticated/wrong-space/path-header negatives.",
+    "pending_metadata_restart": "Explicit normalized Metadata acceptance with disabled workers; original operation/head survive SIGKILL and persistent-store reopen; actual workers publish required Metadata state.",
+    "cold_clone_missing_journal": "Stopped original data/config and paired DB cold-cloned before negative; new journal cannot ready an established clone; original data unchanged and original journal positive recovery succeeds.",
+    "clean_registered_restore": "Registered backup payload copied and independently byte-count/SHA-256 checked; restores exact baseline source/head/operation; published replacement and extra-source canary do not merge into restored state.",
+    "original_journal_replay": "Completed real public erase followed by old-backup restore with original journal; source absent after first observed Ready, independent second space equal. Public replay only; not independent physical-source inventory, continuous visibility-window proof, or OB3 acceptance.",
+    "bounded_backup_retention": "Actual five-second manifest deadline elapses; startup cleanup removes exact manifest/data files and restore refuses. No fake clock or modified manifest."
+  },
+  "verdicts": "Every case is pass/fail/not_executed for one backend. Any failure, skip, cleanup uncertainty or absent required case prevents product_acceptance. Mocks never qualify a product.",
+  "schema_limit": "Record source/binary/backend and actual readiness verification. Stored migration checksums are not exposed by HTTP and are not invented.",
+  "disk_limit": "Free-space samples before image work and every launch; no claim of a hard named-volume quota or continuous disk monitoring.",
+  "sensitivity": "Actual runs are centrally allocated later, under root's shared-host scheduling. Source/mock work launches no image or service.",
+  "bootstrap_authority": "Actual CLI global operator: management scopes only, no data clearances or spaces. Named service/one-space tokens: explicit spaces, default level-zero clearance and actual current grants. Config administration envelopes use policy default/level 0, the supported fresh global bootstrap; custom-policy/classified bootstrap is not qualified."
+}

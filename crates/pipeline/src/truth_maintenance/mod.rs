@@ -40,6 +40,7 @@ use crate::error::PipelineError;
 use crate::freshness::{apply_freshness_to_ranking, TruthSlotRanking};
 
 pub mod adjudicator;
+pub mod fingerprint;
 
 use self::adjudicator::{
     AdjudicationClaim, AdjudicationDecision, AdjudicationInput, AdjudicationVerdict, ClaimValue,
@@ -75,6 +76,45 @@ impl TmContext {
 /// with real repositories.
 #[async_trait]
 pub trait TruthMaintenanceStorage: Send + Sync {
+    /// Live transaction owner, available only on the production adapter.
+    fn canonical_client(&self) -> Option<elephant_storage::StorageClient> {
+        None
+    }
+    /// Source ownership is ledger authority even if a legacy row omitted its
+    /// provenance source IDs. Production adapters query the sole source owner.
+    async fn has_source_support(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> Result<bool, PipelineError> {
+        let Some(client) = self.canonical_client() else {
+            if self.is_preparing() {
+                return Ok(false);
+            } // isolated domain model
+            return Err(PipelineError::InvalidState(
+                "Source support lookup requires the canonical storage owner".into(),
+            ));
+        };
+        Ok(
+            !elephant_storage::source_publication::SourcePublicationRepository::new(client)
+                .support_for_record(space_id, id)
+                .await?
+                .is_empty(),
+        )
+    }
+    /// Original background attempt; synchronous trusted calls have no attempt.
+    fn maintenance_attempt(&self) -> Option<elephant_types::publication::AttemptFence> {
+        None
+    }
+    /// True only for an effect-preparation adapter (or an isolated test model).
+    fn is_preparing(&self) -> bool {
+        false
+    }
+    /// Original pre-read epoch for a deferred adjudication decision.
+    fn prepared_epoch(&self) -> Result<Option<String>, PipelineError> {
+        Ok(None)
+    }
+
     /// Finds a truth slot by slot key.
     async fn find_slot_by_key(
         &self,
@@ -302,7 +342,8 @@ pub trait TruthMaintenanceStorage: Send + Sync {
         semantics: PredicateSemantics,
         status: SemanticsStatus,
         provenance_note: &str,
-    ) -> Result<PredicateRegistry, PipelineError>;
+        authority: &elephant_types::records::base::BaseFields,
+    ) -> Result<Option<PredicateRegistry>, PipelineError>;
 
     /// Creates an audit log entry.
     async fn create_audit_log(&self, log: AuditLog) -> Result<AuditLog, PipelineError>;
@@ -340,6 +381,8 @@ pub trait TruthMaintenanceStorage: Send + Sync {
 
 /// Production implementation using real repositories.
 pub struct RepositoryTruthMaintenanceStorage {
+    canonical_client: Option<elephant_storage::StorageClient>,
+    attempt: Option<elephant_types::publication::AttemptFence>,
     truth_slot_repo: elephant_storage::TruthSlotRepository,
     conflict_group_repo: elephant_storage::ConflictGroupRepository,
     rel_repo: elephant_storage::RelRepository,
@@ -358,6 +401,8 @@ impl RepositoryTruthMaintenanceStorage {
     /// Creates a new storage from a `StorageClient`.
     pub fn new(client: elephant_storage::StorageClient) -> Self {
         Self {
+            canonical_client: Some(client.clone()),
+            attempt: None,
             truth_slot_repo: elephant_storage::TruthSlotRepository::new(client.clone()),
             conflict_group_repo: elephant_storage::ConflictGroupRepository::new(client.clone()),
             rel_repo: elephant_storage::RelRepository::new(client.clone()),
@@ -375,7 +420,23 @@ impl RepositoryTruthMaintenanceStorage {
         }
     }
 
-    /// Creates storage from individual repositories.
+    /// Bind all prepared mutations to the original currently claimed attempt.
+    #[must_use]
+    pub fn with_attempt(mut self, attempt: elephant_types::publication::AttemptFence) -> Self {
+        self.attempt = Some(attempt);
+        self
+    }
+
+    /// Bind the canonical transaction client when using separately constructed
+    /// repositories. Mutation entrypoints always read and write through this
+    /// client, so an unbound adapter cannot accidentally perform partial writes.
+    #[must_use]
+    pub fn with_canonical_client(mut self, client: elephant_storage::StorageClient) -> Self {
+        self.canonical_client = Some(client);
+        self
+    }
+
+    /// Creates storage from individual repositories; bind a canonical client before mutation.
     #[allow(clippy::too_many_arguments)]
     pub const fn from_repos(
         truth_slot_repo: elephant_storage::TruthSlotRepository,
@@ -392,6 +453,8 @@ impl RepositoryTruthMaintenanceStorage {
         outbox_writer: elephant_outbox::OutboxWriter,
     ) -> Self {
         Self {
+            canonical_client: None,
+            attempt: None,
             truth_slot_repo,
             conflict_group_repo,
             rel_repo,
@@ -410,6 +473,13 @@ impl RepositoryTruthMaintenanceStorage {
 
 #[async_trait]
 impl TruthMaintenanceStorage for RepositoryTruthMaintenanceStorage {
+    fn canonical_client(&self) -> Option<elephant_storage::StorageClient> {
+        self.canonical_client.clone()
+    }
+    fn maintenance_attempt(&self) -> Option<elephant_types::publication::AttemptFence> {
+        self.attempt.clone()
+    }
+
     async fn find_slot_by_key(
         &self,
         space_id: &str,
@@ -791,11 +861,19 @@ impl TruthMaintenanceStorage for RepositoryTruthMaintenanceStorage {
         semantics: PredicateSemantics,
         status: SemanticsStatus,
         provenance_note: &str,
-    ) -> Result<PredicateRegistry, PipelineError> {
-        self.predicate_registry_repo
-            .upsert_semantics(space_id, predicate_id, semantics, status, provenance_note)
-            .await
-            .map_err(PipelineError::StorageError)
+        authority: &elephant_types::records::base::BaseFields,
+    ) -> Result<Option<PredicateRegistry>, PipelineError> {
+        let _ = (
+            space_id,
+            predicate_id,
+            semantics,
+            status,
+            provenance_note,
+            authority,
+        );
+        Err(PipelineError::InvalidState(
+            "predicate proposals require canonical preparation".to_owned(),
+        ))
     }
 
     async fn create_audit_log(&self, log: AuditLog) -> Result<AuditLog, PipelineError> {
@@ -949,6 +1027,195 @@ pub fn compute_claim_set_hash(claim_ids: &[String]) -> String {
     format!("{digest:x}")
 }
 
+/// Load the complete selected semantic inputs. Missing evidence fails closed;
+/// storage errors cannot turn into a reusable "unchanged" decision. Missing
+/// evidence is fingerprinted explicitly; this helper never grants support.
+async fn semantic_decision_hash<S: TruthMaintenanceStorage>(
+    space_id: &str,
+    slot_key: &str,
+    slot_type: &str,
+    claim_ids: &[String],
+    adjudicator_version: &str,
+    storage: &S,
+) -> Result<String, PipelineError> {
+    let mut claims = Vec::new();
+    let mut claim_bases = Vec::new();
+    let mut entity_ids = std::collections::BTreeSet::new();
+    let mut evidence_ids = std::collections::BTreeSet::new();
+    for claim_id in claim_ids {
+        let id = RecordId::from_str(claim_id)
+            .map_err(|error| PipelineError::InvalidInput(error.to_string()))?;
+        let value = match slot_type {
+            "rel" | "rel_set" => storage.get_rel(space_id, &id).await?.map(|claim| {
+                entity_ids.insert(claim.subject.id().clone());
+                entity_ids.insert(claim.object.id().clone());
+                claim_bases.push(claim.base.clone());
+                evidence_ids.extend(
+                    claim
+                        .evidence
+                        .iter()
+                        .map(|evidence| evidence.assertion.id().to_string()),
+                );
+                serde_json::to_value(claim)
+            }),
+            "attribute" => storage.get_attribute(space_id, &id).await?.map(|claim| {
+                entity_ids.insert(claim.subject.id().clone());
+                claim_bases.push(claim.base.clone());
+                evidence_ids.extend(
+                    claim
+                        .evidence
+                        .iter()
+                        .map(|evidence| evidence.assertion.id().to_string()),
+                );
+                serde_json::to_value(claim)
+            }),
+            "event" => storage.get_event(space_id, &id).await?.map(|claim| {
+                claim_bases.push(claim.base.clone());
+                evidence_ids.extend(
+                    claim
+                        .assertion_refs
+                        .iter()
+                        .map(|assertion| assertion.id().to_string()),
+                );
+                serde_json::to_value(claim)
+            }),
+            _ => {
+                return Err(PipelineError::InvalidInput(
+                    "Unknown semantic decision slot type".into(),
+                ))
+            }
+        };
+        if let Some(value) = value {
+            claims.push(fingerprint::semantic_record(
+                value.map_err(|error| PipelineError::ConfigError(error.to_string()))?,
+            ));
+        }
+    }
+    let mut evidence = Vec::new();
+    for assertion_id in evidence_ids {
+        let id = RecordId::from_str(&assertion_id)
+            .map_err(|error| PipelineError::InvalidInput(error.to_string()))?;
+        if let Some(assertion) = storage.get_assertion(space_id, &id).await? {
+            evidence.push(fingerprint::semantic_record(
+                serde_json::to_value(assertion)
+                    .map_err(|error| PipelineError::ConfigError(error.to_string()))?,
+            ));
+        } else {
+            evidence.push(serde_json::json!({"assertion": assertion_id, "missing": true}));
+        }
+    }
+    // Entity displays are provider inputs too; a renamed/reclassified entity
+    // must not reuse a decision fingerprint computed for a different prompt.
+    for id in entity_ids {
+        let entity = storage.get_entity(space_id, &id).await?;
+        evidence.push(fingerprint::semantic_record(
+            serde_json::json!({"entity_input": id, "entity": entity}),
+        ));
+    }
+    let semantics = if slot_type == "event" {
+        serde_json::to_value(event_slot_semantics())
+    } else {
+        let parts = parse_slot_key(slot_key, slot_type)?;
+        let predicate = scoped_predicate(
+            storage
+                .find_predicate_registry_by_predicate_id(space_id, &parts.predicate_id)
+                .await?,
+            authority_for_bases(claim_bases.iter())?.as_ref(),
+            storage,
+        )
+        .await?;
+        serde_json::to_value(
+            predicate.map(|predicate| (predicate.semantics, predicate.semantics_status)),
+        )
+    }
+    .map_err(|error| PipelineError::ConfigError(error.to_string()))?;
+    Ok(fingerprint::decision_input_fingerprint(
+        &claims,
+        &evidence,
+        &semantics,
+        adjudicator_version,
+    ))
+}
+
+async fn stamp_decision_fingerprint<S: TruthMaintenanceStorage>(
+    input: &mut CommitInput,
+    space_id: &str,
+    storage: &S,
+) -> Result<(), PipelineError> {
+    input.adjudicator_version = "deterministic-tm-v2".into();
+    input.decision_input_hash = Some(
+        semantic_decision_hash(
+            space_id,
+            &input.slot_key,
+            &input.slot_type,
+            &input.claim_ids,
+            &input.adjudicator_version,
+            storage,
+        )
+        .await?,
+    );
+    Ok(())
+}
+
+async fn resolution_decision_hash<S: TruthMaintenanceStorage>(
+    ctx: &TmContext,
+    group: &ConflictGroup,
+    claims: &[ClaimWithMetadata],
+    space: &str,
+    storage: &S,
+) -> Result<String, PipelineError> {
+    let version = adjudicator_version(ctx);
+    let ids: Vec<_> = claims.iter().map(|claim| claim.claim_id.clone()).collect();
+    if ids.iter().all(|id| RecordId::from_str(id).is_ok()) {
+        return semantic_decision_hash(
+            space,
+            &group.slot_key,
+            &group.slot_type,
+            &ids,
+            &version,
+            storage,
+        )
+        .await;
+    }
+    // This abstract resolver seam does not publish: storage-backed commit
+    // requires actual record IDs and exact immutable evidence separately.
+    let semantic_claims: Vec<_> = claims.iter().map(|claim| serde_json::json!({
+        "id": claim.claim_id, "value": claim.value, "confidence": claim.confidence,
+        "evidence_count": claim.evidence_count, "evidence": claim.evidence_sources,
+        "timestamp": claim.timestamp, "time_basis": claim.time_basis, "context": claim.context,
+    })).collect();
+    let semantics = if group.slot_type == "event" {
+        serde_json::to_value(event_slot_semantics())
+    } else {
+        let parts = parse_slot_key(&group.slot_key, &group.slot_type)?;
+        serde_json::to_value(
+            scoped_predicate(
+                storage
+                    .find_predicate_registry_by_predicate_id(space, &parts.predicate_id)
+                    .await?,
+                Some(&group.base),
+                storage,
+            )
+            .await?
+            .map(|predicate| (predicate.semantics, predicate.semantics_status)),
+        )
+    }
+    .map_err(|error| PipelineError::ConfigError(error.to_string()))?;
+    Ok(fingerprint::decision_input_fingerprint(
+        &semantic_claims,
+        &[],
+        &semantics,
+        &version,
+    ))
+}
+
+fn adjudicator_version(ctx: &TmContext) -> String {
+    ctx.adjudicator.as_ref().map_or_else(
+        || "deterministic-tm-v2".into(),
+        |adjudicator| adjudicator.decision_version(),
+    )
+}
+
 #[derive(Debug, Clone)]
 struct SlotKeyParts {
     subject_id: RecordId,
@@ -1026,6 +1293,19 @@ fn time_basis_from_recency(recency: RecencyBasis) -> TimeBasis {
 }
 
 /// Computes a deterministic security hash from a security envelope.
+pub(crate) fn compute_record_partition(base: &elephant_types::records::base::BaseFields) -> String {
+    let mut subjects: Vec<_> = base
+        .subjects
+        .iter()
+        .map(|subject| subject.id().to_string())
+        .collect();
+    subjects.sort();
+    subjects.dedup();
+    let input = serde_json::json!({"security": compute_security_hash(&base.security),
+        "subjects": subjects, "subjects_state": base.subjects_state});
+    hex::encode(Sha256::digest(input.to_string().as_bytes()))
+}
+
 fn compute_security_hash(security: &Security) -> String {
     let mut hasher = Sha256::new();
     hasher.update(security.policy_id.as_bytes());
@@ -1055,7 +1335,7 @@ fn compute_security_hash(security: &Security) -> String {
 pub const TM_DETECT_CONFLICTS_KIND: &str = "tm_detect_conflicts";
 
 /// Event types that can trigger conflict detection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TriggerEvent {
     /// New assertion created.
     Assertion(RecordId),
@@ -1089,7 +1369,7 @@ enum StaleTrigger {
 }
 
 /// Result of conflict detection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectCommit {
     /// Resolution result to apply.
     pub resolution: ResolutionResult,
@@ -1098,7 +1378,7 @@ pub struct DirectCommit {
 }
 
 /// Result of conflict detection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectConflictsResult {
     /// Number of events processed.
     pub events_processed: usize,
@@ -1112,6 +1392,9 @@ pub struct DetectConflictsResult {
     pub direct_commits: Vec<DirectCommit>,
 }
 
+// Keep preparation, deterministic application and commit futures behind their
+// own heap allocations. They are composed inside the normal queue/scenario
+// runtime stack; boxing only the outer worker does not bound nested poll frames.
 /// Executes the tm_detect_conflicts work kind.
 ///
 /// Per spec §11: detects conflicts when new claims arrive for existing slots.
@@ -1120,6 +1403,75 @@ pub struct DetectConflictsResult {
 ///
 /// Returns an error if storage operations fail.
 pub async fn execute_tm_detect_conflicts<S: TruthMaintenanceStorage>(
+    events: &[TriggerEvent],
+    space_id: &str,
+    storage: &S,
+) -> Result<DetectConflictsResult, PipelineError> {
+    if let Some(planning) =
+        crate::maintenance_commit::PlanningTruthMaintenanceStorage::for_storage(storage, space_id)
+            .await?
+    {
+        let request = serde_json::json!({"events": events});
+        if let Some(previous) = planning
+            .replay("execute_tm_detect_conflicts", "detection", &request)
+            .await?
+        {
+            return Ok(previous);
+        }
+        let mut result = Box::pin(execute_tm_detect_conflicts_prepared(
+            events, space_id, &planning,
+        ))
+        .await?;
+        Box::pin(apply_detected_direct_commits(
+            &mut result,
+            space_id,
+            &planning,
+        ))
+        .await?;
+        Box::pin(planning.commit(
+            "execute_tm_detect_conflicts",
+            "detection",
+            &request,
+            &result,
+        ))
+        .await?;
+        Ok(result)
+    } else {
+        Box::pin(execute_tm_detect_conflicts_prepared(
+            events, space_id, storage,
+        ))
+        .await
+    }
+}
+
+async fn apply_detected_direct_commits<S: TruthMaintenanceStorage>(
+    result: &mut DetectConflictsResult,
+    space_id: &str,
+    storage: &S,
+) -> Result<(), PipelineError> {
+    // Deterministic decisions share the detection read set and epoch. A child
+    // carrying that epoch would already be stale after detection changes slots.
+    for mut direct in std::mem::take(&mut result.direct_commits) {
+        if direct.input.decision_input_hash.is_none() {
+            stamp_decision_fingerprint(&mut direct.input, space_id, storage).await?;
+        }
+        let applied = Box::pin(execute_tm_commit_with_storage_prepared(
+            &direct.resolution,
+            &direct.input,
+            space_id,
+            storage,
+        ))
+        .await?;
+        if applied.skipped_stale {
+            return Err(PipelineError::InvalidState(
+                "maintenance inputs changed during detection; reprepare".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn execute_tm_detect_conflicts_prepared<S: TruthMaintenanceStorage>(
     events: &[TriggerEvent],
     space_id: &str,
     storage: &S,
@@ -1142,7 +1494,7 @@ pub async fn execute_tm_detect_conflicts<S: TruthMaintenanceStorage>(
                         subject_id: rel.subject.id().clone(),
                         object_id: rel.object.id().clone(),
                         rel_type: rel.rel_type.clone(),
-                        security_hash: compute_security_hash(&rel.base.security),
+                        security_hash: compute_record_partition(&rel.base),
                         deleted: rel.base.deleted_at.is_some(),
                     });
                 }
@@ -1161,7 +1513,7 @@ pub async fn execute_tm_detect_conflicts<S: TruthMaintenanceStorage>(
                         attr_id: attr.base.id.clone(),
                         subject_id: attr.subject.id().clone(),
                         attr_type: attr.attr_type.clone(),
-                        security_hash: compute_security_hash(&attr.base.security),
+                        security_hash: compute_record_partition(&attr.base),
                         deleted: attr.base.deleted_at.is_some(),
                     });
                 }
@@ -1210,19 +1562,29 @@ pub async fn execute_tm_detect_conflicts<S: TruthMaintenanceStorage>(
         }
     }
 
-    let mut result =
-        execute_tm_detect_conflicts_with_storage(&rel_events, &attr_events, space_id, storage)
-            .await?;
+    let mut result = Box::pin(execute_tm_detect_conflicts_with_storage(
+        &rel_events,
+        &attr_events,
+        space_id,
+        storage,
+    ))
+    .await?;
     if !event_events.is_empty() {
-        let event_result =
-            execute_tm_detect_event_conflicts_with_storage(&event_events, space_id, storage)
-                .await?;
+        let event_result = Box::pin(execute_tm_detect_event_conflicts_with_storage(
+            &event_events,
+            space_id,
+            storage,
+        ))
+        .await?;
         result.conflicts_detected += event_result.conflicts_detected;
         result.conflicts_updated += event_result.conflicts_updated;
         result
             .conflict_group_ids
             .extend(event_result.conflict_group_ids);
         result.direct_commits.extend(event_result.direct_commits);
+    }
+    for commit in &mut result.direct_commits {
+        stamp_decision_fingerprint(&mut commit.input, space_id, storage).await?;
     }
     result.events_processed = events.len();
     result
@@ -1299,7 +1661,7 @@ async fn apply_stale_triggers<S: TruthMaintenanceStorage>(
 }
 
 /// Rel event info for conflict detection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelEventInfo {
     /// The rel ID that triggered the event.
     pub rel_id: RecordId,
@@ -1316,7 +1678,7 @@ pub struct RelEventInfo {
 }
 
 /// Attribute event info for conflict detection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttributeEventInfo {
     /// The attribute ID that triggered the event.
     pub attr_id: RecordId,
@@ -1440,6 +1802,8 @@ fn compute_event_slot_key(event: &Event) -> String {
     hasher.update(day_bucket.as_bytes());
     hasher.update(b"|");
     hasher.update(parts.title_key.as_bytes());
+    hasher.update(b"|");
+    hasher.update(compute_record_partition(&event.base).as_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -1569,7 +1933,7 @@ async fn build_direct_commit_for_events(
         slot_type: "event".to_string(),
         subject_entity: event_subject_from_participants_key(&parts.participants_key),
         predicate_id: parts.title_key,
-        security_hash: compute_security_hash(&canonical_event.base.security),
+        security_hash: compute_record_partition(&canonical_event.base),
         claim_ids,
         claim_set_hash: Some(claim_set_hash),
         ..CommitInput::default()
@@ -1625,6 +1989,9 @@ async fn execute_tm_detect_event_conflicts_with_storage<S: TruthMaintenanceStora
     }
 
     let mut direct_commit_list: Vec<DirectCommit> = direct_commits.into_values().collect();
+    for commit in &mut direct_commit_list {
+        stamp_decision_fingerprint(&mut commit.input, space_id, storage).await?;
+    }
     direct_commit_list.sort_by(|a, b| a.input.slot_key.cmp(&b.input.slot_key));
 
     Ok(DetectConflictsResult {
@@ -1640,8 +2007,6 @@ async fn execute_tm_detect_event_conflicts_with_storage<S: TruthMaintenanceStora
 enum SlotDetection {
     /// All claims share one value: direct corroboration commit.
     Corroborated(Box<DirectCommit>),
-    /// A resolved group already adjudicated this exact claim set; skip.
-    Memoized,
     /// Real value conflict: group created or updated.
     Conflict {
         /// Conflict group id.
@@ -1651,9 +2016,9 @@ enum SlotDetection {
     },
 }
 
-/// Upserts an unresolved conflict group unless a resolved group already
-/// adjudicated this exact claim set (memoization skip: no reopen, no counters).
-async fn upsert_conflict_group_memoized<S: TruthMaintenanceStorage>(
+/// Upserts a conflict group while preserving its prior semantic memo.
+/// The resolver owns safe memo reuse against current evidence and provider input.
+async fn upsert_conflict_group_preserving_memo<S: TruthMaintenanceStorage>(
     space_id: &str,
     slot_key: &str,
     slot_type: &str,
@@ -1664,16 +2029,8 @@ async fn upsert_conflict_group_memoized<S: TruthMaintenanceStorage>(
     let existing = storage
         .get_conflict_group(space_id, &deterministic_id)
         .await?;
-    if let Some(existing) = &existing {
-        // Resolved OR unresolved (needs_review cooldown): an unchanged claim
-        // set that was already adjudicated must not reopen or re-enqueue.
-        if existing.adjudicated_claim_set_hash.as_deref()
-            == Some(compute_claim_set_hash(&claim_ids).as_str())
-        {
-            return Ok(SlotDetection::Memoized);
-        }
-    }
-
+    // Detection only schedules. Resolution has the full semantic inputs and
+    // current adjudicator contract needed to recognize a safe memoized replay.
     let was_existing = storage
         .find_unresolved_conflict_by_type(space_id, slot_key, slot_type)
         .await?
@@ -1683,6 +2040,9 @@ async fn upsert_conflict_group_memoized<S: TruthMaintenanceStorage>(
     if let Some(existing) = existing {
         group.adjudicated_claim_set_hash = existing.adjudicated_claim_set_hash;
         group.adjudicated_at = existing.adjudicated_at;
+        group.resolved = existing.resolved;
+        group.resolved_at = existing.resolved_at;
+        group.resolution_rationale = existing.resolution_rationale;
     }
     let upserted = storage.upsert_unresolved_conflict_group(group).await?;
     Ok(SlotDetection::Conflict {
@@ -1705,9 +2065,14 @@ async fn detect_slot_outcome<S: TruthMaintenanceStorage>(
     claim_ids: Vec<String>,
     storage: &S,
 ) -> Result<SlotDetection, PipelineError> {
-    let predicate = storage
-        .find_predicate_registry_by_predicate_id(space_id, predicate_id)
-        .await?;
+    let predicate = scoped_predicate(
+        storage
+            .find_predicate_registry_by_predicate_id(space_id, predicate_id)
+            .await?,
+        claim_authority(claim_records)?.as_ref(),
+        storage,
+    )
+    .await?;
     let semantics = predicate.as_ref().and_then(|p| p.semantics.as_ref());
     // Displays are only needed for adjudication prompts; detection compares by id.
     let entity_displays = HashMap::new();
@@ -1730,7 +2095,7 @@ async fn detect_slot_outcome<S: TruthMaintenanceStorage>(
         )));
     }
 
-    upsert_conflict_group_memoized(space_id, slot_key, slot_type, claim_ids, storage).await
+    upsert_conflict_group_preserving_memo(space_id, slot_key, slot_type, claim_ids, storage).await
 }
 
 /// Detects cross-object cardinality conflicts for a subject + predicate.
@@ -1749,7 +2114,7 @@ async fn detect_rel_set_conflict<S: TruthMaintenanceStorage>(
         .find_rels_for_subject_predicate(space_id, subject_id, predicate_id)
         .await?
         .into_iter()
-        .filter(|rel| compute_security_hash(&rel.base.security) == security_hash)
+        .filter(|rel| compute_record_partition(&rel.base) == security_hash)
         .collect();
 
     let distinct_objects: HashSet<String> =
@@ -1758,10 +2123,15 @@ async fn detect_rel_set_conflict<S: TruthMaintenanceStorage>(
         return Ok(None);
     }
 
-    let cardinality = storage
-        .find_predicate_registry_by_predicate_id(space_id, predicate_id)
-        .await?
-        .and_then(|p| p.semantics.map(|s| s.cardinality));
+    let cardinality = scoped_predicate(
+        storage
+            .find_predicate_registry_by_predicate_id(space_id, predicate_id)
+            .await?,
+        authority_for_bases(rels.iter().map(|row| &row.base))?.as_ref(),
+        storage,
+    )
+    .await?
+    .and_then(|p| p.semantics.map(|s| s.cardinality));
     if cardinality == Some(Cardinality::Many) {
         return Ok(None);
     }
@@ -1770,7 +2140,7 @@ async fn detect_rel_set_conflict<S: TruthMaintenanceStorage>(
     claim_ids.sort();
     claim_ids.dedup();
 
-    upsert_conflict_group_memoized(space_id, rel_set_key, "rel_set", claim_ids, storage)
+    upsert_conflict_group_preserving_memo(space_id, rel_set_key, "rel_set", claim_ids, storage)
         .await
         .map(Some)
 }
@@ -1788,6 +2158,59 @@ pub async fn execute_tm_detect_conflicts_with_storage<S: TruthMaintenanceStorage
     space_id: &str,
     storage: &S,
 ) -> Result<DetectConflictsResult, PipelineError> {
+    if let Some(planning) =
+        crate::maintenance_commit::PlanningTruthMaintenanceStorage::for_storage(storage, space_id)
+            .await?
+    {
+        let request = serde_json::json!({"rels": rel_events, "attrs": attr_events});
+        if let Some(previous) = planning
+            .replay(
+                "execute_tm_detect_conflicts_with_storage",
+                "record_detection",
+                &request,
+            )
+            .await?
+        {
+            return Ok(previous);
+        }
+        let mut result = Box::pin(execute_tm_detect_conflicts_with_storage_prepared(
+            rel_events,
+            attr_events,
+            space_id,
+            &planning,
+        ))
+        .await?;
+        Box::pin(apply_detected_direct_commits(
+            &mut result,
+            space_id,
+            &planning,
+        ))
+        .await?;
+        Box::pin(planning.commit(
+            "execute_tm_detect_conflicts_with_storage",
+            "record_detection",
+            &request,
+            &result,
+        ))
+        .await?;
+        Ok(result)
+    } else {
+        Box::pin(execute_tm_detect_conflicts_with_storage_prepared(
+            rel_events,
+            attr_events,
+            space_id,
+            storage,
+        ))
+        .await
+    }
+}
+
+async fn execute_tm_detect_conflicts_with_storage_prepared<S: TruthMaintenanceStorage>(
+    rel_events: &[RelEventInfo],
+    attr_events: &[AttributeEventInfo],
+    space_id: &str,
+    storage: &S,
+) -> Result<DetectConflictsResult, PipelineError> {
     let mut conflicts_detected = 0;
     let mut conflicts_updated = 0;
     let mut conflict_group_ids = Vec::new();
@@ -1800,7 +2223,6 @@ pub async fn execute_tm_detect_conflicts_with_storage<S: TruthMaintenanceStorage
 
     // Process rel events
     for event in rel_events {
-        let is_event_like = predicate_is_event_like(storage, space_id, &event.rel_type).await?;
         let slot_key = compute_slot_key(
             &event.subject_id.to_string(),
             Some(&event.object_id.to_string()),
@@ -1819,10 +2241,17 @@ pub async fn execute_tm_detect_conflicts_with_storage<S: TruthMaintenanceStorage
             )
             .await?
             .into_iter()
-            .filter(|rel| compute_security_hash(&rel.base.security) == event.security_hash)
+            .filter(|rel| compute_record_partition(&rel.base) == event.security_hash)
             .collect::<Vec<_>>();
 
         let claim_records: Vec<ClaimRecord> = claims.into_iter().map(ClaimRecord::Rel).collect();
+        let is_event_like = predicate_is_event_like(
+            storage,
+            space_id,
+            &event.rel_type,
+            claim_authority(&claim_records)?.as_ref(),
+        )
+        .await?;
         let claim_count = claim_records.len();
         let claim_ids: Vec<String> = claim_records
             .iter()
@@ -1878,7 +2307,6 @@ pub async fn execute_tm_detect_conflicts_with_storage<S: TruthMaintenanceStorage
                 SlotDetection::Corroborated(commit) => {
                     direct_commits.entry(slot_key.clone()).or_insert(*commit);
                 }
-                SlotDetection::Memoized => {}
                 SlotDetection::Conflict { id, was_existing } => {
                     if seen_conflict_group_ids.insert(id.clone()) {
                         conflict_group_ids.push(id);
@@ -1949,7 +2377,7 @@ pub async fn execute_tm_detect_conflicts_with_storage<S: TruthMaintenanceStorage
             )
             .await?
             {
-                None | Some(SlotDetection::Memoized) => {}
+                None => {}
                 Some(SlotDetection::Conflict { id, was_existing }) => {
                     if seen_conflict_group_ids.insert(id.clone()) {
                         conflict_group_ids.push(id);
@@ -1970,7 +2398,6 @@ pub async fn execute_tm_detect_conflicts_with_storage<S: TruthMaintenanceStorage
 
     // Process attribute events
     for event in attr_events {
-        let is_event_like = predicate_is_event_like(storage, space_id, &event.attr_type).await?;
         let slot_key = compute_slot_key(
             &event.subject_id.to_string(),
             None,
@@ -1984,11 +2411,18 @@ pub async fn execute_tm_detect_conflicts_with_storage<S: TruthMaintenanceStorage
             .find_attrs_for_slot(space_id, &event.subject_id, &event.attr_type)
             .await?
             .into_iter()
-            .filter(|attr| compute_security_hash(&attr.base.security) == event.security_hash)
+            .filter(|attr| compute_record_partition(&attr.base) == event.security_hash)
             .collect::<Vec<_>>();
 
         let claim_records: Vec<ClaimRecord> =
             claims.into_iter().map(ClaimRecord::Attribute).collect();
+        let is_event_like = predicate_is_event_like(
+            storage,
+            space_id,
+            &event.attr_type,
+            claim_authority(&claim_records)?.as_ref(),
+        )
+        .await?;
         let claim_count = claim_records.len();
         let claim_ids: Vec<String> = claim_records
             .iter()
@@ -2044,7 +2478,6 @@ pub async fn execute_tm_detect_conflicts_with_storage<S: TruthMaintenanceStorage
                 SlotDetection::Corroborated(commit) => {
                     direct_commits.entry(slot_key.clone()).or_insert(*commit);
                 }
-                SlotDetection::Memoized => {}
                 SlotDetection::Conflict { id, was_existing } => {
                     if seen_conflict_group_ids.insert(id.clone()) {
                         conflict_group_ids.push(id);
@@ -2100,6 +2533,9 @@ pub async fn execute_tm_detect_conflicts_with_storage<S: TruthMaintenanceStorage
     }
 
     let mut direct_commit_list: Vec<DirectCommit> = direct_commits.into_values().collect();
+    for commit in &mut direct_commit_list {
+        stamp_decision_fingerprint(&mut commit.input, space_id, storage).await?;
+    }
     direct_commit_list.sort_by(|a, b| a.input.slot_key.cmp(&b.input.slot_key));
 
     Ok(DetectConflictsResult {
@@ -2151,10 +2587,16 @@ async fn predicate_is_event_like<S: TruthMaintenanceStorage>(
     storage: &S,
     space_id: &str,
     predicate_id: &str,
+    authority: Option<&elephant_types::records::base::BaseFields>,
 ) -> Result<bool, PipelineError> {
-    let predicate = storage
-        .find_predicate_registry_by_predicate_id(space_id, predicate_id)
-        .await?;
+    let predicate = scoped_predicate(
+        storage
+            .find_predicate_registry_by_predicate_id(space_id, predicate_id)
+            .await?,
+        authority,
+        storage,
+    )
+    .await?;
     Ok(predicate
         .as_ref()
         .and_then(|p| p.semantics.as_ref())
@@ -2179,9 +2621,14 @@ async fn build_direct_commit_for_records<S: TruthMaintenanceStorage>(
         ));
     }
 
-    let predicate = storage
-        .find_predicate_registry_by_predicate_id(space_id, predicate_id)
-        .await?;
+    let predicate = scoped_predicate(
+        storage
+            .find_predicate_registry_by_predicate_id(space_id, predicate_id)
+            .await?,
+        claim_authority(claim_records)?.as_ref(),
+        storage,
+    )
+    .await?;
     let semantics = predicate.as_ref().and_then(|p| p.semantics.as_ref());
 
     let entity_displays = HashMap::new();
@@ -2411,6 +2858,10 @@ pub struct SupersededOverride {
 /// Adjudication side-channel carried from resolution into the commit payload.
 #[derive(Debug, Clone, Default)]
 pub struct ResolutionExtras {
+    /// Proposed semantics remain staged until the complete claim transaction commits.
+    pub proposed_semantics: Option<PredicateSemantics>,
+    /// Bounded explanation for a deferred proposal.
+    pub semantics_rationale: Option<String>,
     /// Whether the resolution came from an LLM adjudication verdict.
     pub adjudicated: bool,
     /// The resolution is a memoized replay and must not be committed.
@@ -2799,29 +3250,26 @@ pub async fn execute_tm_resolve_slot<S: TruthMaintenanceStorage>(
     }
 
     if conflict_group.slot_type == "event" {
-        return resolve_multi_value_event_slot(ctx, conflict_group, claims, space_id, storage)
-            .await;
+        return Box::pin(resolve_multi_value_event_slot(
+            ctx,
+            conflict_group,
+            claims,
+            space_id,
+            storage,
+        ))
+        .await;
     }
 
     let parts = parse_slot_key(&conflict_group.slot_key, &conflict_group.slot_type)?;
-    let predicate = storage
-        .find_predicate_registry_by_predicate_id(space_id, &parts.predicate_id)
-        .await?;
+    let predicate = scoped_predicate(
+        storage
+            .find_predicate_registry_by_predicate_id(space_id, &parts.predicate_id)
+            .await?,
+        Some(&conflict_group.base),
+        storage,
+    )
+    .await?;
     let semantics = predicate.and_then(|p| p.semantics);
-
-    if semantics.is_none() && claims.len() > 1 {
-        let mut payload = OutboxPayload::new(
-            space_id.to_string(),
-            "predicate_conflict_no_semantics".to_string(),
-            "truth_maintenance".to_string(),
-        );
-        payload.add_record(RecordRef {
-            id: conflict_group.base.id.clone(),
-            table: "conflict_group".to_string(),
-            op: EventOperation::Update,
-        });
-        storage.emit_system_event(payload).await?;
-    }
 
     resolve_multi_value_slot(
         ctx,
@@ -2846,8 +3294,8 @@ async fn resolve_multi_value_event_slot<S: TruthMaintenanceStorage>(
     space_id: &str,
     storage: &S,
 ) -> Result<(ResolutionResult, ResolutionExtras), PipelineError> {
-    let claim_ids: Vec<String> = claims.iter().map(|claim| claim.claim_id.clone()).collect();
-    let claim_set_hash = compute_claim_set_hash(&claim_ids);
+    let claim_set_hash =
+        resolution_decision_hash(ctx, conflict_group, claims, space_id, storage).await?;
     if conflict_group.adjudicated_claim_set_hash.as_deref() == Some(claim_set_hash.as_str()) {
         // Memoized replay: never re-commit (a commit here would clobber the
         // previously committed outcome with Disputed statuses).
@@ -2876,17 +3324,12 @@ async fn resolve_multi_value_event_slot<S: TruthMaintenanceStorage>(
             &evidence_notes,
         );
         if let Some(verdict) = adjudicator.adjudicate(&input).await? {
-            record_adjudication(
-                conflict_group,
-                &claim_set_hash,
-                &verdict,
-                true,
-                &input.predicate_id,
-                space_id,
-                storage,
-            )
-            .await?;
-            return Ok(map_adjudication_verdict(verdict, claims));
+            let proposal = None;
+            let note = truncated_rationale(&verdict.rationale);
+            let (resolution, mut extras) = map_adjudication_verdict(verdict, claims);
+            extras.proposed_semantics = proposal;
+            extras.semantics_rationale = Some(note);
+            return Ok((resolution, extras));
         }
     }
 
@@ -2904,8 +3347,8 @@ async fn resolve_multi_value_slot<S: TruthMaintenanceStorage>(
     parts: SlotKeyParts,
     semantics: Option<PredicateSemantics>,
 ) -> Result<(ResolutionResult, ResolutionExtras), PipelineError> {
-    let claim_ids: Vec<String> = claims.iter().map(|claim| claim.claim_id.clone()).collect();
-    let claim_set_hash = compute_claim_set_hash(&claim_ids);
+    let claim_set_hash =
+        resolution_decision_hash(ctx, conflict_group, claims, space_id, storage).await?;
     if conflict_group.adjudicated_claim_set_hash.as_deref() == Some(claim_set_hash.as_str()) {
         // Memoized replay: never re-commit (a commit here would clobber the
         // previously committed outcome with Disputed statuses).
@@ -2937,17 +3380,20 @@ async fn resolve_multi_value_slot<S: TruthMaintenanceStorage>(
             &evidence_notes,
         );
         if let Some(verdict) = adjudicator.adjudicate(&input).await? {
-            record_adjudication(
-                conflict_group,
-                &claim_set_hash,
-                &verdict,
-                false,
-                &parts.predicate_id,
-                space_id,
-                storage,
-            )
-            .await?;
-            return Ok(map_adjudication_verdict(verdict, claims));
+            let proposal = verdict
+                .proposed_semantics
+                .as_ref()
+                .map(|proposed| PredicateSemantics {
+                    cardinality: proposed.cardinality,
+                    temporal_model: proposed.temporal_model,
+                    conflict_policy: proposed.conflict_policy,
+                    ..PredicateSemantics::default()
+                });
+            let note = truncated_rationale(&verdict.rationale);
+            let (resolution, mut extras) = map_adjudication_verdict(verdict, claims);
+            extras.proposed_semantics = proposal;
+            extras.semantics_rationale = Some(note);
+            return Ok((resolution, extras));
         }
     }
 
@@ -2974,68 +3420,170 @@ async fn resolve_multi_value_slot<S: TruthMaintenanceStorage>(
     ))
 }
 
-/// Persists memoization state and any proposed semantics after a verdict.
-async fn record_adjudication<S: TruthMaintenanceStorage>(
-    conflict_group: &ConflictGroup,
-    claim_set_hash: &str,
-    verdict: &AdjudicationVerdict,
-    suppress_semantics: bool,
-    predicate_id: &str,
+/// Apply a deferred proposal inside the same prepared transaction as claims.
+/// Returns an explicit scoped-only rationale when a global row belongs elsewhere.
+async fn apply_proposed_semantics<S: TruthMaintenanceStorage>(
+    input: &CommitInput,
     space_id: &str,
+    authority: &elephant_types::records::base::BaseFields,
     storage: &S,
-) -> Result<(), PipelineError> {
-    let mut updated = conflict_group.clone();
-    updated.adjudicated_claim_set_hash = Some(claim_set_hash.to_string());
-    updated.adjudicated_at = Some(Utc::now());
-    updated.base.updated_at = Utc::now();
-    let group_id = updated.base.id.clone();
-    storage
-        .update_conflict_group(space_id, &group_id, updated)
-        .await?;
-
-    let Some(proposed) = verdict.proposed_semantics else {
-        return Ok(());
+) -> Result<Option<String>, PipelineError> {
+    let Some(semantics) = input.proposed_semantics.clone() else {
+        return Ok(None);
     };
-    if suppress_semantics {
-        return Ok(());
+    if !input.adjudicated || input.slot_type == "event" {
+        return Err(PipelineError::InvalidInput(
+            "predicate proposal requires a non-event adjudication".to_owned(),
+        ));
     }
-
-    let semantics = PredicateSemantics {
-        cardinality: proposed.cardinality,
-        temporal_model: proposed.temporal_model,
-        conflict_policy: proposed.conflict_policy,
-        ..PredicateSemantics::default()
-    };
     let registry = storage
         .upsert_predicate_semantics(
             space_id,
-            predicate_id,
+            &input.predicate_id,
             semantics,
             SemanticsStatus::LlmProposed,
-            &truncated_rationale(&verdict.rationale),
+            input.semantics_rationale.as_deref().unwrap_or_default(),
+            authority,
         )
         .await?;
-
-    // Configured semantics are never overwritten; skip the stale-marking event
-    // when the upsert was refused.
-    if registry.semantics_status != SemanticsStatus::LlmProposed {
-        return Ok(());
+    let Some(registry) = registry else {
+        let proposal = serde_json::to_string(&input.proposed_semantics)
+            .map_err(|e| PipelineError::InvalidState(e.to_string()))?;
+        return Ok(Some(format!(
+            "proposal_not_globalized_due_to_support_partition; local_semantics={proposal}; {}",
+            input.semantics_rationale.as_deref().unwrap_or_default()
+        )));
+    };
+    if registry.semantics_status == SemanticsStatus::Configured {
+        return Ok(None);
     }
-
-    // Standard predicate_registry event -> mark_slots_stale_by_predicate
-    // machinery recomputes old slots under the learned semantics.
     let mut payload = OutboxPayload::new(
-        space_id.to_string(),
-        "predicate_registry.updated".to_string(),
-        "truth_maintenance".to_string(),
+        space_id.to_owned(),
+        "predicate_registry.updated".to_owned(),
+        "truth_maintenance".to_owned(),
     );
     payload.add_record(RecordRef {
         id: registry.base.id,
-        table: "predicate_registry".to_string(),
+        table: "predicate_registry".to_owned(),
         op: EventOperation::Update,
     });
     storage.emit_system_event(payload).await?;
-    Ok(())
+    Ok(None)
+}
+
+/// Only the retained independent built-in default envelope can govern the
+/// whole space. Named policy IDs have no implicit public ordering. Unknown
+/// subjects with an empty subject set are retained for this explicit operator
+/// configuration case; learned/source-backed records never receive this escape.
+fn public_independent_policy_envelope(base: &elephant_types::records::base::BaseFields) -> bool {
+    base.deleted_at.is_none()
+        && base.security.policy_id == "default"
+        && base.security.level == 0
+        && base.security.labels.is_empty()
+        && base.security.handling.is_empty()
+        && base.subjects.is_empty()
+        && base.subjects_state != elephant_types::records::base::SubjectsState::Partial
+        && base.provenance.sources.is_empty()
+}
+
+fn exact_policy_scope(
+    base: &elephant_types::records::base::BaseFields,
+    authority: &elephant_types::records::base::BaseFields,
+) -> bool {
+    let left: std::collections::BTreeSet<_> = base.provenance.sources.iter().collect();
+    let right: std::collections::BTreeSet<_> = authority.provenance.sources.iter().collect();
+    base.space_id == authority.space_id
+        && base.deleted_at.is_none()
+        && compute_record_partition(base) == compute_record_partition(authority)
+        && left == right
+}
+
+pub(crate) async fn scoped_predicate<S: TruthMaintenanceStorage>(
+    predicate: Option<PredicateRegistry>,
+    authority: Option<&elephant_types::records::base::BaseFields>,
+    storage: &S,
+) -> Result<Option<PredicateRegistry>, PipelineError> {
+    let Some(row) = predicate else {
+        return Ok(None);
+    };
+    if row.base.deleted_at.is_some()
+        || row.status != "active"
+        || authority.is_some_and(|base| base.space_id != row.base.space_id)
+    {
+        return Ok(None);
+    }
+    let independent = if row.base.provenance.sources.is_empty() {
+        !storage
+            .has_source_support(&row.base.space_id, &row.base.id)
+            .await?
+    } else {
+        false
+    };
+    // An empty claimed source set with real ledger support cannot establish an
+    // exact source partition, even if its other fields look like a public row.
+    if row.base.provenance.sources.is_empty() && !independent {
+        return Ok(None);
+    }
+    if (row.semantics_status == SemanticsStatus::Configured
+        && independent
+        && public_independent_policy_envelope(&row.base))
+        || authority.is_some_and(|base| exact_policy_scope(&row.base, base))
+    {
+        Ok(Some(row))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn scoped_alias_version<S: TruthMaintenanceStorage>(
+    aliases: &[PredicateAlias],
+    authority: &elephant_types::records::base::BaseFields,
+    storage: &S,
+) -> Result<u32, PipelineError> {
+    let mut version = 0;
+    for row in aliases {
+        if row.base.space_id != authority.space_id
+            || row.base.deleted_at.is_some()
+            || row.status != elephant_types::records::predicate::AliasStatus::Active
+        {
+            continue;
+        }
+        let independent = row.base.provenance.sources.is_empty()
+            && !storage
+                .has_source_support(&row.base.space_id, &row.base.id)
+                .await?;
+        if row.base.provenance.sources.is_empty() && !independent {
+            continue;
+        }
+        if (row.scope == elephant_types::records::predicate::AliasScope::Global
+            && independent
+            && public_independent_policy_envelope(&row.base))
+            || exact_policy_scope(&row.base, authority)
+        {
+            version = version.max(row.confidence_version);
+        }
+    }
+    Ok(version)
+}
+
+fn authority_for_bases<'a>(
+    bases: impl IntoIterator<Item = &'a elephant_types::records::base::BaseFields>,
+) -> Result<Option<elephant_types::records::base::BaseFields>, PipelineError> {
+    let mut authority = None;
+    for base in bases {
+        if let Some(first) = &mut authority {
+            crate::maintenance_commit::merge_authority(first, base)?;
+        } else {
+            authority = Some(base.clone());
+        }
+    }
+    Ok(authority)
+}
+
+fn claim_authority(
+    claims: &[ClaimRecord],
+) -> Result<Option<elephant_types::records::base::BaseFields>, PipelineError> {
+    authority_for_bases(claims.iter().map(ClaimRecord::base))
 }
 
 /// Fetches display names for the object entities referenced by rel claims.
@@ -3078,6 +3626,116 @@ pub async fn resolve_conflict_group_with_storage<S: TruthMaintenanceStorage>(
     space_id: &str,
     storage: &S,
 ) -> Result<(ResolutionResult, CommitInput), PipelineError> {
+    if let Some(planning) =
+        crate::maintenance_commit::PlanningTruthMaintenanceStorage::for_storage(storage, space_id)
+            .await?
+    {
+        let current = planning
+            .get_conflict_group(space_id, &conflict_group.base.id)
+            .await?
+            .ok_or_else(|| PipelineError::NotFound(conflict_group.base.id.to_string()))?;
+        if current != *conflict_group {
+            return Err(PipelineError::InvalidState(
+                "conflict group changed before resolution".to_owned(),
+            ));
+        }
+        let result = Box::pin(resolve_conflict_group_with_storage_prepared(
+            ctx, &current, space_id, &planning,
+        ))
+        .await?;
+        if result.1.skip_commit {
+            Box::pin(acknowledge_current_memo(&planning, space_id, &result)).await?;
+        }
+        Ok(result)
+    } else {
+        Box::pin(resolve_conflict_group_with_storage_prepared(
+            ctx,
+            conflict_group,
+            space_id,
+            storage,
+        ))
+        .await
+    }
+}
+
+async fn acknowledge_current_memo(
+    planning: &crate::maintenance_commit::PlanningTruthMaintenanceStorage,
+    space: &str,
+    result: &(ResolutionResult, CommitInput),
+) -> Result<(), PipelineError> {
+    let input = &result.1;
+    let Some(mut slot) = planning.find_slot_by_key(space, &input.slot_key).await? else {
+        return Ok(());
+    };
+    if !slot.stale {
+        return Ok(());
+    }
+    // A memo validates the existing outcome; never apply its sentinel
+    // NeedsReview value or invent a fresh verdict. Slot values must still name
+    // the current claims and exactly retain their status/evidence/confidence.
+    for value in &slot.current_values {
+        if !input.claim_ids.contains(&value.claim_id) {
+            return Err(PipelineError::InvalidState(
+                "Memoized slot membership changed; reprepare".into(),
+            ));
+        }
+        let id = RecordId::from_str(&value.claim_id)
+            .map_err(|e| PipelineError::InvalidInput(e.to_string()))?;
+        let valid = match id.table() {
+            TableName::Rel => planning.get_rel(space, &id).await?.is_some_and(|row| {
+                row.status == value.status
+                    && row.confidence == value.confidence
+                    && row.evidence == value.evidence
+            }),
+            TableName::Attribute => planning
+                .get_attribute(space, &id)
+                .await?
+                .is_some_and(|row| {
+                    row.status == value.status
+                        && row.confidence == value.confidence
+                        && row.evidence == value.evidence
+                }),
+            _ => false,
+        };
+        if !valid {
+            return Err(PipelineError::InvalidState(
+                "Memoized slot contents changed; reprepare".into(),
+            ));
+        }
+    }
+    let before = audit_snapshot(&slot)?;
+    slot.stale = false;
+    slot.stale_reason = None;
+    slot.computed_at = Utc::now();
+    slot.base.updated_at = slot.computed_at;
+    let id = slot.base.id.clone();
+    let updated = planning.update_slot(space, &id, slot).await?;
+    planning
+        .create_audit_log(build_audit_log(
+            space,
+            TM_RESOLVE_SLOT_KIND,
+            AuditAction::Update,
+            &id,
+            Some(before),
+            Some(audit_snapshot(&updated)?),
+            Some("Current semantic memo acknowledged".into()),
+        ))
+        .await?;
+    Box::pin(planning.commit(
+        "tm_memo_acknowledgement",
+        &input.slot_key,
+        &serde_json::json!({"input":input}),
+        result,
+    ))
+    .await
+}
+
+async fn resolve_conflict_group_with_storage_prepared<S: TruthMaintenanceStorage>(
+    ctx: &TmContext,
+    conflict_group: &ConflictGroup,
+    space_id: &str,
+    storage: &S,
+) -> Result<(ResolutionResult, CommitInput), PipelineError> {
     if conflict_group.slot_type == "event" {
         return resolve_event_conflict_group_with_storage(ctx, conflict_group, space_id, storage)
             .await;
@@ -3093,7 +3751,7 @@ pub async fn resolve_conflict_group_with_storage<S: TruthMaintenanceStorage>(
             .find_rels_for_subject_predicate(space_id, &parts.subject_id, &parts.predicate_id)
             .await?
             .into_iter()
-            .filter(|rel| compute_security_hash(&rel.base.security) == parts.security_hash)
+            .filter(|rel| compute_record_partition(&rel.base) == parts.security_hash)
             .map(ClaimRecord::Rel)
             .collect();
         if claim_records.is_empty() {
@@ -3154,7 +3812,7 @@ pub async fn resolve_conflict_group_with_storage<S: TruthMaintenanceStorage>(
                     )
                     .await?
                     .into_iter()
-                    .filter(|rel| compute_security_hash(&rel.base.security) == parts.security_hash)
+                    .filter(|rel| compute_record_partition(&rel.base) == parts.security_hash)
                     .map(ClaimRecord::Rel)
                     .collect::<Vec<_>>()
             }
@@ -3162,7 +3820,7 @@ pub async fn resolve_conflict_group_with_storage<S: TruthMaintenanceStorage>(
                 .find_attrs_for_slot(space_id, &parts.subject_id, &parts.predicate_id)
                 .await?
                 .into_iter()
-                .filter(|attr| compute_security_hash(&attr.base.security) == parts.security_hash)
+                .filter(|attr| compute_record_partition(&attr.base) == parts.security_hash)
                 .map(ClaimRecord::Attribute)
                 .collect::<Vec<_>>(),
             other => {
@@ -3186,9 +3844,14 @@ pub async fn resolve_conflict_group_with_storage<S: TruthMaintenanceStorage>(
         claim_records = claims;
     }
 
-    let predicate = storage
-        .find_predicate_registry_by_predicate_id(space_id, &parts.predicate_id)
-        .await?;
+    let predicate = scoped_predicate(
+        storage
+            .find_predicate_registry_by_predicate_id(space_id, &parts.predicate_id)
+            .await?,
+        claim_authority(&claim_records)?.as_ref(),
+        storage,
+    )
+    .await?;
     let semantics = predicate.as_ref().and_then(|p| p.semantics.as_ref());
 
     let entity_displays = fetch_object_displays(&claim_records, space_id, storage).await;
@@ -3204,6 +3867,16 @@ pub async fn resolve_conflict_group_with_storage<S: TruthMaintenanceStorage>(
         )));
     }
 
+    let decision_version = adjudicator_version(ctx);
+    let decision_input_hash = semantic_decision_hash(
+        space_id,
+        &conflict_group.slot_key,
+        &conflict_group.slot_type,
+        &claim_ids,
+        &decision_version,
+        storage,
+    )
+    .await?;
     let (resolution, extras) =
         execute_tm_resolve_slot(ctx, conflict_group, &claims, space_id, storage).await?;
 
@@ -3216,11 +3889,16 @@ pub async fn resolve_conflict_group_with_storage<S: TruthMaintenanceStorage>(
         security_hash: parts.security_hash,
         claim_ids,
         claim_set_hash: Some(claim_set_hash),
+        decision_input_hash: Some(decision_input_hash),
+        adjudicator_version: decision_version,
         adjudicated: extras.adjudicated,
         merged_claim_ids: extras.merged_claim_ids,
         superseded_overrides: extras.superseded_overrides,
         winner_valid_from: extras.winner_valid_from,
         skip_commit: extras.skip_commit,
+        prepared_epoch: storage.prepared_epoch()?,
+        proposed_semantics: extras.proposed_semantics,
+        semantics_rationale: extras.semantics_rationale,
     };
 
     Ok((resolution, input))
@@ -3290,6 +3968,16 @@ async fn resolve_event_conflict_group_with_storage<S: TruthMaintenanceStorage>(
     let mut claims: Vec<ClaimWithMetadata> =
         events.iter().map(build_event_claim_metadata).collect();
     claims.sort_by(|a, b| a.claim_id.cmp(&b.claim_id));
+    let decision_version = adjudicator_version(ctx);
+    let decision_input_hash = semantic_decision_hash(
+        space_id,
+        &conflict_group.slot_key,
+        &conflict_group.slot_type,
+        &claim_ids,
+        &decision_version,
+        storage,
+    )
+    .await?;
     let (resolution, extras) =
         execute_tm_resolve_slot(ctx, conflict_group, &claims, space_id, storage).await?;
     let canonical_event = events
@@ -3309,14 +3997,19 @@ async fn resolve_event_conflict_group_with_storage<S: TruthMaintenanceStorage>(
         slot_type: "event".to_string(),
         subject_entity: event_subject_from_participants_key(&parts.participants_key),
         predicate_id: parts.title_key,
-        security_hash: compute_security_hash(&canonical_event.base.security),
+        security_hash: compute_record_partition(&canonical_event.base),
         claim_ids,
         claim_set_hash: Some(claim_set_hash),
+        decision_input_hash: Some(decision_input_hash),
+        adjudicator_version: decision_version,
         adjudicated: extras.adjudicated,
         merged_claim_ids: extras.merged_claim_ids,
         superseded_overrides: extras.superseded_overrides,
         winner_valid_from: extras.winner_valid_from,
         skip_commit: extras.skip_commit,
+        prepared_epoch: storage.prepared_epoch()?,
+        proposed_semantics: extras.proposed_semantics,
+        semantics_rationale: extras.semantics_rationale,
     };
 
     Ok((resolution, input))
@@ -3690,7 +4383,7 @@ pub fn refine_temporal_audit(
 pub const TM_COMMIT_KIND: &str = "tm_commit";
 
 /// Result of tm_commit work kind.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommitResult {
     /// Number of truth slots updated.
     pub slots_updated: usize,
@@ -3716,12 +4409,24 @@ pub async fn execute_tm_commit<S: TruthMaintenanceStorage>(
     space_id: &str,
     storage: &S,
 ) -> Result<CommitResult, PipelineError> {
-    execute_tm_commit_with_storage(resolution, input, space_id, storage).await
+    Box::pin(execute_tm_commit_with_storage(
+        resolution, input, space_id, storage,
+    ))
+    .await
 }
 
 /// Input for tm_commit with storage.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommitInput {
+    /// Epoch captured before deferred resolution reads/provider work.
+    #[serde(default)]
+    pub prepared_epoch: Option<String>,
+    /// Proposed semantics remain staged until the complete claim transaction commits.
+    #[serde(default)]
+    pub proposed_semantics: Option<PredicateSemantics>,
+    /// Bounded explanation for a deferred proposal.
+    #[serde(default)]
+    pub semantics_rationale: Option<String>,
     /// The slot key for this truth slot.
     pub slot_key: String,
     /// The slot type ("rel", "attribute", "rel_set", or "event").
@@ -3738,6 +4443,12 @@ pub struct CommitInput {
     /// when the live claim set no longer matches.
     #[serde(default)]
     pub claim_set_hash: Option<String>,
+    /// Complete evidence/value/predicate/version fingerprint at resolution.
+    #[serde(default)]
+    pub decision_input_hash: Option<String>,
+    /// Exact adjudicator contract used when computing the semantic fingerprint.
+    #[serde(default)]
+    pub adjudicator_version: String,
     /// Whether the resolution came from an LLM adjudication verdict.
     #[serde(default)]
     pub adjudicated: bool,
@@ -3782,6 +4493,13 @@ struct RefinementEvidence {
 }
 
 impl ClaimRecord {
+    fn base(&self) -> &elephant_types::records::base::BaseFields {
+        match self {
+            Self::Rel(row) => &row.base,
+            Self::Attribute(row) => &row.base,
+        }
+    }
+
     fn id(&self) -> &RecordId {
         match self {
             Self::Rel(rel) => &rel.base.id,
@@ -3856,13 +4574,6 @@ impl ClaimRecord {
         match self {
             Self::Rel(rel) => rel.status,
             Self::Attribute(attr) => attr.status,
-        }
-    }
-
-    fn soft_delete(&mut self) {
-        match self {
-            Self::Rel(rel) => rel.base.soft_delete(),
-            Self::Attribute(attr) => attr.base.soft_delete(),
         }
     }
 
@@ -4011,14 +4722,6 @@ fn semantics_version_from_registry(predicate: Option<&PredicateRegistry>) -> u32
         .unwrap_or(0)
 }
 
-fn alias_version_from_aliases(aliases: &[PredicateAlias]) -> u32 {
-    aliases
-        .iter()
-        .map(|alias| alias.confidence_version)
-        .max()
-        .unwrap_or(0)
-}
-
 fn audit_snapshot<T: Serialize>(record: &T) -> Result<JsonValue, PipelineError> {
     serde_json::to_value(record).map_err(|e| {
         PipelineError::InvalidInput(format!("Failed to serialize audit snapshot: {e}"))
@@ -4088,6 +4791,10 @@ async fn execute_tm_commit_events<S: TruthMaintenanceStorage>(
         }
     }
 
+    let original_snapshots = events_by_id
+        .iter()
+        .map(|(id, row)| Ok((id.clone(), audit_snapshot(row)?)))
+        .collect::<Result<HashMap<_, _>, PipelineError>>()?;
     let mut merged_ids: HashSet<String> = input.merged_claim_ids.iter().cloned().collect();
     let merge_winner = match resolution {
         ResolutionResult::SingleWinner { winner_id, .. } => {
@@ -4158,8 +4865,7 @@ async fn execute_tm_commit_events<S: TruthMaintenanceStorage>(
 
     let reject_floor = event_reject_floor();
 
-    // Persist surviving events (the winner with its merged refs above all)
-    // before soft-deleting duplicates so a crash mid-commit retries cleanly.
+    // Prepare the complete survivor and duplicate effects in one overlay.
     let ordered_claim_ids: Vec<&String> = claim_ids
         .iter()
         .filter(|id| !merged_ids.contains(*id))
@@ -4171,14 +4877,20 @@ async fn execute_tm_commit_events<S: TruthMaintenanceStorage>(
             .remove(claim_id)
             .ok_or_else(|| PipelineError::NotFound(format!("Event claim not found: {claim_id}")))?;
 
-        let before_snapshot = audit_snapshot(&event)?;
+        let before_snapshot = original_snapshots
+            .get(claim_id)
+            .cloned()
+            .ok_or_else(|| PipelineError::InvalidState("missing original event snapshot".into()))?;
 
         // Corroborated duplicates: refs merged into the winner; soft-delete.
         if merged_ids.contains(claim_id) {
             let event_id = event.base.id.clone();
             storage.delete_event(space_id, &event_id).await?;
-            event.base.soft_delete();
-            let after_snapshot = audit_snapshot(&event)?;
+            let deleted = storage
+                .get_event_with_deleted(space_id, &event_id)
+                .await?
+                .ok_or_else(|| PipelineError::NotFound(event_id.to_string()))?;
+            let after_snapshot = audit_snapshot(&deleted)?;
             let audit = build_audit_log(
                 space_id,
                 TM_COMMIT_KIND,
@@ -4239,7 +4951,16 @@ async fn execute_tm_commit_events<S: TruthMaintenanceStorage>(
             // Memoize the decided claim set so detection/recompute skip
             // unchanged sets even for deterministic (keyless) resolutions.
             if input.claim_set_hash.is_some() {
-                updated_group.adjudicated_claim_set_hash = input.claim_set_hash.clone();
+                let committed_hash = semantic_decision_hash(
+                    space_id,
+                    &input.slot_key,
+                    &input.slot_type,
+                    &claim_ids,
+                    &input.adjudicator_version,
+                    storage,
+                )
+                .await?;
+                updated_group.adjudicated_claim_set_hash = Some(committed_hash);
                 updated_group.adjudicated_at = Some(Utc::now());
             }
             let group_id = updated_group.base.id.clone();
@@ -4321,6 +5042,49 @@ pub async fn execute_tm_commit_with_storage<S: TruthMaintenanceStorage>(
     space_id: &str,
     storage: &S,
 ) -> Result<CommitResult, PipelineError> {
+    if let Some(planning) =
+        crate::maintenance_commit::PlanningTruthMaintenanceStorage::for_storage(storage, space_id)
+            .await?
+    {
+        let request = serde_json::json!({"resolution": resolution, "input": input});
+        if let Some(previous) = planning
+            .replay("execute_tm_commit_with_storage", &input.slot_key, &request)
+            .await?
+        {
+            return Ok(previous);
+        }
+        let result = Box::pin(execute_tm_commit_with_storage_prepared(
+            resolution, input, space_id, &planning,
+        ))
+        .await?;
+        if result.skipped_stale {
+            return Err(PipelineError::InvalidState(
+                "maintenance inputs changed; reprepare".to_owned(),
+            ));
+        }
+
+        Box::pin(planning.commit(
+            "execute_tm_commit_with_storage",
+            &input.slot_key,
+            &request,
+            &result,
+        ))
+        .await?;
+        Ok(result)
+    } else {
+        Box::pin(execute_tm_commit_with_storage_prepared(
+            resolution, input, space_id, storage,
+        ))
+        .await
+    }
+}
+
+async fn execute_tm_commit_with_storage_prepared<S: TruthMaintenanceStorage>(
+    resolution: &ResolutionResult,
+    input: &CommitInput,
+    space_id: &str,
+    storage: &S,
+) -> Result<CommitResult, PipelineError> {
     use elephant_types::records::base::BaseFields;
     use elephant_types::Link;
 
@@ -4332,6 +5096,14 @@ pub async fn execute_tm_commit_with_storage<S: TruthMaintenanceStorage>(
             "tm_commit skipped: resolution was a memoized replay"
         );
         return Ok(CommitResult::default());
+    }
+
+    if let Some(expected) = &input.prepared_epoch {
+        if storage.prepared_epoch()?.as_ref() != Some(expected) {
+            return Err(PipelineError::InvalidState(
+                "maintenance decision source/configuration changed; reprepare".to_owned(),
+            ));
+        }
     }
 
     let mut slots_updated = 0;
@@ -4380,6 +5152,29 @@ pub async fn execute_tm_commit_with_storage<S: TruthMaintenanceStorage>(
         return Err(PipelineError::InvalidInput(
             "tm_commit requires claim_ids".to_string(),
         ));
+    }
+
+    if input.adjudicated && input.decision_input_hash.is_none() {
+        return Err(PipelineError::ValidationError(
+            "Adjudicated TM commit lacks semantic input fingerprint".into(),
+        ));
+    }
+    if let Some(expected) = &input.decision_input_hash {
+        let current = semantic_decision_hash(
+            space_id,
+            &input.slot_key,
+            &input.slot_type,
+            &claim_ids,
+            &input.adjudicator_version,
+            storage,
+        )
+        .await?;
+        if &current != expected {
+            return Ok(CommitResult {
+                skipped_stale: true,
+                ..CommitResult::default()
+            });
+        }
     }
 
     if input.slot_type == "event" {
@@ -4464,10 +5259,59 @@ pub async fn execute_tm_commit_with_storage<S: TruthMaintenanceStorage>(
         return Ok(CommitResult::default());
     }
 
-    let predicate = storage
-        .find_predicate_registry_by_predicate_id(space_id, &input.predicate_id)
-        .await?;
-    let semantics = predicate.as_ref().and_then(|p| p.semantics.as_ref());
+    let original_snapshots = claim_records
+        .iter()
+        .map(|(id, row)| {
+            let snapshot = match row {
+                ClaimRecord::Rel(row) => audit_snapshot(row)?,
+                ClaimRecord::Attribute(row) => audit_snapshot(row)?,
+            };
+            Ok((id.clone(), snapshot))
+        })
+        .collect::<Result<HashMap<_, _>, PipelineError>>()?;
+    let authority = authority_for_bases(claim_records.values().map(ClaimRecord::base))?
+        .ok_or_else(|| PipelineError::InvalidState("missing maintenance claim authority".into()))?;
+    let local_proposal_note =
+        apply_proposed_semantics(input, space_id, &authority, storage).await?;
+    let predicate = scoped_predicate(
+        storage
+            .find_predicate_registry_by_predicate_id(space_id, &input.predicate_id)
+            .await?,
+        Some(&authority),
+        storage,
+    )
+    .await?;
+    let configured = predicate
+        .as_ref()
+        .filter(|p| p.semantics_status == SemanticsStatus::Configured);
+    let semantics = configured
+        .and_then(|p| p.semantics.as_ref())
+        .or(input.proposed_semantics.as_ref())
+        .or_else(|| predicate.as_ref().and_then(|p| p.semantics.as_ref()));
+    // Resolution only prepares a verdict. Governance observations belong to
+    // the same transaction as its claims, slot, audit and receipt, so a failed
+    // or stale commit cannot leave a successful-looking standalone event.
+    if semantics.is_none() {
+        if let Some(group) = &unresolved_group {
+            let values = claim_records
+                .values()
+                .map(|record| claim_value_for_record(record, &HashMap::new()))
+                .collect::<Vec<_>>();
+            if partition_value_groups(&values).len() > 1 {
+                let mut event = OutboxPayload::new(
+                    space_id.into(),
+                    "predicate_conflict_no_semantics".into(),
+                    "truth_maintenance".into(),
+                );
+                event.add_record(RecordRef {
+                    id: group.base.id.clone(),
+                    table: "conflict_group".into(),
+                    op: EventOperation::Update,
+                });
+                storage.emit_system_event(event).await?;
+            }
+        }
+    }
     let thresholds = promotion_thresholds(semantics);
     let conflict_policy = semantics
         .map(|semantics| semantics.conflict_policy)
@@ -4475,7 +5319,7 @@ pub async fn execute_tm_commit_with_storage<S: TruthMaintenanceStorage>(
     let aliases = storage
         .list_predicate_aliases_by_predicate_id(space_id, &input.predicate_id)
         .await?;
-    let alias_version = alias_version_from_aliases(&aliases);
+    let alias_version = scoped_alias_version(&aliases, &authority, storage).await?;
     let semantics_version = semantics_version_from_registry(predicate.as_ref());
 
     let refinement_policy = semantics
@@ -4662,6 +5506,10 @@ pub async fn execute_tm_commit_with_storage<S: TruthMaintenanceStorage>(
 
     current_value_order.retain(|id| !merged_ids.contains(id));
 
+    if let Some(note) = &local_proposal_note {
+        rationale = Some(format!("{}; {note}", rationale.unwrap_or_default()));
+    }
+
     let mut needs_review = matches!(resolution, ResolutionResult::NeedsReview { .. });
     if needs_review {
         order_needs_review_claims(&mut current_value_order, &claim_records, conflict_policy);
@@ -4818,10 +5666,8 @@ pub async fn execute_tm_commit_with_storage<S: TruthMaintenanceStorage>(
 
     let mut audit_entries = 0;
 
-    // Persist surviving claims (the winner with its merged evidence above all)
-    // BEFORE soft-deleting duplicates: the evidence merge is idempotent, so a
-    // crash between the two phases retries cleanly, while the reverse order
-    // would trip the staleness guard with the duplicate's evidence unpersisted.
+    // Prepare all survivor and duplicate effects; none are live until the
+    // canonical transaction also commits their audits, outbox and receipt.
     let ordered_claim_ids: Vec<&String> = claim_ids
         .iter()
         .filter(|id| !merged_ids.contains(*id))
@@ -4832,10 +5678,10 @@ pub async fn execute_tm_commit_with_storage<S: TruthMaintenanceStorage>(
         let Some(mut record) = claim_records.remove(claim_id) else {
             continue;
         };
-        let before_snapshot = match &record {
-            ClaimRecord::Rel(rel) => audit_snapshot(rel)?,
-            ClaimRecord::Attribute(attr) => audit_snapshot(attr)?,
-        };
+        let before_snapshot = original_snapshots
+            .get(claim_id)
+            .cloned()
+            .ok_or_else(|| PipelineError::InvalidState("missing original claim snapshot".into()))?;
 
         // Corroborated duplicates: evidence already merged into the winner;
         // soft-delete the row (no status change, no validity windows).
@@ -4847,10 +5693,19 @@ pub async fn execute_tm_commit_with_storage<S: TruthMaintenanceStorage>(
                     storage.delete_attribute(space_id, &record_id).await?;
                 }
             }
-            record.soft_delete();
             let after_snapshot = match &record {
-                ClaimRecord::Rel(rel) => audit_snapshot(rel)?,
-                ClaimRecord::Attribute(attr) => audit_snapshot(attr)?,
+                ClaimRecord::Rel(_) => audit_snapshot(
+                    &storage
+                        .get_rel_with_deleted(space_id, &record_id)
+                        .await?
+                        .ok_or_else(|| PipelineError::NotFound(record_id.to_string()))?,
+                )?,
+                ClaimRecord::Attribute(_) => audit_snapshot(
+                    &storage
+                        .get_attribute_with_deleted(space_id, &record_id)
+                        .await?
+                        .ok_or_else(|| PipelineError::NotFound(record_id.to_string()))?,
+                )?,
             };
             let audit = build_audit_log(
                 space_id,
@@ -4950,7 +5805,20 @@ pub async fn execute_tm_commit_with_storage<S: TruthMaintenanceStorage>(
             // Memoize the decided claim set so detection/recompute skip
             // unchanged sets even for deterministic (keyless) resolutions.
             if input.claim_set_hash.is_some() {
-                updated_group.adjudicated_claim_set_hash = input.claim_set_hash.clone();
+                let committed_hash = semantic_decision_hash(
+                    space_id,
+                    &input.slot_key,
+                    &input.slot_type,
+                    &claim_ids,
+                    &input.adjudicator_version,
+                    storage,
+                )
+                .await?;
+                updated_group.adjudicated_claim_set_hash = Some(if local_proposal_note.is_some() {
+                    crate::maintenance_commit::request_fingerprint(&(committed_hash, semantics))?
+                } else {
+                    committed_hash
+                });
                 updated_group.adjudicated_at = Some(Utc::now());
             }
             let group_id = updated_group.base.id.clone();
@@ -5013,11 +5881,10 @@ pub async fn execute_tm_commit_with_storage<S: TruthMaintenanceStorage>(
                     .await?;
             }
             Err(err) => {
-                tracing::warn!(
-                    subject = %input.subject_entity,
-                    error = %err,
-                    "rel_set commit could not mark per-object slots stale"
-                );
+                return Err(PipelineError::InvalidInput(format!(
+                    "rel_set commit has invalid subject {}: {err}",
+                    input.subject_entity
+                )));
             }
         }
     }
@@ -5059,6 +5926,7 @@ pub async fn execute_tm_commit_with_storage<S: TruthMaintenanceStorage>(
         (None, AuditAction::Create, slot)
     };
 
+    crate::maintenance_commit::inherit(&mut slot.base, &authority);
     slot.base.updated_at = Utc::now();
     let upserted = storage.upsert_slot(slot).await?;
     let after_snapshot = audit_snapshot(&upserted)?;
@@ -5329,6 +6197,14 @@ pub fn trigger_events_from_outbox_payload(payload: &OutboxPayload) -> Vec<Trigge
     payload
         .records
         .iter()
+        // The same canonical TM transaction has already applied these claim
+        // changes. Other consumers still receive the durable events; feeding
+        // them straight back into TM would produce endless single-value work.
+        .filter(|record| {
+            !(payload.actor == "truth_maintenance"
+                && payload.event_type.ends_with(".maintenance")
+                && matches!(record.table.as_str(), "rel" | "attribute" | "event"))
+        })
         .filter_map(trigger_from_record_ref)
         .collect()
 }
@@ -5410,7 +6286,7 @@ pub async fn execute_tm_detect_conflicts_from_outbox_events<S: TruthMaintenanceS
     };
 
     for (space_id, triggers) in triggers_by_space {
-        let result = execute_tm_detect_conflicts(&triggers, &space_id, storage).await?;
+        let result = Box::pin(execute_tm_detect_conflicts(&triggers, &space_id, storage)).await?;
         aggregated.events_processed += result.events_processed;
         aggregated.conflicts_detected += result.conflicts_detected;
         aggregated.conflicts_updated += result.conflicts_updated;
@@ -5442,7 +6318,7 @@ pub enum RecomputePriority {
 }
 
 /// Result of tm_recompute work kind.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecomputeResult {
     /// Number of stale slots found.
     pub stale_slots_found: usize,
@@ -5471,6 +6347,39 @@ pub async fn execute_tm_recompute<S: TruthMaintenanceStorage>(
     max_slots: usize,
     storage: &S,
 ) -> Result<RecomputeResult, PipelineError> {
+    if let Some(planning) =
+        crate::maintenance_commit::PlanningTruthMaintenanceStorage::for_storage(storage, space_id)
+            .await?
+    {
+        let request =
+            serde_json::json!({"priority": format!("{priority:?}"), "max_slots": max_slots});
+        if let Some(previous) = planning
+            .replay("execute_tm_recompute", "recompute", &request)
+            .await?
+        {
+            return Ok(previous);
+        }
+        let result = Box::pin(execute_tm_recompute_prepared(
+            _ctx, space_id, priority, max_slots, &planning,
+        ))
+        .await?;
+        Box::pin(planning.commit("execute_tm_recompute", "recompute", &request, &result)).await?;
+        Ok(result)
+    } else {
+        Box::pin(execute_tm_recompute_prepared(
+            _ctx, space_id, priority, max_slots, storage,
+        ))
+        .await
+    }
+}
+
+async fn execute_tm_recompute_prepared<S: TruthMaintenanceStorage>(
+    _ctx: &TmContext,
+    space_id: &str,
+    priority: RecomputePriority,
+    max_slots: usize,
+    storage: &S,
+) -> Result<RecomputeResult, PipelineError> {
     let _ = priority;
     let stale_slots = storage.find_stale_slots(space_id, max_slots).await?;
     let stale_slots_found = stale_slots.len();
@@ -5481,9 +6390,14 @@ pub async fn execute_tm_recompute<S: TruthMaintenanceStorage>(
 
     for slot in stale_slots {
         let parts = parse_slot_key(&slot.slot_key, &slot.slot_type)?;
-        let predicate = storage
-            .find_predicate_registry_by_predicate_id(space_id, &slot.predicate_id)
-            .await?;
+        let predicate = scoped_predicate(
+            storage
+                .find_predicate_registry_by_predicate_id(space_id, &slot.predicate_id)
+                .await?,
+            Some(&slot.base),
+            storage,
+        )
+        .await?;
         let semantics = predicate.as_ref().and_then(|p| p.semantics.as_ref());
 
         let claim_records: Vec<ClaimRecord> = match slot.slot_type.as_str() {
@@ -5496,7 +6410,7 @@ pub async fn execute_tm_recompute<S: TruthMaintenanceStorage>(
                     .find_rels_for_slot(space_id, &parts.subject_id, &object_id, &slot.predicate_id)
                     .await?
                     .into_iter()
-                    .filter(|rel| compute_security_hash(&rel.base.security) == parts.security_hash)
+                    .filter(|rel| compute_record_partition(&rel.base) == parts.security_hash)
                     .collect::<Vec<_>>();
                 rels.into_iter().map(ClaimRecord::Rel).collect()
             }
@@ -5504,7 +6418,7 @@ pub async fn execute_tm_recompute<S: TruthMaintenanceStorage>(
                 .find_rels_for_subject_predicate(space_id, &parts.subject_id, &slot.predicate_id)
                 .await?
                 .into_iter()
-                .filter(|rel| compute_security_hash(&rel.base.security) == parts.security_hash)
+                .filter(|rel| compute_record_partition(&rel.base) == parts.security_hash)
                 .map(ClaimRecord::Rel)
                 .collect(),
             "attribute" => {
@@ -5512,9 +6426,7 @@ pub async fn execute_tm_recompute<S: TruthMaintenanceStorage>(
                     .find_attrs_for_slot(space_id, &parts.subject_id, &slot.predicate_id)
                     .await?
                     .into_iter()
-                    .filter(|attr| {
-                        compute_security_hash(&attr.base.security) == parts.security_hash
-                    })
+                    .filter(|attr| compute_record_partition(&attr.base) == parts.security_hash)
                     .collect::<Vec<_>>();
                 attrs.into_iter().map(ClaimRecord::Attribute).collect()
             }
@@ -5525,7 +6437,8 @@ pub async fn execute_tm_recompute<S: TruthMaintenanceStorage>(
         };
 
         if claim_records.is_empty() {
-            slots_skipped += 1;
+            settle_empty_slot(space_id, slot, storage).await?;
+            slots_recomputed += 1;
             continue;
         }
 
@@ -5544,7 +6457,7 @@ pub async fn execute_tm_recompute<S: TruthMaintenanceStorage>(
         if partition_value_groups(&values).len() == 1 {
             // One value group: inline corroboration commit (resurrect guard
             // in commit preserves adjudicated supersessions on lone claims).
-            let commit = build_corroboration_commit(
+            let mut commit = build_corroboration_commit(
                 &slot.slot_key,
                 &slot.slot_type,
                 &parts.subject_id,
@@ -5552,19 +6465,25 @@ pub async fn execute_tm_recompute<S: TruthMaintenanceStorage>(
                 &slot.security_hash,
                 &claims,
             );
-            let _ = execute_tm_commit_with_storage(
+            stamp_decision_fingerprint(&mut commit.input, space_id, storage).await?;
+            let committed = Box::pin(execute_tm_commit_with_storage(
                 &commit.resolution,
                 &commit.input,
                 space_id,
                 storage,
-            )
+            ))
             .await?;
+            if committed.skipped_stale {
+                return Err(PipelineError::InvalidState(
+                    "maintenance inputs changed; reprepare".to_owned(),
+                ));
+            }
             slots_recomputed += 1;
             continue;
         }
 
         // Multiple value groups: hand the conflict group to tm_resolve_slot.
-        match upsert_conflict_group_memoized(
+        match upsert_conflict_group_preserving_memo(
             space_id,
             &slot.slot_key,
             &slot.slot_type,
@@ -5573,18 +6492,6 @@ pub async fn execute_tm_recompute<S: TruthMaintenanceStorage>(
         )
         .await?
         {
-            SlotDetection::Memoized => {
-                // The committed truth already covers this exact claim set;
-                // just clear the stale flag.
-                let mut refreshed = slot;
-                refreshed.stale = false;
-                refreshed.stale_reason = None;
-                refreshed.computed_at = Utc::now();
-                refreshed.base.updated_at = Utc::now();
-                let slot_id = refreshed.base.id.clone();
-                let _ = storage.update_slot(space_id, &slot_id, refreshed).await?;
-                slots_recomputed += 1;
-            }
             SlotDetection::Conflict { id, .. } => {
                 pending_conflict_groups.push(id);
             }
@@ -5600,6 +6507,66 @@ pub async fn execute_tm_recompute<S: TruthMaintenanceStorage>(
         slots_skipped,
         pending_conflict_groups,
     })
+}
+
+/// An empty live partition is a computed result, including after its last
+/// claim was deleted. Stage only the obsolete projection/group cleanup in the
+/// caller's existing epoch- and attempt-fenced maintenance transaction.
+async fn settle_empty_slot<S: TruthMaintenanceStorage>(
+    space_id: &str,
+    mut slot: TruthSlot,
+    storage: &S,
+) -> Result<(), PipelineError> {
+    let now = Utc::now();
+    if let Some(mut group) = storage
+        .find_unresolved_conflict_by_type(space_id, &slot.slot_key, &slot.slot_type)
+        .await?
+    {
+        let before = audit_snapshot(&group)?;
+        let id = group.base.id.clone();
+        group.claim_ids.clear();
+        group.resolved = true;
+        group.resolution_rationale = Some("No active claims remain in this partition".into());
+        group.resolved_at = Some(now);
+        group.base.updated_at = now;
+        // Retain the historical adjudication fingerprint/time; empty membership
+        // is bookkeeping, not a new adjudicator verdict.
+        let updated = storage.update_conflict_group(space_id, &id, group).await?;
+        storage
+            .create_audit_log(build_audit_log(
+                space_id,
+                TM_RECOMPUTE_KIND,
+                AuditAction::Update,
+                &id,
+                Some(before),
+                Some(audit_snapshot(&updated)?),
+                Some("Empty claim partition reconciled".into()),
+            ))
+            .await?;
+    }
+    let before = audit_snapshot(&slot)?;
+    let id = slot.base.id.clone();
+    slot.current_values.clear();
+    slot.conflict_group = None;
+    slot.confidence = 0.0;
+    slot.rationale = Some("No active claims remain in this partition".into());
+    slot.stale = false;
+    slot.stale_reason = None;
+    slot.computed_at = now;
+    slot.base.updated_at = now;
+    let updated = storage.update_slot(space_id, &id, slot).await?;
+    storage
+        .create_audit_log(build_audit_log(
+            space_id,
+            TM_RECOMPUTE_KIND,
+            AuditAction::Update,
+            &id,
+            Some(before),
+            Some(audit_snapshot(&updated)?),
+            Some("Empty claim partition reconciled".into()),
+        ))
+        .await?;
+    Ok(())
 }
 
 // ============================================================================
@@ -5781,19 +6748,6 @@ mod tests {
         }
     }
 
-    const TM_SCHEMA: &str = r"
-        DEFINE TABLE rel SCHEMALESS;
-        DEFINE TABLE attribute SCHEMALESS;
-        DEFINE TABLE event SCHEMALESS;
-        DEFINE TABLE conflict_group SCHEMALESS;
-        DEFINE TABLE truth_slot SCHEMALESS;
-        DEFINE TABLE entity SCHEMALESS;
-        DEFINE TABLE predicate_registry SCHEMALESS;
-        DEFINE TABLE predicate_alias SCHEMALESS;
-        DEFINE TABLE audit_log SCHEMALESS;
-        DEFINE TABLE system_event SCHEMALESS;
-    ";
-
     fn make_predicate_registry(
         space_id: &str,
         predicate_id: &str,
@@ -5814,6 +6768,102 @@ mod tests {
             usage_count: 0,
             last_used_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn configured_predicates_preserve_public_defaults_without_crossing_restricted_partitions()
+    {
+        let storage = MockTruthMaintenanceStorage::new();
+        let public = make_predicate_registry(
+            "test_space",
+            "has-title",
+            Some(PredicateSemantics::default()),
+        );
+        let mut authority = public.base.clone();
+        authority.id = RecordId::new_v4(TableName::Rel);
+        authority.subjects_state = elephant_types::records::base::SubjectsState::Complete;
+        authority.subjects = vec![elephant_types::Link::new(RecordId::new_v4(
+            TableName::Entity,
+        ))];
+        // The actual retained operator baseline uses Unknown and no subjects.
+        assert!(
+            scoped_predicate(Some(public.clone()), Some(&authority), &storage)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        for case in 0..9 {
+            let mut restricted = public.clone();
+            match case {
+                0 => restricted.base.security.level = 1,
+                1 => restricted.base.security.labels = vec!["private".into()],
+                2 => restricted.base.security.policy_id = "named-policy".into(),
+                3 => restricted.base.security.policy_id.clear(),
+                4 => {
+                    restricted.base.subjects = vec![elephant_types::Link::new(RecordId::new_v4(
+                        TableName::Entity,
+                    ))]
+                }
+                5 => restricted.base.provenance.sources = vec![RecordId::new_v4(TableName::Source)],
+                6 => restricted.base.deleted_at = Some(Utc::now()),
+                7 => {
+                    restricted.base.subjects_state =
+                        elephant_types::records::base::SubjectsState::Partial
+                }
+                _ => restricted.status = "deprecated".into(),
+            }
+            assert!(
+                scoped_predicate(Some(restricted), Some(&authority), &storage)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "case {case}"
+            );
+        }
+        let mut restricted = public;
+        restricted.base = authority.clone();
+        restricted.base.id = RecordId::new_v4(TableName::PredicateRegistry);
+        restricted.base.security.policy_id = "named-policy".into();
+        restricted.base.security.level = 2;
+        restricted.base.provenance.sources = vec![RecordId::new_v4(TableName::Source)];
+        let mut exact = restricted.base.clone();
+        exact.id = RecordId::new_v4(TableName::Rel);
+        assert!(
+            scoped_predicate(Some(restricted.clone()), Some(&exact), &storage)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        exact.provenance.sources = vec![RecordId::new_v4(TableName::Source)];
+        assert!(
+            scoped_predicate(Some(restricted.clone()), Some(&exact), &storage)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        exact = restricted.base.clone();
+        exact.space_id = "another_space".into();
+        assert!(scoped_predicate(Some(restricted), Some(&exact), &storage)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn alias_version_uses_only_the_actual_input_authority() {
+        let storage = MockTruthMaintenanceStorage::new();
+        let public = make_predicate_alias("test_space", "works_at", 3);
+        let authority = public.base.clone();
+        let mut private = make_predicate_alias("test_space", "works_at", 99);
+        private.base.security.policy_id = "private".into();
+        let mut sourced = make_predicate_alias("test_space", "works_at", 100);
+        sourced.base.provenance.sources = vec![RecordId::new_v4(TableName::Source)];
+        assert_eq!(
+            scoped_alias_version(&[public, private, sourced], &authority, &storage)
+                .await
+                .unwrap(),
+            3
+        );
     }
 
     fn make_predicate_alias(
@@ -5842,8 +6892,103 @@ mod tests {
 
     async fn setup_tm_storage() -> StorageClient {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(TM_SCHEMA).await.expect("schema");
+        elephant_migrations::apply_schema(&storage)
+            .await
+            .expect("schema");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    "test_space".to_owned(),
+                    "test".to_owned(),
+                ),
+                embedding_provider: "unconfigured".into(),
+                embedding_model: "unconfigured".into(),
+                embedding_dims: 1,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .expect("space");
         storage
+    }
+
+    // Repository tests use real immutable evidence, not nonexistent assertion
+    // IDs that a production support gate could accidentally treat as authority.
+    async fn persist_test_rel_evidence(storage: &StorageClient, rel: &mut Rel) {
+        let entities = elephant_storage::EntityRepository::new(storage.clone());
+        for (id, name) in [(rel.subject.id(), "Ada"), (rel.object.id(), "Research")] {
+            if entities
+                .get(&rel.base.space_id, id)
+                .await
+                .expect("entity lookup")
+                .is_none()
+            {
+                let mut base = rel.base.clone();
+                base.id = id.clone();
+                entities
+                    .create(Entity::new(
+                        base,
+                        elephant_types::records::EntityType::new("person"),
+                        name.into(),
+                    ))
+                    .await
+                    .expect("actual relationship endpoint");
+            }
+        }
+        for evidence in &mut rel.evidence {
+            let mut doc_base = rel.base.clone();
+            doc_base.id = RecordId::new_v4(TableName::Doc);
+            let doc = elephant_types::records::Doc {
+                base: doc_base,
+                title: "test".into(),
+                text: "test".into(),
+                sidecar_text: None,
+                source: None,
+                media_attachments: vec![],
+                rendition_key: uuid::Uuid::new_v4().to_string(),
+                metadata: serde_json::json!({}),
+            };
+            elephant_storage::DocRepository::new(storage.clone())
+                .create(doc.clone())
+                .await
+                .expect("doc");
+            let mut revision_base = rel.base.clone();
+            revision_base.id = evidence.span.revision.id().clone();
+            let hash = crate::extraction::AssertionValidator::hash_quote("test");
+            let revision = elephant_types::records::DocRevision {
+                base: revision_base,
+                doc: Link::new(doc.base.id),
+                text: "test".into(),
+                text_hash: hash.clone(),
+                renderer: elephant_types::records::doc_revision::RendererMetadata {
+                    name: "test".into(),
+                    version: "1".into(),
+                    config_hash: None,
+                },
+                manifest: None,
+                supersedes: None,
+                status: elephant_types::records::RevisionStatus::Active,
+                rendered_at: Utc::now(),
+            };
+            elephant_storage::DocRevisionRepository::new(storage.clone())
+                .create(revision)
+                .await
+                .expect("revision");
+            evidence.span.start = 0;
+            evidence.span.end = 4;
+            evidence.span.quote_hash = hash;
+            let mut assertion = make_evidence_assertion("Ada", &rel.rel_type, "Research", None);
+            assertion.base = rel.base.clone();
+            assertion.base.id = evidence.assertion.id().clone();
+            assertion.assertion_key = assertion.base.id.to_string();
+            assertion.evidence = evidence.span.clone();
+            elephant_storage::AssertionRepository::new(storage.clone())
+                .create(assertion)
+                .await
+                .expect("assertion");
+        }
     }
 
     // =========================================================================
@@ -6147,7 +7292,7 @@ mod tests {
         );
         let rel_id = rel.base.id.to_string();
         let stale_id = RecordId::new_v4(TableName::Rel).to_string();
-        let security_hash = compute_security_hash(&rel.base.security);
+        let security_hash = compute_record_partition(&rel.base);
         let slot_key = compute_slot_key(
             &subject_id.to_string(),
             Some(&object_id.to_string()),
@@ -6480,51 +7625,35 @@ mod tests {
         }
     }
 
-    /// Test: missing semantics emits predicate_conflict_no_semantics event.
+    /// Missing-semantics governance is committed with the actual verdict.
     #[tokio::test]
     async fn test_execute_tm_resolve_slot_emits_conflict_no_semantics_event() {
-        let storage = MockTruthMaintenanceStorage::new();
-
-        let predicate_id = "works_at";
-        let mut predicate = make_predicate_registry("test_space", predicate_id, None);
-        predicate.semantics = None;
-        predicate.semantics_status = SemanticsStatus::Default;
-        storage.add_predicate_registry(predicate);
-
-        let subject_id = RecordId::new_v4(TableName::Entity);
-        let object_id = RecordId::new_v4(TableName::Entity);
-        let slot_key = compute_slot_key(
-            &subject_id.to_string(),
-            Some(&object_id.to_string()),
-            predicate_id,
-            None,
-            "hash",
-        );
-
-        let group = create_conflict_group(
-            &slot_key,
-            "rel",
-            vec!["claim1".to_string(), "claim2".to_string()],
-            "test_space",
-        );
-
-        let now = Utc::now();
-        let earlier = now - chrono::Duration::hours(1);
-        let later = now + chrono::Duration::hours(1);
-        let claims = vec![
-            make_claim("claim1", 0.7, earlier),
-            make_claim("claim2", 0.8, later),
-        ];
-
-        let _ =
-            execute_tm_resolve_slot(&TmContext::none(), &group, &claims, "test_space", &storage)
+        let fixture = rel_set_fixture();
+        let storage = &fixture.storage;
+        execute_tm_detect_conflicts_with_storage(&fixture.rel_events, &[], "test_space", storage)
+            .await
+            .expect("detect");
+        let group = storage
+            .find_unresolved_conflict_by_type("test_space", &fixture.rel_set_key, "rel_set")
+            .await
+            .unwrap()
+            .expect("actual conflict group");
+        let (resolution, input) =
+            resolve_conflict_group_with_storage(&TmContext::none(), &group, "test_space", storage)
                 .await
-                .expect("resolve should succeed");
-
+                .expect("prepare verdict");
+        assert!(
+            storage.emitted_events().is_empty(),
+            "preparation has no live governance effects"
+        );
+        execute_tm_commit_with_storage(&resolution, &input, "test_space", storage)
+            .await
+            .expect("commit verdict");
         let events = storage.emitted_events();
         assert_eq!(events.len(), 1, "Expected one governance event");
         assert_eq!(events[0].event_type, "predicate_conflict_no_semantics");
         assert_eq!(events[0].space_id, "test_space");
+        assert_eq!(events[0].records[0].id, group.base.id);
     }
 
     // =========================================================================
@@ -6958,13 +8087,13 @@ mod tests {
         let subject_id = RecordId::new_v4(TableName::Entity);
         let object_id = RecordId::new_v4(TableName::Entity);
 
-        let rel1 = make_test_rel(
+        let mut rel1 = make_test_rel(
             "test_space",
             subject_id.clone(),
             object_id.clone(),
             "works_at",
         );
-        let rel2 = make_test_rel(
+        let mut rel2 = make_test_rel(
             "test_space",
             subject_id.clone(),
             object_id.clone(),
@@ -6973,6 +8102,8 @@ mod tests {
         let rel1_id = rel1.base.id.clone();
         let rel2_id = rel2.base.id.clone();
 
+        persist_test_rel_evidence(&storage, &mut rel1).await;
+        persist_test_rel_evidence(&storage, &mut rel2).await;
         rel_repo.create(rel1.clone()).await.expect("create rel1");
         rel_repo.create(rel2.clone()).await.expect("create rel2");
 
@@ -7004,9 +8135,9 @@ mod tests {
             .expect("detect conflicts");
 
         assert_eq!(result.conflicts_detected, 0, "Identical values corroborate");
-        assert_eq!(result.direct_commits.len(), 1);
+        assert!(result.direct_commits.is_empty());
 
-        let security_hash = compute_security_hash(&rel1.base.security);
+        let security_hash = compute_record_partition(&rel1.base);
         let slot_key = compute_slot_key(
             &subject_id.to_string(),
             Some(&object_id.to_string()),
@@ -7024,32 +8155,19 @@ mod tests {
             "No conflict group for identical values"
         );
 
-        let commit = &result.direct_commits[0];
-        let ResolutionResult::CorroboratedWinner {
-            winner_id,
-            merged_claim_ids,
-            ..
-        } = &commit.resolution
-        else {
-            panic!("Expected CorroboratedWinner, got {:?}", commit.resolution);
+        let first = rel_repo
+            .get("test_space", &rel1_id)
+            .await
+            .expect("get first");
+        let second = rel_repo
+            .get("test_space", &rel2_id)
+            .await
+            .expect("get second");
+        let (winner_record_id, merged_record_id) = match (first, second) {
+            (Some(_), None) => (rel1_id.clone(), rel2_id.clone()),
+            (None, Some(_)) => (rel2_id.clone(), rel1_id.clone()),
+            other => panic!("detection must commit one survivor, got {other:?}"),
         };
-        assert_eq!(merged_claim_ids.len(), 1);
-
-        execute_tm_commit_with_storage(
-            &commit.resolution,
-            &commit.input,
-            "test_space",
-            &tm_storage,
-        )
-        .await
-        .expect("corroboration commit");
-
-        let winner_record_id = RecordId::from_str(winner_id).expect("winner id");
-        let merged_record_id = RecordId::from_str(&merged_claim_ids[0]).expect("merged id");
-        assert!(
-            [&rel1_id, &rel2_id].contains(&&winner_record_id),
-            "winner is one of the duplicates"
-        );
 
         let winner = rel_repo
             .get("test_space", &winner_record_id)
@@ -7119,8 +8237,10 @@ mod tests {
         let rel1_id = rel1.base.id.clone();
         let rel2_id = rel2.base.id.clone();
 
-        let security_hash = compute_security_hash(&rel2.base.security);
+        let security_hash = compute_record_partition(&rel2.base);
 
+        persist_test_rel_evidence(&storage, &mut rel1).await;
+        persist_test_rel_evidence(&storage, &mut rel2).await;
         rel_repo.create(rel1).await.expect("create rel1");
         rel_repo.create(rel2).await.expect("create rel2");
         let slot_key = compute_slot_key(
@@ -7234,7 +8354,7 @@ mod tests {
         let rel1_id = rel1.base.id.to_string();
         let rel2_id = rel2.base.id.to_string();
 
-        let security_hash = compute_security_hash(&rel1.base.security);
+        let security_hash = compute_record_partition(&rel1.base);
 
         storage.add_rel(rel1);
         storage.add_rel(rel2);
@@ -7332,6 +8452,229 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the three partition/deletion/quiescence scenarios together"
+    )]
+    async fn recompute_deleted_partition_settles_once_without_touching_other_claims() {
+        for slot_type in ["attribute", "rel", "rel_set"] {
+            let storage = MockTruthMaintenanceStorage::new();
+            let subject = RecordId::new_v4(TableName::Entity);
+            let object = RecordId::new_v4(TableName::Entity);
+            let claim = if slot_type == "attribute" {
+                ClaimRecord::Attribute(make_test_attribute("test_space", subject.clone(), "age"))
+            } else {
+                ClaimRecord::Rel(make_test_rel(
+                    "test_space",
+                    subject.clone(),
+                    object.clone(),
+                    "works_at",
+                ))
+            };
+            let predicate = if slot_type == "attribute" {
+                "age"
+            } else {
+                "works_at"
+            };
+            let partition = compute_record_partition(claim.base());
+            let slot_key = if slot_type == "rel_set" {
+                compute_rel_set_slot_key(&subject.to_string(), predicate, &partition)
+            } else {
+                compute_slot_key(
+                    &subject.to_string(),
+                    (slot_type == "rel").then(|| object.to_string()).as_deref(),
+                    predicate,
+                    None,
+                    &partition,
+                )
+            };
+            let mut slot_base = claim.base().clone();
+            slot_base.id = RecordId::new_v4(TableName::TruthSlot);
+            let mut group_base = claim.base().clone();
+            group_base.id = RecordId::new_v4(TableName::ConflictGroup);
+            let group = ConflictGroup {
+                base: group_base,
+                slot_key: slot_key.clone(),
+                slot_type: slot_type.into(),
+                claim_ids: vec![claim.id().to_string()],
+                resolved: false,
+                resolution_rationale: None,
+                detected_at: Utc::now(),
+                resolved_at: None,
+                adjudicated_claim_set_hash: Some("historical-verdict".into()),
+                adjudicated_at: Some(Utc::now()),
+            };
+            let slot = TruthSlot {
+                base: slot_base,
+                slot_key: slot_key.clone(),
+                slot_type: slot_type.into(),
+                subject_entity: subject.to_string(),
+                predicate_id: predicate.into(),
+                current_values: vec![CurrentValue {
+                    claim_id: claim.id().to_string(),
+                    confidence: 0.95,
+                    status: ClaimStatus::Approved,
+                    evidence: vec![make_test_evidence()],
+                }],
+                conflict_group: Some(Link::new(group.base.id.clone())),
+                confidence: 0.95,
+                rationale: None,
+                semantics_version: 1,
+                alias_version: 1,
+                stale: true,
+                stale_reason: Some("source_deleted".into()),
+                computed_at: Utc::now(),
+                security_hash: partition,
+            };
+            storage.create_slot(slot.clone()).await.unwrap();
+            storage.create_conflict_group(group.clone()).await.unwrap();
+
+            // Same subject/predicate/value, but another authorized partition.
+            // Its existence must neither populate this slot nor cause a merge.
+            let other = match claim {
+                ClaimRecord::Attribute(mut row) => {
+                    storage.add_attr(row.clone());
+                    storage
+                        .delete_attribute("test_space", &row.base.id)
+                        .await
+                        .unwrap();
+                    row.base.id = RecordId::new_v4(TableName::Attribute);
+                    row.base.security.policy_id = "other-policy".into();
+                    storage.add_attr(row.clone());
+                    ClaimRecord::Attribute(row)
+                }
+                ClaimRecord::Rel(mut row) => {
+                    storage.add_rel(row.clone());
+                    storage
+                        .delete_rel("test_space", &row.base.id)
+                        .await
+                        .unwrap();
+                    row.base.id = RecordId::new_v4(TableName::Rel);
+                    row.base.security.policy_id = "other-policy".into();
+                    storage.add_rel(row.clone());
+                    ClaimRecord::Rel(row)
+                }
+            };
+            // Exercise the actual deletion notification as well as an orphaned
+            // group whose notification has not yet been processed.
+            if slot_type == "attribute" {
+                handle_deleted_slot(
+                    "test_space",
+                    &slot_key,
+                    slot_type,
+                    &storage,
+                    &mut Vec::new(),
+                    &mut 0,
+                )
+                .await
+                .unwrap();
+            }
+            let operations_before = storage.ops.lock().unwrap().clone();
+            let result = execute_tm_recompute(
+                &TmContext::none(),
+                "test_space",
+                RecomputePriority::Normal,
+                10,
+                &storage,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.stale_slots_found, 1);
+            assert_eq!(result.slots_recomputed, 1);
+            assert_eq!(result.slots_skipped, 0);
+            assert!(result.pending_conflict_groups.is_empty());
+            let settled = storage
+                .find_slot_by_key("test_space", &slot_key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!settled.stale);
+            assert!(settled.stale_reason.is_none());
+            assert!(settled.current_values.is_empty());
+            assert!(settled.conflict_group.is_none());
+            assert_eq!(settled.confidence, 0.0);
+            let mut expected_base = slot.base.clone();
+            expected_base.updated_at = settled.base.updated_at;
+            assert_eq!(
+                audit_snapshot(&settled.base).unwrap(),
+                audit_snapshot(&expected_base).unwrap()
+            );
+            let resolved = storage.conflict_groups.lock().unwrap()[0].clone();
+            assert!(resolved.resolved);
+            assert!(resolved.claim_ids.is_empty());
+            assert_eq!(
+                resolved.adjudicated_claim_set_hash,
+                group.adjudicated_claim_set_hash
+            );
+            assert_eq!(resolved.adjudicated_at, group.adjudicated_at);
+            assert_eq!(*storage.ops.lock().unwrap(), operations_before);
+            match other {
+                ClaimRecord::Attribute(row) => assert_eq!(
+                    audit_snapshot(
+                        &storage
+                            .get_attribute("test_space", &row.base.id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    audit_snapshot(&row).unwrap()
+                ),
+                ClaimRecord::Rel(row) => assert_eq!(
+                    audit_snapshot(
+                        &storage
+                            .get_rel("test_space", &row.base.id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    audit_snapshot(&row).unwrap()
+                ),
+            }
+            let audit_count = storage.audit_logs.lock().unwrap().len();
+            assert!(audit_count > 0);
+            let repeat = execute_tm_recompute(
+                &TmContext::none(),
+                "test_space",
+                RecomputePriority::Normal,
+                10,
+                &storage,
+            )
+            .await
+            .unwrap();
+            assert_eq!(repeat.stale_slots_found, 0);
+            assert_eq!(repeat.slots_recomputed, 0);
+            assert_eq!(storage.audit_logs.lock().unwrap().len(), audit_count);
+            let mut malformed = slot;
+            malformed.base.id = RecordId::new_v4(TableName::TruthSlot);
+            malformed.slot_key = "not-a-valid-slot-key".into();
+            storage.create_slot(malformed.clone()).await.unwrap();
+            assert!(execute_tm_recompute(
+                &TmContext::none(),
+                "test_space",
+                RecomputePriority::Normal,
+                10,
+                &storage
+            )
+            .await
+            .is_err());
+            assert_eq!(storage.audit_logs.lock().unwrap().len(), audit_count);
+            assert_eq!(
+                audit_snapshot(
+                    &storage
+                        .find_slot_by_key("test_space", &malformed.slot_key)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                audit_snapshot(&malformed).unwrap()
+            );
+        }
+    }
+
     /// Test: recompute defers divergent-value slots to tm_resolve_slot.
     #[tokio::test]
     async fn test_tm_recompute_pending_group_split() {
@@ -7352,7 +8695,7 @@ mod tests {
             "age",
             Literal::Integer(36),
         );
-        let security_hash = compute_security_hash(&attr1.base.security);
+        let security_hash = compute_record_partition(&attr1.base);
         storage.add_attr(attr1);
         storage.add_attr(attr2);
 
@@ -7496,6 +8839,10 @@ mod tests {
 
     #[async_trait]
     impl TruthMaintenanceStorage for MockTruthMaintenanceStorage {
+        fn is_preparing(&self) -> bool {
+            true
+        }
+
         async fn find_slot_by_key(
             &self,
             space_id: &str,
@@ -7990,25 +9337,31 @@ mod tests {
             semantics: PredicateSemantics,
             status: SemanticsStatus,
             provenance_note: &str,
-        ) -> Result<PredicateRegistry, PipelineError> {
+            authority: &BaseFields,
+        ) -> Result<Option<PredicateRegistry>, PipelineError> {
             let mut predicates = self.predicate_registry.lock().unwrap();
             if let Some(existing) = predicates
                 .iter_mut()
                 .find(|p| p.base.space_id == space_id && p.predicate_id == predicate_id)
             {
                 if existing.semantics_status == SemanticsStatus::Configured {
-                    return Ok(existing.clone());
+                    return Ok(Some(existing.clone()));
+                }
+                if !crate::maintenance_commit::same_partition(&existing.base, authority)? {
+                    return Ok(None);
                 }
                 existing.semantics = Some(semantics);
                 existing.semantics_status = status;
                 if existing.description.is_none() && !provenance_note.is_empty() {
                     existing.description = Some(provenance_note.to_string());
                 }
-                return Ok(existing.clone());
+                return Ok(Some(existing.clone()));
             }
 
             let id = RecordId::new_v4(TableName::PredicateRegistry);
-            let base = BaseFields::new(id, space_id.to_string(), "truth_maintenance".to_string());
+            let mut base =
+                BaseFields::new(id, space_id.to_string(), "truth_maintenance".to_string());
+            crate::maintenance_commit::inherit(&mut base, authority);
             let record = PredicateRegistry {
                 base,
                 predicate_id: predicate_id.to_string(),
@@ -8021,7 +9374,7 @@ mod tests {
                 last_used_at: None,
             };
             predicates.push(record.clone());
-            Ok(record)
+            Ok(Some(record))
         }
 
         async fn create_audit_log(&self, log: AuditLog) -> Result<AuditLog, PipelineError> {
@@ -8242,7 +9595,7 @@ mod tests {
         );
         attr1.evidence[0].time_value = Utc::now() - chrono::Duration::hours(6);
         let attr1_id = attr1.base.id.clone();
-        let security_hash = compute_security_hash(&attr1.base.security);
+        let security_hash = compute_record_partition(&attr1.base);
 
         let mut attr2 = make_test_attribute_with_value(
             "test_space",
@@ -8351,7 +9704,7 @@ mod tests {
         rel2.base.created_at = Utc::now();
         storage.add_rel(rel1.clone());
         storage.add_rel(rel2.clone());
-        let security_hash = compute_security_hash(&rel1.base.security);
+        let security_hash = compute_record_partition(&rel1.base);
 
         let rel_events = vec![RelEventInfo {
             rel_id: rel1.base.id.clone(),
@@ -8454,7 +9807,7 @@ mod tests {
             subject_id: subject_id.clone(),
             object_id: object_id.clone(),
             rel_type: "attended_meeting".to_string(),
-            security_hash: compute_security_hash(&rel1.base.security),
+            security_hash: compute_record_partition(&rel1.base),
             deleted: false,
         }];
 
@@ -8556,7 +9909,7 @@ mod tests {
         let attr2 = make_test_attribute("test_space", subject_id.clone(), "age");
         storage.add_attr(attr1.clone());
         storage.add_attr(attr2.clone());
-        let security_hash = compute_security_hash(&attr1.base.security);
+        let security_hash = compute_record_partition(&attr1.base);
 
         let attr_events = vec![AttributeEventInfo {
             attr_id: attr1.base.id.clone(),
@@ -8614,7 +9967,7 @@ mod tests {
         );
         storage.add_attr(attr1.clone());
         storage.add_attr(attr2.clone());
-        let security_hash = compute_security_hash(&attr1.base.security);
+        let security_hash = compute_record_partition(&attr1.base);
 
         let attr_events = vec![AttributeEventInfo {
             attr_id: attr1.base.id.clone(),
@@ -8658,7 +10011,7 @@ mod tests {
             "works_at",
         );
         storage.add_rel(rel1.clone());
-        let security_hash = compute_security_hash(&rel1.base.security);
+        let security_hash = compute_record_partition(&rel1.base);
 
         let rel_events = vec![RelEventInfo {
             rel_id: rel1.base.id.clone(),
@@ -10089,7 +11442,7 @@ mod tests {
             object_b.clone(),
             "works_at",
         );
-        let security_hash = compute_security_hash(&rel_a.base.security);
+        let security_hash = compute_record_partition(&rel_a.base);
         let rel_events = vec![RelEventInfo {
             rel_id: rel_a.base.id.clone(),
             subject_id: subject_id.clone(),
@@ -10524,24 +11877,28 @@ mod tests {
         assert!(matches!(result, ResolutionResult::NeedsReview { .. }));
         assert_eq!(fake.call_count(), 1);
 
-        // The verdict memoized on the group; an unchanged claim set skips the LLM.
+        // A verdict alone is not a committed outcome and cannot install a memo.
         let refreshed = storage
             .get_conflict_group("test_space", &group.base.id)
             .await
             .unwrap()
             .expect("group persisted");
-        assert!(refreshed.adjudicated_claim_set_hash.is_some());
-        assert!(refreshed.adjudicated_at.is_some());
+        assert!(refreshed.adjudicated_claim_set_hash.is_none());
+        assert!(refreshed.adjudicated_at.is_none());
 
         let (result, extras) =
             execute_tm_resolve_slot(&ctx, &refreshed, &claims, "test_space", &storage)
                 .await
                 .expect("resolve again");
-        assert_eq!(fake.call_count(), 1, "memoization skips the adjudicator");
+        assert_eq!(
+            fake.call_count(),
+            2,
+            "uncommitted verdict must be evaluated again"
+        );
         assert!(extras.adjudicated);
         assert!(
-            extras.skip_commit,
-            "memoized replay must not produce a committable resolution"
+            !extras.skip_commit,
+            "uncommitted verdict remains eligible for atomic commit"
         );
         assert!(matches!(result, ResolutionResult::NeedsReview { .. }));
     }
@@ -10566,7 +11923,7 @@ mod tests {
         );
         let old_id = attr_old.base.id.to_string();
         let new_id = attr_new.base.id.to_string();
-        let security_hash = compute_security_hash(&attr_old.base.security);
+        let security_hash = compute_record_partition(&attr_old.base);
         storage.add_attr(attr_old);
         storage.add_attr(attr_new);
 
@@ -10727,7 +12084,7 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_detection_memoization_skips_adjudicated_claim_set() {
+    async fn test_detection_never_trusts_an_id_only_memo() {
         let storage = MockTruthMaintenanceStorage::new();
         let subject_id = RecordId::new_v4(TableName::Entity);
 
@@ -10743,7 +12100,7 @@ mod tests {
             "age",
             Literal::Integer(36),
         );
-        let security_hash = compute_security_hash(&attr1.base.security);
+        let security_hash = compute_record_partition(&attr1.base);
         let mut claim_ids = vec![attr1.base.id.to_string(), attr2.base.id.to_string()];
         claim_ids.sort();
         storage.add_attr(attr1.clone());
@@ -10775,9 +12132,11 @@ mod tests {
                 .await
                 .expect("detect");
 
-        assert_eq!(result.conflicts_detected, 0, "memoized: no reopen");
-        assert_eq!(result.conflicts_updated, 0);
-        assert!(result.conflict_group_ids.is_empty());
+        assert_eq!(
+            result.conflict_group_ids.len(),
+            1,
+            "resolver must inspect current semantics and adjudicator"
+        );
         assert!(
             storage
                 .find_unresolved_conflict("test_space", &slot_key)
@@ -10844,7 +12203,7 @@ mod tests {
             end: Some(closed_end),
         });
         let attr_id = attr.base.id.to_string();
-        let security_hash = compute_security_hash(&attr.base.security);
+        let security_hash = compute_record_partition(&attr.base);
         storage.add_attr(attr);
 
         let slot_key = compute_slot_key(
@@ -10937,7 +12296,7 @@ mod tests {
         });
         let winner_id = winner.base.id.clone();
         let duplicate_id = duplicate.base.id.clone();
-        let security_hash = compute_security_hash(&winner.base.security);
+        let security_hash = compute_record_partition(&winner.base);
         storage.add_rel(winner);
         storage.add_rel(duplicate);
 
@@ -11051,7 +12410,7 @@ mod tests {
             merged_claim_ids: vec![b_id.clone()],
             rationale: "duplicate event".to_string(),
         };
-        let input = CommitInput {
+        let mut input = CommitInput {
             slot_key: "event-slot".to_string(),
             slot_type: "event".to_string(),
             subject_entity: "event_group".to_string(),
@@ -11062,6 +12421,9 @@ mod tests {
             ..CommitInput::default()
         };
 
+        stamp_decision_fingerprint(&mut input, "test_space", &storage)
+            .await
+            .expect("fingerprint");
         execute_tm_commit_with_storage(&resolution, &input, "test_space", &storage)
             .await
             .expect("commit");
@@ -11118,7 +12480,7 @@ mod tests {
                 confidence: 0.9,
                 rationale: "winner".to_string(),
             };
-            let input = CommitInput {
+            let mut input = CommitInput {
                 slot_key: "event-slot".to_string(),
                 slot_type: "event".to_string(),
                 subject_entity: "event_group".to_string(),
@@ -11129,6 +12491,9 @@ mod tests {
                 ..CommitInput::default()
             };
 
+            stamp_decision_fingerprint(&mut input, "test_space", &storage)
+                .await
+                .expect("fingerprint");
             execute_tm_commit_with_storage(&resolution, &input, "test_space", &storage)
                 .await
                 .expect("commit");
@@ -11171,7 +12536,7 @@ mod tests {
         );
         let old_id = attr_old.base.id.to_string();
         let new_id = attr_new.base.id.to_string();
-        let security_hash = compute_security_hash(&attr_old.base.security);
+        let security_hash = compute_record_partition(&attr_old.base);
         storage.add_attr(attr_old);
         storage.add_attr(attr_new);
 
@@ -11194,14 +12559,17 @@ mod tests {
         let fake = Arc::new(FakeAdjudicator::new(Some(scripted)));
         let ctx = ctx_with(&fake);
 
-        // First resolve adjudicates and records the memo hash.
+        // First resolve prepares a verdict without a success memo.
         let (resolution1, input1) =
             resolve_conflict_group_with_storage(&ctx, &group, "test_space", &storage)
                 .await
                 .expect("first resolve");
         assert!(!input1.skip_commit);
 
-        // A duplicate/retried resolve item runs before the commit lands.
+        execute_tm_commit_with_storage(&resolution1, &input1, "test_space", &storage)
+            .await
+            .expect("verdict commit");
+        // A duplicate resolve after durable commit can safely use the memo.
         let refreshed = storage
             .get_conflict_group("test_space", &group.base.id)
             .await
@@ -11218,10 +12586,7 @@ mod tests {
         );
         assert!(input2.skip_commit, "memoized replay must not commit");
 
-        // Commit the real verdict, then replay the memoized resolution.
-        execute_tm_commit_with_storage(&resolution1, &input1, "test_space", &storage)
-            .await
-            .expect("verdict commit");
+        // Replay the memoized resolution without changing committed claims.
         let replay = execute_tm_commit_with_storage(&resolution2, &input2, "test_space", &storage)
             .await
             .expect("replay commit");
@@ -11280,7 +12645,7 @@ mod tests {
             "age",
             Literal::Integer(36),
         );
-        let security_hash = compute_security_hash(&attr1.base.security);
+        let security_hash = compute_record_partition(&attr1.base);
         let make_event =
             |attr: &elephant_types::records::attribute::Attribute| AttributeEventInfo {
                 attr_id: attr.base.id.clone(),
@@ -11322,7 +12687,7 @@ mod tests {
             "age",
             Literal::Integer(36),
         );
-        let security_hash = compute_security_hash(&attr1.base.security);
+        let security_hash = compute_record_partition(&attr1.base);
         let claim_ids = vec![attr1.base.id.to_string(), attr2.base.id.to_string()];
         let attr_event = AttributeEventInfo {
             attr_id: attr1.base.id.clone(),
@@ -11351,9 +12716,11 @@ mod tests {
                 .await
                 .expect("detect");
 
-        assert_eq!(result.conflicts_detected, 0, "cooldown: no reopen");
-        assert_eq!(result.conflicts_updated, 0);
-        assert!(result.conflict_group_ids.is_empty(), "no resolve enqueued");
+        assert_eq!(
+            result.conflict_group_ids.len(),
+            1,
+            "semantic cooldown is checked by the resolver"
+        );
 
         let untouched = storage
             .get_conflict_group("test_space", &group.base.id)
@@ -11383,7 +12750,7 @@ mod tests {
             "age",
             Literal::Integer(36),
         );
-        let security_hash = compute_security_hash(&attr1.base.security);
+        let security_hash = compute_record_partition(&attr1.base);
         let attr_event = AttributeEventInfo {
             attr_id: attr1.base.id.clone(),
             subject_id: subject_id.clone(),
@@ -11494,8 +12861,11 @@ mod tests {
         )
         .await
         .expect("re-detect");
-        assert_eq!(redetect.conflicts_detected, 0, "no reopen");
-        assert!(redetect.conflict_group_ids.is_empty());
+        assert_eq!(
+            redetect.conflict_group_ids.len(),
+            1,
+            "resolver checks current decision contract"
+        );
 
         // Nothing is stale, so recompute is a no-op.
         let recompute = execute_tm_recompute(
@@ -11532,7 +12902,7 @@ mod tests {
         duplicate.base.created_at = Utc::now();
         let winner_id = winner.base.id.to_string();
         let duplicate_id = duplicate.base.id.to_string();
-        let security_hash = compute_security_hash(&winner.base.security);
+        let security_hash = compute_record_partition(&winner.base);
         let attr_event = AttributeEventInfo {
             attr_id: winner.base.id.clone(),
             subject_id: subject_id.clone(),
@@ -11590,7 +12960,7 @@ mod tests {
         );
         let old_id = attr_old.base.id.to_string();
         let new_id = attr_new.base.id.to_string();
-        let security_hash = compute_security_hash(&attr_old.base.security);
+        let security_hash = compute_record_partition(&attr_old.base);
         storage.add_attr(attr_old);
         storage.add_attr(attr_new);
 

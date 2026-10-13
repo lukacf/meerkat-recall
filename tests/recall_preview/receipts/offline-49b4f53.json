@@ -1,0 +1,18 @@
+{
+  "format": "recall-preview-qualification-receipt/v1",
+  "source_sha": "49b4f53efaad62f6e2f2568cd4eaa73ce741851e",
+  "evidence_class": "evaluator-self-test",
+  "command": "python3 -m unittest discover -s tests/recall_preview -p 'test_*.py'",
+  "authorization": "coordinator approved offline Python self-tests, 2026-10-06T20:35Z",
+  "exit_code": 0,
+  "tests_run": 34,
+  "failures": 0,
+  "skipped": 0,
+  "reported_duration_seconds": 0.007,
+  "product_executed": false,
+  "cargo_executed": false,
+  "network_or_provider_executed": false,
+  "artifact_qualification": "unexecuted",
+  "consumer_adoption": "not_established",
+  "scope": "Evaluator mutation, fixture byte sizes and corrected public-wire normalization only. Does not qualify Recall backend, transaction, model semantics, native/container or consumer behavior."
+}

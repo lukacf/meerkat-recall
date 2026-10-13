@@ -45,6 +45,7 @@ fn test_principal(space_id: &str) -> Principal {
 #[tokio::test]
 async fn scenario_s5_8_file_ingestion() -> anyhow::Result<()> {
     let harness = Harness::new().await?;
+    super::register_scenario_space(&harness.client, "default").await?;
     let dispatcher = create_dispatcher(harness.client.clone(), test_principal("default"));
 
     let path = std::env::temp_dir().join(format!("elephant-s5-8-{}.md", uuid::Uuid::new_v4()));
@@ -60,6 +61,9 @@ async fn scenario_s5_8_file_ingestion() -> anyhow::Result<()> {
         )
         .await?;
 
+    let operation: elephant_types::publication::OperationReceipt =
+        serde_json::from_value(response["operation"].clone())?;
+    let queued_id: RecordId = serde_json::from_value(response["work_item_id"].clone())?;
     let decoded: ToolResponse<serde_json::Value> = serde_json::from_value(response)?;
     assert!(decoded.ok, "ingest_file should succeed");
 
@@ -80,12 +84,25 @@ async fn scenario_s5_8_file_ingestion() -> anyhow::Result<()> {
         .expect("source id");
 
     let repo = WorkItemRepository::new(harness.client.clone());
-    let idempotency_key = format!("{TRIAGE_SOURCE_KIND}:{source_id}");
+    let idempotency_key = format!(
+        "{TRIAGE_SOURCE_KIND}:{source_id}:{}",
+        operation.source_generation
+    );
     let item = repo
         .find_by_idempotency_key("default", &idempotency_key)
         .await?;
 
-    assert!(item.is_some(), "triage_source work item should be enqueued");
+    let item = item.expect("triage_source work item should be enqueued");
+    assert_eq!(item.base.id, queued_id);
+    assert_eq!(
+        item.payload["_publication"]["operation_id"],
+        operation.operation_id
+    );
+    assert_eq!(
+        item.payload["_publication"]["generation"],
+        operation.source_generation
+    );
+    assert_eq!(item.payload["_publication"]["source_id"], source_id);
 
     Ok(())
 }

@@ -18,12 +18,16 @@ macro_rules! redacted_debug {
     )+};
 }
 
+pub mod bootstrap;
 mod claims;
 pub mod contract;
 pub mod exchange;
 mod identity;
 pub mod information;
+pub mod projection;
 pub mod restrictions;
+pub mod service_token;
+pub mod standing_watch;
 
 pub use claims::Claims;
 pub use identity::{
@@ -155,6 +159,14 @@ impl LegacyVerifier<'_> {
             &DecodingKey::from_secret(self.secret.as_bytes()),
             &validation,
         )?;
+        if data.claims.bootstrap_space.is_some() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+                .ok_or(AuthError::InvalidFreshness)?;
+            bootstrap::validate(&data.claims, now)?;
+        }
         // Preserve unrelated legacy extension claims, but never silently drop
         // the restrictions of a signed exchange hybrid. This inspection only
         // rejects reserved profile fields; authenticated identity still comes
@@ -164,6 +176,9 @@ impl LegacyVerifier<'_> {
             .map_err(|_| AuthError::InvalidToken)?;
         let fields: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(&payload).map_err(|_| AuthError::InvalidToken)?;
+        if fields.contains_key("bootstrap_space") && data.claims.bootstrap_space.is_none() {
+            return Err(AuthError::UnsupportedProfile);
+        }
         if [
             "version",
             "profile",

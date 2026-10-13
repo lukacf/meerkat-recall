@@ -66,14 +66,37 @@ const FULL_ONLY_WRITE_TOOLS: &[&str] = &[
     "restore_source",
     "create_space",
     "update_space",
+    "start_embedding_reindex",
+    "activate_embedding_reindex",
+    "cancel_embedding_reindex",
+    "retract_source",
+    "erase_source",
     "create_reprocess_job",
     "delete_entity",
     "restore_entity",
+    "restamp_attribution",
+    "revert_audit",
+    "validate_predicate_proposal",
 ];
 
 #[cfg(test)]
 const FULL_ONLY_MUTATION_PREFIXES: &[&str] = &[
-    "create_", "batch_", "relate_", "upsert_", "update_", "delete_", "restore_",
+    "create_",
+    "batch_",
+    "relate_",
+    "upsert_",
+    "update_",
+    "delete_",
+    "restore_",
+    "start_",
+    "activate_",
+    "cancel_",
+    "import_",
+    "retract_",
+    "erase_",
+    "restamp_",
+    "revert_",
+    "validate_",
 ];
 
 fn is_semantic_ingest_tool(name: &str) -> bool {
@@ -81,23 +104,49 @@ fn is_semantic_ingest_tool(name: &str) -> bool {
 }
 
 fn is_write_mutation_tool(name: &str) -> bool {
+    // Profiles group audiences, not effects. These pipeline/maintenance tools
+    // only inspect state or export it and remain usable in a read-only runtime.
+    if matches!(
+        name,
+        "list_work_items"
+            | "list_pending_work_items"
+            | "list_identity_candidates"
+            | "export_snapshot"
+    ) {
+        return false;
+    }
     is_semantic_ingest_tool(name)
         || is_pipeline_tool(name)
         || (is_maintenance_tool(name) && !is_agent_tool(name))
         || FULL_ONLY_WRITE_TOOLS.contains(&name)
 }
 
-fn runtime_allows_tool(name: &str, status: &RuntimeStatus) -> bool {
-    if !status.configured {
-        return false;
+fn runtime_tool_failure(
+    name: &str,
+    status: &RuntimeStatus,
+) -> Option<elephant_types::public_error::ErrorCode> {
+    use elephant_types::public_error::ErrorCode;
+    if !status.configured || (!status.storage_ready && name != "import_snapshot") {
+        return Some(ErrorCode::NotReady);
     }
-    if !status.semantic_ingest_ready && is_semantic_ingest_tool(name) {
-        return false;
+    if status
+        .issues
+        .iter()
+        .any(|issue| issue == "runtime_draining")
+        && is_write_mutation_tool(name)
+    {
+        return Some(ErrorCode::NotReady);
     }
+    // Source tools acknowledge durable admission. Worker/provider readiness is
+    // reported separately and cannot turn accepted queueing into fake completion.
     if matches!(status.runtime_mode, RuntimeMode::ReadOnly) && is_write_mutation_tool(name) {
-        return false;
+        return Some(ErrorCode::CapabilityDisabled);
     }
-    true
+    None
+}
+
+fn runtime_allows_tool(name: &str, status: &RuntimeStatus) -> bool {
+    runtime_tool_failure(name, status).is_none()
 }
 
 fn filtered_tools_for_dispatcher(
@@ -135,15 +184,18 @@ fn tool_from_meta(meta: elephant_mcp::ToolMeta) -> Tool {
     Tool::new(meta.name, meta.description, input_schema)
 }
 
-/// Extract `X-Space-Id` header from MCP request context (dev mode override).
-fn space_id_from_context(context: &RequestContext<RoleServer>, default: &str) -> String {
-    context
+/// Select an exact request space; only an absent development header can use its configured context.
+fn space_id_from_context(
+    context: &RequestContext<RoleServer>,
+    default: &str,
+) -> Result<String, AuthError> {
+    let selected = context
         .extensions
         .get::<Parts>()
-        .and_then(|parts| parts.headers.get("X-Space-Id"))
-        .and_then(|h| h.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .map_or_else(|| default.to_string(), String::from)
+        .map(|parts| crate::auth::selected_space_header(&parts.headers))
+        .transpose()?
+        .flatten();
+    Ok(selected.unwrap_or(default).to_owned())
 }
 
 /// Shared MCP state.
@@ -164,7 +216,7 @@ impl McpState {
         Self::new_with_runtime(
             Arc::new(RuntimeManager::new_preconfigured(storage)),
             auth,
-            std::env::var("MCP_SPACE_ID").unwrap_or_else(|_| "default".to_string()),
+            std::env::var("MCP_SPACE_ID").unwrap_or_default(),
             std::env::var("MCP_POLICY_IDS").ok().map_or_else(
                 || {
                     vec![
@@ -186,8 +238,7 @@ impl McpState {
 
     #[must_use]
     pub fn new_managed(runtime: Arc<RuntimeManager>, auth: AuthConfig) -> Self {
-        let default_space_id =
-            std::env::var("MCP_SPACE_ID").unwrap_or_else(|_| "default".to_string());
+        let default_space_id = std::env::var("MCP_SPACE_ID").unwrap_or_default();
         let policy_ids = std::env::var("MCP_POLICY_IDS").ok().map_or_else(
             || {
                 vec![
@@ -242,7 +293,7 @@ impl McpState {
         policy_ids: Vec<String>,
     ) -> Self {
         Self::new_with_runtime(
-            Arc::new(RuntimeManager::new_preconfigured(storage)),
+            Arc::new(RuntimeManager::new_with_storage_for_tests(storage)),
             auth,
             default_space_id,
             policy_ids,
@@ -309,6 +360,24 @@ fn runtime_status_tool() -> Tool {
     )
 }
 
+/// Report the original storage phase without exposing its private error chain.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Retain the private initialization error until its public projection completes."
+)]
+fn runtime_initialization_error(error: anyhow::Error) -> rmcp::ErrorData {
+    let diagnostic = error.chain().find_map(|cause| {
+        cause.downcast_ref::<elephant_storage::initialization_diagnostic::StorageInitializationError>()
+    });
+    let data = diagnostic.map(|error| {
+        serde_json::json!({
+            "format": "recall-storage-initialization/v1",
+            "storage_initialization": error.diagnostic(),
+        })
+    });
+    rmcp::ErrorData::internal_error("Failed to initialize runtime", data)
+}
+
 fn initialize_runtime_tool() -> Tool {
     Tool::new(
         TOOL_INITIALIZE_RUNTIME,
@@ -350,16 +419,20 @@ fn runtime_json_result(
 fn can_manage_runtime(state: &McpState, principal: Option<&AbacPrincipal>) -> bool {
     state.auth.skip_auth
         || principal.is_some_and(|principal| {
-            principal.scopes.contains("*") || principal.scopes.contains("write:system")
+            principal.space_id.is_empty()
+                && principal.subject_allowlist.is_none()
+                && (principal.scopes.contains("*") || principal.scopes.contains("write:system"))
         })
 }
 
 fn can_read_runtime_config(state: &McpState, principal: Option<&AbacPrincipal>) -> bool {
     state.auth.skip_auth
         || principal.is_some_and(|principal| {
-            principal.scopes.contains("*")
-                || principal.scopes.contains("read:system")
-                || principal.scopes.contains("write:system")
+            principal.space_id.is_empty()
+                && principal.subject_allowlist.is_none()
+                && (principal.scopes.contains("*")
+                    || principal.scopes.contains("read:system")
+                    || principal.scopes.contains("write:system"))
         })
 }
 
@@ -389,7 +462,21 @@ async fn handle_runtime_tool(
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     match name {
         TOOL_GET_RUNTIME_STATUS => {
-            let status = state.runtime.get_status().await;
+            if !state.auth.skip_auth
+                && !principal.is_some_and(|principal| {
+                    ["*", "read:status", "read:system", "read:space_config"]
+                        .iter()
+                        .any(|scope| principal.scopes.contains(*scope))
+                })
+            {
+                return Ok(public_tool_error(
+                    elephant_types::public_error::PublicError::new(
+                        elephant_types::public_error::ErrorCode::ForbiddenSpace,
+                        "Runtime status requires read:status scope",
+                    ),
+                ));
+            }
+            let status = state.runtime.get_readiness().await;
             runtime_json_result(serde_json::to_value(status))
         }
         TOOL_INITIALIZE_RUNTIME => {
@@ -408,12 +495,7 @@ async fn handle_runtime_tool(
                 .runtime
                 .initialize_runtime(patch)
                 .await
-                .map_err(|err| {
-                    rmcp::ErrorData::internal_error(
-                        format!("Failed to initialize runtime: {err}"),
-                        None,
-                    )
-                })?;
+                .map_err(runtime_initialization_error)?;
             let _refresh = state.runtime.clone().schedule_post_bind_readiness_refresh();
             runtime_json_result(serde_json::to_value(result))
         }
@@ -508,7 +590,7 @@ fn principal_from_context(
 ) -> Result<McpRequestPrincipal, AuthError> {
     if state.auth.skip_auth {
         let mut principal = default_principal(state);
-        principal.space_id = space_id_from_context(context, &state.default_space_id);
+        principal.space_id = space_id_from_context(context, &state.default_space_id)?;
         return Ok(McpRequestPrincipal {
             principal,
             verified: None,
@@ -520,18 +602,118 @@ fn principal_from_context(
         message: "Authorization header with Bearer token required".to_string(),
     })?;
 
-    verified_principal(state, &token)
+    let selected = space_id_from_context(context, "")?;
+    verified_principal_for_space(
+        state,
+        &token,
+        (!selected.is_empty()).then_some(selected.as_str()),
+    )
 }
 
+#[cfg(test)]
 fn verified_principal(state: &McpState, token: &str) -> Result<McpRequestPrincipal, AuthError> {
+    verified_principal_for_space(state, token, None)
+}
+
+fn verified_principal_for_space(
+    state: &McpState,
+    token: &str,
+    selected: Option<&str>,
+) -> Result<McpRequestPrincipal, AuthError> {
     let verified = state
         .auth
         .verify_token(token, state.issuer_mappings.as_deref())?;
-    let auth_principal = AuthPrincipal::from(verified.claims().clone());
+    if verified.claims().bootstrap_space.is_some() {
+        return Err(AuthError {
+            error: "insufficient_scope".into(),
+            message: "Space bootstrap authority is restricted to HTTP management routes".into(),
+        });
+    }
+    let mut auth_principal = AuthPrincipal::from(verified.claims().clone());
+    auth_principal.bind_space(selected)?;
     Ok(McpRequestPrincipal {
         principal: state.authz.to_abac_principal(&auth_principal),
         verified: Some(verified),
     })
+}
+
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original state owner lifetimes and dispatch future layout."
+)]
+async fn authorized_caller(
+    state: &McpState,
+    context: &RequestContext<RoleServer>,
+) -> Result<McpRequestPrincipal, elephant_types::public_error::PublicError> {
+    use elephant_types::public_error::{ErrorCode, PublicError};
+    let mut caller = principal_from_context(state, context).map_err(|error| {
+        PublicError::new(
+            if error.error == "insufficient_scope" {
+                ErrorCode::ForbiddenSpace
+            } else {
+                ErrorCode::Unauthorized
+            },
+            error.message,
+        )
+    })?;
+    if let Some(verified) = caller
+        .verified
+        .as_ref()
+        .filter(|verified| verified.claims().spaces.is_some())
+    {
+        let storage =
+            state.runtime.current_storage().await.ok_or_else(|| {
+                PublicError::new(ErrorCode::NotReady, "Storage is not configured")
+            })?;
+        if !storage.recovery_status().ready {
+            return Err(PublicError::new(
+                ErrorCode::NotReady,
+                "Current service grants are unavailable during storage recovery",
+            ));
+        }
+        let grant = elephant_storage::space_grant_repository::SpaceGrantRepository::new(storage)
+            .get(&caller.principal.space_id, &verified.claims().sub)
+            .await
+            .map_err(|_| {
+                PublicError::new(ErrorCode::Unavailable, "Service grant lookup unavailable")
+            })?
+            .filter(|grant| grant.active)
+            .ok_or_else(|| {
+                PublicError::new(
+                    ErrorCode::ForbiddenSpace,
+                    "No active service grant in the selected space",
+                )
+            })?;
+        let mut projected = AuthPrincipal::from(verified.claims().clone());
+        projected.space_id = Some(caller.principal.space_id.clone());
+        projected.scopes =
+            elephant_types::space_grant::intersect_scopes(&projected.scopes, &grant.scopes);
+        caller.principal = state.authz.to_abac_principal(&projected);
+    }
+    Ok(caller)
+}
+
+struct RuntimeSnapshotCoordinator(Arc<RuntimeManager>);
+#[async_trait::async_trait]
+impl elephant_mcp::snapshot_control::SnapshotCoordinator for RuntimeSnapshotCoordinator {
+    async fn run(
+        &self,
+        path: std::path::PathBuf,
+        name: String,
+        retention: elephant_storage::snapshot::SnapshotRetention,
+        restore: bool,
+    ) -> elephant_mcp::McpResult<elephant_storage::snapshot::SnapshotManifest> {
+        self.0
+            .snapshot_operation(path, name, retention, restore)
+            .await
+            .map_err(|error| {
+                tracing::warn!(error=%error,restore,"MCP snapshot coordination failed");
+                elephant_mcp::McpError::Public(elephant_types::public_error::PublicError::new(
+                    elephant_types::public_error::ErrorCode::Unavailable,
+                    "Snapshot operation unavailable; inspect readiness and operator logs",
+                ))
+            })
+    }
 }
 
 async fn dispatcher_for(
@@ -542,7 +724,8 @@ async fn dispatcher_for(
     let storage = state.runtime.current_storage().await?;
     let authz = Arc::new(McpAuthzService::new_with_skip_auth(state.auth.skip_auth));
     let context = ToolContext::with_authz(storage, authz, caller.principal)
-        .with_verified_caller(caller.verified);
+        .with_verified_caller(caller.verified)
+        .with_snapshot_coordinator(Arc::new(RuntimeSnapshotCoordinator(state.runtime.clone())));
     Some(match profile {
         DispatcherProfile::Full => create_dispatcher_with_context(context),
         DispatcherProfile::Default => create_default_dispatcher_with_context(context),
@@ -569,7 +752,7 @@ async fn list_tools_for_profile(
     profile: DispatcherProfile,
     context: RequestContext<RoleServer>,
 ) -> Result<ListToolsResult, rmcp::ErrorData> {
-    let principal = principal_from_context(state, &context).ok();
+    let principal = authorized_caller(state, &context).await.ok();
     // Readiness, not get_status: listing tools must never wait on a queue scan.
     let status = state.runtime.get_readiness().await;
     let mut tools = runtime_tools_for_profile(
@@ -588,6 +771,11 @@ async fn list_tools_for_profile(
     Ok(ListToolsResult::with_all_items(tools))
 }
 
+#[expect(
+    clippy::large_futures,
+    clippy::too_many_lines,
+    reason = "Preserve the ordered profile authorization and dispatch flow with its original future layout."
+)]
 async fn call_tool_for_profile(
     state: &McpState,
     profile: DispatcherProfile,
@@ -597,7 +785,32 @@ async fn call_tool_for_profile(
     let params = request
         .arguments
         .map_or_else(|| Value::Object(serde_json::Map::new()), Value::Object);
-    let principal = principal_from_context(state, &context).ok();
+    let principal = match authorized_caller(state, &context).await {
+        Ok(caller) => Some(caller),
+        Err(error) => return Ok(public_tool_error(error)),
+    };
+    if principal.as_ref().is_some_and(|caller| {
+        caller.verified.as_ref().is_some_and(|verified| {
+            verified.claims().spaces.is_none() && verified.claims().space_id.is_none()
+        }) && !caller.principal.space_id.is_empty()
+    }) && !matches!(
+        request.name.as_ref(),
+        "create_space"
+            | "update_space"
+            | "get_space"
+            | "list_spaces"
+            | "start_embedding_reindex"
+            | "get_embedding_reindex"
+            | "activate_embedding_reindex"
+            | "cancel_embedding_reindex"
+    ) {
+        return Ok(public_tool_error(
+            elephant_types::public_error::PublicError::new(
+                elephant_types::public_error::ErrorCode::ForbiddenSpace,
+                "Global management tokens cannot select ordinary data spaces",
+            ),
+        ));
+    }
     let runtime_tool_allowed = matches!(
         request.name.as_ref(),
         TOOL_GET_RUNTIME_STATUS
@@ -616,32 +829,150 @@ async fn call_tool_for_profile(
         .await;
     }
     let Some(principal) = principal else {
-        return Ok(CallToolResult::error(vec![Content::text(
-            "Authorization header with Bearer token required".to_string(),
-        )]));
+        return Ok(public_tool_error(
+            elephant_types::public_error::PublicError::new(
+                elephant_types::public_error::ErrorCode::Unauthorized,
+                "Authorization header with Bearer token required",
+            ),
+        ));
     };
     // Readiness, not get_status: gating a tool call must never wait on a queue scan.
     let status = state.runtime.get_readiness().await;
-    if !runtime_allows_tool(&request.name, &status) {
-        return Ok(CallToolResult::error(vec![Content::text(format!(
-            "Tool not available in current runtime state: {}",
-            request.name
-        ))]));
+    if let Some(code) = runtime_tool_failure(&request.name, &status) {
+        return Ok(public_tool_error(
+            elephant_types::public_error::PublicError::new(
+                code,
+                format!(
+                    "Tool not available in current runtime state: {}",
+                    request.name
+                ),
+            ),
+        ));
     }
     let Some(dispatcher) = dispatcher_for(state, principal, profile).await else {
-        return Ok(CallToolResult::error(vec![Content::text(
-            "Runtime storage is not configured".to_string(),
-        )]));
+        return Ok(public_tool_error(
+            elephant_types::public_error::PublicError::new(
+                elephant_types::public_error::ErrorCode::NotReady,
+                "Runtime storage is not configured",
+            ),
+        ));
     };
 
-    match dispatcher.execute(&request.name, params).await {
+    let Some(storage) = state.runtime.current_storage().await else {
+        return Ok(public_tool_error(
+            elephant_types::public_error::PublicError::new(
+                elephant_types::public_error::ErrorCode::NotReady,
+                "Storage is not configured",
+            ),
+        ));
+    };
+    // Snapshot and erase tools own an exclusive barrier and must not nest a shared activity.
+    let result = if matches!(
+        request.name.as_ref(),
+        "export_snapshot" | "import_snapshot" | "restore_snapshot" | "erase_source"
+    ) {
+        dispatcher.execute(&request.name, params).await
+    } else {
+        match storage
+            .with_activity(dispatcher.execute(&request.name, params))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::debug!(error=%error,"MCP storage admission refused");
+                Err(elephant_mcp::McpError::Public(
+                    elephant_types::public_error::PublicError::new(
+                        elephant_types::public_error::ErrorCode::NotReady,
+                        "Storage recovery or maintenance is in progress",
+                    ),
+                ))
+            }
+        }
+    };
+    match result {
         Ok(result) => {
+            if let Some(error) = legacy_response_error(&result) {
+                return Ok(public_tool_error(error));
+            }
+            let result = match crate::mcp_output::bounded_response(result) {
+                Ok(result) => result,
+                Err(error) => return Ok(public_tool_error(error)),
+            };
             let content_item = Content::json(result)
                 .unwrap_or_else(|_| Content::text("Failed to serialize tool response"));
             Ok(CallToolResult::success(vec![content_item]))
         }
-        Err(err) => Ok(CallToolResult::error(vec![Content::text(err.to_string())])),
+        Err(error) => Ok(public_tool_error(classify_mcp_error(error))),
     }
+}
+
+fn legacy_response_error(result: &Value) -> Option<elephant_types::public_error::PublicError> {
+    use elephant_types::public_error::{ErrorCode, PublicError};
+    if result.get("ok").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let code = result
+        .get("error_code")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ErrorCode>(value).ok())
+        .unwrap_or(ErrorCode::InvalidRequest);
+    let message = match code {
+        ErrorCode::ForbiddenSpace | ErrorCode::Unauthorized => {
+            "Operation not permitted in the selected space"
+        }
+        ErrorCode::NotFound | ErrorCode::UnknownSpace => {
+            "Requested authorized record was not found"
+        }
+        ErrorCode::ConflictGeneration => {
+            "Record generation or immutable input changed; read current state"
+        }
+        ErrorCode::NotReady | ErrorCode::Unavailable => "Tool operation is not ready",
+        ErrorCode::CapabilityDisabled => "Requested capability is unavailable in this runtime",
+        ErrorCode::PayloadTooLarge => "Request exceeds the published size limit",
+        ErrorCode::ProviderUnapproved => "Space processing provider is not approved",
+        ErrorCode::RateLimited => "Request budget is temporarily exhausted",
+        ErrorCode::InvalidRequest => "Tool request was refused; check its parameters",
+    };
+    Some(PublicError::new(code, message))
+}
+
+fn classify_mcp_error(error: elephant_mcp::McpError) -> elephant_types::public_error::PublicError {
+    use elephant_types::public_error::{ErrorCode, PublicError};
+    match error {
+        elephant_mcp::McpError::Public(error) => error,
+        elephant_mcp::McpError::InvalidParameters(message) => {
+            PublicError::new(ErrorCode::InvalidRequest, message)
+        }
+        elephant_mcp::McpError::PolicyError(
+            elephant_policy::PolicyError::AccessDenied(_)
+            | elephant_policy::PolicyError::InvalidClearance(_)
+            | elephant_policy::PolicyError::SubjectScopeViolation(_),
+        ) => PublicError::new(
+            ErrorCode::ForbiddenSpace,
+            "Operation not permitted in the selected space",
+        ),
+        elephant_mcp::McpError::PolicyError(_) => PublicError::new(
+            ErrorCode::NotReady,
+            "Required policy configuration is unavailable",
+        ),
+        elephant_mcp::McpError::StorageError(error) => {
+            crate::public_error::ApiFailure::from(error).0
+        }
+        elephant_mcp::McpError::ToolNotFound(_) => PublicError::new(
+            ErrorCode::CapabilityDisabled,
+            "Requested tool is not available in this profile",
+        ),
+        error => {
+            tracing::warn!(error=%error,"MCP operation failed");
+            PublicError::new(ErrorCode::Unavailable, "Tool operation unavailable")
+        }
+    }
+}
+
+fn public_tool_error(error: elephant_types::public_error::PublicError) -> CallToolResult {
+    let content =
+        Content::json(error).unwrap_or_else(|_| Content::text("Cannot encode tool error"));
+    CallToolResult::error(vec![content])
 }
 
 fn mcp_transport_config(
@@ -869,6 +1200,10 @@ impl ServerHandler for ElephantMcpServer {
         list_tools_for_profile(&self.state, DispatcherProfile::Full, context).await
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original state owner lifetimes and dispatch future layout."
+    )]
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -908,6 +1243,10 @@ impl ServerHandler for ElephantMcpDefaultServer {
         list_tools_for_profile(&self.state, DispatcherProfile::Default, context).await
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original state owner lifetimes and dispatch future layout."
+    )]
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -952,6 +1291,10 @@ impl ServerHandler for ElephantMcpAgentServer {
         list_tools_for_profile(&self.state, DispatcherProfile::Agent, context).await
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original state owner lifetimes and dispatch future layout."
+    )]
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -1000,6 +1343,10 @@ impl ServerHandler for ElephantMcpMaintenanceServer {
         list_tools_for_profile(&self.state, DispatcherProfile::Maintenance, context).await
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original state owner lifetimes and dispatch future layout."
+    )]
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -1014,6 +1361,17 @@ impl ServerHandler for ElephantMcpMaintenanceServer {
         .await
     }
 }
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../crates/mcp/src/retrieval_test_support.rs"]
+mod toy_query_fixture;
+
+#[cfg(test)]
+// Shared scenarios also expose a single-stage entry point this toy does not use.
+#[allow(dead_code)]
+#[path = "../../../tests/e2e/src/pipeline_driver.rs"]
+mod toy_pipeline;
 
 #[cfg(test)]
 mod tests {
@@ -1044,6 +1402,65 @@ mod tests {
     use elephant_types::records::source::{Source, SourceType};
     use elephant_types::Link;
 
+    /// Scope only synthetic credential resolution around the actual RMCP
+    /// handler. RMCP's session tasks do not inherit an enclosing task-local.
+    struct ApprovedToyServer {
+        inner: ElephantMcpServer,
+        fixture: Arc<toy_query_fixture::QueryFixture>,
+    }
+
+    impl ServerHandler for ApprovedToyServer {
+        fn get_info(&self) -> ServerInfo {
+            self.inner.get_info()
+        }
+
+        async fn list_tools(
+            &self,
+            request: Option<PaginatedRequestParams>,
+            context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, rmcp::ErrorData> {
+            self.inner.list_tools(request, context).await
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, rmcp::ErrorData> {
+            let name = request.name.clone();
+            eprintln!("toy MCP handler begin: {name}");
+            // The task-local credential wrapper otherwise embeds the entire
+            // production dispatcher future in another generic future frame.
+            let result = self
+                .fixture
+                .run(Box::pin(self.inner.call_tool(request, context)))
+                .await;
+            eprintln!("toy MCP handler returned: {name}");
+            result
+        }
+    }
+
+    struct ToyDocumentOnlyExtractor {
+        manifest: elephant_types::records::work::PluginManifest,
+    }
+
+    #[async_trait::async_trait]
+    impl elephant_pipeline::extraction::Extractor for ToyDocumentOnlyExtractor {
+        fn manifest(&self) -> &elephant_types::records::work::PluginManifest {
+            &self.manifest
+        }
+
+        async fn extract(
+            &self,
+            _context: elephant_pipeline::extraction::ExtractionContext,
+        ) -> Result<elephant_pipeline::extraction::ExtractionResult, elephant_pipeline::PipelineError>
+        {
+            Ok(elephant_pipeline::extraction::ExtractionResult::empty(
+                "toy-document-bucket-fixture".into(),
+            ))
+        }
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -1057,6 +1474,8 @@ mod tests {
             iss: None,
             aud: None,
             space_id: space_id.map(std::string::ToString::to_string),
+            spaces: None,
+            bootstrap_space: None,
             scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
             security_level: 0,
             security_labels: Vec::new(),
@@ -1072,6 +1491,40 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep MCP state and fixture owners alive through the original assertions."
+    )]
+    async fn explicit_space_bootstrap_is_not_mcp_authority() {
+        let secret = "synthetic-only-mcp-bootstrap-signing-key";
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let state = McpState::new_with_defaults(
+            storage,
+            AuthConfig {
+                secret: secret.into(),
+                ..AuthConfig::default()
+            },
+            String::new(),
+            vec!["default".into()],
+        );
+        let mut claims = make_claims(
+            Some("household"),
+            &["read:space_config", "write:space_config"],
+        );
+        claims.spaces = Some(vec!["household".into()]);
+        claims.bootstrap_space = Some("household".into());
+        let token =
+            elephant_auth::service_token::issue_space_bootstrap(secret, &claims, claims.iat)
+                .unwrap();
+        let rejected = verified_principal_for_space(&state, &token, Some("household"));
+        assert!(matches!(rejected, Err(error) if error.error == "insufficient_scope"));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Preserve the original state owner lifetimes and dispatch future layout."
+    )]
     async fn empty_subject_scope_refuses_authenticated_mcp_body(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use elephant_storage::Repository;
@@ -1124,7 +1577,18 @@ mod tests {
             let text = serde_json::to_string(&response)?;
             assert_eq!(text.contains("PRIVATE MCP CANARY"), !restricted, "{text}");
             if restricted {
-                assert!(text.contains("Access denied"), "{text}");
+                assert_eq!(response.is_error, Some(true));
+                let error: Value = serde_json::from_str(
+                    &response
+                        .content
+                        .first()
+                        .expect("error content")
+                        .as_text()
+                        .expect("text error")
+                        .text,
+                )?;
+                assert_eq!(error["error_code"], "forbidden_space");
+                assert_eq!(error["retryable"], false);
             }
             client.cancel().await?;
         }
@@ -1264,6 +1728,10 @@ mod tests {
     ];
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep MCP state and fixture owners alive through the original assertions."
+    )]
     async fn test_mcp_profiles_enforce_exact_origins() {
         use axum::body::Body;
         use tower::ServiceExt;
@@ -1333,6 +1801,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep MCP state and fixture owners alive through the original assertions."
+    )]
     async fn test_mcp_profiles_reject_untrusted_host() {
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -1373,6 +1845,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep MCP state and fixture owners alive through the original assertions."
+    )]
     async fn test_default_principal_includes_clearances() {
         let prior_policy_ids = std::env::var("MCP_POLICY_IDS").ok();
         let prior_space = std::env::var("MCP_SPACE_ID").ok();
@@ -1409,6 +1885,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep MCP state and fixture owners alive through the original assertions."
+    )]
     async fn test_tool_mapping_keeps_schema() {
         let storage = StorageClient::new_memory().await.expect("storage");
         let auth = AuthConfig {
@@ -1439,6 +1919,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep MCP state and fixture owners alive through the original assertions."
+    )]
     async fn test_mcp_http_list_tools() -> Result<(), Box<dyn std::error::Error>> {
         let storage = StorageClient::new_memory().await?;
         let auth = AuthConfig {
@@ -1515,6 +1999,10 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep MCP state and fixture owners alive through the original assertions."
+    )]
     async fn test_mcp_maintenance_list_tools_hides_snapshot_tools_for_space_principal(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let claims = make_claims(Some("default"), &["read:system", "read:entity"]);
@@ -1576,11 +2064,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep MCP state and fixture owners alive through the original assertions."
+    )]
     async fn test_full_only_write_tools_cover_mutating_full_profile_tools() {
         let expected: HashSet<&str> = FULL_ONLY_WRITE_TOOLS.iter().copied().collect();
-        let storage = StorageClient::new_memory()
+        let storage = StorageClient::new_embedded()
             .await
-            .expect("in-memory storage");
+            .expect("embedded storage includes snapshot tools");
         let state = Arc::new(McpState::new_with_defaults(
             storage.clone(),
             AuthConfig {
@@ -1610,10 +2102,66 @@ mod tests {
             actual, expected,
             "FULL_ONLY_WRITE_TOOLS drifted from the mutating full-profile tool set"
         );
+        let reads = [
+            "list_work_items",
+            "list_pending_work_items",
+            "list_identity_candidates",
+            "export_snapshot",
+        ];
+        for read in reads {
+            assert!(tool_meta.iter().any(|tool| tool.name == read));
+        }
+        let mut status = RuntimeStatus {
+            configured: true,
+            bootstrap_mode: false,
+            runtime_mode: RuntimeMode::ReadOnly,
+            backend: None,
+            storage_ready: true,
+            worker_ready: false,
+            extractor_ready: false,
+            semantic_ingest_ready: false,
+            conveyor: None,
+            issues: vec![],
+        };
+        for mode in [RuntimeMode::ReadOnly, RuntimeMode::LocalMemory] {
+            status.runtime_mode = mode;
+            if mode == RuntimeMode::LocalMemory {
+                status.issues.push("runtime_draining".into());
+            }
+            for mutation in &expected {
+                assert!(!runtime_allows_tool(mutation, &status), "{mutation}");
+            }
+            for mutation in [
+                "claim_work_item",
+                "retry_work_item",
+                "register_predicate",
+                "import_snapshot",
+            ] {
+                assert!(!runtime_allows_tool(mutation, &status), "{mutation}");
+            }
+            for read in reads {
+                assert!(runtime_allows_tool(read, &status), "{read}");
+            }
+        }
+        // Actual shutdown clears storage readiness. Neither reads nor writes
+        // may bypass that barrier, even if the configured mode is ReadOnly.
+        status.runtime_mode = RuntimeMode::ReadOnly;
+        status.storage_ready = false;
+        for name in reads.into_iter().chain(expected.iter().copied()) {
+            assert_eq!(
+                runtime_tool_failure(name, &status),
+                Some(elephant_types::public_error::ErrorCode::NotReady),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep MCP state and fixture owners alive through the original assertions."
+    )]
     async fn test_mcp_default_list_tools_hides_global_health_for_space_principal(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let claims = make_claims(Some("default"), &["read:doc:metadata", "read:entity"]);
@@ -1672,6 +2220,10 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock, clippy::too_many_lines)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Preserve the original state owner lifetimes and dispatch future layout."
+    )]
     async fn incoming_mcp_requests_never_inherit_server_worker_credentials(
     ) -> Result<(), Box<dyn std::error::Error>> {
         struct RestoreToken(Option<String>);
@@ -1739,7 +2291,17 @@ mod tests {
                     )
                     .await?;
                 assert_eq!(response.is_error, Some(true));
-                assert!(serde_json::to_string(&response)?.contains("Authorization"));
+                let error: Value = serde_json::from_str(
+                    &response
+                        .content
+                        .first()
+                        .expect("error content")
+                        .as_text()
+                        .expect("text error")
+                        .text,
+                )?;
+                assert_eq!(error["error_code"], "unauthorized");
+                assert_eq!(error["retryable"], false);
                 client.cancel().await?;
             }
         }
@@ -1773,9 +2335,40 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn test_mcp_e2e_toy_flow() -> Result<(), Box<dyn std::error::Error>> {
-        let storage = StorageClient::new_memory().await?;
+        Box::pin(run_mcp_e2e_toy_flow()).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
+    async fn run_mcp_e2e_toy_flow() -> Result<(), Box<dyn std::error::Error>> {
+        use elephant_pipeline::extraction::Extractor;
+        use elephant_storage::source_publication::SourcePublicationRepository;
+        use elephant_storage::source_publication_manifest::SourcePublicationManifestRepository;
+        use elephant_storage::{IngestDecisionRepository, Repository};
+        use elephant_types::publication::{OperationReceipt, OperationState, PublicationFence};
+        use elephant_types::records::ingest::IngestMode;
+        use sha2::Digest;
+
+        eprintln!("toy MCP phase: storage");
+        let storage = Box::pin(StorageClient::new_memory()).await?;
+        eprintln!("toy MCP phase: schema");
+        Box::pin(elephant_migrations::apply_schema(&storage)).await?;
+        eprintln!("toy MCP phase: approved transport fixture");
+        let fixture = Arc::new(
+            Box::pin(toy_query_fixture::QueryFixture::install(
+                &storage,
+                "default",
+                vec![
+                    ("Alice", vec![1.0, 0.0, 0.0]),
+                    ("Alice met Bob in January.", vec![1.0, 0.0, 0.0]),
+                ],
+            ))
+            .await,
+        );
         let auth = AuthConfig {
             secret: "test-secret".to_string(),
             algorithm: Algorithm::HS256,
@@ -1785,7 +2378,7 @@ mod tests {
         };
         // Use explicit defaults to avoid env var race conditions with other tests
         let state = Arc::new(McpState::new_with_defaults(
-            storage,
+            storage.clone(),
             auth,
             "default".to_string(),
             vec![
@@ -1794,8 +2387,26 @@ mod tests {
                 "tenant_policy_v1".to_string(),
             ],
         ));
-        let router = mcp_full_routes(state);
+        let scoped_fixture = fixture.clone();
+        let mut transport_config = mcp_transport_config(None, None);
+        let origins = McpOriginPolicy::new(&std::mem::take(&mut transport_config.allowed_origins));
+        let router = Router::new()
+            .route_service(
+                "/mcp/full",
+                StreamableHttpService::new(
+                    move || {
+                        Ok(ApprovedToyServer {
+                            inner: ElephantMcpServer::new(state.clone()),
+                            fixture: scoped_fixture.clone(),
+                        })
+                    },
+                    Arc::new(LocalSessionManager::default()),
+                    transport_config,
+                ),
+            )
+            .layer(middleware::from_fn_with_state(origins, enforce_mcp_origin));
 
+        eprintln!("toy MCP phase: mounted service");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1808,7 +2419,7 @@ mod tests {
         });
 
         let transport = StreamableHttpClientTransport::from_uri(format!("http://{addr}/mcp/full"));
-        let client = ().serve(transport).await?;
+        let client = Box::pin(().serve(transport)).await?;
 
         let mut alice = Entity::new(
             base_fields(TableName::Entity, "default", "mcp_test"),
@@ -1822,7 +2433,7 @@ mod tests {
             "Bob".to_string(),
         );
 
-        let batch_entities = call_tool_json(
+        let batch_entities = toy_call_tool_json(
             &client,
             "batch_entities",
             serde_json::json!({ "items": [alice, bob] }),
@@ -1846,16 +2457,49 @@ mod tests {
         let mut source = Source::new(
             base_fields(TableName::Source, "default", "mcp_test"),
             SourceType::Manual,
-            "hash-alice".to_string(),
+            hex::encode(sha2::Sha256::digest(b"Alice met Bob in January.")),
         );
         source.uri = Some("file://alice_notes.txt".to_string());
-        let source_resp = call_tool_json(
+        source.set_requested_ingest_mode(IngestMode::Metadata);
+        let source_resp = toy_call_tool_json(
             &client,
             "create_source",
             serde_json::json!({ "source": source }),
         )
         .await?;
         let source_id = source_resp["data"]["id"].as_str().expect("source id");
+        let metadata_accepted: OperationReceipt =
+            serde_json::from_value(source_resp["operation"].clone())?;
+        assert_eq!(source_resp["enqueued"], true);
+        assert_ne!(metadata_accepted.state, OperationState::Completed);
+        let extractor = ToyDocumentOnlyExtractor {
+            manifest: elephant_pipeline::extraction::DefaultExtractor::new()
+                .manifest()
+                .clone(),
+        };
+        // create_source owns an actual metadata operation. Finish that accepted
+        // generation before ingest_doc accepts its successor; otherwise the
+        // original queued triage is correctly rejected as superseded work.
+        eprintln!("toy MCP phase: original metadata pipeline work");
+        fixture
+            .run(Box::pin(toy_pipeline::drive_pipeline(
+                &storage, "default", &extractor, 300,
+            )))
+            .await?;
+        let metadata_published = SourcePublicationRepository::new(storage.clone())
+            .operation("default", &metadata_accepted.operation_id)
+            .await?
+            .expect("original metadata operation");
+        assert_eq!(metadata_published.state, OperationState::Completed);
+        assert_eq!(metadata_published.source_id, metadata_accepted.source_id);
+        assert_eq!(
+            metadata_published.source_generation,
+            metadata_accepted.source_generation
+        );
+        assert_eq!(
+            metadata_published.published_revision,
+            metadata_accepted.desired_revision
+        );
 
         let source_rid = RecordId::from_str(source_id)?;
         let mut doc = Doc {
@@ -1870,11 +2514,95 @@ mod tests {
         };
         doc.base.security.policy_id = "default".to_string();
 
-        let ingest_doc =
-            call_tool_json(&client, "ingest_doc", serde_json::json!({ "doc": doc })).await?;
+        let ingest_doc = toy_call_tool_json(
+            &client,
+            "ingest_doc",
+            serde_json::json!({
+                "doc": doc,
+                "intake": {
+                    "revision_id": "alice-notes-v1",
+                    "idempotency_key": "alice-notes-v1",
+                    "expected_generation": source_resp["operation"]["source_generation"]
+                }
+            }),
+        )
+        .await?;
         assert_eq!(ingest_doc["ok"], true);
+        assert_eq!(
+            ingest_doc["operation"]["desired_revision"],
+            "alice-notes-v1"
+        );
+        assert_eq!(ingest_doc["enqueued"], true);
+        assert_eq!(
+            ingest_doc["operation"]["published_revision"],
+            serde_json::to_value(&metadata_published.published_revision)?
+        );
+        let accepted: OperationReceipt = serde_json::from_value(ingest_doc["operation"].clone())?;
+        assert_ne!(accepted.state, OperationState::Completed);
+        assert_eq!(accepted.source_id, metadata_accepted.source_id);
+        assert_ne!(
+            accepted.source_generation,
+            metadata_accepted.source_generation
+        );
+        assert_ne!(accepted.operation_id, metadata_accepted.operation_id);
+        let pending =
+            toy_call_tool_json(&client, "search_docs", serde_json::json!({"query":"Alice"}))
+                .await?;
+        assert!(pending["data"]["items"]
+            .as_array()
+            .expect("pending document bucket")
+            .is_empty());
+        eprintln!("toy MCP phase: original pipeline work");
+        fixture
+            .run(Box::pin(toy_pipeline::drive_pipeline(
+                &storage, "default", &extractor, 300,
+            )))
+            .await?;
+        eprintln!("toy MCP phase: completed original publication");
+        let published = SourcePublicationRepository::new(storage.clone())
+            .operation("default", &accepted.operation_id)
+            .await?
+            .expect("original accepted operation");
+        assert_eq!(published.state, OperationState::Completed);
+        assert_eq!(published.source_id, accepted.source_id);
+        assert_eq!(published.source_generation, accepted.source_generation);
+        assert_eq!(published.published_revision, accepted.desired_revision);
+        let original_graph = PublicationFence {
+            source_id: accepted.source_id.clone(),
+            generation: accepted.source_generation.clone(),
+            revision_id: "alice-notes-v1".into(),
+            operation_id: accepted.operation_id.clone(),
+        };
+        let graph_completion = SourcePublicationManifestRepository::new(storage.clone())
+            .completion("default", &original_graph)
+            .await?
+            .expect("original completed Graph proof");
+        assert_eq!(graph_completion.publication, original_graph);
+        let graph_progress = graph_completion
+            .published_progress
+            .as_ref()
+            .expect("original certified Graph progress");
+        assert_eq!(graph_progress.mode, IngestMode::Graph);
+        let decision_id = graph_progress
+            .latest_ingest_decision
+            .as_ref()
+            .expect("real original triage decision");
+        let original_decision = IngestDecisionRepository::new(storage.clone())
+            .get("default", decision_id)
+            .await?
+            .expect("original triage decision row");
+        assert_eq!(&original_decision.base.id, decision_id);
+        assert_eq!(original_decision.source.id(), &published.source_id);
+        assert_eq!(original_decision.decision, IngestMode::Graph);
+        assert_eq!(
+            graph_progress.ingest_decision_fingerprint,
+            Some(
+                elephant_storage::canonical_commit::source_support_fingerprint(&original_decision)?
+            )
+        );
+        let expected_decision = serde_json::to_value(decision_id)?;
 
-        let relate = call_tool_json(
+        let relate = toy_call_tool_json(
             &client,
             "relate_entities",
             serde_json::json!({
@@ -1888,10 +2616,10 @@ mod tests {
         .await?;
         assert_eq!(relate["ok"], true);
 
-        let health = call_tool_json(&client, "get_health", serde_json::json!({})).await?;
+        let health = toy_call_tool_json(&client, "get_health", serde_json::json!({})).await?;
         assert!(health["data"]["status"].is_string());
 
-        let search_sources = call_tool_json(
+        let search_sources = toy_call_tool_json(
             &client,
             "search_sources",
             serde_json::json!({ "query": "alice" }),
@@ -1899,10 +2627,56 @@ mod tests {
         .await?;
         assert!(!search_sources["data"]["items"]
             .as_array()
-            .unwrap()
+            .expect("published source bucket")
             .is_empty());
+        let searched_source = search_sources["data"]["items"]
+            .as_array()
+            .expect("published source bucket")
+            .iter()
+            .find(|item| item["id"] == source_id)
+            .expect("original completed Graph source");
+        assert_eq!(searched_source["current_ingest_mode"], "graph");
+        assert_eq!(searched_source["lifecycle_status"], "graph_ready");
+        assert_eq!(searched_source["latest_ingest_decision"], expected_decision);
+        let read_source =
+            toy_call_tool_json(&client, "get_source", serde_json::json!({"id":source_id})).await?;
+        assert_eq!(read_source["data"]["id"], source_id);
+        assert_eq!(read_source["data"]["current_ingest_mode"], "graph");
+        assert_eq!(read_source["data"]["lifecycle_status"], "graph_ready");
+        assert_eq!(
+            read_source["data"]["latest_ingest_decision"],
+            expected_decision
+        );
+        let operation = toy_call_tool_json(
+            &client,
+            "get_source_operation",
+            serde_json::json!({"operation_id": ingest_doc["operation"]["operation_id"]}),
+        )
+        .await?;
+        assert_eq!(
+            operation["data"]["operation_id"],
+            ingest_doc["operation"]["operation_id"]
+        );
+        // This public poll follows the actual completed Graph publication,
+        // not the earlier pending read. Both surfaces must retain its identity.
+        assert_eq!(operation["data"]["state"], "complete");
+        assert_eq!(
+            operation["data"]["internal_source_id"],
+            published.source_id.to_string()
+        );
+        assert_eq!(operation["data"]["generation"], published.source_generation);
+        assert_eq!(
+            operation["data"]["desired_revision"],
+            serde_json::to_value(&published.desired_revision)?
+        );
+        assert_eq!(
+            operation["data"]["published_revision"],
+            serde_json::to_value(&published.published_revision)?
+        );
+        assert_eq!(operation["data"]["lifecycle"], "active");
+        assert!(operation["data"]["error_code"].is_null());
 
-        let search_entities = call_tool_json(
+        let search_entities = toy_call_tool_json(
             &client,
             "search_entities",
             serde_json::json!({ "query": "Alice" }),
@@ -1913,15 +2687,18 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        let search_docs = call_tool_json(
+        let search_docs = toy_call_tool_json(
             &client,
             "search_docs",
             serde_json::json!({ "query": "Alice" }),
         )
         .await?;
-        assert!(!search_docs["data"]["items"].as_array().unwrap().is_empty());
+        assert!(!search_docs["data"]["items"]
+            .as_array()
+            .expect("published document bucket")
+            .is_empty());
 
-        let search_all = call_tool_json(
+        let search_all = toy_call_tool_json(
             &client,
             "search_all",
             serde_json::json!({ "query": "Alice" }),
@@ -1931,10 +2708,22 @@ mod tests {
         assert!(search_all["data"]["docs"].is_object());
         assert!(search_all["data"]["sources"].is_object());
 
+        eprintln!("toy MCP phase: cleanup");
         client.cancel().await?;
         let _ = shutdown_tx.send(());
         let _ = server_handle.await;
         Ok(())
+    }
+
+    async fn toy_call_tool_json(
+        client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        name: &str,
+        params: Value,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        eprintln!("toy MCP client begin: {name}");
+        let result = Box::pin(call_tool_json(client, name, params)).await;
+        eprintln!("toy MCP client returned: {name}");
+        result
     }
 
     async fn call_tool_json(
@@ -1981,6 +2770,10 @@ mod tests {
     /// - `/mcp/full`: all tools (~60)
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+    )]
     async fn test_three_mcp_profiles() -> Result<(), Box<dyn std::error::Error>> {
         let storage = StorageClient::new_memory().await?;
         let auth = AuthConfig {
@@ -2120,4 +2913,170 @@ mod tests {
         Ok(())
     }
     include!("mcp_auth_context_tests.rs");
+}
+
+#[cfg(test)]
+mod public_error_classification_tests {
+    use super::*;
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "Preserve the explicit typed-refusal assertion in this protocol regression test."
+    )]
+    fn legacy_denied_envelope_becomes_a_protocol_error() {
+        let error=legacy_response_error(&serde_json::json!({"ok":false,"error":"Access denied: private details","error_code":"forbidden_space","retryable":false})).expect("typed refusal");
+        assert_eq!(
+            error.error_code,
+            elephant_types::public_error::ErrorCode::ForbiddenSpace
+        );
+        assert!(!error.message.contains("private"));
+        assert_eq!(public_tool_error(error).is_error, Some(true));
+    }
+    #[test]
+    fn storage_reservation_is_a_retryable_protocol_error() {
+        let error = classify_mcp_error(elephant_mcp::McpError::StorageError(
+            elephant_storage::StorageError::ErasureInProgress,
+        ));
+        assert_eq!(
+            error.error_code,
+            elephant_types::public_error::ErrorCode::NotReady
+        );
+        assert!(error.retryable);
+        assert_eq!(
+            error.message,
+            "Source erasure is in progress; retry after cleanup"
+        );
+        assert_eq!(public_tool_error(error).is_error, Some(true));
+    }
+
+    #[test]
+    fn policy_denials_are_not_retryable_availability_failures() {
+        use elephant_policy::PolicyError;
+        for policy in [
+            PolicyError::AccessDenied("raw scope".into()),
+            PolicyError::InvalidClearance("classification".into()),
+            PolicyError::SubjectScopeViolation("subjects".into()),
+        ] {
+            let error = classify_mcp_error(elephant_mcp::McpError::PolicyError(policy));
+            assert_eq!(
+                error.error_code,
+                elephant_types::public_error::ErrorCode::ForbiddenSpace
+            );
+            assert!(!error.retryable);
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_initialization_diagnostic_tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use elephant_pipeline::scheduler::execution_contract::{classify_failure, FailureClass};
+    use elephant_storage::initialization_diagnostic::{InitializationPhase, StorageFailureKind};
+    use elephant_storage::{StorageBackendKind, StorageConfig, StorageError};
+
+    struct OwnedDirectory(std::path::PathBuf);
+    impl Drop for OwnedDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Real, independent filesystem failures exercise the storage-to-runtime
+    /// error chain and the same MCP mapper used by `initialize_runtime`. No
+    /// backend, provider, worker, policy or sandbox permission is substituted.
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_in_scrutinee,
+        reason = "Retain both original failure results through the complete phase and errno assertions."
+    )]
+    async fn filesystem_failures_keep_safe_phase_and_errno() {
+        let root = OwnedDirectory(
+            std::env::temp_dir().join(format!("recall-init-error-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir(&root.0).expect("owned fixture directory");
+        let blocker = root.0.join("private-path-token-marker");
+        std::fs::write(&blocker, b"fixture").expect("regular file blocks directory creation");
+        let absent = root.0.join("private-missing-snapshot-marker");
+        let writer_errno = std::fs::create_dir_all(&blocker)
+            .expect_err("independent filesystem oracle")
+            .raw_os_error();
+        let snapshot_errno = std::fs::canonicalize(&absent)
+            .expect_err("independent canonicalization oracle")
+            .raw_os_error();
+        assert!(writer_errno.is_some() && snapshot_errno.is_some());
+        let config = StorageConfig {
+            backend: StorageBackendKind::ElephantDb,
+            ..StorageConfig::default()
+        };
+        let mut missing_config = config.clone();
+        missing_config.snapshot_load = Some(absent);
+        let (writer, snapshot) = tokio::join!(
+            StorageClient::new_with_snapshot_destination_diagnosed(
+                config,
+                Some(blocker.join("state.snapshot"))
+            ),
+            StorageClient::new_with_snapshot_destination_diagnosed(
+                missing_config,
+                Some(root.0.join("new.snapshot"))
+            ),
+        );
+        for (result, expected_phase, expected_kind, expected_errno, expected_class) in [
+            (
+                writer,
+                InitializationPhase::WriterLock,
+                StorageFailureKind::Connection,
+                writer_errno,
+                FailureClass::Transient,
+            ),
+            (
+                snapshot,
+                InitializationPhase::SnapshotPath,
+                StorageFailureKind::DataIntegrity,
+                snapshot_errno,
+                FailureClass::Terminal,
+            ),
+        ] {
+            let error = result.expect_err("actual storage initialization failure");
+            assert_eq!(error.diagnostic().phase, expected_phase);
+            assert_eq!(error.diagnostic().storage_error_kind, expected_kind);
+            assert_eq!(error.diagnostic().raw_os_error, expected_errno);
+            let original = std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<StorageError>())
+                .expect("original storage error remains typed");
+            assert!(matches!(
+                original,
+                StorageError::ConnectionError(_) | StorageError::DataIntegrityError(_)
+            ));
+            let wrapped = anyhow::Error::new(error).context("private outer token and URL marker");
+            assert_eq!(
+                classify_failure(&wrapped),
+                expected_class,
+                "diagnostics must preserve retry classification"
+            );
+            let public = runtime_initialization_error(wrapped);
+            assert_eq!(public.message, "Failed to initialize runtime");
+            let wire = serde_json::to_value(public).expect("MCP protocol error");
+            assert_eq!(wire["code"], -32603);
+            assert_eq!(wire["data"]["format"], "recall-storage-initialization/v1");
+            assert_eq!(
+                wire["data"]["storage_initialization"]["raw_os_error"],
+                serde_json::json!(expected_errno)
+            );
+            let encoded = wire.to_string();
+            assert!(
+                !encoded.contains("private")
+                    && !encoded.contains("marker")
+                    && !encoded.contains("token")
+            );
+            assert!(!encoded.contains(root.0.to_string_lossy().as_ref()));
+        }
+        let unclassified =
+            runtime_initialization_error(anyhow::anyhow!("private URL and token marker"));
+        assert_eq!(unclassified.message, "Failed to initialize runtime");
+        assert!(
+            unclassified.data.is_none(),
+            "unknown failures must not invent a phase or errno"
+        );
+    }
 }

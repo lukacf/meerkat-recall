@@ -1,5 +1,7 @@
 //! Reusable pipeline worker entry points.
 
+// Preserve the concrete Send future types in the nested worker tests.
+#![cfg_attr(test, recursion_limit = "256")]
 #![allow(missing_docs)]
 
 #[allow(dead_code)]

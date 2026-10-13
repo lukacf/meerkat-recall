@@ -148,6 +148,40 @@ pub async fn record_claim_freshness(
     target_base: &BaseFields,
     observation: ClaimFreshnessObservation<'_>,
 ) -> PipelineResult<Freshness> {
+    let existing = repository
+        .find_by_target(&target_base.space_id, &target_id.to_string())
+        .await
+        .map_err(PipelineError::StorageError)?;
+    let freshness = prepare_claim_freshness(
+        existing.as_ref(),
+        target_id,
+        target_type,
+        target_base,
+        observation,
+    );
+    if let Some(existing) = existing {
+        let freshness_space_id = freshness.base.space_id.clone();
+        repository
+            .update(&freshness_space_id, &existing.base.id, freshness)
+            .await
+            .map_err(PipelineError::StorageError)
+    } else {
+        repository
+            .create(freshness)
+            .await
+            .map_err(PipelineError::StorageError)
+    }
+}
+
+/// Prepare a deterministic freshness effect without writing live storage.
+#[must_use]
+pub fn prepare_claim_freshness(
+    existing: Option<&Freshness>,
+    target_id: &RecordId,
+    target_type: &str,
+    target_base: &BaseFields,
+    observation: ClaimFreshnessObservation<'_>,
+) -> Freshness {
     let now = Utc::now();
     let newest_evidence = observation
         .evidence_times
@@ -186,11 +220,7 @@ pub async fn record_claim_freshness(
         TableName::Freshness,
         Uuid::new_v5(&Uuid::NAMESPACE_URL, deterministic_key.as_bytes()),
     );
-    let existing = repository
-        .find_by_target(&target_base.space_id, &target_id.to_string())
-        .await
-        .map_err(PipelineError::StorageError)?;
-    let mut base = existing.as_ref().map_or_else(
+    let mut base = existing.map_or_else(
         || {
             BaseFields::new(
                 deterministic_id,
@@ -225,18 +255,7 @@ pub async fn record_claim_freshness(
         demotion_threshold: demotion.threshold,
     };
 
-    if let Some(existing) = existing {
-        let freshness_space_id = freshness.base.space_id.clone();
-        repository
-            .update(&freshness_space_id, &existing.base.id, freshness)
-            .await
-            .map_err(PipelineError::StorageError)
-    } else {
-        repository
-            .create(freshness)
-            .await
-            .map_err(PipelineError::StorageError)
-    }
+    freshness
 }
 
 fn default_claim_decay_policy(target_type: &str) -> (DecayModel, DecayConfig) {

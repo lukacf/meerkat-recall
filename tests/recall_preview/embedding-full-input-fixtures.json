@@ -1,0 +1,712 @@
+{
+  "format": "recall-independent-full-input-embedding-fixtures/v1",
+  "review_status": "pending_qualification_owner",
+  "execution_authorized": false,
+  "provider_dispatch_authorized": false,
+  "product_acceptance": false,
+  "preprocessing": "text-full-v2",
+  "old_preprocessing": "text-v1",
+  "algorithm": {
+    "initial_max_utf8_bytes": 2048,
+    "segmentation": "ordered contiguous nonempty valid UTF8 slices, take largest prefix at most2048bytes, no trim/overlap/drop/padding",
+    "aggregation": "byte-weighted mean using f64 accumulators, then L2 normalize once, then checked finite f32 output",
+    "failure": "no aggregate until every original input segment succeeds; malformed shape, nonfinite components, nonpositive byte weights, nonfinite sums/norm or zero norm refuse",
+    "return_shape": "one final vector per original input, preserving original order; no cross-input pooling",
+    "tolerance_after_f32_conversion": 1e-07
+  },
+  "segmentation_cases": [
+    {
+      "id": "exact_ascii_boundary",
+      "input_parts": [
+        {
+          "text": "a",
+          "repeat": 2048
+        }
+      ],
+      "input_utf8_bytes": 2048,
+      "input_sha256": "b2a3a502fdfc34f4e3edfa94b7f3109cd972d87a4fec63ab21a6673379ccf7ad",
+      "expected_segments": [
+        {
+          "start": 0,
+          "end": 2048,
+          "utf8_bytes": 2048,
+          "sha256": "b2a3a502fdfc34f4e3edfa94b7f3109cd972d87a4fec63ab21a6673379ccf7ad"
+        }
+      ]
+    },
+    {
+      "id": "one_byte_suffix_survives",
+      "input_parts": [
+        {
+          "text": "a",
+          "repeat": 2048
+        },
+        {
+          "text": "Z",
+          "repeat": 1
+        }
+      ],
+      "input_utf8_bytes": 2049,
+      "input_sha256": "fd36063bdfd954b4a98c15c93325aabfc460acb003cd78269b3769db49cce0bc",
+      "expected_segments": [
+        {
+          "start": 0,
+          "end": 2048,
+          "utf8_bytes": 2048,
+          "sha256": "b2a3a502fdfc34f4e3edfa94b7f3109cd972d87a4fec63ab21a6673379ccf7ad"
+        },
+        {
+          "start": 2048,
+          "end": 2049,
+          "utf8_bytes": 1,
+          "sha256": "bbeebd879e1dff6918546dc0c179fdde505f2a21591c9a9c96e36b054ec5af83"
+        }
+      ]
+    },
+    {
+      "id": "emoji_crosses_boundary",
+      "input_parts": [
+        {
+          "text": "a",
+          "repeat": 2047
+        },
+        {
+          "text": "🦊",
+          "repeat": 1
+        },
+        {
+          "text": "Z",
+          "repeat": 1
+        }
+      ],
+      "input_utf8_bytes": 2052,
+      "input_sha256": "a2adb1789d346bbf4118f2ef96e688b81edd609b40ede33a6e6d7ef44c4f7646",
+      "expected_segments": [
+        {
+          "start": 0,
+          "end": 2047,
+          "utf8_bytes": 2047,
+          "sha256": "5d8098602265204dabadbc3cc14431446432926ca242f6f5699b106c51c40725"
+        },
+        {
+          "start": 2047,
+          "end": 2052,
+          "utf8_bytes": 5,
+          "sha256": "8f49ac11e8c56953d52cac65256a40c30e643372d1c06dec852192eb7d489c52"
+        }
+      ]
+    },
+    {
+      "id": "emoji_exact_then_accent",
+      "input_parts": [
+        {
+          "text": "🦊",
+          "repeat": 512
+        },
+        {
+          "text": "é",
+          "repeat": 1
+        }
+      ],
+      "input_utf8_bytes": 2050,
+      "input_sha256": "de9a79670b5e422305843ad16dcf0e79da81443ae828189d79d591b4cdcf7475",
+      "expected_segments": [
+        {
+          "start": 0,
+          "end": 2048,
+          "utf8_bytes": 2048,
+          "sha256": "98901e1c3ace641d46ad18ffdb59ac28c076aca7fafe3bd8a4b21f25e4a6de32"
+        },
+        {
+          "start": 2048,
+          "end": 2050,
+          "utf8_bytes": 2,
+          "sha256": "4a99557e4033c3539de2eb65472017cad5f9557f7a0625a09f1c3f6e2ba69c4c"
+        }
+      ]
+    },
+    {
+      "id": "accent_before_emoji",
+      "input_parts": [
+        {
+          "text": "é",
+          "repeat": 1023
+        },
+        {
+          "text": "🦊",
+          "repeat": 1
+        },
+        {
+          "text": "Z",
+          "repeat": 1
+        }
+      ],
+      "input_utf8_bytes": 2051,
+      "input_sha256": "39b4bb0d41cc8134804d24dd02a136476efeb02637ca2fe50f94979936426c59",
+      "expected_segments": [
+        {
+          "start": 0,
+          "end": 2046,
+          "utf8_bytes": 2046,
+          "sha256": "11e404cdfb1e0ca99dbdea262fdbc874a3d9e5bb201ca124ed34cd91dab3be65"
+        },
+        {
+          "start": 2046,
+          "end": 2051,
+          "utf8_bytes": 5,
+          "sha256": "8f49ac11e8c56953d52cac65256a40c30e643372d1c06dec852192eb7d489c52"
+        }
+      ]
+    },
+    {
+      "id": "exact_accent_boundary",
+      "input_parts": [
+        {
+          "text": "é",
+          "repeat": 1024
+        }
+      ],
+      "input_utf8_bytes": 2048,
+      "input_sha256": "0c894f1c5dcb55c41a2b43a60c9ef51a3918fbc44b02ff577aeb5b0bfa8d2931",
+      "expected_segments": [
+        {
+          "start": 0,
+          "end": 2048,
+          "utf8_bytes": 2048,
+          "sha256": "0c894f1c5dcb55c41a2b43a60c9ef51a3918fbc44b02ff577aeb5b0bfa8d2931"
+        }
+      ]
+    },
+    {
+      "id": "nul_and_crlf_are_original_bytes",
+      "input_parts": [
+        {
+          "text": "a",
+          "repeat": 2046
+        },
+        {
+          "text": "\u0000\r\n",
+          "repeat": 1
+        }
+      ],
+      "input_utf8_bytes": 2049,
+      "input_sha256": "5549eb6c4267e7a7fb2fa1beb37af978a80c22a44d0bd926aa9fe4bdb45c2386",
+      "expected_segments": [
+        {
+          "start": 0,
+          "end": 2048,
+          "utf8_bytes": 2048,
+          "sha256": "d3bbe93a65ae4f55e5deda80ee876198d2ac851e0e4c38ed1f47d83b95016a38"
+        },
+        {
+          "start": 2048,
+          "end": 2049,
+          "utf8_bytes": 1,
+          "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+        }
+      ]
+    }
+  ],
+  "original_full_workload_capacity": {
+    "contract_path": "full-workload-contract.json",
+    "contract_sha256": "44a91b9f0ae4c2ae32d2f8aec9eb783a48ccca63eeee010ff2427ef1ec4a0c0b",
+    "input_parts": [
+      {
+        "text": "Helios large source. The custodian is Mira. The approved capacity is 47.\n",
+        "repeat": 1
+      },
+      {
+        "text": "The synthetic catalogue lists labelled shelves and blank paper covers.\n",
+        "repeat": 28166
+      },
+      {
+        "text": "The synthetic catalogue lists labelled shelves and blank paper co",
+        "repeat": 1
+      },
+      {
+        "text": "\nHelios final original evidence: Mira keeps the violet key; capacity is 47.\n",
+        "repeat": 1
+      }
+    ],
+    "input_utf8_bytes": 2000000,
+    "input_sha256": "fdae2b405d6f3123836e3dc6b6aef46de8cf41342349265ff06a403d1f1af613",
+    "expected_regular_segments": {
+      "first_start": 0,
+      "bytes_each": 2048,
+      "count": 976
+    },
+    "expected_final_segment": {
+      "start": 1998848,
+      "end": 2000000,
+      "utf8_bytes": 1152,
+      "sha256": "b6abdd885a02a35d04712b45966b13fdcf2d497a918478179b91a6568da4c6b8"
+    },
+    "expected_segment_count": 977,
+    "required_final_original_suffix": "\nHelios final original evidence: Mira keeps the violet key; capacity is 47.\n",
+    "sdk_regular_segment_vector": [
+      1.0,
+      0.0
+    ],
+    "sdk_final_segment_vector": [
+      0.0,
+      1.0
+    ],
+    "sdk_expected_weighted_sum": [
+      1998848.0,
+      1152.0
+    ],
+    "sdk_expected_unit_vector": [
+      0.9999998339207732,
+      0.0005763318714963472
+    ],
+    "sdk_expected_unit_vector_exact": [
+      "1998848/sqrt(3995394654208)",
+      "1152/sqrt(3995394654208)"
+    ]
+  },
+  "aggregation_cases": [
+    {
+      "id": "unequal_bytes_not_unweighted",
+      "segment_utf8_bytes": [
+        2048,
+        1024
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0
+        ]
+      ],
+      "weighted_sum": [
+        2048.0,
+        1024.0
+      ],
+      "expected_unit_vector": [
+        0.8944271909999159,
+        0.4472135954999579
+      ],
+      "expected_unit_vector_exact": [
+        "2/sqrt(5)",
+        "1/sqrt(5)"
+      ],
+      "input_parts": [
+        {
+          "text": "A",
+          "repeat": 2048
+        },
+        {
+          "text": "B",
+          "repeat": 1024
+        }
+      ],
+      "input_sha256": "1a45087400d169393ad5417c876f18f6f958350736f7b6e308ed46abb96010c5"
+    },
+    {
+      "id": "same_prefix_changed_suffix",
+      "segment_utf8_bytes": [
+        2048,
+        1024
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          -1.0
+        ]
+      ],
+      "weighted_sum": [
+        2048.0,
+        -1024.0
+      ],
+      "expected_unit_vector": [
+        0.8944271909999159,
+        -0.4472135954999579
+      ],
+      "expected_unit_vector_exact": [
+        "2/sqrt(5)",
+        "-1/sqrt(5)"
+      ],
+      "input_parts": [
+        {
+          "text": "A",
+          "repeat": 2048
+        },
+        {
+          "text": "C",
+          "repeat": 1024
+        }
+      ],
+      "input_sha256": "ca9190220563592dec8fd4fba80a85da5e2694a480da6e3b1deef27639a17a83"
+    },
+    {
+      "id": "three_segments_all_contribute",
+      "segment_utf8_bytes": [
+        2048,
+        2048,
+        1024
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0
+        ],
+        [
+          1.0,
+          0.0
+        ]
+      ],
+      "weighted_sum": [
+        3072.0,
+        2048.0
+      ],
+      "expected_unit_vector": [
+        0.8320502943378437,
+        0.5547001962252291
+      ],
+      "expected_unit_vector_exact": [
+        "3/sqrt(13)",
+        "2/sqrt(13)"
+      ],
+      "input_parts": [
+        {
+          "text": "A",
+          "repeat": 2048
+        },
+        {
+          "text": "B",
+          "repeat": 2048
+        },
+        {
+          "text": "D",
+          "repeat": 1024
+        }
+      ],
+      "input_sha256": "ed863670e69d550345ced615b6ef3208167efb1ae60cc55cadfe0a8dcafdc9eb"
+    },
+    {
+      "id": "single_full_vector_is_l2_normalized",
+      "segment_utf8_bytes": [
+        17
+      ],
+      "vectors": [
+        [
+          3.0,
+          4.0
+        ]
+      ],
+      "weighted_sum": [
+        51.0,
+        68.0
+      ],
+      "expected_unit_vector": [
+        0.6,
+        0.8
+      ],
+      "expected_unit_vector_exact": [
+        "3/5",
+        "4/5"
+      ],
+      "input_parts": [
+        {
+          "text": "S",
+          "repeat": 17
+        }
+      ],
+      "input_sha256": "e98a3f3f3f1d2eaeff569c766047917b1a4f605e49ab07b528de309485a2d17e"
+    },
+    {
+      "id": "byte_weights_differ_from_unicode_scalar_weights",
+      "segment_utf8_bytes": [
+        2047,
+        5
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0
+        ]
+      ],
+      "weighted_sum": [
+        2047.0,
+        5.0
+      ],
+      "expected_unit_vector": [
+        0.9999970168685938,
+        0.002442591638662906
+      ],
+      "expected_unit_vector_exact": [
+        "2047/sqrt(4190234)",
+        "5/sqrt(4190234)"
+      ],
+      "input_parts": [
+        {
+          "text": "a",
+          "repeat": 2047
+        },
+        {
+          "text": "🦊Z",
+          "repeat": 1
+        }
+      ],
+      "input_sha256": "a2adb1789d346bbf4118f2ef96e688b81edd609b40ede33a6e6d7ef44c4f7646"
+    }
+  ],
+  "suffix_pair": {
+    "original_case": "unequal_bytes_not_unweighted",
+    "changed_case": "same_prefix_changed_suffix",
+    "required_unchanged_prefix_vector": [
+      1.0,
+      0.0
+    ],
+    "required_changed_final_vector": true
+  },
+  "multi_input_case": {
+    "ids": [
+      "unequal_bytes_not_unweighted",
+      "same_prefix_changed_suffix",
+      "single_full_vector_is_l2_normalized"
+    ],
+    "expected_ordered_vectors": [
+      [
+        0.8944271909999159,
+        0.4472135954999579
+      ],
+      [
+        0.8944271909999159,
+        -0.4472135954999579
+      ],
+      [
+        0.6,
+        0.8
+      ]
+    ],
+    "allow_shared_aggregate": false
+  },
+  "retry_case": {
+    "id": "rejected_original_is_replaced_by_both_utf8_halves",
+    "input_parts": [
+      {
+        "text": "a",
+        "repeat": 2047
+      },
+      {
+        "text": "🦊",
+        "repeat": 1
+      },
+      {
+        "text": "Z",
+        "repeat": 1
+      }
+    ],
+    "original_segments": [
+      [
+        0,
+        2047
+      ],
+      [
+        2047,
+        2052
+      ]
+    ],
+    "rejected_segment": [
+      2047,
+      2052
+    ],
+    "expected_retry_segments": [
+      [
+        2047,
+        2051
+      ],
+      [
+        2051,
+        2052
+      ]
+    ],
+    "successful_final_segments": [
+      [
+        0,
+        2047
+      ],
+      [
+        2047,
+        2051
+      ],
+      [
+        2051,
+        2052
+      ]
+    ],
+    "vectors": [
+      [
+        1.0,
+        0.0
+      ],
+      [
+        0.0,
+        1.0
+      ],
+      [
+        0.0,
+        1.0
+      ]
+    ],
+    "segment_utf8_bytes": [
+      2047,
+      4,
+      1
+    ],
+    "expected_unit_vector": [
+      0.9999970168685938,
+      0.002442591638662906
+    ],
+    "rejected_response_contributes_to_mean": false,
+    "full_result_before_all_segments_succeed": false,
+    "split_rule": "nearest nonempty UTF8 boundary at or below midpoint; if no such boundary, first complete scalar above midpoint; fail if no interior boundary"
+  },
+  "refusal_cases": [
+    {
+      "id": "wrong_vector_dimensions",
+      "weights": [
+        2,
+        1
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          1.0
+        ]
+      ],
+      "expect": "refuse entire original input"
+    },
+    {
+      "id": "missing_vector",
+      "weights": [
+        2,
+        1
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ]
+      ],
+      "expect": "refuse entire original input"
+    },
+    {
+      "id": "duplicate_or_missing_provider_index",
+      "physical_response_indices": [
+        0,
+        0
+      ],
+      "expected_indices": [
+        0,
+        1
+      ],
+      "expect": "refuse; sorting does not establish exact complete response shape"
+    },
+    {
+      "id": "zero_norm",
+      "weights": [
+        1,
+        1
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          -1.0,
+          0.0
+        ]
+      ],
+      "expect": "refuse before return"
+    },
+    {
+      "id": "nan_or_infinity",
+      "nonfinite_component_variants": [
+        "nan",
+        "positive_infinity",
+        "negative_infinity"
+      ],
+      "expect": "refuse before accumulation and return"
+    },
+    {
+      "id": "later_segment_transport_failure",
+      "successful_segments": [
+        0
+      ],
+      "failed_segment": 1,
+      "expected_returned_aggregate_count": 0,
+      "expect": "retain original physical success and failed/unknown usage receipts; no partial input success"
+    },
+    {
+      "id": "binding_revoked_before_later_dispatch",
+      "successful_physical_batches": [
+        0
+      ],
+      "revoked_before_physical_batch": 1,
+      "additional_sends_after_revocation": 0,
+      "expected_returned_aggregate_count": 0,
+      "expect": "original current-authority lookup required for every physical attempt"
+    },
+    {
+      "id": "one_unicode_scalar_cannot_split_further",
+      "input_parts": [
+        {
+          "text": "🦊",
+          "repeat": 1
+        }
+      ],
+      "provider_size_rejections": 1,
+      "expected_resubmitted_shortened_inputs": 0,
+      "expect": "explicit failure; never empty input or dropped scalar"
+    },
+    {
+      "id": "unapproved_preprocessing",
+      "preprocessing": "text-full-v3",
+      "physical_sends": 0,
+      "expect": "refuse before provider dispatch"
+    },
+    {
+      "id": "text_v1_oversize",
+      "preprocessing": "text-v1",
+      "input_parts": [
+        {
+          "text": "a",
+          "repeat": 24000
+        },
+        {
+          "text": "FINAL_SUFFIX",
+          "repeat": 1
+        }
+      ],
+      "expected_first_physical_input_sha256": "aeb03972dd9e4e97ad619727f27f3237be9709591d28b9d3944e2c1279263a07",
+      "expected_prefix_retry_count": 0,
+      "expect": "send complete original text or explicitly refuse; never destructive prefix fallback"
+    }
+  ],
+  "proof_limits": [
+    "Only independently authored literal/arithmetical expectations; no actual model semantic quality, provider capacity, billing or product acceptance.",
+    "Actual provider SDK/observer/accounting and bounded physical refusal tests owned by M/B and centrally executed; D independent final review.",
+    "Input/partition profile must opt in explicitly; existing paid profiles, text-v1 receipts and source corpus bytes are not rewritten."
+  ]
+}

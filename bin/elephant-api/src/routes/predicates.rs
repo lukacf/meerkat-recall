@@ -17,6 +17,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use elephant_storage::canonical_commit::CanonicalRecord;
+use elephant_storage::public_mutation::{inherit_public_envelope, PublicMutation};
 use elephant_storage::{
     parse_id, PredicateAliasRepository, PredicateRegistryRepository, Repository, StorageClient,
     StorageResult,
@@ -43,6 +45,8 @@ pub struct PredicatesState {
     pub alias_repo: Arc<dyn PredicateAliasRepo>,
     /// Authorization service.
     pub authz: AuthzState,
+    /// Production canonical transaction adapter; absent only in repository mock tests.
+    pub mutation_storage: Option<StorageClient>,
 }
 
 /// Predicate registry repository interface used by the API layer.
@@ -183,8 +187,9 @@ impl PredicatesState {
     pub fn new(client: StorageClient, authz: AuthzState) -> Self {
         Self {
             predicate_repo: Arc::new(PredicateRegistryRepository::new(client.clone())),
-            alias_repo: Arc::new(PredicateAliasRepository::new(client)),
+            alias_repo: Arc::new(PredicateAliasRepository::new(client.clone())),
             authz,
+            mutation_storage: Some(client),
         }
     }
 
@@ -200,6 +205,7 @@ impl PredicatesState {
             predicate_repo,
             alias_repo,
             authz,
+            mutation_storage: None,
         }
     }
 }
@@ -463,13 +469,74 @@ async fn get_predicate(
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Retain the owned error adapter used by existing map_err callers."
+)]
+fn predicate_storage_error(error: elephant_storage::StorageError) -> (StatusCode, Json<ApiError>) {
+    ApiError::storage(&error)
+}
+
+fn predicate_auth_error(error: crate::authz::AuthzError) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            code: error.code,
+            message: error.message,
+            details: None,
+        }),
+    )
+}
+
+async fn begin_predicate_mutation(
+    state: &PredicatesState,
+    principal: &AuthPrincipal,
+    space: &str,
+) -> Result<Option<PublicMutation>, (StatusCode, Json<ApiError>)> {
+    state
+        .authz
+        .authorize_space_scope(principal, space, "write:predicate")
+        .map_err(predicate_auth_error)?;
+    match &state.mutation_storage {
+        Some(storage) => PublicMutation::begin(storage.clone(), space)
+            .await
+            .map(Some)
+            .map_err(predicate_storage_error),
+        None => Ok(None),
+    }
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Retain the shared HTTP error representation at this boundary."
+)]
+fn authorize_predicate_record(
+    state: &PredicatesState,
+    principal: &AuthPrincipal,
+    record: &impl elephant_types::records::HasSecurity,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .authz
+        .authorize_record_read(principal, record, "read:predicate")
+        .map_err(predicate_auth_error)?;
+    state
+        .authz
+        .authorize_record_write(principal, record, "write:predicate")
+        .map_err(predicate_auth_error)
+}
+
 /// POST /v1/predicates - Create predicate.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn create_predicate(
     State(state): State<Arc<PredicatesState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(req): Json<CreatePredicateRequest>,
 ) -> Result<(StatusCode, Json<PredicateRegistry>), (StatusCode, Json<ApiError>)> {
     let space_id = require_space_id(&principal)?;
+    let mutation = begin_predicate_mutation(&state, &principal, &space_id).await?;
     let id = RecordId::new_v4(TableName::PredicateRegistry);
     let mut base = BaseFields::new(id, space_id, principal.subject.clone());
     base.security.policy_id = "default".to_string();
@@ -516,16 +583,21 @@ async fn create_predicate(
             )
         })?;
 
-    match state.predicate_repo.create(predicate).await {
+    let result = match mutation {
+        Some(mutation) => mutation.create(predicate, &principal.subject).await,
+        None => state.predicate_repo.create(predicate).await,
+    };
+    match result {
         Ok(created) => Ok((StatusCode::CREATED, Json(created))),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 
 /// POST /v1/predicates/{id}/aliases - Propose alias.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn propose_alias(
     State(state): State<Arc<PredicatesState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -533,6 +605,7 @@ async fn propose_alias(
     Json(req): Json<ProposeAliasRequest>,
 ) -> Result<(StatusCode, Json<PredicateAlias>), (StatusCode, Json<ApiError>)> {
     let space_id = require_space_id(&principal)?;
+    let mut mutation = begin_predicate_mutation(&state, &principal, &space_id).await?;
     let rid = parse_id(&predicate_id, TableName::PredicateRegistry).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -545,12 +618,7 @@ async fn propose_alias(
         .predicate_repo
         .get(&space_id, &rid)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
+        .map_err(|error| ApiError::storage(&error))?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -558,9 +626,16 @@ async fn propose_alias(
             )
         })?;
 
+    authorize_predicate_record(&state, &principal, &predicate)?;
+    if let Some(mutation) = mutation.as_mut() {
+        mutation.depend_on(CanonicalRecord::PredicateRegistry(Box::new(
+            predicate.clone(),
+        )));
+    }
     let alias_id = RecordId::new_v4(TableName::PredicateAlias);
     let mut base = BaseFields::new(alias_id, space_id, principal.subject.clone());
-    base.security.policy_id = "default".to_string();
+    base.security.policy_id = predicate.base.security.policy_id.clone();
+    inherit_public_envelope(&mut base, &predicate.base).map_err(predicate_storage_error)?;
 
     let alias = PredicateAlias {
         base,
@@ -589,17 +664,22 @@ async fn propose_alias(
             )
         })?;
 
-    match state.alias_repo.create(alias).await {
+    let result = match mutation {
+        Some(mutation) => mutation.create(alias, &principal.subject).await,
+        None => state.alias_repo.create(alias).await,
+    };
+    match result {
         Ok(created) => Ok((StatusCode::CREATED, Json(created))),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 
 /// `PATCH /v1/predicates/{id}/aliases/{alias_id}` - Activate/deprecate alias.
 #[allow(clippy::similar_names)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn update_alias_status(
     State(state): State<Arc<PredicatesState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -607,7 +687,8 @@ async fn update_alias_status(
     Json(req): Json<UpdateAliasStatusRequest>,
 ) -> ApiResult<PredicateAlias> {
     let space_id = require_space_id(&principal)?;
-    let _pred_rid = parse_id(&predicate_id, TableName::PredicateRegistry).map_err(|e| {
+    let mut mutation = begin_predicate_mutation(&state, &principal, &space_id).await?;
+    let predicate_rid = parse_id(&predicate_id, TableName::PredicateRegistry).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(ApiError::validation(e.to_string())),
@@ -619,49 +700,63 @@ async fn update_alias_status(
             Json(ApiError::validation(e.to_string())),
         )
     })?;
-
-    let mut alias = match state.alias_repo.get(&space_id, &alias_rid).await {
-        Ok(Some(a)) => a,
-        Ok(None) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ApiError::not_found("Alias", &alias_id)),
-            ))
-        }
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            ))
-        }
-    };
-
-    state
-        .authz
-        .authorize_record_write(&principal, &alias, "write:predicate")
-        .map_err(|e| {
+    let predicate = state
+        .predicate_repo
+        .get(&space_id, &predicate_rid)
+        .await
+        .map_err(predicate_storage_error)?
+        .ok_or_else(|| {
             (
-                StatusCode::FORBIDDEN,
-                Json(ApiError {
-                    code: e.code,
-                    message: e.message,
-                    details: None,
-                }),
+                StatusCode::NOT_FOUND,
+                Json(ApiError::not_found("Predicate", &predicate_id)),
             )
         })?;
-
-    alias.status = req.status;
-
-    match state.alias_repo.update(&space_id, &alias_rid, alias).await {
-        Ok(updated) => Ok(Json(updated)),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+    authorize_predicate_record(&state, &principal, &predicate)?;
+    let observed = state
+        .alias_repo
+        .get(&space_id, &alias_rid)
+        .await
+        .map_err(predicate_storage_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::not_found("Alias", &alias_id)),
+            )
+        })?;
+    authorize_predicate_record(&state, &principal, &observed)?;
+    if observed.predicate_id != predicate.predicate_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::validation("Alias belongs to another predicate")),
+        ));
     }
+    let mut proposed = observed.clone();
+    proposed.status = req.status;
+    state
+        .authz
+        .authorize_record_write(&principal, &proposed, "write:predicate")
+        .map_err(predicate_auth_error)?;
+    let result = match mutation.as_mut() {
+        Some(mutation) => {
+            mutation.depend_on(CanonicalRecord::PredicateRegistry(Box::new(predicate)));
+            mutation
+                .replace(&observed, proposed, false, &principal.subject)
+                .await
+        }
+        None => {
+            state
+                .alias_repo
+                .update(&space_id, &alias_rid, proposed)
+                .await
+        }
+    };
+    result.map(Json).map_err(predicate_storage_error)
 }
 
-/// `POST /v1/predicates/aliases/deactivate-hygiene` - Deprecate generated active hygiene aliases.
+#[expect(
+    clippy::single_match_else,
+    reason = "Keep the reviewed canonical and fixture branches together."
+)]
 async fn deactivate_hygiene_aliases(
     State(state): State<Arc<PredicatesState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -669,11 +764,12 @@ async fn deactivate_hygiene_aliases(
 ) -> ApiResult<DeactivateHygieneAliasesResponse> {
     let space_id = require_space_id(&principal)?;
 
+    let mut mutation = begin_predicate_mutation(&state, &principal, &space_id).await?;
+    let mut replacements = Vec::new();
     let limit = req.limit.clamp(1, default_repair_limit());
     let mut cursor: Option<RecordId> = None;
     let mut scanned = 0usize;
     let mut matched = 0usize;
-    let mut deactivated = 0usize;
     let mut samples = Vec::new();
 
     loop {
@@ -685,18 +781,13 @@ async fn deactivate_hygiene_aliases(
                 cursor.as_ref(),
             )
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )
-            })?;
+            .map_err(|error| ApiError::storage(&error))?;
 
         if page.is_empty() {
             break;
         }
 
-        for mut alias in page {
+        for alias in page {
             cursor = Some(alias.base.id.clone());
             scanned += 1;
 
@@ -706,19 +797,7 @@ async fn deactivate_hygiene_aliases(
                 continue;
             }
 
-            state
-                .authz
-                .authorize_record_write(&principal, &alias, "write:predicate")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
+            authorize_predicate_record(&state, &principal, &alias)?;
 
             matched += 1;
             if samples.len() < 20 {
@@ -731,18 +810,13 @@ async fn deactivate_hygiene_aliases(
             }
 
             if !req.dry_run {
-                alias.status = AliasStatus::Deprecated;
+                let mut proposed = alias.clone();
+                proposed.status = AliasStatus::Deprecated;
                 state
-                    .alias_repo
-                    .update(&space_id, &alias.base.id.clone(), alias)
-                    .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ApiError::internal(e.to_string())),
-                        )
-                    })?;
-                deactivated += 1;
+                    .authz
+                    .authorize_record_write(&principal, &proposed, "write:predicate")
+                    .map_err(predicate_auth_error)?;
+                replacements.push((alias, proposed));
             }
 
             if scanned >= limit {
@@ -752,6 +826,33 @@ async fn deactivate_hygiene_aliases(
 
         if scanned >= limit {
             break;
+        }
+    }
+
+    let deactivated = replacements.len();
+    if let Some((observed, proposed)) = replacements.pop() {
+        match mutation.as_mut() {
+            Some(mutation) => {
+                for (before, after) in replacements {
+                    mutation
+                        .stage_replace(&before, after)
+                        .map_err(predicate_storage_error)?;
+                }
+                mutation
+                    .replace(&observed, proposed, false, &principal.subject)
+                    .await
+                    .map_err(predicate_storage_error)?;
+            }
+            None => {
+                replacements.push((observed, proposed));
+                for (before, after) in replacements {
+                    state
+                        .alias_repo
+                        .update(&space_id, &before.base.id, after)
+                        .await
+                        .map_err(predicate_storage_error)?;
+                }
+            }
         }
     }
 
@@ -811,5 +912,89 @@ mod tests {
         let req: PredicateListRequest = serde_json::from_str(json).expect("deserialize");
         assert_eq!(req.limit, 50);
         assert!(req.include_aliases);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
+    async fn registry_route_returns_retryable_erasure_barrier_and_rolls_back() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let storage = StorageClient::new_memory().await.expect("storage");
+        storage
+            .query_checked(include_str!(
+                "../../../../crates/migrations/sql/031_source_publication.surql"
+            ))
+            .await
+            .expect("canonical schema");
+        let space = "http-erasure-barrier";
+        let config: elephant_types::records::SpaceConfig =
+            serde_json::from_value(serde_json::json!({
+                "id":RecordId::new_v4(TableName::SpaceConfig),"space_id":space,
+                "created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now(),"created_by":"test",
+                "security":{"policy_id":"default","level":0,"labels":[],"handling":[]},
+                "provenance":{},"subjects":[],"subjects_state":"complete",
+                "embedding_provider":"fake","embedding_model":"test","embedding_dims":8
+            }))
+            .expect("config");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(config)
+            .await
+            .expect("space");
+        storage.query_checked("DEFINE EVENT test_erasure_barrier ON TABLE predicate_registry WHEN $event = 'CREATE' THEN { THROW 'publication:erasure_space_reserved'; };").await.expect("barrier event");
+        let principal = AuthPrincipal {
+            subject: "writer".into(),
+            space_id: Some(space.into()),
+            scopes: vec!["read:predicate".into(), "write:predicate".into()],
+            ..AuthPrincipal::default()
+        };
+        let app = predicate_routes()
+            .layer(axum::Extension(principal))
+            .with_state(Arc::new(PredicatesState::new(
+                storage.clone(),
+                Arc::new(crate::authz::AuthzService::new()),
+            )));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/predicates")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"predicate_id":"retained-predicate"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.expect("body"))
+                .expect("json");
+        assert_eq!(body["error_code"], "not_ready");
+        assert_eq!(body["retryable"], true);
+        assert!(!body
+            .to_string()
+            .contains("publication:erasure_space_reserved"));
+        assert!(Repository::list(
+            &PredicateRegistryRepository::new(storage.clone()),
+            space,
+            100,
+            None,
+        )
+        .await
+        .expect("registry")
+        .is_empty());
+        assert!(elephant_storage::AuditLogRepository::new(storage.clone())
+            .list(space, 100, None)
+            .await
+            .expect("audits")
+            .is_empty());
+        assert!(elephant_storage::SystemEventRepository::new(storage)
+            .get_after_seq(space, 0, 100)
+            .await
+            .expect("outbox")
+            .is_empty());
     }
 }

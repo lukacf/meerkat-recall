@@ -1,0 +1,31 @@
+{
+  "format": "recall-render-coordinate-source-review/v1",
+  "mapping_source_commit": "33ea76eeae234c3ebbe09e7fc051ecc0c76a4ee0",
+  "dto_source_commit": "5575d5ece5814c1a8903703512648327c625d6d9",
+  "source_review_only": true,
+  "execution_authorized": false,
+  "executed_by_qualification": false,
+  "product_acceptance": false,
+  "source_blockers_in_selected_mapping_scope": [],
+  "reviewed_properties": [
+    "One exact normalization implementation is used by the actual default renderer and original_text_span; prior1.0.0 CRLF/CR/LF, Rust trailing Unicode whitespace and terminal newline output semantics are retained.",
+    "Mapped ranges track monotonic original byte origins; no quote search or occurrence heuristic. Contiguous supported runs coalesce, and raw_cover returns the smallest source interval covering original contributing bytes, retaining internal deleted whitespace.",
+    "Original CRLF newline retains both bytes; original LF/CR retain one byte. A synthesized final LF contributes no raw bytes; wholly synthesized evidence refuses, mixed support maps the actual original bytes.",
+    "The mapping entrypoint requires a recognized exact renderer name/version/config, full exact rendered output equality, nonempty ordered bounded UTF8 interval and original support. Passthrough1.0.0 requires exact input/output identity.",
+    "Test source consumes all seven independent D literal coordinate cases, with additional generated-only, changed transform/config, invalid UTF8, actual terminator-origin and exhaustive small old-output equivalence controls.",
+    "Frozen additive public fields are rendered_span, rendered_quote_sha256 and rendered_text_sha256; existing span/quote remains exact accepted-source bytes. No duplicate full rendered quotation."
+  ],
+  "mandatory_consumer_obligations": [
+    "S must recompute original raw bytes against BOTH immutable accepted content_hash and Source.hash; mapping alone supplies no cryptographic source integrity.",
+    "S must recompute actual immutable rendered text/hash, preserve the original selected rendered span/quote hash, resolve full original completed-render proof and retain current ancestor/read authorization.",
+    "Search must revalidate original head/revision/authority after assembly; stale/newer mappings cannot replace the originally selected evidence.",
+    "Actual HTTP/MCP fixtures on both backends must prove normalized later-paragraph citations and exact full immutable DTO; no runtime result is inferred here."
+  ],
+  "response_size_obligation": "All three additional required fields must be included in full encoded REST/tool/MCP response arithmetic. E arithmetic successor pending actual ToolResponse success-envelope correction.",
+  "source_hashes": {
+    "crates/types/src/rendered_text.rs": "b1feff7e2860062032095f85c6aacd8dad07e791db38033dcdea78f40eb668de",
+    "crates/types/src/lib.rs": "1863e538a50184197a147d3995db7382cc0affc98ce77c7f57cb63b63e798c38",
+    "crates/pipeline/src/renderer/default.rs": "32a4f91296e5928de7875d7ffda1ef1831d360aa2a5256e4a4e52274eb01ab08"
+  },
+  "independent_fixture_sha256": "54138704a332d6e275dc434ad0d6456f49107a811c08ea9abbafdbd68171dc3b"
+}

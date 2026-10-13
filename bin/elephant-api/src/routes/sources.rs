@@ -8,21 +8,25 @@
 //! - DELETE /v1/sources/{id} - Soft delete source
 //! - POST /v1/sources/{id}/restore - Restore soft-deleted source
 
+#[cfg(test)]
+use elephant_storage::MediaAssetRepository;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use super::source_intake::accept_intake;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{delete, get, post, put},
     Json, Router,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use elephant_storage::source_intake::IntakeControl;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tracing::warn;
+
 use uuid::Uuid;
 
 use crate::auth::Principal as AuthPrincipal;
@@ -31,23 +35,24 @@ use crate::routes::entities::ApiError;
 use crate::routes::ingest_guard::ensure_semantic_ingest_ready;
 use crate::routes::require_space_id;
 use crate::runtime::RuntimeManager;
-use elephant_pipeline::scheduler::ingest_work_kinds::enqueue_triage_source_work_item;
+
 use elephant_storage::{
-    deterministic_source_id_for_ingest, find_existing_doc_for_doc, find_existing_source_for_doc,
-    find_existing_source_for_source, parse_id, persist_manual_doc_for_source_detailed,
-    preview_persisted_manual_doc_for_source, rollback_persisted_manual_doc,
-    rollback_persisted_source, MediaAssetRepository, PaginatedResult, PersistedManualDoc,
-    Repository, SearchCriteria, SourceRepository, StorageClient, StorageResult,
+    deterministic_source_id_for_ingest, find_existing_doc_for_doc, parse_id, PaginatedResult,
+    SearchCriteria, SourceRepository, StorageClient, StorageResult,
 };
+#[cfg(test)]
+use elephant_storage::{find_existing_source_for_doc, find_existing_source_for_source};
 use elephant_types::ids::TableName;
 use elephant_types::mcp_simple::ExtractionGuidanceInput;
 use elephant_types::records::ingest::IngestMode;
 use elephant_types::records::media_asset::{inline_media_max_bytes, managed_asset_relative_path};
+#[cfg(test)]
 use elephant_types::records::{
-    apply_manual_doc_to_source, prepare_source_for_reingest,
-    prepare_source_for_reingest_preserving_acl_if_placeholder, validate_manual_ingest_mode,
-    validate_simple_source_fields, Doc, DocMediaAttachment, DocMediaInput, DocMediaKind,
-    DocMediaLocation, MediaAsset, Source, SourceType,
+    prepare_source_for_reingest, prepare_source_for_reingest_preserving_acl_if_placeholder,
+};
+use elephant_types::records::{
+    validate_manual_ingest_mode, validate_simple_source_fields, Doc, DocMediaAttachment,
+    DocMediaInput, DocMediaKind, DocMediaLocation, MediaAsset, Source, SourceType,
 };
 use elephant_types::{BaseFieldsBuilder, RecordId};
 
@@ -301,6 +306,7 @@ impl SourcesState {
     }
 }
 
+#[cfg(test)]
 async fn update_existing_source_for_reingest_with_repo(
     repo: &dyn SourceRepo,
     existing: &Source,
@@ -380,6 +386,9 @@ pub enum SourceIngestRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizedSourceIngestRequest {
+    /// Explicit immutable revision and desired-head comparison.
+    #[serde(default)]
+    pub intake: IntakeControl,
     /// Human-readable source name.
     pub name: String,
     /// Optional source URI.
@@ -423,6 +432,9 @@ pub struct NormalizedSourceIngestRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacySourceIngestRequest {
+    /// Explicit immutable revision and desired-head comparison.
+    #[serde(default)]
+    pub intake: IntakeControl,
     /// Source data to create first-class provenance.
     pub source: Source,
     /// Optional staged manual document payload for retrieval/graph ingest.
@@ -460,6 +472,8 @@ struct NormalizedStagedDocInput {
 /// Source-first ingest response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceIngestResult {
+    /// Durable acceptance receipt, distinct from completed publication.
+    pub operation: elephant_types::publication::OperationReceipt,
     /// Created source ID.
     pub source_id: String,
     /// Current lifecycle status.
@@ -752,55 +766,6 @@ fn build_media_attachments(
     })
 }
 
-async fn persist_prepared_media_assets(
-    storage: &StorageClient,
-    assets: &[MediaAsset],
-) -> Result<(), (StatusCode, Json<ApiError>)> {
-    let repo = MediaAssetRepository::new(storage.clone());
-    let mut persisted_ids = Vec::with_capacity(assets.len());
-    for asset in assets {
-        match repo.create(asset.clone()).await {
-            Ok(_) => persisted_ids.push(asset.base.id.clone()),
-            Err(e) => {
-                rollback_media_assets_by_ids(storage, &asset.base.space_id, &persisted_ids).await;
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn rollback_media_assets_by_ids(
-    storage: &StorageClient,
-    space_id: &str,
-    asset_ids: &[RecordId],
-) {
-    let repo = MediaAssetRepository::new(storage.clone());
-    for asset_id in asset_ids {
-        if let Err(err) = repo.delete(space_id, asset_id).await {
-            warn!(
-                asset_id = %asset_id,
-                error = %err,
-                "failed to roll back staged media asset after source ingest failure"
-            );
-        }
-    }
-}
-
-async fn rollback_prepared_media_assets(storage: &StorageClient, assets: &[MediaAsset]) {
-    let Some(first_asset) = assets.first() else {
-        return;
-    };
-    let asset_ids = assets
-        .iter()
-        .map(|asset| asset.base.id.clone())
-        .collect::<Vec<_>>();
-    rollback_media_assets_by_ids(storage, &first_asset.base.space_id, &asset_ids).await;
-}
-
 impl NormalizedStagedDocInput {
     const fn has_doc_fields(&self) -> bool {
         self.title.is_some()
@@ -876,6 +841,13 @@ impl NormalizedStagedDocInput {
 }
 
 impl SourceIngestRequest {
+    fn intake(&self) -> IntakeControl {
+        match self {
+            Self::Normalized(req) => req.intake.clone(),
+            Self::Legacy(req) => req.intake.clone(),
+        }
+    }
+
     const fn sync(&self) -> bool {
         match self {
             Self::Normalized(req) => req.sync,
@@ -974,6 +946,7 @@ fn build_source_search_criteria(
     criteria
 }
 
+#[cfg(test)]
 async fn stage_source_for_ingest(
     state: &SourcesState,
     principal: &AuthPrincipal,
@@ -1050,47 +1023,7 @@ async fn stage_source_for_ingest(
     Ok((source, None))
 }
 
-async fn rollback_staged_source_and_doc(
-    state: &SourcesState,
-    source: &Source,
-    previous_source: Option<&Source>,
-    staged_doc: Option<&PersistedManualDoc>,
-) {
-    if let Some(staged_doc) = staged_doc {
-        if let Err(err) = rollback_persisted_manual_doc(&state.storage, staged_doc).await {
-            warn!(
-                doc_id = %staged_doc.doc.base.id,
-                source_id = %source.base.id,
-                rollback_error = %err,
-                "failed to roll back staged source doc after ingest failure"
-            );
-        }
-    }
-
-    match previous_source {
-        Some(previous_source) => {
-            if let Err(err) =
-                rollback_persisted_source(&state.storage, source, Some(previous_source)).await
-            {
-                warn!(
-                    source_id = %previous_source.base.id,
-                    rollback_error = %err,
-                    "failed to roll back staged source after ingest failure"
-                );
-            }
-        }
-        None => {
-            if let Err(err) = rollback_persisted_source(&state.storage, source, None).await {
-                warn!(
-                    source_id = %source.base.id,
-                    rollback_error = %err,
-                    "failed to delete staged source after ingest failure"
-                );
-            }
-        }
-    }
-}
-
+#[cfg(test)]
 async fn create_or_reuse_source_candidate(
     state: &SourcesState,
     principal: &AuthPrincipal,
@@ -1167,126 +1100,6 @@ async fn create_or_reuse_source_candidate(
     }
 }
 
-async fn authorize_persisted_source_doc_write(
-    state: &SourcesState,
-    principal: &AuthPrincipal,
-    source: &Source,
-    doc: &Doc,
-) -> Result<(), (StatusCode, Json<ApiError>)> {
-    let preview = preview_persisted_manual_doc_for_source(&state.storage, source, doc)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-    state
-        .authz
-        .authorize_record_write(principal, &preview, "write:doc")
-        .map_err(|e| {
-            (
-                StatusCode::FORBIDDEN,
-                Json(ApiError {
-                    code: e.code,
-                    message: e.message,
-                    details: None,
-                }),
-            )
-        })
-}
-
-async fn persist_manual_doc_with_source_rollback(
-    state: &SourcesState,
-    source: &Source,
-    previous_source: Option<&Source>,
-    doc: Doc,
-) -> Result<PersistedManualDoc, (StatusCode, Json<ApiError>)> {
-    match persist_manual_doc_for_source_detailed(&state.storage, source, doc).await {
-        Ok(staged_doc) => Ok(staged_doc),
-        Err(err) => {
-            match previous_source {
-                Some(previous_source) => {
-                    if let Err(rollback_err) =
-                        rollback_persisted_source(&state.storage, source, Some(previous_source))
-                            .await
-                    {
-                        warn!(
-                            source_id = %previous_source.base.id,
-                            error = %err,
-                            rollback_error = %rollback_err,
-                            "failed to roll back source after manual doc persistence error"
-                        );
-                    }
-                }
-                None => {
-                    if let Err(cleanup_err) =
-                        rollback_persisted_source(&state.storage, source, None).await
-                    {
-                        warn!(
-                            source_id = %source.base.id,
-                            error = %err,
-                            cleanup_error = %cleanup_err,
-                            "failed to roll back source after manual doc persistence error"
-                        );
-                    }
-                }
-            }
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(err.to_string())),
-            ))
-        }
-    }
-}
-
-async fn persist_staged_source_and_doc(
-    state: &SourcesState,
-    principal: &AuthPrincipal,
-    source_candidate: Source,
-    previous_source: Option<Source>,
-    doc: Option<Doc>,
-) -> Result<(Source, Option<PersistedManualDoc>, Option<Source>), (StatusCode, Json<ApiError>)> {
-    if let Some(previous_source) = previous_source {
-        let updated_source = update_existing_source_for_reingest_with_repo(
-            state.source_repo.as_ref(),
-            &previous_source,
-            source_candidate,
-        )
-        .await?;
-        let staged_doc = match doc {
-            Some(doc) => Some(
-                persist_manual_doc_with_source_rollback(
-                    state,
-                    &updated_source,
-                    Some(&previous_source),
-                    doc,
-                )
-                .await?,
-            ),
-            None => None,
-        };
-        Ok((updated_source, staged_doc, None))
-    } else {
-        let (created_source, rollback_source) =
-            create_or_reuse_source_candidate(state, principal, &source_candidate, doc.is_some())
-                .await?;
-        let staged_doc = match doc {
-            Some(doc) => Some(
-                persist_manual_doc_with_source_rollback(
-                    state,
-                    &created_source,
-                    rollback_source.as_ref(),
-                    doc,
-                )
-                .await?,
-            ),
-            None => None,
-        };
-        Ok((created_source, staged_doc, rollback_source))
-    }
-}
-
 async fn count_visible_source_search_results(
     state: &SourcesState,
     principal: &AuthPrincipal,
@@ -1323,10 +1136,15 @@ async fn count_visible_source_search_results(
             break;
         };
 
-        if !state
-            .authz
-            .filter_records(principal, vec![source], SOURCE_SEARCH_SCOPE)
-            .is_empty()
+        if !super::current_read::filter(
+            Some(&state.storage),
+            &state.authz,
+            principal,
+            vec![source],
+            SOURCE_SEARCH_SCOPE,
+        )
+        .await?
+        .is_empty()
         {
             total_visible = total_visible.saturating_add(1);
         }
@@ -1401,9 +1219,14 @@ async fn rerun_source_search_after_authz_filter(
             break;
         };
 
-        let allowed = state
-            .authz
-            .filter_records(principal, vec![source], SOURCE_SEARCH_SCOPE);
+        let allowed = super::current_read::filter(
+            Some(&state.storage),
+            &state.authz,
+            principal,
+            vec![source],
+            SOURCE_SEARCH_SCOPE,
+        )
+        .await?;
         if let Some(source) = allowed.into_iter().next() {
             if visible.len() < limit {
                 visible.push(source);
@@ -1445,6 +1268,10 @@ async fn rerun_source_search_after_authz_filter(
 }
 
 /// POST /v1/sources/search - Search sources.
+#[expect(
+    clippy::if_not_else,
+    reason = "Keep the authorization-filter retry path first and preserve its branch ownership"
+)]
 async fn search_sources(
     State(state): State<Arc<SourcesState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -1484,9 +1311,14 @@ async fn search_sources(
     })?;
 
     let page_len = result.results.len();
-    let filtered = state
-        .authz
-        .filter_records(&principal, result.results, SOURCE_SEARCH_SCOPE);
+    let filtered = super::current_read::filter(
+        Some(&state.storage),
+        &state.authz,
+        &principal,
+        result.results,
+        SOURCE_SEARCH_SCOPE,
+    )
+    .await?;
     let total_visible = count_visible_source_search_results(
         &state,
         &principal,
@@ -1496,8 +1328,8 @@ async fn search_sources(
     )
     .await?;
 
-    if filtered.len() != page_len {
-        let response = rerun_source_search_after_authz_filter(
+    let mut response = if filtered.len() != page_len {
+        rerun_source_search_after_authz_filter(
             &state,
             &principal,
             &space_id,
@@ -1506,52 +1338,70 @@ async fn search_sources(
             req.include_deleted,
             start_cursor,
         )
-        .await?;
-        return Ok(Json(response));
-    }
+        .await?
+    } else {
+        SourceSearchResponse {
+            results: filtered,
+            cursor: result.cursor,
+            has_more: result.has_more,
+            total: total_visible,
+        }
+    };
+    response.results = response
+        .results
+        .into_iter()
+        .map(|source| crate::redaction::redact_source(&principal, source).data)
+        .collect();
+    Ok(Json(response))
+}
 
-    Ok(Json(SourceSearchResponse {
-        results: filtered,
-        cursor: result.cursor,
-        has_more: result.has_more,
-        total: total_visible,
-    }))
+/// Retained storage-shaped write with explicit acceptance controls.
+#[derive(Debug, Deserialize)]
+pub struct SourceWriteRequest {
+    /// Complete proposed source envelope.
+    #[serde(flatten)]
+    pub source: Source,
+    /// Revision and desired-head CAS, separate from metadata.
+    #[serde(default)]
+    pub intake: IntakeControl,
 }
 
 /// POST /v1/sources - Create source.
+#[expect(
+    clippy::large_futures,
+    reason = "Retain the existing dispatch future layout and ownership across the original await"
+)]
 async fn create_source(
     State(state): State<Arc<SourcesState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
-    Json(source): Json<Source>,
-) -> Result<(StatusCode, Json<Source>), (StatusCode, Json<ApiError>)> {
-    // Override space_id with principal's space to prevent cross-space writes
-    let mut source = source;
+    Json(request): Json<SourceWriteRequest>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<ApiError>)> {
+    let mut source = request.source;
     source.base.space_id = require_space_id(&principal)?;
-
-    state
-        .authz
-        .authorize_record_write(&principal, &source, "write:source")
-        .map_err(|e| {
-            (
-                StatusCode::FORBIDDEN,
-                Json(ApiError {
-                    code: e.code,
-                    message: e.message,
-                    details: None,
-                }),
-            )
-        })?;
-
-    match state.source_repo.create(source).await {
-        Ok(created) => Ok((StatusCode::CREATED, Json(created))),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
-    }
+    source.set_requested_ingest_mode(IngestMode::Metadata);
+    let (accepted, work_item_id) = accept_intake(
+        &state.storage,
+        &state.authz,
+        &principal,
+        source,
+        None,
+        request.intake,
+        &[],
+    )
+    .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "source":crate::redaction::redact_source(&principal, accepted.source).data,"operation":accepted.operation,"work_item_id":work_item_id
+        })),
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::large_futures,
+    reason = "Retain the existing dispatch future layout and ownership across the original await"
+)]
 async fn ingest_source(
     State(state): State<Arc<SourcesState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -1568,6 +1418,8 @@ async fn ingest_source(
         ));
     }
     let space_id = require_space_id(&principal)?;
+    let intake = req.intake();
+    let legacy_document_identity = matches!(&req, SourceIngestRequest::Legacy(_));
     let (mut source, prepared_doc, ingest_mode) = req.into_parts(&space_id)?;
     let pending_assets = prepared_doc
         .as_ref()
@@ -1576,6 +1428,17 @@ async fn ingest_source(
     source.base.space_id.clone_from(&space_id);
     if doc.is_none() {
         source.base.id = deterministic_source_id_for_ingest(&source);
+    } else if legacy_document_identity {
+        if let Some(document) = &mut doc {
+            document.base.space_id.clone_from(&space_id);
+            elephant_storage::source_intake::bind_legacy_document_source_identity(
+                &state.storage,
+                &mut source,
+                document,
+            )
+            .await
+            .map_err(super::source_intake::storage_error)?;
+        }
     }
 
     let doc_id =
@@ -1598,63 +1461,33 @@ async fn ingest_source(
         )
     })?;
     source.set_requested_ingest_mode(requested_mode);
-    let (source_candidate, previous_source) =
-        match stage_source_for_ingest(&state, &principal, source, doc.as_ref()).await {
-            Ok(value) => value,
-            Err(err) => return Err(err),
-        };
-    if let Some(doc_ref) = doc.as_ref() {
-        authorize_persisted_source_doc_write(&state, &principal, &source_candidate, doc_ref)
-            .await?;
-    }
-
-    persist_prepared_media_assets(&state.storage, &pending_assets).await?;
-
-    let rollback_source = previous_source.clone();
-    let (created, staged_doc, rollback_source_override) = match Box::pin(
-        persist_staged_source_and_doc(&state, &principal, source_candidate, previous_source, doc),
+    let (accepted, work_item_id) = accept_intake(
+        &state.storage,
+        &state.authz,
+        &principal,
+        source,
+        doc.as_ref(),
+        intake,
+        &pending_assets,
     )
-    .await
-    {
-        Ok(value) => value,
-        Err(err) => {
-            rollback_prepared_media_assets(&state.storage, &pending_assets).await;
-            return Err(err);
-        }
-    };
-    let rollback_source = rollback_source.or(rollback_source_override);
-    let work_item_id_result =
-        enqueue_triage_source_work_item(&state.storage, &created, &principal.subject, 5).await;
-    let work_item_id = match work_item_id_result {
-        Ok(work_item_id) => work_item_id,
-        Err(e) => {
-            rollback_prepared_media_assets(&state.storage, &pending_assets).await;
-            rollback_staged_source_and_doc(
-                &state,
-                &created,
-                rollback_source.as_ref(),
-                staged_doc.as_ref(),
-            )
-            .await;
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            ));
-        }
-    };
-
+    .await?;
     Ok((
-        StatusCode::CREATED,
+        StatusCode::ACCEPTED,
         Json(SourceIngestResult {
-            source_id: created.base.id.to_string(),
-            lifecycle_status: created.lifecycle_status,
-            current_ingest_mode: created.current_ingest_mode,
-            work_item_id: Some(work_item_id.to_string()),
-            doc_id,
+            source_id: accepted.source.base.id.to_string(),
+            lifecycle_status: accepted.source.lifecycle_status,
+            current_ingest_mode: accepted.source.current_ingest_mode,
+            work_item_id: work_item_id.map(|id| id.to_string()),
+            doc_id: accepted.document.map(|doc| doc.base.id.to_string()),
+            operation: accepted.operation,
         }),
     ))
 }
 
+#[expect(
+    clippy::large_futures,
+    reason = "Retain the existing dispatch future layout and ownership across the original await"
+)]
 async fn ingest_source_http(
     State(state): State<Arc<SourcesState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -1728,12 +1561,9 @@ async fn stage_manual_doc_for_ingest(
             })?;
     }
 
-    let doc_id = apply_manual_doc_to_source(source, doc_ref).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiError::validation(e.to_string())),
-        )
-    })?;
+    elephant_storage::source_intake::attach_document(source, doc_ref)
+        .map_err(super::source_intake::storage_error)?;
+    let doc_id = doc_ref.base.id.to_string();
     Ok(Some(doc_id))
 }
 
@@ -1765,7 +1595,17 @@ async fn get_source(
                         }),
                     )
                 })?;
-            Ok(Json(source))
+            let source = super::current_read::require(
+                Some(&state.storage),
+                &state.authz,
+                &principal,
+                source,
+                "read:source",
+            )
+            .await?;
+            Ok(Json(
+                crate::redaction::redact_source(&principal, source).data,
+            ))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -1779,65 +1619,49 @@ async fn get_source(
 }
 
 /// PUT /v1/sources/{id} - Update source.
+#[expect(
+    clippy::large_futures,
+    reason = "Retain the existing dispatch future layout and ownership across the original await"
+)]
 async fn update_source(
     State(state): State<Arc<SourcesState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(id): Path<String>,
-    Json(source): Json<Source>,
-) -> ApiResult<Source> {
+    Json(request): Json<SourceWriteRequest>,
+) -> ApiResult<Value> {
     let space_id = require_space_id(&principal)?;
-    let rid = parse_id(&id, TableName::Source).map_err(|e| {
-        (
+    let rid = parse_id(&id, TableName::Source).map_err(super::source_intake::storage_error)?;
+    let mut source = request.source;
+    if source.base.id != rid || source.base.space_id != space_id {
+        return Err((
             StatusCode::BAD_REQUEST,
-            Json(ApiError::validation(e.to_string())),
-        )
-    })?;
-    match state.source_repo.get(&space_id, &rid).await {
-        Ok(Some(existing)) => {
-            state
-                .authz
-                .authorize_record_write(&principal, &existing, "write:source")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-            state
-                .authz
-                .authorize_record_write(&principal, &source, "write:source")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-
-            match state.source_repo.update(&space_id, &rid, source).await {
-                Ok(updated) => Ok(Json(updated)),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
-            }
-        }
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError::not_found("Source", &id)),
-        )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+            Json(ApiError::validation(
+                "source identity differs from selected route",
+            )),
+        ));
     }
+    if request.intake.expected_generation.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::validation(
+                "update_source requires intake.expected_generation",
+            )),
+        ));
+    }
+    source.base.space_id = space_id;
+    let (accepted, work_item_id) = accept_intake(
+        &state.storage,
+        &state.authz,
+        &principal,
+        source,
+        None,
+        request.intake,
+        &[],
+    )
+    .await?;
+    Ok(Json(
+        serde_json::json!({"source":crate::redaction::redact_source(&principal, accepted.source).data,"operation":accepted.operation,"work_item_id":work_item_id}),
+    ))
 }
 
 /// DELETE /v1/sources/{id} - Soft delete source.
@@ -1845,7 +1669,8 @@ async fn delete_source(
     State(state): State<Arc<SourcesState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(id): Path<String>,
-) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    Query(intake): Query<IntakeControl>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<ApiError>)> {
     let space_id = require_space_id(&principal)?;
     let rid = parse_id(&id, TableName::Source).map_err(|e| {
         (
@@ -1853,7 +1678,7 @@ async fn delete_source(
             Json(ApiError::validation(e.to_string())),
         )
     })?;
-    match state.source_repo.get(&space_id, &rid).await {
+    match state.source_repo.get_with_deleted(&space_id, &rid).await {
         Ok(Some(existing)) => {
             state
                 .authz
@@ -1869,13 +1694,19 @@ async fn delete_source(
                     )
                 })?;
 
-            match state.source_repo.delete(&space_id, &rid).await {
-                Ok(()) => Ok(StatusCode::NO_CONTENT),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
-            }
+            let operation = super::source_intake::retract_intake(
+                &state.storage,
+                &state.authz,
+                &principal,
+                &existing,
+                intake,
+                None,
+            )
+            .await?;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({"operation":operation})),
+            ))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -1889,11 +1720,16 @@ async fn delete_source(
 }
 
 /// POST /v1/sources/{id}/restore - Restore soft-deleted source.
+#[expect(
+    clippy::large_futures,
+    reason = "Retain the existing dispatch future layout and ownership across the original await"
+)]
 async fn restore_source(
     State(state): State<Arc<SourcesState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(id): Path<String>,
-) -> ApiResult<Source> {
+    Query(intake): Query<IntakeControl>,
+) -> ApiResult<Value> {
     let space_id = require_space_id(&principal)?;
     let rid = parse_id(&id, TableName::Source).map_err(|e| {
         (
@@ -1931,25 +1767,18 @@ async fn restore_source(
                     )
                 })?;
 
-            match state
-                .source_repo
-                .restore_guarded(&space_id, &rid, &existing)
-                .await
-            {
-                Ok(restored) => Ok(Json(restored)),
-                Err(elephant_storage::StorageError::Conflict(_)) => Err((
-                    StatusCode::CONFLICT,
-                    Json(ApiError {
-                        code: "CONFLICT".to_string(),
-                        message: "record changed since it was authorized; retry".to_string(),
-                        details: None,
-                    }),
-                )),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
-            }
+            let (accepted, work_item_id) = super::source_intake::restore_intake(
+                &state.storage,
+                &state.authz,
+                &principal,
+                existing,
+                intake,
+                None,
+            )
+            .await?;
+            Ok(Json(
+                serde_json::json!({"source":crate::redaction::redact_source(&principal, accepted.source).data,"operation":accepted.operation,"work_item_id":work_item_id}),
+            ))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -2005,6 +1834,80 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
+    async fn source_read_and_search_project_private_payloads_after_authorization() {
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let repo = elephant_storage::SourceRepository::new(storage.clone());
+        let mut source = Source::new(
+            BaseFields::new(
+                RecordId::new_v4(TableName::Source),
+                "projection".into(),
+                "fixture".into(),
+            ),
+            SourceType::Manual,
+            "projection-content-hash".into(),
+        );
+        source.external_id = Some("Projection Canary".into());
+        source.uri = Some("https://example.test/private-location".into());
+        source.path = Some("/private/source-location".into());
+        source.metadata = serde_json::json!({"public_note":"kept","_manual_doc":{
+            "text":"private-template-canary", "_intake_assets":[{"bytes":"private-media-canary"}]
+        }});
+        let saved = Repository::create(&repo, source).await.unwrap();
+        let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
+        for raw in [false, true] {
+            let mut principal = AuthPrincipal {
+                subject: "reader".into(),
+                space_id: Some("projection".into()),
+                scopes: vec!["read:source".into()],
+                ..AuthPrincipal::default()
+            };
+            if raw {
+                principal.scopes.push("read:source:raw".into());
+            }
+            let Json(direct) = get_source(
+                State(state.clone()),
+                axum::Extension(principal.clone()),
+                Path(saved.base.id.to_string()),
+            )
+            .await
+            .unwrap();
+            let Json(search) = search_sources(
+                State(state.clone()),
+                axum::Extension(principal),
+                Json(SourceSearchRequest {
+                    query: None,
+                    space_id: None,
+                    include_deleted: false,
+                    limit: 10,
+                    cursor: None,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(search.results.len(), 1);
+            for projected in [&direct, &search.results[0]] {
+                assert_eq!(projected.base.id, saved.base.id);
+                assert_eq!(projected.metadata["public_note"], "kept");
+                assert!(projected.metadata.get("_manual_doc").is_none());
+                assert_eq!(projected.uri.is_some(), raw);
+                assert_eq!(projected.path.is_some(), raw);
+            }
+        }
+        assert_eq!(
+            Repository::get(&repo, "projection", &saved.base.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata,
+            saved.metadata
+        );
+    }
+
     fn legacy_ingest_request(
         source: Source,
         doc: Option<Doc>,
@@ -2012,6 +1915,7 @@ mod tests {
         sync: bool,
     ) -> SourceIngestRequest {
         SourceIngestRequest::Legacy(Box::new(LegacySourceIngestRequest {
+            intake: IntakeControl::default(),
             source,
             doc,
             ingest_mode,
@@ -2034,6 +1938,7 @@ mod tests {
             .expect("source type string")
             .to_string();
         SourceIngestRequest::Normalized(Box::new(NormalizedSourceIngestRequest {
+            intake: IntakeControl::default(),
             name: source
                 .external_id
                 .clone()
@@ -2052,13 +1957,57 @@ mod tests {
         }))
     }
 
+    fn replacement_request(
+        mut request: SourceIngestRequest,
+        operation: &elephant_types::publication::OperationReceipt,
+        revision: &str,
+    ) -> SourceIngestRequest {
+        let control = IntakeControl {
+            revision_id: Some(revision.into()),
+            idempotency_key: Some(revision.into()),
+            expected_generation: Some(operation.source_generation.clone()),
+        };
+        match &mut request {
+            SourceIngestRequest::Normalized(input) => input.intake = control,
+            SourceIngestRequest::Legacy(input) => input.intake = control,
+        }
+        request
+    }
+
+    async fn intake_test_storage() -> StorageClient {
+        let storage = StorageClient::new_embedded()
+            .await
+            .expect("embedded storage");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    "default".into(),
+                    "fixture".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .expect("named space");
+        storage
+    }
+
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_source_http_rejects_invalid_json_with_structured_validation_error() {
         use axum::body::{to_bytes, Body};
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let app = source_routes()
             .layer(axum::Extension(AuthPrincipal::default()))
@@ -2111,7 +2060,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let source = Source::new(
             BaseFields::new(
@@ -2160,11 +2109,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_source_only_reingest_preserves_acl_in_staging_and_create_conflict() {
         use elephant_types::records::base::SubjectsState;
         use elephant_types::Link;
 
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = intake_test_storage().await;
         let state = SourcesState::new(storage.clone(), Arc::new(AuthzService::new()));
         let subject = RecordId::new_v4(TableName::Entity);
         let principal = AuthPrincipal {
@@ -2285,10 +2238,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_source_accepts_normalized_staged_doc_shape() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(
             storage.clone(),
             Arc::new(AuthzService::new()),
@@ -2296,7 +2251,12 @@ mod tests {
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: false,
             ..AuthPrincipal::default()
         };
@@ -2345,15 +2305,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_source_rejects_uri_media_transport() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
@@ -2395,15 +2362,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_legacy_ingest_source_rejects_path_or_uri_media_attachments() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
@@ -2460,15 +2434,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_source_rejects_inline_video_without_duration() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
@@ -2514,14 +2495,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_ingest_source_accepts_browser_style_data_url_inline_media() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
@@ -2563,7 +2547,7 @@ mod tests {
         .await
         .expect("data url inline media should be accepted");
 
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::ACCEPTED);
         assert!(result.doc_id.is_some());
 
         let doc_id = RecordId::from_str(&result.doc_id.expect("doc id")).expect("parse doc id");
@@ -2579,15 +2563,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_source_rejects_zero_duration_inline_video() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
@@ -2632,15 +2623,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ingest_source_same_name_with_distinct_content_creates_distinct_sources() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+    async fn test_ingest_source_same_identity_replaces_with_explicit_generation() {
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
@@ -2674,36 +2668,43 @@ mod tests {
         let (_, Json(second_result)) = ingest_source(
             State(state.clone()),
             axum::Extension(principal),
-            Json(normalized_ingest_request(
-                &source,
-                Some("Observed frame"),
-                Some("second observation"),
-                Vec::new(),
-                Some("frames"),
-                Some(IngestMode::Graph),
-                false,
+            Json(replacement_request(
+                normalized_ingest_request(
+                    &source,
+                    Some("Observed frame"),
+                    Some("second observation"),
+                    Vec::new(),
+                    Some("frames"),
+                    Some(IngestMode::Graph),
+                    false,
+                ),
+                &first_result.operation,
+                "v2",
             )),
         )
         .await
         .expect("second normalized source ingest");
 
-        assert_ne!(
+        assert_eq!(
             first_result.source_id, second_result.source_id,
-            "same display label but different content should not collapse to one source"
+            "explicit replacement preserves the stable external source identity"
         );
+        assert_ne!(
+            first_result.operation.source_generation,
+            second_result.operation.source_generation
+        );
+        assert_ne!(first_result.doc_id, second_result.doc_id);
 
         let sources = SourceRepository::new(state.storage.clone())
             .list("default", 10, None)
             .await
             .expect("list sources");
-        assert_eq!(sources.len(), 2);
+        assert_eq!(sources.len(), 1);
     }
 
     #[tokio::test]
     async fn test_ingest_source_rolls_back_media_assets_when_authorization_fails() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
@@ -2758,15 +2759,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_source_rejects_missing_space_id_before_cross_space_staging() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: None,
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
@@ -2812,15 +2820,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_source_rejects_sync_mode() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
@@ -2856,15 +2871,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_source_rejects_missing_space_id() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: None,
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
@@ -2897,15 +2919,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_source_rejects_empty_space_id() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("   ".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
@@ -2938,15 +2967,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_source_principal_space_override_allows_mismatched_payload_spaces() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
@@ -2988,20 +3024,27 @@ mod tests {
         .await
         .expect("principal space should win over payload placeholder spaces");
 
-        assert_eq!(result.0, StatusCode::CREATED);
+        assert_eq!(result.0, StatusCode::ACCEPTED);
         assert!(result.1.doc_id.is_some());
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_source_reuses_existing_source_and_resets_lifecycle() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
@@ -3042,24 +3085,9 @@ mod tests {
         .expect("first ingest");
 
         let source_id = RecordId::from_str(&first_result.source_id).expect("parse source id");
-        let mut existing_source = state
-            .source_repo
-            .get("default", &source_id)
-            .await
-            .expect("load source")
-            .expect("persisted source");
-        existing_source.base.security.level = 4;
-        existing_source.lifecycle_status = SourceLifecycleStatus::GraphReady;
-        existing_source.current_ingest_mode = Some(IngestMode::Graph);
-        state
-            .source_repo
-            .update("default", &source_id, existing_source)
-            .await
-            .expect("promote source state");
-
         let second_source = Source::new(
             BaseFields::new(
-                RecordId::new_v4(TableName::Source),
+                source_id.clone(),
                 "default".to_string(),
                 "tester".to_string(),
             ),
@@ -3081,17 +3109,22 @@ mod tests {
         let (_, Json(second_result)) = ingest_source(
             State(state.clone()),
             axum::Extension(principal),
-            Json(legacy_ingest_request(
-                second_source,
-                Some(second_doc),
-                Some(IngestMode::Graph),
-                false,
+            Json(replacement_request(
+                legacy_ingest_request(
+                    second_source,
+                    Some(second_doc),
+                    Some(IngestMode::Graph),
+                    false,
+                ),
+                &first_result.operation,
+                "v2",
             )),
         )
         .await
         .expect("second ingest");
 
         assert_eq!(first_result.source_id, second_result.source_id);
+        assert_ne!(first_result.doc_id, second_result.doc_id);
         assert_eq!(
             second_result.lifecycle_status,
             SourceLifecycleStatus::Discovered
@@ -3112,7 +3145,11 @@ mod tests {
         assert_eq!(persisted_source.current_ingest_mode, None);
 
         let persisted_doc = elephant_storage::DocRepository::new(state.storage.clone())
-            .get("default", &doc_id)
+            .get(
+                "default",
+                &RecordId::from_str(second_result.doc_id.as_deref().expect("new document"))
+                    .unwrap(),
+            )
             .await
             .expect("load doc")
             .expect("persisted doc");
@@ -3126,21 +3163,29 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_source_updates_extraction_guidance_on_reuse() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
 
         let first_request =
             SourceIngestRequest::Normalized(Box::new(NormalizedSourceIngestRequest {
+                intake: IntakeControl::default(),
                 name: "Example observation stream".to_string(),
                 uri: Some("example://session/123/frame/1".to_string()),
                 source_type: Some("device_frame".to_string()),
@@ -3168,22 +3213,9 @@ mod tests {
         .expect("first ingest");
 
         let source_id = RecordId::from_str(&first_result.source_id).expect("parse source id");
-        let mut existing_source = state
-            .source_repo
-            .get("default", &source_id)
-            .await
-            .expect("load source")
-            .expect("persisted source");
-        existing_source.lifecycle_status = SourceLifecycleStatus::MetadataReady;
-        existing_source.current_ingest_mode = Some(IngestMode::Metadata);
-        state
-            .source_repo
-            .update("default", &source_id, existing_source)
-            .await
-            .expect("promote source state");
-
         let second_request =
             SourceIngestRequest::Normalized(Box::new(NormalizedSourceIngestRequest {
+                intake: IntakeControl::default(),
                 name: "Example observation stream".to_string(),
                 uri: Some("example://session/123/frame/1".to_string()),
                 source_type: Some("device_frame".to_string()),
@@ -3205,7 +3237,11 @@ mod tests {
         let (_, Json(second_result)) = ingest_source(
             State(state.clone()),
             axum::Extension(principal),
-            Json(second_request),
+            Json(replacement_request(
+                second_request,
+                &first_result.operation,
+                "v2",
+            )),
         )
         .await
         .expect("second ingest");
@@ -3245,15 +3281,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_source_rejects_overwrite_of_secured_existing_doc() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
             space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            scopes: vec![
+                "write:source".into(),
+                "write:doc".into(),
+                "read:source".into(),
+                "read:doc:metadata".into(),
+            ],
             ..AuthPrincipal::default()
         };
         let doc_id = RecordId::new_v4(TableName::Doc);
@@ -3292,6 +3335,7 @@ mod tests {
         .await
         .expect("first ingest");
 
+        let doc_id = RecordId::from_str(first_result.doc_id.as_deref().unwrap()).unwrap();
         let source_id = RecordId::from_str(&first_result.source_id).expect("parse source id");
         let mut existing_doc = elephant_storage::DocRepository::new(state.storage.clone())
             .get("default", &doc_id)
@@ -3326,7 +3370,7 @@ mod tests {
             "hash-2".to_string(),
         );
         let err = ingest_source(
-            State(state),
+            State(state.clone()),
             axum::Extension(principal),
             Json(legacy_ingest_request(
                 second_source,
@@ -3339,13 +3383,51 @@ mod tests {
         .expect_err("secured existing doc should block overwrite");
 
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            state
+                .source_repo
+                .get("default", &source_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .base
+                .security
+                .level,
+            4
+        );
+        assert_eq!(
+            elephant_storage::DocRepository::new(state.storage.clone())
+                .get("default", &doc_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .base
+                .security
+                .level,
+            4
+        );
+        assert_eq!(
+            elephant_storage::SourceRepository::new(state.storage.clone())
+                .list("default", 10, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            elephant_storage::SourcePublicationRepository::new(state.storage.clone())
+                .head("default", &source_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            first_result.operation.operation_id
+        );
     }
 
     #[tokio::test]
     async fn test_ingest_source_without_doc_reuses_deterministic_source_id() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
@@ -3410,159 +3492,152 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ingest_source_without_doc_restores_soft_deleted_source() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
-        let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));
-        let principal = AuthPrincipal {
-            subject: "tester".to_string(),
-            space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string()],
-            bypass_abac: true,
-            ..AuthPrincipal::default()
-        };
-
-        let source = Source::new(
-            BaseFields::new(
-                RecordId::new_v4(TableName::Source),
-                "default".to_string(),
-                "tester".to_string(),
-            ),
-            SourceType::Web,
-            "same-hash".to_string(),
-        );
-
-        let (_, Json(first_result)) = ingest_source(
-            State(state.clone()),
-            axum::Extension(principal.clone()),
-            Json(legacy_ingest_request(
-                source.clone(),
-                None,
-                Some(IngestMode::Metadata),
-                false,
-            )),
-        )
-        .await
-        .expect("first ingest");
-
-        let source_id = RecordId::from_str(&first_result.source_id).expect("parse source id");
-        state
-            .source_repo
-            .delete("default", &source_id)
-            .await
-            .expect("delete source");
-
-        let (_, Json(second_result)) = ingest_source(
-            State(state.clone()),
-            axum::Extension(principal),
-            Json(legacy_ingest_request(
-                source,
-                None,
-                Some(IngestMode::Metadata),
-                false,
-            )),
-        )
-        .await
-        .expect("second ingest");
-
-        assert_eq!(first_result.source_id, second_result.source_id);
-        let restored = state
-            .source_repo
-            .get("default", &source_id)
-            .await
-            .expect("load source")
-            .expect("restored source");
-        assert!(restored.base.deleted_at.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_ingest_source_with_doc_restores_soft_deleted_source() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+    async fn test_ingest_source_without_doc_requires_explicit_restore() {
+        let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(
             storage.clone(),
             Arc::new(AuthzService::new()),
         ));
         let principal = AuthPrincipal {
-            subject: "tester".to_string(),
-            space_id: Some("default".to_string()),
-            scopes: vec!["write:source".to_string(), "write:doc".to_string()],
+            subject: "tester".into(),
+            space_id: Some("default".into()),
             bypass_abac: true,
             ..AuthPrincipal::default()
         };
-
-        let source_id = RecordId::new_v4(TableName::Source);
-        let doc_id = RecordId::new_v4(TableName::Doc);
         let source = Source::new(
             BaseFields::new(
-                source_id.clone(),
-                "default".to_string(),
-                "tester".to_string(),
+                RecordId::new_v4(TableName::Source),
+                "default".into(),
+                "tester".into(),
             ),
             SourceType::Manual,
-            "same-hash".to_string(),
+            "input".into(),
         );
-        let doc = Doc {
-            base: BaseFields::new(doc_id.clone(), "default".to_string(), "tester".to_string()),
-            title: "Doc".to_string(),
-            text: "First".to_string(),
-            sidecar_text: None,
-            source: None,
-            media_attachments: Vec::new(),
-            rendition_key: "manual".to_string(),
-            metadata: serde_json::json!({}),
-        };
-
-        let (_, Json(first_result)) = ingest_source(
+        let request = normalized_ingest_request(
+            &source,
+            None,
+            None,
+            vec![],
+            None,
+            Some(IngestMode::Metadata),
+            false,
+        );
+        let (_, Json(first)) = ingest_source(
             State(state.clone()),
             axum::Extension(principal.clone()),
-            Json(legacy_ingest_request(
-                source.clone(),
-                Some(doc.clone()),
-                Some(IngestMode::Graph),
-                false,
-            )),
+            Json(request),
         )
         .await
-        .expect("first ingest");
-
-        state
-            .source_repo
-            .delete("default", &source_id)
-            .await
-            .expect("delete source");
-
-        let (_, Json(second_result)) = ingest_source(
+        .expect("accept");
+        let source_id = first.source_id.clone();
+        let (_, Json(retracted)) = delete_source(
+            State(state.clone()),
+            axum::Extension(principal.clone()),
+            Path(source_id.clone()),
+            Query(IntakeControl {
+                expected_generation: Some(first.operation.source_generation),
+                idempotency_key: Some("delete".into()),
+                revision_id: None,
+            }),
+        )
+        .await
+        .expect("retract");
+        let Json(restored) = restore_source(
             State(state.clone()),
             axum::Extension(principal),
-            Json(legacy_ingest_request(
-                source,
-                Some(doc),
-                Some(IngestMode::Graph),
-                false,
-            )),
+            Path(source_id),
+            Query(IntakeControl {
+                expected_generation: Some(
+                    retracted["operation"]["source_generation"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                ),
+                idempotency_key: Some("restore".into()),
+                revision_id: Some("restored".into()),
+            }),
         )
         .await
-        .expect("second ingest");
-
-        assert_eq!(first_result.source_id, second_result.source_id);
-        let restored = state
-            .source_repo
-            .get("default", &source_id)
-            .await
-            .expect("load source")
-            .expect("restored source");
-        assert!(restored.base.deleted_at.is_none());
-        let persisted_doc = elephant_storage::DocRepository::new(state.storage.clone())
-            .get("default", &doc_id)
-            .await
-            .expect("load doc")
-            .expect("persisted doc");
-        assert_eq!(
-            persisted_doc.source.as_ref().expect("source link").id(),
-            &source_id
+        .expect("explicit restore");
+        assert_ne!(
+            restored["operation"]["operation_id"],
+            serde_json::json!(first.operation.operation_id)
         );
+        assert!(restored["source"]["deleted_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_ingest_source_with_doc_requires_explicit_restore() {
+        let storage = intake_test_storage().await;
+        let state = Arc::new(SourcesState::new(
+            storage.clone(),
+            Arc::new(AuthzService::new()),
+        ));
+        let principal = AuthPrincipal {
+            subject: "tester".into(),
+            space_id: Some("default".into()),
+            bypass_abac: true,
+            ..AuthPrincipal::default()
+        };
+        let source = Source::new(
+            BaseFields::new(
+                RecordId::new_v4(TableName::Source),
+                "default".into(),
+                "tester".into(),
+            ),
+            SourceType::Manual,
+            "input".into(),
+        );
+        let request = normalized_ingest_request(
+            &source,
+            Some("Doc"),
+            Some("Facts"),
+            vec![],
+            None,
+            Some(IngestMode::Graph),
+            false,
+        );
+        let (_, Json(first)) = ingest_source(
+            State(state.clone()),
+            axum::Extension(principal.clone()),
+            Json(request),
+        )
+        .await
+        .expect("accept");
+        let source_id = first.source_id.clone();
+        let (_, Json(retracted)) = delete_source(
+            State(state.clone()),
+            axum::Extension(principal.clone()),
+            Path(source_id.clone()),
+            Query(IntakeControl {
+                expected_generation: Some(first.operation.source_generation),
+                idempotency_key: Some("delete".into()),
+                revision_id: None,
+            }),
+        )
+        .await
+        .expect("retract");
+        let Json(restored) = restore_source(
+            State(state.clone()),
+            axum::Extension(principal),
+            Path(source_id),
+            Query(IntakeControl {
+                expected_generation: Some(
+                    retracted["operation"]["source_generation"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                ),
+                idempotency_key: Some("restore".into()),
+                revision_id: Some("restored".into()),
+            }),
+        )
+        .await
+        .expect("explicit restore");
+        assert_ne!(
+            restored["operation"]["operation_id"],
+            serde_json::json!(first.operation.operation_id)
+        );
+        assert!(restored["source"]["deleted_at"].is_null());
     }
 }

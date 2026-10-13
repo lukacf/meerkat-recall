@@ -27,6 +27,7 @@ elephant-embeddings = { path = "../../crates/embeddings" }
 elephant-mcp = { path = "../../crates/mcp" }
 elephant-policy = { path = "../../crates/policy" }
 elephant-identity = { path = "../../crates/identity" }
+elephant-knowledge-views = { path = "../../crates/knowledge-views" }
 elephant-migrations = { path = "../../crates/migrations" }
 elephant-api = { path = "../../bin/elephant-api" }
 elephant-outbox = { path = "../../crates/outbox" }

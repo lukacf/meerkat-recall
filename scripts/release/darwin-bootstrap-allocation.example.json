@@ -1,0 +1,63 @@
+{
+  "format": "recall-darwin-bootstrap-allocation/v1",
+  "execution_authorized": false,
+  "operation": "tools",
+  "target": "aarch64-apple-darwin",
+  "cargo_jobs": 4,
+  "maximum_seconds": 43200,
+  "minimum_free_bytes": 268435456000,
+  "allocation_bytes": 161061273600,
+  "maximum_group_resident_bytes": 103079215104,
+  "started_at": "2026-10-07T09:01:32.294444Z",
+  "expires_at": "2026-10-07T20:11:00Z",
+  "lane": {
+    "coordinator": "codex-security-adr-mac",
+    "state": "START",
+    "grant_id": "recall-darwin-20261007T090132Z"
+  },
+  "task_directory": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1",
+  "budget_receipt": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1/private0700/resource-budget.json",
+  "lane_lock": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1/private0700/lane.lock",
+  "monitored_paths": [
+    "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1",
+    "/Users/luka/Library/Caches/rust-workspaces",
+    "/private/tmp",
+    "/Applications/Xcode.app"
+  ],
+  "bootstrap_python": {
+    "path": "/ACTUAL/REVIEWED/python3",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "origin_receipt": {
+      "path": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1/private0700/python3-origin.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "tools": {
+    "uv": {
+      "path": "/ACTUAL/REVIEWED/uv",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "origin_receipt": {
+        "path": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1/private0700/uv-origin.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "rustup": {
+      "path": "/ACTUAL/REVIEWED/rustup",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "origin_receipt": {
+        "path": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1/private0700/rustup-origin.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    }
+  },
+  "paths": {
+    "tmp_directory": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1/bootstrap-tmp",
+    "receipt_directory": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1/bootstrap-receipts-1",
+    "uv_cache": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1/uv-cache",
+    "python_install": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1/tools/python",
+    "rustup_home": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1/rustup",
+    "cargo_bootstrap": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1/cargo-bootstrap",
+    "acquisition_directory": "/Users/luka/.codex/worktrees/security-adr/recall-darwin-qualification-r1/acquisition-1"
+  },
+  "source": null
+}

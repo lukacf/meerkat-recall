@@ -997,7 +997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_timeline_returns_500_when_repo_fails() {
+    async fn test_create_timeline_returns_503_when_repo_fails() {
         let app = setup_failing_test_app().await;
         let event = create_test_event("Repo Failure Create");
 
@@ -1013,7 +1013,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -1053,6 +1053,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_restore_event_requires_read_authorization() {
         let authz = Arc::new(AuthzService::new());
         let event_repo: Arc<dyn TimelineEventRepo> = Arc::new(MockEventRepository::empty());
@@ -1154,6 +1158,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_update_event_cannot_declassify() {
         // A writer cleared for the private label and both levels, so every
         // refusal below is the declassification rule, not missing clearance.

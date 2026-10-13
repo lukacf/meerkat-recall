@@ -1,0 +1,36 @@
+{
+  "format": "recall-coordinate-composition-source-review/v1",
+  "source_commit": "adbb8eb6258e8a25fa4c4f28992f212f8e80bd79",
+  "source_review_only": true,
+  "execution_authorized": false,
+  "executed_by_qualification": false,
+  "product_acceptance": false,
+  "source_blockers_in_selected_scope": [],
+  "reviewed_properties": [
+    "Actual scoped search recomputes raw accepted text against both immutable content_hash and Source.hash, full rendered text hash, exact recognized complete transform and original rendered evidence.",
+    "Existing public raw span/quote preserves minimal original byte cover; required rendered_span/rendered_quote_sha256/rendered_text_sha256 bind actual immutable DocRevision.",
+    "Original accepted snapshot fingerprint, source-to-render mapping and exact resolved Doc/Revision/Source/Node/quote are reread through the same ReadEligibility; original current proof is verified before returning. Reader conflicts remain retryable not_ready.",
+    "Actual default renderer uses the shared mapping implementation. Seven independently frozen D literal cases are unchanged and both collector constants pin the exact541387 fixture SHA.",
+    "Repeated-phrase positive now uses actual indexed semantic node retrieval for its two equal phrases; declared unit vectors select the independently fixed second node. Both MCP and mounted HTTP make exactly one governed query dispatch each, tamper recheck one further dispatch.",
+    "Other six cases remain lexical with no query provider send. All seven run through actual source acceptance, immutable rendering, EmbedWorker, manifest/finalizer in both backends and both classified named spaces.",
+    "Mounted HTTP search checks both coordinates/hashes and original immutable ID; full immutable GET checks entire rendered text/hash/renderer and Doc mapping. Missing raw scope and foreign selected space refuse.",
+    "A self-consistent changed rendered text/hash cannot borrow the original completed publication proof."
+  ],
+  "limits": [
+    "Controlled vectors establish coordinate selection mechanics only, not relevance, live provider quality or measured semantic latency.",
+    "Mounted HTTP fixture injects Principal; actual signed middleware/grant revocation and installed artifact gates remain separate.",
+    "Source review does not establish compilation, execution, full2MB Graph capacity, native race behavior or product acceptance.",
+    "This source family remains separate from frozen central Runtime15 until parent composes and validates it."
+  ],
+  "source_sha256": {
+    "crates/mcp/src/scoped_search.rs": "f6e91c7e89ad07f60684d6960bc1c189b1937c8af30521196aad47373346d741",
+    "crates/types/src/rendered_text.rs": "b1feff7e2860062032095f85c6aacd8dad07e791db38033dcdea78f40eb668de",
+    "crates/pipeline/src/renderer/default.rs": "32a4f91296e5928de7875d7ffda1ef1831d360aa2a5256e4a4e52274eb01ab08",
+    "tests/recall_preview/render-coordinate-fixtures.json": "54138704a332d6e275dc434ad0d6456f49107a811c08ea9abbafdbd68171dc3b",
+    "tests/recall_preview_semantics/render_coordinates.rs": "3016c1db5f9b4e06069508edb539082911be9c34d59e45e3a1e5ce24de76dd4f",
+    "tests/recall_preview_semantics/render_coordinates_http.rs": "3dc0deb6f5314b1519069d735f0be1a7ef3538f8771aec433af2eb95b2cbb3f2",
+    "tests/recall_preview_semantics/index_fixture.rs": "bf7cbecbe315c82af60f41951a7b9becef782998782fb75df36ae58f6f32b752",
+    "tests/recall_preview_semantics/provider_spy.rs": "9dd45eb62eabd8b2d377e88663a262f5ed70639011283ca5ba756c6ce4a58290",
+    "tests/scenarios/tests/recall_preview_providers.rs": "2394fbd6867eec39d175391dd7f0610a3943f8d6b3184ed8f715f3e61bebd968"
+  }
+}

@@ -8,20 +8,30 @@
 //! - **Work queue**: Processes DAG-scheduled work items (render, plan, extract, truth maintenance)
 //! - **Truth maintenance**: Detects conflicts from outbox events and resolves truth slots
 
-use std::collections::HashMap;
+mod attempt_settlement;
+mod metadata_bundle_replay;
+#[path = "source_runtime.rs"]
+mod source_runtime;
+
 use std::env;
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
+
+mod pipeline_shutdown;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use elephant_embeddings::{EmbeddingPolicy, EmbeddingProviderCache};
+use elephant_embeddings::EmbeddingProviderCache;
+use elephant_pipeline::provider_dispatch::ProviderDispatchContext;
 use elephant_pipeline::renderer::default::{DefaultTextRenderer, PassthroughRenderer};
 use elephant_pipeline::renderer::multimodal::MultimodalRenderer;
 use elephant_pipeline::renderer::RendererRegistry;
+use elephant_pipeline::scheduler::execution_contract::{
+    classify_failure, retry_action, AttemptUsage, FailureClass, RetryAction, WorkFailure,
+};
 use elephant_pipeline::scheduler::extraction_work_kinds::{
     ExtractionArtifactData, KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE,
     LEGACY_ASSERTION_BATCH_ARTIFACT_TYPE,
@@ -33,27 +43,27 @@ use elephant_pipeline::scheduler::staged_commit::{
     CommitBundleArtifactData, CommitBundleKind, CommitBundlePayload, COMMIT_BUNDLE_ARTIFACT_TYPE,
 };
 use elephant_pipeline::scheduler::work_queue::WorkQueueConfig;
+use elephant_pipeline::source_queue::{enqueue_idempotent, inherit_source_context};
 use elephant_pipeline::{
     error::PipelineError,
     extraction::Extractor,
     freshness::{execute_freshness_sweep, WORK_KIND_FRESHNESS_SWEEP},
     reprocess::{
-        execute_reprocess_job, ReprocessConfig, ReprocessExecutionContext,
+        execute_reprocess_job_with_attempt, ReprocessConfig, ReprocessExecutionContext,
         WORK_KIND_EXECUTE_REPROCESS_JOB,
     },
     resolution::{
-        apply_resolution_patch, commit_resolution_patches, validate_resolution_patches,
-        BackoffConfig, ResolutionPatchWorkflow,
+        commit_resolution_patches, validate_resolution_patches, BackoffConfig,
+        ResolutionPatchWorkflow,
     },
     scheduler::DagExecutor,
     scheduler::{
-        execute_build_doc_tree, execute_extract_assertions, execute_ingest_metadata,
-        execute_ingest_source_stub, execute_plan_extraction, execute_render_doc,
+        execute_ingest_metadata, execute_ingest_source_stub, execute_plan_extraction,
         execute_triage_source, execute_upgrade_ingest_mode, promote_assertions_inline_with_options,
-        BudgetEnforcer, DailyCapCheck, DefaultTriagePlugin, DocTreeConfig, ExtractionPlanConfig,
-        StagedCommit, WorkQueue, COMMIT_ARTIFACTS_KIND, EXTRACT_ASSERTIONS_KIND,
-        INGEST_METADATA_KIND, INGEST_SOURCE_STUB_KIND, PLAN_EXTRACTION_KIND, RENDER_DOC_KIND,
-        TRIAGE_SOURCE_KIND, UPGRADE_INGEST_MODE_KIND, VALIDATE_ARTIFACTS_KIND,
+        BudgetEnforcer, DailyCapCheck, DefaultTriagePlugin, ExtractionPlanConfig, StagedCommit,
+        WorkQueue, COMMIT_ARTIFACTS_KIND, EXTRACT_ASSERTIONS_KIND, INGEST_METADATA_KIND,
+        INGEST_SOURCE_STUB_KIND, PLAN_EXTRACTION_KIND, RENDER_DOC_KIND, TRIAGE_SOURCE_KIND,
+        UPGRADE_INGEST_MODE_KIND, VALIDATE_ARTIFACTS_KIND,
     },
     source_watch::{enqueue_source_watch_refresh, SourceWatchService, REFRESH_SOURCE_WATCH_KIND},
     truth_maintenance::{
@@ -78,6 +88,7 @@ use elephant_storage::{
     WorkArtifactRepository, WorkItemRepository, WorkRunRepository,
 };
 use elephant_types::ids::TableName;
+use elephant_types::provider_binding::ModelOperation;
 use elephant_types::records::base::BaseFields;
 use elephant_types::records::ingest::{Budget, DowngradePolicy, IngestMode};
 use elephant_types::records::source::{Source, SourceLifecycleStatus};
@@ -102,22 +113,17 @@ fn validate_backend_env() -> anyhow::Result<()> {
 use config::{
     EmbedWorkerConfig, PipelineConfig, TruthMaintenanceWorkerConfig, WorkQueueWorkerConfig,
 };
-use elephant_embeddings::EmbeddingProvider;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 #[cfg(feature = "meerkat-extraction")]
 use elephant_pipeline::extraction::{AgenticExtractor, AgenticExtractorConfig};
 #[cfg(feature = "meerkat-extraction")]
-use elephant_pipeline::wiki_editorial::execute_managed_wiki_reconciliation;
+use elephant_pipeline::wiki_editorial::execute_managed_wiki_reconciliation_with_attempt;
 
 const AGENTIC_EXTRACTOR_ID: &str = "elephant.extractor.agentic";
 const MANAGED_WIKI_TIMEOUT_SECS: u64 = 4 * 60 * 60;
 const MANAGED_WIKI_LEASE_GRACE_SECS: u64 = 60;
-
-fn policy_from_embed_config(config: &EmbedWorkerConfig) -> EmbeddingPolicy {
-    EmbeddingPolicy::new(config.provider.clone(), config.model.clone(), config.dims)
-}
 
 fn build_semantic_extractor(extractor_id: Option<&str>) -> anyhow::Result<Box<dyn Extractor>> {
     let extractor_id = extractor_id.unwrap_or(AGENTIC_EXTRACTOR_ID);
@@ -147,81 +153,15 @@ fn build_semantic_extractor(extractor_id: Option<&str>) -> anyhow::Result<Box<dy
     }
 }
 
+#[cfg(test)]
 fn is_transient_work_error(error: &anyhow::Error) -> bool {
-    fn is_transient_message(message: &str) -> bool {
-        let normalized = message.to_ascii_lowercase();
-        [
-            "read or write conflict",
-            "transaction can be retried",
-            "temporarily unavailable",
-            "timeout",
-            "timed out",
-            "rate limit",
-            "too many requests",
-            "connection reset",
-            "broken pipe",
-        ]
-        .iter()
-        .any(|pattern| normalized.contains(pattern))
-    }
-
-    fn is_transient_storage_error(error: &StorageError) -> bool {
-        match error {
-            StorageError::Conflict(_)
-            | StorageError::ConnectionError(_)
-            | StorageError::TransactionError(_) => true,
-            StorageError::QueryError(message) => is_transient_message(message),
-            StorageError::Surreal(inner) => is_transient_message(&inner.to_string()),
-            StorageError::NotFound(_)
-            | StorageError::SerializationError(_)
-            | StorageError::DataIntegrityError(_)
-            | StorageError::MigrationError(_)
-            | StorageError::TypeError(_) => false,
-        }
-    }
-
-    fn is_transient_pipeline_error(error: &PipelineError) -> bool {
-        match error {
-            PipelineError::LeaseConflict(_) => true,
-            PipelineError::StorageError(storage_error) => is_transient_storage_error(storage_error),
-            PipelineError::IngestionError(_)
-            | PipelineError::ExtractionError(_)
-            | PipelineError::PromotionError(_)
-            | PipelineError::OutboxError(_)
-            | PipelineError::EmbeddingError(_)
-            | PipelineError::Duplicate(_)
-            | PipelineError::NotFound(_)
-            | PipelineError::InvalidStateTransition { .. }
-            | PipelineError::CycleDetected
-            | PipelineError::SecurityViolation(_)
-            | PipelineError::ConfigError(_)
-            | PipelineError::BudgetExceeded(_)
-            | PipelineError::BudgetBreach { .. }
-            | PipelineError::PerItemCapExceeded { .. }
-            | PipelineError::InvalidInput(_)
-            | PipelineError::ValidationError(_)
-            | PipelineError::InvalidState(_) => false,
-        }
-    }
-
-    // error.chain() includes the root error as its first element,
-    // so there's no need to check downcast_ref separately before the loop.
-    for cause in error.chain() {
-        if let Some(pipeline_error) = cause.downcast_ref::<PipelineError>() {
-            if is_transient_pipeline_error(pipeline_error) {
-                return true;
-            }
-        }
-        if let Some(storage_error) = cause.downcast_ref::<StorageError>() {
-            if is_transient_storage_error(storage_error) {
-                return true;
-            }
-        }
-    }
-
-    is_transient_message(&error.to_string())
+    matches!(
+        classify_failure(error),
+        FailureClass::Transient | FailureClass::Timeout
+    )
 }
 
+#[cfg(test)]
 fn compute_transient_retry_delay_secs(
     attempt: u32,
     base_delay_secs: i64,
@@ -236,6 +176,7 @@ fn compute_transient_retry_delay_secs(
 
 #[cfg(test)]
 mod work_item_tests {
+
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -244,9 +185,30 @@ mod work_item_tests {
         clippy::large_futures
     )]
 
+    mod dispatch_wake_tests;
+    mod governed_extraction_repair_tests;
+    mod grounded_event_tests;
+    mod grounded_stage_tests;
+    mod renewal_render_tests;
+    mod resolution_bundle_tests;
+    // Compile the production policy/controller verbatim in this test binary.
+    // No public testing API or copied retry implementation is introduced.
+    mod metadata_bundle_replay_tests;
+    #[path = "../../../../crates/storage/src/client_source_acceptance_retry.rs"]
+    mod source_acceptance_retry_controls;
+    mod source_admission_contention_tests;
+    mod source_contact_finalization_tests;
+    mod source_finalizer_contention_tests;
+    mod source_finalizer_readiness_epoch_tests;
+    mod source_graph_progress_tests;
+    mod source_triage_decision_tests;
+    mod source_watch_attempt_tests;
+    mod source_watch_recovery_tests;
+    mod source_watch_test_authority;
+
     use super::*;
     use chrono::Utc;
-    use elephant_pipeline::scheduler::extraction_work_kinds::SerializedRawAssertion;
+    use elephant_pipeline::resolution::apply_resolution_patch;
     use elephant_pipeline::truth_maintenance::{compute_slot_key, create_conflict_group};
     use elephant_storage::{
         AttributeRepository, ConflictGroupRepository, DocNodeRepository, DocRevisionRepository,
@@ -264,6 +226,44 @@ mod work_item_tests {
     use elephant_types::records::rel::{ClaimStatus, EvidenceRef, TimeBasis};
     use elephant_types::records::source::{ManualDocTemplate, SourceType};
     use elephant_types::records::work::{WorkItemStatus, WorkRun, WorkRunMetrics};
+
+    #[tokio::test]
+    async fn dispatcher_future_storage_stays_bounded_on_default_stack() {
+        // Inspect the actual future type without constructing or polling it.
+        // This catches growth before constructing an oversized dispatcher could
+        // itself overflow the default test/worker stack.
+        fn future_bytes<F: std::future::Future>(_: impl FnOnce() -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        let item = WorkItem {
+            base: BaseFields::new(
+                RecordId::new_v4(TableName::WorkItem),
+                "size-only".into(),
+                "fixture".into(),
+            ),
+            kind: TM_RECOMPUTE_KIND.into(),
+            payload: serde_json::json!({}),
+            status: WorkItemStatus::Runnable,
+            priority: 0,
+            idempotency_key: "size-only".into(),
+            attempts: 0,
+            lease_expires_at: None,
+            leased_by: None,
+            run_after: None,
+            last_error: None,
+        };
+        let run = RecordId::new_v4(TableName::WorkRun);
+        let config = WorkQueueWorkerConfig::default();
+        let tm = TmContext::none();
+        let bytes = future_bytes(|| {
+            execute_work_item_with_extractor(&item, &run, storage, &config, &tm, None)
+        });
+        assert!(
+            bytes <= 64 * 1024,
+            "dispatcher future is {bytes} bytes; box the growing phase boundary"
+        );
+    }
 
     /// A fixed extractor response exercises orchestration without network calls.
     struct FixtureExtractor {
@@ -292,6 +292,7 @@ mod work_item_tests {
             })?;
             Ok(ExtractionResult::new(
                 vec![RawAssertion {
+                    support_verification: None,
                     subject_text: "Alice".to_string(),
                     predicate_text: "works at".to_string(),
                     object_text: Some("Acme Corp".to_string()),
@@ -331,32 +332,18 @@ mod work_item_tests {
         }
     }
 
-    const SCHEMA: &str = r"
-        DEFINE TABLE doc SCHEMALESS;
-        DEFINE TABLE doc_chunk SCHEMALESS;
-        DEFINE TABLE doc_revision SCHEMALESS;
-        DEFINE TABLE doc_node SCHEMALESS;
-        DEFINE TABLE source SCHEMALESS;
-        DEFINE TABLE ingest_decision SCHEMALESS;
-        DEFINE TABLE work_artifact SCHEMALESS;
-        DEFINE TABLE work_item SCHEMALESS;
-        DEFINE TABLE work_edge SCHEMALESS;
-        DEFINE TABLE work_run SCHEMALESS;
-        DEFINE TABLE assertion SCHEMALESS;
-        DEFINE TABLE entity SCHEMALESS;
-        DEFINE TABLE rel SCHEMALESS;
-        DEFINE TABLE event SCHEMALESS;
-        DEFINE TABLE conflict_group SCHEMALESS;
-        DEFINE TABLE attribute SCHEMALESS;
-        DEFINE TABLE truth_slot SCHEMALESS;
-        DEFINE TABLE audit_log SCHEMALESS;
-        DEFINE TABLE predicate_registry SCHEMALESS;
-        DEFINE TABLE predicate_alias SCHEMALESS;
-        DEFINE TABLE system_event SCHEMALESS;
-        DEFINE TABLE reprocess_job SCHEMALESS;
-        DEFINE INDEX system_event_space_seq ON TABLE system_event FIELDS space_id, seq UNIQUE;
-    ";
+    /// Native dispatcher tests use the same explicitly initialized schema as
+    /// the service. Table declarations alone omit canonical fences and receipts.
+    async fn initialize_fixture_schema(storage: &StorageClient) {
+        Box::pin(elephant_migrations::apply_schema(storage))
+            .await
+            .expect("explicit complete fixture schema");
+    }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn create_revision_with_node(
         storage: &StorageClient,
         space_id: &str,
@@ -365,11 +352,24 @@ mod work_item_tests {
     ) -> (RecordId, RecordId) {
         let revision_id = RecordId::new_v4(TableName::DocRevision);
         let doc_id = RecordId::new_v4(TableName::Doc);
+        DocRepository::new(storage.clone())
+            .create(Doc {
+                base: BaseFields::new(doc_id.clone(), space_id.to_string(), actor.to_string()),
+                title: "Fixture evidence".into(),
+                text: text.into(),
+                sidecar_text: None,
+                source: None,
+                media_attachments: vec![],
+                rendition_key: doc_id.to_string(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("physical fixture document");
         let revision = DocRevision {
             base: BaseFields::new(revision_id.clone(), space_id.to_string(), actor.to_string()),
             doc: Link::new(doc_id),
             text: text.to_string(),
-            text_hash: "hash".to_string(),
+            text_hash: elephant_pipeline::extraction::AssertionValidator::hash_quote(text),
             renderer: RendererMetadata {
                 name: "test".to_string(),
                 version: "1.0.0".to_string(),
@@ -454,7 +454,7 @@ mod work_item_tests {
             base: BaseFields::new(revision_id.clone(), space_id.to_string(), actor.to_string()),
             doc: Link::new(doc_id),
             text: text.to_string(),
-            text_hash: "source-backed-hash".to_string(),
+            text_hash: elephant_pipeline::extraction::AssertionValidator::hash_quote(text),
             renderer: RendererMetadata {
                 name: "test".to_string(),
                 version: "1.0.0".to_string(),
@@ -493,12 +493,58 @@ mod work_item_tests {
         (revision_id, node_id, source.base.id)
     }
 
+    #[expect(
+        clippy::default_trait_access,
+        clippy::significant_drop_tightening,
+        reason = "Preserve the fixture collection defaults and repository owner lifetime."
+    )]
+    async fn ensure_fixture_space(storage: &StorageClient, space_id: &str, actor: &str) {
+        let spaces = SpaceConfigRepository::new(storage.clone());
+        if spaces
+            .get_by_space_id(space_id)
+            .await
+            .expect("space lookup")
+            .is_none()
+        {
+            spaces
+                .create(elephant_types::records::SpaceConfig {
+                    base: BaseFields::new(
+                        RecordId::new_v4(TableName::SpaceConfig),
+                        space_id.to_string(),
+                        actor.to_string(),
+                    ),
+                    embedding_provider: "openai".to_string(),
+                    embedding_model: "text-embedding-3-small".to_string(),
+                    embedding_dims: 1536,
+                    purpose: None,
+                    skill: None,
+                    processing: Some(elephant_types::provider_binding::SpaceProcessingConfig {
+                        generation: 1,
+                        index_generation: 0,
+                        policy_id: "fixture-no-model-approval".to_string(),
+                        connections: Default::default(),
+                        profiles: Default::default(),
+                        bindings: Default::default(),
+                        active_embedding_profile_id: None,
+                        pending_reindex: None,
+                    }),
+                })
+                .await
+                .expect("explicit fixture space");
+        }
+    }
+
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn create_work_run(
         storage: &StorageClient,
         space_id: &str,
         actor: &str,
         work_item_id: &RecordId,
     ) -> RecordId {
+        ensure_fixture_space(storage, space_id, actor).await;
         let work_run_id = RecordId::new_v4(TableName::WorkRun);
         let work_run = WorkRun {
             base: BaseFields::new(work_run_id.clone(), space_id.to_string(), actor.to_string()),
@@ -523,6 +569,203 @@ mod work_item_tests {
             .expect("create work_run");
 
         work_run_id
+    }
+
+    /// Exercise the real dispatcher with durable queue authority and run receipts.
+    /// The unit fixture supplies its explicit TM context (including deterministic
+    /// `None`) instead of constructing a live model client from ambient settings.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_fixture(
+        item: &WorkItem,
+        run_id: &RecordId,
+        storage: StorageClient,
+        config: &WorkQueueWorkerConfig,
+        _spaces: &SpaceConfigRepository,
+        _providers: &EmbeddingProviderCache,
+        _embedding: &EmbedWorkerConfig,
+        tm: &TmContext,
+    ) -> anyhow::Result<WorkRunMetrics> {
+        dispatch_fixture_with_extractor(item, run_id, storage, config, tm, None).await
+    }
+
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
+    async fn dispatch_fixture_with_extractor(
+        item: &WorkItem,
+        run_id: &RecordId,
+        storage: StorageClient,
+        config: &WorkQueueWorkerConfig,
+        tm: &TmContext,
+        extractor: Option<&dyn Extractor>,
+    ) -> anyhow::Result<WorkRunMetrics> {
+        ensure_fixture_space(&storage, &item.base.space_id, &item.base.created_by).await;
+        let items = WorkItemRepository::new(storage.clone());
+        if items
+            .get(&item.base.space_id, &item.base.id)
+            .await?
+            .is_none()
+        {
+            items.create(item.clone()).await?;
+        }
+        let claimed = items
+            .claim_with_lease(
+                &item.base.space_id,
+                &item.base.id,
+                "fixture-worker",
+                Utc::now() + chrono::Duration::minutes(5),
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("fixture item must be runnable"))?;
+        let attempt = elephant_storage::work_attempt_repository::fence_from_claim(&claimed)?;
+        let runs = WorkRunRepository::new(storage.clone());
+        let existing = runs.get(&item.base.space_id, run_id).await?;
+        let is_new = existing.is_none();
+        let mut run = existing.unwrap_or_else(|| {
+            let mut base = claimed.base.clone();
+            base.id = run_id.clone();
+            WorkRun {
+                base,
+                work_item: Link::new(claimed.base.id.clone()),
+                attempt: claimed.attempts,
+                started_at: Utc::now(),
+                completed_at: None,
+                success: false,
+                error: None,
+                metrics: WorkRunMetrics::default(),
+                worker_id: "fixture-worker".into(),
+                worker_version: "fixture".into(),
+                model_version: None,
+                prompt_id: None,
+                config_hash: None,
+            }
+        });
+        anyhow::ensure!(
+            run.work_item.id() == &claimed.base.id,
+            "fixture run identity"
+        );
+        run.attempt = claimed.attempts;
+        run.metrics
+            .custom
+            .insert("attempt_fence".into(), serde_json::to_value(&attempt)?);
+        if is_new {
+            runs.create(run.clone()).await?;
+        } else {
+            runs.update(&item.base.space_id, run_id, run.clone())
+                .await?;
+        }
+        let observer = elephant_pipeline::provider_usage::DurableUsageObserver::for_attempt(
+            storage.clone(),
+            run_id,
+            attempt.clone(),
+        );
+        eprintln!(
+            "fixture dispatch begin kind={} work={} generation={}",
+            item.kind, item.base.id, attempt.generation
+        );
+        let result = storage
+            .with_activity(
+                elephant_pipeline::provider_dispatch::with_dispatch_observer(
+                    observer.clone(),
+                    Box::pin(super::execute_work_item_with_extractor(
+                        &claimed,
+                        run_id,
+                        storage.clone(),
+                        config,
+                        tm,
+                        extractor,
+                    )),
+                ),
+            )
+            .await?;
+        eprintln!(
+            "fixture dispatch end kind={} work={} success={}",
+            item.kind,
+            item.base.id,
+            result.is_ok()
+        );
+        run = runs
+            .get(&item.base.space_id, run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("fixture original run disappeared"))?;
+        run.completed_at = Some(Utc::now());
+        run.success = result.is_ok();
+        run.error = result.as_ref().err().map(ToString::to_string);
+        if let Ok(metrics) = &result {
+            let preserved = run.metrics.custom.clone();
+            run.metrics = metrics.clone();
+            for (key, value) in preserved {
+                run.metrics.custom.entry(key).or_insert(value);
+            }
+        }
+        run.metrics
+            .custom
+            .insert("attempt_fence".into(), serde_json::to_value(&attempt)?);
+        observer
+            .summarize(AttemptUsage::reserved(0, 0.0))
+            .await?
+            .write_metrics(&mut run.metrics)?;
+        runs.update(&item.base.space_id, run_id, run).await?;
+        let queue =
+            WorkQueue::new(storage.clone(), WorkQueueConfig::default()).for_attempt(&claimed)?;
+        if result.is_ok() {
+            complete_work_item_and_promote(
+                &queue,
+                &DagExecutor::new(storage),
+                &item.base.space_id,
+                &item.base.id,
+            )
+            .await?;
+        } else if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| classify_failure(error) == FailureClass::PendingDependencies)
+        {
+            let pending_error = result.as_ref().err().ok_or_else(|| {
+                anyhow::anyhow!("dependency retry requires the actual failed result")
+            })?;
+            let RetryAction::Blocked { delay_secs } = retry_action(
+                FailureClass::PendingDependencies,
+                claimed.attempts,
+                config.transient_retry_max_attempts,
+                config.transient_retry_base_delay_secs,
+                config.transient_retry_max_delay_secs,
+            ) else {
+                anyhow::bail!("pending dependency did not receive production blocked policy");
+            };
+            source_runtime::record_operation_failure(
+                &storage,
+                &claimed,
+                FailureClass::PendingDependencies,
+                RetryAction::Blocked { delay_secs },
+            )
+            .await?;
+            items
+                .requeue_pending_dependencies(
+                    &item.base.space_id,
+                    &item.base.id,
+                    &attempt.lease_token,
+                    delay_secs,
+                    pending_error.to_string(),
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("fixture lost original blocked attempt"))?;
+            // The caller sees the original typed error and independently checks
+            // the failed run, refund and real due time before scheduling again.
+        } else {
+            items
+                .update_running_for_worker(
+                    &item.base.space_id,
+                    &item.base.id,
+                    &attempt.lease_token,
+                    WorkItemStatus::Failed,
+                    result.as_ref().err().map(ToString::to_string),
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("fixture lost original attempt"))?;
+        }
+        result
     }
 
     async fn create_entity(
@@ -555,7 +798,13 @@ mod work_item_tests {
         predicate_raw: &str,
         object_text: Option<&str>,
     ) -> Assertion {
+        ensure_fixture_space(storage, space_id, actor).await;
         let (revision_id, node_id) = evidence_ids;
+        let revision = DocRevisionRepository::new(storage.clone())
+            .get(space_id, revision_id)
+            .await
+            .expect("fixture revision lookup")
+            .expect("fixture revision exists");
         let now = Utc::now();
         AssertionRepository::new(storage.clone())
             .create(Assertion {
@@ -573,8 +822,10 @@ mod work_item_tests {
                     revision: Link::new(revision_id.clone()),
                     node: Some(Link::new(node_id.clone())),
                     start: 0,
-                    end: 10,
-                    quote_hash: "pending-assertion".to_string(),
+                    end: u32::try_from(revision.text.len()).expect("fixture text length"),
+                    quote_hash: elephant_pipeline::extraction::AssertionValidator::hash_quote(
+                        &revision.text,
+                    ),
                 },
                 source_event_time: None,
                 observed_at: now,
@@ -664,103 +915,35 @@ mod work_item_tests {
     }
 
     #[tokio::test]
-    async fn test_build_embedding_provider_supports_hashed() {
-        let policy = EmbeddingPolicy::new("hashed", "hashed-bow-v1", 32);
-        let provider = super::build_embedding_provider(&policy);
-        let vectors = provider
-            .embed(&["Alice visits Wonderland".to_string()])
-            .await
-            .unwrap();
-        assert_eq!(vectors.len(), 1);
-        assert_eq!(vectors[0].len(), 32);
-        assert!(vectors[0].iter().any(|value| *value != 0.0));
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
+    async fn test_unconfigured_space_cannot_fall_back_to_ambient_embeddings() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        ensure_fixture_space(&storage, "denied-embedding", "fixture").await;
+        let context =
+            ProviderDispatchContext::new(SpaceConfigRepository::new(storage), "denied-embedding");
+        let result = context.embedding(ModelOperation::DocumentEmbedding).await;
+        assert!(
+            matches!(result, Err(PipelineError::ConfigError(_))),
+            "explicit model approval is required"
+        );
     }
 
     #[tokio::test]
     async fn test_execute_work_item_plan_extraction_enqueues_extract() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let space_id = "plan_space";
-        let actor = "tester";
-        let (revision_id, node_id) =
-            create_revision_with_node(&storage, space_id, actor, "Alice works at Acme.").await;
-
-        let work_item_id = RecordId::new_v4(TableName::WorkItem);
-        let work_item = WorkItem {
-            base: BaseFields::new(
-                work_item_id.clone(),
-                space_id.to_string(),
-                actor.to_string(),
-            ),
-            kind: PLAN_EXTRACTION_KIND.to_string(),
-            payload: serde_json::json!({
-                "revision_id": revision_id.to_string(),
-                "ingest_mode": "graph",
-                "policy_version": "v1.0"
-            }),
-            status: WorkItemStatus::Runnable,
-            priority: 5,
-            idempotency_key: "plan-extraction-test".to_string(),
-            attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
-            run_after: None,
-            last_error: None,
-        };
-
-        let work_run_id = create_work_run(&storage, space_id, actor, &work_item_id).await;
-        let config = WorkQueueWorkerConfig::default();
-        let space_config_repo = SpaceConfigRepository::new(storage.clone());
-        let provider_cache = EmbeddingProviderCache::new();
-        let embed_config = EmbedWorkerConfig::default();
-
-        let _ = execute_work_item(
-            &work_item,
-            &work_run_id,
-            storage.clone(),
-            &config,
-            &space_config_repo,
-            &provider_cache,
-            &embed_config,
-            &TmContext::none(),
-        )
-        .await
-        .expect("execute plan_extraction");
-
-        let node_id_str = node_id.to_string();
-        let revision_id_str = revision_id.to_string();
-        let item_repo = WorkItemRepository::new(storage);
-        let items = item_repo
-            .list(space_id, 10, None)
-            .await
-            .expect("list work items");
-
-        let extract_items: Vec<_> = items
-            .iter()
-            .filter(|item| item.kind == EXTRACT_ASSERTIONS_KIND)
-            .collect();
-        assert_eq!(extract_items.len(), 1);
-        assert_eq!(
-            extract_items[0]
-                .payload
-                .get("node_id")
-                .and_then(|v| v.as_str()),
-            Some(node_id_str.as_str())
-        );
-        assert_eq!(
-            extract_items[0]
-                .payload
-                .get("revision_id")
-                .and_then(|v| v.as_str()),
-            Some(revision_id_str.as_str())
-        );
+        grounded_stage_tests::plan_enqueues_extract(false).await;
     }
 
     #[tokio::test]
-    async fn test_execute_work_item_plan_extraction_completes_missing_revision_as_obsolete() {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
+    async fn test_execute_work_item_plan_extraction_reports_missing_revision_as_stale_input() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "obsolete_plan_space";
         let actor = "tester";
@@ -794,7 +977,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        let metrics = execute_work_item(
+        let error = dispatch_fixture(
             &work_item,
             &work_run_id,
             storage.clone(),
@@ -805,9 +988,9 @@ mod work_item_tests {
             &TmContext::none(),
         )
         .await
-        .expect("obsolete plan_extraction should complete");
+        .expect_err("missing immutable input cannot complete");
 
-        assert_eq!(metrics.tokens_used, 0);
+        assert_eq!(classify_failure(&error), FailureClass::StaleInput);
         let item_repo = WorkItemRepository::new(storage);
         let items = item_repo
             .list(space_id, 10, None)
@@ -820,163 +1003,21 @@ mod work_item_tests {
 
     #[tokio::test]
     async fn test_execute_work_item_plan_extraction_derives_source_from_revision_doc() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let space_id = "plan_source_space";
-        let actor = "tester";
-        let (revision_id, _node_id, source_id) = create_source_backed_revision_with_node(
-            &storage,
-            space_id,
-            actor,
-            "Alice works at Acme.",
-        )
-        .await;
-
-        let work_item_id = RecordId::new_v4(TableName::WorkItem);
-        let work_item = WorkItem {
-            base: BaseFields::new(
-                work_item_id.clone(),
-                space_id.to_string(),
-                actor.to_string(),
-            ),
-            kind: PLAN_EXTRACTION_KIND.to_string(),
-            payload: serde_json::json!({
-                "revision_id": revision_id.to_string(),
-                "ingest_mode": "graph",
-                "policy_version": "v1.0"
-            }),
-            status: WorkItemStatus::Runnable,
-            priority: 5,
-            idempotency_key: "plan-extraction-source-test".to_string(),
-            attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
-            run_after: None,
-            last_error: None,
-        };
-
-        let work_run_id = create_work_run(&storage, space_id, actor, &work_item_id).await;
-        let config = WorkQueueWorkerConfig::default();
-        let space_config_repo = SpaceConfigRepository::new(storage.clone());
-        let provider_cache = EmbeddingProviderCache::new();
-        let embed_config = EmbedWorkerConfig::default();
-
-        execute_work_item(
-            &work_item,
-            &work_run_id,
-            storage.clone(),
-            &config,
-            &space_config_repo,
-            &provider_cache,
-            &embed_config,
-            &TmContext::none(),
-        )
-        .await
-        .expect("execute source-backed plan_extraction");
-
-        let item_repo = WorkItemRepository::new(storage);
-        let items = item_repo
-            .list(space_id, 10, None)
-            .await
-            .expect("list work items");
-        let extract_item = items
-            .iter()
-            .find(|item| item.kind == EXTRACT_ASSERTIONS_KIND)
-            .expect("extract item");
-        let source_id_str = source_id.to_string();
-
-        assert_eq!(
-            extract_item
-                .payload
-                .get("source_id")
-                .and_then(|value| value.as_str()),
-            Some(source_id_str.as_str())
-        );
+        grounded_stage_tests::plan_enqueues_extract(true).await;
     }
 
     #[tokio::test]
     async fn test_execute_work_item_render_doc_enqueues_plan_extraction() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let space_id = "default";
-        let actor = "tester";
-
-        let doc_id = RecordId::new_v4(TableName::Doc);
-        let doc = elephant_types::records::Doc {
-            base: BaseFields::new(doc_id.clone(), space_id.to_string(), actor.to_string()),
-            title: "Test Doc".to_string(),
-            text: "Alice works at Acme.".to_string(),
-            sidecar_text: None,
-            media_attachments: Vec::new(),
-            source: None,
-            rendition_key: "test-rendition".to_string(),
-            metadata: serde_json::json!({}),
-        };
-        let doc_repo = DocRepository::new(storage.clone());
-        let _ = doc_repo.create(doc).await.expect("create doc");
-
-        let work_item_id = RecordId::new_v4(TableName::WorkItem);
-        let work_item = WorkItem {
-            base: BaseFields::new(
-                work_item_id.clone(),
-                space_id.to_string(),
-                actor.to_string(),
-            ),
-            kind: RENDER_DOC_KIND.to_string(),
-            payload: serde_json::json!({ "doc_id": doc_id.to_string() }),
-            status: WorkItemStatus::Runnable,
-            priority: 10,
-            idempotency_key: "render-doc-test".to_string(),
-            attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
-            run_after: None,
-            last_error: None,
-        };
-
-        let work_run_id = create_work_run(&storage, space_id, actor, &work_item_id).await;
-        let config = WorkQueueWorkerConfig::default();
-        let space_config_repo = SpaceConfigRepository::new(storage.clone());
-        let provider_cache = EmbeddingProviderCache::new();
-        let embed_config = EmbedWorkerConfig::default();
-
-        let _ = execute_work_item(
-            &work_item,
-            &work_run_id,
-            storage.clone(),
-            &config,
-            &space_config_repo,
-            &provider_cache,
-            &embed_config,
-            &TmContext::none(),
-        )
-        .await
-        .expect("execute render_doc");
-
-        let item_repo = WorkItemRepository::new(storage);
-        let items = item_repo
-            .list(space_id, 50, None)
-            .await
-            .expect("list work items");
-
-        let plan_items: Vec<_> = items
-            .iter()
-            .filter(|item| item.kind == PLAN_EXTRACTION_KIND)
-            .collect();
-        assert_eq!(plan_items.len(), 1);
-        assert!(plan_items[0]
-            .payload
-            .get("revision_id")
-            .and_then(|v| v.as_str())
-            .is_some());
+        grounded_stage_tests::render_enqueues_plan().await;
     }
-
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_render_doc_does_not_regress_graph_ready_source_mode() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "default";
         let actor = "tester";
@@ -1040,7 +1081,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        let _ = execute_work_item(
+        let _ = dispatch_fixture(
             &work_item,
             &work_run_id,
             storage.clone(),
@@ -1066,9 +1107,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_execute_work_item_ingest_source_stub_accepts_discovered_source() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "source-stub-space";
         let actor = "tester";
@@ -1107,7 +1152,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        execute_work_item(
+        dispatch_fixture(
             &work_item,
             &work_run_id,
             storage.clone(),
@@ -1133,331 +1178,27 @@ mod work_item_tests {
 
     #[tokio::test]
     async fn test_execute_work_item_extract_assertions_creates_artifact() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let space_id = "extract_space";
-        let actor = "tester";
-        let (revision_id, node_id) =
-            create_revision_with_node(&storage, space_id, actor, "Alice works at Acme Corp.").await;
-
-        let work_item_id = RecordId::new_v4(TableName::WorkItem);
-        let work_item = WorkItem {
-            base: BaseFields::new(
-                work_item_id.clone(),
-                space_id.to_string(),
-                actor.to_string(),
-            ),
-            kind: EXTRACT_ASSERTIONS_KIND.to_string(),
-            payload: serde_json::json!({
-                "node_id": node_id.to_string(),
-                "revision_id": revision_id.to_string(),
-                "ingest_mode": "graph"
-            }),
-            status: WorkItemStatus::Runnable,
-            priority: 5,
-            idempotency_key: "extract-assertions-test".to_string(),
-            attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
-            run_after: None,
-            last_error: None,
-        };
-
-        let work_run_id = create_work_run(&storage, space_id, actor, &work_item_id).await;
-        let config = WorkQueueWorkerConfig::default();
-
-        let _ = execute_work_item_with_extractor(
-            &work_item,
-            &work_run_id,
-            storage.clone(),
-            &config,
-            &TmContext::none(),
-            Some(&FixtureExtractor::new()),
-        )
-        .await
-        .expect("execute extract_assertions");
-
-        // Verify the knowledge_candidates artifact was created by extract_assertions.
-        let artifact_repo = WorkArtifactRepository::new(storage.clone());
-        let artifacts = artifact_repo
-            .list(space_id, 10, None)
-            .await
-            .expect("list artifacts");
-        assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].artifact_type, "knowledge_candidates");
-
-        // No outbox events should exist until commit_artifacts materializes canonical knowledge.
-        let event_repo = SystemEventRepository::new(storage.clone());
-        let events = event_repo
-            .get_after_seq(space_id, 0, 10)
-            .await
-            .expect("get outbox events");
-        assert!(
-            events.is_empty(),
-            "extract_assertions should only stage candidate artifacts"
-        );
-
-        // The staged path should enqueue validation for the new artifact.
-        let item_repo = WorkItemRepository::new(storage);
-        let queued = item_repo
-            .list(space_id, 20, None)
-            .await
-            .expect("list queued work items");
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].kind, VALIDATE_ARTIFACTS_KIND);
+        grounded_stage_tests::extraction_stages_candidate(false).await;
     }
 
     #[tokio::test]
     async fn test_execute_work_item_extract_assertions_derives_source_for_artifact_workflow() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let space_id = "extract_source_space";
-        let actor = "tester";
-        let (revision_id, node_id, source_id) = create_source_backed_revision_with_node(
-            &storage,
-            space_id,
-            actor,
-            "Alice works at Acme Corp.",
-        )
-        .await;
-
-        let work_item_id = RecordId::new_v4(TableName::WorkItem);
-        let work_item = WorkItem {
-            base: BaseFields::new(
-                work_item_id.clone(),
-                space_id.to_string(),
-                actor.to_string(),
-            ),
-            kind: EXTRACT_ASSERTIONS_KIND.to_string(),
-            payload: serde_json::json!({
-                "node_id": node_id.to_string(),
-                "revision_id": revision_id.to_string(),
-                "ingest_mode": "graph"
-            }),
-            status: WorkItemStatus::Runnable,
-            priority: 5,
-            idempotency_key: "extract-source-test".to_string(),
-            attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
-            run_after: None,
-            last_error: None,
-        };
-
-        let work_run_id = create_work_run(&storage, space_id, actor, &work_item_id).await;
-        let config = WorkQueueWorkerConfig::default();
-
-        execute_work_item_with_extractor(
-            &work_item,
-            &work_run_id,
-            storage.clone(),
-            &config,
-            &TmContext::none(),
-            Some(&FixtureExtractor::new()),
-        )
-        .await
-        .expect("execute source-backed extract_assertions");
-
-        let item_repo = WorkItemRepository::new(storage);
-        let queued = item_repo
-            .list(space_id, 20, None)
-            .await
-            .expect("list queued work items");
-        let validate_item = queued
-            .iter()
-            .find(|item| item.kind == VALIDATE_ARTIFACTS_KIND)
-            .expect("validate item");
-        let source_id_str = source_id.to_string();
-
-        assert_eq!(
-            validate_item
-                .payload
-                .get("source_id")
-                .and_then(|value| value.as_str()),
-            Some(source_id_str.as_str())
-        );
+        grounded_stage_tests::extraction_stages_candidate(true).await;
     }
 
     #[tokio::test]
     async fn test_extract_to_truth_maintenance_chain() {
-        use elephant_pipeline::truth_maintenance::{
-            execute_tm_detect_conflicts_from_outbox_events, RepositoryTruthMaintenanceStorage,
-        };
-
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-        // Also define entity and rel tables for staged artifact commit promotion.
-        storage
-            .query("DEFINE TABLE entity SCHEMALESS; DEFINE TABLE rel SCHEMALESS; DEFINE TABLE attribute SCHEMALESS;")
-            .await
-            .expect("entity/rel/attr schema");
-
-        let space_id = "chain_space";
-        let actor = "tester";
-        let (revision_id, node_id) =
-            create_revision_with_node(&storage, space_id, actor, "Alice works at Acme Corp.").await;
-
-        let work_item_id = RecordId::new_v4(TableName::WorkItem);
-        let work_item = WorkItem {
-            base: BaseFields::new(
-                work_item_id.clone(),
-                space_id.to_string(),
-                actor.to_string(),
-            ),
-            kind: EXTRACT_ASSERTIONS_KIND.to_string(),
-            payload: serde_json::json!({
-                "node_id": node_id.to_string(),
-                "revision_id": revision_id.to_string(),
-                "ingest_mode": "graph"
-            }),
-            status: WorkItemStatus::Runnable,
-            priority: 5,
-            idempotency_key: "chain-test".to_string(),
-            attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
-            run_after: None,
-            last_error: None,
-        };
-
-        let work_run_id = create_work_run(&storage, space_id, actor, &work_item_id).await;
-        let config = WorkQueueWorkerConfig::default();
-        let space_config_repo = SpaceConfigRepository::new(storage.clone());
-        let provider_cache = EmbeddingProviderCache::new();
-        let embed_config = EmbedWorkerConfig::default();
-
-        // Step 1: Execute extraction (stages knowledge candidates and validation work)
-        let _ = execute_work_item_with_extractor(
-            &work_item,
-            &work_run_id,
-            storage.clone(),
-            &config,
-            &TmContext::none(),
-            Some(&FixtureExtractor::new()),
-        )
-        .await
-        .expect("execute extract_assertions");
-
-        let item_repo = WorkItemRepository::new(storage.clone());
-        let queued_after_extract = item_repo
-            .list(space_id, 20, None)
-            .await
-            .expect("queued after extract");
-        assert_eq!(queued_after_extract.len(), 1);
-        assert_eq!(queued_after_extract[0].kind, VALIDATE_ARTIFACTS_KIND);
-
-        let validate_item = queued_after_extract[0].clone();
-        let validate_run_id =
-            create_work_run(&storage, space_id, actor, &validate_item.base.id).await;
-        let _ = execute_work_item(
-            &validate_item,
-            &validate_run_id,
-            storage.clone(),
-            &config,
-            &space_config_repo,
-            &provider_cache,
-            &embed_config,
-            &TmContext::none(),
-        )
-        .await
-        .expect("execute validate_artifacts");
-
-        let queued_after_validate = item_repo
-            .list(space_id, 20, None)
-            .await
-            .expect("queued after validate");
-        assert!(
-            queued_after_validate
-                .iter()
-                .any(|item| item.kind == COMMIT_ARTIFACTS_KIND),
-            "validate_artifacts should enqueue commit_artifacts"
-        );
-
-        let commit_item = queued_after_validate
-            .into_iter()
-            .find(|item| item.kind == COMMIT_ARTIFACTS_KIND)
-            .expect("commit item");
-        let commit_run_id = create_work_run(&storage, space_id, actor, &commit_item.base.id).await;
-        let _ = execute_work_item(
-            &commit_item,
-            &commit_run_id,
-            storage.clone(),
-            &config,
-            &space_config_repo,
-            &provider_cache,
-            &embed_config,
-            &TmContext::none(),
-        )
-        .await
-        .expect("execute commit_artifacts");
-
-        // Step 2: Verify outbox events exist after commit
-        let event_repo = SystemEventRepository::new(storage.clone());
-        let events = event_repo
-            .get_after_seq(space_id, 0, 100)
-            .await
-            .expect("get outbox events");
-        assert!(
-            !events.is_empty(),
-            "Should have outbox events after extraction"
-        );
-
-        // Step 3: Run truth maintenance on outbox events
-        let tm_storage = RepositoryTruthMaintenanceStorage::new(storage.clone());
-        let tm_result = execute_tm_detect_conflicts_from_outbox_events(&events, &tm_storage)
-            .await
-            .expect("truth maintenance detect");
-
-        // For a single document's assertions (no conflicts), we expect direct commits
-        // or no-ops (if no rels/attrs were created by the DefaultExtractor).
-        assert!(
-            tm_result.events_processed > 0,
-            "Truth maintenance should have processed events"
-        );
-
-        // Step 4: Execute direct commits to populate truth_slots
-        for commit in &tm_result.direct_commits {
-            elephant_pipeline::truth_maintenance::execute_tm_commit(
-                &commit.resolution,
-                &commit.input,
-                space_id,
-                &tm_storage,
-            )
-            .await
-            .expect("tm_commit");
-        }
-
-        // Step 5: Verify truth_slots exist if there were commits
-        if !tm_result.direct_commits.is_empty() {
-            let slot_result: Vec<serde_json::Value> = storage
-                .query_bind(
-                    "SELECT count() FROM truth_slot WHERE space_id = $space_id GROUP ALL",
-                    serde_json::json!({ "space_id": space_id }),
-                )
-                .await
-                .expect("count truth_slots")
-                .take(0)
-                .expect("take result");
-
-            let slot_count = slot_result
-                .first()
-                .and_then(|v| v.get("count"))
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-
-            assert!(
-                slot_count > 0,
-                "Truth slots should be created after direct commits"
-            );
-        }
+        Box::pin(grounded_stage_tests::extract_to_truth_maintenance_chain()).await;
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_source_metadata_mode_records_metadata_artifact_without_doc_materialization() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "source-metadata-space";
         let actor = "tester";
@@ -1499,7 +1240,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        let _ = execute_work_item(
+        let _ = dispatch_fixture(
             &triage_item,
             &triage_run_id,
             storage.clone(),
@@ -1528,7 +1269,7 @@ mod work_item_tests {
         );
         let metadata_run_id =
             create_work_run(&storage, space_id, actor, &metadata_item.base.id).await;
-        let _ = execute_work_item(
+        let _ = dispatch_fixture(
             &metadata_item,
             &metadata_run_id,
             storage.clone(),
@@ -1564,7 +1305,7 @@ mod work_item_tests {
             .clone();
         let validate_run_id =
             create_work_run(&storage, space_id, actor, &validate_item.base.id).await;
-        let _ = execute_work_item(
+        let _ = dispatch_fixture(
             &validate_item,
             &validate_run_id,
             storage.clone(),
@@ -1602,7 +1343,7 @@ mod work_item_tests {
             .expect("commit item")
             .clone();
         let commit_run_id = create_work_run(&storage, space_id, actor, &commit_item.base.id).await;
-        let _ = execute_work_item(
+        let _ = dispatch_fixture(
             &commit_item,
             &commit_run_id,
             storage.clone(),
@@ -1646,9 +1387,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_graph_mode_metadata_commit_enqueues_upgrade_without_marking_graph_ready() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "source-graph-metadata-space";
         let actor = "tester";
@@ -1690,7 +1435,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        execute_work_item(
+        dispatch_fixture(
             &triage_item,
             &triage_run_id,
             storage.clone(),
@@ -1719,7 +1464,7 @@ mod work_item_tests {
         );
         let metadata_run_id =
             create_work_run(&storage, space_id, actor, &metadata_item.base.id).await;
-        execute_work_item(
+        dispatch_fixture(
             &metadata_item,
             &metadata_run_id,
             storage.clone(),
@@ -1742,7 +1487,7 @@ mod work_item_tests {
             .expect("validate item");
         let validate_run_id =
             create_work_run(&storage, space_id, actor, &validate_item.base.id).await;
-        execute_work_item(
+        dispatch_fixture(
             &validate_item,
             &validate_run_id,
             storage.clone(),
@@ -1764,7 +1509,7 @@ mod work_item_tests {
             .expect("find commit item")
             .expect("commit item");
         let commit_run_id = create_work_run(&storage, space_id, actor, &commit_item.base.id).await;
-        execute_work_item(
+        dispatch_fixture(
             &commit_item,
             &commit_run_id,
             storage.clone(),
@@ -1804,7 +1549,7 @@ mod work_item_tests {
 
         let upgrade_run_id =
             create_work_run(&storage, space_id, actor, &upgrade_item.base.id).await;
-        execute_work_item(
+        dispatch_fixture(
             &upgrade_item,
             &upgrade_run_id,
             storage.clone(),
@@ -1828,9 +1573,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_execute_work_item_ingest_metadata_skips_when_source_not_triaged() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "metadata-skip-space";
         let actor = "tester";
@@ -1872,7 +1621,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        execute_work_item(
+        dispatch_fixture(
             &metadata_item,
             &metadata_run_id,
             storage.clone(),
@@ -1907,473 +1656,32 @@ mod work_item_tests {
 
     #[tokio::test]
     async fn test_validate_artifacts_creates_commit_bundle_before_canonical_writes() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let space_id = "artifact-boundary-space";
-        let actor = "tester";
-        let (revision_id, node_id) =
-            create_revision_with_node(&storage, space_id, actor, "Alice works at Acme Corp.").await;
-
-        let work_item_id = RecordId::new_v4(TableName::WorkItem);
-        let work_item = WorkItem {
-            base: BaseFields::new(
-                work_item_id.clone(),
-                space_id.to_string(),
-                actor.to_string(),
-            ),
-            kind: EXTRACT_ASSERTIONS_KIND.to_string(),
-            payload: serde_json::json!({
-                "node_id": node_id.to_string(),
-                "revision_id": revision_id.to_string(),
-                "ingest_mode": "graph"
-            }),
-            status: WorkItemStatus::Runnable,
-            priority: 5,
-            idempotency_key: "artifact-boundary-test".to_string(),
-            attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
-            run_after: None,
-            last_error: None,
-        };
-
-        let work_run_id = create_work_run(&storage, space_id, actor, &work_item_id).await;
-        let config = WorkQueueWorkerConfig::default();
-        let space_config_repo = SpaceConfigRepository::new(storage.clone());
-        let provider_cache = EmbeddingProviderCache::new();
-        let embed_config = EmbedWorkerConfig::default();
-
-        let _ = execute_work_item_with_extractor(
-            &work_item,
-            &work_run_id,
-            storage.clone(),
-            &config,
-            &TmContext::none(),
-            Some(&FixtureExtractor::new()),
-        )
-        .await
-        .expect("execute extract_assertions");
-
-        let item_repo = WorkItemRepository::new(storage.clone());
-        let validate_item = item_repo
-            .list(space_id, 20, None)
-            .await
-            .expect("list queued work items")
-            .into_iter()
-            .find(|item| item.kind == VALIDATE_ARTIFACTS_KIND)
-            .expect("validate item");
-        let validate_run_id =
-            create_work_run(&storage, space_id, actor, &validate_item.base.id).await;
-        let _ = execute_work_item(
-            &validate_item,
-            &validate_run_id,
-            storage.clone(),
-            &config,
-            &space_config_repo,
-            &provider_cache,
-            &embed_config,
-            &TmContext::none(),
-        )
-        .await
-        .expect("execute validate_artifacts");
-
-        let artifact_repo = WorkArtifactRepository::new(storage.clone());
-        let artifacts = artifact_repo
-            .find_by_work_run(&work_run_id)
-            .await
-            .expect("find artifacts");
-        assert!(
-            artifacts
-                .iter()
-                .any(|artifact| artifact.artifact_type == KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE),
-            "knowledge candidates should still be present"
-        );
-        let commit_bundle = artifacts
-            .iter()
-            .find(|artifact| artifact.artifact_type == COMMIT_BUNDLE_ARTIFACT_TYPE)
-            .expect("commit bundle");
-        assert_eq!(commit_bundle.status, ArtifactStatus::Validated);
-
-        let assertion_repo = AssertionRepository::new(storage.clone());
-        let assertions = assertion_repo
-            .list(space_id, 10, None)
-            .await
-            .expect("list assertions");
-        assert!(
-            assertions.is_empty(),
-            "canonical assertions must not exist before commit_artifacts"
-        );
-
-        let event_repo = SystemEventRepository::new(storage);
-        let events = event_repo
-            .get_after_seq(space_id, 0, 10)
-            .await
-            .expect("list outbox events");
-        assert!(
-            events.is_empty(),
-            "outbox should remain empty before commit_artifacts"
-        );
+        Box::pin(grounded_stage_tests::validation_stages_before_canonical_writes()).await;
     }
 
     #[tokio::test]
     async fn test_validate_artifacts_legacy_assertion_batch_alias_still_bundles() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let space_id = "legacy-artifact-space";
-        let actor = "tester";
-        let (revision_id, node_id) =
-            create_revision_with_node(&storage, space_id, actor, "Alice works at Acme Corp.").await;
-        let work_item_id = RecordId::new_v4(TableName::WorkItem);
-        let work_run_id = create_work_run(&storage, space_id, actor, &work_item_id).await;
-
-        let artifact_repo = WorkArtifactRepository::new(storage.clone());
-        artifact_repo
-            .create(elephant_types::records::work::WorkArtifact {
-                base: BaseFields::new(
-                    RecordId::new_v4(TableName::WorkArtifact),
-                    space_id.to_string(),
-                    actor.to_string(),
-                ),
-                work_run: Link::new(work_run_id.clone()),
-                artifact_type: LEGACY_ASSERTION_BATCH_ARTIFACT_TYPE.to_string(),
-                data: serde_json::to_value(ExtractionArtifactData {
-                    source_id: None,
-                    node_id: node_id.to_string(),
-                    revision_id: revision_id.to_string(),
-                    assertions: Vec::new(),
-                    tokens_used: 0,
-                    model: "legacy".to_string(),
-                    revision_text_len: 0,
-                })
-                .expect("serialize legacy artifact"),
-                status: ArtifactStatus::Draft,
-                validation_errors: None,
-                validated_at: None,
-                committed_at: None,
-            })
-            .await
-            .expect("create legacy artifact");
-
-        let validate_item = WorkItem {
-            base: BaseFields::new(
-                RecordId::new_v4(TableName::WorkItem),
-                space_id.to_string(),
-                actor.to_string(),
-            ),
-            kind: VALIDATE_ARTIFACTS_KIND.to_string(),
-            payload: serde_json::json!({
-                "work_run_id": work_run_id.to_string(),
-                "ingest_mode": "graph"
-            }),
-            status: WorkItemStatus::Runnable,
-            priority: 5,
-            idempotency_key: "validate-legacy-assertion-batch".to_string(),
-            attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
-            run_after: None,
-            last_error: None,
-        };
-        let validate_run_id =
-            create_work_run(&storage, space_id, actor, &validate_item.base.id).await;
-
-        let config = WorkQueueWorkerConfig::default();
-        let space_config_repo = SpaceConfigRepository::new(storage.clone());
-        let provider_cache = EmbeddingProviderCache::new();
-        let embed_config = EmbedWorkerConfig::default();
-
-        execute_work_item(
-            &validate_item,
-            &validate_run_id,
-            storage.clone(),
-            &config,
-            &space_config_repo,
-            &provider_cache,
-            &embed_config,
-            &TmContext::none(),
-        )
-        .await
-        .expect("execute validate_artifacts");
-
-        let artifacts = artifact_repo
-            .find_by_work_run(&work_run_id)
-            .await
-            .expect("find artifacts");
-        assert!(
-            artifacts
-                .iter()
-                .any(|artifact| artifact.artifact_type == COMMIT_BUNDLE_ARTIFACT_TYPE),
-            "legacy assertion_batch artifacts should still produce commit bundles"
-        );
+        grounded_stage_tests::legacy_alias_bundles().await;
     }
 
     #[tokio::test]
     async fn test_commit_knowledge_candidates_refines_event_across_nodes_for_same_source() {
-        use elephant_storage::EventRepository;
-        use elephant_types::records::attribute::Literal;
-
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let space_id = "event-lineage-space";
-        let actor = "tester";
-        let source = create_manual_source(
-            &storage,
-            space_id,
-            actor,
-            "Launch source",
-            "Alice launched Project Phoenix.",
-            IngestMode::Graph,
-        )
-        .await;
-        let (revision_a, node_a) =
-            create_revision_with_node(&storage, space_id, actor, "Alice launched Project Phoenix.")
-                .await;
-        let (revision_b, node_b) = create_revision_with_node(
-            &storage,
-            space_id,
-            actor,
-            "Project Phoenix launch date was confirmed later.",
-        )
-        .await;
-
-        let mut first = elephant_pipeline::extraction::RawAssertion {
-            subject_text: "Alice".to_string(),
-            predicate_text: "launched".to_string(),
-            object_text: Some("Project Phoenix".to_string()),
-            object_literal: None,
-            evidence_span: EvidenceSpan {
-                revision: Link::new(revision_a.clone()),
-                node: Some(Link::new(node_a.clone())),
-                start: 0,
-                end: 30,
-                quote_hash: "event-a".to_string(),
-            },
-            confidence: 0.95,
-            quote: Some("Alice launched Project Phoenix.".to_string()),
-            source_event_time: None,
-            source_event_time_precision: None,
-            event_title: Some("Project Phoenix launch".to_string()),
-            event_lineage_key: None,
-            subject_entity_id: None,
-            subject_entity_type: Some("person".to_string()),
-            object_entity_id: None,
-            object_entity_type: Some("project".to_string()),
-            significance: Some("high".to_string()),
-        };
-        let lineage_key = format!("source:{}:project-phoenix-launch", source.base.id);
-        first.event_lineage_key = Some(lineage_key.clone());
-        let mut second = first.clone();
-        second.evidence_span = EvidenceSpan {
-            revision: Link::new(revision_b.clone()),
-            node: Some(Link::new(node_b.clone())),
-            start: 0,
-            end: 44,
-            quote_hash: "event-b".to_string(),
-        };
-        second.object_text = None;
-        second.object_literal = Some(Literal::String("Project Phoenix".to_string()));
-        second.source_event_time = Some(
-            chrono::DateTime::parse_from_rfc3339("2024-03-10T12:00:00Z")
-                .expect("parse time")
-                .with_timezone(&Utc),
-        );
-        second.source_event_time_precision = Some(TimePrecision::Day);
-
-        let data_first = ExtractionArtifactData {
-            source_id: Some(source.base.id.to_string()),
-            node_id: node_a.to_string(),
-            revision_id: revision_a.to_string(),
-            assertions: vec![SerializedRawAssertion::from_raw(&first).expect("serialize first")],
-            tokens_used: 10,
-            model: "test-model".to_string(),
-            revision_text_len: 30,
-        };
-        let data_second = ExtractionArtifactData {
-            source_id: Some(source.base.id.to_string()),
-            node_id: node_b.to_string(),
-            revision_id: revision_b.to_string(),
-            assertions: vec![SerializedRawAssertion::from_raw(&second).expect("serialize second")],
-            tokens_used: 12,
-            model: "test-model".to_string(),
-            revision_text_len: 44,
-        };
-
-        commit_knowledge_candidates_bundle(
-            &storage,
-            space_id,
-            &RecordId::new_v4(TableName::WorkRun),
-            actor,
-            &data_first,
-        )
-        .await
-        .expect("commit first bundle");
-        commit_knowledge_candidates_bundle(
-            &storage,
-            space_id,
-            &RecordId::new_v4(TableName::WorkRun),
-            actor,
-            &data_second,
-        )
-        .await
-        .expect("commit second bundle");
-
-        let event_repo = EventRepository::new(storage.clone());
-        let events = event_repo
-            .list_recent(space_id, 10)
-            .await
-            .expect("list events");
-        assert_eq!(
-            events.len(),
-            1,
-            "same source lineage should refine one event"
-        );
-        let event = &events[0];
-        assert_eq!(
-            event.time_start,
-            Some(
-                chrono::DateTime::parse_from_rfc3339("2024-03-10T12:00:00Z")
-                    .expect("parse time")
-                    .with_timezone(&Utc)
-            )
-        );
-        assert_eq!(event.time_precision, TimePrecision::Day);
-        let lineage = event
-            .metadata
-            .get("lineage_key")
-            .and_then(serde_json::Value::as_str)
-            .expect("lineage key");
-        assert!(
-            lineage.starts_with(&format!("source:{}:", source.base.id)),
-            "lineage should be source-scoped, got {lineage}"
-        );
-        assert_eq!(lineage, lineage_key);
+        grounded_event_tests::refines_event_across_nodes().await;
     }
 
     #[tokio::test]
     async fn test_commit_knowledge_candidates_distinguishes_fallback_lineage_by_event_time() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let space_id = "event-lineage-time-space";
-        let actor = "tester";
-        let source = create_manual_source(
-            &storage,
-            space_id,
-            actor,
-            "Launch source",
-            "Alice launched Project Phoenix twice.",
-            IngestMode::Graph,
-        )
-        .await;
-        let (revision_a, node_a) =
-            create_revision_with_node(&storage, space_id, actor, "Alice launched Project Phoenix.")
-                .await;
-        let (revision_b, node_b) = create_revision_with_node(
-            &storage,
-            space_id,
-            actor,
-            "Alice launched Project Phoenix again.",
-        )
-        .await;
-
-        let first = elephant_pipeline::extraction::RawAssertion {
-            subject_text: "Alice".to_string(),
-            predicate_text: "launched".to_string(),
-            object_text: Some("Project Phoenix".to_string()),
-            object_literal: None,
-            evidence_span: EvidenceSpan {
-                revision: Link::new(revision_a.clone()),
-                node: Some(Link::new(node_a.clone())),
-                start: 0,
-                end: 30,
-                quote_hash: "event-a".to_string(),
-            },
-            confidence: 0.95,
-            quote: Some("Alice launched Project Phoenix.".to_string()),
-            source_event_time: Some(
-                chrono::DateTime::parse_from_rfc3339("2024-03-10T12:00:00Z")
-                    .expect("parse time")
-                    .with_timezone(&Utc),
-            ),
-            source_event_time_precision: Some(TimePrecision::Exact),
-            event_title: Some("Project Phoenix launch".to_string()),
-            event_lineage_key: None,
-            subject_entity_id: None,
-            subject_entity_type: Some("person".to_string()),
-            object_entity_id: None,
-            object_entity_type: Some("project".to_string()),
-            significance: Some("high".to_string()),
-        };
-        let mut second = first.clone();
-        second.evidence_span = EvidenceSpan {
-            revision: Link::new(revision_b.clone()),
-            node: Some(Link::new(node_b.clone())),
-            start: 0,
-            end: 36,
-            quote_hash: "event-b".to_string(),
-        };
-        second.source_event_time = Some(
-            chrono::DateTime::parse_from_rfc3339("2024-03-10T13:00:00Z")
-                .expect("parse time")
-                .with_timezone(&Utc),
-        );
-
-        let data_first = ExtractionArtifactData {
-            source_id: Some(source.base.id.to_string()),
-            node_id: node_a.to_string(),
-            revision_id: revision_a.to_string(),
-            assertions: vec![SerializedRawAssertion::from_raw(&first).expect("serialize first")],
-            tokens_used: 10,
-            model: "test-model".to_string(),
-            revision_text_len: 30,
-        };
-        let data_second = ExtractionArtifactData {
-            source_id: Some(source.base.id.to_string()),
-            node_id: node_b.to_string(),
-            revision_id: revision_b.to_string(),
-            assertions: vec![SerializedRawAssertion::from_raw(&second).expect("serialize second")],
-            tokens_used: 12,
-            model: "test-model".to_string(),
-            revision_text_len: 36,
-        };
-
-        commit_knowledge_candidates_bundle(
-            &storage,
-            space_id,
-            &RecordId::new_v4(TableName::WorkRun),
-            actor,
-            &data_first,
-        )
-        .await
-        .expect("commit first bundle");
-        commit_knowledge_candidates_bundle(
-            &storage,
-            space_id,
-            &RecordId::new_v4(TableName::WorkRun),
-            actor,
-            &data_second,
-        )
-        .await
-        .expect("commit second bundle");
-
-        let events = EventRepository::new(storage)
-            .list_recent(space_id, 10)
-            .await
-            .expect("list events");
-        assert_eq!(
-            events.len(),
-            2,
-            "distinct exact event times should produce separate events even with the same fallback lineage key"
-        );
+        grounded_event_tests::distinguishes_exact_event_times().await;
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_validate_artifacts_rejects_resolution_patch_without_target_assertion() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "resolution-validate-space";
         let actor = "tester";
@@ -2381,12 +1689,30 @@ mod work_item_tests {
         let resolution_run_id =
             create_work_run(&storage, space_id, actor, &resolution_item_id).await;
         let workflow = ResolutionPatchWorkflow::new(storage.clone());
+        let (revision, node) = Box::pin(create_revision_with_node(
+            &storage,
+            space_id,
+            actor,
+            "Alice works at Acme Corp.",
+        ))
+        .await;
+        let target = Box::pin(create_pending_assertion(
+            &storage,
+            space_id,
+            actor,
+            (&revision, &node),
+            "Alice",
+            "works_at",
+            Some("Acme Corp"),
+        ))
+        .await;
 
         workflow
             .stage_resolution_patch(
                 &resolution_run_id,
                 elephant_pipeline::resolution::ResolutionPatch {
-                    assertion_id: RecordId::new_v4(TableName::Assertion),
+                    prepared_epoch: None,
+                    assertion_id: target.base.id.clone(),
                     resolved_subject: None,
                     resolved_object: None,
                     confidence: 0.4,
@@ -2398,6 +1724,12 @@ mod work_item_tests {
             )
             .await
             .expect("stage resolution patch");
+        // Staging requires the actual authorized target. Remove it only after
+        // staging so this remains an oracle for the later validation boundary.
+        AssertionRepository::new(storage.clone())
+            .delete(space_id, &target.base.id)
+            .await
+            .expect("remove staged target");
 
         let staged_commit = StagedCommit::new(storage.clone());
         let validated = elephant_pipeline::scheduler::staged_commit::validate_artifacts::execute(
@@ -2423,9 +1755,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_validate_artifacts_rejected_artifacts_do_not_bundle_or_enqueue_commit() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "resolution-reject-space";
         let actor = "tester";
@@ -2433,12 +1769,30 @@ mod work_item_tests {
         let resolution_run_id =
             create_work_run(&storage, space_id, actor, &resolution_item_id).await;
         let workflow = ResolutionPatchWorkflow::new(storage.clone());
+        let (revision, node) = Box::pin(create_revision_with_node(
+            &storage,
+            space_id,
+            actor,
+            "Alice works at Acme Corp.",
+        ))
+        .await;
+        let target = Box::pin(create_pending_assertion(
+            &storage,
+            space_id,
+            actor,
+            (&revision, &node),
+            "Alice",
+            "works_at",
+            Some("Acme Corp"),
+        ))
+        .await;
 
         workflow
             .stage_resolution_patch(
                 &resolution_run_id,
                 elephant_pipeline::resolution::ResolutionPatch {
-                    assertion_id: RecordId::new_v4(TableName::Assertion),
+                    prepared_epoch: None,
+                    assertion_id: target.base.id.clone(),
                     resolved_subject: None,
                     resolved_object: None,
                     confidence: 0.4,
@@ -2450,6 +1804,12 @@ mod work_item_tests {
             )
             .await
             .expect("stage resolution patch");
+        // Staging requires the actual authorized target. Remove it only after
+        // staging so this remains an oracle for the later validation boundary.
+        AssertionRepository::new(storage.clone())
+            .delete(space_id, &target.base.id)
+            .await
+            .expect("remove staged target");
 
         let validate_item = WorkItem {
             base: BaseFields::new(
@@ -2478,7 +1838,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        execute_work_item(
+        dispatch_fixture(
             &validate_item,
             &validate_run_id,
             storage.clone(),
@@ -2516,155 +1876,21 @@ mod work_item_tests {
 
     #[tokio::test]
     async fn test_commit_artifacts_applies_resolution_patch_bundle() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let space_id = "resolution-commit-space";
-        let actor = "tester";
-        let (revision_id, node_id) =
-            create_revision_with_node(&storage, space_id, actor, "Alice works at Acme Corp.").await;
-        let assertion = create_pending_assertion(
-            &storage,
-            space_id,
-            actor,
-            (&revision_id, &node_id),
-            "Alice",
-            "works_at",
-            Some("Acme Corp"),
-        )
+        Box::pin(resolution_bundle_tests::contract(
+            false,
+            resolution_bundle_tests::Scenario::Commit,
+        ))
         .await;
-        let resolved_subject = create_entity(&storage, space_id, actor, "Alice", "person").await;
-
-        let resolution_item_id = RecordId::new_v4(TableName::WorkItem);
-        let resolution_run_id =
-            create_work_run(&storage, space_id, actor, &resolution_item_id).await;
-        let workflow = ResolutionPatchWorkflow::new(storage.clone());
-        workflow
-            .stage_resolution_patch(
-                &resolution_run_id,
-                elephant_pipeline::resolution::ResolutionPatch {
-                    assertion_id: assertion.base.id.clone(),
-                    resolved_subject: Some(resolved_subject.base.id.clone()),
-                    resolved_object: None,
-                    confidence: 0.91,
-                    resolution_method: "graph_context".to_string(),
-                    status: ResolutionStatus::Resolved,
-                    abstention_reason: None,
-                },
-                space_id,
-            )
-            .await
-            .expect("stage resolution patch");
-
-        let config = WorkQueueWorkerConfig::default();
-        let space_config_repo = SpaceConfigRepository::new(storage.clone());
-        let provider_cache = EmbeddingProviderCache::new();
-        let embed_config = EmbedWorkerConfig::default();
-        let validate_item = WorkItem {
-            base: BaseFields::new(
-                RecordId::new_v4(TableName::WorkItem),
-                space_id.to_string(),
-                actor.to_string(),
-            ),
-            kind: VALIDATE_ARTIFACTS_KIND.to_string(),
-            payload: serde_json::json!({
-                "work_run_id": resolution_run_id.to_string(),
-                "ingest_mode": "graph"
-            }),
-            status: WorkItemStatus::Runnable,
-            priority: 5,
-            idempotency_key: "validate-resolution-bundle".to_string(),
-            attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
-            run_after: None,
-            last_error: None,
-        };
-        let validate_run_id =
-            create_work_run(&storage, space_id, actor, &validate_item.base.id).await;
-        execute_work_item(
-            &validate_item,
-            &validate_run_id,
-            storage.clone(),
-            &config,
-            &space_config_repo,
-            &provider_cache,
-            &embed_config,
-            &TmContext::none(),
-        )
-        .await
-        .expect("execute validate_artifacts");
-
-        let artifact_repo = WorkArtifactRepository::new(storage.clone());
-        let bundled = artifact_repo
-            .find_by_work_run(&resolution_run_id)
-            .await
-            .expect("find bundle artifacts");
-        assert!(
-            bundled
-                .iter()
-                .any(|artifact| artifact.artifact_type == COMMIT_BUNDLE_ARTIFACT_TYPE),
-            "resolution patch should produce a commit bundle"
-        );
-
-        let commit_item = WorkItem {
-            base: BaseFields::new(
-                RecordId::new_v4(TableName::WorkItem),
-                space_id.to_string(),
-                actor.to_string(),
-            ),
-            kind: COMMIT_ARTIFACTS_KIND.to_string(),
-            payload: serde_json::json!({
-                "work_run_id": resolution_run_id.to_string(),
-                "ingest_mode": "graph"
-            }),
-            status: WorkItemStatus::Runnable,
-            priority: 5,
-            idempotency_key: "commit-resolution-bundle".to_string(),
-            attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
-            run_after: None,
-            last_error: None,
-        };
-        let commit_run_id = create_work_run(&storage, space_id, actor, &commit_item.base.id).await;
-        execute_work_item(
-            &commit_item,
-            &commit_run_id,
-            storage.clone(),
-            &config,
-            &space_config_repo,
-            &provider_cache,
-            &embed_config,
-            &TmContext::none(),
-        )
-        .await
-        .expect("execute commit_artifacts");
-
-        let refreshed = AssertionRepository::new(storage.clone())
-            .get(space_id, &assertion.base.id)
-            .await
-            .expect("load assertion")
-            .expect("assertion should exist");
-        assert_eq!(refreshed.resolution_status, ResolutionStatus::Resolved);
-        assert_eq!(
-            refreshed
-                .subject_entity
-                .as_ref()
-                .map(|link| link.id().clone()),
-            Some(resolved_subject.base.id.clone())
-        );
-        assert_eq!(
-            refreshed.resolution_method.as_deref(),
-            Some("graph_context")
-        );
-        assert_eq!(refreshed.resolution_confidence, Some(0.91));
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_apply_resolution_patch_rejects_second_patch_after_first_commit() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "resolution-cas-space";
         let actor = "tester";
@@ -2688,6 +1914,7 @@ mod work_item_tests {
             &storage,
             space_id,
             &elephant_pipeline::resolution::ResolutionPatch {
+                prepared_epoch: None,
                 assertion_id: assertion.base.id.clone(),
                 resolved_subject: Some(first_entity.base.id.clone()),
                 resolved_object: None,
@@ -2706,6 +1933,7 @@ mod work_item_tests {
             &storage,
             space_id,
             &elephant_pipeline::resolution::ResolutionPatch {
+                prepared_epoch: None,
                 assertion_id: assertion.base.id.clone(),
                 resolved_subject: Some(second_entity.base.id.clone()),
                 resolved_object: None,
@@ -2736,9 +1964,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_upgrade_ingest_mode_skips_when_source_already_at_target_mode() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "upgrade-skip-space";
         let actor = "tester";
@@ -2786,7 +2018,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        execute_work_item(
+        dispatch_fixture(
             &upgrade_item,
             &upgrade_run_id,
             storage.clone(),
@@ -2815,9 +2047,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_enqueue_upgrade_after_metadata_commit_reopens_terminal_item() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "upgrade-reopen-space";
         let actor = "tester";
@@ -2908,9 +2144,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_upgrade_ingest_mode_reopens_terminal_render_doc_item() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "upgrade-render-reopen-space";
         let actor = "tester";
@@ -2990,7 +2230,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        execute_work_item(
+        dispatch_fixture(
             &upgrade_item,
             &upgrade_run_id,
             storage.clone(),
@@ -3018,9 +2258,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_mark_source_graph_ready_waits_for_render_doc() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "graph-ready-space";
         let actor = "tester";
@@ -3087,9 +2331,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_materialize_doc_from_source_refreshes_doc_acl_and_provenance() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "materialize-source-space";
         let actor = "tester";
@@ -3152,9 +2400,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_materialize_doc_from_source_uses_existing_linked_doc_without_manual_template() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "materialize-linked-doc-space";
         let actor = "tester";
@@ -3213,9 +2465,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_materialize_doc_from_source_restores_soft_deleted_staged_doc() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "materialize-restores-doc-space";
         let actor = "tester";
@@ -3262,9 +2518,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_upgrade_ingest_mode_rejects_graph_without_staged_doc() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "upgrade-no-doc-space";
         let actor = "tester";
@@ -3312,7 +2572,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        let err = execute_work_item(
+        let err = dispatch_fixture(
             &upgrade_item,
             &upgrade_run_id,
             storage.clone(),
@@ -3333,9 +2593,13 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_resolution_dependency_promotes_after_completion() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "test_space";
         let actor = "tester";
@@ -3397,14 +2661,11 @@ mod work_item_tests {
         };
         let work_queue = WorkQueue::new(storage.clone(), queue_config);
 
-        let mut running_item = extract_item.clone();
-        running_item.status = WorkItemStatus::Running;
-        running_item.leased_by = Some("test-worker".to_string());
-        running_item.lease_expires_at = Some(chrono::Utc::now() + chrono::Duration::minutes(5));
-        item_repo
-            .update(space_id, &extract_item.base.id, running_item)
-            .await
-            .expect("mark running");
+        let running_item = work_queue.claim().await.expect("claim").expect("item");
+        assert_eq!(running_item.base.id, extract_item.base.id);
+        let work_queue = work_queue
+            .for_attempt(&running_item)
+            .expect("captured attempt");
 
         complete_work_item_and_promote(&work_queue, &dag, space_id, &extract_item.base.id)
             .await
@@ -3419,43 +2680,28 @@ mod work_item_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_truth_maintenance_execute_work_item_tm_resolve_slot_enqueues_tm_commit() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "tm_space";
         let actor = "tester";
 
         let subject_id = RecordId::new_v4(TableName::Entity);
-        let assertion_id = RecordId::new_v4(TableName::Assertion);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-        let attr_id = RecordId::new_v4(TableName::Attribute);
-
-        let base = BaseFields::new(attr_id.clone(), space_id.to_string(), actor.to_string());
-        let evidence = EvidenceRef {
-            assertion: Link::new(assertion_id),
-            span: EvidenceSpan {
-                revision: Link::new(revision_id),
-                node: None,
-                start: 0,
-                end: 5,
-                quote_hash: "hash".to_string(),
-            },
-            time_basis: TimeBasis::ObservedAt,
-            time_value: chrono::Utc::now(),
-        };
-
-        let attribute = Attribute {
-            base,
-            subject: Link::new(subject_id.clone()),
-            attr_type: "title".to_string(),
-            value: Literal::String("CEO".to_string()),
-            status: ClaimStatus::Candidate,
-            confidence: 0.9,
-            validity_window: None,
-            evidence: vec![evidence],
-            temporal_audit: None,
-        };
+        let attribute = make_chain_attribute(
+            &storage,
+            space_id,
+            actor,
+            &subject_id,
+            "title",
+            Literal::String("CEO".into()),
+        )
+        .await;
+        let attr_id = attribute.base.id.clone();
 
         let attr_repo = AttributeRepository::new(storage.clone());
         attr_repo.create(attribute).await.expect("create attribute");
@@ -3500,7 +2746,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        let _ = execute_work_item(
+        let _ = dispatch_fixture(
             &work_item,
             &work_run_id,
             storage.clone(),
@@ -3522,20 +2768,29 @@ mod work_item_tests {
     }
 
     #[tokio::test]
-    async fn test_truth_maintenance_execute_work_item_tm_detect_conflicts_enqueues_tm_commit_for_single_claim(
-    ) {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
+    async fn test_truth_maintenance_execute_work_item_tm_detect_conflicts_commits_single_claim() {
         use elephant_outbox::{EventOperation, OutboxPayload, RecordRef};
         use elephant_types::records::rel::{ClaimStatus, Rel};
         use elephant_types::records::SystemEvent;
 
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "tm_space";
         let actor = "tester";
 
-        let subject_id = RecordId::new_v4(TableName::Entity);
-        let object_id = RecordId::new_v4(TableName::Entity);
+        let subject_id = Box::pin(create_entity(&storage, space_id, actor, "Alice", "person"))
+            .await
+            .base
+            .id;
+        let object_id = Box::pin(create_entity(&storage, space_id, actor, "Acme Corp", "org"))
+            .await
+            .base
+            .id;
         let rel_id = RecordId::new_v4(TableName::Rel);
         let rel = Rel {
             base: BaseFields::new(rel_id.clone(), space_id.to_string(), actor.to_string()),
@@ -3603,7 +2858,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        let _ = execute_work_item(
+        let _ = dispatch_fixture(
             &work_item,
             &work_run_id,
             storage.clone(),
@@ -3616,18 +2871,31 @@ mod work_item_tests {
         .await
         .expect("execute tm_detect_conflicts");
 
-        let item_repo = WorkItemRepository::new(storage);
+        let item_repo = WorkItemRepository::new(storage.clone());
         let items = item_repo
             .list(space_id, 10, None)
             .await
             .expect("list work items");
-        assert!(items.iter().any(|item| item.kind == TM_COMMIT_KIND));
+        assert!(!items.iter().any(|item| item.kind == TM_COMMIT_KIND));
+        let slots = elephant_storage::TruthSlotRepository::new(storage)
+            .list(space_id, 20, None)
+            .await
+            .expect("committed slots");
+        assert_eq!(
+            slots.len(),
+            1,
+            "single claim is applied in detection transaction"
+        );
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_truth_maintenance_execute_work_item_tm_recompute_runs() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "tm_space";
         let actor = "tester";
@@ -3656,7 +2924,7 @@ mod work_item_tests {
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
 
-        let _ = execute_work_item(
+        let _ = dispatch_fixture(
             &work_item,
             &work_run_id,
             storage,
@@ -3670,30 +2938,18 @@ mod work_item_tests {
         .expect("execute tm_recompute");
     }
 
-    #[test]
-    fn test_tm_context_from_requires_api_key() {
-        assert!(tm_context_from(false, None).adjudicator.is_none());
-        assert!(tm_context_from(false, Some("claude-custom".to_string()))
-            .adjudicator
-            .is_none());
-    }
-
-    #[test]
-    fn test_tm_context_from_key_present_gated_on_feature() {
-        for model in [
-            None,
-            Some("claude-custom".to_string()),
-            Some(" ".to_string()),
-        ] {
-            let ctx = tm_context_from(true, model);
-            #[cfg(feature = "meerkat-extraction")]
-            assert!(
-                ctx.adjudicator.is_some(),
-                "key present enables adjudication"
-            );
-            #[cfg(not(feature = "meerkat-extraction"))]
-            assert!(ctx.adjudicator.is_none(), "no adjudicator without meerkat");
-        }
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
+    async fn missing_space_cannot_acquire_adjudication_from_ambient_configuration() {
+        let storage = StorageClient::new_embedded().await.expect("store");
+        let context = ProviderDispatchContext::new(SpaceConfigRepository::new(storage), "missing");
+        let error = build_tm_context_for_space(context)
+            .await
+            .expect_err("explicit space is required");
+        assert_eq!(classify_failure(&error), FailureClass::ConfigurationBlocked);
     }
 
     /// Scripted adjudicator for chain tests.
@@ -3719,7 +2975,8 @@ mod work_item_tests {
         }
     }
 
-    fn make_chain_attribute(
+    async fn make_chain_attribute(
+        storage: &StorageClient,
         space_id: &str,
         actor: &str,
         subject_id: &RecordId,
@@ -3727,17 +2984,23 @@ mod work_item_tests {
         value: Literal,
     ) -> Attribute {
         let attr_id = RecordId::new_v4(TableName::Attribute);
+        let text = format!("Fixture {subject_id} {attr_type}: {value:?}");
+        let (revision, node) = create_revision_with_node(storage, space_id, actor, &text).await;
+        let assertion = create_pending_assertion(
+            storage,
+            space_id,
+            actor,
+            (&revision, &node),
+            "Fixture subject",
+            attr_type,
+            None,
+        )
+        .await;
         let evidence = EvidenceRef {
-            assertion: Link::new(RecordId::new_v4(TableName::Assertion)),
-            span: EvidenceSpan {
-                revision: Link::new(RecordId::new_v4(TableName::DocRevision)),
-                node: None,
-                start: 0,
-                end: 5,
-                quote_hash: "hash".to_string(),
-            },
+            assertion: Link::new(assertion.base.id),
+            span: assertion.evidence,
             time_basis: TimeBasis::ObservedAt,
-            time_value: chrono::Utc::now(),
+            time_value: Utc::now(),
         };
         Attribute {
             base: BaseFields::new(attr_id, space_id.to_string(), actor.to_string()),
@@ -3821,7 +3084,7 @@ mod work_item_tests {
         let space_config_repo = SpaceConfigRepository::new(storage.clone());
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
-        let _ = execute_work_item(
+        let _ = dispatch_fixture(
             item,
             &work_run_id,
             storage.clone(),
@@ -3838,17 +3101,37 @@ mod work_item_tests {
     /// Chain: two identical attribute claims corroborate end-to-end through
     /// the TM work kinds (detect -> direct commit, no conflict group).
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_tm_chain_identical_attrs_corroborate_end_to_end() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "tm_chain_space";
         let actor = "tester";
         let subject_id = RecordId::new_v4(TableName::Entity);
 
         let attr_repo = AttributeRepository::new(storage.clone());
-        let attr1 = make_chain_attribute(space_id, actor, &subject_id, "age", Literal::Integer(35));
-        let attr2 = make_chain_attribute(space_id, actor, &subject_id, "age", Literal::Integer(35));
+        let attr1 = make_chain_attribute(
+            &storage,
+            space_id,
+            actor,
+            &subject_id,
+            "age",
+            Literal::Integer(35),
+        )
+        .await;
+        let attr2 = make_chain_attribute(
+            &storage,
+            space_id,
+            actor,
+            &subject_id,
+            "age",
+            Literal::Integer(35),
+        )
+        .await;
         let attr1_id = attr1.base.id.clone();
         let attr2_id = attr2.base.id.clone();
         attr_repo.create(attr1).await.expect("create attr1");
@@ -3870,12 +3153,10 @@ mod work_item_tests {
             !queued.iter().any(|item| item.kind == TM_RESOLVE_SLOT_KIND),
             "identical values must not enqueue resolution"
         );
-        let commit_item = queued
-            .iter()
-            .find(|item| item.kind == TM_COMMIT_KIND)
-            .expect("corroboration commit enqueued")
-            .clone();
-        run_tm_item(&storage, &commit_item, &TmContext::none()).await;
+        assert!(
+            !queued.iter().any(|item| item.kind == TM_COMMIT_KIND),
+            "deterministic corroboration commits with detection"
+        );
 
         let live1 = attr_repo.get(space_id, &attr1_id).await.expect("get attr1");
         let live2 = attr_repo.get(space_id, &attr2_id).await.expect("get attr2");
@@ -3898,13 +3179,17 @@ mod work_item_tests {
     /// Chain: divergent attribute values go through `tm_resolve_slot` where
     /// the injected adjudicator's verdict wins, then `tm_commit` applies it.
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_tm_chain_value_conflict_adjudicated_end_to_end() {
         use elephant_pipeline::truth_maintenance::adjudicator::{
             AdjudicationDecision, AdjudicationVerdict,
         };
 
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "tm_chain_space";
         let actor = "tester";
@@ -3912,19 +3197,23 @@ mod work_item_tests {
 
         let attr_repo = AttributeRepository::new(storage.clone());
         let attr_old = make_chain_attribute(
+            &storage,
             space_id,
             actor,
             &subject_id,
             "employer",
             Literal::String("King".to_string()),
-        );
+        )
+        .await;
         let attr_new = make_chain_attribute(
+            &storage,
             space_id,
             actor,
             &subject_id,
             "employer",
             Literal::String("Blizzard".to_string()),
-        );
+        )
+        .await;
         let old_id = attr_old.base.id.clone();
         let new_id = attr_new.base.id.clone();
         attr_repo.create(attr_old).await.expect("create old");
@@ -3999,129 +3288,292 @@ mod work_item_tests {
         assert!(unresolved.is_empty(), "group resolved after adjudication");
     }
 
-    /// Mirrors the private truth-maintenance security hash for slot keys.
-    fn security_hash_of(security: &elephant_types::records::base::Security) -> String {
-        use sha2::{Digest, Sha256};
-
-        let mut hasher = Sha256::new();
-        hasher.update(security.policy_id.as_bytes());
-        hasher.update(security.level.to_be_bytes());
-        let mut labels = security.labels.clone();
-        labels.sort();
-        for label in labels {
-            hasher.update(label.as_bytes());
+    /// Read the complete original queue inventory, including retained history.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
+    async fn tm_items(storage: &StorageClient, space: &str, kind: &str) -> Vec<WorkItem> {
+        let items = WorkItemRepository::new(storage.clone());
+        let mut selected = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = items
+                .list(space, 256, cursor.as_ref())
+                .await
+                .expect("actual queue page");
+            let count = page.len();
+            if let Some(last) = page.last() {
+                assert_ne!(
+                    cursor.as_ref(),
+                    Some(&last.base.id),
+                    "queue cursor advances"
+                );
+                cursor = Some(last.base.id.clone());
+            }
+            selected.extend(page.into_iter().filter(|item| item.kind == kind));
+            if count < 256 {
+                return selected;
+            }
         }
-        let mut handling = security.handling.clone();
-        handling.sort();
-        for handle in handling {
-            hasher.update(handle.as_bytes());
-        }
-        format!("{:x}", hasher.finalize())
     }
 
-    /// Seeds two divergent `age` attributes plus their truth slot; returns the
-    /// slot key.
+    /// Seed the slot through actual detection, resolution and atomic commit.
+    /// Its original partition and decision state come from the active runtime.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn seed_divergent_attr_slot(
         storage: &StorageClient,
         space_id: &str,
         actor: &str,
         stale: bool,
     ) -> (String, RecordId, Vec<String>) {
-        use elephant_types::records::truth::TruthSlot;
-
+        ensure_fixture_space(storage, space_id, actor).await;
+        // The default AllowParallel policy resolves both values without a
+        // provider. This fixture needs a real unresolved review requirement
+        // so the subsequent queue arms exercise pending conflict work.
+        elephant_storage::PredicateRegistryRepository::new(storage.clone())
+            .create(elephant_types::records::PredicateRegistry {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::PredicateRegistry),
+                    space_id.to_string(),
+                    actor.to_string(),
+                ),
+                predicate_id: "age".into(),
+                description: None,
+                status: "active".into(),
+                semantics: Some(elephant_types::records::predicate::PredicateSemantics {
+                    conflict_policy:
+                        elephant_types::records::truth::ConflictPolicy::RequireMoreEvidence,
+                    ..Default::default()
+                }),
+                semantics_status: elephant_types::records::predicate::SemanticsStatus::Configured,
+                first_seen_at: None,
+                usage_count: 0,
+                last_used_at: None,
+            })
+            .await
+            .expect("original explicit review-required predicate");
         let subject_id = RecordId::new_v4(TableName::Entity);
         let attr_repo = AttributeRepository::new(storage.clone());
         let mut claim_ids = Vec::new();
-        let mut security_hash = String::new();
         for value in [35_i64, 36] {
-            let attr =
-                make_chain_attribute(space_id, actor, &subject_id, "age", Literal::Integer(value));
-            security_hash = security_hash_of(&attr.base.security);
+            let attr = make_chain_attribute(
+                storage,
+                space_id,
+                actor,
+                &subject_id,
+                "age",
+                Literal::Integer(value),
+            )
+            .await;
             claim_ids.push(attr.base.id.to_string());
-            attr_repo.create(attr).await.expect("create attr");
+            attr_repo
+                .create(attr)
+                .await
+                .expect("create actual grounded attribute");
         }
         claim_ids.sort();
-        let slot_key = compute_slot_key(&subject_id.to_string(), None, "age", None, &security_hash);
-        let slot = TruthSlot {
-            base: BaseFields::new(
-                RecordId::new_v4(TableName::TruthSlot),
-                space_id.to_string(),
-                actor.to_string(),
-            ),
-            slot_key: slot_key.clone(),
-            slot_type: "attribute".to_string(),
-            subject_entity: subject_id.to_string(),
-            predicate_id: "age".to_string(),
-            current_values: vec![],
-            conflict_group: None,
-            confidence: 0.0,
-            rationale: None,
-            semantics_version: 1,
-            alias_version: 1,
-            stale,
-            stale_reason: stale.then(|| "test".to_string()),
-            computed_at: chrono::Utc::now() - chrono::Duration::days(10),
-            security_hash,
-        };
-        let slot_repo = elephant_storage::TruthSlotRepository::new(storage.clone());
-        slot_repo.create(slot).await.expect("create slot");
-
-        (slot_key, subject_id, claim_ids)
+        let changed: RecordId = claim_ids[0].parse().expect("original attribute identity");
+        let event = enqueue_attr_outbox_event(storage, space_id, &changed).await;
+        let detection = make_tm_work_item(
+            space_id,
+            actor,
+            TM_DETECT_CONFLICTS_KIND,
+            serde_json::json!({"event_ids":[event.to_string()]}),
+            "seed-actual-partition-detect",
+        );
+        run_tm_item(storage, &detection, &TmContext::none()).await;
+        let resolution = tm_items(storage, space_id, TM_RESOLVE_SLOT_KIND)
+            .await
+            .into_iter()
+            .find(|item| item.status == WorkItemStatus::Runnable)
+            .expect("actual detected conflict work");
+        let group_id: RecordId = resolution.payload["conflict_group_id"]
+            .as_str()
+            .expect("actual original group")
+            .parse()
+            .expect("typed group");
+        run_tm_item(storage, &resolution, &TmContext::none()).await;
+        let commit = tm_items(storage, space_id, TM_COMMIT_KIND)
+            .await
+            .into_iter()
+            .find(|item| item.status == WorkItemStatus::Runnable)
+            .expect("actual unresolved decision commit");
+        run_tm_item(storage, &commit, &TmContext::none()).await;
+        let group = ConflictGroupRepository::new(storage.clone())
+            .get(space_id, &group_id)
+            .await
+            .expect("actual group read")
+            .expect("retained group");
+        assert!(
+            !group.resolved,
+            "no provider verdict was invented during setup"
+        );
+        assert!(
+            group.adjudicated_claim_set_hash.is_none(),
+            "setup did not fabricate memo authority"
+        );
+        let slots = elephant_storage::TruthSlotRepository::new(storage.clone());
+        let slot = slots
+            .find_by_slot_key(space_id, &group.slot_key)
+            .await
+            .expect("actual committed partition lookup")
+            .expect("slot committed by real runtime");
+        assert_eq!(slot.subject_entity, subject_id.to_string());
+        if stale {
+            slots
+                .mark_stale_by_entity(space_id, &subject_id, "explicit recompute fixture")
+                .await
+                .expect("sanctioned actual stale transition");
+        }
+        (slot.slot_key, subject_id, claim_ids)
     }
 
     /// A memoized replay must not enqueue a `tm_commit` (it would clobber the
     /// previously committed verdict with Disputed statuses).
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_tm_resolve_slot_arm_skips_commit_for_memoized_replay() {
-        use elephant_pipeline::truth_maintenance::compute_claim_set_hash;
-
+        use elephant_pipeline::truth_maintenance::adjudicator::{
+            AdjudicationDecision, AdjudicationVerdict, ProposedSemantics,
+        };
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
+        initialize_fixture_schema(&storage).await;
         let space_id = "tm_space";
         let actor = "tester";
-        let (slot_key, _subject_id, claim_ids) =
+        let (slot_key, _, claim_ids) =
             seed_divergent_attr_slot(&storage, space_id, actor, false).await;
-
-        // Unresolved group already adjudicated for this exact claim set.
-        let mut conflict_group =
-            create_conflict_group(&slot_key, "attribute", claim_ids.clone(), space_id);
-        conflict_group.adjudicated_claim_set_hash = Some(compute_claim_set_hash(&claim_ids));
-        conflict_group.adjudicated_at = Some(chrono::Utc::now());
-        let conflict_group_id = conflict_group.base.id.clone();
-        let conflict_repo = ConflictGroupRepository::new(storage.clone());
-        conflict_repo
-            .create(conflict_group)
+        let groups = ConflictGroupRepository::new(storage.clone());
+        let group = groups
+            .find_unresolved_by_slot_key_and_type(space_id, &slot_key, "attribute")
             .await
-            .expect("create conflict group");
-
-        let work_item = make_tm_work_item(
+            .expect("original group")
+            .expect("unresolved group");
+        let context = TmContext {
+            adjudicator: Some(Arc::new(FakeChainAdjudicator {
+                verdict: AdjudicationVerdict {
+                    decision: AdjudicationDecision::SingleWinner,
+                    winner_id: Some(claim_ids[1].clone()),
+                    equivalent_groups: vec![],
+                    superseded: vec![],
+                    winner_valid_from: None,
+                    proposed_semantics: Some(ProposedSemantics {
+                        cardinality: elephant_types::records::predicate::Cardinality::One,
+                        temporal_model:
+                            elephant_types::records::temporal::TemporalPersonality::StateOverTime,
+                        conflict_policy:
+                            elephant_types::records::truth::ConflictPolicy::SupersedeByRecency,
+                    }),
+                    rationale: "actual original scripted fixture verdict".into(),
+                },
+            })),
+        };
+        let original = make_tm_work_item(
             space_id,
             actor,
             TM_RESOLVE_SLOT_KIND,
-            serde_json::json!({ "conflict_group_id": conflict_group_id.to_string() }),
+            serde_json::json!({"conflict_group_id":group.base.id.to_string()}),
+            "tm-original-adjudication",
+        );
+        run_tm_item(&storage, &original, &context).await;
+        let commit = tm_items(&storage, space_id, TM_COMMIT_KIND)
+            .await
+            .into_iter()
+            .find(|item| item.status == WorkItemStatus::Runnable)
+            .expect("real original adjudicated commit");
+        run_tm_item(&storage, &commit, &TmContext::none()).await;
+        let completed = groups
+            .get(space_id, &group.base.id)
+            .await
+            .expect("actual memo read")
+            .expect("group");
+        assert!(completed.resolved && completed.adjudicated_claim_set_hash.is_some());
+        let attributes = AttributeRepository::new(storage.clone());
+        let winner_id: RecordId = claim_ids[1].parse().expect("winner identity");
+        let loser_id: RecordId = claim_ids[0].parse().expect("loser identity");
+        let winner = attributes
+            .get(space_id, &winner_id)
+            .await
+            .expect("winner")
+            .expect("present");
+        let loser = attributes
+            .get(space_id, &loser_id)
+            .await
+            .expect("loser")
+            .expect("present");
+        assert_eq!(winner.status, ClaimStatus::Approved);
+        assert_eq!(loser.status, ClaimStatus::Superseded);
+        let before: std::collections::BTreeSet<_> = tm_items(&storage, space_id, TM_COMMIT_KIND)
+            .await
+            .into_iter()
+            .map(|item| item.base.id)
+            .collect();
+        let replay = make_tm_work_item(
+            space_id,
+            actor,
+            TM_RESOLVE_SLOT_KIND,
+            serde_json::json!({"conflict_group_id":group.base.id.to_string()}),
             "tm-resolve-memoized",
         );
-        run_tm_item(&storage, &work_item, &TmContext::none()).await;
-
-        let item_repo = WorkItemRepository::new(storage);
-        let items = item_repo.list(space_id, 10, None).await.expect("list");
-        assert!(
-            !items.iter().any(|item| item.kind == TM_COMMIT_KIND),
-            "memoized replay must not enqueue tm_commit"
+        run_tm_item(&storage, &replay, &context).await;
+        let after: std::collections::BTreeSet<_> = tm_items(&storage, space_id, TM_COMMIT_KIND)
+            .await
+            .into_iter()
+            .map(|item| item.base.id)
+            .collect();
+        assert_eq!(
+            after, before,
+            "memoized replay must not enqueue another tm_commit"
+        );
+        assert_eq!(
+            attributes
+                .get(space_id, &winner_id)
+                .await
+                .expect("winner unchanged"),
+            Some(winner)
+        );
+        assert_eq!(
+            attributes
+                .get(space_id, &loser_id)
+                .await
+                .expect("loser unchanged"),
+            Some(loser)
+        );
+        assert_eq!(
+            groups
+                .get(space_id, &group.base.id)
+                .await
+                .expect("memo unchanged"),
+            Some(completed)
         );
     }
 
     /// The recompute arm enqueues one `tm_resolve_slot` per pending group.
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_tm_recompute_arm_enqueues_pending_resolves() {
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "tm_space";
         let actor = "tester";
         let (slot_key, _subject_id, _claim_ids) =
             seed_divergent_attr_slot(&storage, space_id, actor, true).await;
+        let prior_resolves: std::collections::BTreeSet<_> =
+            tm_items(&storage, space_id, TM_RESOLVE_SLOT_KIND)
+                .await
+                .into_iter()
+                .map(|item| item.base.id)
+                .collect();
 
         let work_item = make_tm_work_item(
             space_id,
@@ -4132,11 +3584,10 @@ mod work_item_tests {
         );
         run_tm_item(&storage, &work_item, &TmContext::none()).await;
 
-        let item_repo = WorkItemRepository::new(storage.clone());
-        let items = item_repo.list(space_id, 10, None).await.expect("list");
+        let items = tm_items(&storage, space_id, TM_RESOLVE_SLOT_KIND).await;
         let resolve_item = items
             .iter()
-            .find(|item| item.kind == TM_RESOLVE_SLOT_KIND)
+            .find(|item| !prior_resolves.contains(&item.base.id))
             .expect("pending group enqueued as tm_resolve_slot");
 
         let conflict_repo = ConflictGroupRepository::new(storage);
@@ -4157,18 +3608,28 @@ mod work_item_tests {
     /// The reprocess arm enqueues `tm_resolve_slot` items for the conflict
     /// groups its reconvergence recompute deferred.
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repository owners alive through the original regression assertion scope."
+    )]
     async fn test_reprocess_arm_enqueues_pending_conflict_resolves() {
         use elephant_types::records::reprocess::{
             default_reprocess_target_stages, SelectionCriteria,
         };
 
         let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        initialize_fixture_schema(&storage).await;
 
         let space_id = "tm_space";
         let actor = "tester";
         let (slot_key, _subject_id, _claim_ids) =
             seed_divergent_attr_slot(&storage, space_id, actor, false).await;
+        let prior_resolves: std::collections::BTreeSet<_> =
+            tm_items(&storage, space_id, TM_RESOLVE_SLOT_KIND)
+                .await
+                .into_iter()
+                .map(|item| item.base.id)
+                .collect();
 
         // No sources match the criteria: the job runs straight into the
         // remaintain recompute, which defers the divergent slot.
@@ -4188,20 +3649,23 @@ mod work_item_tests {
         .await
         .expect("create reprocess job");
 
-        let work_item = make_tm_work_item(
-            space_id,
-            actor,
-            WORK_KIND_EXECUTE_REPROCESS_JOB,
-            serde_json::json!({ "job_id": creation.job.base.id.to_string() }),
-            "reprocess-pending",
-        );
+        let work_id = job_repo
+            .ensure_work(&creation.job)
+            .await
+            .expect("original durable handoff");
+        let work_item = WorkItemRepository::new(storage.clone())
+            .get(space_id, &work_id)
+            .await
+            .expect("read handoff")
+            .expect("actual job work");
         // Reprocess loads its work run for provenance; seed a real one.
         let work_run_id = create_work_run(&storage, space_id, actor, &work_item.base.id).await;
         let config = WorkQueueWorkerConfig::default();
         let space_config_repo = SpaceConfigRepository::new(storage.clone());
         let provider_cache = EmbeddingProviderCache::new();
         let embed_config = EmbedWorkerConfig::default();
-        let _ = execute_work_item(
+        let requeue_started = Utc::now();
+        let error = dispatch_fixture(
             &work_item,
             &work_run_id,
             storage.clone(),
@@ -4212,13 +3676,77 @@ mod work_item_tests {
             &TmContext::none(),
         )
         .await
-        .expect("execute reprocess job");
+        .expect_err("real conflict children leave the original reprocess attempt pending");
+        let requeue_finished = Utc::now();
+        assert_eq!(
+            error
+                .downcast_ref::<WorkFailure>()
+                .map(|failure| failure.class),
+            Some(FailureClass::PendingDependencies),
+            "the original dispatcher must return typed pending work: {error}"
+        );
+        let original_work = WorkItemRepository::new(storage.clone())
+            .get(space_id, &work_id)
+            .await
+            .expect("read original requeued work")
+            .expect("original work retained");
+        assert_eq!(original_work.base.id, work_item.base.id);
+        assert_eq!(original_work.status, WorkItemStatus::Runnable);
+        assert_eq!(original_work.attempts, work_item.attempts);
+        assert!(original_work.leased_by.is_none());
+        assert!(original_work.lease_expires_at.is_none());
+        assert_eq!(
+            original_work.last_error.as_deref(),
+            Some(format!("pending_dependencies: {error}").as_str())
+        );
+        let run_after = original_work.run_after.expect("original dependency delay");
+        assert!(run_after >= requeue_started + Duration::seconds(5));
+        assert!(run_after <= requeue_finished + Duration::seconds(5));
+        let original_run = WorkRunRepository::new(storage.clone())
+            .get(space_id, &work_run_id)
+            .await
+            .expect("read actual original run")
+            .expect("original failed run retained");
+        assert_eq!(original_run.work_item.id(), &work_id);
+        assert_eq!(original_run.attempt, work_item.attempts + 1);
+        assert!(!original_run.success);
+        assert_eq!(
+            original_run.error.as_deref(),
+            Some(error.to_string().as_str())
+        );
+        let completed = original_run.completed_at.expect("original run finished");
+        assert!(
+            original_work.run_after.is_some_and(|due| due > completed),
+            "actual blocked work must retain a future retry time"
+        );
+        let fence: elephant_types::publication::AttemptFence = serde_json::from_value(
+            original_run
+                .metrics
+                .custom
+                .get("attempt_fence")
+                .expect("original claimed authority recorded")
+                .clone(),
+        )
+        .expect("typed original attempt fence");
+        assert_eq!(fence.work_item_id, work_id);
+        assert_eq!(fence.space_id, space_id);
+        assert!(fence.generation > 0 && !fence.lease_token.is_empty());
+        let pending_job = job_repo
+            .get(space_id, &creation.job.base.id)
+            .await
+            .expect("read original paused job")
+            .expect("original job retained");
+        assert_eq!(pending_job.target_stages, default_reprocess_target_stages());
+        assert_eq!(
+            pending_job.status,
+            elephant_types::records::reprocess::ReprocessStatus::Paused
+        );
+        assert!(pending_job.completed_at.is_none());
 
-        let item_repo = WorkItemRepository::new(storage.clone());
-        let items = item_repo.list(space_id, 10, None).await.expect("list");
+        let items = tm_items(&storage, space_id, TM_RESOLVE_SLOT_KIND).await;
         let resolve_item = items
             .iter()
-            .find(|item| item.kind == TM_RESOLVE_SLOT_KIND)
+            .find(|item| !prior_resolves.contains(&item.base.id))
             .expect("reprocess must enqueue tm_resolve_slot for pending groups");
 
         let conflict_repo = ConflictGroupRepository::new(storage);
@@ -4237,66 +3765,59 @@ mod work_item_tests {
     }
 }
 
-async fn resolve_embedding_policy(
-    repo: &SpaceConfigRepository,
-    space_id: &str,
-    fallback: &EmbeddingPolicy,
-) -> anyhow::Result<EmbeddingPolicy> {
-    let policy = match repo.get_by_space_id(space_id).await {
-        Ok(Some(config)) => EmbeddingPolicy::from_space_config(&config),
-        Ok(None) => fallback.clone(),
-        Err(err) => {
-            warn!("Failed to load space_config, falling back to config: {err}");
-            fallback.clone()
+async fn list_configured_space_ids(repo: &SpaceConfigRepository) -> anyhow::Result<Vec<String>> {
+    const PAGE: usize = 256;
+    let mut spaces = std::collections::BTreeSet::new();
+    let mut cursor = None;
+    loop {
+        let page = repo.list_all(PAGE, cursor.as_ref()).await?;
+        let count = page.len();
+        if let Some(last) = page.last() {
+            if cursor.as_ref() == Some(&last.base.id) {
+                anyhow::bail!("space registry cursor did not advance");
+            }
+            cursor = Some(last.base.id.clone());
         }
-    };
-
-    if policy.dims == 0 {
-        return Err(anyhow::anyhow!("Embedding policy has invalid dimensions"));
-    }
-
-    Ok(policy)
-}
-
-/// Builds the truth-maintenance adjudication context.
-///
-/// LLM adjudication activates only when the binary is built with
-/// `meerkat-extraction` AND `ANTHROPIC_API_KEY` is present; the model comes
-/// from `PIPELINE_TM_MODEL`. This is the single place TM reads env vars.
-fn build_tm_context() -> TmContext {
-    let key_present = std::env::var("ANTHROPIC_API_KEY")
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    let model = std::env::var("PIPELINE_TM_MODEL").ok();
-    tm_context_from(key_present, model)
-}
-
-/// Pure decision half of [`build_tm_context`], unit-testable without env mutation.
-#[cfg(feature = "meerkat-extraction")]
-fn tm_context_from(key_present: bool, model: Option<String>) -> TmContext {
-    use elephant_pipeline::truth_maintenance::adjudicator::{
-        AdjudicationConfig, AgenticSlotAdjudicator,
-    };
-
-    if !key_present {
-        return TmContext::none();
-    }
-    let mut config = AdjudicationConfig::default();
-    if let Some(model) = model {
-        let trimmed = model.trim();
-        if !trimmed.is_empty() {
-            config.model = trimmed.to_string();
+        spaces.extend(page.into_iter().map(|space| space.base.space_id));
+        if count < PAGE {
+            break;
         }
     }
-    TmContext {
-        adjudicator: Some(Arc::new(AgenticSlotAdjudicator::new(config))),
-    }
+    Ok(spaces.into_iter().collect())
 }
 
-/// Without the meerkat feature there is no adjudicator implementation.
-#[cfg(not(feature = "meerkat-extraction"))]
-fn tm_context_from(_key_present: bool, _model: Option<String>) -> TmContext {
-    TmContext::none()
+/// Optional deterministic TM remains available without a model binding. A
+/// configured but revoked adjudication binding fails; ambient keys never grant it.
+async fn build_tm_context_for_space(context: ProviderDispatchContext) -> anyhow::Result<TmContext> {
+    let resolved = context
+        .repository
+        .resolve_space(&context.space_id)
+        .await
+        .map_err(|error| PipelineError::ConfigError(format!("provider_authorization: {error}")))?;
+    if !resolved
+        .processing
+        .bindings
+        .contains_key(&ModelOperation::TruthMaintenance)
+    {
+        return Ok(TmContext::none());
+    }
+    #[cfg(feature = "meerkat-extraction")]
+    {
+        use elephant_pipeline::truth_maintenance::adjudicator::{
+            AdjudicationConfig, AgenticSlotAdjudicator,
+        };
+        let adjudicator = AgenticSlotAdjudicator::new(AdjudicationConfig::default())
+            .with_provider_context(context)
+            .await?;
+        Ok(TmContext {
+            adjudicator: Some(Arc::new(adjudicator)),
+        })
+    }
+    #[cfg(not(feature = "meerkat-extraction"))]
+    Err(anyhow::Error::new(PipelineError::ConfigError(
+        "semantic_extractor_unavailable: truth maintenance binding requires meerkat-extraction"
+            .to_string(),
+    )))
 }
 
 fn is_obsolete_tm_commit_error(err: &PipelineError) -> bool {
@@ -4333,10 +3854,6 @@ fn is_obsolete_extraction_reference_error(err: &PipelineError) -> bool {
         }
         _ => false,
     }
-}
-
-fn build_embedding_provider(policy: &EmbeddingPolicy) -> Arc<dyn EmbeddingProvider> {
-    elephant_embeddings::provider_for_policy(policy)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4564,6 +4081,10 @@ async fn load_source_record(
         .ok_or_else(|| anyhow::anyhow!("Source not found: {source_id}"))
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original repository lifetimes and future ownership"
+)]
 async fn update_source_record<F>(
     storage: &StorageClient,
     space_id: &str,
@@ -4685,6 +4206,10 @@ async fn derive_source_id_for_revision(
     Ok(doc.and_then(|doc| doc.source.map(|source| source.id().to_string())))
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original repository lifetimes and future ownership"
+)]
 async fn mark_source_graph_ready_if_quiescent(
     storage: &StorageClient,
     space_id: &str,
@@ -4821,6 +4346,132 @@ fn normalized_literal_for_event_lineage(
     }
 }
 
+async fn enqueue_work_successor(
+    storage: &StorageClient,
+    parent: &WorkItem,
+    mut child: WorkItem,
+) -> anyhow::Result<WorkItem> {
+    if parent.kind.starts_with("tm_") || parent.kind == WORK_KIND_EXECUTE_REPROCESS_JOB {
+        let run = original_execution_run(storage, parent).await?;
+        child.base.security.clone_from(&parent.base.security);
+        child.base.subjects.clone_from(&parent.base.subjects);
+        child.base.subjects_state = parent.base.subjects_state;
+        child.base.provenance.clone_from(&parent.base.provenance);
+        return Ok(
+            elephant_storage::work_producer_repository::WorkProducerRepository::new(
+                storage.clone(),
+            )
+            .enqueue_successor(parent, &run, child, true)
+            .await?,
+        );
+    }
+    inherit_source_context(parent, &mut child)?;
+    child.payload[source_runtime::PREDECESSOR] = serde_json::json!(parent.base.id.to_string());
+    if let Some(ids) = parent.payload.get(source_runtime::METADATA_IDS) {
+        if child.payload.get(source_runtime::METADATA_IDS).is_none() {
+            child.payload[source_runtime::METADATA_IDS] = ids.clone();
+        }
+    }
+    if parent.kind == TRIAGE_SOURCE_KIND
+        && child.kind == INGEST_METADATA_KIND
+        && elephant_pipeline::source_queue::publication_from_work(parent)?.is_some()
+    {
+        let run = original_execution_run(storage, parent).await?;
+        return Ok(
+            elephant_storage::work_producer_repository::WorkProducerRepository::new(
+                storage.clone(),
+            )
+            .enqueue_source_metadata(parent, &run, child)
+            .await?,
+        );
+    }
+    Ok(enqueue_idempotent(storage, child).await?)
+}
+
+/// Locate the actual receipt for the captured original claim, never a latest run.
+async fn original_execution_run(
+    storage: &StorageClient,
+    parent: &WorkItem,
+) -> anyhow::Result<elephant_types::records::WorkRun> {
+    let fence = elephant_storage::work_attempt_repository::fence_from_claim(parent)?;
+    let runs = WorkRunRepository::new(storage.clone())
+        .find_by_work_item(&parent.base.id)
+        .await?;
+    let mut matching = runs.into_iter().filter(|run| {
+        run.base.space_id == parent.base.space_id
+            && run
+                .metrics
+                .custom
+                .get("attempt_fence")
+                .and_then(|value| {
+                    serde_json::from_value::<elephant_types::publication::AttemptFence>(
+                        value.clone(),
+                    )
+                    .ok()
+                })
+                .as_ref()
+                == Some(&fence)
+    });
+    let run = matching
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Original attempt execution receipt missing"))?;
+    if matching.next().is_some() {
+        anyhow::bail!("Original attempt has ambiguous execution receipts");
+    }
+    Ok(run)
+}
+
+/// Group-derived children keep the canonical group's complete public authority.
+/// The original coordinator/run restriction is stored only in private evidence.
+async fn enqueue_group_resolution(
+    storage: &StorageClient,
+    parent: &WorkItem,
+    work_run: &RecordId,
+    group_id: &RecordId,
+    wait: bool,
+) -> anyhow::Result<WorkItem> {
+    let group = ConflictGroupRepository::new(storage.clone())
+        .get(&parent.base.space_id, group_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Original conflict group missing"))?;
+    let run = original_execution_run(storage, parent).await?;
+    if &run.base.id != work_run {
+        anyhow::bail!("Conflict child uses a different original run");
+    }
+    let mut base = group.base.clone();
+    base.id = RecordId::new_v4(TableName::WorkItem);
+    base.created_at = Utc::now();
+    base.updated_at = base.created_at;
+    let child = WorkItem {
+        base,
+        kind: TM_RESOLVE_SLOT_KIND.into(),
+        payload: serde_json::json!({"conflict_group_id": group_id.to_string()}),
+        status: WorkItemStatus::Runnable,
+        priority: successor_priority(parent.priority),
+        idempotency_key: format!("tm_resolve_slot:{group_id}:{work_run}"),
+        attempts: 0,
+        lease_expires_at: None,
+        leased_by: None,
+        run_after: None,
+        last_error: None,
+    };
+    Ok(
+        elephant_storage::work_producer_repository::WorkProducerRepository::new(storage.clone())
+            .enqueue_group_child(parent, &run, &group, child, wait)
+            .await?,
+    )
+}
+
+/// Coordinator continuations can run while the original job awaits their outcome.
+async fn enqueue_reprocess_resolution(
+    storage: &StorageClient,
+    parent: &WorkItem,
+    work_run: &RecordId,
+    group_id: &RecordId,
+) -> anyhow::Result<WorkItem> {
+    enqueue_group_resolution(storage, parent, work_run, group_id, false).await
+}
+
 async fn commit_source_metadata_bundle(
     storage: &StorageClient,
     space_id: &str,
@@ -4868,6 +4519,10 @@ async fn commit_source_metadata_bundle(
     Ok(())
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original repository lifetimes and future ownership"
+)]
 async fn enqueue_upgrade_after_metadata_commit(
     storage: &StorageClient,
     item: &WorkItem,
@@ -4930,10 +4585,14 @@ async fn enqueue_upgrade_after_metadata_commit(
         run_after: None,
         last_error: None,
     };
-    work_item_repo.create(upgrade_item).await?;
+    enqueue_work_successor(storage, item, upgrade_item).await?;
     Ok(())
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original repository lifetimes and future ownership"
+)]
 async fn enqueue_render_doc_work_item(
     storage: &StorageClient,
     item: &WorkItem,
@@ -4997,8 +4656,49 @@ async fn enqueue_render_doc_work_item(
         run_after: None,
         last_error: None,
     };
-    work_item_repo.create(render_item).await?;
+    enqueue_work_successor(storage, item, render_item).await?;
     Ok(())
+}
+
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original repository lifetimes and future ownership"
+)]
+async fn source_promotion_options(
+    storage: &StorageClient,
+    space_id: &str,
+) -> Result<elephant_pipeline::scheduler::PromotionOptions, PipelineError> {
+    let context =
+        ProviderDispatchContext::new(SpaceConfigRepository::new(storage.clone()), space_id);
+    let resolved = context
+        .repository
+        .resolve_space(space_id)
+        .await
+        .map_err(|error| PipelineError::ConfigError(format!("provider_authorization: {error}")))?;
+    let mut promotion_options = elephant_pipeline::scheduler::PromotionOptions::default();
+    if resolved
+        .processing
+        .bindings
+        .contains_key(&ModelOperation::PromotionDisambiguation)
+    {
+        #[cfg(feature = "meerkat-extraction")]
+        {
+            use elephant_pipeline::scheduler::promotion_disambiguation::{
+                AgenticPromotionDisambiguator, PromotionDisambiguationConfig,
+            };
+            promotion_options.disambiguator = Some(Arc::new(
+                AgenticPromotionDisambiguator::new(PromotionDisambiguationConfig::default())
+                    .with_provider_context(context)
+                    .await?,
+            ));
+        }
+        #[cfg(not(feature = "meerkat-extraction"))]
+        return Err(PipelineError::ConfigError(
+            "semantic_extractor_unavailable: promotion binding requires meerkat-extraction"
+                .to_string(),
+        ));
+    }
+    Ok(promotion_options)
 }
 
 async fn commit_knowledge_candidates_bundle(
@@ -5017,12 +4717,7 @@ async fn commit_knowledge_candidates_bundle(
             }
         }
     }
-    let promotion_options = elephant_pipeline::scheduler::PromotionOptions {
-        disambiguator: elephant_pipeline::scheduler::promotion_disambiguator_from(
-            std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
-            std::env::var("PIPELINE_PROMOTION_DISAMBIGUATION_MODEL").ok(),
-        ),
-    };
+    let promotion_options = source_promotion_options(storage, space_id).await?;
     promote_assertions_inline_with_options(
         storage,
         space_id,
@@ -5102,14 +4797,23 @@ where
     T: Send + 'static,
 {
     let runtime = tokio::runtime::Handle::current();
-    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let dispatch_scope = elephant_pipeline::provider_dispatch::capture_dispatch_scope();
+    let (mut sender, receiver) = tokio::sync::oneshot::channel();
     let thread_name = thread_name.to_string();
     std::thread::Builder::new()
         .name(thread_name)
         .stack_size(stack_bytes)
         .spawn(move || {
-            let output = runtime.block_on(future);
-            let _ = sender.send(output);
+            let output = runtime.block_on(dispatch_scope.run(async {
+                tokio::select! {
+                    biased;
+                    () = sender.closed() => None,
+                    output = future => Some(output),
+                }
+            }));
+            if let Some(output) = output {
+                let _ = sender.send(output);
+            }
         })
         .map_err(|error| anyhow::anyhow!("Could not start dedicated worker thread: {error}"))?;
     receiver
@@ -5118,8 +4822,14 @@ where
 }
 
 #[cfg(feature = "meerkat-extraction")]
+#[expect(
+    clippy::large_futures,
+    clippy::large_stack_frames,
+    reason = "Keep the dedicated-stack wiki execution and its original future layout"
+)]
 async fn execute_managed_wiki_work_item(
     item: &WorkItem,
+    work_run_id: &RecordId,
     storage: StorageClient,
     payload: ManagedWikiPayload,
 ) -> anyhow::Result<WorkRunMetrics> {
@@ -5127,23 +4837,40 @@ async fn execute_managed_wiki_work_item(
     let reconciliation_storage = storage.clone();
     let reconciliation_space = item.base.space_id.clone();
     let reconciliation_payload = payload.clone();
+    let original_attempt = elephant_storage::work_attempt_repository::fence_from_claim(item)?;
+    let observer = elephant_pipeline::provider_usage::DurableUsageObserver::for_attempt(
+        storage.clone(),
+        work_run_id,
+        original_attempt.clone(),
+    );
     let result = run_on_dedicated_stack(
         "elephant-living-wiki",
         MANAGED_WIKI_STACK_BYTES,
         async move {
-            execute_managed_wiki_reconciliation(
-                reconciliation_storage,
-                &reconciliation_space,
-                &reconciliation_payload,
-            )
-            .await
+            let activity_client = reconciliation_storage.clone();
+            activity_client
+                .with_activity(
+                    elephant_pipeline::provider_dispatch::with_dispatch_observer(
+                        observer,
+                        execute_managed_wiki_reconciliation_with_attempt(
+                            reconciliation_storage,
+                            &reconciliation_space,
+                            &reconciliation_payload,
+                            original_attempt,
+                        ),
+                    ),
+                )
+                .await
+                .map_err(PipelineError::from)?
         },
     )
     .await?
-    .map_err(|error| anyhow::anyhow!("Managed wiki reconciliation failed: {error}"))?;
+    .map_err(|error| anyhow::Error::new(error).context("Managed wiki reconciliation failed"))?;
     let mut next_payload = payload;
-    next_payload.last_graph_fingerprint =
-        (result.failed_articles == 0).then(|| result.graph_fingerprint.clone());
+    next_payload.last_graph_fingerprint = (result.failed_articles == 0
+        && result.partition_failures.is_empty()
+        && result.reconciliation_errors.is_empty())
+    .then(|| result.graph_fingerprint.clone());
     let next_run = Utc::now() + Duration::minutes(i64::from(next_payload.refresh_interval_minutes));
     if let Err(error) = enqueue_managed_wiki_successor(
         &storage,
@@ -5186,13 +4913,25 @@ async fn execute_managed_wiki_work_item(
         "wiki_hidden_articles".to_string(),
         serde_json::json!(result.hidden_articles),
     );
+    metrics.custom.insert(
+        "wiki_partition_failures".to_string(),
+        serde_json::to_value(&result.partition_failures)?,
+    );
+    metrics.custom.insert(
+        "wiki_reconciliation_errors".to_string(),
+        serde_json::to_value(&result.reconciliation_errors)?,
+    );
     Ok(metrics)
 }
 
-// This is the central typed work-kind dispatcher. Its broad dependency set and
-// match-state size are bounded by the worker semaphore; the graph-scale Living
-// Wiki arm is additionally moved onto `run_on_dedicated_stack` above.
+// Large branch futures are boxed at their await boundaries below. A semaphore
+// limits concurrent work, but cannot bound the stack storage of one dispatcher.
+// The graph-scale Living Wiki arm also uses its dedicated execution stack.
 #[allow(clippy::too_many_arguments, clippy::large_stack_frames)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original repository lifetimes and future ownership"
+)]
 async fn execute_work_item(
     item: &WorkItem,
     work_run_id: &RecordId,
@@ -5203,6 +4942,23 @@ async fn execute_work_item(
     _embed_config: &EmbedWorkerConfig,
     tm_ctx: &TmContext,
 ) -> anyhow::Result<WorkRunMetrics> {
+    let context = ProviderDispatchContext::new(
+        SpaceConfigRepository::new(storage.clone()),
+        item.base.space_id.clone(),
+    );
+    context
+        .repository
+        .resolve_space(&item.base.space_id)
+        .await?;
+    let resolved_tm;
+    let tm_ctx = if matches!(item.kind.as_str(), TM_RESOLVE_SLOT_KIND | TM_RECOMPUTE_KIND)
+        && tm_ctx.adjudicator.is_none()
+    {
+        resolved_tm = build_tm_context_for_space(context).await?;
+        &resolved_tm
+    } else {
+        tm_ctx
+    };
     Box::pin(execute_work_item_with_extractor(
         item,
         work_run_id,
@@ -5230,7 +4986,11 @@ pub async fn execute_work_item_for_test(
     storage: StorageClient,
     extractor: &dyn Extractor,
 ) -> anyhow::Result<WorkRunMetrics> {
-    Box::pin(execute_work_item_with_extractor(
+    eprintln!(
+        "test dispatch begin kind={} work={}",
+        item.kind, item.base.id
+    );
+    let result = Box::pin(execute_work_item_with_extractor(
         item,
         work_run_id,
         storage,
@@ -5238,10 +4998,45 @@ pub async fn execute_work_item_for_test(
         &TmContext::none(),
         Some(extractor),
     ))
-    .await
+    .await;
+    eprintln!(
+        "test dispatch end kind={} work={} success={}",
+        item.kind,
+        item.base.id,
+        result.is_ok()
+    );
+    result
+}
+
+// Tests scope only the existing network policy so the real dispatcher can
+// exercise a paused loopback fetch. There is no runtime configuration bypass.
+#[cfg(test)]
+tokio::task_local! {
+    static WATCH_FETCH_POLICY: elephant_pipeline::remote_source::RemoteFetchPolicy;
+}
+
+fn watch_service(storage: StorageClient) -> SourceWatchService {
+    #[cfg(test)]
+    if let Ok(policy) = WATCH_FETCH_POLICY.try_with(|policy| *policy) {
+        return SourceWatchService::with_fetch_policy(storage, policy);
+    }
+    SourceWatchService::new(storage)
+}
+
+// Construct only the selected branch outside the dispatcher poll frame.
+// Its body remains lazy and is polled in the caller's original task scopes.
+#[inline(never)]
+fn boxed_work_item_phase<F: std::future::Future>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
 }
 
 #[allow(clippy::too_many_lines, clippy::large_stack_frames)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original repository lifetimes and future ownership"
+)]
 async fn execute_work_item_with_extractor(
     item: &WorkItem,
     work_run_id: &RecordId,
@@ -5251,9 +5046,97 @@ async fn execute_work_item_with_extractor(
     extractor_override: Option<&dyn Extractor>,
 ) -> anyhow::Result<WorkRunMetrics> {
     let space_id = &item.base.space_id;
+    let accepted_source = source_runtime::accepted_source(&storage, item).await?;
+    let publication = elephant_pipeline::source_queue::publication_from_work(item)?;
     let mut metrics = WorkRunMetrics::default();
+    if source_runtime::begin_operation(&storage, item).await? {
+        metrics.custom.insert(
+            "source_dispatch_short_circuit".into(),
+            serde_json::json!(true),
+        );
+        return Ok(metrics);
+    }
+    // Check original configuration before predecessor readiness, so an obsolete
+    // chain can recover even when its old predecessor has been cancelled.
+    source_runtime::require_predecessor(&storage, item).await?;
+    // Each work kind has its own poll function. A single async match can have
+    // a small stored future but a very large poll stack from temporary values
+    // in all of its branches, including branches this invocation never uses.
     match item.kind.as_str() {
-        REFRESH_SOURCE_WATCH_KIND => {
+        elephant_pipeline::source_finalization::FINALIZE_SOURCE_REVISION_KIND => boxed_work_item_phase(|| async move {
+            let publication = publication
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Finalizer lacks original source fence"))?;
+            let attempt = elephant_storage::work_attempt_repository::fence_from_claim(item)?;
+            let manifest = elephant_storage::source_publication_manifest::SourcePublicationManifestRepository::new(storage.clone())
+                .get(space_id, publication).await?.ok_or_else(|| WorkFailure {
+                    class: FailureClass::PendingDependencies, message: "Source finalizer manifest missing".into(),
+                })?;
+            let options = if manifest.mode == IngestMode::Graph {
+                source_promotion_options(&storage, space_id).await?
+            } else {
+                elephant_pipeline::scheduler::PromotionOptions::default()
+            };
+            let receipt = Box::pin(
+                elephant_pipeline::source_finalization::execute_finalizer(
+                    &storage,
+                    space_id,
+                    publication,
+                    &attempt,
+                    &item.base.created_by,
+                    &options,
+                ),
+            )
+            .await?;
+            metrics.custom.insert(
+                "canonical_commit_id".to_string(),
+                serde_json::json!(receipt.commit_id),
+            );
+            Ok(metrics)
+        }).await,
+        "embed_source_revision" => boxed_work_item_phase(|| async move {
+            Box::pin(source_runtime::execute_embeddings(&storage, item)).await
+        }).await,
+        "reindex_space_embeddings" => boxed_work_item_phase(|| async move {
+            let configs = SpaceConfigRepository::new(storage.clone());
+            let current = configs
+                .get_by_space_id(space_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Reindex space missing"))?;
+            let expected = item
+                .payload
+                .get("reindex_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("Reindex work lacks original accepted ID"))?;
+            if current
+                .processing
+                .as_ref()
+                .and_then(|processing| processing.pending_reindex.as_ref())
+                .map(|pending| pending.id.as_str())
+                != Some(expected)
+            {
+                anyhow::bail!("Reindex was cancelled or superseded");
+            }
+            let attempt = elephant_storage::work_attempt_repository::fence_from_claim(item)?;
+            let progress = Box::pin(
+                elephant_pipeline::embedding_reindex::process_embedding_reindex_with_attempt(
+                    &storage, space_id, 128, expected, &attempt,
+                ),
+            )
+            .await?;
+            metrics
+                .custom
+                .insert("reindex".to_string(), serde_json::to_value(&progress)?);
+            if !progress.ready_to_activate {
+                return Err(WorkFailure {
+                    class: FailureClass::PendingDependencies,
+                    message: "Reindex page persisted; more coverage remains".to_string(),
+                }
+                .into());
+            }
+            Ok(metrics)
+        }).await,
+        REFRESH_SOURCE_WATCH_KIND => boxed_work_item_phase(|| async move {
             let payload: SourceWatchPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid source-watch payload: {e}"))?;
             let watch_id = RecordId::from_str(&payload.watch_id)
@@ -5274,19 +5157,30 @@ async fn execute_work_item_with_extractor(
                 );
                 return Ok(metrics);
             }
-            let run = Box::pin(
-                SourceWatchService::new(storage.clone()).check(watch, &item.base.created_by),
-            )
+            let attempt = elephant_storage::work_attempt_repository::fence_from_claim(item)?;
+            let outcome = Box::pin(watch_service(storage.clone()).check_with_attempt(
+                watch,
+                &item.base.created_by,
+                &attempt,
+                work_run_id,
+            ))
             .await
-            .map_err(|e| anyhow::anyhow!("source-watch refresh failed: {e}"))?;
-            info!(
-                watch_id = %run.watch.base.id,
-                outcome = %run.check.outcome,
-                triage_work_item = ?run.triage_work_item,
-                "Source-watch refresh completed"
-            );
-        }
-        INGEST_SOURCE_STUB_KIND => {
+            .map_err(|e| anyhow::Error::new(e).context("source-watch refresh failed"))?;
+            match outcome {
+                elephant_pipeline::source_watch::SourceWatchAttemptOutcome::Observed(run) => {
+                    info!(watch_id = %run.watch.base.id, outcome = %run.check.outcome,
+                        triage_work_item = ?run.triage_work_item, "Source-watch observation recorded");
+                }
+                elephant_pipeline::source_watch::SourceWatchAttemptOutcome::ReceiptOnly(
+                    receipt,
+                ) => {
+                    info!(operation_id = %receipt.operation_id, state = ?receipt.state,
+                        "Original source-watch receipt replayed without new observation or queue work");
+                }
+            }
+            Ok(metrics)
+        }).await,
+        INGEST_SOURCE_STUB_KIND => boxed_work_item_phase(|| async move {
             let payload: SourceLifecyclePayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid ingest_source_stub payload: {e}"))?;
             let source_id = RecordId::from_str(&payload.source_id).map_err(|e| {
@@ -5295,8 +5189,13 @@ async fn execute_work_item_with_extractor(
                     payload_source_id = payload.source_id
                 )
             })?;
-            let source = load_source_record(&storage, space_id, &source_id).await?;
-            if source.lifecycle_status != SourceLifecycleStatus::Discovered {
+            let source = match &accepted_source {
+                Some(source) if source.base.id == source_id => source.clone(),
+                Some(_) => anyhow::bail!("Work payload source differs from accepted revision"),
+                None => load_source_record(&storage, space_id, &source_id).await?,
+            };
+            if publication.is_none() && source.lifecycle_status != SourceLifecycleStatus::Discovered
+            {
                 info!(
                     kind = INGEST_SOURCE_STUB_KIND,
                     source_id = %source_id,
@@ -5307,9 +5206,10 @@ async fn execute_work_item_with_extractor(
             }
             let _ = execute_ingest_source_stub(source, &storage)
                 .await
-                .map_err(|e| anyhow::anyhow!("ingest_source_stub failed: {e}"))?;
-        }
-        TRIAGE_SOURCE_KIND => {
+                .map_err(|e| anyhow::Error::new(e).context("ingest_source_stub failed"))?;
+            Ok(metrics)
+        }).await,
+        TRIAGE_SOURCE_KIND => boxed_work_item_phase(|| async move {
             let payload: SourceLifecyclePayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid triage_source payload: {e}"))?;
             let source_id = RecordId::from_str(&payload.source_id).map_err(|e| {
@@ -5318,8 +5218,13 @@ async fn execute_work_item_with_extractor(
                     payload_source_id = payload.source_id
                 )
             })?;
-            let source = load_source_record(&storage, space_id, &source_id).await?;
-            if source.lifecycle_status != SourceLifecycleStatus::Discovered {
+            let source = match &accepted_source {
+                Some(source) if source.base.id == source_id => source.clone(),
+                Some(_) => anyhow::bail!("Work payload source differs from accepted revision"),
+                None => load_source_record(&storage, space_id, &source_id).await?,
+            };
+            if publication.is_none() && source.lifecycle_status != SourceLifecycleStatus::Discovered
+            {
                 info!(
                     kind = TRIAGE_SOURCE_KIND,
                     source_id = %source_id,
@@ -5333,7 +5238,8 @@ async fn execute_work_item_with_extractor(
             let triage_plugin = DefaultTriagePlugin::new();
             let decision_repo = IngestDecisionRepository::new(storage.clone());
             let policy_version = payload.policy_version.as_deref().unwrap_or("default");
-            let triage_result = execute_triage_source(
+            let triage_result = if publication.is_some() {
+                elephant_pipeline::scheduler::ingest_work_kinds::execute_triage_source_for_work_attempt(
                 &source,
                 &triage_plugin,
                 &budget_enforcer,
@@ -5343,23 +5249,57 @@ async fn execute_work_item_with_extractor(
                 &item.base.created_by,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("triage_source failed: {e}"))?;
+                .map_err(|e| anyhow::Error::new(e).context("triage_source failed"))?
+            } else {
+                execute_triage_source(
+                    &source,
+                    &triage_plugin,
+                    &budget_enforcer,
+                    &decision_repo,
+                    space_id,
+                    policy_version,
+                    &item.base.created_by,
+                )
+                .await
+                .map_err(|e| anyhow::Error::new(e).context("triage_source failed"))?
+            };
+            if publication.is_some() && triage_result.was_downgraded {
+                return Err(WorkFailure {
+                    class: FailureClass::ConfigurationBlocked,
+                    message: format!(
+                        "Accepted source mode awaits budget: {}",
+                        triage_result
+                            .downgrade_reason
+                            .as_deref()
+                            .unwrap_or("budget unavailable")
+                    ),
+                }
+                .into());
+            }
 
-            let latest_decision = Link::new(triage_result.decision_id.clone());
-            update_source_record(&storage, space_id, &source_id, |source| {
-                source.latest_ingest_decision = Some(latest_decision);
-                source.lifecycle_status = match triage_result.decided_mode {
-                    IngestMode::Skip => SourceLifecycleStatus::Skipped,
-                    _ => SourceLifecycleStatus::Triaged,
-                };
-                source.current_ingest_mode = match triage_result.decided_mode {
-                    IngestMode::Skip => Some(IngestMode::Skip),
-                    _ => None,
-                };
-            })
-            .await?;
+            if publication.is_some() {
+                metrics.custom.insert(
+                    "source_ingest_decision_id".into(),
+                    serde_json::Value::String(triage_result.decision_id.to_string()),
+                );
+            }
 
-            if triage_result.decided_mode != IngestMode::Skip {
+            if publication.is_none() {
+                let latest_decision = Link::new(triage_result.decision_id.clone());
+                update_source_record(&storage, space_id, &source_id, |source| {
+                    source.latest_ingest_decision = Some(latest_decision);
+                    source.lifecycle_status = match triage_result.decided_mode {
+                        IngestMode::Skip => SourceLifecycleStatus::Skipped,
+                        _ => SourceLifecycleStatus::Triaged,
+                    };
+                    source.current_ingest_mode = match triage_result.decided_mode {
+                        IngestMode::Skip => Some(IngestMode::Skip),
+                        _ => None,
+                    };
+                })
+                .await?;
+            }
+            if publication.is_some() || triage_result.decided_mode != IngestMode::Skip {
                 let next_kind = INGEST_METADATA_KIND;
                 let next_payload = serde_json::json!({
                     "source_id": source_id.to_string(),
@@ -5384,12 +5324,11 @@ async fn execute_work_item_with_extractor(
                     run_after: None,
                     last_error: None,
                 };
-                WorkItemRepository::new(storage.clone())
-                    .create(next_item)
-                    .await?;
+                enqueue_work_successor(&storage, item, next_item).await?;
             }
-        }
-        INGEST_METADATA_KIND => {
+            Ok(metrics)
+        }).await,
+        INGEST_METADATA_KIND => boxed_work_item_phase(|| async move {
             let payload: SourceLifecyclePayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid ingest_metadata payload: {e}"))?;
             let source_id = RecordId::from_str(&payload.source_id).map_err(|e| {
@@ -5398,8 +5337,12 @@ async fn execute_work_item_with_extractor(
                     payload_source_id = payload.source_id
                 )
             })?;
-            let source = load_source_record(&storage, space_id, &source_id).await?;
-            if source.lifecycle_status != SourceLifecycleStatus::Triaged {
+            let source = match &accepted_source {
+                Some(source) if source.base.id == source_id => source.clone(),
+                Some(_) => anyhow::bail!("Work payload source differs from accepted revision"),
+                None => load_source_record(&storage, space_id, &source_id).await?,
+            };
+            if publication.is_none() && source.lifecycle_status != SourceLifecycleStatus::Triaged {
                 info!(
                     kind = INGEST_METADATA_KIND,
                     source_id = %source_id,
@@ -5410,14 +5353,11 @@ async fn execute_work_item_with_extractor(
             }
             let result = execute_ingest_metadata(&source, &storage)
                 .await
-                .map_err(|e| anyhow::anyhow!("ingest_metadata failed: {e}"))?;
-            let artifact_repo = WorkArtifactRepository::new(storage.clone());
+                .map_err(|e| anyhow::Error::new(e).context("ingest_metadata failed"))?;
+            let mut metadata_base = source.base.clone();
+            metadata_base.id = RecordId::new_v4(TableName::WorkArtifact);
             let metadata_artifact = elephant_types::records::work::WorkArtifact {
-                base: BaseFields::new(
-                    RecordId::new_v4(TableName::WorkArtifact),
-                    space_id.clone(),
-                    item.base.created_by.clone(),
-                ),
+                base: metadata_base,
                 work_run: Link::new(work_run_id.clone()),
                 artifact_type: SOURCE_METADATA_ARTIFACT_TYPE.to_string(),
                 data: serde_json::to_value(&result.metadata_artifact).map_err(|e| {
@@ -5428,7 +5368,8 @@ async fn execute_work_item_with_extractor(
                 validated_at: None,
                 committed_at: None,
             };
-            artifact_repo.create(metadata_artifact).await?;
+            source_runtime::persist_metadata_stage(&storage, item, work_run_id, metadata_artifact)
+                .await?;
 
             let validate_payload = ArtifactWorkflowPayload {
                 work_run_id: work_run_id.to_string(),
@@ -5461,10 +5402,11 @@ async fn execute_work_item_with_extractor(
                     run_after: None,
                     last_error: None,
                 };
-                work_item_repo.create(validate_item).await?;
+                enqueue_work_successor(&storage, item, validate_item).await?;
             }
-        }
-        UPGRADE_INGEST_MODE_KIND => {
+            Ok(metrics)
+        }).await,
+        UPGRADE_INGEST_MODE_KIND => boxed_work_item_phase(|| async move {
             let payload: SourceLifecyclePayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid upgrade_ingest_mode payload: {e}"))?;
             let source_id = RecordId::from_str(&payload.source_id).map_err(|e| {
@@ -5473,13 +5415,18 @@ async fn execute_work_item_with_extractor(
                     payload_source_id = payload.source_id
                 )
             })?;
-            let source = load_source_record(&storage, space_id, &source_id).await?;
+            let source = match &accepted_source {
+                Some(source) if source.base.id == source_id => source.clone(),
+                Some(_) => anyhow::bail!("Work payload source differs from accepted revision"),
+                None => load_source_record(&storage, space_id, &source_id).await?,
+            };
             let target_mode =
                 parse_optional_ingest_mode(payload.target_mode.as_deref(), IngestMode::Retrieval);
-            if !matches!(
-                source.lifecycle_status,
-                SourceLifecycleStatus::MetadataReady | SourceLifecycleStatus::RetrievalReady
-            ) || source_has_reached_ingest_mode(&source, target_mode)
+            if publication.is_none()
+                && (!matches!(
+                    source.lifecycle_status,
+                    SourceLifecycleStatus::MetadataReady | SourceLifecycleStatus::RetrievalReady
+                ) || source_has_reached_ingest_mode(&source, target_mode))
             {
                 info!(
                     kind = UPGRADE_INGEST_MODE_KIND,
@@ -5494,7 +5441,8 @@ async fn execute_work_item_with_extractor(
             let current_mode = source.current_ingest_mode.unwrap_or(IngestMode::Metadata);
             let budget_enforcer =
                 BudgetEnforcer::new(storage.clone(), load_budget_from_env(), space_id.clone());
-            let upgrade = execute_upgrade_ingest_mode(
+            let upgrade = if publication.is_some() {
+                elephant_pipeline::scheduler::ingest_work_kinds::execute_upgrade_ingest_mode_for_work_attempt(
                 &source,
                 current_mode,
                 target_mode,
@@ -5503,17 +5451,43 @@ async fn execute_work_item_with_extractor(
                 payload.reason.as_deref().unwrap_or("source_upgrade"),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("upgrade_ingest_mode failed: {e}"))?;
+            .map_err(|e| anyhow::Error::new(e).context("upgrade_ingest_mode failed"))?
+            } else {
+                execute_upgrade_ingest_mode(
+                    &source,
+                    current_mode,
+                    target_mode,
+                    &budget_enforcer,
+                    0.0,
+                    payload.reason.as_deref().unwrap_or("source_upgrade"),
+                )
+                .await
+                .map_err(|e| anyhow::Error::new(e).context("upgrade_ingest_mode failed"))?
+            };
 
             if !upgrade.allowed {
+                if publication.is_some() {
+                    return Err(WorkFailure {
+                        class: FailureClass::ConfigurationBlocked,
+                        message: format!(
+                            "Accepted source upgrade awaits budget: {}",
+                            upgrade
+                                .denied_reason
+                                .as_deref()
+                                .unwrap_or("budget unavailable")
+                        ),
+                    }
+                    .into());
+                }
                 return Ok(metrics);
             }
 
-            let doc = materialize_doc_from_source(&storage, &source, &item.base.created_by).await?;
+            let doc = Box::pin(source_runtime::materialize(&storage, &source, item)).await?;
             enqueue_render_doc_work_item(&storage, item, &source_id, &doc, upgrade.new_mode)
                 .await?;
-        }
-        RENDER_DOC_KIND => {
+            Ok(metrics)
+        }).await,
+        RENDER_DOC_KIND => boxed_work_item_phase(|| async move {
             let payload: RenderDocPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid render_doc payload: {e}"))?;
             if payload.doc_id.trim().is_empty() {
@@ -5538,37 +5512,59 @@ async fn execute_work_item_with_extractor(
                 .first()
                 .map_or("text/plain", |attachment| attachment.media_type.as_str());
 
-            let render_result =
-                execute_render_doc(&storage, &renderer_registry, &doc, Some(source_type))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("render_doc failed: {e}"))?;
+            let render_result = Box::pin(elephant_pipeline::scheduler::evidence_work_kinds::execute_render_doc_for_work(
+                &storage,
+                &renderer_registry,
+                &doc,
+                Some(source_type),
+                item,
+            ))
+            .await
+            .map_err(|e| anyhow::Error::new(e).context("render_doc failed"))?;
 
-            let mut tree_config = DocTreeConfig::default();
-            if let Ok(model) = std::env::var("PIPELINE_SUMMARIZER_MODEL") {
-                if !model.trim().is_empty() {
-                    tree_config.summarizer_model = model;
-                }
-            }
-            execute_build_doc_tree(&storage, &render_result.revision_id, &tree_config)
-                .await
-                .map_err(|e| anyhow::anyhow!("build_doc_tree failed: {e}"))?;
+            Box::pin(elephant_pipeline::scheduler::evidence_work_kinds::execute_build_doc_tree_for_work(
+                &storage,
+                &render_result.revision_id,
+                &config.doc_tree,
+                item,
+            ))
+            .await
+            .map_err(|e| anyhow::Error::new(e).context("build_doc_tree failed"))?;
 
             let ingest_mode =
                 parse_optional_ingest_mode(payload.ingest_mode.as_deref(), IngestMode::Graph);
-            if let Some(source_id) = payload.source_id.as_deref() {
-                let source_id = RecordId::from_str(source_id).map_err(|e| {
-                    anyhow::anyhow!("Invalid render_doc source id {source_id}: {e}")
-                })?;
-                update_source_record(&storage, space_id, &source_id, |source| {
-                    if source.lifecycle_status != SourceLifecycleStatus::GraphReady {
-                        source.lifecycle_status = SourceLifecycleStatus::RetrievalReady;
-                        source.current_ingest_mode = Some(IngestMode::Retrieval);
-                    }
-                })
-                .await?;
+            if item.payload.get("repair_for").is_some() && publication.is_some() {
+                // The closed manifest retains the original planned identities.
+                // Its ordinary pending sweep recreates exact lost successors.
+                return Ok(metrics);
+            }
+            if publication.is_none() {
+                if let Some(source_id) = payload.source_id.as_deref() {
+                    let source_id = RecordId::from_str(source_id).map_err(|e| {
+                        anyhow::anyhow!("Invalid render_doc source id {source_id}: {e}")
+                    })?;
+                    update_source_record(&storage, space_id, &source_id, |source| {
+                        if source.lifecycle_status != SourceLifecycleStatus::GraphReady {
+                            source.lifecycle_status = SourceLifecycleStatus::RetrievalReady;
+                            source.current_ingest_mode = Some(IngestMode::Retrieval);
+                        }
+                    })
+                    .await?;
+                }
             }
 
             if ingest_mode == IngestMode::Retrieval {
+                if publication.is_some() {
+                    source_runtime::seal_manifest(
+                        &storage,
+                        item,
+                        ingest_mode,
+                        Some(&render_result.revision_id),
+                        None,
+                    )
+                    .await?;
+                    source_runtime::enqueue_finalizer(&storage, item).await?;
+                }
                 return Ok(metrics);
             }
 
@@ -5618,12 +5614,12 @@ async fn execute_work_item_with_extractor(
                 last_error: None,
             };
 
-            work_item_repo
-                .create(plan_item)
+            enqueue_work_successor(&storage, item, plan_item)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to enqueue plan_extraction: {e}"))?;
-        }
-        PLAN_EXTRACTION_KIND => {
+            Ok(metrics)
+        }).await,
+        PLAN_EXTRACTION_KIND => boxed_work_item_phase(|| async move {
             let payload: PlanExtractionPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid plan_extraction payload: {e}"))?;
             if payload.revision_id.is_empty() {
@@ -5641,8 +5637,20 @@ async fn execute_work_item_with_extractor(
                 .ok_or_else(|| {
                     anyhow::anyhow!("plan_extraction requires policy_version payload")
                 })?;
+            if let Some(publication) = &publication {
+                let captured_configuration =
+                    elephant_pipeline::source_queue::configuration_from_work(item)?;
+                if let Some(manifest) = elephant_storage::source_publication_manifest::SourcePublicationManifestRepository::new(storage.clone()).get(space_id, publication).await?
+                    .filter(|manifest| captured_configuration.as_ref() == Some(&manifest.configuration)) {
+                    elephant_storage::source_publication_manifest::SourcePublicationManifestRepository::new(storage.clone()).resume_plan_attempt(
+                        space_id, publication, &elephant_storage::work_attempt_repository::fence_from_claim(item)?, work_run_id).await?;
+                    source_runtime::enqueue_manifest_children(&storage, item, &manifest).await?;
+                    source_runtime::enqueue_finalizer(&storage, item).await?;
+                    return Ok(metrics);
+                }
+            }
             let config = ExtractionPlanConfig::default();
-            let result = match execute_plan_extraction(
+            let result = match Box::pin(execute_plan_extraction(
                 &storage,
                 &revision_id,
                 policy_version,
@@ -5650,7 +5658,7 @@ async fn execute_work_item_with_extractor(
                 work_run_id,
                 space_id,
                 &item.base.created_by,
-            )
+            ))
             .await
             {
                 Ok(result) => result,
@@ -5659,15 +5667,24 @@ async fn execute_work_item_with_extractor(
                         work_item = %item.base.id,
                         revision_id = %revision_id,
                         error = %err,
-                        "Completing obsolete plan_extraction work item for missing extraction reference"
+                        "Stale plan_extraction reference requires revision-aware recovery"
                     );
-                    return Ok(metrics);
+                    return Err(anyhow::Error::new(WorkFailure {
+                        class: FailureClass::StaleInput,
+                        message: err.to_string(),
+                    }));
                 }
-                Err(err) => return Err(anyhow::anyhow!("plan_extraction failed: {err}")),
+                Err(err) => return Err(anyhow::Error::new(err).context("plan_extraction failed")),
             };
 
-            metrics.tokens_used = result.estimated_tokens;
-            metrics.estimated_cost_euros = result.plan.estimated_cost_euros;
+            metrics.custom.insert(
+                "planned_tokens".to_string(),
+                serde_json::json!(result.estimated_tokens),
+            );
+            metrics.custom.insert(
+                "planned_budget_units".to_string(),
+                serde_json::json!(result.plan.estimated_cost_euros),
+            );
 
             let ingest_mode = payload
                 .ingest_mode
@@ -5684,7 +5701,20 @@ async fn execute_work_item_with_extractor(
                 None => derive_source_id_for_revision(&storage, space_id, &revision_id).await?,
             };
 
-            let work_item_repo = WorkItemRepository::new(storage.clone());
+            if publication.is_some() {
+                let manifest = source_runtime::seal_manifest(
+                    &storage,
+                    item,
+                    ingest_mode,
+                    Some(&revision_id),
+                    Some(&result),
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Source manifest not persisted"))?;
+                source_runtime::enqueue_manifest_children(&storage, item, &manifest).await?;
+                source_runtime::enqueue_finalizer(&storage, item).await?;
+                return Ok(metrics);
+            }
             let node_selections = result.plan.node_selections;
             let no_node_selections = node_selections.is_empty();
             for selection in node_selections {
@@ -5724,8 +5754,7 @@ async fn execute_work_item_with_extractor(
                     last_error: None,
                 };
 
-                work_item_repo
-                    .create(work_item)
+                enqueue_work_successor(&storage, item, work_item)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to enqueue extract_assertions: {e}"))?;
             }
@@ -5743,8 +5772,9 @@ async fn execute_work_item_with_extractor(
                     .await?;
                 }
             }
-        }
-        EXTRACT_ASSERTIONS_KIND => {
+            Ok(metrics)
+        }).await,
+        EXTRACT_ASSERTIONS_KIND => boxed_work_item_phase(|| async move {
             let payload: ExtractAssertionsPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid extract_assertions payload: {e}"))?;
             if payload.node_id.is_empty() || payload.revision_id.is_empty() {
@@ -5776,7 +5806,7 @@ async fn execute_work_item_with_extractor(
 
             let span_override = payload.span_start.zip(payload.span_end);
 
-            let result = match execute_extract_assertions(
+            let result = match elephant_pipeline::scheduler::extraction_work_kinds::execute_source_extraction(
                 &storage,
                 extractor,
                 &node_id,
@@ -5785,6 +5815,7 @@ async fn execute_work_item_with_extractor(
                 space_id,
                 &item.base.created_by,
                 span_override,
+                config.transient_retry_max_attempts,
             )
             .await
             {
@@ -5795,15 +5826,35 @@ async fn execute_work_item_with_extractor(
                         node_id = %node_id,
                         revision_id = %revision_id,
                         error = %err,
-                        "Completing obsolete extract_assertions work item for missing extraction reference"
+                        "Stale extraction reference requires revision-aware recovery"
                     );
-                    return Ok(metrics);
+                    return Err(anyhow::Error::new(WorkFailure {
+                        class: FailureClass::StaleInput,
+                        message: err.to_string(),
+                    }));
                 }
-                Err(err) => return Err(anyhow::anyhow!("extract_assertions failed: {err}")),
+                Err(err) => {
+                    return Err(anyhow::Error::new(err).context("extract_assertions failed"))
+                }
             };
 
+            if let Some(publication) = &publication {
+                let repo = WorkArtifactRepository::new(storage.clone());
+                let artifact = repo
+                    .get(space_id, &result.artifact_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Extraction candidate disappeared"))?;
+                if artifact.data["source_id"] != serde_json::json!(publication.source_id.to_string())
+                    || !elephant_pipeline::scheduler::grounding::same_authorization_partition(&artifact.base, &item.base)
+                {
+                    return Err(PipelineError::ValidationError("Extraction producer source or authorization changed".into()).into());
+                }
+            }
             metrics.tokens_used = result.tokens_used;
-            metrics.estimated_cost_euros = estimate_cost_from_tokens(result.tokens_used);
+            metrics.custom.insert(
+                "measured_tokens".to_string(),
+                serde_json::json!(result.tokens_used),
+            );
             let workflow_payload = ArtifactWorkflowPayload {
                 work_run_id: work_run_id.to_string(),
                 source_id: source_id_for_extraction,
@@ -5835,28 +5886,47 @@ async fn execute_work_item_with_extractor(
                     run_after: None,
                     last_error: None,
                 };
-                work_item_repo.create(validate_item).await?;
+                enqueue_work_successor(&storage, item, validate_item).await?;
             }
-        }
-        VALIDATE_ARTIFACTS_KIND => {
+            Ok(metrics)
+        }).await,
+        VALIDATE_ARTIFACTS_KIND => boxed_work_item_phase(|| async move {
             let payload: ArtifactWorkflowPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid validate_artifacts payload: {e}"))?;
             let run_id = RecordId::from_str(&payload.work_run_id)
                 .map_err(|e| anyhow::anyhow!("Invalid work_run_id {}: {e}", payload.work_run_id))?;
+            if publication.is_some() {
+                source_runtime::require_successful_run(&storage, space_id, &run_id).await?;
+            }
             let staged_commit = StagedCommit::new(storage.clone());
             let artifact_repo = WorkArtifactRepository::new(storage.clone());
-            let validated =
-                elephant_pipeline::scheduler::staged_commit::validate_artifacts::execute(
-                    &staged_commit,
-                    space_id,
-                    &run_id,
+            let validated = if publication.is_some() {
+                Box::pin(
+                    elephant_pipeline::scheduler::staged_commit::validate_artifacts::execute_source(
+                        &staged_commit,
+                        space_id,
+                        &run_id,
+                    ),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("validate_artifacts failed: {e}"))?;
+            } else {
+                Box::pin(
+                    elephant_pipeline::scheduler::staged_commit::validate_artifacts::execute(
+                        &staged_commit,
+                        space_id,
+                        &run_id,
+                    ),
+                )
+                .await
+            }
+            .map_err(|e| anyhow::Error::new(e).context("validate_artifacts failed"))?;
             let existing_artifacts: Vec<_> = artifact_repo.find_by_work_run(&run_id).await?;
             let any_validated = validated
                 .iter()
                 .any(|artifact| artifact.status == ArtifactStatus::Validated);
+            // A deterministic metadata replay keeps the selected bundle's
+            // original producer. Its commit handoff must follow that same run.
+            let mut commit_run_id = run_id.clone();
             for artifact in &validated {
                 if artifact.status != ArtifactStatus::Validated {
                     continue;
@@ -5872,10 +5942,8 @@ async fn execute_work_item_with_extractor(
                             .and_then(serde_json::Value::as_str)
                             .is_some_and(|id| id == artifact.base.id.to_string())
                 });
-                if existing_commit_bundle.is_some() {
-                    continue;
-                }
-
+                // A prior bundle is a replay candidate, not proof that its
+                // semantics or authorization still match the validated artifact.
                 let commit_payload = match bundle_kind {
                     CommitBundleKind::SourceMetadata => CommitBundlePayload::SourceMetadata(
                         serde_json::from_value(artifact.data.clone()).map_err(|e| {
@@ -5902,12 +5970,38 @@ async fn execute_work_item_with_extractor(
                     }
                 };
 
-                let bundle = elephant_types::records::work::WorkArtifact {
-                    base: BaseFields::new(
-                        RecordId::new_v4(TableName::WorkArtifact),
-                        space_id.clone(),
-                        item.base.created_by.clone(),
+                let mut bundle_base = artifact.base.clone();
+                bundle_base.id = match (&publication, &commit_payload) {
+                    (Some(fence), CommitBundlePayload::SourceMetadata(_)) => {
+                        source_runtime::metadata_bundle_id(
+                            fence,
+                            &elephant_pipeline::source_queue::configuration_from_work(item)?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("Metadata producer configuration missing")
+                                })?,
+                        )
+                    }
+                    (Some(fence), CommitBundlePayload::KnowledgeCandidates(data)) => {
+                        elephant_storage::source_publication_manifest::source_bundle_id_for_plan(
+                            fence,
+                            &elephant_pipeline::source_queue::configuration_from_work(item)?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("Bundle producer configuration missing")
+                                })?,
+                            &RecordId::from_str(&data.revision_id)?,
+                            &RecordId::from_str(&data.node_id)?,
+                        )
+                    }
+                    _ => existing_commit_bundle.map_or_else(
+                        || RecordId::new_v4(TableName::WorkArtifact),
+                        |bundle| bundle.base.id.clone(),
                     ),
+                };
+                bundle_base.created_at = Utc::now();
+                bundle_base.updated_at = bundle_base.created_at;
+                bundle_base.created_by.clone_from(&item.base.created_by);
+                let mut bundle = elephant_types::records::work::WorkArtifact {
+                    base: bundle_base,
                     work_run: Link::new(run_id.clone()),
                     artifact_type: COMMIT_BUNDLE_ARTIFACT_TYPE.to_string(),
                     data: serde_json::to_value(CommitBundleArtifactData {
@@ -5922,46 +6016,167 @@ async fn execute_work_item_with_extractor(
                     validated_at: Some(chrono::Utc::now()),
                     committed_at: None,
                 };
-                artifact_repo.create(bundle).await?;
+                if let Some(publication) = &publication {
+                    bundle.data["publication"] = serde_json::to_value(publication)?;
+                    bundle.data[elephant_pipeline::source_queue::SOURCE_CONFIGURATION_KEY] = item
+                        .payload[elephant_pipeline::source_queue::SOURCE_CONFIGURATION_KEY]
+                        .clone();
+                    bundle.data[elephant_pipeline::source_queue::SOURCE_PLAN_KEY] =
+                        item.payload[elephant_pipeline::source_queue::SOURCE_PLAN_KEY].clone();
+                }
+                if let Some(existing) = artifact_repo.get(space_id, &bundle.base.id).await? {
+                    if existing.data != bundle.data
+                        || existing.base.space_id != bundle.base.space_id
+                        || existing.base.deleted_at.is_some()
+                        || existing.work_run != bundle.work_run
+                        || existing.artifact_type != bundle.artifact_type
+                        || existing.validated_at.is_none()
+                        || existing
+                            .validation_errors
+                            .as_ref()
+                            .is_some_and(|errors| !errors.is_empty())
+                        || !matches!(
+                            existing.status,
+                            ArtifactStatus::Validated
+                                | ArtifactStatus::Committing
+                                | ArtifactStatus::Committed
+                        )
+                        || existing.base.security != bundle.base.security
+                        || existing.base.subjects != bundle.base.subjects
+                        || existing.base.subjects_state != bundle.base.subjects_state
+                    {
+                        let replay = if validated.len() == 1 {
+                            Box::pin(metadata_bundle_replay::original_run(
+                                &storage, item, artifact, &bundle, &existing,
+                            ))
+                            .await?
+                        } else {
+                            None
+                        };
+                        if let Some(original_run) = replay {
+                            commit_run_id = original_run;
+                        } else {
+                            return Err(PipelineError::ValidationError(
+                                "Commit bundle conflicts with prior validated candidate".into(),
+                            )
+                            .into());
+                        }
+                    }
+                } else {
+                    commit_run_id = Box::pin(metadata_bundle_replay::create_bundle(
+                        &storage, item, artifact, bundle, validated.len() == 1,
+                    ))
+                    .await?;
+                }
             }
             if any_validated {
                 let work_item_repo = WorkItemRepository::new(storage.clone());
-                let commit_idempotency_key = format!("{COMMIT_ARTIFACTS_KIND}:{run_id}");
-                if work_item_repo
-                    .find_by_idempotency_key(space_id, &commit_idempotency_key)
+                let commit_payload = ArtifactWorkflowPayload {
+                    work_run_id: commit_run_id.to_string(),
+                    source_id: payload.source_id.clone(),
+                    ingest_mode: payload.ingest_mode.clone(),
+                };
+                let mut commit_item = WorkItem {
+                    base: BaseFields::new(
+                        RecordId::new_v4(TableName::WorkItem),
+                        space_id.clone(),
+                        item.base.created_by.clone(),
+                    ),
+                    kind: COMMIT_ARTIFACTS_KIND.to_string(),
+                    payload: serde_json::to_value(&commit_payload).map_err(|e| {
+                        anyhow::anyhow!("Failed to serialize commit_artifacts payload: {e}")
+                    })?,
+                    status: WorkItemStatus::Runnable,
+                    priority: successor_priority(item.priority),
+                    idempotency_key: format!("{COMMIT_ARTIFACTS_KIND}:{commit_run_id}"),
+                    attempts: 0,
+                    lease_expires_at: None,
+                    leased_by: None,
+                    run_after: None,
+                    last_error: None,
+                };
+                // Lookup uses the actual durable key, including source/plan
+                // suffix. Keep an existing child's original validator parent;
+                // the replay must not enqueue it under another predecessor.
+                inherit_source_context(item, &mut commit_item)?;
+                if let Some(ids) = item.payload.get(source_runtime::METADATA_IDS) {
+                    commit_item.payload[source_runtime::METADATA_IDS] = ids.clone();
+                }
+                if let Some(existing) = work_item_repo
+                    .find_by_idempotency_key(space_id, &commit_item.idempotency_key)
                     .await?
-                    .is_none()
                 {
-                    let commit_item = WorkItem {
-                        base: BaseFields::new(
-                            RecordId::new_v4(TableName::WorkItem),
-                            space_id.clone(),
-                            item.base.created_by.clone(),
-                        ),
-                        kind: COMMIT_ARTIFACTS_KIND.to_string(),
-                        payload: serde_json::to_value(&payload).map_err(|e| {
-                            anyhow::anyhow!("Failed to serialize commit_artifacts payload: {e}")
-                        })?,
-                        status: WorkItemStatus::Runnable,
-                        priority: successor_priority(item.priority),
-                        idempotency_key: commit_idempotency_key,
-                        attempts: 0,
-                        lease_expires_at: None,
-                        leased_by: None,
-                        run_after: None,
-                        last_error: None,
-                    };
-                    work_item_repo.create(commit_item).await?;
+                    if publication.is_some()
+                        && !Box::pin(metadata_bundle_replay::original_commit_child(
+                            &storage, &commit_item, &existing,
+                        )).await?
+                    {
+                        return Err(PipelineError::ValidationError(
+                            "Existing source commit handoff differs from selected producer".into(),
+                        ).into());
+                    }
+                } else {
+                    enqueue_work_successor(&storage, item, commit_item).await?;
                 }
             }
-        }
-        COMMIT_ARTIFACTS_KIND => {
+            Ok(metrics)
+        }).await,
+        COMMIT_ARTIFACTS_KIND => boxed_work_item_phase(|| async move {
             let payload: ArtifactWorkflowPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid commit_artifacts payload: {e}"))?;
             let run_id = RecordId::from_str(&payload.work_run_id)
                 .map_err(|e| anyhow::anyhow!("Invalid work_run_id {}: {e}", payload.work_run_id))?;
             let ingest_mode =
                 parse_optional_ingest_mode(payload.ingest_mode.as_deref(), IngestMode::Graph);
+            if let Some(publication) = &publication {
+                let attempt = elephant_storage::work_attempt_repository::fence_from_claim(item)?;
+                let artifacts = WorkArtifactRepository::new(storage.clone())
+                    .find_by_work_run(&run_id)
+                    .await?;
+                for artifact in artifacts.into_iter().filter(|artifact| {
+                    artifact.artifact_type == COMMIT_BUNDLE_ARTIFACT_TYPE
+                        && artifact.status == ArtifactStatus::Validated
+                }) {
+                    let bundle = commit_bundle_payload(&artifact)?;
+                    let mut successor_parent = item.clone();
+                    if matches!(bundle.payload, CommitBundlePayload::SourceMetadata(_)) {
+                        successor_parent.payload[source_runtime::METADATA_IDS] =
+                            serde_json::json!([artifact.base.id.to_string()]);
+                        if matches!(ingest_mode, IngestMode::Metadata | IngestMode::Skip) {
+                            source_runtime::seal_manifest(
+                                &storage,
+                                &successor_parent,
+                                ingest_mode,
+                                None,
+                                None,
+                            )
+                            .await?;
+                        }
+                    }
+                    elephant_pipeline::source_finalization::register_bundle(
+                        &storage,
+                        space_id,
+                        publication,
+                        &artifact.base.id,
+                        &attempt,
+                    )
+                    .await?;
+                    if matches!(bundle.payload, CommitBundlePayload::SourceMetadata(_))
+                        && matches!(ingest_mode, IngestMode::Graph | IngestMode::Retrieval)
+                    {
+                        enqueue_upgrade_after_metadata_commit(
+                            &storage,
+                            &successor_parent,
+                            &publication.source_id,
+                            ingest_mode,
+                        )
+                        .await?;
+                    } else {
+                        source_runtime::enqueue_finalizer(&storage, &successor_parent).await?;
+                    }
+                }
+                return Ok(metrics);
+            }
             let staged_commit = StagedCommit::new(storage.clone());
             let work_run = WorkRunRepository::new(storage.clone())
                 .get(space_id, &run_id)
@@ -5998,9 +6213,40 @@ async fn execute_work_item_with_extractor(
                 .get_artifacts_for_run(&run_id)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to load staged artifacts: {e}"))?;
-            let mut committed_graph_artifacts = false;
+            // Resolution bundles are one canonical batch. The maintenance
+            // owner verifies the original patch/run/epoch and commits both
+            // artifact states with all assertion effects and the receipt.
+            // Include committed rows so retries must verify that receipt.
+            let mut resolution_bundles = Vec::new();
+            for artifact in &artifacts {
+                if artifact.artifact_type == COMMIT_BUNDLE_ARTIFACT_TYPE
+                    && matches!(
+                        commit_bundle_payload(artifact)?.payload,
+                        CommitBundlePayload::ResolutionPatchSet(_)
+                    )
+                {
+                    resolution_bundles.push(artifact.base.id.clone());
+                }
+            }
+            if !resolution_bundles.is_empty() {
+                let workflow = ResolutionPatchWorkflow::new(storage.clone()).with_attempt(
+                    elephant_storage::work_attempt_repository::fence_from_claim(item)?,
+                );
+                Box::pin(workflow.commit_resolution_bundle_batch(
+                    space_id,
+                    &resolution_bundles,
+                    &BackoffConfig::default(),
+                    None,
+                ))
+                .await
+                .map_err(|error| anyhow::Error::new(error).context("commit resolution bundles"))?;
+            }
+            let mut committed_graph_artifacts = !resolution_bundles.is_empty();
 
             for artifact in artifacts {
+                if resolution_bundles.contains(&artifact.base.id) {
+                    continue;
+                }
                 if artifact.status != ArtifactStatus::Validated
                     || artifact.artifact_type != COMMIT_BUNDLE_ARTIFACT_TYPE
                 {
@@ -6008,7 +6254,7 @@ async fn execute_work_item_with_extractor(
                 }
 
                 let bundle_preview = commit_bundle_payload(&artifact)
-                    .map_err(|e| anyhow::anyhow!("commit_artifacts failed: {e}"))?;
+                    .map_err(|e| anyhow::Error::new(e).context("commit_artifacts failed"))?;
                 committed_graph_artifacts |= !matches!(
                     bundle_preview.payload,
                     CommitBundlePayload::SourceMetadata(_)
@@ -6056,27 +6302,22 @@ async fn execute_work_item_with_extractor(
                                     Ok(())
                                 }
                                 CommitBundlePayload::KnowledgeCandidates(data) => {
-                                    commit_knowledge_candidates_bundle(
+                                    Box::pin(commit_knowledge_candidates_bundle(
                                         &storage, space_id, &run_id, &actor, &data,
-                                    )
+                                    ))
                                     .await
                                 }
-                                CommitBundlePayload::ResolutionPatchSet(patch) => {
-                                    apply_resolution_patch(
-                                        &storage,
-                                        space_id,
-                                        &patch,
-                                        &BackoffConfig::default(),
-                                        None,
-                                    )
-                                    .await
+                                CommitBundlePayload::ResolutionPatchSet(_) => {
+                                    Err(PipelineError::InvalidState(
+                                        "Resolution bundles require the complete atomic maintenance batch".into(),
+                                    ))
                                 }
                             }
                         }
                     },
                 ))
                 .await
-                .map_err(|e| anyhow::anyhow!("commit_artifacts failed: {e}"))?;
+                .map_err(|e| anyhow::Error::new(e).context("commit_artifacts failed"))?;
             }
 
             if ingest_mode == IngestMode::Graph && committed_graph_artifacts {
@@ -6092,31 +6333,41 @@ async fn execute_work_item_with_extractor(
                     .await?;
                 }
             }
-        }
-        validate_resolution_patches::KIND => {
+            Ok(metrics)
+        }).await,
+        validate_resolution_patches::KIND => boxed_work_item_phase(|| async move {
             let payload: WorkRunPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid validate payload: {e}"))?;
             let run_id = RecordId::from_str(&payload.work_run_id)
                 .map_err(|e| anyhow::anyhow!("Invalid work_run_id: {e}"))?;
-            let workflow = ResolutionPatchWorkflow::new(storage.clone());
-            validate_resolution_patches::execute(&workflow, space_id, &run_id).await?;
-        }
-        commit_resolution_patches::KIND => {
+            let workflow = ResolutionPatchWorkflow::new(storage.clone()).with_attempt(
+                elephant_storage::work_attempt_repository::fence_from_claim(item)?,
+            );
+            Box::pin(validate_resolution_patches::execute(
+                &workflow, space_id, &run_id,
+            ))
+            .await?;
+            Ok(metrics)
+        }).await,
+        commit_resolution_patches::KIND => boxed_work_item_phase(|| async move {
             let payload: WorkRunPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid commit payload: {e}"))?;
             let run_id = RecordId::from_str(&payload.work_run_id)
                 .map_err(|e| anyhow::anyhow!("Invalid work_run_id: {e}"))?;
-            let workflow = ResolutionPatchWorkflow::new(storage.clone());
-            commit_resolution_patches::execute(
+            let workflow = ResolutionPatchWorkflow::new(storage.clone()).with_attempt(
+                elephant_storage::work_attempt_repository::fence_from_claim(item)?,
+            );
+            Box::pin(commit_resolution_patches::execute(
                 &workflow,
                 space_id,
                 &run_id,
                 &BackoffConfig::default(),
                 None,
-            )
+            ))
             .await?;
-        }
-        WORK_KIND_EXECUTE_REPROCESS_JOB => {
+            Ok(metrics)
+        }).await,
+        WORK_KIND_EXECUTE_REPROCESS_JOB => boxed_work_item_phase(|| async move {
             let payload: ReprocessJobPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid reprocess payload: {e}"))?;
             if payload.job_id.is_empty() {
@@ -6137,48 +6388,32 @@ async fn execute_work_item_with_extractor(
                 work_run_repo: WorkRunRepository::new(storage.clone()),
             };
             let reprocess_config = ReprocessConfig::default();
-            let reprocess_result = Box::pin(execute_reprocess_job(
+            let reprocess_result = Box::pin(execute_reprocess_job_with_attempt(
                 &ctx,
                 &job_id,
                 work_run_id,
                 space_id,
                 &reprocess_config,
+                Some(elephant_storage::work_attempt_repository::fence_from_claim(
+                    item,
+                )?),
             ))
             .await?;
 
-            // The reconvergence recompute defers multi-value-group slots;
-            // enqueue one tm_resolve_slot per pending conflict group.
-            if !reprocess_result.pending_conflict_groups.is_empty() {
-                let work_item_repo = WorkItemRepository::new(storage.clone());
-                for group_id in reprocess_result.pending_conflict_groups {
-                    let work_item = WorkItem {
-                        base: BaseFields::new(
-                            RecordId::new_v4(TableName::WorkItem),
-                            space_id.clone(),
-                            item.base.created_by.clone(),
-                        ),
-                        kind: TM_RESOLVE_SLOT_KIND.to_string(),
-                        payload: serde_json::json!({
-                            "conflict_group_id": group_id.to_string()
-                        }),
-                        status: WorkItemStatus::Runnable,
-                        priority: successor_priority(item.priority),
-                        idempotency_key: format!("tm_resolve_slot:{group_id}:{work_run_id}"),
-                        attempts: 0,
-                        lease_expires_at: None,
-                        leased_by: None,
-                        run_after: None,
-                        last_error: None,
-                    };
-
-                    work_item_repo
-                        .create(work_item)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to enqueue tm_resolve_slot: {e}"))?;
-                }
+            let pending = reprocess_result.continuation_required
+                || !reprocess_result.pending_operations.is_empty();
+            for group_id in &reprocess_result.pending_conflict_groups {
+                enqueue_reprocess_resolution(&storage, item, work_run_id, group_id).await?;
             }
-        }
-        TM_DETECT_CONFLICTS_KIND => {
+            if pending {
+                return Err(WorkFailure {
+                    class: FailureClass::PendingDependencies,
+                    message: "Reprocess progress persisted; accepted source operations or maintenance continuations remain".into(),
+                }.into());
+            }
+            Ok(metrics)
+        }).await,
+        TM_DETECT_CONFLICTS_KIND => boxed_work_item_phase(|| async move {
             let payload: DetectConflictsPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid tm_detect_conflicts payload: {e}"))?;
             if payload.event_ids.is_empty() {
@@ -6192,18 +6427,28 @@ async fn execute_work_item_with_extractor(
             for id in payload.event_ids {
                 let record_id = RecordId::from_str(&id)
                     .map_err(|e| anyhow::anyhow!("Invalid system_event id {id}: {e}"))?;
-                if let Some(event) = event_repo.get_by_id(&record_id).await? {
-                    events.push(event);
+                let event = event_repo
+                    .get_by_id(&record_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Required outbox event missing: {record_id}"))?;
+                if event.base.space_id != *space_id {
+                    anyhow::bail!("Required outbox event crosses spaces: {record_id}");
                 }
+                events.push(event);
             }
 
             if events.is_empty() {
                 return Ok(metrics);
             }
 
-            let tm_storage = RepositoryTruthMaintenanceStorage::new(storage.clone());
-            let result =
-                execute_tm_detect_conflicts_from_outbox_events(&events, &tm_storage).await?;
+            let tm_storage = RepositoryTruthMaintenanceStorage::new(storage.clone()).with_attempt(
+                elephant_storage::work_attempt_repository::fence_from_claim(item)?,
+            );
+            let result = Box::pin(execute_tm_detect_conflicts_from_outbox_events(
+                &events,
+                &tm_storage,
+            ))
+            .await?;
             let DetectConflictsResult {
                 conflict_group_ids,
                 direct_commits,
@@ -6211,33 +6456,8 @@ async fn execute_work_item_with_extractor(
             } = result;
 
             if !conflict_group_ids.is_empty() || !direct_commits.is_empty() {
-                let work_item_repo = WorkItemRepository::new(storage.clone());
-
                 for group_id in conflict_group_ids {
-                    let work_item = WorkItem {
-                        base: BaseFields::new(
-                            RecordId::new_v4(TableName::WorkItem),
-                            space_id.clone(),
-                            item.base.created_by.clone(),
-                        ),
-                        kind: TM_RESOLVE_SLOT_KIND.to_string(),
-                        payload: serde_json::json!({
-                            "conflict_group_id": group_id.to_string()
-                        }),
-                        status: WorkItemStatus::Runnable,
-                        priority: successor_priority(item.priority),
-                        idempotency_key: format!("tm_resolve_slot:{group_id}:{work_run_id}"),
-                        attempts: 0,
-                        lease_expires_at: None,
-                        leased_by: None,
-                        run_after: None,
-                        last_error: None,
-                    };
-
-                    work_item_repo
-                        .create(work_item)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to enqueue tm_resolve_slot: {e}"))?;
+                    enqueue_group_resolution(&storage, item, work_run_id, &group_id, true).await?;
                 }
 
                 for commit in direct_commits {
@@ -6268,32 +6488,47 @@ async fn execute_work_item_with_extractor(
                         last_error: None,
                     };
 
-                    work_item_repo
-                        .create(work_item)
+                    enqueue_work_successor(&storage, item, work_item)
                         .await
                         .map_err(|e| anyhow::anyhow!("Failed to enqueue tm_commit: {e}"))?;
                 }
             }
-        }
-        TM_COMMIT_KIND => {
+            Ok(metrics)
+        }).await,
+        TM_COMMIT_KIND => boxed_work_item_phase(|| async move {
             let payload: CommitTruthPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid tm_commit payload: {e}"))?;
 
-            let tm_storage = RepositoryTruthMaintenanceStorage::new(storage.clone());
-            if let Err(err) =
-                execute_tm_commit(&payload.resolution, &payload.input, space_id, &tm_storage).await
-            {
-                if is_obsolete_tm_commit_error(&err) {
-                    warn!(
-                        "Skipping obsolete tm_commit work item {} after cleanup: {}",
-                        item.base.id, err
-                    );
+            let tm_storage = RepositoryTruthMaintenanceStorage::new(storage.clone()).with_attempt(
+                elephant_storage::work_attempt_repository::fence_from_claim(item)?,
+            );
+            let result = Box::pin(execute_tm_commit(
+                &payload.resolution,
+                &payload.input,
+                space_id,
+                &tm_storage,
+            ))
+            .await
+            .map_err(|error| {
+                if is_obsolete_tm_commit_error(&error) {
+                    anyhow::Error::new(WorkFailure {
+                        class: FailureClass::StaleInput,
+                        message: error.to_string(),
+                    })
                 } else {
-                    return Err(err.into());
+                    anyhow::Error::new(error)
                 }
+            })?;
+            if result.skipped_stale {
+                return Err(WorkFailure {
+                    class: FailureClass::StaleInput,
+                    message: "Truth-maintenance decision needs fresh preparation".into(),
+                }
+                .into());
             }
-        }
-        TM_RESOLVE_SLOT_KIND => {
+            Ok(metrics)
+        }).await,
+        TM_RESOLVE_SLOT_KIND => boxed_work_item_phase(|| async move {
             let payload: ResolveSlotPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid tm_resolve_slot payload: {e}"))?;
             if payload.conflict_group_id.is_empty() {
@@ -6324,33 +6559,24 @@ async fn execute_work_item_with_extractor(
                 return Ok(metrics);
             }
 
-            let tm_storage = RepositoryTruthMaintenanceStorage::new(storage.clone());
-            let (resolution, input) = match resolve_conflict_group_with_storage(
+            let tm_storage = RepositoryTruthMaintenanceStorage::new(storage.clone()).with_attempt(
+                elephant_storage::work_attempt_repository::fence_from_claim(item)?,
+            );
+            let (resolution, input) = match Box::pin(resolve_conflict_group_with_storage(
                 tm_ctx,
                 &conflict_group,
                 space_id,
                 &tm_storage,
-            )
+            ))
             .await
             {
                 Ok(result) => result,
                 Err(err) if is_obsolete_tm_resolve_error(&err) => {
-                    warn!(
-                        "Resolving obsolete tm_resolve_slot work item {} after cleanup: {}",
-                        item.base.id, err
-                    );
-                    let mut resolved_group = conflict_group.clone();
-                    resolved_group.resolved = true;
-                    resolved_group.resolved_at = Some(Utc::now());
-                    resolved_group.resolution_rationale =
-                        Some("No active claims remain after cleanup".to_string());
-                    conflict_repo
-                        .update(space_id, &group_id, resolved_group)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to mark obsolete conflict_group resolved: {e}")
-                        })?;
-                    return Ok(metrics);
+                    return Err(WorkFailure {
+                        class: FailureClass::StaleInput,
+                        message: err.to_string(),
+                    }
+                    .into());
                 }
                 Err(err) => return Err(err.into()),
             };
@@ -6384,82 +6610,171 @@ async fn execute_work_item_with_extractor(
                 last_error: None,
             };
 
-            let work_item_repo = WorkItemRepository::new(storage.clone());
-            work_item_repo
-                .create(commit_item)
+            enqueue_work_successor(&storage, item, commit_item)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to enqueue tm_commit: {e}"))?;
-        }
-        TM_RECOMPUTE_KIND => {
+            Ok(metrics)
+        }).await,
+        TM_RECOMPUTE_KIND => boxed_work_item_phase(|| async move {
             let payload: RecomputePayload = serde_json::from_value(item.payload.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid tm_recompute payload: {e}"))?;
             let priority = parse_recompute_priority(payload.priority.as_deref());
-            let tm_storage = RepositoryTruthMaintenanceStorage::new(storage.clone());
-            let result =
-                execute_tm_recompute(tm_ctx, space_id, priority, payload.max_slots, &tm_storage)
-                    .await?;
+            let tm_storage = RepositoryTruthMaintenanceStorage::new(storage.clone()).with_attempt(
+                elephant_storage::work_attempt_repository::fence_from_claim(item)?,
+            );
+            let result = Box::pin(execute_tm_recompute(
+                tm_ctx,
+                space_id,
+                priority,
+                payload.max_slots,
+                &tm_storage,
+            ))
+            .await?;
 
             // Multi-value-group slots defer adjudication out of the recompute
             // lease: enqueue one tm_resolve_slot item per pending group.
             if !result.pending_conflict_groups.is_empty() {
-                let work_item_repo = WorkItemRepository::new(storage.clone());
                 for group_id in result.pending_conflict_groups {
-                    let work_item = WorkItem {
-                        base: BaseFields::new(
-                            RecordId::new_v4(TableName::WorkItem),
-                            space_id.clone(),
-                            item.base.created_by.clone(),
-                        ),
-                        kind: TM_RESOLVE_SLOT_KIND.to_string(),
-                        payload: serde_json::json!({
-                            "conflict_group_id": group_id.to_string()
-                        }),
+                    enqueue_group_resolution(&storage, item, work_run_id, &group_id, true).await?;
+                }
+            }
+            if result.slots_skipped > 0 {
+                let mut base = item.base.clone();
+                base.id = RecordId::new_v4(TableName::WorkItem);
+                enqueue_work_successor(
+                    &storage,
+                    item,
+                    WorkItem {
+                        base,
+                        kind: TM_RECOMPUTE_KIND.into(),
+                        payload: item.payload.clone(),
                         status: WorkItemStatus::Runnable,
-                        priority: successor_priority(item.priority),
-                        idempotency_key: format!("tm_resolve_slot:{group_id}:{work_run_id}"),
+                        priority: item.priority,
+                        idempotency_key: format!("tm_recompute_continuation:{}", item.base.id),
                         attempts: 0,
                         lease_expires_at: None,
                         leased_by: None,
                         run_after: None,
                         last_error: None,
-                    };
-
-                    work_item_repo
-                        .create(work_item)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to enqueue tm_resolve_slot: {e}"))?;
-                }
+                    },
+                )
+                .await?;
             }
-        }
-        WORK_KIND_FRESHNESS_SWEEP => {
+            Ok(metrics)
+        }).await,
+        WORK_KIND_FRESHNESS_SWEEP => boxed_work_item_phase(|| async move {
             let freshness_repo = FreshnessRepository::new(storage.clone());
             let result = execute_freshness_sweep(freshness_repo, space_id, None).await?;
             metrics.custom.insert(
                 "items_processed".to_string(),
                 serde_json::json!(result.processed),
             );
-        }
-        RECONCILE_LIVING_WIKI_KIND => {
+            Ok(metrics)
+        }).await,
+        RECONCILE_LIVING_WIKI_KIND => boxed_work_item_phase(|| async move {
             let payload: ManagedWikiPayload = serde_json::from_value(item.payload.clone())
                 .map_err(|error| anyhow::anyhow!("Invalid managed wiki payload: {error}"))?;
             #[cfg(feature = "meerkat-extraction")]
             {
-                metrics = Box::pin(execute_managed_wiki_work_item(item, storage, payload)).await?;
+                return Box::pin(execute_managed_wiki_work_item(
+                    item,
+                    work_run_id,
+                    storage,
+                    payload,
+                ))
+                .await;
             }
 
             #[cfg(not(feature = "meerkat-extraction"))]
             return Err(anyhow::anyhow!(
                 "reconcile_living_wiki requires the meerkat-extraction feature"
             ));
-        }
+        }).await,
         other => {
-            return Err(anyhow::anyhow!("Unsupported work kind: {other}"));
+            Err(anyhow::anyhow!("Unsupported work kind: {other}"))
         }
     }
-
-    Ok(metrics)
 }
 
+mod failure_diagnostic;
+
+/// Expose only reviewed static context codes, never arbitrary nested errors.
+fn failure_context_code(error: &anyhow::Error) -> Option<&'static str> {
+    error.chain().find_map(|cause| {
+        let storage = cause.downcast_ref::<StorageError>().or_else(|| {
+            match cause.downcast_ref::<PipelineError>() {
+                Some(PipelineError::StorageError(storage)) => Some(storage),
+                _ => None,
+            }
+        });
+        match storage {
+            Some(StorageError::Conflict(message))
+                if message == "standing_watch_authority_changed_or_missing" =>
+            {
+                Some("original_work_authority_changed")
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Renew the original attempt and carry its exact updated snapshot to dispatch.
+/// The queue changes only lease bookkeeping; never adopt a changed work input.
+async fn renew_execution_work(
+    queue: &WorkQueue,
+    original: &WorkItem,
+    execution_timeout_secs: u64,
+) -> Result<WorkItem, PipelineError> {
+    let renewed = queue
+        .renew_lease(
+            &original.base.space_id,
+            &original.base.id,
+            execution_timeout_secs.saturating_add(MANAGED_WIKI_LEASE_GRACE_SECS),
+        )
+        .await?;
+    let mut expected = original.clone();
+    expected.base.updated_at = renewed.base.updated_at;
+    expected.lease_expires_at = renewed.lease_expires_at;
+    // These fields are cleared by the existing renewal transition on both backends.
+    expected.run_after = None;
+    expected.last_error = None;
+    if renewed != expected {
+        return Err(PipelineError::LeaseConflict(original.base.id.to_string()));
+    }
+    Ok(renewed)
+}
+
+/// A completed owned task may have published runnable children or freed capacity.
+/// Keep the fallback timer alive across completions: other producers, delayed
+/// retries and recovery sweeps must not starve behind a stream of short tasks.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkQueueWake {
+    Poll,
+    Completion,
+}
+
+async fn wait_for_work_queue_wake(
+    tasks: &mut JoinSet<()>,
+    poll: std::pin::Pin<&mut tokio::time::Sleep>,
+) -> WorkQueueWake {
+    tokio::select! {
+        biased;
+        () = poll => WorkQueueWake::Poll,
+        result = tasks.join_next(), if !tasks.is_empty() => {
+            if let Some(Err(error)) = result {
+                warn!(%error, "Work queue task failed");
+            }
+            WorkQueueWake::Completion
+        }
+    }
+}
+
+#[expect(
+    clippy::large_futures,
+    clippy::option_if_let_else,
+    clippy::significant_drop_tightening,
+    reason = "Keep the explicit timeout disposition, admission lifetimes and original future layout"
+)]
 async fn run_work_queue_loop(
     storage: StorageClient,
     config: WorkQueueWorkerConfig,
@@ -6505,11 +6820,13 @@ async fn run_work_queue_loop(
     let budget = Arc::new(budget);
     let daily_cap = Arc::new(daily_cap);
     // Built once near worker startup; the only TM env read in the binary.
-    let tm_ctx = Arc::new(build_tm_context());
+    let tm_ctx = Arc::new(TmContext::none());
 
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
     let extract_semaphore = Arc::new(Semaphore::new(config.max_extract_concurrent));
     let mut tasks = JoinSet::new();
+    let poll = tokio::time::sleep(config.poll_interval());
+    tokio::pin!(poll);
 
     info!(
         "Work queue loop starting with max_concurrent={} max_extract_concurrent={} allowed_kinds={:?} disabled_kinds={:?}",
@@ -6532,8 +6849,15 @@ async fn run_work_queue_loop(
                     break;
                 }
             }
-            () = tokio::time::sleep(config.poll_interval()) => {
-                // Reap completed tasks
+            wake = wait_for_work_queue_wake(&mut tasks, poll.as_mut()) => {
+                if wake == WorkQueueWake::Poll {
+                    poll.as_mut().reset(tokio::time::Instant::now() + config.poll_interval());
+                    let recovery: anyhow::Result<()> = async { storage.with_activity(source_runtime::recover_sources(&storage)).await??; Ok(()) }.await;
+                    if let Err(error) = recovery { warn!(%error, "Source recovery sweep incomplete; durable intent retained"); }
+                }
+                // Coalesce completions into one bounded claim pass. The wake
+                // grants no authority: the existing claim still checks due time,
+                // original attempt fences, kind selection and available permits.
                 while let Some(result) = tasks.try_join_next() {
                     if let Err(e) = result {
                         warn!("Task panicked: {e}");
@@ -6542,7 +6866,7 @@ async fn run_work_queue_loop(
 
                 loop {
                     // Drain as much runnable work as we have capacity for on each
-                    // poll tick. One batched claim fills every free permit from a
+                    // wake. One batched claim fills every free permit from a
                     // single candidate scan instead of paying the scan per item —
                     // at deep queues the scan dominates, which serialized claims.
                     let free_permits = semaphore.available_permits();
@@ -6570,6 +6894,13 @@ async fn run_work_queue_loop(
                     }
                     let batch_len = claimed_items.len();
                     for item in claimed_items {
+                        let work_queue = match work_queue.for_attempt(&item) {
+                            Ok(queue) => Arc::new(queue),
+                            Err(error) => {
+                                error!(work_item = %item.base.id, %error, "Invalid work claim");
+                                continue;
+                            }
+                        };
                         let Ok(permit) = semaphore.clone().try_acquire_owned() else {
                             // Batch is sized by free permits and nothing else takes
                             // from this semaphore, so this is defensive: put the
@@ -6611,13 +6942,29 @@ async fn run_work_queue_loop(
                                         .requeue_with_delay(
                                             &item.base.space_id,
                                             &item.base.id,
-                                            &queue_config.worker_id,
+                                            work_queue.lease_owner(),
                                             60,
                                             Some("living_wiki_serialization".to_string()),
                                         )
                                         .await;
                                     drop(permit);
                                     continue;
+                                }
+                            }
+                            if item.kind == EXTRACT_ASSERTIONS_KIND {
+                                let admission = elephant_pipeline::scheduler::extraction_repair::semantic_retry_limit(
+                                    &storage, &item, config.transient_retry_max_attempts,
+                                ).await;
+                                let refusal = match admission {
+                                    Ok(limit) if item.attempts > limit => Some(PipelineError::GroundingRepairExhausted),
+                                    Ok(_) => None,
+                                    Err(error) => Some(error),
+                                };
+                                if let Some(failure) = refusal {
+                                    if let Err(error) = source_runtime::record_preflight_failure(&storage, &item, &failure.into(), &config).await {
+                                        warn!(%error, "Extraction admission receipt remains pending original lease recovery");
+                                    }
+                                    drop(permit); continue;
                                 }
                             }
                             // Check daily cap
@@ -6627,12 +6974,9 @@ async fn run_work_queue_loop(
                                 let work_item_repo = WorkItemRepository::new((*storage).clone());
                                 let delay = i64::try_from(config.poll_interval_secs).unwrap_or(i64::MAX);
                                 let _ = work_item_repo
-                                    .requeue_with_delay(
-                                        &item.base.space_id,
-                                        &item.base.id,
-                                        &queue_config.worker_id,
-                                        delay.max(1),
-                                        Some("daily_cap_reached".to_string()),
+                                    .requeue_configuration_blocked(
+                                        &item.base.space_id, &item.base.id, work_queue.lease_owner(),
+                                        delay.max(30), "daily_cap_reached".to_string(),
                                     )
                                     .await;
                                 drop(permit);
@@ -6640,7 +6984,10 @@ async fn run_work_queue_loop(
                             }
                             Err(err) => {
                                 warn!("Daily cap check failed for {}: {}", item.base.id, err);
-                                // On error, allow work to proceed rather than blocking
+                                if let Err(error) = source_runtime::record_preflight_failure(&storage, &item, &err.into(), &config).await {
+                                    warn!(%error, "Daily cap failure transition remains pending lease recovery");
+                                }
+                                drop(permit); continue;
                             }
                             Ok(true) => {} // Under cap, proceed
                         }
@@ -6650,22 +6997,23 @@ async fn run_work_queue_loop(
                         } else {
                             config.work_item_timeout_secs
                         };
-                        if item.kind == RECONCILE_LIVING_WIKI_KIND {
-                            let lease_duration = work_item_timeout_secs
-                                .saturating_add(MANAGED_WIKI_LEASE_GRACE_SECS);
-                            if let Err(err) = work_queue
-                                .renew_lease(&item.base.space_id, &item.base.id, lease_duration)
-                                .await
-                            {
+                        let item = match renew_execution_work(
+                            &work_queue, &item, work_item_timeout_secs,
+                        ).await {
+                            Ok(renewed) => renewed,
+                            Err(err) => {
                                 warn!(
                                     work_item = %item.base.id,
                                     error = %err,
-                                    "Could not extend managed wiki lease; refusing duplicate-prone execution"
+                                    "Could not extend attempt lease to execution deadline"
                                 );
+                                if let Err(error) = source_runtime::record_preflight_failure(&storage, &item, &err.into(), &config).await {
+                                    warn!(%error, "Lease deadline failure transition remains pending recovery");
+                                }
                                 drop(permit);
                                 continue;
                             }
-                        }
+                        };
 
                         // Clone Arcs for the spawned task
                         let storage = Arc::clone(&storage);
@@ -6697,15 +7045,11 @@ async fn run_work_queue_loop(
                         };
 
                             tasks.spawn(async move {
+                            let activity_client = (*storage).clone();
+                            if let Err(error) = activity_client.with_activity(async {
                             let _permit = permit; // Hold permit until task completes
                             let _extract_permit = extract_permit;
                             let timeout = std::time::Duration::from_secs(work_item_timeout_secs);
-                            let timed_out_item_id = item.base.id.clone();
-                            let timed_out_space_id = item.base.space_id.clone();
-                            let timed_out_kind = item.kind.clone();
-                            let timed_out_attempt = item.attempts;
-
-                            let task_result = tokio::time::timeout(timeout, async {
                                 let estimates = {
                                     let mut est = budget_estimates_from_payload(&item.payload);
                                     if item.kind == PLAN_EXTRACTION_KIND {
@@ -6734,29 +7078,27 @@ async fn run_work_queue_loop(
                                             "Failed to reserve cost for work item {}: {}",
                                             item.base.id, err
                                         );
-                                        let _ = work_queue
-                                            .fail(
-                                                &item.base.space_id,
-                                                &item.base.id,
-                                                format!("cost reserve failed: {err}"),
-                                            )
-                                            .await;
+                                        if let Err(error) = source_runtime::record_preflight_failure(&storage, &item, &err.into(), &config).await {
+                                            warn!(%error, "Cost reservation failure transition remains pending lease recovery");
+                                        }
                                         return;
                                     }
                                 };
 
                                 let run_id = RecordId::new_v4(TableName::WorkRun);
-                                let base = BaseFields::new(
-                                    run_id.clone(),
-                                    item.base.space_id.clone(),
-                                    queue_config.worker_id.clone(),
-                                );
+                                let mut base = item.base.clone();
+                                base.id = run_id.clone();
+                                base.created_by = queue_config.worker_id.clone();
+                                base.created_at = Utc::now(); base.updated_at = base.created_at;
                                 let started_at = chrono::Utc::now();
-                                let initial_metrics = WorkRunMetrics {
-                                    estimated_cost_euros: estimates.estimated_cost_euros,
-                                    tokens_used: estimates.estimated_tokens,
-                                    ..WorkRunMetrics::default()
-                                };
+                                let mut usage = AttemptUsage::reserved(estimates.estimated_tokens, estimates.estimated_cost_euros);
+                                let mut initial_metrics = WorkRunMetrics::default();
+                                initial_metrics.custom.insert("cost_ledger_id".to_string(), serde_json::json!(ledger_id.to_string()));
+                                initial_metrics.custom.insert("attempt_fence".to_string(), item.payload["_attempt_fence"].clone());
+                                if let Err(error) = usage.write_metrics(&mut initial_metrics) {
+                                    error!(%error, "Cannot serialize attempt usage");
+                                    return;
+                                }
 
                                 let work_run = WorkRun {
                                     base,
@@ -6778,6 +7120,9 @@ async fn run_work_queue_loop(
                                     Ok(run) => run,
                                     Err(err) => {
                                         error!("Failed to create work_run for {}: {}", item.base.id, err);
+                                        if let Err(error) = budget_enforcer.reconcile_cost(&ledger_id, 0.0, 0, false).await {
+                                            warn!(%error, "Failed to release unused reservation");
+                                        }
                                         let _ = work_queue
                                             .fail(
                                                 &item.base.space_id,
@@ -6789,7 +7134,14 @@ async fn run_work_queue_loop(
                                     }
                                 };
 
-                                let result = Box::pin(execute_work_item(
+                                let attempt = match elephant_storage::work_attempt_repository::fence_from_claim(&item) {
+                                    Ok(attempt) => attempt,
+                                    Err(error) => { error!(%error, "Invalid original attempt fence"); return; }
+                                };
+                                let usage_observer = elephant_pipeline::provider_usage::DurableUsageObserver::for_attempt(
+                                    (*storage).clone(), &created_run.base.id, attempt);
+                                let execution = elephant_pipeline::provider_dispatch::with_dispatch_observer(
+                                    usage_observer.clone(), Box::pin(execute_work_item(
                                     &item,
                                     &created_run.base.id,
                                     (*storage).clone(),
@@ -6798,8 +7150,11 @@ async fn run_work_queue_loop(
                                     &provider_cache,
                                     &embed_config,
                                     &tm_ctx,
-                                ))
-                                .await;
+                                )));
+                                let result = match tokio::time::timeout(timeout, execution).await {
+                                    Ok(result) => result,
+                                    Err(_) => Err(anyhow::Error::new(WorkFailure::timeout(work_item_timeout_secs))),
+                                };
 
                                 let completed_at = chrono::Utc::now();
                                 let wall_time_ms_i64 = completed_at
@@ -6808,59 +7163,68 @@ async fn run_work_queue_loop(
                                     .max(0);
                                 let wall_time_ms = u64::try_from(wall_time_ms_i64).unwrap_or(0);
 
-                                let mut updated_run = match work_run_repo
-                                    .get(&item.base.space_id, &created_run.base.id)
-                                    .await
+                                let settlement = match attempt_settlement::AttemptSettlement::new(&storage, &item) {
+                                    Ok(settlement) => settlement,
+                                    Err(error) => { warn!(work_item = %item.base.id, %error, "Original outcome cannot settle after lease expiry"); return; }
+                                };
+
+                                let mut updated_run = match settlement.persist("read_original_run", || async {
+                                    Ok(work_run_repo.get(&item.base.space_id, &created_run.base.id).await?)
+                                }).await
                                 {
                                     Ok(Some(run)) => run,
-                                    Ok(None) => created_run.clone(),
+                                    Ok(None) => {
+                                        error!(work_run = %created_run.base.id, "Attempt receipt disappeared; refusing completion");
+                                        return;
+                                    },
                                     Err(err) => {
                                         warn!(
                                             "Failed to refresh work_run {}: {}",
                                             created_run.base.id, err
                                         );
-                                        created_run.clone()
+                                        return;
                                     }
                                 };
                                 updated_run.completed_at = Some(completed_at);
+                                usage = match settlement.persist("summarize_original_usage", || async {
+                                    Ok(usage_observer.summarize(usage.clone()).await?)
+                                }).await {
+                                    Ok(usage) => usage,
+                                    Err(error) => { error!(%error, "Usage receipts unavailable; refusing completion"); return; }
+                                };
 
                                 match result {
                                     Ok(mut run_metrics) => {
                                         run_metrics.wall_time_ms = wall_time_ms;
-                                        if run_metrics.tokens_used == 0 {
-                                            run_metrics.tokens_used = estimates.estimated_tokens;
+                                        if let Err(error) = usage.write_metrics(&mut run_metrics) {
+                                            error!(%error, "Cannot persist usage receipt");
+                                            return;
                                         }
-                                        if run_metrics.estimated_cost_euros == 0.0 {
-                                            run_metrics.estimated_cost_euros = estimates.estimated_cost_euros;
+                                        run_metrics.custom.insert("attempt_fence".to_string(), item.payload["_attempt_fence"].clone());
+                                        run_metrics.custom.insert("cost_ledger_id".to_string(), serde_json::json!(ledger_id.to_string()));
+                                        let frozen_key = elephant_pipeline::scheduler::extraction_repair::EXTRACTION_BUDGET_KEY;
+                                        if updated_run.metrics.custom.get(frozen_key).is_some_and(|original| {
+                                            run_metrics.custom.get(frozen_key).is_some_and(|returned| returned != original)
+                                        }) {
+                                            error!("Returned metrics changed frozen extraction input; refusing completion");
+                                            return;
+                                        }
+                                        for (key, value) in &updated_run.metrics.custom {
+                                            run_metrics.custom.entry(key.clone()).or_insert_with(|| value.clone());
                                         }
                                         updated_run.metrics = run_metrics.clone();
                                         updated_run.success = true;
-
-                                        let actual_cost = if run_metrics.estimated_cost_euros > 0.0 {
-                                            run_metrics.estimated_cost_euros
-                                        } else {
-                                            estimate_cost_from_tokens(run_metrics.tokens_used)
-                                        };
-                                        if let Err(err) = budget_enforcer
-                                            .reconcile_cost(
-                                                &ledger_id,
-                                                actual_cost,
-                                                u64::from(run_metrics.tokens_used),
-                                                true,
-                                            )
-                                            .await
-                                        {
-                                            warn!(
-                                                "Failed to reconcile cost for work item {}: {}",
-                                                item.base.id, err
-                                            );
-                                        }
-
-                                        if let Err(err) = work_run_repo
-                                            .update(&item.base.space_id, &created_run.base.id, updated_run)
-                                            .await
+                                        if let Err(err) = settlement.persist("record_successful_outcome", || async {
+                                            Ok(work_run_repo.update(&item.base.space_id, &created_run.base.id, updated_run.clone()).await?)
+                                        }).await
                                         {
                                             warn!("Failed to update work_run {}: {}", created_run.base.id, err);
+                                            return;
+                                        }
+                                        if let Err(error) = settlement.persist("settle_successful_usage", || async {
+                                            Ok(elephant_pipeline::provider_usage::reconcile_finished_usage(&storage, &item.base.space_id, &created_run.base.id).await?)
+                                        }).await {
+                                            warn!(%error, "Usage settlement incomplete; recovery will retry"); return;
                                         }
                                         if let Err(err) = complete_work_item_and_promote(
                                             &work_queue,
@@ -6883,117 +7247,30 @@ async fn run_work_queue_loop(
                                         }
                                     }
                                     Err(err) => {
-                                        let actual_cost =
-                                            estimate_cost_from_tokens(estimates.estimated_tokens);
-                                        let _ = budget_enforcer
-                                            .reconcile_cost(
-                                                &ledger_id,
-                                                actual_cost,
-                                                u64::from(estimates.estimated_tokens),
-                                                false,
-                                            )
-                                            .await;
-
-                                        updated_run.success = false;
-                                        updated_run.error = Some(err.to_string());
-                                        updated_run.metrics.wall_time_ms = wall_time_ms;
-                                        updated_run.metrics.tokens_used = estimates.estimated_tokens;
-                                        if let Err(err) = work_run_repo.update(&item.base.space_id, &created_run.base.id, updated_run).await {
-                                            warn!("Failed to update failed work_run {}: {}", created_run.base.id, err);
-                                        }
-
-                                        let should_retry = item.attempts < config.transient_retry_max_attempts
-                                            && is_transient_work_error(&err);
-
-                                        if should_retry {
-                                            let delay_secs = compute_transient_retry_delay_secs(
-                                                item.attempts,
-                                                config.transient_retry_base_delay_secs,
-                                                config.transient_retry_max_delay_secs,
-                                            );
-                                            let work_item_repo = WorkItemRepository::new((*storage).clone());
-                                            match work_item_repo
-                                                .requeue_with_delay(
-                                                    &item.base.space_id,
-                                                    &item.base.id,
-                                                    &queue_config.worker_id,
-                                                    delay_secs,
-                                                    Some(format!(
-                                                        "transient_retry attempt {}: {err}",
-                                                        item.attempts
-                                                    )),
-                                                )
-                                                .await
-                                            {
-                                                Ok(Some(_)) => {
-                                                    warn!(
-                                                        "Requeued transiently failing work item {} (attempt {} / {}, delay {}s): {}",
-                                                        item.base.id,
-                                                        item.attempts,
-                                                        config.transient_retry_max_attempts,
-                                                        delay_secs,
-                                                        err
-                                                    );
-                                                    return;
-                                                }
-                                                Ok(None) => {
-                                                    warn!(
-                                                        "Transient retry skipped for work item {} due to lease/state conflict; marking failed",
-                                                        item.base.id
-                                                    );
-                                                }
-                                                Err(requeue_err) => {
-                                                    warn!(
-                                                        "Failed to requeue transiently failing work item {}: {}",
-                                                        item.base.id,
-                                                        requeue_err
-                                                    );
-                                                }
-                                            }
-                                        }
-
-                                        if let Err(err) = work_queue.fail(&item.base.space_id, &item.base.id, err.to_string()).await {
-                                            error!("Failed to mark work item {} failed: {}", item.base.id, err);
+                                        let (class, action) = match settlement.persist("record_failed_outcome_and_usage", || source_runtime::record_failed_execution(
+                                            &storage, &item, &created_run.base.id, &err, &usage,
+                                            completed_at, wall_time_ms, &config,
+                                        )).await {
+                                            Ok(disposition) => disposition,
+                                            Err(error) => { warn!(%error, "Failed outcome or usage remains pending original lease recovery"); return; }
+                                        };
+                                        if let Err(error) = source_runtime::apply_failed_disposition(
+                                            &storage, &item, &err, class, action,
+                                        ).await {
+                                            warn!(%error, "Original failed disposition remains pending lease recovery");
                                         } else {
-                                            warn!(
-                                                work_item = %item.base.id,
-                                                kind = %item.kind,
-                                                error = %err,
-                                                "Failed work item"
-                                            );
+                                            warn!(work_item = %item.base.id, kind = %item.kind, error = %err,
+                                                ?class, ?action, "Recorded failed work attempt");
                                         }
                                     }
                                 }
-                            }).await;
-
-                            if task_result.is_err() {
-                                let timeout_message =
-                                    format!("work item timed out after {work_item_timeout_secs}s");
-                                error!(
-                                    work_item = %timed_out_item_id,
-                                    kind = %timed_out_kind,
-                                    attempt = timed_out_attempt,
-                                    timeout_secs = work_item_timeout_secs,
-                                    "Work item timed out"
-                                );
-                                if let Err(err) = work_queue
-                                    .fail(&timed_out_space_id, &timed_out_item_id, timeout_message)
-                                    .await
-                                {
-                                    warn!(
-                                        work_item = %timed_out_item_id,
-                                        kind = %timed_out_kind,
-                                        error = %err,
-                                        "Failed to mark timed out work item as failed"
-                                    );
-                                }
-                            }
+                            }).await { warn!(%error, "Work activity admission closed; lease remains recoverable"); }
                             });
                         }
                     }
                     if batch_len < free_permits {
                         // The queue had less claimable work than capacity —
-                        // nothing more to drain this tick.
+                        // wait for a completion or the retained poll deadline.
                         break;
                     }
                 }
@@ -7004,15 +7281,17 @@ async fn run_work_queue_loop(
     Ok(())
 }
 
-fn knowledge_view_event_records(events: &[SystemEvent]) -> (bool, Vec<String>) {
-    let records = events
-        .iter()
-        .filter_map(|event| event.payload.get("records"))
-        .filter_map(|records| {
-            serde_json::from_value::<Vec<elephant_outbox::RecordRef>>(records.clone()).ok()
-        })
-        .flatten()
-        .collect::<Vec<_>>();
+fn knowledge_view_event_records(events: &[SystemEvent]) -> anyhow::Result<(bool, Vec<String>)> {
+    let mut records = Vec::new();
+    for event in events {
+        if let Some(value) = event.payload.get("records") {
+            records.extend(serde_json::from_value::<Vec<elephant_outbox::RecordRef>>(
+                value.clone(),
+            )?);
+        } else if event.event_type == "records.changed" {
+            anyhow::bail!("records.changed event {} has no records", event.base.id);
+        }
+    }
     let living_wiki_graph_changed = records.iter().any(|record| {
         matches!(
             record.id.table(),
@@ -7041,7 +7320,7 @@ fn knowledge_view_event_records(events: &[SystemEvent]) -> (bool, Vec<String>) {
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    (living_wiki_graph_changed, affected_projection_records)
+    Ok((living_wiki_graph_changed, affected_projection_records))
 }
 
 async fn process_knowledge_view_events(
@@ -7049,9 +7328,9 @@ async fn process_knowledge_view_events(
     space_id: &str,
     after_seq: i64,
     events: &[SystemEvent],
-) {
+) -> anyhow::Result<()> {
     let (living_wiki_graph_changed, affected_projection_records) =
-        knowledge_view_event_records(events);
+        knowledge_view_event_records(events)?;
     if !affected_projection_records.is_empty() {
         let knowledge_views = KnowledgeViewRepository::new(storage.clone());
         let reason = format!(
@@ -7067,10 +7346,7 @@ async fn process_knowledge_view_events(
             }
             Ok(_) => {}
             Err(err) => {
-                warn!(
-                    "Knowledge-view invalidation failed for {}: {}",
-                    space_id, err
-                );
+                return Err(err.into());
             }
         }
     }
@@ -7101,14 +7377,17 @@ async fn process_knowledge_view_events(
                 "Debounced graph change into managed Living Wiki reconciliation"
             ),
             Ok(None) => {}
-            Err(err) => warn!(
-                "Living Wiki graph-change scheduling failed for {}: {}",
-                space_id, err
-            ),
+            Err(err) => return Err(err.into()),
         }
     }
+    Ok(())
 }
 
+#[expect(
+    clippy::large_futures,
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original repository lifetimes and future ownership"
+)]
 async fn run_knowledge_view_invalidation_loop(
     storage: StorageClient,
     poll_interval: std::time::Duration,
@@ -7116,11 +7395,6 @@ async fn run_knowledge_view_invalidation_loop(
 ) -> anyhow::Result<()> {
     const BATCH_SIZE: usize = 500;
     let event_repo = SystemEventRepository::new(storage.clone());
-    let mut last_seq_by_space: HashMap<String, i64> = HashMap::new();
-    for space_id in event_repo.get_all_spaces().await? {
-        let latest = event_repo.get_latest_seq(&space_id).await?;
-        last_seq_by_space.insert(space_id, latest);
-    }
     loop {
         tokio::select! {
             _ = rx.changed() => {
@@ -7138,26 +7412,16 @@ async fn run_knowledge_view_invalidation_loop(
                     }
                 };
                 for space_id in spaces {
-                    let after_seq = last_seq_by_space.get(&space_id).copied().unwrap_or(0);
-                    let events = match event_repo
-                        .get_after_seq(&space_id, after_seq, BATCH_SIZE)
-                        .await
-                    {
-                        Ok(events) => events,
-                        Err(err) => {
-                            warn!(
-                                "Knowledge-view invalidation worker failed to fetch events for {}: {}",
-                                space_id, err
-                            );
-                            continue;
-                        }
-                    };
-                    if events.is_empty() {
-                        continue;
-                    }
-                    process_knowledge_view_events(&storage, &space_id, after_seq, &events).await;
-                    if let Some(last) = events.last() {
-                        last_seq_by_space.insert(space_id, last.seq);
+                    let client = &storage;
+                    let space = &space_id;
+                    let delivery: anyhow::Result<usize> = elephant_pipeline::outbox_delivery::deliver_batch(
+                        client, space, "knowledge_views", BATCH_SIZE,
+                        |after, events| async move {
+                            process_knowledge_view_events(client, space, after, &events).await
+                        },
+                    ).await;
+                    if let Err(error) = delivery {
+                        warn!(%space_id, %error, "Outbox batch failed; checkpoint retained for replay");
                     }
                 }
             }
@@ -7166,185 +7430,82 @@ async fn run_knowledge_view_invalidation_loop(
     Ok(())
 }
 
+/// Acknowledgment transfers a complete event batch into durable work. All
+/// canonical mutations run later under the worker's original attempt fence.
+async fn process_truth_maintenance_events(
+    storage: &StorageClient,
+    space_id: &str,
+    events: &[SystemEvent],
+) -> anyhow::Result<()> {
+    let Some(last) = events.last() else {
+        return Ok(());
+    };
+    if events.iter().any(|event| event.base.space_id != space_id) {
+        anyhow::bail!("Truth-maintenance delivery crosses spaces");
+    }
+    let first = events
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Missing first event"))?;
+    let work_item = WorkItem {
+        base: BaseFields::new(
+            RecordId::new_v4(TableName::WorkItem),
+            space_id.to_string(),
+            "truth_maintenance".to_string(),
+        ),
+        kind: TM_DETECT_CONFLICTS_KIND.to_string(),
+        payload: serde_json::json!({"event_ids":events.iter().map(|event| event.base.id.to_string()).collect::<Vec<_>>()}),
+        status: WorkItemStatus::Runnable,
+        priority: 50,
+        idempotency_key: format!("tm_detect_conflicts:{}:{}", first.seq, last.seq),
+        attempts: 0,
+        lease_expires_at: None,
+        leased_by: None,
+        run_after: None,
+        last_error: None,
+    };
+    elephant_pipeline::source_queue::enqueue_idempotent(storage, work_item).await?;
+    Ok(())
+}
+
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original repository lifetimes and future ownership"
+)]
 async fn run_truth_maintenance_loop(
     storage: StorageClient,
     config: TruthMaintenanceWorkerConfig,
     mut rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let event_repo = SystemEventRepository::new(storage.clone());
-    let work_item_repo = WorkItemRepository::new(storage.clone());
-    let mut last_seq_by_space: HashMap<String, i64> = HashMap::new();
-    let mut last_event_id_by_space: HashMap<String, RecordId> = HashMap::new();
-
     loop {
         tokio::select! {
             _ = rx.changed() => {
-                if *rx.borrow() {
-                    info!("Truth maintenance worker received shutdown signal");
-                    break;
-                }
+                if *rx.borrow() { break; }
             }
             () = tokio::time::sleep(config.poll_interval()) => {
                 let spaces = match event_repo.get_all_spaces().await {
                     Ok(spaces) => spaces,
-                    Err(err) => {
-                        error!("Truth maintenance worker failed to list spaces: {}", err);
+                    Err(error) => {
+                        error!(%error, "Cannot discover truth-maintenance outbox spaces");
                         continue;
                     }
                 };
-
                 for space_id in spaces {
-                    let after_seq = last_seq_by_space.get(&space_id).copied().unwrap_or(0);
-                    let events = match event_repo
-                        .get_after_seq(&space_id, after_seq, config.batch_size)
-                        .await
-                    {
-                        Ok(events) => events,
-                        Err(err) => {
-                            error!(
-                                "Truth maintenance worker failed to fetch events for {}: {}",
-                                space_id, err
-                            );
-                            continue;
-                        }
-                    };
-
-                    if events.is_empty() {
-                        if after_seq > 0 {
-                            match event_repo.get_latest_seq(&space_id).await {
-                                Ok(latest) if latest < after_seq => {
-                                    let reset_seq = 0;
-                                    info!(
-                                        "Truth maintenance seq reset detected for {}, resetting cursor from {} to {}",
-                                        space_id, after_seq, reset_seq
-                                    );
-                                    last_seq_by_space.insert(space_id.clone(), reset_seq);
-                                    last_event_id_by_space.remove(&space_id);
-                                }
-                                Ok(latest) if latest == after_seq => {
-                                    if let Some(last_id) = last_event_id_by_space.get(&space_id) {
-                                        let before_seq = latest.saturating_add(1);
-                                        match event_repo
-                                            .get_before_seq(&space_id, before_seq, 1)
-                                            .await
-                                        {
-                                            Ok(latest_events) => {
-                                                if let Some(latest_event) = latest_events.first() {
-                                                    if &latest_event.base.id != last_id {
-                                                        let reset_seq = 0;
-                                                        info!(
-                                                            "Truth maintenance seq reset detected for {}, resetting cursor from {} to {} (seq reuse)",
-                                                            space_id, after_seq, reset_seq
-                                                        );
-                                                        last_seq_by_space.insert(space_id.clone(), reset_seq);
-                                                        last_event_id_by_space.remove(&space_id);
-                                                    }
-                                                }
-                                            }
-                                            Err(err) => {
-                                                warn!(
-                                                    "Truth maintenance worker failed to fetch latest event for {}: {}",
-                                                    space_id, err
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(_) => {}
-                                Err(err) => {
-                                    warn!(
-                                        "Truth maintenance worker failed to fetch latest seq for {}: {}",
-                                        space_id, err
-                                    );
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    info!(
-                        "Truth maintenance processing {} events for {}",
-                        events.len(),
-                        space_id
-                    );
-                    let tm_storage = RepositoryTruthMaintenanceStorage::new(storage.clone());
-                    match execute_tm_detect_conflicts_from_outbox_events(&events, &tm_storage).await
-                    {
-                        Ok(result) => {
-                            info!(
-                                "Truth maintenance detected {} direct commits and {} conflict groups for {}",
-                                result.direct_commits.len(),
-                                result.conflict_group_ids.len(),
-                                space_id
-                            );
-                            for commit in result.direct_commits {
-                                if let Err(err) = execute_tm_commit(
-                                    &commit.resolution,
-                                    &commit.input,
-                                    &space_id,
-                                    &tm_storage,
-                                )
-                                .await
-                                {
-                                    warn!(
-                                        "Truth maintenance direct commit failed for {}: {}",
-                                        space_id, err
-                                    );
-                                }
-                            }
-
-                            if !result.conflict_group_ids.is_empty() {
-                                for group_id in result.conflict_group_ids {
-                                    let work_item = WorkItem {
-                                        base: BaseFields::new(
-                                            RecordId::new_v4(TableName::WorkItem),
-                                            space_id.clone(),
-                                            "truth_maintenance".to_string(),
-                                        ),
-                                        kind: TM_RESOLVE_SLOT_KIND.to_string(),
-                                        payload: serde_json::json!({
-                                            "conflict_group_id": group_id.to_string()
-                                        }),
-                                        status: WorkItemStatus::Runnable,
-                                        priority: 50,
-                                        idempotency_key: format!(
-                                            "tm_resolve_slot:{}:{}",
-                                            group_id,
-                                            events.last().map_or(after_seq, |event| event.seq)
-                                        ),
-                                        attempts: 0,
-                                        lease_expires_at: None,
-                                        leased_by: None,
-                                        run_after: None,
-                                        last_error: None,
-                                    };
-
-                                    if let Err(err) = work_item_repo.create(work_item).await {
-                                        error!(
-                                            "Truth maintenance worker failed to enqueue tm_resolve_slot for {}: {}",
-                                            space_id, err
-                                        );
-                                    }
-                                }
-                            }
-
-                            if let Some(last) = events.last() {
-                                last_seq_by_space.insert(space_id.clone(), last.seq);
-                                last_event_id_by_space.insert(space_id.clone(), last.base.id.clone());
-                            }
-                        }
-                        Err(err) => {
-                            warn!(
-                                "Truth maintenance worker failed to process events for {}: {}",
-                                space_id, err
-                            );
-                        }
+                    let client = &storage;
+                    let space = &space_id;
+                    let delivery: anyhow::Result<usize> = elephant_pipeline::outbox_delivery::deliver_batch(
+                        client, space, "truth_maintenance", config.batch_size,
+                        |_, events| async move {
+                            process_truth_maintenance_events(client, space, &events).await
+                        },
+                    ).await;
+                    if let Err(error) = delivery {
+                        warn!(%space_id, %error, "Truth-maintenance delivery failed; checkpoint retained for replay");
                     }
                 }
             }
         }
     }
-
     Ok(())
 }
 
@@ -7386,17 +7547,22 @@ async fn report_embedding_progress(node_repo: &DocNodeRepository, space_id: &str
 
 /// Helper function to run the embed worker loop.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::large_futures,
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original repository lifetimes and future ownership"
+)]
 async fn run_embed_loop(
+    storage: StorageClient,
     doc_repo: DocRepository,
     node_repo: DocNodeRepository,
     revision_repo: DocRevisionRepository,
     embedding_repo: elephant_storage::NodeEmbeddingRepository,
     space_config_repo: SpaceConfigRepository,
-    provider_cache: EmbeddingProviderCache,
+    _provider_cache: EmbeddingProviderCache,
     embed_config: EmbedWorkerConfig,
     mut rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let fallback_policy = policy_from_embed_config(&embed_config);
     let mut last_progress_report: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
@@ -7407,8 +7573,10 @@ async fn run_embed_loop(
                 }
             }
             () = tokio::time::sleep(embed_config.poll_interval()) => {
-                let spaces = doc_repo.get_all_spaces().await.unwrap_or_else(|_| vec!["default".to_string()]);
-                let spaces = if spaces.is_empty() { vec!["default".to_string()] } else { spaces };
+                let spaces = match doc_repo.get_all_spaces().await {
+                    Ok(spaces) => spaces,
+                    Err(error) => { error!(%error, "Cannot discover embedding spaces"); continue; }
+                };
                 // The count walks doc_node: only pay for it when the operator
                 // opted in to the debug progress target (off under the default
                 // `info` filter).
@@ -7420,23 +7588,12 @@ async fn run_embed_loop(
                 }
 
                 for space_id in spaces {
-                    let policy = match resolve_embedding_policy(
-                        &space_config_repo,
-                        &space_id,
-                        &fallback_policy,
-                    )
-                    .await
-                    {
-                        Ok(policy) => policy,
-                        Err(err) => {
-                            error!("Failed to resolve embedding policy for space {}: {}", space_id, err);
-                            continue;
-                        }
+                    let observer = elephant_pipeline::provider_usage::DurableUsageObserver::for_activity(storage.clone(), &space_id, "embed_batch");
+                    let context = ProviderDispatchContext::new(space_config_repo.clone(), space_id.clone()).with_observer(observer);
+                    let (policy, provider, _binding) = match context.embedding(ModelOperation::DocumentEmbedding).await {
+                        Ok(binding) => binding,
+                        Err(error) => { warn!(%space_id, %error, "Embedding blocked by space configuration"); continue; }
                     };
-
-                    let provider = provider_cache
-                        .get_or_create(policy.clone(), build_embedding_provider)
-                        .await;
                     let worker = EmbedWorker::new(
                         node_repo.clone(),
                         revision_repo.clone(),
@@ -7444,7 +7601,10 @@ async fn run_embed_loop(
                         provider,
                     );
 
-                    match worker.process_pending(&space_id, embed_config.batch_size).await {
+                    let outcome: anyhow::Result<_> = async {
+                        Ok(storage.with_activity(worker.process_pending(&space_id, embed_config.batch_size)).await??)
+                    }.await;
+                    match outcome {
                         Ok(result) => {
                             if result.chunks_processed > 0 {
                                 info!(
@@ -7538,6 +7698,11 @@ pub async fn run_pipeline_with_client(
 /// # Errors
 ///
 /// Returns an error if any worker or runtime dependency fails.
+#[expect(
+    clippy::large_futures,
+    clippy::significant_drop_tightening,
+    reason = "Preserve the original repository lifetimes and future ownership"
+)]
 pub async fn run_pipeline_with_shutdown(
     config: PipelineConfig,
     storage_client: StorageClient,
@@ -7566,6 +7731,7 @@ pub async fn run_pipeline_with_shutdown(
             let provider_cache = EmbeddingProviderCache::new();
 
             run_embed_loop(
+                client.clone(),
                 doc_repo,
                 node_repo,
                 revision_repo,
@@ -7587,7 +7753,7 @@ pub async fn run_pipeline_with_shutdown(
         let mut rx = shutdown_rx.clone();
         tasks.spawn(async move {
             let worker = elephant_pipeline::retention::RetentionWorker::new(
-                client,
+                client.clone(),
                 retention_config.retention_period(),
             );
             let batch_size = retention_config.work_history_batch_size();
@@ -7602,7 +7768,8 @@ pub async fn run_pipeline_with_shutdown(
                         }
                     }
                     _ = interval.tick() => {
-                        match worker.process_work_history(batch_size).await {
+                        let outcome: anyhow::Result<_> = async { Ok(client.with_activity(worker.process_work_history(batch_size)).await??) }.await;
+                        match outcome {
                             Ok(result) => {
                                 if result.items_archived > 0 || result.runs_archived > 0 {
                                     info!(
@@ -7633,7 +7800,7 @@ pub async fn run_pipeline_with_shutdown(
                 retention_config.retention_days
             );
             let worker = elephant_pipeline::retention::RetentionWorker::new(
-                client,
+                client.clone(),
                 retention_config.retention_period(),
             );
 
@@ -7646,7 +7813,8 @@ pub async fn run_pipeline_with_shutdown(
                         }
                     }
                     () = tokio::time::sleep(retention_config.poll_interval()) => {
-                        match worker.process_cleanup().await {
+                        let outcome: anyhow::Result<_> = async { Ok(client.with_activity(worker.process_cleanup()).await??) }.await;
+                        match outcome {
                             Ok(result) => {
                                 if result.total_deleted > 0 {
                                     info!(
@@ -7727,7 +7895,6 @@ pub async fn run_pipeline_with_shutdown(
     if config.maintenance.enabled {
         let client = storage_client.clone();
         let maintenance_config = config.maintenance.clone();
-        let embed_config = config.embed.clone();
         let mut rx = shutdown_rx.clone();
 
         tasks.spawn(async move {
@@ -7746,8 +7913,7 @@ pub async fn run_pipeline_with_shutdown(
 
             // Get list of spaces to sweep
             let space_config_repo = SpaceConfigRepository::new(client.clone());
-            let provider_cache = EmbeddingProviderCache::new();
-            let fallback_policy = policy_from_embed_config(&embed_config);
+
 
             loop {
                 tokio::select! {
@@ -7758,40 +7924,27 @@ pub async fn run_pipeline_with_shutdown(
                         }
                     }
                     () = tokio::time::sleep(maintenance_config.poll_interval()) => {
-                        // Get space IDs to sweep. If no space_config records exist,
-                        // fall back to sweeping "default" (the implicit space).
-                        let space_ids: Vec<String> = match space_config_repo.list_all(100, None).await {
-                            Ok(s) if !s.is_empty() => s.into_iter().map(|sc| sc.base.space_id).collect(),
-                            Ok(_) => vec!["default".to_string()],
-                            Err(e) => {
-                                error!("Maintenance worker failed to list spaces: {e}");
-                                continue;
-                            }
+                        let space_ids = match list_configured_space_ids(&space_config_repo).await {
+                            Ok(spaces) => spaces,
+                            Err(error) => { error!(%error, "Cannot enumerate maintenance spaces"); continue; }
                         };
-
                         for space_id in &space_ids {
-                            let embedding_policy = match resolve_embedding_policy(
-                                &space_config_repo,
-                                space_id,
-                                &fallback_policy,
-                            ).await {
-                                Ok(policy) => policy,
-                                Err(e) => {
-                                    error!(
-                                        "Maintenance worker failed to resolve embedding policy for '{space_id}': {e}",
-                                    );
-                                    continue;
-                                }
+                            let observer = elephant_pipeline::provider_usage::DurableUsageObserver::for_activity(client.clone(), space_id, "maintenance_sweep");
+                            let context = ProviderDispatchContext::new(space_config_repo.clone(), space_id.clone()).with_observer(observer.clone());
+                            let (_policy, embedding_provider, _binding) = match context.embedding(ModelOperation::DocumentEmbedding).await {
+                                Ok(binding) => binding,
+                                Err(error) => { warn!(%space_id, %error, "Maintenance embedding blocked by configuration"); continue; }
                             };
-                            let embedding_provider = provider_cache
-                                .get_or_create(embedding_policy, build_embedding_provider)
-                                .await;
-                            match Box::pin(elephant_pipeline::maintenance::run_maintenance_sweep(
+                            let outcome: anyhow::Result<_> = async { Ok(client.with_activity(
+                                elephant_pipeline::provider_dispatch::with_dispatch_observer(observer, Box::pin(elephant_pipeline::maintenance::run_maintenance_sweep_with_attempt(
                                 &client,
                                 space_id,
                                 &maint_cfg,
                                 embedding_provider.as_ref(),
-                            )).await {
+                                None,
+                                None,
+                            )))).await??) }.await;
+                            match outcome {
                                 Ok(result) => {
                                     if result.identity.candidates_evaluated > 0
                                         || result.entity_hygiene.retired > 0
@@ -7860,37 +8013,7 @@ pub async fn run_pipeline_with_shutdown(
         config.maintenance.enabled
     );
 
-    tokio::select! {
-        changed = shutdown_rx.changed() => {
-            changed?;
-            info!("Received shutdown signal, stopping workers...");
-        }
-        result = tasks.join_next(), if !tasks.is_empty() => {
-            match result {
-                Some(Ok(Ok(()))) => {
-                    anyhow::bail!("pipeline worker exited unexpectedly");
-                }
-                Some(Ok(Err(err))) => {
-                    return Err(err.context("pipeline worker stopped with error"));
-                }
-                Some(Err(err)) => {
-                    anyhow::bail!("pipeline worker task panicked: {err}");
-                }
-                None => {
-                    anyhow::bail!("all pipeline workers exited unexpectedly");
-                }
-            }
-        }
-    }
-
-    // Wait for all workers to complete
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok(Ok(())) => info!("Worker stopped successfully"),
-            Ok(Err(e)) => warn!("Worker stopped with error: {}", e),
-            Err(e) => error!("Worker task panicked: {}", e),
-        }
-    }
+    pipeline_shutdown::wait(&mut tasks, &mut shutdown_rx).await?;
 
     info!("All workers stopped. Goodbye!");
     Ok(())
@@ -7962,7 +8085,8 @@ mod tests {
             }),
         };
 
-        let (graph_changed, affected) = knowledge_view_event_records(&[event]);
+        let (graph_changed, affected) =
+            knowledge_view_event_records(&[event]).expect("valid event");
 
         assert!(graph_changed);
         assert!(affected.contains(&entity_id.to_string()));

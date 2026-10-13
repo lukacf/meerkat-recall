@@ -78,10 +78,12 @@ Return a JSON object with the following structure:
 - For entity-to-entity relationships: set to `null`
 
 ### evidence (required)
-- `start`: Character offset where the supporting text begins (0-indexed)
-- `end`: Character offset where the supporting text ends (exclusive)
+- `start`: UTF-8 byte offset where the supporting text begins (0-indexed)
+- `end`: UTF-8 byte offset where the supporting text ends (exclusive)
 - `quote`: The exact substring from source text that supports this assertion
 - The quote must be verbatim from the source - do not paraphrase
+
+{{EVIDENCE_CONTEXT}}
 
 ### confidence (required)
 - Float between 0.0 and 1.0 indicating extraction confidence

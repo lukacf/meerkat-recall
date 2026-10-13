@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.meerkat.recall</string>
+  <key>ProgramArguments</key>
+  <array><string>__INSTALL_DIR__/meerkat-recall</string><string>serve</string><string>--shutdown-timeout-seconds</string><string>60</string></array>
+  <key>WorkingDirectory</key><string>__STATE_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ELEPHANT_HOST</key><string>127.0.0.1</string>
+    <key>ELEPHANT_PORT</key><string>3000</string>
+    <key>ELEPHANT_DB</key><string>surreal-db</string>
+    <key>SURREALDB_URL</key><string>rocksdb://__STATE_DIR__/data/store</string>
+    <key>SURREALDB_NAMESPACE</key><string>recall</string>
+    <key>SURREALDB_DATABASE</key><string>main</string>
+    <key>ELEPHANT_SNAPSHOT_DIR</key><string>__STATE_DIR__/backups</string>
+    <key>ELEPHANT_DURABILITY_PATH</key><string>__RECOVERY_DIR__</string>
+    <key>JWT_SECRET_FILE</key><string>__STATE_DIR__/secrets/signing-key</string>
+    <key>JWT_ISSUER</key><string>recall-local</string>
+    <key>JWT_AUDIENCE</key><string>recall</string>
+    <key>FASTEMBED_CACHE_DIR</key><string>__STATE_DIR__/model-cache</string>
+    <key>PIPELINE_SKILLS_DIR</key><string>__INSTALL_DIR__/skills</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ExitTimeOut</key><integer>75</integer>
+  <key>StandardOutPath</key><string>__STATE_DIR__/logs/stdout.log</string>
+  <key>StandardErrorPath</key><string>__STATE_DIR__/logs/stderr.log</string>
+</dict>
+</plist>

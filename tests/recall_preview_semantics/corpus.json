@@ -1,0 +1,1053 @@
+{
+  "version": "recall-preview-semantics-v1",
+  "review_status": "D-approved-expectations-with-evaluator-corrections-awaiting-final-digest-seal",
+  "metric": {
+    "cutoff": 3,
+    "rank_unit": "source-revision-first-appearance",
+    "min_macro_reciprocal_rank": 0.9,
+    "required_evidence_recall": 1.0,
+    "max_unsupported_claims": 0,
+    "min_completion": 1.0
+  },
+  "spaces": [
+    {
+      "id": "semantics-household",
+      "policy": "synthetic-household",
+      "level": 3,
+      "guidance": "Record household instructions and dated changes; proposals are not completed events."
+    },
+    {
+      "id": "semantics-business",
+      "policy": "synthetic-business",
+      "level": 7,
+      "guidance": "Distinguish approved decisions, forecasts, rejected proposals and actual outcomes; preserve units and effective dates."
+    }
+  ],
+  "sources": [
+    {
+      "id": "home/water",
+      "space": "semantics-household",
+      "revision": "water-r1",
+      "text": "To stop the garden tap supply, close the small red lever inside the utility cupboard. The blue wheel isolates only the upstairs washbasin."
+    },
+    {
+      "id": "home/water-distractor",
+      "space": "semantics-household",
+      "revision": "water-guide-r1",
+      "text": "The picture book shows a red water wheel in a garden. It is a story, not instructions for this house."
+    },
+    {
+      "id": "home/parcel",
+      "space": "semantics-household",
+      "revision": "parcel-r1",
+      "text": "If nobody answers the door, leave parcels in the lidded bench beside the east entrance. Never leave deliveries in the greenhouse."
+    },
+    {
+      "id": "home/travel",
+      "space": "semantics-household",
+      "revision": "travel-r1",
+      "text": "For the ferry on 18 November 2026, arrive at the terminal by 07:20. The boat departs at 08:05. The reservation is for two adults and one bicycle."
+    },
+    {
+      "id": "home/travel-distractor",
+      "space": "semantics-household",
+      "revision": "timetable-r1",
+      "text": "Last year's ferry left at 07:20. This archived timetable is not valid for the November 2026 reservation."
+    },
+    {
+      "id": "home/repair",
+      "space": "semantics-household",
+      "revision": "repair-r1",
+      "text": "The dishwasher leaks at the inlet hose. Replacement hose part number is QH-47. No repair appointment has been booked."
+    },
+    {
+      "id": "home/repair-proposal",
+      "space": "semantics-household",
+      "revision": "proposal-r1",
+      "text": "A neighbour suggested asking Mara to repair the dishwasher on Thursday. Mara has not accepted and Thursday is only a proposal."
+    },
+    {
+      "id": "home/plants",
+      "space": "semantics-household",
+      "revision": "plants-r1",
+      "text": "While we are away, water the fern every third day. Leave the cactus dry. The orchid belongs to the neighbour and is not part of our care instructions."
+    },
+    {
+      "id": "home/library",
+      "space": "semantics-household",
+      "revision": "library-r1",
+      "text": "Nico's library card is kept in the green envelope in the desk drawer. The red envelope contains old museum tickets."
+    },
+    {
+      "id": "shared/access",
+      "space": "semantics-household",
+      "revision": "access-home-r1",
+      "text": "The spare entrance key is in the ceramic jar above the coat hooks. The office access badge is not stored here."
+    },
+    {
+      "id": "home/visit",
+      "space": "semantics-household",
+      "revision": "visit-r1",
+      "state": "superseded",
+      "text": "The chimney inspection is scheduled for 9 December 2026 at 10:00."
+    },
+    {
+      "id": "home/visit",
+      "space": "semantics-household",
+      "revision": "visit-r2",
+      "text": "The chimney inspection has moved to 16 December 2026 at 14:30. The 9 December appointment is cancelled."
+    },
+    {
+      "id": "home/visit-confirmation",
+      "space": "semantics-household",
+      "revision": "confirmation-r1",
+      "text": "The inspector confirmed a chimney visit on 16 December 2026 at 14:30. This confirmation replaces the earlier date."
+    },
+    {
+      "id": "business/contract",
+      "space": "semantics-business",
+      "revision": "contract-r1",
+      "text": "For Cedar's signed supply contract, payment is due 45 days after an accepted invoice. The unsigned draft proposed 30 days and has no effect."
+    },
+    {
+      "id": "business/contract-draft",
+      "space": "semantics-business",
+      "revision": "draft-r1",
+      "text": "UNSIGNED DRAFT: Cedar invoices would be payable within 30 days. This draft was rejected and is not the signed supply agreement."
+    },
+    {
+      "id": "business/launch",
+      "space": "semantics-business",
+      "revision": "launch-r1",
+      "text": "Project Lantern's production release is blocked until the independent accessibility audit passes. The pilot on 4 February 2027 is not a production release."
+    },
+    {
+      "id": "business/budget",
+      "space": "semantics-business",
+      "revision": "budget-r1",
+      "text": "The board approved EUR 18000 for the Lantern pilot. A request for EUR 80000 for wider rollout was rejected. Neither amount is reported expenditure."
+    },
+    {
+      "id": "business/budget-minutes",
+      "space": "semantics-business",
+      "revision": "minutes-r1",
+      "text": "Signed board minutes: the Lantern pilot allocation is eighteen thousand euros. The wider rollout funding request did not pass."
+    },
+    {
+      "id": "business/ownership",
+      "space": "semantics-business",
+      "revision": "ownership-r1",
+      "text": "Leena is the incident coordinator through 31 March 2027. Omar takes over effective 1 April 2027. This changes coordination responsibility, not system ownership."
+    },
+    {
+      "id": "business/ownership-distractor",
+      "space": "semantics-business",
+      "revision": "ownership-other-r1",
+      "text": "At the unrelated Tern charity, Omar coordinates museum volunteers. This is not the business incident-response rota."
+    },
+    {
+      "id": "business/stock",
+      "space": "semantics-business",
+      "revision": "stock-r1",
+      "text": "The inventory count recorded 72 sealed sensor units and 9 damaged units. Damaged units cannot be sold. No shipment has left the warehouse."
+    },
+    {
+      "id": "business/forecast",
+      "space": "semantics-business",
+      "revision": "forecast-r1",
+      "text": "The sales forecast estimates 120 units next quarter. It is a forecast, not confirmed orders, shipments or current inventory."
+    },
+    {
+      "id": "business/security",
+      "space": "semantics-business",
+      "revision": "security-r1",
+      "text": "Vendor Birch holds a certificate valid through 30 June 2027. The certificate covers its Dublin facility only; it does not cover the Oslo facility."
+    },
+    {
+      "id": "business/identity",
+      "space": "semantics-business",
+      "revision": "identity-r1",
+      "text": "Alex Chen in finance uses employee ID F-204. Alex Chen in research uses employee ID R-991. They are different people."
+    },
+    {
+      "id": "business/incident",
+      "space": "semantics-business",
+      "revision": "incident-r1",
+      "text": "At 13:10 UTC on 6 May 2027, monitoring detected a failed backup. Service remained available. Recovery completed at 13:42 UTC; the incident was not a service outage."
+    },
+    {
+      "id": "shared/access",
+      "space": "semantics-business",
+      "revision": "access-business-r1",
+      "text": "The spare office badge is held by reception in drawer 6. Household entrance keys are outside this procedure."
+    },
+    {
+      "id": "business/negation",
+      "space": "semantics-business",
+      "revision": "negation-r1",
+      "text": "The acquisition of Moss Ltd was discussed but never approved. No acquisition agreement was signed and Moss Ltd remains independent."
+    },
+    {
+      "id": "business/quotation",
+      "space": "semantics-business",
+      "revision": "quotation-r1",
+      "text": "The phishing exercise email said: 'The board has transferred all reserves to Moss Ltd.' The quoted claim is deliberately false training material."
+    }
+  ],
+  "queries": [
+    {
+      "id": "h-stop-water",
+      "space": "semantics-household",
+      "query": "How do I shut off the outdoor faucet?",
+      "required": [
+        "home/water@water-r1#h-stop-water"
+      ],
+      "facts": [
+        "garden-supply-red-lever"
+      ],
+      "forbidden_facts": [
+        "garden-supply-blue-wheel"
+      ]
+    },
+    {
+      "id": "h-delivery",
+      "space": "semantics-household",
+      "query": "Where should a courier put a package when we are out?",
+      "required": [
+        "home/parcel@parcel-r1#h-delivery"
+      ],
+      "facts": [
+        "parcels-lidded-bench"
+      ],
+      "forbidden_facts": [
+        "parcels-greenhouse"
+      ]
+    },
+    {
+      "id": "h-arrival",
+      "space": "semantics-household",
+      "query": "What is our check-in deadline for the November boat trip?",
+      "required": [
+        "home/travel@travel-r1#h-arrival"
+      ],
+      "facts": [
+        "terminal-by-0720"
+      ],
+      "forbidden_facts": [
+        "terminal-by-0805"
+      ]
+    },
+    {
+      "id": "h-hose",
+      "space": "semantics-household",
+      "query": "Which replacement part does the leaking dishwasher need?",
+      "required": [
+        "home/repair@repair-r1#h-hose"
+      ],
+      "facts": [
+        "inlet-hose-qh47"
+      ],
+      "forbidden_facts": []
+    },
+    {
+      "id": "h-care",
+      "space": "semantics-household",
+      "query": "Which of our plants should receive no water during our absence?",
+      "required": [
+        "home/plants@plants-r1#h-care"
+      ],
+      "facts": [
+        "cactus-no-water"
+      ],
+      "forbidden_facts": [
+        "fern-no-water"
+      ]
+    },
+    {
+      "id": "h-card",
+      "space": "semantics-household",
+      "query": "Where can Nico find the card used to borrow books?",
+      "required": [
+        "home/library@library-r1#h-card"
+      ],
+      "facts": [
+        "library-green-envelope"
+      ],
+      "forbidden_facts": [
+        "library-red-envelope"
+      ]
+    },
+    {
+      "id": "h-key",
+      "space": "semantics-household",
+      "query": "Where is the backup key to our front door?",
+      "required": [
+        "shared/access@access-home-r1#h-key"
+      ],
+      "facts": [
+        "home-key-ceramic-jar"
+      ],
+      "forbidden_facts": [
+        "home-key-reception"
+      ]
+    },
+    {
+      "id": "h-visit",
+      "space": "semantics-household",
+      "query": "When will the chimney inspector actually come now?",
+      "required": [
+        "home/visit@visit-r2#h-visit",
+        "home/visit-confirmation@confirmation-r1#h-visit"
+      ],
+      "facts": [
+        "chimney-dec16-1430"
+      ],
+      "forbidden_facts": [
+        "chimney-dec9-1000"
+      ]
+    },
+    {
+      "id": "h-no-booking",
+      "space": "semantics-household",
+      "query": "Has Mara confirmed Thursday's dishwasher repair appointment?",
+      "required": [
+        "home/repair-proposal@proposal-r1#h-no-booking"
+      ],
+      "facts": [
+        "mara-not-accepted"
+      ],
+      "forbidden_facts": [
+        "mara-booked-thursday"
+      ]
+    },
+    {
+      "id": "h-unknown",
+      "space": "semantics-household",
+      "query": "What is the confirmed serial number of our attic wind turbine?",
+      "required": [],
+      "facts": [],
+      "forbidden_facts": [
+        "attic-turbine-serial"
+      ],
+      "unsupported_question": true
+    },
+    {
+      "id": "b-payment",
+      "space": "semantics-business",
+      "query": "Under the binding Cedar agreement, how long do we have to settle an accepted bill?",
+      "required": [
+        "business/contract@contract-r1#b-payment"
+      ],
+      "facts": [
+        "payment-45-days"
+      ],
+      "forbidden_facts": [
+        "payment-30-days"
+      ]
+    },
+    {
+      "id": "b-release",
+      "space": "semantics-business",
+      "query": "What must happen before Lantern can go into production?",
+      "required": [
+        "business/launch@launch-r1#b-release"
+      ],
+      "facts": [
+        "accessibility-audit-required"
+      ],
+      "forbidden_facts": [
+        "production-feb4"
+      ]
+    },
+    {
+      "id": "b-budget",
+      "space": "semantics-business",
+      "query": "How much pilot funding did Lantern obtain, and is there independent confirmation?",
+      "required": [
+        "business/budget@budget-r1#b-budget",
+        "business/budget-minutes@minutes-r1#b-budget"
+      ],
+      "facts": [
+        "pilot-budget-eur18000"
+      ],
+      "forbidden_facts": [
+        "pilot-budget-eur80000",
+        "spent-eur18000"
+      ]
+    },
+    {
+      "id": "b-march",
+      "space": "semantics-business",
+      "query": "Who coordinates incidents on 20 March 2027?",
+      "required": [
+        "business/ownership@ownership-r1#b-march"
+      ],
+      "facts": [
+        "march-coordinator-leena"
+      ],
+      "forbidden_facts": [
+        "march-coordinator-omar"
+      ]
+    },
+    {
+      "id": "b-april",
+      "space": "semantics-business",
+      "query": "Who coordinates incidents on 3 April 2027?",
+      "required": [
+        "business/ownership@ownership-r1#b-april"
+      ],
+      "facts": [
+        "april-coordinator-omar"
+      ],
+      "forbidden_facts": [
+        "april-coordinator-leena",
+        "system-owner-omar"
+      ]
+    },
+    {
+      "id": "b-stock",
+      "space": "semantics-business",
+      "query": "How many counted sensor units are eligible for sale?",
+      "required": [
+        "business/stock@stock-r1#b-stock"
+      ],
+      "facts": [
+        "sellable-stock-72"
+      ],
+      "forbidden_facts": [
+        "sellable-stock-81",
+        "sellable-stock-120"
+      ]
+    },
+    {
+      "id": "b-cert",
+      "space": "semantics-business",
+      "query": "Does Birch's certificate cover its Oslo site?",
+      "required": [
+        "business/security@security-r1#b-cert"
+      ],
+      "facts": [
+        "oslo-not-covered"
+      ],
+      "forbidden_facts": [
+        "oslo-certified"
+      ]
+    },
+    {
+      "id": "b-identity",
+      "space": "semantics-business",
+      "query": "Are the finance and research employees named Alex Chen the same person?",
+      "required": [
+        "business/identity@identity-r1#b-identity"
+      ],
+      "facts": [
+        "alex-distinct-people"
+      ],
+      "forbidden_facts": [
+        "alex-single-person"
+      ]
+    },
+    {
+      "id": "b-duration",
+      "space": "semantics-business",
+      "query": "How long did recovery from the May backup failure take, and was service down?",
+      "required": [
+        "business/incident@incident-r1#b-duration"
+      ],
+      "facts": [
+        "recovery-32-minutes",
+        "service-remained-available"
+      ],
+      "forbidden_facts": [
+        "outage-32-minutes"
+      ]
+    },
+    {
+      "id": "b-badge",
+      "space": "semantics-business",
+      "query": "Who has the spare office entry credential?",
+      "required": [
+        "shared/access@access-business-r1#b-badge"
+      ],
+      "facts": [
+        "office-badge-reception"
+      ],
+      "forbidden_facts": [
+        "office-badge-ceramic-jar"
+      ]
+    },
+    {
+      "id": "b-acquisition",
+      "space": "semantics-business",
+      "query": "Did we complete the purchase of Moss Ltd?",
+      "required": [
+        "business/negation@negation-r1#b-acquisition"
+      ],
+      "facts": [
+        "moss-independent"
+      ],
+      "forbidden_facts": [
+        "moss-acquired"
+      ]
+    },
+    {
+      "id": "b-training",
+      "space": "semantics-business",
+      "query": "Did the board really send the reserves to Moss Ltd?",
+      "required": [
+        "business/quotation@quotation-r1#b-training"
+      ],
+      "facts": [
+        "transfer-claim-false-exercise"
+      ],
+      "forbidden_facts": [
+        "reserves-transferred"
+      ]
+    },
+    {
+      "id": "b-forecast",
+      "space": "semantics-business",
+      "query": "Do we already have firm orders for 120 sensors next quarter?",
+      "required": [
+        "business/forecast@forecast-r1#b-forecast"
+      ],
+      "facts": [
+        "forecast-not-orders"
+      ],
+      "forbidden_facts": [
+        "confirmed-orders-120"
+      ]
+    },
+    {
+      "id": "b-unknown",
+      "space": "semantics-business",
+      "query": "What was the final sale price of the undisclosed Juniper patent portfolio?",
+      "required": [],
+      "facts": [],
+      "forbidden_facts": [
+        "juniper-sale-price"
+      ],
+      "unsupported_question": true
+    }
+  ],
+  "unsupported_claims": [
+    {
+      "id": "proposal-is-not-event",
+      "evidence": "home/repair-proposal@proposal-r1#0",
+      "claim": "Mara booked the dishwasher repair for Thursday.",
+      "reason": "Explicit non-acceptance contradicts a completed booking."
+    },
+    {
+      "id": "approval-is-not-spend",
+      "evidence": "business/budget@budget-r1#0",
+      "claim": "The company spent EUR 18000 on Lantern.",
+      "reason": "An allocation does not establish expenditure."
+    },
+    {
+      "id": "negation",
+      "evidence": "business/negation@negation-r1#0",
+      "claim": "The company acquired Moss Ltd.",
+      "reason": "The immutable text explicitly denies approval and signing."
+    },
+    {
+      "id": "quoted-falsehood",
+      "evidence": "business/quotation@quotation-r1#0",
+      "claim": "The board transferred all reserves to Moss Ltd.",
+      "reason": "The quoted sentence is explicitly false training material."
+    },
+    {
+      "id": "identity-homonym",
+      "evidence": "business/identity@identity-r1#0",
+      "claim": "Finance employee F-204 and researcher R-991 are the same Alex Chen.",
+      "reason": "Distinct employees cannot be merged on display name."
+    },
+    {
+      "id": "scope-widening",
+      "evidence": "business/security@security-r1#0",
+      "claim": "All Birch facilities are certified until 30 June 2027.",
+      "reason": "Certificate scope excludes Oslo."
+    },
+    {
+      "id": "wrong-temporal-value",
+      "evidence": "business/ownership@ownership-r1#0",
+      "claim": "Omar coordinated incidents on 20 March 2027.",
+      "reason": "The successor takes over only on 1 April."
+    },
+    {
+      "id": "part-whole",
+      "evidence": "business/stock@stock-r1#0",
+      "claim": "All 81 sensor units can be sold.",
+      "reason": "Nine damaged units are explicitly unsellable."
+    }
+  ],
+  "evidence": [
+    {
+      "id": "home/water@water-r1#0",
+      "space": "semantics-household",
+      "source_id": "home/water",
+      "revision": "water-r1",
+      "start": 0,
+      "end": 138,
+      "quote": "To stop the garden tap supply, close the small red lever inside the utility cupboard. The blue wheel isolates only the upstairs washbasin."
+    },
+    {
+      "id": "home/water-distractor@water-guide-r1#0",
+      "space": "semantics-household",
+      "source_id": "home/water-distractor",
+      "revision": "water-guide-r1",
+      "start": 0,
+      "end": 101,
+      "quote": "The picture book shows a red water wheel in a garden. It is a story, not instructions for this house."
+    },
+    {
+      "id": "home/parcel@parcel-r1#0",
+      "space": "semantics-household",
+      "source_id": "home/parcel",
+      "revision": "parcel-r1",
+      "start": 0,
+      "end": 129,
+      "quote": "If nobody answers the door, leave parcels in the lidded bench beside the east entrance. Never leave deliveries in the greenhouse."
+    },
+    {
+      "id": "home/travel@travel-r1#0",
+      "space": "semantics-household",
+      "source_id": "home/travel",
+      "revision": "travel-r1",
+      "start": 0,
+      "end": 145,
+      "quote": "For the ferry on 18 November 2026, arrive at the terminal by 07:20. The boat departs at 08:05. The reservation is for two adults and one bicycle."
+    },
+    {
+      "id": "home/travel-distractor@timetable-r1#0",
+      "space": "semantics-household",
+      "source_id": "home/travel-distractor",
+      "revision": "timetable-r1",
+      "start": 0,
+      "end": 104,
+      "quote": "Last year's ferry left at 07:20. This archived timetable is not valid for the November 2026 reservation."
+    },
+    {
+      "id": "home/repair@repair-r1#0",
+      "space": "semantics-household",
+      "source_id": "home/repair",
+      "revision": "repair-r1",
+      "start": 0,
+      "end": 117,
+      "quote": "The dishwasher leaks at the inlet hose. Replacement hose part number is QH-47. No repair appointment has been booked."
+    },
+    {
+      "id": "home/repair-proposal@proposal-r1#0",
+      "space": "semantics-household",
+      "source_id": "home/repair-proposal",
+      "revision": "proposal-r1",
+      "start": 0,
+      "end": 126,
+      "quote": "A neighbour suggested asking Mara to repair the dishwasher on Thursday. Mara has not accepted and Thursday is only a proposal."
+    },
+    {
+      "id": "home/plants@plants-r1#0",
+      "space": "semantics-household",
+      "source_id": "home/plants",
+      "revision": "plants-r1",
+      "start": 0,
+      "end": 150,
+      "quote": "While we are away, water the fern every third day. Leave the cactus dry. The orchid belongs to the neighbour and is not part of our care instructions."
+    },
+    {
+      "id": "home/library@library-r1#0",
+      "space": "semantics-household",
+      "source_id": "home/library",
+      "revision": "library-r1",
+      "start": 0,
+      "end": 115,
+      "quote": "Nico's library card is kept in the green envelope in the desk drawer. The red envelope contains old museum tickets."
+    },
+    {
+      "id": "shared/access@access-home-r1#0",
+      "space": "semantics-household",
+      "source_id": "shared/access",
+      "revision": "access-home-r1",
+      "start": 0,
+      "end": 110,
+      "quote": "The spare entrance key is in the ceramic jar above the coat hooks. The office access badge is not stored here."
+    },
+    {
+      "id": "home/visit@visit-r1#0",
+      "space": "semantics-household",
+      "source_id": "home/visit",
+      "revision": "visit-r1",
+      "start": 0,
+      "end": 65,
+      "quote": "The chimney inspection is scheduled for 9 December 2026 at 10:00."
+    },
+    {
+      "id": "home/visit@visit-r2#0",
+      "space": "semantics-household",
+      "source_id": "home/visit",
+      "revision": "visit-r2",
+      "start": 0,
+      "end": 103,
+      "quote": "The chimney inspection has moved to 16 December 2026 at 14:30. The 9 December appointment is cancelled."
+    },
+    {
+      "id": "home/visit-confirmation@confirmation-r1#0",
+      "space": "semantics-household",
+      "source_id": "home/visit-confirmation",
+      "revision": "confirmation-r1",
+      "start": 0,
+      "end": 114,
+      "quote": "The inspector confirmed a chimney visit on 16 December 2026 at 14:30. This confirmation replaces the earlier date."
+    },
+    {
+      "id": "business/contract@contract-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/contract",
+      "revision": "contract-r1",
+      "start": 0,
+      "end": 140,
+      "quote": "For Cedar's signed supply contract, payment is due 45 days after an accepted invoice. The unsigned draft proposed 30 days and has no effect."
+    },
+    {
+      "id": "business/contract-draft@draft-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/contract-draft",
+      "revision": "draft-r1",
+      "start": 0,
+      "end": 127,
+      "quote": "UNSIGNED DRAFT: Cedar invoices would be payable within 30 days. This draft was rejected and is not the signed supply agreement."
+    },
+    {
+      "id": "business/launch@launch-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/launch",
+      "revision": "launch-r1",
+      "start": 0,
+      "end": 155,
+      "quote": "Project Lantern's production release is blocked until the independent accessibility audit passes. The pilot on 4 February 2027 is not a production release."
+    },
+    {
+      "id": "business/budget@budget-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/budget",
+      "revision": "budget-r1",
+      "start": 0,
+      "end": 147,
+      "quote": "The board approved EUR 18000 for the Lantern pilot. A request for EUR 80000 for wider rollout was rejected. Neither amount is reported expenditure."
+    },
+    {
+      "id": "business/budget-minutes@minutes-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/budget-minutes",
+      "revision": "minutes-r1",
+      "start": 0,
+      "end": 126,
+      "quote": "Signed board minutes: the Lantern pilot allocation is eighteen thousand euros. The wider rollout funding request did not pass."
+    },
+    {
+      "id": "business/ownership@ownership-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/ownership",
+      "revision": "ownership-r1",
+      "start": 0,
+      "end": 160,
+      "quote": "Leena is the incident coordinator through 31 March 2027. Omar takes over effective 1 April 2027. This changes coordination responsibility, not system ownership."
+    },
+    {
+      "id": "business/ownership-distractor@ownership-other-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/ownership-distractor",
+      "revision": "ownership-other-r1",
+      "start": 0,
+      "end": 115,
+      "quote": "At the unrelated Tern charity, Omar coordinates museum volunteers. This is not the business incident-response rota."
+    },
+    {
+      "id": "business/stock@stock-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/stock",
+      "revision": "stock-r1",
+      "start": 0,
+      "end": 138,
+      "quote": "The inventory count recorded 72 sealed sensor units and 9 damaged units. Damaged units cannot be sold. No shipment has left the warehouse."
+    },
+    {
+      "id": "business/forecast@forecast-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/forecast",
+      "revision": "forecast-r1",
+      "start": 0,
+      "end": 124,
+      "quote": "The sales forecast estimates 120 units next quarter. It is a forecast, not confirmed orders, shipments or current inventory."
+    },
+    {
+      "id": "business/security@security-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/security",
+      "revision": "security-r1",
+      "start": 0,
+      "end": 146,
+      "quote": "Vendor Birch holds a certificate valid through 30 June 2027. The certificate covers its Dublin facility only; it does not cover the Oslo facility."
+    },
+    {
+      "id": "business/identity@identity-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/identity",
+      "revision": "identity-r1",
+      "start": 0,
+      "end": 117,
+      "quote": "Alex Chen in finance uses employee ID F-204. Alex Chen in research uses employee ID R-991. They are different people."
+    },
+    {
+      "id": "business/incident@incident-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/incident",
+      "revision": "incident-r1",
+      "start": 0,
+      "end": 164,
+      "quote": "At 13:10 UTC on 6 May 2027, monitoring detected a failed backup. Service remained available. Recovery completed at 13:42 UTC; the incident was not a service outage."
+    },
+    {
+      "id": "shared/access@access-business-r1#0",
+      "space": "semantics-business",
+      "source_id": "shared/access",
+      "revision": "access-business-r1",
+      "start": 0,
+      "end": 108,
+      "quote": "The spare office badge is held by reception in drawer 6. Household entrance keys are outside this procedure."
+    },
+    {
+      "id": "business/negation@negation-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/negation",
+      "revision": "negation-r1",
+      "start": 0,
+      "end": 131,
+      "quote": "The acquisition of Moss Ltd was discussed but never approved. No acquisition agreement was signed and Moss Ltd remains independent."
+    },
+    {
+      "id": "business/quotation@quotation-r1#0",
+      "space": "semantics-business",
+      "source_id": "business/quotation",
+      "revision": "quotation-r1",
+      "start": 0,
+      "end": 145,
+      "quote": "The phishing exercise email said: 'The board has transferred all reserves to Moss Ltd.' The quoted claim is deliberately false training material."
+    },
+    {
+      "id": "home/water@water-r1#h-stop-water",
+      "space": "semantics-household",
+      "source_id": "home/water",
+      "revision": "water-r1",
+      "start": 0,
+      "end": 85,
+      "quote": "To stop the garden tap supply, close the small red lever inside the utility cupboard."
+    },
+    {
+      "id": "home/parcel@parcel-r1#h-delivery",
+      "space": "semantics-household",
+      "source_id": "home/parcel",
+      "revision": "parcel-r1",
+      "start": 0,
+      "end": 87,
+      "quote": "If nobody answers the door, leave parcels in the lidded bench beside the east entrance."
+    },
+    {
+      "id": "home/travel@travel-r1#h-arrival",
+      "space": "semantics-household",
+      "source_id": "home/travel",
+      "revision": "travel-r1",
+      "start": 0,
+      "end": 67,
+      "quote": "For the ferry on 18 November 2026, arrive at the terminal by 07:20."
+    },
+    {
+      "id": "home/repair@repair-r1#h-hose",
+      "space": "semantics-household",
+      "source_id": "home/repair",
+      "revision": "repair-r1",
+      "start": 0,
+      "end": 78,
+      "quote": "The dishwasher leaks at the inlet hose. Replacement hose part number is QH-47."
+    },
+    {
+      "id": "home/plants@plants-r1#h-care",
+      "space": "semantics-household",
+      "source_id": "home/plants",
+      "revision": "plants-r1",
+      "start": 51,
+      "end": 72,
+      "quote": "Leave the cactus dry."
+    },
+    {
+      "id": "home/library@library-r1#h-card",
+      "space": "semantics-household",
+      "source_id": "home/library",
+      "revision": "library-r1",
+      "start": 0,
+      "end": 69,
+      "quote": "Nico's library card is kept in the green envelope in the desk drawer."
+    },
+    {
+      "id": "shared/access@access-home-r1#h-key",
+      "space": "semantics-household",
+      "source_id": "shared/access",
+      "revision": "access-home-r1",
+      "start": 0,
+      "end": 66,
+      "quote": "The spare entrance key is in the ceramic jar above the coat hooks."
+    },
+    {
+      "id": "home/visit@visit-r2#h-visit",
+      "space": "semantics-household",
+      "source_id": "home/visit",
+      "revision": "visit-r2",
+      "start": 0,
+      "end": 62,
+      "quote": "The chimney inspection has moved to 16 December 2026 at 14:30."
+    },
+    {
+      "id": "home/visit-confirmation@confirmation-r1#h-visit",
+      "space": "semantics-household",
+      "source_id": "home/visit-confirmation",
+      "revision": "confirmation-r1",
+      "start": 0,
+      "end": 69,
+      "quote": "The inspector confirmed a chimney visit on 16 December 2026 at 14:30."
+    },
+    {
+      "id": "home/repair-proposal@proposal-r1#h-no-booking",
+      "space": "semantics-household",
+      "source_id": "home/repair-proposal",
+      "revision": "proposal-r1",
+      "start": 0,
+      "end": 126,
+      "quote": "A neighbour suggested asking Mara to repair the dishwasher on Thursday. Mara has not accepted and Thursday is only a proposal."
+    },
+    {
+      "id": "business/contract@contract-r1#b-payment",
+      "space": "semantics-business",
+      "source_id": "business/contract",
+      "revision": "contract-r1",
+      "start": 0,
+      "end": 85,
+      "quote": "For Cedar's signed supply contract, payment is due 45 days after an accepted invoice."
+    },
+    {
+      "id": "business/launch@launch-r1#b-release",
+      "space": "semantics-business",
+      "source_id": "business/launch",
+      "revision": "launch-r1",
+      "start": 0,
+      "end": 97,
+      "quote": "Project Lantern's production release is blocked until the independent accessibility audit passes."
+    },
+    {
+      "id": "business/budget@budget-r1#b-budget",
+      "space": "semantics-business",
+      "source_id": "business/budget",
+      "revision": "budget-r1",
+      "start": 0,
+      "end": 51,
+      "quote": "The board approved EUR 18000 for the Lantern pilot."
+    },
+    {
+      "id": "business/budget-minutes@minutes-r1#b-budget",
+      "space": "semantics-business",
+      "source_id": "business/budget-minutes",
+      "revision": "minutes-r1",
+      "start": 0,
+      "end": 78,
+      "quote": "Signed board minutes: the Lantern pilot allocation is eighteen thousand euros."
+    },
+    {
+      "id": "business/ownership@ownership-r1#b-march",
+      "space": "semantics-business",
+      "source_id": "business/ownership",
+      "revision": "ownership-r1",
+      "start": 0,
+      "end": 56,
+      "quote": "Leena is the incident coordinator through 31 March 2027."
+    },
+    {
+      "id": "business/ownership@ownership-r1#b-april",
+      "space": "semantics-business",
+      "source_id": "business/ownership",
+      "revision": "ownership-r1",
+      "start": 0,
+      "end": 96,
+      "quote": "Leena is the incident coordinator through 31 March 2027. Omar takes over effective 1 April 2027."
+    },
+    {
+      "id": "business/stock@stock-r1#b-stock",
+      "space": "semantics-business",
+      "source_id": "business/stock",
+      "revision": "stock-r1",
+      "start": 0,
+      "end": 102,
+      "quote": "The inventory count recorded 72 sealed sensor units and 9 damaged units. Damaged units cannot be sold."
+    },
+    {
+      "id": "business/security@security-r1#b-cert",
+      "space": "semantics-business",
+      "source_id": "business/security",
+      "revision": "security-r1",
+      "start": 0,
+      "end": 146,
+      "quote": "Vendor Birch holds a certificate valid through 30 June 2027. The certificate covers its Dublin facility only; it does not cover the Oslo facility."
+    },
+    {
+      "id": "business/identity@identity-r1#b-identity",
+      "space": "semantics-business",
+      "source_id": "business/identity",
+      "revision": "identity-r1",
+      "start": 0,
+      "end": 117,
+      "quote": "Alex Chen in finance uses employee ID F-204. Alex Chen in research uses employee ID R-991. They are different people."
+    },
+    {
+      "id": "business/incident@incident-r1#b-duration",
+      "space": "semantics-business",
+      "source_id": "business/incident",
+      "revision": "incident-r1",
+      "start": 0,
+      "end": 164,
+      "quote": "At 13:10 UTC on 6 May 2027, monitoring detected a failed backup. Service remained available. Recovery completed at 13:42 UTC; the incident was not a service outage."
+    },
+    {
+      "id": "shared/access@access-business-r1#b-badge",
+      "space": "semantics-business",
+      "source_id": "shared/access",
+      "revision": "access-business-r1",
+      "start": 0,
+      "end": 56,
+      "quote": "The spare office badge is held by reception in drawer 6."
+    },
+    {
+      "id": "business/negation@negation-r1#b-acquisition",
+      "space": "semantics-business",
+      "source_id": "business/negation",
+      "revision": "negation-r1",
+      "start": 62,
+      "end": 131,
+      "quote": "No acquisition agreement was signed and Moss Ltd remains independent."
+    },
+    {
+      "id": "business/quotation@quotation-r1#b-training",
+      "space": "semantics-business",
+      "source_id": "business/quotation",
+      "revision": "quotation-r1",
+      "start": 0,
+      "end": 145,
+      "quote": "The phishing exercise email said: 'The board has transferred all reserves to Moss Ltd.' The quoted claim is deliberately false training material."
+    },
+    {
+      "id": "business/forecast@forecast-r1#b-forecast",
+      "space": "semantics-business",
+      "source_id": "business/forecast",
+      "revision": "forecast-r1",
+      "start": 0,
+      "end": 124,
+      "quote": "The sales forecast estimates 120 units next quarter. It is a forecast, not confirmed orders, shipments or current inventory."
+    }
+  ]
+}

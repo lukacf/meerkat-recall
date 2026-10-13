@@ -11,7 +11,7 @@ semantic organization, and statement-local support.
 
 Use this page to understand the projection and publication contract. To try it,
 jump to the [runnable demo](#runnable-projection-demo). To call it from an agent,
-use the [MCP surface](#mcp-surface) and [tool reference](/mcp/tools).
+use the [MCP surface](#mcp-surface) and inspect the connected server's `tools/list` schema.
 
 | Reader question | Surface | What to inspect |
 | --- | --- | --- |
@@ -284,10 +284,17 @@ an article implicitly.
 
 ## Runnable projection demo
 
-Run a fully isolated example using Meerkat Recall's normal Meerkat LLM runtime:
+Run a fully isolated example using Meerkat Recall's normal Meerkat LLM runtime.
+Copy `deploy/native/demo-wiki-processing.example.json` to a private configuration
+file, replace its account, model and immutable version values, and set the
+environment variable named by its `credential_ref`. The file must explicitly
+approve the isolated `default` space's `wiki_planner`, `wiki_writer` and
+`wiki_verifier` bindings. In a native archive, the example is under `service/`.
+Then pass the configured file:
 
 ```bash
-./scripts/repo-cargo run -p meerkat-recall-bin -- demo-wiki
+./scripts/repo-cargo run -p meerkat-recall-bin -- demo-wiki \
+  --processing-config /absolute/private/demo-wiki-processing.json
 ```
 
 The command loads this architecture document as a real source, creates an
@@ -302,10 +309,15 @@ article,
 [http://localhost:3000/inspect/knowledge-views](http://localhost:3000/inspect/knowledge-views)
 for deterministic projections and
 [http://localhost:3000/evidence](http://localhost:3000/evidence) for source
-material. `ELEPHANT_WIKI_WRITER_MODEL` and `ELEPHANT_WIKI_VERIFIER_MODEL`
-override the normal model selection. The default build requires credentials
-for the selected provider. A `--no-default-features` build still demonstrates
-the evidence and inspector surfaces but deliberately leaves `/wiki` empty.
+material. Model selection and provider authority come from the explicit processing
+configuration; credentials alone do not approve those operations. The default
+build requires that configuration and the selected provider's credentials.
+A `--no-default-features` build needs neither and still demonstrates the evidence
+and inspector surfaces, but deliberately leaves `/wiki` empty:
+
+```bash
+./scripts/repo-cargo run -p meerkat-recall-bin --no-default-features -- demo-wiki
+```
 Use `--port 3100` when port 3000 is in use. The demo is an isolated in-memory
 store and disappears when the process stops.
 

@@ -1,0 +1,43 @@
+{
+  "format": "recall-direct-provider-delta-review/v1",
+  "source_commit": "7f07a6d8552bc906d6695e20740e44fc9dc3be51",
+  "reviewer": "qualification",
+  "source_review_only": true,
+  "execution_authorized": false,
+  "executed_by_qualification": false,
+  "product_acceptance": false,
+  "prior_reviews": [
+    "direct-provider-source-review.json",
+    "reindex-render-source-review.json"
+  ],
+  "reviewed_commits": [
+    "7f07a6d8552bc906d6695e20740e44fc9dc3be51",
+    "b756d93b8d1b30c1efab1c5f20d6cbdc174c0bc3",
+    "f7a7d353c13bd14617f6499adf9ad42ce39f5fea"
+  ],
+  "source_blockers_in_reviewed_scope": [],
+  "reviewed_properties": [
+    "Native node reindex observes the exact original configuration, named space, processing snapshot and undeleted state in the same transaction as its vector writes.",
+    "The no-op UPDATE is replaced by a real random epoch write to the existing canonical_epoch row, shared with actual migration031 space-configuration writers. A missing original epoch refuses rather than creating authority.",
+    "Original attempt/source guards and vector transaction atomicity remain; this selected change does not mutate processing generation, active profile, progress, or canonical nodes.",
+    "Actual native fixture creates real Doc/Revision/Chunk and two distinct named-space configurations; its positive must change only its own epoch and store exact literal vector bytes while preserving full config and node.",
+    "Current revocation makes the stale observed write fail without changing its epoch or vector; removing the original epoch makes a refreshed write fail without recreating the epoch or replacing the prior vector.",
+    "Provider extraction fixture changes only boxing of large setup/run futures and phase diagnostics. Existing actual extractor/support dispatch, exact count, distinct-approval and revocation assertions remain.",
+    "Current multimodal analyzer boxes the actual dependency-built agent build/run futures inside the original timeout, retaining actual ContentInput blocks and error propagation. No replacement analyzer or thread-stack override."
+  ],
+  "evidence_limits": [
+    "The native epoch fixture is a sequential transaction-custody check; it does not establish deterministic overlapping configuration conflict.",
+    "Literal fixture vectors and controlled extraction/transport responses do not establish live relevance, interpretation quality, or semantic acceptance.",
+    "No Rust/compiler/test/runtime execution is inferred. Earlier Runtime11 provider extraction SIGABRT remains an observed failure until this exact successor is centrally run.",
+    "This selected source-delta review does not qualify target activation, installed native/container artifacts, cleanup, real provider behavior, or the full preview."
+  ],
+  "source_hashes": {
+    "crates/storage/src/chunk_embedding_repository.rs": "d481c1280eaf6a2b9df1c6d0c4b9992d02490cfe8bbe82e10df2841d542eb121",
+    "tests/recall_preview_semantics/native_reindex.rs": "ac9b49e3e7ab6d4bcbc0f934240aae56be6fb111c06ee2dbe161fc82cf490c70",
+    "tests/recall_preview_semantics/provider_extraction.rs": "b399ad3567d1482fd8d2c7c5d37c763921b5a40df18825cb271f96fd503c8aa5",
+    "crates/pipeline/src/renderer/multimodal.rs": "ffa595e8fa541542797fc3eac0541615c54743c66ff07361f32a2f4dcb35f8e5",
+    "tests/scenarios/tests/recall_preview_providers.rs": "ea0eebe1f08239c424c7a73a6708692dec99afd864eed8fb81f249d6371b8c58",
+    "crates/migrations/sql/031_source_publication.surql": "70ebca97b51023daa03597e6cbe7e66e5cbaa9289241b38e90fae5943ce4d74f",
+    "crates/migrations/sql/039_private_reference_fence.surql": "2a33e12698ed04654a431bfe4aa4986b68f319e22bd7b076740f8085155b09b5"
+  }
+}

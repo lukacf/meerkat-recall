@@ -37,7 +37,7 @@ When you're satisfied with coverage, stop calling tools. The system will collect
 
 - `search_entities` — Check if entities already exist in the knowledge graph
 - `list_predicates` — See existing predicate names to reuse
-- `read_text_range` — Read exact characters at given offsets (for verifying evidence quotes)
+- `read_text_range` — Read exact source text at UTF-8 byte offsets (for verifying evidence quotes)
 
 ## What to Extract
 
@@ -76,17 +76,17 @@ and relationships whose subject or object would be a non-durable phrase.
 - Notable traits, abilities, catchphrases
 - Quantities, dates, measurements
 
-## Evidence (STRONGLY PREFERRED)
+## Evidence required for publication
 
-Evidence spans are strongly preferred whenever the source text contains a concrete supporting phrase. Include them whenever you can provide an exact quote from the rendered text, especially for multimodal-derived docs where visible strings may be the most trustworthy grounding. Do NOT let evidence requirements limit your coverage, but do not skip easy evidence.
+{{EVIDENCE_CONTEXT}}
 
-When you do provide evidence:
-- `start`: character offset (0-indexed)
-- `end`: character offset (exclusive)
+For each evidence span:
+- `start`: UTF-8 byte offset (0-indexed)
+- `end`: UTF-8 byte offset (exclusive)
 - `quote`: exact substring from source
 - Use `read_text_range` to verify if unsure
 
-When you cannot provide evidence, set `evidence` to `null`. Only do this when the rendered text truly lacks a stable supporting quote or you cannot verify one after checking with `read_text_range`.
+The response format can represent missing evidence as `null`, but that interpretation remains unsupported and prevents publication. Check the original text and provide a complete supporting quote for every claim you propose for publication.
 
 ## Entity Naming
 

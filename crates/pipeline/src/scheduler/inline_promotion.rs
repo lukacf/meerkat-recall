@@ -1,8 +1,7 @@
 //! Inline promotion: deterministic code that takes structured extractor output
-//! and creates entities, rels, attributes, and assertions atomically.
-//!
-//! This replaces the old multi-stage pipeline (commit -> resolve -> synthesize)
-//! with a single pass after extraction.
+//! and prepares entities, rels, attributes, and assertions without live writes.
+//! Complete source publication is owned by the manifest finalizer and the
+//! canonical storage transaction.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -10,11 +9,10 @@ use std::sync::Arc;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use sha2::{Digest, Sha256};
 
-use elephant_outbox::{EventOperation, OutboxPayload, OutboxWriter, RecordRef};
+use elephant_outbox::{EventOperation, OutboxPayload, RecordRef};
 use elephant_storage::{
-    AssertionRepository, AttributeRepository, DocRepository, DocRevisionRepository,
-    EntityRepository, EventRepository, FreshnessRepository, RelRepository, Repository,
-    StorageClient,
+    AssertionRepository, AttributeRepository, EntityRepository, EventRepository,
+    FreshnessRepository, RelRepository, StorageClient,
 };
 use elephant_types::ids::TableName;
 use elephant_types::records::assertion::{
@@ -27,12 +25,18 @@ use elephant_types::records::event::{Event, EventStatus, TimePrecision};
 use elephant_types::records::rel::{ClaimStatus, EvidenceRef, Rel, TimeBasis};
 use elephant_types::{Link, RecordId};
 
+use super::grounding::{load_grounding_lineage, same_support_partition, GroundingLineage};
+use super::promotion_plan::{
+    record_claim_freshness, PlanCapture, PlannedEntities, PlannedEvents, PlannedRels,
+    PlannedRepository,
+};
 use crate::error::PipelineError;
 use crate::extraction::RawAssertion;
-use crate::freshness::{record_claim_freshness, ClaimFreshnessObservation};
+use crate::freshness::ClaimFreshnessObservation;
 use crate::scheduler::promotion_disambiguation::{
     CandidateEntity, DisambiguationRequest, PromotionDisambiguationDecision, PromotionDisambiguator,
 };
+use elephant_storage::canonical_commit::{CanonicalPlan, CanonicalRecord};
 
 const DEFAULT_EVENT_AUTO_APPROVE_THRESHOLD: f32 = 0.85;
 const CONTEXT_SNIPPET_MAX_CHARS: usize = 500;
@@ -64,6 +68,10 @@ pub struct PromotionResult {
 /// tests pass fakes or `Default` explicitly.
 #[derive(Debug, Clone, Default)]
 pub struct PromotionOptions {
+    /// Captured source head and attempt authority. Never inferred from current state.
+    pub publication: Option<elephant_storage::canonical_commit::CanonicalPublicationContext>,
+    /// Stable identity of the complete publication batch, not an assertion ID.
+    pub commit_id: Option<String>,
     /// Optional LLM disambiguator consulted when identity-key entity reuse is
     /// ambiguous or type-conflicting. `None` means deterministic rules only.
     pub disambiguator: Option<Arc<dyn PromotionDisambiguator>>,
@@ -86,7 +94,7 @@ pub async fn promote_assertions_inline(
     doc_node_id: &RecordId,
     revision_id: &RecordId,
     actor: &str,
-) -> Result<PromotionResult, PipelineError> {
+) -> Result<elephant_storage::canonical_commit::CanonicalCommitReceipt, PipelineError> {
     promote_assertions_inline_with_options(
         storage,
         space_id,
@@ -100,22 +108,196 @@ pub async fn promote_assertions_inline(
     .await
 }
 
-/// Promotes a batch of extracted assertions into entities, rels/attrs, and assertion records.
-///
-/// For each assertion:
-/// 1. Creates or reuses subject entity
-/// 2. Creates or reuses object entity (if entity-to-entity)
-/// 3. Creates the assertion record (evidence layer, always)
-/// 4. If significance != "skip": creates rel or attribute
-///
-/// Idempotency: uses `{doc_node_id}:{predicate}:{sha256(subject+object)}` as assertion key.
-///
-/// # Errors
-///
-/// Returns an error if entity validation fails due to a database error (not NotFound),
-/// or if any record creation fails.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+/// Compatibility entrypoint for callers with captured source/attempt authority.
+/// Finalizes only the complete durable source manifest; supplied node-local
+/// arguments never authorize additional or partial effects. Returns the durable
+/// receipt rather than invented per-node counts. New callers should use
+/// [`crate::source_finalization::finalize_source_revision`] directly.
+#[allow(clippy::too_many_arguments)]
 pub async fn promote_assertions_inline_with_options(
+    storage: &StorageClient,
+    space_id: &str,
+    _assertions: &[RawAssertion],
+    _work_run_id: &RecordId,
+    _doc_node_id: &RecordId,
+    _revision_id: &RecordId,
+    actor: &str,
+    options: &PromotionOptions,
+) -> Result<elephant_storage::canonical_commit::CanonicalCommitReceipt, PipelineError> {
+    let publication = options.publication.as_ref().ok_or_else(|| {
+        PipelineError::ValidationError(
+            "Source promotion requires captured publication and attempt fences".into(),
+        )
+    })?;
+    crate::source_finalization::finalize_source_revision(
+        storage,
+        space_id,
+        &publication.source,
+        &publication.attempt,
+        actor,
+        options,
+    )
+    .await
+}
+
+/// One staged extraction group within a complete source publication.
+#[derive(Debug, Clone)]
+pub struct PromotionGroup {
+    /// Supported interpretations; unsupported artifacts must be repaired first.
+    pub assertions: Vec<RawAssertion>,
+    /// Extraction provenance, separate from the finalizer's fenced attempt.
+    pub work_run_id: RecordId,
+    /// Immutable structural node identity.
+    pub doc_node_id: RecordId,
+    /// Immutable rendered revision identity.
+    pub revision_id: RecordId,
+}
+
+/// Prepare all groups against one epoch and shared overlay; performs no writes.
+pub async fn prepare_assertion_groups(
+    storage: &StorageClient,
+    space_id: &str,
+    groups: &[PromotionGroup],
+    actor: &str,
+    options: &PromotionOptions,
+) -> Result<PreparedPromotion, PipelineError> {
+    if groups.is_empty() {
+        return Err(PipelineError::ValidationError(
+            "A source publication needs an explicit extraction group".into(),
+        ));
+    }
+    let canonical = elephant_storage::canonical_commit::CanonicalRepository::new(storage.clone());
+    let prefix = if let Some(publication) = options.publication.as_ref() {
+        canonical
+            .prepare_source_replacement(space_id, &publication.source)
+            .await?
+    } else {
+        CanonicalPlan {
+            observed_epoch: canonical.epoch(space_id).await?,
+            dependencies: Vec::new(),
+            effects: Vec::new(),
+            outbox: Vec::new(),
+            ..CanonicalPlan::default()
+        }
+    };
+    Box::pin(prepare_assertion_groups_with_plan(
+        storage, space_id, groups, actor, options, prefix,
+    ))
+    .await
+}
+
+/// Continue the finalizer's original authorized overlay before resolving groups.
+///
+/// The caller prepares source retirement, then attaches the sealed effects from
+/// the original acceptance. This function keeps that epoch, original before
+/// images, dependencies, outbox and effects intact. It does not reload contact
+/// authority, restart retirement or relax immutable support partitions. Only the
+/// canonical owner may publish the returned plan.
+pub(crate) async fn prepare_assertion_groups_with_plan(
+    storage: &StorageClient,
+    space_id: &str,
+    groups: &[PromotionGroup],
+    actor: &str,
+    options: &PromotionOptions,
+    prefix: CanonicalPlan,
+) -> Result<PreparedPromotion, PipelineError> {
+    if groups.is_empty() || prefix.observed_epoch.is_empty() {
+        return Err(PipelineError::ValidationError(
+            "Promotion needs extraction groups and the original captured plan epoch".into(),
+        ));
+    }
+    if options.publication.as_ref().is_some_and(|publication| {
+        publication.attempt.space_id != space_id
+            || publication.attempt.work_item_id.table() != TableName::WorkItem
+            || publication.attempt.generation == 0
+            || publication.attempt.lease_token.is_empty()
+            || publication.source.source_id.table() != TableName::Source
+            || publication.source.generation.is_empty()
+            || publication.source.revision_id.is_empty()
+            || publication.source.operation_id.is_empty()
+    }) {
+        return Err(PipelineError::ValidationError(
+            "Promotion prefix requires the original source and same-space attempt fences".into(),
+        ));
+    }
+    if prefix
+        .dependencies
+        .iter()
+        .chain(
+            prefix
+                .effects
+                .iter()
+                .flat_map(|effect| effect.before.iter().chain(effect.after.iter())),
+        )
+        .any(|record| record.base().space_id != space_id)
+        || prefix
+            .outbox
+            .iter()
+            .any(|event| event.base.space_id != space_id)
+    {
+        return Err(PipelineError::ValidationError(
+            "Promotion prefix belongs to another space".into(),
+        ));
+    }
+    // Compare the caller's original observation; never replace it with a newer
+    // epoch. The canonical owner repeats this check at actual publication.
+    let canonical = elephant_storage::canonical_commit::CanonicalRepository::new(storage.clone());
+    if canonical.epoch(space_id).await? != prefix.observed_epoch {
+        // This is a concurrent preparation conflict, before any group can
+        // consult a disambiguator. Keep the same typed refusal as retirement;
+        // the finalizer alone decides whether the original attempt is refundable.
+        return Err(
+            elephant_storage::StorageError::Conflict("canonical_epoch_changed".into()).into(),
+        );
+    }
+    let capture = PlanCapture::new(prefix);
+    let mut ordered: Vec<_> = groups.iter().collect();
+    ordered.sort_by_key(|group| (group.revision_id.to_string(), group.doc_node_id.to_string()));
+    let mut result = PromotionResult::default();
+    for group in ordered {
+        let counts = Box::pin(prepare_group(
+            storage,
+            space_id,
+            &group.assertions,
+            &group.work_run_id,
+            &group.doc_node_id,
+            &group.revision_id,
+            actor,
+            options,
+            &capture,
+        ))
+        .await?;
+        result.entities_created += counts.entities_created;
+        result.rels_created += counts.rels_created;
+        result.attributes_created += counts.attributes_created;
+        result.assertions_recorded += counts.assertions_recorded;
+        result.assertions_skipped += counts.assertions_skipped;
+        result.outbox_events_written += counts.outbox_events_written;
+        result.events_created += counts.events_created;
+    }
+    let plan = capture.finish()?;
+    let sources: std::collections::BTreeSet<_> = plan
+        .dependencies
+        .iter()
+        .filter_map(|record| {
+            if let CanonicalRecord::Source(source) = record {
+                Some(source.base.id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if options.publication.is_none() && sources.len() != 1 {
+        return Err(PipelineError::ValidationError(
+            "A source publication cannot mix sources".into(),
+        ));
+    }
+    Ok(PreparedPromotion { plan, result })
+}
+
+/// Prepare one group without writing live storage, for a complete batch caller.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_assertions_inline_with_options(
     storage: &StorageClient,
     space_id: &str,
     assertions: &[RawAssertion],
@@ -124,95 +306,118 @@ pub async fn promote_assertions_inline_with_options(
     revision_id: &RecordId,
     actor: &str,
     options: &PromotionOptions,
+) -> Result<PreparedPromotion, PipelineError> {
+    prepare_assertion_groups(
+        storage,
+        space_id,
+        &[PromotionGroup {
+            assertions: assertions.to_vec(),
+            work_run_id: work_run_id.clone(),
+            doc_node_id: doc_node_id.clone(),
+            revision_id: revision_id.clone(),
+        }],
+        actor,
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn prepare_group(
+    storage: &StorageClient,
+    space_id: &str,
+    assertions: &[RawAssertion],
+    work_run_id: &RecordId,
+    doc_node_id: &RecordId,
+    revision_id: &RecordId,
+    actor: &str,
+    options: &PromotionOptions,
+    capture: &PlanCapture,
 ) -> Result<PromotionResult, PipelineError> {
-    let entity_repo = EntityRepository::new(storage.clone());
-    let assertion_repo = AssertionRepository::new(storage.clone());
-    let rel_repo = RelRepository::new(storage.clone());
-    let attr_repo = AttributeRepository::new(storage.clone());
-    let event_repo = EventRepository::new(storage.clone());
-    let freshness_repo = FreshnessRepository::new(storage.clone());
+    let entity_repo = PlannedRepository::new(EntityRepository::new(storage.clone()), capture);
+    let assertion_repo = PlannedRepository::new(AssertionRepository::new(storage.clone()), capture);
+    let rel_repo = PlannedRepository::new(RelRepository::new(storage.clone()), capture);
+    let attr_repo = PlannedRepository::new(AttributeRepository::new(storage.clone()), capture);
+    let event_repo = PlannedRepository::new(EventRepository::new(storage.clone()), capture);
+    let freshness_repo = PlannedRepository::new(FreshnessRepository::new(storage.clone()), capture);
 
     let mut result = PromotionResult::default();
     let mut outbox_records: Vec<RecordRef> = Vec::new();
     let event_auto_approve_threshold = event_auto_approve_threshold();
 
-    // Attribution metadata and classification from the parent doc flow onto the
-    // records this batch derives (loaded once per batch; missing doc = no-op).
-    let inheritance = load_doc_inheritance(storage, space_id, revision_id).await?;
-    let doc_protectees = inheritance.angel_protectees;
-    let doc_security = inheritance.security.as_ref();
+    let lineage = Box::pin(load_grounding_lineage(
+        storage,
+        space_id,
+        revision_id,
+        doc_node_id,
+    ))
+    .await?;
+    if options
+        .publication
+        .as_ref()
+        .is_some_and(|publication| publication.source.source_id != lineage.source.base.id)
+    {
+        return Err(PipelineError::ValidationError(
+            "Extraction group belongs to a different accepted source".into(),
+        ));
+    }
+    lineage.validate_assertions(assertions)?;
+    capture.dependency(CanonicalRecord::Source(Box::new(lineage.source.clone())))?;
+    capture.dependency(CanonicalRecord::Doc(Box::new(lineage.doc.clone())))?;
+    capture.dependency(CanonicalRecord::DocRevision(Box::new(
+        lineage.revision.clone(),
+    )))?;
+    capture.dependency(CanonicalRecord::DocNode(Box::new(lineage.node.clone())))?;
+    let doc_protectees = angel_protectees_from_metadata(&lineage.doc.metadata);
 
-    for raw in assertions {
+    let mut ordered: Vec<_> = assertions.iter().collect();
+    ordered.sort_by(|left, right| {
+        build_assertion_key(doc_node_id, &left.predicate_text, left)
+            .cmp(&build_assertion_key(
+                doc_node_id,
+                &right.predicate_text,
+                right,
+            ))
+            .then_with(|| right.confidence.total_cmp(&left.confidence))
+    });
+    for raw in ordered {
         let assertion_key = build_assertion_key(doc_node_id, &raw.predicate_text, raw);
-        let event_lineage_key = raw
-            .event_lineage_key
-            .clone()
-            .unwrap_or_else(|| assertion_key.clone());
+        let event_lineage_key = format!(
+            "{}:{}:{}",
+            lineage.source.base.id,
+            revision_id,
+            hex::encode(Sha256::digest(
+                serde_json::json!({
+                    "subject": raw.subject_text, "predicate": raw.predicate_text,
+                    "object": raw.object_text, "literal": raw.object_literal,
+                    "extractor_lineage": raw.event_lineage_key,
+                })
+                .to_string()
+                .as_bytes()
+            ))
+        );
 
-        // Check idempotency — skip if assertion with this key already exists
-        if let Some(existing_assertion) = assertion_repo
+        // The commit receipt, not an assertion's existence, governs replay.
+        // Encountering a preexisting semantic assertion outside that receipt is
+        // an explicit reconciliation conflict; never mark missing effects done.
+        if let Some(existing) = assertion_repo
             .find_by_assertion_key(space_id, &assertion_key)
-            .await
-            .map_err(PipelineError::StorageError)?
+            .await?
         {
-            enrich_existing_assertion_entities(
-                &entity_repo,
-                space_id,
-                &existing_assertion,
-                raw,
-                &doc_protectees,
-                &mut outbox_records,
-            )
-            .await?;
-
-            if let Some(mut existing_event) =
-                find_event_for_lineage_refinement(&event_repo, space_id, &event_lineage_key, raw)
-                    .await?
-            {
-                let updated = apply_event_temporal_refinement(
-                    &mut existing_event,
-                    raw,
-                    Some(Link::new(existing_assertion.base.id.clone())),
-                    event_auto_approve_threshold,
-                );
-                if updated {
-                    event_repo
-                        .update(space_id, &existing_event.base.id, existing_event.clone())
-                        .await
-                        .map_err(PipelineError::StorageError)?;
-                    outbox_records.push(RecordRef {
-                        id: existing_event.base.id.clone(),
-                        table: "event".to_string(),
-                        op: EventOperation::Update,
-                    });
-                }
-                let evidence_times = [raw
-                    .source_event_time
-                    .unwrap_or(existing_assertion.observed_at)];
-                record_claim_freshness(
-                    &freshness_repo,
-                    &existing_event.base.id,
-                    "event",
-                    &existing_event.base,
-                    ClaimFreshnessObservation {
-                        evidence_times: &evidence_times,
-                        evidence_strength: existing_event.confidence,
-                        conflict_severity: flag_score(
-                            existing_event.status == EventStatus::Rejected,
-                        ),
-                        corroboration_count: existing_event.assertion_refs.len(),
-                    },
-                )
-                .await?;
+            if capture.has_effect(&existing.base.id)? {
+                continue;
             }
-            continue;
+            return Err(PipelineError::InvalidState(
+                "Assertion exists without this bundle receipt; canonical reconciliation required"
+                    .into(),
+            ));
         }
 
         let context_snippet = assertion_context_snippet(raw);
         let disambiguator = options.disambiguator.as_deref();
 
         // 1. Resolve or create subject entity
-        let subject_entity_link = resolve_or_create_entity(
+        let subject_entity_link = Box::pin(resolve_or_create_entity(
             &entity_repo,
             space_id,
             raw.subject_entity_id.as_deref(),
@@ -221,10 +426,11 @@ pub async fn promote_assertions_inline_with_options(
             &context_snippet,
             disambiguator,
             &doc_protectees,
+            &lineage,
             actor,
             &mut result,
             &mut outbox_records,
-        )
+        ))
         .await?;
 
         // 2. Resolve or create object entity (only for entity-to-entity, not literals)
@@ -234,7 +440,7 @@ pub async fn promote_assertions_inline_with_options(
                 None
             } else {
                 Some(
-                    resolve_or_create_entity(
+                    Box::pin(resolve_or_create_entity(
                         &entity_repo,
                         space_id,
                         raw.object_entity_id.as_deref(),
@@ -243,10 +449,11 @@ pub async fn promote_assertions_inline_with_options(
                         &context_snippet,
                         disambiguator,
                         &doc_protectees,
+                        &lineage,
                         actor,
                         &mut result,
                         &mut outbox_records,
-                    )
+                    ))
                     .await?,
                 )
             }
@@ -265,7 +472,7 @@ pub async fn promote_assertions_inline_with_options(
         assertion_base.subjects_state = SubjectsState::Complete;
         assertion_base.provenance.work_run_id = Some(work_run_id.clone());
         assertion_base.provenance.run_id = Some(work_run_id.to_string());
-        inherit_security(&mut assertion_base, doc_security);
+        lineage.inherit(&mut assertion_base);
 
         let now = Utc::now();
         #[allow(clippy::cast_possible_truncation)]
@@ -307,6 +514,11 @@ pub async fn promote_assertions_inline_with_options(
             .await
             .map_err(PipelineError::StorageError)?;
         result.assertions_recorded += 1;
+        outbox_records.push(RecordRef {
+            id: assertion_id.clone(),
+            table: "assertion".into(),
+            op: EventOperation::Create,
+        });
 
         // 4. If significance == "skip", don't promote to rel/attr
         let is_skip = raw
@@ -331,12 +543,17 @@ pub async fn promote_assertions_inline_with_options(
         event_base.subjects_state = SubjectsState::Complete;
         event_base.provenance.work_run_id = Some(work_run_id.clone());
         event_base.provenance.run_id = Some(work_run_id.to_string());
-        inherit_security(&mut event_base, doc_security);
+        lineage.inherit(&mut event_base);
 
         let assertion_link = Link::new(assertion_id.clone());
-        if let Some(mut existing_event) =
-            find_event_for_lineage_refinement(&event_repo, space_id, &event_lineage_key, raw)
-                .await?
+        if let Some(mut existing_event) = Box::pin(find_event_for_lineage_refinement(
+            &event_repo,
+            space_id,
+            &event_lineage_key,
+            raw,
+            &event_base,
+        ))
+        .await?
         {
             let updated = apply_event_temporal_refinement(
                 &mut existing_event,
@@ -356,7 +573,7 @@ pub async fn promote_assertions_inline_with_options(
                 });
             }
             let event_evidence_times = [raw.source_event_time.unwrap_or(now)];
-            record_claim_freshness(
+            Box::pin(record_claim_freshness(
                 &freshness_repo,
                 &existing_event.base.id,
                 "event",
@@ -367,7 +584,7 @@ pub async fn promote_assertions_inline_with_options(
                     conflict_severity: flag_score(existing_event.status == EventStatus::Rejected),
                     corroboration_count: existing_event.assertion_refs.len(),
                 },
-            )
+            ))
             .await?;
         } else {
             let event = Event {
@@ -385,7 +602,7 @@ pub async fn promote_assertions_inline_with_options(
                 confidence: confidence_f32,
                 time_confidence: confidence_f32,
                 assertion_refs: vec![assertion_link.clone()],
-                source_refs: Vec::new(),
+                source_refs: vec![Link::new(lineage.source.base.id.clone())],
                 metadata: serde_json::json!({
                     "origin": "inline_promotion",
                     EVENT_METADATA_LINEAGE_KEY: event_lineage_key,
@@ -402,7 +619,7 @@ pub async fn promote_assertions_inline_with_options(
                 .await
                 .map_err(PipelineError::StorageError)?;
             let event_evidence_times = [raw.source_event_time.unwrap_or(now)];
-            record_claim_freshness(
+            Box::pin(record_claim_freshness(
                 &freshness_repo,
                 &event.base.id,
                 "event",
@@ -413,7 +630,7 @@ pub async fn promote_assertions_inline_with_options(
                     conflict_severity: 0.0,
                     corroboration_count: event.assertion_refs.len(),
                 },
-            )
+            ))
             .await?;
             result.events_created += 1;
             outbox_records.push(RecordRef {
@@ -450,7 +667,7 @@ pub async fn promote_assertions_inline_with_options(
             attr_base.subjects_state = SubjectsState::Complete;
             attr_base.provenance.work_run_id = Some(work_run_id.clone());
             attr_base.provenance.run_id = Some(work_run_id.to_string());
-            inherit_security(&mut attr_base, doc_security);
+            lineage.inherit(&mut attr_base);
 
             let attribute = elephant_types::records::attribute::Attribute {
                 base: attr_base,
@@ -473,7 +690,7 @@ pub async fn promote_assertions_inline_with_options(
                 .iter()
                 .map(|evidence| evidence.time_value)
                 .collect::<Vec<_>>();
-            record_claim_freshness(
+            Box::pin(record_claim_freshness(
                 &freshness_repo,
                 &attribute.base.id,
                 "attribute",
@@ -484,7 +701,7 @@ pub async fn promote_assertions_inline_with_options(
                     conflict_severity: flag_score(attribute.status == ClaimStatus::Disputed),
                     corroboration_count: attribute.evidence.len(),
                 },
-            )
+            ))
             .await?;
             result.attributes_created += 1;
             outbox_records.push(RecordRef {
@@ -501,7 +718,7 @@ pub async fn promote_assertions_inline_with_options(
             rel_base.subjects_state = SubjectsState::Complete;
             rel_base.provenance.work_run_id = Some(work_run_id.clone());
             rel_base.provenance.run_id = Some(work_run_id.to_string());
-            inherit_security(&mut rel_base, doc_security);
+            lineage.inherit(&mut rel_base);
 
             let rel = Rel {
                 base: rel_base,
@@ -515,14 +732,20 @@ pub async fn promote_assertions_inline_with_options(
                 temporal_audit: None,
             };
 
-            let (relation, op) =
-                merge_or_create_rel(&rel_repo, space_id, rel, evidence_ref, confidence_f32).await?;
+            let (relation, op) = Box::pin(merge_or_create_rel(
+                &rel_repo,
+                space_id,
+                rel,
+                evidence_ref,
+                confidence_f32,
+            ))
+            .await?;
             let relation_evidence_times = relation
                 .evidence
                 .iter()
                 .map(|evidence| evidence.time_value)
                 .collect::<Vec<_>>();
-            record_claim_freshness(
+            Box::pin(record_claim_freshness(
                 &freshness_repo,
                 &relation.base.id,
                 "rel",
@@ -533,7 +756,7 @@ pub async fn promote_assertions_inline_with_options(
                     conflict_severity: flag_score(relation.status == ClaimStatus::Disputed),
                     corroboration_count: relation.evidence.len(),
                 },
-            )
+            ))
             .await?;
             if matches!(op, EventOperation::Create) {
                 result.rels_created += 1;
@@ -548,7 +771,6 @@ pub async fn promote_assertions_inline_with_options(
 
     // Write outbox events so truth maintenance and downstream workers fire.
     if !outbox_records.is_empty() {
-        let outbox = OutboxWriter::new(storage.clone());
         let mut payload = OutboxPayload::new(
             space_id.to_string(),
             "inline_promotion.completed".to_string(),
@@ -558,15 +780,43 @@ pub async fn promote_assertions_inline_with_options(
         for record in outbox_records {
             payload.add_record(record);
         }
-        outbox.write(payload).await?;
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::SystemEvent),
+            space_id.to_string(),
+            actor.to_string(),
+        );
+        lineage.inherit(&mut base);
+        base.provenance.work_run_id = Some(work_run_id.clone());
+        capture.outbox(elephant_types::records::SystemEvent {
+            base,
+            seq: 0,
+            event_type: payload.event_type.clone(),
+            payload: serde_json::to_value(payload)
+                .map_err(|error| PipelineError::ConfigError(error.to_string()))?,
+        })?;
         result.outbox_events_written += 1;
     }
 
     Ok(result)
 }
 
+/// Complete, uncommitted canonical effects produced from verified evidence.
+#[derive(Debug, Clone)]
+pub struct PreparedPromotion {
+    /// Storage-owned transaction input, including all read dependencies.
+    pub plan: CanonicalPlan,
+    /// Counts that become committed only after the atomic repository succeeds.
+    pub result: PromotionResult,
+}
+
+fn lineage_entity_base(lineage: &GroundingLineage) -> BaseFields {
+    let mut base = lineage.source.base.clone();
+    lineage.inherit(&mut base);
+    base
+}
+
 async fn merge_or_create_rel(
-    rel_repo: &RelRepository,
+    rel_repo: &PlannedRels,
     space_id: &str,
     rel: Rel,
     evidence_ref: EvidenceRef,
@@ -577,7 +827,7 @@ async fn merge_or_create_rel(
         .await
         .map_err(PipelineError::StorageError)?
         .into_iter()
-        .next();
+        .find(|existing| same_support_partition(&existing.base, &rel.base));
 
     let Some(existing_rel) = existing.as_mut() else {
         let created = rel_repo
@@ -599,10 +849,6 @@ async fn merge_or_create_rel(
     if existing_rel.status == ClaimStatus::Candidate && rel.status == ClaimStatus::Approved {
         existing_rel.status = ClaimStatus::Approved;
     }
-    // The incoming doc contributes evidence to a rel other docs also feed, so
-    // widen the classification instead of adopting the newcomer's verbatim.
-    escalate_security(&mut existing_rel.base.security, Some(&rel.base.security));
-
     let id = existing_rel.base.id.clone();
     rel_repo
         .update(space_id, &id, existing_rel.clone())
@@ -613,8 +859,8 @@ async fn merge_or_create_rel(
 
 /// Resolves an existing entity by ID, or creates a new one.
 ///
-/// - If `entity_id` is provided and found in the same space: reuses it
-///   (trusted extraction — exempt from the type guard).
+/// - A provided `entity_id` is an untrusted extraction hint. Reuse requires
+///   the same source revision, authorization, compatible type and known name.
 /// - Otherwise, identity-key matches are filtered by type compatibility;
 ///   ambiguous or conflicting matches go to the optional disambiguator
 ///   (see [`resolve_identity_key_matches`]).
@@ -622,7 +868,7 @@ async fn merge_or_create_rel(
 /// - DB/network errors are propagated (not swallowed).
 #[allow(clippy::too_many_arguments)]
 async fn resolve_or_create_entity(
-    entity_repo: &EntityRepository,
+    entity_repo: &PlannedEntities,
     space_id: &str,
     entity_id: Option<&str>,
     display_name: &str,
@@ -630,50 +876,51 @@ async fn resolve_or_create_entity(
     context_snippet: &str,
     disambiguator: Option<&dyn PromotionDisambiguator>,
     doc_protectees: &[String],
+    lineage: &GroundingLineage,
     actor: &str,
     result: &mut PromotionResult,
     outbox_records: &mut Vec<RecordRef>,
 ) -> Result<Link<Entity>, PipelineError> {
-    // Try to reuse existing entity if ID was provided
-    if let Some(id_str) = entity_id {
-        if let Ok(record_id) = RecordId::from_str(id_str) {
-            match entity_repo.get(space_id, &record_id).await {
-                Ok(Some(entity)) => {
-                    return reuse_entity_for_display_name(
-                        entity_repo,
-                        space_id,
-                        entity,
-                        display_name,
-                        None,
-                        doc_protectees,
-                        outbox_records,
-                    )
-                    .await;
-                }
-                Ok(None) => {
-                    // NotFound or soft-deleted — fall through
-                }
-                Err(e) => {
-                    // DB error — propagate, don't swallow
-                    return Err(PipelineError::StorageError(e));
-                }
+    let entity_type = entity_type_str
+        .map(normalize_entity_type)
+        .unwrap_or_else(|| EntityType::new("topic"));
+
+    if let Some(record_id) = entity_id.and_then(|id| RecordId::from_str(id).ok()) {
+        if let Some(entity) = entity_repo.get(space_id, &record_id).await? {
+            let observed_key = display_name.trim().to_lowercase();
+            let known_name = entity.display_name.trim().to_lowercase() == observed_key
+                || entity
+                    .aliases
+                    .iter()
+                    .chain(entity.identity_keys.iter())
+                    .any(|name| name.trim().to_lowercase() == observed_key);
+            if known_name
+                && entity_types_compatible(&entity.entity_type, &entity_type)
+                && same_support_partition(&entity.base, &lineage_entity_base(lineage))
+            {
+                return reuse_entity_for_display_name(
+                    entity_repo,
+                    space_id,
+                    entity,
+                    display_name,
+                    Some(&entity_type),
+                    doc_protectees,
+                    outbox_records,
+                )
+                .await;
             }
         }
-        // Invalid RecordId format — fall through
     }
-
-    // Map the extractor type to the DB vocabulary up front; the type guard
-    // and entity creation both use the normalized form.
-    let entity_type = entity_type_str
-        .map(|t| normalize_entity_type(t))
-        .unwrap_or_else(|| EntityType::new("topic"));
 
     // Try to find existing entities by identity key (lowercased display_name)
     let identity_key = display_name.to_lowercase();
     let matches = entity_repo
         .find_by_identity_key_all(space_id, &identity_key)
         .await
-        .map_err(PipelineError::StorageError)?;
+        .map_err(PipelineError::StorageError)?
+        .into_iter()
+        .filter(|entity| same_support_partition(&entity.base, &lineage_entity_base(lineage)))
+        .collect::<Vec<_>>();
     if !matches.is_empty() {
         if let Some(link) = resolve_identity_key_matches(
             entity_repo,
@@ -694,7 +941,8 @@ async fn resolve_or_create_entity(
     }
 
     let entity_id = RecordId::new_v4(TableName::Entity);
-    let base = BaseFields::new(entity_id.clone(), space_id.to_string(), actor.to_string());
+    let mut base = BaseFields::new(entity_id.clone(), space_id.to_string(), actor.to_string());
+    lineage.inherit(&mut base);
 
     let mut metadata = serde_json::Value::Object(serde_json::Map::new());
     union_angel_protectees_into_metadata(&mut metadata, doc_protectees);
@@ -744,7 +992,7 @@ async fn resolve_or_create_entity(
 ///   false-merge).
 #[allow(clippy::too_many_arguments)]
 async fn resolve_identity_key_matches(
-    entity_repo: &EntityRepository,
+    entity_repo: &PlannedEntities,
     space_id: &str,
     matches: Vec<Entity>,
     display_name: &str,
@@ -770,7 +1018,7 @@ async fn resolve_identity_key_matches(
                 context_snippet,
                 &incompatible,
             )
-            .await;
+            .await?;
             match decision {
                 Some(PromotionDisambiguationDecision::Reuse { entity_id }) => {
                     if let Some(entity) = take_entity_by_id(&mut incompatible, &entity_id) {
@@ -825,7 +1073,7 @@ async fn resolve_identity_key_matches(
                 context_snippet,
                 &compatible,
             )
-            .await;
+            .await?;
             match decision {
                 Some(PromotionDisambiguationDecision::CreateNew) => return Ok(None),
                 Some(PromotionDisambiguationDecision::Reuse { entity_id }) => {
@@ -876,7 +1124,7 @@ async fn resolve_identity_key_matches(
 
 /// Two entity types are compatible when they normalize to the same value or
 /// either side is `topic` (the catch-all bucket for unknown types).
-fn entity_types_compatible(stored: &EntityType, incoming: &EntityType) -> bool {
+pub(crate) fn entity_types_compatible(stored: &EntityType, incoming: &EntityType) -> bool {
     let stored = normalize_entity_type(stored.as_str());
     let incoming = normalize_entity_type(incoming.as_str());
     stored.as_str() == incoming.as_str()
@@ -936,7 +1184,7 @@ async fn run_disambiguator(
     incoming_type: &EntityType,
     context_snippet: &str,
     candidates: &[Entity],
-) -> Option<PromotionDisambiguationDecision> {
+) -> Result<Option<PromotionDisambiguationDecision>, PipelineError> {
     let request = DisambiguationRequest {
         mention: mention.to_string(),
         normalized_type: incoming_type.as_str().to_string(),
@@ -951,17 +1199,7 @@ async fn run_disambiguator(
             })
             .collect(),
     };
-    match disambiguator.disambiguate(&request).await {
-        Ok(decision) => decision,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                mention,
-                "promotion disambiguator failed; falling back to deterministic entity-reuse rules"
-            );
-            None
-        }
-    }
+    disambiguator.disambiguate(&request).await
 }
 
 /// Builds the source-document context passed to the disambiguator: the
@@ -998,59 +1236,8 @@ fn assertion_context_snippet(raw: &RawAssertion) -> String {
     }
 }
 
-async fn enrich_existing_assertion_entities(
-    entity_repo: &EntityRepository,
-    space_id: &str,
-    assertion: &Assertion,
-    raw: &RawAssertion,
-    doc_protectees: &[String],
-    outbox_records: &mut Vec<RecordRef>,
-) -> Result<(), PipelineError> {
-    if let Some(subject_entity) = &assertion.subject_entity {
-        if let Some(entity) = entity_repo
-            .get(space_id, subject_entity.id())
-            .await
-            .map_err(PipelineError::StorageError)?
-        {
-            reuse_entity_for_display_name(
-                entity_repo,
-                space_id,
-                entity,
-                &raw.subject_text,
-                None,
-                doc_protectees,
-                outbox_records,
-            )
-            .await?;
-        }
-    }
-
-    if let (Some(object_entity), Some(object_text)) =
-        (&assertion.object_entity, raw.object_text.as_deref())
-    {
-        if let Some(entity) = entity_repo
-            .get(space_id, object_entity.id())
-            .await
-            .map_err(PipelineError::StorageError)?
-        {
-            reuse_entity_for_display_name(
-                entity_repo,
-                space_id,
-                entity,
-                object_text,
-                None,
-                doc_protectees,
-                outbox_records,
-            )
-            .await?;
-        }
-    }
-
-    Ok(())
-}
-
 async fn reuse_entity_for_display_name(
-    entity_repo: &EntityRepository,
+    entity_repo: &PlannedEntities,
     space_id: &str,
     entity: Entity,
     display_name: &str,
@@ -1058,7 +1245,13 @@ async fn reuse_entity_for_display_name(
     doc_protectees: &[String],
     outbox_records: &mut Vec<RecordRef>,
 ) -> Result<Link<Entity>, PipelineError> {
+    let original_base = entity.base.clone();
     let mut entity = follow_entity_redirect(entity_repo, space_id, entity).await?;
+    if !same_support_partition(&entity.base, &original_base) {
+        return Err(PipelineError::ValidationError(
+            "Entity redirect crosses a support/security partition".into(),
+        ));
+    }
     let entity_id = entity.base.id.clone();
     let observed_name = display_name.trim();
     let identity_key = observed_name.to_ascii_lowercase();
@@ -1145,7 +1338,7 @@ fn should_promote_observed_display_name(entity: &Entity, observed_name: &str) ->
 }
 
 async fn follow_entity_redirect(
-    entity_repo: &EntityRepository,
+    entity_repo: &PlannedEntities,
     space_id: &str,
     mut entity: Entity,
 ) -> Result<Entity, PipelineError> {
@@ -1221,127 +1414,49 @@ pub(crate) fn union_angel_protectees_into_metadata(
     true
 }
 
-/// Loads the parent doc's `metadata.angel_protectees` for a revision.
-///
-/// A missing revision or doc is tolerated as "no attribution" so promotion
-/// never fails on a lookup that only feeds metadata propagation.
-async fn load_doc_inheritance(
-    storage: &StorageClient,
-    space_id: &str,
-    revision_id: &RecordId,
-) -> Result<DocInheritance, PipelineError> {
-    let revision_repo = DocRevisionRepository::new(storage.clone());
-    let Some(revision) = revision_repo
-        .get_by_id(revision_id)
-        .await
-        .map_err(PipelineError::StorageError)?
-    else {
-        return Ok(DocInheritance::default());
-    };
-
-    let doc_repo = DocRepository::new(storage.clone());
-    let Some(doc) = doc_repo
-        .get(space_id, revision.doc.id())
-        .await
-        .map_err(PipelineError::StorageError)?
-    else {
-        return Ok(DocInheritance::default());
-    };
-
-    Ok(DocInheritance {
-        angel_protectees: angel_protectees_from_metadata(&doc.metadata),
-        security: Some(doc.base.security.clone()),
-    })
-}
-
-/// Classification and attribution a document passes down to the records derived
-/// from it.
-#[derive(Debug, Clone, Default)]
-struct DocInheritance {
-    /// Angel protectees named by the parent doc's metadata.
-    angel_protectees: Vec<String>,
-    /// The parent doc's security envelope. `None` when the doc or its revision
-    /// could not be loaded, in which case derived records keep the baseline
-    /// envelope from [`BaseFields::new`] rather than a guessed one.
-    security: Option<Security>,
-}
-
-/// Stamps the parent document's classification onto a record derived from it.
-///
-/// Derived records are only as shareable as the evidence behind them: an
-/// assertion extracted from an owner-only, `no_voice` document must not be a
-/// household-open, speakable fact. Before this existed, every derived record
-/// carried the `BaseFields::new` baseline (`policy_id: "default"`, `level: 0`,
-/// no labels, no handling) no matter what the source said, so document-level
-/// classification could not gate access to the facts at all.
-///
-/// A `None` envelope leaves the record untouched. That is the missing-doc path,
-/// which for extraction is an invariant violation rather than a normal case
-/// (extraction runs *from* a revision), and it keeps fakes in tests on the
-/// baseline envelope.
-pub(crate) fn inherit_security(base: &mut BaseFields, inherited: Option<&Security>) {
-    if let Some(security) = inherited {
-        base.security = security.clone();
-    }
-}
-
-/// Merges an incoming document's classification into a record that several
-/// documents contribute to, escalating only.
-///
-/// Rels are slot-merged across documents ([`merge_or_create_rel`]), so the same
-/// rel can carry evidence from a household-open note and an owner-only legal
-/// document. Taking the incoming envelope verbatim would let whichever document
-/// happened to be extracted last decide the classification, and a later
-/// low-sensitivity mention would silently *declassify* the rel. So this widens
-/// and never narrows: the level is the max, labels and handling are unioned, and
-/// a real `policy_id` displaces the `"default"` placeholder but never another
-/// real one.
-///
-/// Same escalate-only shape as the confidence (`max`) and status
-/// (`Candidate` -> `Approved`) merges alongside it.
-pub(crate) fn escalate_security(existing: &mut Security, incoming: Option<&Security>) {
+/// Conjoin restrictions only within one policy schema. Distinct policy IDs
+/// have no generic ordering and must never be folded with first-wins semantics.
+pub(crate) fn escalate_security(
+    existing: &mut Security,
+    incoming: Option<&Security>,
+) -> Result<(), PipelineError> {
     let Some(incoming) = incoming else {
-        return;
+        return Ok(());
     };
-
+    if existing.policy_id != incoming.policy_id {
+        return Err(PipelineError::ValidationError(
+            "Cannot conjoin different security policy schemas".into(),
+        ));
+    }
     existing.level = existing.level.max(incoming.level);
-
-    if existing.policy_id == "default" && incoming.policy_id != "default" {
-        existing.policy_id = incoming.policy_id.clone();
-    }
-
-    for label in &incoming.labels {
-        if !existing.labels.contains(label) {
-            existing.labels.push(label.clone());
-        }
-    }
+    existing.labels.extend(incoming.labels.iter().cloned());
     existing.labels.sort();
-
-    for caveat in &incoming.handling {
-        if !existing.handling.contains(caveat) {
-            existing.handling.push(caveat.clone());
-        }
-    }
+    existing.labels.dedup();
+    existing.handling.extend(incoming.handling.iter().cloned());
     existing.handling.sort();
+    existing.handling.dedup();
+    Ok(())
 }
 
 /// Builds the idempotency key for an assertion.
 fn build_assertion_key(doc_node_id: &RecordId, predicate: &str, raw: &RawAssertion) -> String {
-    let object_part = if let Some(ref text) = raw.object_text {
-        text.clone()
-    } else if let Some(ref literal) = raw.object_literal {
-        format!("{literal:?}")
-    } else {
-        String::new()
-    };
-
     let mut hasher = Sha256::new();
-    hasher.update(raw.subject_text.as_bytes());
-    hasher.update(b"|");
-    hasher.update(object_part.as_bytes());
-    let hash = hex::encode(hasher.finalize());
-
-    format!("{doc_node_id}:{predicate}:{hash}")
+    hasher.update(
+        serde_json::json!({
+            "node": doc_node_id.to_string(), "predicate": predicate,
+            "revision": raw.evidence_span.revision.id().to_string(),
+            "start": raw.evidence_span.start, "end": raw.evidence_span.end,
+            "quote": raw.evidence_span.quote_hash,
+            "subject": raw.subject_text, "object": raw.object_text, "literal": raw.object_literal,
+            "subject_type": raw.subject_entity_type, "object_type": raw.object_entity_type,
+            "subject_entity": raw.subject_entity_id, "object_entity": raw.object_entity_id,
+            "event_time": raw.source_event_time, "event_precision": raw.source_event_time_precision,
+            "event_title": raw.event_title, "significance": raw.significance,
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    format!("grounded:{}", hex::encode(hasher.finalize()))
 }
 
 fn time_precision_rank(precision: TimePrecision) -> u8 {
@@ -1409,15 +1524,19 @@ fn event_is_time_compatible(
 }
 
 async fn find_event_for_lineage_refinement(
-    event_repo: &EventRepository,
+    event_repo: &PlannedEvents,
     space_id: &str,
     lineage_key: &str,
     raw: &RawAssertion,
+    expected_base: &BaseFields,
 ) -> Result<Option<Event>, crate::error::PipelineError> {
     let candidates = event_repo
         .find_all_by_lineage_key(space_id, lineage_key)
         .await
-        .map_err(PipelineError::StorageError)?;
+        .map_err(PipelineError::StorageError)?
+        .into_iter()
+        .filter(|event| same_support_partition(&event.base, expected_base))
+        .collect::<Vec<_>>();
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -1529,7 +1648,7 @@ fn apply_event_temporal_refinement(
 /// The DB schema constrains entity types to:
 /// `person`, `app`, `group`, `topic`, `platform`, `org`, `location`, `device`.
 /// LLMs may return other types (e.g. "other", "character", "animal") which need mapping.
-fn normalize_entity_type(raw: &str) -> EntityType {
+pub(crate) fn normalize_entity_type(raw: &str) -> EntityType {
     let lower = raw.to_lowercase();
     match lower.as_str() {
         "person" | "app" | "group" | "topic" | "platform" | "org" | "location" | "device" => {
@@ -1645,2129 +1764,5 @@ const fn flag_score(flag: bool) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::float_cmp,
-        unused_imports,
-        dead_code,
-        clippy::too_many_lines,
-        clippy::cognitive_complexity
-    )]
-
-    use super::*;
-    use crate::extraction::RawAssertion;
-    use elephant_storage::{SearchCriteria, SearchRepository};
-    use elephant_types::records::assertion::EvidenceSpan;
-    use elephant_types::records::base::Security;
-    use elephant_types::records::doc::Doc;
-    use elephant_types::records::doc_revision::{DocRevision, RendererMetadata, RevisionStatus};
-
-    const SCHEMA: &str = r"
-        DEFINE TABLE entity SCHEMALESS;
-        DEFINE TABLE assertion SCHEMALESS;
-        DEFINE TABLE rel SCHEMALESS;
-        DEFINE TABLE attribute SCHEMALESS;
-        DEFINE TABLE event SCHEMALESS;
-        DEFINE TABLE doc SCHEMALESS;
-        DEFINE TABLE doc_revision SCHEMALESS;
-        DEFINE TABLE system_event SCHEMALESS;
-        DEFINE INDEX system_event_space_seq ON TABLE system_event FIELDS space_id, seq UNIQUE;
-    ";
-
-    fn make_evidence_span() -> EvidenceSpan {
-        EvidenceSpan {
-            revision: Link::new(RecordId::new_v4(TableName::DocRevision)),
-            node: None,
-            start: 0,
-            end: 25,
-            quote_hash: "testhash".to_string(),
-        }
-    }
-
-    fn make_raw_assertion(subject: &str, predicate: &str, object: &str) -> RawAssertion {
-        RawAssertion {
-            subject_text: subject.to_string(),
-            predicate_text: predicate.to_string(),
-            object_text: Some(object.to_string()),
-            object_literal: None,
-            evidence_span: make_evidence_span(),
-            confidence: 0.95,
-            quote: Some("test quote".to_string()),
-            source_event_time: None,
-            source_event_time_precision: None,
-            event_title: None,
-            event_lineage_key: None,
-            subject_entity_id: None,
-            subject_entity_type: Some("person".to_string()),
-            object_entity_id: None,
-            object_entity_type: Some("org".to_string()),
-            significance: Some("high".to_string()),
-        }
-    }
-
-    fn make_literal_assertion(subject: &str, predicate: &str, value: &str) -> RawAssertion {
-        RawAssertion {
-            subject_text: subject.to_string(),
-            predicate_text: predicate.to_string(),
-            object_text: None,
-            object_literal: Some(Literal::String(value.to_string())),
-            evidence_span: make_evidence_span(),
-            confidence: 0.90,
-            quote: Some("literal quote".to_string()),
-            source_event_time: None,
-            source_event_time_precision: None,
-            event_title: None,
-            event_lineage_key: None,
-            subject_entity_id: None,
-            subject_entity_type: Some("person".to_string()),
-            object_entity_id: None,
-            object_entity_type: None,
-            significance: Some("medium".to_string()),
-        }
-    }
-
-    /// Creates a doc with the given metadata plus an active revision pointing
-    /// at it, returning the revision id.
-    async fn create_doc_with_revision(
-        storage: &StorageClient,
-        metadata: serde_json::Value,
-    ) -> RecordId {
-        create_doc_with_revision_and_security(storage, metadata, None).await
-    }
-
-    /// As [`create_doc_with_revision`], with an explicit classification on the
-    /// parent doc so inheritance onto derived records can be asserted.
-    async fn create_doc_with_revision_and_security(
-        storage: &StorageClient,
-        metadata: serde_json::Value,
-        security: Option<Security>,
-    ) -> RecordId {
-        let doc_repo = DocRepository::new(storage.clone());
-        let revision_repo = DocRevisionRepository::new(storage.clone());
-
-        let doc_id = RecordId::new_v4(TableName::Doc);
-        let mut doc_base =
-            BaseFields::new(doc_id.clone(), "test_space".to_string(), "test".to_string());
-        if let Some(security) = security {
-            doc_base.security = security;
-        }
-        let doc = Doc {
-            base: doc_base,
-            title: "Test Doc".to_string(),
-            text: "test text".to_string(),
-            sidecar_text: None,
-            source: None,
-            media_attachments: vec![],
-            rendition_key: format!("rendition-{doc_id}"),
-            metadata,
-        };
-        doc_repo.create(doc).await.expect("create doc");
-
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-        let revision = DocRevision {
-            base: BaseFields::new(
-                revision_id.clone(),
-                "test_space".to_string(),
-                "test".to_string(),
-            ),
-            doc: Link::new(doc_id),
-            text: "test text".to_string(),
-            text_hash: "hash".to_string(),
-            renderer: RendererMetadata {
-                name: "test".to_string(),
-                version: "1.0.0".to_string(),
-                config_hash: None,
-            },
-            manifest: None,
-            supersedes: None,
-            status: RevisionStatus::Active,
-            rendered_at: Utc::now(),
-        };
-        revision_repo
-            .create(revision)
-            .await
-            .expect("create revision");
-
-        revision_id
-    }
-
-    #[tokio::test]
-    async fn test_promote_creates_entity_for_new_subject() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let raw = make_raw_assertion("Alice", "works_at", "Acme Corp");
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        // Should create 2 entities (Alice + Acme Corp), 1 rel, 1 assertion
-        assert_eq!(result.entities_created, 2);
-        assert_eq!(result.rels_created, 1);
-        assert_eq!(result.assertions_recorded, 1);
-        assert_eq!(result.attributes_created, 0);
-    }
-
-    #[tokio::test]
-    async fn test_promote_reuses_existing_entity() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        // Pre-create an entity
-        let entity_repo = EntityRepository::new(storage.clone());
-        let existing_id = RecordId::new_v4(TableName::Entity);
-        let entity = Entity {
-            base: BaseFields::new(
-                existing_id.clone(),
-                "test_space".to_string(),
-                "test".to_string(),
-            ),
-            entity_type: EntityType::new("person"),
-            display_name: "Alice".to_string(),
-            aliases: vec![],
-            summary: None,
-            handles: vec![],
-            identity_keys: vec!["alice".to_string()],
-            risk_level: None,
-            trust_level: None,
-            known_safe: false,
-            first_seen: None,
-            last_seen: None,
-            status: EntityStatus::Active,
-            redirect_to: None,
-            metadata: serde_json::Value::Object(serde_json::Map::new()),
-        };
-        entity_repo.create(entity).await.expect("create entity");
-
-        // Create assertion referencing existing entity
-        let mut raw = make_raw_assertion("Alice", "works_at", "Acme Corp");
-        raw.subject_entity_id = Some(existing_id.to_string());
-
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        // Only 1 entity created (Acme Corp); Alice was reused
-        assert_eq!(result.entities_created, 1);
-        assert_eq!(result.rels_created, 1);
-        assert_eq!(result.assertions_recorded, 1);
-    }
-
-    #[tokio::test]
-    async fn test_promote_propagates_angel_protectees_from_doc_to_entities() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let entity_repo = EntityRepository::new(storage.clone());
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-
-        // First doc attributed to child-a creates the entities.
-        let revision_a = create_doc_with_revision(
-            &storage,
-            serde_json::json!({ "angel_protectees": ["child-a"] }),
-        )
-        .await;
-        promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[make_raw_assertion("Alice", "works_at", "Acme Corp")],
-            &work_run_id,
-            &RecordId::new_v4(TableName::DocNode),
-            &revision_a,
-            "test_actor",
-        )
-        .await
-        .expect("promote first doc");
-
-        let alice = entity_repo
-            .find_by_identity_key_all("test_space", "alice")
-            .await
-            .expect("find alice")
-            .pop()
-            .expect("alice exists");
-        assert_eq!(
-            alice.metadata[ANGEL_PROTECTEES_METADATA_KEY],
-            serde_json::json!(["child-a"])
-        );
-
-        // Second doc attributed to child-b reuses Alice: ids union, sorted.
-        let revision_b = create_doc_with_revision(
-            &storage,
-            serde_json::json!({ "angel_protectees": ["child-b"] }),
-        )
-        .await;
-        promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[make_raw_assertion("Alice", "mentors", "Bob")],
-            &work_run_id,
-            &RecordId::new_v4(TableName::DocNode),
-            &revision_b,
-            "test_actor",
-        )
-        .await
-        .expect("promote second doc");
-
-        let alice = entity_repo
-            .find_by_identity_key_all("test_space", "alice")
-            .await
-            .expect("find alice again")
-            .pop()
-            .expect("alice still exists");
-        assert_eq!(
-            alice.metadata[ANGEL_PROTECTEES_METADATA_KEY],
-            serde_json::json!(["child-a", "child-b"])
-        );
-
-        // The entity created by the second doc only carries child-b.
-        let bob = entity_repo
-            .find_by_identity_key_all("test_space", "bob")
-            .await
-            .expect("find bob")
-            .pop()
-            .expect("bob exists");
-        assert_eq!(
-            bob.metadata[ANGEL_PROTECTEES_METADATA_KEY],
-            serde_json::json!(["child-b"])
-        );
-    }
-
-    #[tokio::test]
-    async fn test_promote_without_doc_protectees_leaves_entity_metadata_unset() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let revision_id =
-            create_doc_with_revision(&storage, serde_json::json!({ "other": "value" })).await;
-        promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[make_raw_assertion("Alice", "works_at", "Acme Corp")],
-            &RecordId::new_v4(TableName::WorkRun),
-            &RecordId::new_v4(TableName::DocNode),
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        let entity_repo = EntityRepository::new(storage.clone());
-        let alice = entity_repo
-            .find_by_identity_key_all("test_space", "alice")
-            .await
-            .expect("find alice")
-            .pop()
-            .expect("alice exists");
-        assert!(alice.metadata.get(ANGEL_PROTECTEES_METADATA_KEY).is_none());
-    }
-
-    fn owner_only_security() -> Security {
-        Security {
-            policy_id: "household-v1".to_string(),
-            level: 2,
-            labels: vec!["audience:owner".to_string(), "topic:estate".to_string()],
-            handling: vec!["no_voice".to_string()],
-        }
-    }
-
-    /// An owner-only, `no_voice` document must not yield household-open,
-    /// speakable facts. Covers the assertion (evidence layer), the event, and
-    /// the attribute in one pass.
-    #[tokio::test]
-    async fn test_derived_records_inherit_doc_classification() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let revision_id = create_doc_with_revision_and_security(
-            &storage,
-            serde_json::json!({}),
-            Some(owner_only_security()),
-        )
-        .await;
-
-        promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[make_literal_assertion(
-                "Grete Friis estate",
-                "has_share",
-                "50/50",
-            )],
-            &RecordId::new_v4(TableName::WorkRun),
-            &RecordId::new_v4(TableName::DocNode),
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        let expected = owner_only_security();
-
-        let assertions = AssertionRepository::new(storage.clone())
-            .list("test_space", 10, None)
-            .await
-            .expect("list assertions");
-        assert_eq!(assertions.len(), 1);
-        assert_eq!(assertions[0].base.security, expected);
-
-        let attributes = AttributeRepository::new(storage.clone())
-            .list("test_space", 10, None)
-            .await
-            .expect("list attributes");
-        assert_eq!(attributes.len(), 1);
-        assert_eq!(attributes[0].base.security, expected);
-
-        let events = EventRepository::new(storage.clone())
-            .list("test_space", 10, None)
-            .await
-            .expect("list events");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].base.security, expected);
-    }
-
-    /// Negative control: without a resolvable parent doc there is nothing to
-    /// inherit, so records keep the `BaseFields::new` baseline. Guards against
-    /// the inheritance helper inventing a classification.
-    #[tokio::test]
-    async fn test_promote_without_doc_keeps_baseline_classification() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[make_literal_assertion("Alice", "has_title", "engineer")],
-            &RecordId::new_v4(TableName::WorkRun),
-            &RecordId::new_v4(TableName::DocNode),
-            &RecordId::new_v4(TableName::DocRevision),
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        let assertions = AssertionRepository::new(storage.clone())
-            .list("test_space", 10, None)
-            .await
-            .expect("list assertions");
-        assert_eq!(assertions.len(), 1);
-        assert_eq!(assertions[0].base.security.policy_id, "default");
-        assert_eq!(assertions[0].base.security.level, 0);
-        assert!(assertions[0].base.security.labels.is_empty());
-        assert!(assertions[0].base.security.handling.is_empty());
-    }
-
-    /// A rel is slot-merged across docs, so a later low-sensitivity mention of
-    /// the same fact must not declassify it.
-    #[tokio::test]
-    async fn test_rel_merge_escalates_classification_and_never_downgrades() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let sensitive_revision = create_doc_with_revision_and_security(
-            &storage,
-            serde_json::json!({}),
-            Some(owner_only_security()),
-        )
-        .await;
-        promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[make_raw_assertion("Alice", "works_at", "Acme Corp")],
-            &RecordId::new_v4(TableName::WorkRun),
-            &RecordId::new_v4(TableName::DocNode),
-            &sensitive_revision,
-            "test_actor",
-        )
-        .await
-        .expect("promote sensitive");
-
-        // Same slot, this time from a household-open doc carrying one new label.
-        let open_revision = create_doc_with_revision_and_security(
-            &storage,
-            serde_json::json!({}),
-            Some(Security {
-                policy_id: "household-v1".to_string(),
-                level: 0,
-                labels: vec!["topic:work".to_string()],
-                handling: vec![],
-            }),
-        )
-        .await;
-        promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[make_raw_assertion("Alice", "works_at", "Acme Corp")],
-            &RecordId::new_v4(TableName::WorkRun),
-            &RecordId::new_v4(TableName::DocNode),
-            &open_revision,
-            "test_actor",
-        )
-        .await
-        .expect("promote open");
-
-        let rels = RelRepository::new(storage.clone())
-            .find_by_type("works_at")
-            .await
-            .expect("find rels");
-        assert_eq!(rels.len(), 1, "same slot should merge, not duplicate");
-        let security = &rels[0].base.security;
-
-        assert_eq!(
-            security.level, 2,
-            "must not be declassified to the open doc"
-        );
-        assert_eq!(security.handling, vec!["no_voice".to_string()]);
-        assert_eq!(
-            security.labels,
-            vec![
-                "audience:owner".to_string(),
-                "topic:estate".to_string(),
-                "topic:work".to_string(),
-            ],
-            "labels union, sorted"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_promote_creates_rel_for_entity_object() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let raw = make_raw_assertion("Alice", "works_at", "Acme Corp");
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        assert_eq!(result.rels_created, 1);
-        assert_eq!(result.attributes_created, 0);
-
-        // Verify rel exists in the DB
-        let rel_repo = RelRepository::new(storage.clone());
-        let rels = rel_repo.find_by_type("works_at").await.expect("find rels");
-        assert_eq!(rels.len(), 1);
-        assert_eq!(rels[0].rel_type, "works_at");
-    }
-
-    #[tokio::test]
-    async fn test_promote_creates_attribute_for_literal_object() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let raw = make_literal_assertion("Alice", "job_title", "CEO");
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        assert_eq!(result.entities_created, 1); // Only Alice
-        assert_eq!(result.attributes_created, 1);
-        assert_eq!(result.rels_created, 0);
-        assert_eq!(result.assertions_recorded, 1);
-    }
-
-    #[tokio::test]
-    async fn test_promote_idempotent() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let raw = make_raw_assertion("Alice", "works_at", "Acme Corp");
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        // First promotion
-        let r1 = promote_assertions_inline(
-            &storage,
-            "test_space",
-            std::slice::from_ref(&raw),
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("first promote");
-
-        assert_eq!(r1.assertions_recorded, 1);
-        assert_eq!(r1.entities_created, 2);
-
-        // Second promotion — same assertion, same doc_node_id
-        let r2 = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("second promote");
-
-        // Should be skipped due to idempotency
-        assert_eq!(r2.assertions_recorded, 0);
-        assert_eq!(r2.entities_created, 0);
-        assert_eq!(r2.rels_created, 0);
-    }
-
-    #[tokio::test]
-    async fn test_promote_merges_repeated_relationship_evidence() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let raw = make_raw_assertion("Alice", "works_at", "Acme Corp");
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-        let first_doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let second_doc_node_id = RecordId::new_v4(TableName::DocNode);
-
-        let first = promote_assertions_inline(
-            &storage,
-            "test_space",
-            std::slice::from_ref(&raw),
-            &work_run_id,
-            &first_doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("first promote");
-        let second = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &second_doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("second promote");
-
-        assert_eq!(first.assertions_recorded, 1);
-        assert_eq!(first.rels_created, 1);
-        assert_eq!(second.assertions_recorded, 1);
-        assert_eq!(second.rels_created, 0);
-
-        let rel_repo = RelRepository::new(storage.clone());
-        let rels = rel_repo.find_by_type("works_at").await.expect("find rels");
-        assert_eq!(rels.len(), 1);
-        assert_eq!(rels[0].evidence.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_promote_skips_low_significance() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let mut raw = make_raw_assertion("Alice", "mentioned_in", "news article");
-        raw.significance = Some("skip".to_string());
-
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        // Assertion IS recorded (evidence layer), but NOT promoted to rel/attr
-        assert_eq!(result.assertions_recorded, 1);
-        assert_eq!(result.assertions_skipped, 1);
-        assert_eq!(result.rels_created, 0);
-        assert_eq!(result.attributes_created, 0);
-        // Entities are still created for the assertion record
-        assert_eq!(result.entities_created, 2);
-    }
-
-    #[tokio::test]
-    async fn test_identity_key_dedup_across_batches() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-
-        let work_run_id = RecordId::new_v4(TableName::WorkItem);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        // Batch 1 from chunk A: "Alice works_at Acme"
-        let node_a = RecordId::new_v4(TableName::DocNode);
-        let batch_a = vec![make_raw_assertion("Alice", "works_at", "Acme")];
-
-        let result_a = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &batch_a,
-            &work_run_id,
-            &node_a,
-            &revision_id,
-            "test",
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            result_a.entities_created, 2,
-            "First batch should create Alice + Acme"
-        );
-
-        // Batch 2 from chunk B: "Alice knows Bob"
-        let node_b = RecordId::new_v4(TableName::DocNode);
-        let batch_b = vec![make_raw_assertion("Alice", "knows", "Bob")];
-
-        let result_b = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &batch_b,
-            &work_run_id,
-            &node_b,
-            &revision_id,
-            "test",
-        )
-        .await
-        .unwrap();
-
-        // Alice should be reused (identity key "alice" already exists), only Bob is new
-        assert_eq!(
-            result_b.entities_created, 1,
-            "Second batch should only create Bob, reusing Alice"
-        );
-
-        // Verify total entity count in DB
-        let entity_repo = EntityRepository::new(storage.clone());
-        let all = entity_repo
-            .search(
-                &SearchCriteria::new()
-                    .with_space_id("test_space".to_string())
-                    .with_limit(100),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            all.results.len(),
-            3,
-            "Should have exactly 3 entities: Alice, Acme, Bob"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_identity_key_dedup_case_insensitive() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-
-        let work_run_id = RecordId::new_v4(TableName::WorkItem);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        // Batch 1: "Alice Chen" (title case)
-        let node_a = RecordId::new_v4(TableName::DocNode);
-        let batch_a = vec![make_raw_assertion("Alice Chen", "works_at", "Acme")];
-
-        let result_a = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &batch_a,
-            &work_run_id,
-            &node_a,
-            &revision_id,
-            "test",
-        )
-        .await
-        .unwrap();
-        assert_eq!(result_a.entities_created, 2);
-
-        // Batch 2: "alice chen" (lowercase) — should reuse
-        let node_b = RecordId::new_v4(TableName::DocNode);
-        let mut assertion = make_raw_assertion("alice chen", "met", "Bob");
-        assertion.object_entity_type = Some("person".to_string());
-        let batch_b = vec![assertion];
-
-        let result_b = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &batch_b,
-            &work_run_id,
-            &node_b,
-            &revision_id,
-            "test",
-        )
-        .await
-        .unwrap();
-
-        // "alice chen" matches identity key "alice chen" from "Alice Chen" — reuse
-        assert_eq!(
-            result_b.entities_created, 1,
-            "Only Bob should be new, alice chen should reuse Alice Chen"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_reused_entity_is_enriched_with_observed_name() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        let entity_id = RecordId::new_v4(TableName::Entity);
-        let base = BaseFields::new(
-            entity_id.clone(),
-            "test_space".to_string(),
-            "test".to_string(),
-        );
-        let mut entity = Entity::new(
-            base,
-            EntityType::new("person"),
-            "alex@example.test".to_string(),
-        );
-        entity.aliases = vec!["Alex".to_string()];
-        entity.identity_keys = vec!["alex".to_string(), "alex@example.test".to_string()];
-        entity_repo.create(entity.clone()).await.unwrap();
-
-        let mut outbox_records = Vec::new();
-        let link = reuse_entity_for_display_name(
-            &entity_repo,
-            "test_space",
-            entity,
-            "Alex Example",
-            None,
-            &[],
-            &mut outbox_records,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(link.id(), &entity_id);
-        let stored = entity_repo
-            .get("test_space", &entity_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(stored.aliases.iter().any(|alias| alias == "Alex Example"));
-        assert!(stored
-            .aliases
-            .iter()
-            .any(|alias| alias == "alex@example.test"));
-        assert!(stored.identity_keys.iter().any(|key| key == "alex example"));
-        assert_eq!(stored.display_name, "Alex Example");
-        assert_eq!(outbox_records.len(), 1);
-        assert_eq!(outbox_records[0].op, EventOperation::Update);
-    }
-
-    #[tokio::test]
-    async fn test_reused_merged_entity_follows_redirect_before_enrichment() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        let active_id = RecordId::new_v4(TableName::Entity);
-        let active_base = BaseFields::new(
-            active_id.clone(),
-            "test_space".to_string(),
-            "test".to_string(),
-        );
-        let mut active = Entity::new(
-            active_base,
-            EntityType::new("person"),
-            "alex@example.test".to_string(),
-        );
-        active.identity_keys = vec!["alex@example.test".to_string()];
-        entity_repo.create(active).await.unwrap();
-
-        let merged_id = RecordId::new_v4(TableName::Entity);
-        let merged_base = BaseFields::new(
-            merged_id.clone(),
-            "test_space".to_string(),
-            "test".to_string(),
-        );
-        let mut merged = Entity::new(merged_base, EntityType::new("person"), "Alex".to_string());
-        merged.status = EntityStatus::Merged;
-        merged.redirect_to = Some(Link::new(active_id.clone()));
-        entity_repo.create(merged.clone()).await.unwrap();
-
-        let mut outbox_records = Vec::new();
-        let link = reuse_entity_for_display_name(
-            &entity_repo,
-            "test_space",
-            merged,
-            "Alex Example",
-            None,
-            &[],
-            &mut outbox_records,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(link.id(), &active_id);
-        let active = entity_repo
-            .get("test_space", &active_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(active.aliases.iter().any(|alias| alias == "Alex Example"));
-        assert!(active.identity_keys.iter().any(|key| key == "alex example"));
-        assert_eq!(active.display_name, "Alex Example");
-    }
-
-    #[tokio::test]
-    async fn test_idempotent_reprocess_enriches_existing_assertion_entity_names() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-        let assertion_repo = AssertionRepository::new(storage.clone());
-
-        let work_run_id = RecordId::new_v4(TableName::WorkItem);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-
-        let entity_id = RecordId::new_v4(TableName::Entity);
-        let base = BaseFields::new(
-            entity_id.clone(),
-            "test_space".to_string(),
-            "test".to_string(),
-        );
-        let mut entity = Entity::new(
-            base,
-            EntityType::new("person"),
-            "alex@example.test".to_string(),
-        );
-        entity.aliases = vec!["Alex".to_string()];
-        entity.identity_keys = vec!["alex".to_string(), "alex@example.test".to_string()];
-        entity_repo.create(entity).await.unwrap();
-
-        let mut raw = make_literal_assertion("Alex Example", "has email", "alex@example.test");
-        raw.subject_entity_type = Some("person".to_string());
-        let assertion_key = build_assertion_key(&doc_node_id, &raw.predicate_text, &raw);
-        let now = Utc::now();
-        let mut assertion_base = BaseFields::new(
-            RecordId::new_v4(TableName::Assertion),
-            "test_space".to_string(),
-            "test".to_string(),
-        );
-        assertion_base.subjects.push(Link::new(entity_id.clone()));
-        assertion_base.subjects_state = SubjectsState::Complete;
-
-        assertion_repo
-            .create(Assertion {
-                base: assertion_base,
-                subject_text: raw.subject_text.clone(),
-                predicate_raw: raw.predicate_text.clone(),
-                predicate_id: Some(raw.predicate_text.clone()),
-                object_text: raw.object_text.clone(),
-                object_literal: raw.object_literal.as_ref().map(|lit| literal_to_json(lit)),
-                evidence: EvidenceSpan {
-                    revision: Link::new(revision_id.clone()),
-                    node: Some(Link::new(doc_node_id.clone())),
-                    start: raw.evidence_span.start,
-                    end: raw.evidence_span.end,
-                    quote_hash: raw.evidence_span.quote_hash.clone(),
-                },
-                source_event_time: raw.source_event_time,
-                observed_at: now,
-                asserted_at: now,
-                assertion_key,
-                resolution_status: ResolutionStatus::Resolved,
-                resolution_method: Some("inline_promotion".to_string()),
-                resolution_confidence: Some(raw.confidence as f32),
-                retry_state: AssertionRetryState::default(),
-                subject_entity: Some(Link::new(entity_id)),
-                object_entity: None,
-                confidence: raw.confidence as f32,
-                subject_entity_type: raw.subject_entity_type.clone(),
-                object_entity_type: raw.object_entity_type.clone(),
-                significance: raw.significance.clone(),
-                lifecycle_tier: "active".to_string(),
-            })
-            .await
-            .unwrap();
-
-        let second = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test",
-        )
-        .await
-        .unwrap();
-        assert_eq!(second.entities_created, 0);
-
-        let results = entity_repo
-            .search(
-                &SearchCriteria::new()
-                    .with_space_id("test_space")
-                    .with_query("Alex Example"),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(results.results.len(), 1);
-        assert_eq!(results.results[0].display_name, "Alex Example");
-        assert!(results.results[0]
-            .aliases
-            .iter()
-            .any(|alias| alias == "Alex Example"));
-    }
-
-    #[tokio::test]
-    async fn test_promote_writes_outbox_events_for_truth_maintenance() {
-        use elephant_storage::SystemEventRepository;
-
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let raw = make_raw_assertion("Alice", "works_at", "Acme Corp");
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        // Should have created entities + rel + written outbox event
-        assert_eq!(result.entities_created, 2);
-        assert_eq!(result.rels_created, 1);
-        assert_eq!(result.outbox_events_written, 1);
-
-        // Verify system_event was written
-        let event_repo = SystemEventRepository::new(storage.clone());
-        let events = event_repo
-            .get_after_seq("test_space", 0, 10)
-            .await
-            .expect("get events");
-        assert_eq!(events.len(), 1, "Should have exactly 1 outbox event");
-        assert_eq!(events[0].event_type, "inline_promotion.completed");
-
-        // Verify the event contains the right records for truth maintenance
-        let payload: elephant_outbox::OutboxPayload =
-            serde_json::from_value(events[0].payload.clone()).expect("parse payload");
-        assert_eq!(payload.space_id, "test_space");
-        assert_eq!(payload.actor, "test_actor");
-        assert!(payload.run_id.is_some());
-
-        // Should have 4 records: 2 entities + 1 event + 1 rel
-        assert_eq!(
-            payload.records.len(),
-            4,
-            "Should have 2 entity + 1 event + 1 rel records"
-        );
-
-        let entity_records: Vec<_> = payload
-            .records
-            .iter()
-            .filter(|r| r.table == "entity")
-            .collect();
-        let event_records: Vec<_> = payload
-            .records
-            .iter()
-            .filter(|r| r.table == "event")
-            .collect();
-        let rel_records: Vec<_> = payload
-            .records
-            .iter()
-            .filter(|r| r.table == "rel")
-            .collect();
-        assert_eq!(entity_records.len(), 2);
-        assert_eq!(event_records.len(), 1);
-        assert_eq!(rel_records.len(), 1);
-
-        // Verify truth maintenance can parse these into trigger events
-        let triggers = crate::truth_maintenance::trigger_events_from_outbox_payload(&payload);
-        assert_eq!(triggers.len(), 4, "Should produce 4 trigger events");
-    }
-
-    #[tokio::test]
-    async fn test_promote_writes_attribute_outbox_event() {
-        use elephant_storage::SystemEventRepository;
-
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let raw = make_literal_assertion("Alice", "job_title", "CEO");
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        assert_eq!(result.entities_created, 1); // Alice only
-        assert_eq!(result.attributes_created, 1);
-        assert_eq!(result.outbox_events_written, 1);
-
-        // Verify outbox payload contains entity + attribute records
-        let event_repo = SystemEventRepository::new(storage.clone());
-        let events = event_repo
-            .get_after_seq("test_space", 0, 10)
-            .await
-            .expect("get events");
-        let payload: elephant_outbox::OutboxPayload =
-            serde_json::from_value(events[0].payload.clone()).expect("parse payload");
-
-        let attr_records: Vec<_> = payload
-            .records
-            .iter()
-            .filter(|r| r.table == "attribute")
-            .collect();
-        assert_eq!(attr_records.len(), 1, "Should have 1 attribute record");
-    }
-
-    #[tokio::test]
-    async fn test_promote_no_outbox_for_skipped_assertions() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let mut raw = make_raw_assertion("Alice", "mentioned_in", "news");
-        raw.significance = Some("skip".to_string());
-
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        // Skipped assertions still create entities but no rel/attr
-        assert_eq!(result.assertions_skipped, 1);
-        // Entities ARE created (for the assertion record), so outbox events should fire
-        assert_eq!(result.entities_created, 2);
-        assert_eq!(result.outbox_events_written, 1);
-
-        // Verify only entity records in outbox (no rel or attribute)
-        use elephant_storage::SystemEventRepository;
-        let event_repo = SystemEventRepository::new(storage.clone());
-        let events = event_repo
-            .get_after_seq("test_space", 0, 10)
-            .await
-            .expect("get events");
-        let payload: elephant_outbox::OutboxPayload =
-            serde_json::from_value(events[0].payload.clone()).expect("parse payload");
-
-        let rel_count = payload.records.iter().filter(|r| r.table == "rel").count();
-        let attr_count = payload
-            .records
-            .iter()
-            .filter(|r| r.table == "attribute")
-            .count();
-        assert_eq!(
-            rel_count, 0,
-            "Skipped assertions should not create rel events"
-        );
-        assert_eq!(
-            attr_count, 0,
-            "Skipped assertions should not create attr events"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_choke_001_inline_promotion_persists_event_and_outbox_ref() {
-        use elephant_storage::{EventRepository, SystemEventRepository};
-
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let mut raw = make_raw_assertion("Alice", "announced", "Project Phoenix");
-        raw.source_event_time = Some(
-            chrono::DateTime::parse_from_rfc3339("2024-01-15T09:00:00Z")
-                .expect("parse time")
-                .with_timezone(&Utc),
-        );
-        raw.event_title = Some("Alice announced Project Phoenix".to_string());
-        raw.confidence = 0.87;
-
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        assert_eq!(result.events_created, 1, "Expected exactly one event");
-
-        let event_repo = EventRepository::new(storage.clone());
-        let events = event_repo
-            .list_recent("test_space", 10)
-            .await
-            .expect("list events");
-        assert_eq!(events.len(), 1, "Expected persisted event");
-        let event = &events[0];
-        assert_eq!(event.title, "Alice announced Project Phoenix");
-        assert_eq!(event.status, EventStatus::Approved);
-        assert_eq!(
-            event.time_start.expect("time_start"),
-            chrono::DateTime::parse_from_rfc3339("2024-01-15T09:00:00Z")
-                .expect("parse time")
-                .with_timezone(&Utc)
-        );
-        assert!((event.confidence - 0.87).abs() < f32::EPSILON);
-        assert!((event.time_confidence - 0.87).abs() < f32::EPSILON);
-        assert_eq!(event.assertion_refs.len(), 1, "Expected assertion evidence");
-        assert_eq!(
-            event.base.subjects.len(),
-            2,
-            "Subject + object participants"
-        );
-
-        let system_event_repo = SystemEventRepository::new(storage.clone());
-        let outbox_events = system_event_repo
-            .get_after_seq("test_space", 0, 10)
-            .await
-            .expect("get outbox events");
-        assert_eq!(outbox_events.len(), 1, "Expected one outbox payload");
-        let payload: elephant_outbox::OutboxPayload =
-            serde_json::from_value(outbox_events[0].payload.clone()).expect("payload");
-        assert!(
-            payload.records.iter().any(|record| record.table == "event"),
-            "Outbox payload must contain event record reference"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_event_below_threshold_stays_candidate() {
-        use elephant_storage::EventRepository;
-
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let mut raw = make_raw_assertion("Alice", "announced", "Project Phoenix");
-        raw.source_event_time = Some(Utc::now());
-        raw.confidence = 0.5;
-
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        let event_repo = EventRepository::new(storage.clone());
-        let events = event_repo
-            .list_recent("test_space", 10)
-            .await
-            .expect("list events");
-        assert_eq!(events.len(), 1, "Expected persisted event");
-        assert_eq!(events[0].status, EventStatus::Candidate);
-    }
-
-    #[tokio::test]
-    async fn test_event_prefers_extractor_title_and_precision() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let mut raw = make_raw_assertion("Alice", "joined", "Acme Corp");
-        raw.source_event_time = Some(Utc::now());
-        raw.source_event_time_precision = Some(TimePrecision::Month);
-        raw.event_title = Some("Board approved acquisition".to_string());
-
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        assert_eq!(result.events_created, 1);
-        let event_repo = EventRepository::new(storage.clone());
-        let events = event_repo
-            .list("test_space", 10, None)
-            .await
-            .expect("events");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].title, "Board approved acquisition");
-        assert_eq!(events[0].time_precision, TimePrecision::Month);
-    }
-
-    #[tokio::test]
-    async fn test_event_without_precise_time_is_still_created() {
-        use elephant_storage::EventRepository;
-
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let mut raw = make_raw_assertion("Alice", "launched", "Project Phoenix");
-        raw.source_event_time = None;
-        raw.source_event_time_precision = None;
-        raw.event_title = Some("Launch event".to_string());
-
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[raw],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("promote");
-
-        assert_eq!(
-            result.events_created, 1,
-            "event should still be materialized"
-        );
-
-        let event_repo = EventRepository::new(storage.clone());
-        let events = event_repo
-            .list_recent("test_space", 10)
-            .await
-            .expect("list events");
-        assert_eq!(events.len(), 1);
-        let event = &events[0];
-        assert!(
-            event.time_start.is_none(),
-            "time_start should remain unknown"
-        );
-        assert_eq!(event.time_precision, TimePrecision::Unknown);
-        assert_eq!(
-            event.metadata["time_basis"],
-            serde_json::Value::String("unknown".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_event_temporal_refinement_updates_existing_lineage() {
-        use elephant_storage::EventRepository;
-
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let mut first = make_raw_assertion("Alice", "launched", "Project Phoenix");
-        first.source_event_time = None;
-        first.source_event_time_precision = None;
-        first.event_title = Some("Launch event".to_string());
-
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let first_result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[first.clone()],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("first promote");
-        assert_eq!(first_result.events_created, 1);
-
-        let mut second = first;
-        second.source_event_time = Some(
-            chrono::DateTime::parse_from_rfc3339("2024-03-10T12:00:00Z")
-                .expect("parse time")
-                .with_timezone(&Utc),
-        );
-        second.source_event_time_precision = Some(TimePrecision::Day);
-
-        let second_result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[second],
-            &RecordId::new_v4(TableName::WorkRun),
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("second promote");
-        assert_eq!(
-            second_result.events_created, 0,
-            "refinement should update existing event instead of creating another"
-        );
-
-        let expected_lineage_key = build_assertion_key(
-            &doc_node_id,
-            "launched",
-            &make_raw_assertion("Alice", "launched", "Project Phoenix"),
-        );
-        let event_repo = EventRepository::new(storage.clone());
-        let events = event_repo
-            .list_recent("test_space", 10)
-            .await
-            .expect("list events");
-        assert_eq!(events.len(), 1);
-        let event = &events[0];
-        assert_eq!(
-            event.time_start,
-            Some(
-                chrono::DateTime::parse_from_rfc3339("2024-03-10T12:00:00Z")
-                    .expect("parse time")
-                    .with_timezone(&Utc)
-            )
-        );
-        assert_eq!(event.time_precision, TimePrecision::Day);
-        assert_eq!(
-            event.metadata["time_basis"],
-            serde_json::Value::String("source_event_time".to_string())
-        );
-        assert_eq!(
-            event.metadata[EVENT_METADATA_LINEAGE_KEY],
-            serde_json::Value::String(expected_lineage_key)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_event_temporal_refinement_reuses_same_timestamp_with_better_precision() {
-        use elephant_storage::EventRepository;
-
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let timestamp = chrono::DateTime::parse_from_rfc3339("2024-03-10T12:00:00Z")
-            .expect("parse time")
-            .with_timezone(&Utc);
-
-        let mut first = make_raw_assertion("Alice", "launched", "Project Phoenix");
-        first.source_event_time = Some(timestamp);
-        first.source_event_time_precision = Some(TimePrecision::Day);
-        first.event_title = Some("Launch event".to_string());
-
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let first_result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[first.clone()],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("first promote");
-        assert_eq!(first_result.events_created, 1);
-
-        let mut second = first;
-        second.source_event_time_precision = Some(TimePrecision::Minute);
-
-        let second_result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[second],
-            &RecordId::new_v4(TableName::WorkRun),
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("second promote");
-        assert_eq!(
-            second_result.events_created, 0,
-            "same timestamp lineage should refine instead of duplicating"
-        );
-
-        let events = EventRepository::new(storage)
-            .list_recent("test_space", 10)
-            .await
-            .expect("list events");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].time_start, Some(timestamp));
-        assert_eq!(events[0].time_precision, TimePrecision::Minute);
-    }
-
-    #[tokio::test]
-    async fn test_event_temporal_refinement_reuses_same_day_with_more_precise_time() {
-        use elephant_storage::EventRepository;
-
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
-
-        let day_precision_time = chrono::DateTime::parse_from_rfc3339("2024-03-10T00:00:00Z")
-            .expect("parse day time")
-            .with_timezone(&Utc);
-        let exact_time = chrono::DateTime::parse_from_rfc3339("2024-03-10T12:30:00Z")
-            .expect("parse exact time")
-            .with_timezone(&Utc);
-
-        let mut first = make_raw_assertion("Alice", "launched", "Project Phoenix");
-        first.source_event_time = Some(day_precision_time);
-        first.source_event_time_precision = Some(TimePrecision::Day);
-        first.event_title = Some("Launch event".to_string());
-
-        let work_run_id = RecordId::new_v4(TableName::WorkRun);
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let revision_id = RecordId::new_v4(TableName::DocRevision);
-
-        let first_result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[first.clone()],
-            &work_run_id,
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("first promote");
-        assert_eq!(first_result.events_created, 1);
-
-        let mut second = first;
-        second.source_event_time = Some(exact_time);
-        second.source_event_time_precision = Some(TimePrecision::Exact);
-
-        let second_result = promote_assertions_inline(
-            &storage,
-            "test_space",
-            &[second],
-            &RecordId::new_v4(TableName::WorkRun),
-            &doc_node_id,
-            &revision_id,
-            "test_actor",
-        )
-        .await
-        .expect("second promote");
-        assert_eq!(
-            second_result.events_created, 0,
-            "same-day lineage should refine instead of duplicating"
-        );
-
-        let events = EventRepository::new(storage)
-            .list_recent("test_space", 10)
-            .await
-            .expect("list events");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].time_start, Some(exact_time));
-        assert_eq!(events[0].time_precision, TimePrecision::Exact);
-    }
-
-    #[derive(Debug, Default)]
-    struct FakePromotionDisambiguator {
-        decisions:
-            std::sync::Mutex<std::collections::VecDeque<Option<PromotionDisambiguationDecision>>>,
-        requests: std::sync::Mutex<Vec<DisambiguationRequest>>,
-    }
-
-    impl FakePromotionDisambiguator {
-        fn scripted(decisions: Vec<Option<PromotionDisambiguationDecision>>) -> Arc<Self> {
-            Arc::new(Self {
-                decisions: std::sync::Mutex::new(decisions.into()),
-                requests: std::sync::Mutex::new(Vec::new()),
-            })
-        }
-
-        fn options(self: &Arc<Self>) -> PromotionOptions {
-            PromotionOptions {
-                disambiguator: Some(self.clone() as Arc<dyn PromotionDisambiguator>),
-            }
-        }
-
-        fn requests(&self) -> Vec<DisambiguationRequest> {
-            self.requests.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl PromotionDisambiguator for FakePromotionDisambiguator {
-        async fn disambiguate(
-            &self,
-            input: &DisambiguationRequest,
-        ) -> Result<Option<PromotionDisambiguationDecision>, PipelineError> {
-            self.requests.lock().unwrap().push(input.clone());
-            Ok(self.decisions.lock().unwrap().pop_front().flatten())
-        }
-    }
-
-    fn make_typed_entity(
-        display_name: &str,
-        entity_type: &str,
-        created_at: DateTime<Utc>,
-    ) -> Entity {
-        let mut base = BaseFields::new(
-            RecordId::new_v4(TableName::Entity),
-            "test_space".to_string(),
-            "test".to_string(),
-        );
-        base.created_at = created_at;
-        let mut entity = Entity::new(base, EntityType::new(entity_type), display_name.to_string());
-        entity.identity_keys = vec![display_name.to_lowercase()];
-        entity
-    }
-
-    async fn promote_with(
-        storage: &StorageClient,
-        raw: &RawAssertion,
-        doc_node_id: &RecordId,
-        options: &PromotionOptions,
-    ) -> PromotionResult {
-        promote_assertions_inline_with_options(
-            storage,
-            "test_space",
-            std::slice::from_ref(raw),
-            &RecordId::new_v4(TableName::WorkRun),
-            doc_node_id,
-            &RecordId::new_v4(TableName::DocRevision),
-            "test_actor",
-            options,
-        )
-        .await
-        .expect("promote")
-    }
-
-    async fn promoted_subject_entity_id(
-        storage: &StorageClient,
-        doc_node_id: &RecordId,
-        raw: &RawAssertion,
-    ) -> RecordId {
-        let key = build_assertion_key(doc_node_id, &raw.predicate_text, raw);
-        let assertion = AssertionRepository::new(storage.clone())
-            .find_by_assertion_key("test_space", &key)
-            .await
-            .expect("find assertion")
-            .expect("assertion exists");
-        assertion
-            .subject_entity
-            .expect("subject entity")
-            .id()
-            .clone()
-    }
-
-    #[tokio::test]
-    async fn test_type_guard_same_specific_type_reuses() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        let existing = make_typed_entity("Alice", "person", Utc::now());
-        let existing_id = existing.base.id.clone();
-        entity_repo.create(existing).await.unwrap();
-
-        let raw = make_literal_assertion("Alice", "job_title", "CEO");
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let result = promote_with(&storage, &raw, &doc_node_id, &PromotionOptions::default()).await;
-
-        assert_eq!(result.entities_created, 0, "same specific type must reuse");
-        assert_eq!(
-            promoted_subject_entity_id(&storage, &doc_node_id, &raw).await,
-            existing_id
-        );
-    }
-
-    #[tokio::test]
-    async fn test_type_guard_topic_and_specific_reuse_with_upgrade() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        // Stored topic + incoming specific: reuse and upgrade the stored type.
-        let stored_topic = make_typed_entity("Acme", "topic", Utc::now());
-        let topic_id = stored_topic.base.id.clone();
-        entity_repo.create(stored_topic).await.unwrap();
-
-        let mut raw = make_literal_assertion("Acme", "founded_in", "1999");
-        raw.subject_entity_type = Some("org".to_string());
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let result = promote_with(&storage, &raw, &doc_node_id, &PromotionOptions::default()).await;
-
-        assert_eq!(result.entities_created, 0);
-        assert_eq!(
-            promoted_subject_entity_id(&storage, &doc_node_id, &raw).await,
-            topic_id
-        );
-        let stored = entity_repo
-            .get("test_space", &topic_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            stored.entity_type.as_str(),
-            "org",
-            "topic must be upgraded to the specific incoming type"
-        );
-
-        // Stored specific + incoming untyped (topic): reuse, keep specific type.
-        let mut untyped = make_literal_assertion("Acme", "employee_count", "500");
-        untyped.subject_entity_type = None;
-        let second_node = RecordId::new_v4(TableName::DocNode);
-        let second = promote_with(
-            &storage,
-            &untyped,
-            &second_node,
-            &PromotionOptions::default(),
-        )
-        .await;
-
-        assert_eq!(second.entities_created, 0);
-        assert_eq!(
-            promoted_subject_entity_id(&storage, &second_node, &untyped).await,
-            topic_id
-        );
-        let stored = entity_repo
-            .get("test_space", &topic_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.entity_type.as_str(), "org", "no downgrade to topic");
-    }
-
-    #[tokio::test]
-    async fn test_type_guard_specific_conflict_creates_new_without_llm() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        let planet = make_typed_entity("Mercury", "location", Utc::now());
-        let planet_id = planet.base.id.clone();
-        entity_repo.create(planet).await.unwrap();
-
-        let mut raw = make_literal_assertion("Mercury", "role", "messenger god");
-        raw.subject_entity_type = Some("person".to_string());
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let result = promote_with(&storage, &raw, &doc_node_id, &PromotionOptions::default()).await;
-
-        assert_eq!(
-            result.entities_created, 1,
-            "conflicting specific types must create a new entity, never false-merge"
-        );
-        let subject_id = promoted_subject_entity_id(&storage, &doc_node_id, &raw).await;
-        assert_ne!(subject_id, planet_id);
-        let planet = entity_repo
-            .get("test_space", &planet_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            planet.entity_type.as_str(),
-            "location",
-            "stored entity untouched"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_untyped_then_typed_sequence_reuses_and_upgrades() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        let mut untyped = make_literal_assertion("Acme", "mentioned", "in passing");
-        untyped.subject_entity_type = None;
-        let first_node = RecordId::new_v4(TableName::DocNode);
-        let first = promote_with(
-            &storage,
-            &untyped,
-            &first_node,
-            &PromotionOptions::default(),
-        )
-        .await;
-        assert_eq!(first.entities_created, 1);
-
-        let mut typed = make_literal_assertion("Acme", "founded_in", "1999");
-        typed.subject_entity_type = Some("org".to_string());
-        let second_node = RecordId::new_v4(TableName::DocNode);
-        let second =
-            promote_with(&storage, &typed, &second_node, &PromotionOptions::default()).await;
-
-        assert_eq!(
-            second.entities_created, 0,
-            "typed mention must reuse, not duplicate"
-        );
-        let matches = entity_repo
-            .find_by_identity_key_all("test_space", "acme")
-            .await
-            .unwrap();
-        assert_eq!(matches.len(), 1, "exactly one Acme entity");
-        assert_eq!(matches[0].entity_type.as_str(), "org");
-    }
-
-    #[tokio::test]
-    async fn test_multi_match_disambiguator_chooses_candidate() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        let now = Utc::now();
-        let mut first = make_typed_entity("Acme Corp", "org", now - chrono::Duration::hours(2));
-        first.identity_keys = vec!["acme".to_string()];
-        let mut second = make_typed_entity("Acme Inc", "org", now - chrono::Duration::hours(1));
-        second.identity_keys = vec!["acme".to_string()];
-        let second_id = second.base.id.clone();
-        entity_repo.create(first).await.unwrap();
-        entity_repo.create(second).await.unwrap();
-
-        let fake = FakePromotionDisambiguator::scripted(vec![Some(
-            PromotionDisambiguationDecision::Reuse {
-                entity_id: second_id.to_string(),
-            },
-        )]);
-        let mut raw = make_literal_assertion("Acme", "founded_in", "1999");
-        raw.subject_entity_type = Some("org".to_string());
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let result = promote_with(&storage, &raw, &doc_node_id, &fake.options()).await;
-
-        assert_eq!(result.entities_created, 0);
-        assert_eq!(
-            promoted_subject_entity_id(&storage, &doc_node_id, &raw).await,
-            second_id
-        );
-        let requests = fake.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].candidates.len(), 2);
-        assert_eq!(requests[0].mention, "Acme");
-        assert_eq!(requests[0].normalized_type, "org");
-    }
-
-    #[tokio::test]
-    async fn test_multi_match_no_decision_falls_back_to_earliest_created() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        let now = Utc::now();
-        // Insert the NEWER entity first so scan/insertion order disagrees
-        // with created_at order.
-        let mut newer = make_typed_entity("Acme Inc", "org", now);
-        newer.identity_keys = vec!["acme".to_string()];
-        let mut older = make_typed_entity("Acme Corp", "org", now - chrono::Duration::hours(3));
-        older.identity_keys = vec!["acme".to_string()];
-        let older_id = older.base.id.clone();
-        entity_repo.create(newer).await.unwrap();
-        entity_repo.create(older).await.unwrap();
-
-        let fake = FakePromotionDisambiguator::scripted(vec![None]);
-        let mut raw = make_literal_assertion("Acme", "founded_in", "1999");
-        raw.subject_entity_type = Some("org".to_string());
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let result = promote_with(&storage, &raw, &doc_node_id, &fake.options()).await;
-
-        assert_eq!(result.entities_created, 0);
-        assert_eq!(
-            promoted_subject_entity_id(&storage, &doc_node_id, &raw).await,
-            older_id,
-            "deterministic fallback must pick the earliest-created match"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_multi_match_disambiguator_create_new() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        let now = Utc::now();
-        for name in ["Acme Corp", "Acme Inc"] {
-            let mut entity = make_typed_entity(name, "org", now);
-            entity.identity_keys = vec!["acme".to_string()];
-            entity_repo.create(entity).await.unwrap();
-        }
-
-        let fake = FakePromotionDisambiguator::scripted(vec![Some(
-            PromotionDisambiguationDecision::CreateNew,
-        )]);
-        let mut raw = make_literal_assertion("Acme", "founded_in", "1999");
-        raw.subject_entity_type = Some("org".to_string());
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let result = promote_with(&storage, &raw, &doc_node_id, &fake.options()).await;
-
-        assert_eq!(
-            result.entities_created, 1,
-            "create_new decision must be honored"
-        );
-        assert_eq!(
-            entity_repo
-                .find_by_identity_key_all("test_space", "acme")
-                .await
-                .unwrap()
-                .len(),
-            3
-        );
-    }
-
-    #[tokio::test]
-    async fn test_indistinguishable_matches_reuse_earliest_without_asking() {
-        // Synthetic regression: a CreateNew response must not amplify duplicate
-        // records that contain no distinguishing information.
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        let now = Utc::now();
-        let earliest = now - chrono::Duration::days(2);
-        let mut first = make_typed_entity("Morgan Sjöberg", "person", earliest);
-        first.identity_keys = vec!["morgan sjöberg".to_string()];
-        let earliest_id = first.base.id.clone();
-        entity_repo.create(first).await.unwrap();
-        let mut second = make_typed_entity("Morgan Sjöberg", "person", now);
-        second.identity_keys = vec!["morgan sjöberg".to_string()];
-        entity_repo.create(second).await.unwrap();
-
-        // Scripted to CreateNew: the point is that it is never consulted.
-        let fake = FakePromotionDisambiguator::scripted(vec![Some(
-            PromotionDisambiguationDecision::CreateNew,
-        )]);
-        let mut raw = make_literal_assertion("Morgan Sjöberg", "works_at", "Northbank Academy");
-        raw.subject_entity_type = Some("person".to_string());
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let result = promote_with(&storage, &raw, &doc_node_id, &fake.options()).await;
-
-        assert_eq!(
-            result.entities_created, 0,
-            "a third record with the same identity key deepens the ambiguity it was \
-             asked to resolve; it must reuse instead"
-        );
-        assert!(
-            fake.requests().is_empty(),
-            "the disambiguator must not be asked to separate records that carry no \
-             distinguishing information"
-        );
-        let stored = entity_repo
-            .find_by_identity_key_all("test_space", "morgan sjöberg")
-            .await
-            .unwrap();
-        assert_eq!(stored.len(), 2, "no duplicate was added");
-        assert_eq!(
-            promoted_subject_entity_id(&storage, &doc_node_id, &raw).await,
-            earliest_id,
-            "reuse is deterministic: the earliest-created candidate wins"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_distinguishable_matches_still_consult_the_disambiguator() {
-        // The legitimate case this must not break: two REAL records that happen to
-        // share an identity key. They differ, so the disambiguator has something to
-        // decide on and its verdict stands - see
-        // test_multi_match_disambiguator_create_new, which covers the CreateNew half.
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        let now = Utc::now();
-        let mut first = make_typed_entity("Anna Andersson", "person", now);
-        first.identity_keys = vec!["anna andersson".to_string()];
-        first.summary = Some("Ada's swimming teacher".to_string());
-        entity_repo.create(first).await.unwrap();
-        let mut second = make_typed_entity("Anna Andersson", "person", now);
-        second.identity_keys = vec!["anna andersson".to_string()];
-        entity_repo.create(second).await.unwrap();
-
-        let fake = FakePromotionDisambiguator::scripted(vec![None]);
-        let mut raw = make_literal_assertion("Anna Andersson", "works_at", "Northbank Academy");
-        raw.subject_entity_type = Some("person".to_string());
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        promote_with(&storage, &raw, &doc_node_id, &fake.options()).await;
-
-        assert_eq!(
-            fake.requests().len(),
-            1,
-            "when the candidates differ, the disambiguator is the right authority"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_incompatible_match_disambiguator_can_override_type_guard() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        // Stored type is wrong: "Mercury" the person was misfiled as location.
-        let stored = make_typed_entity("Mercury", "location", Utc::now());
-        let stored_id = stored.base.id.clone();
-        entity_repo.create(stored).await.unwrap();
-
-        let fake = FakePromotionDisambiguator::scripted(vec![Some(
-            PromotionDisambiguationDecision::Reuse {
-                entity_id: stored_id.to_string(),
-            },
-        )]);
-        let mut raw = make_literal_assertion("Mercury", "role", "messenger god");
-        raw.subject_entity_type = Some("person".to_string());
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let result = promote_with(&storage, &raw, &doc_node_id, &fake.options()).await;
-
-        assert_eq!(
-            result.entities_created, 0,
-            "LLM reuse overrides the type guard"
-        );
-        assert_eq!(
-            promoted_subject_entity_id(&storage, &doc_node_id, &raw).await,
-            stored_id
-        );
-        let stored = entity_repo
-            .get("test_space", &stored_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            stored.entity_type.as_str(),
-            "location",
-            "no type rewrite when reusing across a type conflict"
-        );
-        assert_eq!(fake.requests().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_incompatible_match_unknown_reuse_id_creates_new() {
-        let storage = StorageClient::new_memory().await.unwrap();
-        storage.query(SCHEMA).await.unwrap();
-        let entity_repo = EntityRepository::new(storage.clone());
-
-        let stored = make_typed_entity("Mercury", "location", Utc::now());
-        let stored_id = stored.base.id.clone();
-        entity_repo.create(stored).await.unwrap();
-
-        let fake = FakePromotionDisambiguator::scripted(vec![Some(
-            PromotionDisambiguationDecision::Reuse {
-                entity_id: "entity:not-a-candidate".to_string(),
-            },
-        )]);
-        let mut raw = make_literal_assertion("Mercury", "role", "messenger god");
-        raw.subject_entity_type = Some("person".to_string());
-        let doc_node_id = RecordId::new_v4(TableName::DocNode);
-        let result = promote_with(&storage, &raw, &doc_node_id, &fake.options()).await;
-
-        assert_eq!(result.entities_created, 1);
-        assert_ne!(
-            promoted_subject_entity_id(&storage, &doc_node_id, &raw).await,
-            stored_id
-        );
-    }
-
-    #[test]
-    fn test_entity_types_compatible_matrix() {
-        let person = EntityType::new("person");
-        let org = EntityType::new("org");
-        let topic = EntityType::new("topic");
-        // Legacy/unknown stored values normalize into the vocabulary.
-        let company = EntityType::new("company");
-        let weird = EntityType::new("something-else");
-
-        assert!(entity_types_compatible(&person, &person));
-        assert!(entity_types_compatible(&topic, &person));
-        assert!(entity_types_compatible(&person, &topic));
-        assert!(entity_types_compatible(&topic, &topic));
-        assert!(!entity_types_compatible(&person, &org));
-        assert!(entity_types_compatible(&company, &org));
-        assert!(entity_types_compatible(&weird, &person));
-    }
-
-    #[test]
-    fn test_assertion_context_snippet_prefers_quote() {
-        let mut raw = make_raw_assertion("Alice", "works_at", "Acme Corp");
-        assert_eq!(assertion_context_snippet(&raw), "test quote");
-
-        raw.quote = None;
-        assert_eq!(assertion_context_snippet(&raw), "Alice works_at Acme Corp");
-
-        raw.quote = Some("x".repeat(2 * CONTEXT_SNIPPET_MAX_CHARS));
-        assert_eq!(
-            assertion_context_snippet(&raw).chars().count(),
-            CONTEXT_SNIPPET_MAX_CHARS
-        );
-    }
-}
+#[path = "inline_promotion_tests.rs"]
+mod tests;

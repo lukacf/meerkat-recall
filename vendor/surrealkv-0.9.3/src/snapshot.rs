@@ -77,7 +77,7 @@ impl Snapshot {
 
     /// Retrieves an iterator over the key-value pairs in the snapshot.
     #[allow(unused)]
-    pub(crate) fn iter(&self) -> Iter<VariableSizeKey, IndexValue> {
+    pub(crate) fn iter(&self) -> Iter<'_, VariableSizeKey, IndexValue> {
         self.snap.iter()
     }
 

@@ -38,8 +38,8 @@ REMOVE FIELD provenance.chain ON TABLE doc_chunk;
 DEFINE FIELD provenance.extractor ON TABLE doc_chunk TYPE option<object> FLEXIBLE;
 DEFINE FIELD provenance.chain ON TABLE doc_chunk TYPE array<object> FLEXIBLE;
 
-REMOVE FIELD provenance.extractor ON TABLE chunk_embedding;
-REMOVE FIELD provenance.chain ON TABLE chunk_embedding;
+REMOVE FIELD IF EXISTS provenance.extractor ON TABLE chunk_embedding;
+REMOVE FIELD IF EXISTS provenance.chain ON TABLE chunk_embedding;
 DEFINE FIELD provenance.extractor ON TABLE chunk_embedding TYPE option<object> FLEXIBLE;
 DEFINE FIELD provenance.chain ON TABLE chunk_embedding TYPE array<object> FLEXIBLE;
 

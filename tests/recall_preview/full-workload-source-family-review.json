@@ -1,0 +1,171 @@
+{
+  "format": "recall-independent-source-family-review/v1",
+  "reviewed_at": "2026-10-07T04:21:51.655900+00:00",
+  "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd",
+  "package_source_commit": "f17f5a7dc702fa07cdda6861506d19d626e9cd6c",
+  "package": {
+    "path": "tests/recall_preview_semantics/full_workload_plan/case-plan.json",
+    "sha256": "584f1fa5013432f4f8fb2cc32f327b6f1eb3643cb2663229665df01c856167ac",
+    "bytes": 10691
+  },
+  "decision": "joined-source-contract-ack",
+  "components": [
+    {
+      "module": "fixtures",
+      "package_component": "fixtures",
+      "path": "tests/recall_preview/fixtures.py",
+      "sha256": "ffb15f35c3ad295234284c74c6022cfda2ad1b69a998018b9a8a55db0013be87",
+      "bytes": 2039
+    },
+    {
+      "module": "matrix",
+      "package_component": "matrix",
+      "path": "tests/recall_preview/matrix.py",
+      "sha256": "2abfbc474b5598e5d82190bd47ad554b1899ba8c5b002b1b9f1a0dd1ca30c306",
+      "bytes": 28819
+    },
+    {
+      "module": "oracle",
+      "package_component": "oracle",
+      "path": "tests/recall_preview/oracle.py",
+      "sha256": "57ffffe9ca1dfbe98e984494611d6de07239dd5fff3ffe8454c3dff7ea3dfbbf",
+      "bytes": 22040
+    },
+    {
+      "module": "installed_d_capture",
+      "package_component": "installed_d_capture",
+      "path": "scripts/qualification/recall_preview.py",
+      "sha256": "63b6afe0f2024e4405e6df5ed46b41acf941532ac62d45138c8fde220eb3abdb",
+      "bytes": 14574
+    },
+    {
+      "module": "installed_release_artifact",
+      "package_component": "installed_release_artifact",
+      "path": "scripts/release/artifact.py",
+      "sha256": "d8f62a2b3fae39e00b086774d6b0351e550c5298876a1fea6fc00d56f5bdfc6b",
+      "bytes": 25767
+    },
+    {
+      "module": "installed_original_process_capture",
+      "package_component": "installed_original_process_capture",
+      "path": "scripts/qualification/installed_process_capture.py",
+      "sha256": "731d7c85db8729a6d6f6e7b3757e501f985871d0cf4b6ed77d034f6283a370be",
+      "bytes": 19340
+    },
+    {
+      "module": "full_workload_installed_helpers",
+      "package_component": "full_workload_installed_helpers",
+      "path": "scripts/qualification/installed_linux_offline.py",
+      "sha256": "9884b82c857da367e63e23cb9609eee54340e1a0264c96f1668b98fe9ffc4331",
+      "bytes": 68982
+    },
+    {
+      "module": "snapshot_inspection_capture",
+      "package_component": "snapshot_inspection_capture",
+      "path": "scripts/qualification/snapshot_inspection_capture.py",
+      "sha256": "4fd25528d1df53c6fa4840f7e12b5947a463dbf921c3e4bc4f63ecff4c7be2e4",
+      "bytes": 5010
+    },
+    {
+      "module": "runtime_package_bootstrap_contract",
+      "package_component": "runtime_package_bootstrap_contract",
+      "path": "scripts/qualification/runtime_package_bootstrap_contract.py",
+      "sha256": "460e08d9cbfbbe2890c6aa486b4256d4c2bdd9af0966d6c4193398d44fabee09",
+      "bytes": 19628
+    },
+    {
+      "module": "full_workload_runtime_inspection",
+      "package_component": "full_workload_runtime_inspection",
+      "path": "scripts/qualification/full_workload_runtime_inspection.py",
+      "sha256": "79ce2148bb76f67c0f12e03c223c1ca138af1e4d5504b2be3a4fdc2c2a5fe9c4",
+      "bytes": 17085
+    },
+    {
+      "module": "full_workload_transport",
+      "package_component": "transport",
+      "path": "tests/recall_preview_semantics/full_workload_transport.py",
+      "sha256": "308ee747a86a99bb9e6427c34677bfc42845862fcd18fe662d013a75b119554a",
+      "bytes": 22543
+    },
+    {
+      "module": "full_workload_spy",
+      "package_component": "spy",
+      "path": "tests/recall_preview_semantics/full_workload_spy.py",
+      "sha256": "604086b12a5cc349121d25bbccebeec13ae2c6e318ae25617abcce5344828284",
+      "bytes": 21797
+    },
+    {
+      "module": "full_workload_graph",
+      "package_component": "graph",
+      "path": "tests/recall_preview_semantics/full_workload_graph.py",
+      "sha256": "a2b04bfc33eb065aa7cd77f10362d8da92f7f28e4da4a8e89ff353184d3b45b9",
+      "bytes": 17275
+    },
+    {
+      "module": "full_workload_load",
+      "package_component": "load",
+      "path": "tests/recall_preview_semantics/full_workload_load.py",
+      "sha256": "a6d97ca6c86e8a0c9e2415910d553e3082da07b97eb0389998cc896580680364",
+      "bytes": 10989
+    },
+    {
+      "module": "full_workload_ob3_oracle",
+      "package_component": "ob3_oracle",
+      "path": "scripts/qualification/ob3_outage_oracle.py",
+      "sha256": "b3263d6cec8880929c769b24397975bdc1683123612492cee71324e58bdc5bbf",
+      "bytes": 10839
+    },
+    {
+      "module": "full_workload_owned_runtime",
+      "package_component": "full_workload_owned_runtime",
+      "path": "scripts/qualification/full_workload_owned_runtime.py",
+      "sha256": "b91c01ee9c8f822c65bebe48e3664336abade575c2f3cae4f7550353efd5c60d",
+      "bytes": 46901
+    },
+    {
+      "module": "full_workload_driver",
+      "package_component": "driver",
+      "path": "tests/recall_preview_semantics/full_workload_driver.py",
+      "sha256": "57a2c66f8973fcbee2c7fa6e4c512edaa3153e27a9d36b261e35bf5cce44324d",
+      "bytes": 81082
+    },
+    {
+      "module": "full_workload_verified_cli",
+      "package_component": "cli",
+      "path": "scripts/qualification/full_workload.py",
+      "sha256": "82c23312efb684ef8678e44a5251ee4e53edfc788bc0cc34f2ec39cc023de13f",
+      "bytes": 33101
+    }
+  ],
+  "verified_static": [
+    "Exact 18 MODULES paths match all original package component SHA-256/length/source pins; 467811 bytes; every source parses as AST without imports or execution. Original package aliases and runtime module names are separately retained.",
+    "Verified loader compiles the same original bounded source bytes after complete hash membership validation and injects original installed helper module objects.",
+    "Original approved worker recipe, spy credential and data/manage/revocable principal literals are bound before startup; final binder compares complete management/revocable templates.",
+    "Actual owned startup uses existing signed-token CLI and explicit fresh schema initialization; both named configurations/grants and empty inventories are read back before managed workers are enabled.",
+    "Global operator and inspector roles remain distinct; no named-space header is attached to global runtime calls.",
+    "Initial current process/worker/factory inspection precedes Driver construction; the same actual owner and client bracket all four original boundaries.",
+    "Only processing.index_generation is removed from stable policy comparison; original raw configuration remains and unsigned u64 epoch is initially exact, then monotonic.",
+    "S cleanup timer surrounds active workload inside owner lifetime, leaving the original 75-second reserve for owner exit; original overall deadlines and caps are unchanged.",
+    "Fixed snapshot stdout role uses original F proof stream reservation and actual B charge callback into the same Capture; report bytes retain their original snapshot-inspection reference."
+  ],
+  "peer_review_scope": [
+    "F selected actual original process lifetime, cleanup and stream capacity source review retained; D does not replace it with a callback-present flag.",
+    "C selected product CLI/auth/runtime/readiness compatibility source review agrees with D startup trace.",
+    "G transport and A driver selected source reviews retained; original consumer and physical-report acceptance remain separate."
+  ],
+  "validation": {
+    "imports_executed": false,
+    "tests_executed_by_reviewer": false,
+    "product_processes_started": false,
+    "network_requests_sent": false,
+    "execution_authorized": false,
+    "provider_dispatch_authorized": false,
+    "product_acceptance": false
+  },
+  "remaining_gates": [
+    "Central coherent closed-world controls against this exact composed source family.",
+    "Actual installed artifact provenance and isolated controlled allocation before any workload execution.",
+    "Original physical-report independent oracle and original consumer receipts; authored source does not establish these.",
+    "Primary provider driver original fixed-root reader is a separate outstanding dynamic-family gap; this full-workload ACK does not close it."
+  ]
+}

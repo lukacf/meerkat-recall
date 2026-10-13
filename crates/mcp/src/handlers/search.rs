@@ -152,7 +152,7 @@ fn word_boundary_hit(haystack: &str, needle: &str) -> bool {
         if before_ok && after_ok {
             return true;
         }
-        from = start + 1;
+        from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
         if from >= haystack.len() {
             break;
         }
@@ -311,6 +311,7 @@ impl ToolHandler for UnifiedSearchHandler {
             "type": "object",
             "required": ["query"],
             "properties": {
+                "use_vector": { "type": "boolean", "default": true },
                 "query": {
                     "type": "string",
                     "description": "Search query text"
@@ -338,6 +339,10 @@ impl ToolHandler for UnifiedSearchHandler {
     #[allow(clippy::too_many_lines)]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
+        let use_vector = params
+            .get("use_vector")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let input: UnifiedSearchInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
 
@@ -396,8 +401,7 @@ impl ToolHandler for UnifiedSearchHandler {
                             .await
                             .map_err(|e| McpError::ExecutionError(e.to_string()))?;
                         let filtered =
-                            ctx.authz
-                                .filter_records(&ctx.principal, page.results, "read:entity");
+                            crate::current_read::filter(ctx, page.results, "read:entity").await?;
 
                         for entity in filtered {
                             if seen_ids.insert(entity.base.id.to_string()) {
@@ -417,10 +421,20 @@ impl ToolHandler for UnifiedSearchHandler {
                     // Degrades exactly as the entities handler does: when no provider,
                     // no stored vectors, or nothing above the similarity floor, this
                     // returns None and the lexical results stand unchanged.
-                    let semantic = self
-                        .entity_search
-                        .semantic_entity_hits(ctx, &space_id, &input.query, None, None, input.limit)
-                        .await;
+                    let semantic = if use_vector {
+                        self.entity_search
+                            .semantic_entity_hits(
+                                ctx,
+                                &space_id,
+                                &input.query,
+                                None,
+                                None,
+                                input.limit,
+                            )
+                            .await?
+                    } else {
+                        None
+                    };
                     let mut semantic_scores: std::collections::HashMap<String, f32> =
                         std::collections::HashMap::new();
                     if let Some(hits) = semantic {
@@ -489,11 +503,9 @@ impl ToolHandler for UnifiedSearchHandler {
                             .search(&criteria)
                             .await
                             .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-                        let filtered = ctx.authz.filter_records(
-                            &ctx.principal,
-                            page.results,
-                            "read:doc:metadata",
-                        );
+                        let filtered =
+                            crate::current_read::filter(ctx, page.results, "read:doc:metadata")
+                                .await?;
 
                         for doc in filtered {
                             if items.len() >= input.limit {
@@ -536,15 +548,17 @@ impl ToolHandler for UnifiedSearchHandler {
                             .await
                             .map_err(|e| McpError::ExecutionError(e.to_string()))?;
                         let filtered =
-                            ctx.authz
-                                .filter_records(&ctx.principal, page.results, "read:source");
+                            crate::current_read::filter(ctx, page.results, "read:source").await?;
 
                         for source in filtered {
                             if items.len() >= input.limit {
                                 break;
                             }
                             if seen_ids.insert(source.base.id.to_string()) {
-                                items.push(source);
+                                items.push(super::source_intake::public_source(
+                                    &ctx.principal,
+                                    source,
+                                ));
                             }
                         }
                         if items.len() >= input.limit {
@@ -583,11 +597,9 @@ impl ToolHandler for UnifiedSearchHandler {
                             .search(&criteria)
                             .await
                             .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-                        let filtered = ctx.authz.filter_records(
-                            &ctx.principal,
-                            page.results,
-                            "read:relationship",
-                        );
+                        let filtered =
+                            crate::current_read::filter(ctx, page.results, "read:relationship")
+                                .await?;
 
                         for rel in filtered {
                             if items.len() >= input.limit {
@@ -625,11 +637,12 @@ impl ToolHandler for UnifiedSearchHandler {
                                 if let Ok(outgoing) =
                                     self.rel_repo.find_outgoing(&space_id, &entity_id).await
                                 {
-                                    let filtered = ctx.authz.filter_records(
-                                        &ctx.principal,
+                                    let filtered = crate::current_read::filter(
+                                        ctx,
                                         outgoing,
                                         "read:relationship",
-                                    );
+                                    )
+                                    .await?;
                                     for rel in filtered {
                                         if items.len() >= input.limit {
                                             break;
@@ -644,11 +657,12 @@ impl ToolHandler for UnifiedSearchHandler {
                                 if let Ok(incoming) =
                                     self.rel_repo.find_incoming(&space_id, &entity_id).await
                                 {
-                                    let filtered = ctx.authz.filter_records(
-                                        &ctx.principal,
+                                    let filtered = crate::current_read::filter(
+                                        ctx,
                                         incoming,
                                         "read:relationship",
-                                    );
+                                    )
+                                    .await?;
                                     for rel in filtered {
                                         if items.len() >= input.limit {
                                             break;
@@ -698,38 +712,11 @@ mod tests {
         Entity::new(base, EntityType::new("person"), display_name.to_string())
     }
 
-    struct UnifiedControlledProvider {
-        entries: std::collections::HashMap<String, Vec<f32>>,
-    }
-
-    #[async_trait]
-    impl elephant_embeddings::EmbeddingProvider for UnifiedControlledProvider {
-        #[allow(clippy::unnecessary_literal_bound)]
-        fn model(&self) -> &str {
-            "controlled-unified-test"
-        }
-
-        fn dimensions(&self) -> usize {
-            3
-        }
-
-        async fn embed(
-            &self,
-            texts: &[String],
-        ) -> elephant_embeddings::EmbeddingResult<Vec<Vec<f32>>> {
-            Ok(texts
-                .iter()
-                .map(|text| {
-                    self.entries
-                        .get(text)
-                        .cloned()
-                        .unwrap_or_else(|| vec![0.0; 3])
-                })
-                .collect())
-        }
-    }
-
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_search_all_uses_the_semantic_path_not_just_substring() {
         // Unified search must use stored name embeddings, as `search_entities` does,
         // so a query can match entities without a literal substring match. The
@@ -754,6 +741,12 @@ mod tests {
             .await
             .expect("schema");
         let repo = EntityRepository::new(storage.clone());
+        let fixture = crate::retrieval_test_support::QueryFixture::install(
+            &storage,
+            "test_space",
+            vec![("machine learning", vec![1.0, 0.0, 0.0])],
+        )
+        .await;
 
         // Shares NO substring with the query: only the semantic path can find it.
         let entity = Entity::new(
@@ -766,25 +759,20 @@ mod tests {
             "Riley Kim".to_string(),
         );
         let entity_id = entity.base.id.clone();
+        let entity_hash =
+            elephant_storage::entity_profile_embedding_repository::entity_input_hash(&entity);
         repo.create(entity).await.expect("create");
         repo.set_name_embedding(
             "test_space",
             &entity_id,
             &[0.95, 0.05, 0.0],
-            "controlled-unified-test",
-            "hash-riley",
+            &fixture.policy.model,
+            &entity_hash,
         )
         .await
         .expect("embedding");
 
-        let cache = elephant_embeddings::EmbeddingProviderCache::with_provider(
-            elephant_embeddings::EmbeddingPolicy::from_env(),
-            Arc::new(UnifiedControlledProvider {
-                entries: std::iter::once(("machine learning".to_string(), vec![1.0, 0.0, 0.0]))
-                    .collect(),
-            }),
-        );
-        let handler = UnifiedSearchHandler::with_provider_cache(storage.clone(), cache);
+        let handler = UnifiedSearchHandler::new(storage.clone());
         let ctx = ToolContext::with_authz(
             storage,
             Arc::new(AuthzService::new_with_skip_auth(true)),
@@ -797,11 +785,11 @@ mod tests {
             },
         );
 
-        let result = handler
-            .execute(
+        let result = fixture
+            .run(handler.execute(
                 &ctx,
                 serde_json::json!({"query": "machine learning", "include": ["entities"]}),
-            )
+            ))
             .await
             .expect("search_all");
         let response: ToolResponse<UnifiedSearchOutput> =
@@ -916,6 +904,10 @@ mod tests {
     const ENTITY_SCHEMA: &str = "DEFINE TABLE entity SCHEMALESS;";
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_search_all_ranks_the_real_match_above_a_midword_coincidence() {
         // END-TO-END through execute(), because the scoring unit tests do not cover
         // the SORT: a mutation removing `ranked.sort_by` entirely passed all of them.
@@ -982,7 +974,7 @@ mod tests {
         // reverting the widening while keeping the sort passed a limit-10 version of
         // this test, so the small limit is the point.
         let params = serde_json::json!({
-            "query": "Mia Example principal",
+            "use_vector": false, "query": "Mia Example principal",
             "include": ["entities"],
             "limit": 2
         });
@@ -1008,6 +1000,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_search_all_returns_mixed_results_for_multi_term_query() {
         use std::collections::HashSet;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1076,7 +1072,7 @@ mod tests {
         let _ = doc_repo.create(doc).await.expect("create doc");
 
         let params = serde_json::json!({
-            "query": "Jane Acme",
+            "use_vector": false, "query": "Jane Acme",
             "limit": 10,
             "include": ["entities", "docs"]
         });

@@ -1,0 +1,81 @@
+{
+  "format": "recall-independent-dynamic-source-review/v1",
+  "reviewed_at": "2026-10-07T04:23:16.756637+00:00",
+  "composed_source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd",
+  "decision": "selected-producer-predicate-seams-and-primary-reader-successor-ack",
+  "source_files": [
+    {
+      "path": "tests/recall_preview_semantics/dynamic_component_validator.py",
+      "owner_commit": "cea822d161442cf68468050d3486ac7a031c4b60",
+      "sha256": "2295919aaca8fc8fa7900387179264936b1e7b3de89035324cbbd70ca84b2b6a",
+      "bytes": 142967
+    },
+    {
+      "path": "scripts/qualification/runtime_package_bootstrap_custody.py",
+      "owner_commit": "5001114c764053e3a2bb2475f841fc811b38f773",
+      "sha256": "b8a391c03b226f012230d7b65b29373dc2fb9a8b81f46197b87d02826800b826",
+      "bytes": 7891
+    },
+    {
+      "path": "scripts/qualification/runtime_package_bootstrap_evidence.py",
+      "owner_commit": "5001114c764053e3a2bb2475f841fc811b38f773",
+      "sha256": "5c845563ba9e53d123f1fbcf0e229d7650c2f0112d148b1639b4ef1434caa64a",
+      "bytes": 17541
+    },
+    {
+      "path": "tests/recall_preview_semantics/gateway/launcher.py",
+      "owner_commit": "d4bf681c98b85be122ef7b774d854fa914574f7c",
+      "sha256": "cf7f30109c18aa232d73a48b5a9dc0800547b5de7102db1e0d1318b27b7fc40f",
+      "bytes": 18582
+    },
+    {
+      "path": "tests/recall_preview_semantics/workload_orchestration.py",
+      "owner_commit": "c9edf515f2ba86bccf6df9640e8dc629635e7167",
+      "sha256": "81a673cf324a2208fa3f654932a16be6fddf13f76b47088d2fe42325b955baba",
+      "bytes": 25744
+    },
+    {
+      "path": "tests/recall_preview_semantics/installed_evidence_validator.py",
+      "owner_commit": "c7e09936b11199148f44190aaee411634e752207",
+      "sha256": "49b049bfbe4ec46c2b3491ba86bfc49889d909130080a3eaf179b411bbaee374",
+      "bytes": 56043
+    }
+  ],
+  "verified_static": [
+    "D exact fifteen static anchor fields preserved; output manifest/configuration/inventory hashes remain original dynamic bindings.",
+    "G launches with exact original read-only manifest/spec mounts; C initial/current capture rereads their original bytes; L compares exact initial/current inventories, fixed paths, raw hashes and original command/environment/bindings.",
+    "L accepts exactly the three original primary-v1/settlement-v2/cohort-v1 variants, retains original schema-specific caps and binds both named query/document factories to original account/endpoint/capability/profile/model/dimensions.",
+    "G and L agree on canonical PIPELINE_SKILLS_DIR below /opt/recall/; L does not add a conflicting path grammar.",
+    "S original reader admits only the two fixed new root paths at matching typed kind and 131072 bytes; no generic root admission.",
+    "Original provider channel/caller/index and eight-field provider accounting bundle remain independent original byte authorities; paired artifact legacy field remains executable hash.",
+    "M fixed snapshot stream predicate matches F original producer role contract; full-workload owner charge is separately reviewed."
+  ],
+  "not_closed": [
+    "Historical464bb1e2 primary reader gap is repaired by separately reviewed B4523 successor. Integration must include those exact bytes and refresh relevant dependency pins before execution.",
+    "Actual primary runtime-plan inputs are not yet provided as a reviewed concrete artifact; source predicate compatibility does not prove a future plan matches gateway account/capabilities.",
+    "Whole installed/current runtime and prepared-publication fixtures are deterministic original-byte fixture controls. Peer-reported passes do not qualify an actual artifact, physical process, provider quality, live semantic result or measured concurrent load."
+  ],
+  "validation": {
+    "source_read": true,
+    "static_original_hash_comparison": true,
+    "tests_executed_by_reviewer": false,
+    "imports_executed": false,
+    "product_acceptance": false,
+    "execution_authorized": false
+  },
+  "primary_reader_successor": {
+    "reviewed_at": "2026-10-07T04:24:11.397935+00:00",
+    "source_commit": "4523eee9a089c7a7f2627b06000a3223c6a698cb",
+    "path": "scripts/qualification/primary_provider_driver_runtime.py",
+    "sha256": "391f7703def41f08d0ecfd3409e8c798d87aca8840b4fddb08e0015e1e3bf65d",
+    "bytes": 11827,
+    "decision": "selected-source-ack",
+    "scope": [
+      "Exactly /gateway-manifest.json -> gateway-manifest and /gateway-launch.json -> gateway-launch-spec, each <=131072 bytes, checked before reads.",
+      "Fixed reader requires bounded non-bool integer cap, nofollow regular file, current UID/private mode and unchanged descriptor device/inode/size/mtime/ctime before and after reading.",
+      "Lazy Mapping rehashes every selected original and every same-SHA alias on every lookup; original total/file/count caps and /inputs-only immutable bundle membership stay unchanged."
+    ],
+    "controls": "Four new source controls plus ten existing; B reports14 mocked passes. D inspected source and did not rerun.",
+    "composition": "Separate successor reviewed; not falsely attributed to earlier464bb1e2 composed tree."
+  }
+}

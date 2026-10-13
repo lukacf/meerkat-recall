@@ -207,6 +207,86 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
+    async fn assert_document_space_discovery(client: StorageClient) {
+        let repo = DocRepository::new(client);
+        assert!(repo
+            .get_all_spaces()
+            .await
+            .expect("empty discovery")
+            .is_empty());
+
+        for (space, title) in [
+            ("zeta", "first"),
+            ("alpha", "second"),
+            ("zeta", "duplicate-space"),
+            ("beta", "fourth"),
+        ] {
+            repo.create(test_doc(space, title, "document text"))
+                .await
+                .expect("create document");
+        }
+        let deleted = repo
+            .create(test_doc("deleted-only", "deleted", "retained document"))
+            .await
+            .expect("create document to soft-delete");
+        repo.delete("deleted-only", &deleted.base.id)
+            .await
+            .expect("soft-delete document");
+
+        assert_eq!(
+            repo.get_all_spaces().await.expect("document spaces"),
+            vec!["alpha", "beta", "deleted-only", "zeta"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_document_space_discovery_surreal_memory() {
+        assert_document_space_discovery(StorageClient::new_memory().await.expect("memory client"))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_document_space_discovery_embedded() {
+        assert_document_space_discovery(
+            StorageClient::new_embedded()
+                .await
+                .expect("embedded client"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
+    async fn test_document_space_discovery_rejects_invalid_space_ids() {
+        for sql in [
+            "CREATE doc:malformed SET title = 'missing space'",
+            "CREATE doc:malformed SET space_id = NULL",
+            "CREATE doc:malformed SET space_id = 42",
+        ] {
+            let client = StorageClient::new_memory().await.expect("memory client");
+            let repo = DocRepository::new(client.clone());
+            repo.create(test_doc("valid", "valid", "valid document"))
+                .await
+                .expect("create valid document alongside malformed row");
+            client.query_checked(sql).await.expect("seed malformed row");
+            let error = repo
+                .get_all_spaces()
+                .await
+                .expect_err("malformed rows must not be silently omitted");
+            assert!(
+                matches!(error, StorageError::DataIntegrityError(message) if message.contains("space_id")),
+                "mandatory space field must be validated for {sql}"
+            );
+        }
+    }
+
     fn test_doc_with_id(space_id: &str, id: &str, title: &str, text: &str) -> Doc {
         let mut doc = test_doc(space_id, title, text);
         doc.base.id = RecordId::from_str(id).expect("valid test record id");
@@ -249,6 +329,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_by_angel_session_id_surreal_memory() {
         let client = crate::StorageClient::new_memory()
             .await
@@ -259,6 +343,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_by_angel_session_id_embedded() {
         let client = crate::StorageClient::new_embedded()
             .await
@@ -305,6 +393,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_set_angel_protectees_surreal_memory() {
         let client = crate::StorageClient::new_memory()
             .await
@@ -314,6 +406,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_set_angel_protectees_embedded() {
         let client = crate::StorageClient::new_embedded()
             .await
@@ -323,6 +419,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_search_returns_matching_docs_in_surreal_memory() {
         let client = crate::StorageClient::new_memory()
             .await
@@ -352,6 +452,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_indexed_search_scopes_every_query_term() {
         let client = crate::StorageClient::new_memory()
             .await
@@ -400,6 +504,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_surreal_memory_roundtrip_preserves_media_attachments() {
         let client = crate::StorageClient::new_memory()
             .await
@@ -450,6 +558,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_ranked_search_cursor_uses_offset_pagination() {
         let client = crate::StorageClient::new_memory()
             .await
@@ -524,6 +636,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_ranked_search_last_page_has_more_false() {
         let client = crate::StorageClient::new_embedded()
             .await
@@ -575,6 +691,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_ranked_search_zero_limit_has_no_cursor() {
         let client = crate::StorageClient::new_embedded()
             .await
@@ -607,6 +727,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_update_uses_target_id_not_payload_id() {
         let client = crate::StorageClient::new_embedded()
             .await
@@ -664,6 +788,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_create_rejects_duplicate_rendition_key() {
         let client = crate::StorageClient::new_embedded()
             .await
@@ -685,6 +813,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_update_rejects_duplicate_rendition_key() {
         let client = crate::StorageClient::new_embedded()
             .await
@@ -718,6 +850,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_create_rejects_reusing_soft_deleted_rendition_key() {
         let client = crate::StorageClient::new_embedded()
             .await
@@ -825,6 +961,47 @@ pub struct DocRepository {
 }
 
 impl DocRepository {
+    /// Tests exact physical document presence across spaces, including deletion.
+    ///
+    /// This boolean grants no read permission and exposes no foreign payload.
+    /// Use it when a scoped missing row must not become an absence fallback.
+    ///
+    /// # Errors
+    /// Refuses a non-Doc identity or malformed physical storage response.
+    pub async fn exists_globally(&self, id: &RecordId) -> StorageResult<bool> {
+        if id.table() != TableName::Doc {
+            return Err(StorageError::DataIntegrityError(
+                "document presence requires Doc identity".into(),
+            ));
+        }
+        if let Some(store) = self.client.embedded_store() {
+            return store
+                .get_by_id::<Doc>(id, true)
+                .await
+                .map(|row| row.is_some());
+        }
+        #[derive(Deserialize)]
+        struct Presence {
+            id: RecordId,
+        }
+        let mut response = self
+            .client
+            .query_bind_checked(
+                "SELECT id FROM $id;",
+                crate::bindings! {"id" => crate::surreal::thing_from_record_id(id)},
+            )
+            .await?;
+        let rows: Vec<Presence> = response
+            .take(0)
+            .map_err(|error| StorageError::DataIntegrityError(error.to_string()))?;
+        if rows.len() > 1 || rows.iter().any(|row| row.id != *id) {
+            return Err(StorageError::DataIntegrityError(
+                "document presence changed physical identity".into(),
+            ));
+        }
+        Ok(!rows.is_empty())
+    }
+
     /// Restores a document only if it is unchanged since `authorized`, the row
     /// the caller's authorization was decided on.
     ///
@@ -1520,11 +1697,12 @@ impl DocRepository {
         Ok(results)
     }
 
-    /// Gets all unique space IDs.
+    /// Gets sorted unique space IDs from stored documents, including soft-deleted docs.
     ///
     /// # Errors
     ///
-    /// Returns an error if the query fails or deserialization fails.
+    /// Returns an error if the query fails or a stored space ID cannot be decoded.
+    /// Missing or invalid mandatory space IDs are data-integrity errors.
     pub async fn get_all_spaces(&self) -> StorageResult<Vec<String>> {
         if let Some(store) = self.client.embedded_store() {
             let mut spaces: Vec<_> = store
@@ -1539,16 +1717,28 @@ impl DocRepository {
             return Ok(spaces);
         }
 
+        // Grouped object rows keep the mandatory field explicit at the DB
+        // boundary. The aggregate VALUE projection is not a nested string array
+        // in SurrealDB and prevents the background embed loop discovering spaces.
+        #[derive(Deserialize)]
+        struct SpaceRow {
+            space_id: String,
+        }
+
         let mut response = self
             .client
-            .query("SELECT VALUE array::distinct(space_id) FROM doc GROUP ALL")
+            .query_checked("SELECT space_id FROM doc GROUP BY space_id")
             .await?;
 
-        let spaces: Vec<Vec<String>> = response
-            .take(0)
-            .map_err(|e| StorageError::QueryError(format!("Failed to get spaces: {e}")))?;
-
-        Ok(spaces.into_iter().flatten().collect())
+        let rows: Vec<SpaceRow> = response.take(0).map_err(|error| {
+            StorageError::DataIntegrityError(format!(
+                "Invalid document space_id during space discovery: {error}"
+            ))
+        })?;
+        let mut spaces: Vec<_> = rows.into_iter().map(|row| row.space_id).collect();
+        spaces.sort();
+        spaces.dedup();
+        Ok(spaces)
     }
 }
 
@@ -2135,3 +2325,7 @@ fn ranked_search_offset(cursor: Option<&str>) -> StorageResult<usize> {
         })
     })
 }
+
+#[cfg(test)]
+#[path = "doc_presence_tests.rs"]
+mod physical_presence_tests;

@@ -47,6 +47,12 @@ impl Store {
         })
     }
 
+    /// Whether this actual store retains independently addressable old versions.
+    /// The setting is immutable for this owner and is not inferred from a caller.
+    pub fn versions_enabled(&self) -> bool {
+        self.core.opts.enable_versions
+    }
+
     /// Begins a new read-write transaction.
     /// It creates a new transaction with the core and read-write mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
@@ -183,16 +189,20 @@ impl Core {
             // Load options from the manifest file.
             let opts = Core::load_manifest(&opts, manifest.as_mut().unwrap())?;
 
-            // Determine options for the commit log file and open or create it.
-            clog = Some(Self::initialize_clog(&opts)?);
-
             // Restore the store from a compaction process if necessary.
             restore_from_compaction(&opts)?;
+
+            // Open only the promoted log generation. Opening before recovery
+            // retains handles to files that recovery subsequently retires.
+            clog = Some(Self::initialize_clog(&opts)?);
 
             // Load the index from the commit log if it exists.
             if clog.as_ref().unwrap().size()? > 0 {
                 Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
             }
+            indexer.version_floor = indexer
+                .version_floor
+                .max(crate::checkpoint::read_clock(&opts.dir)?);
         }
 
         // Create and initialize an Oracle.
@@ -299,6 +309,7 @@ impl Core {
         value_offset: u64,
         indexer: &mut Indexer,
     ) -> Result<()> {
+        indexer.version_floor = indexer.version_floor.max(entry.id);
         if entry.metadata.as_ref().is_some_and(|metadata| {
             metadata.is_deleted() || metadata.is_tombstone() && !opts.enable_versions
         }) {
@@ -516,6 +527,7 @@ impl Core {
         F: Fn(&Entry) -> IndexValue,
     {
         let mut index = self.indexer.read().clone();
+        index.version_floor = index.version_floor.max(tx_id);
 
         for entry in entries {
             // If the entry is marked as deleted or a tombstone

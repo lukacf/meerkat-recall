@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""Render a concrete reviewable image-pinned manifest; never applies it."""
+import argparse
+from pathlib import Path
+import re
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--image', required=True, help='registry/repository@sha256:DIGEST')
+parser.add_argument('--output', required=True, type=Path)
+args = parser.parse_args()
+if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9./:_-]*@sha256:[a-f0-9]{64}', args.image):
+    parser.error('image must be a repository pinned to its registry sha256 digest')
+source = Path(__file__).resolve().parents[2] / 'deploy/kubernetes/recall.yaml'
+rendered = source.read_text().replace('RECALL_IMAGE_BY_DIGEST', args.image)
+try:
+    with args.output.open('x') as stream:
+        stream.write(rendered)
+except OSError as error:
+    parser.exit(1, f'render-container: {error}\n')
+print(args.output)

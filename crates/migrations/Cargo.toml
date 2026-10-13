@@ -9,11 +9,13 @@ description = "Database schema for Elephant"
 [dependencies]
 elephant-storage = { path = "../storage" }
 tracing = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
 elephant-types = { path = "../types" }
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

@@ -12,6 +12,19 @@ Applications connect through HTTP. Agents use MCP tools to ingest evidence,
 search, navigate relationships, and read cited context. Spaces and
 attribute-based access control restrict what each caller can see or change.
 
+Recall can serve any application or agent stack through those interfaces. In
+Meerkat, Core runs agents and Meta manages the application and its agent memory
+lifecycle. Recall adds shared knowledge with sources, relationships and access
+rules. You can use it independently or add it to an existing Meerkat application.
+See the [ecosystem guide](https://docs.rkat.ai/ecosystem) for component choices.
+
+Version 0.1.0 is available from the
+[canonical releases](https://github.com/lukacf/meerkat-recall/releases). Start with
+[binary installation](/installation) and [service setup](/operations/service-setup).
+The current release pins Meerkat 0.8.51. After Meerkat 0.9 ships, Recall will
+upgrade to it and release as Recall 0.9; this is the next release plan, not the
+current dependency version.
+
 ## Follow one piece of evidence
 
 Suppose a project note says, "Alice owns the Project Cedar test plan."
@@ -26,7 +39,7 @@ Suppose a project note says, "Alice owns the Project Cedar test plan."
    and freshness information, subject to the reader's authorization.
 
 ```mermaid
-flowchart LR
+flowchart TB
     Source["Source material"] --> Evidence["Document evidence"]
     Evidence --> Claims["Extracted assertions"]
     Claims --> Graph["Graph and truth slots"]
@@ -70,7 +83,9 @@ evidence they were built from. See [documents](/concepts/documents) and
 [assertions](/concepts/assertions).
 
 **Storage is an operational choice.** SurrealDB is the default durable backend.
-The embedded `elephant-db` kernel runs in memory and supports snapshots. The
+The managed embedded `elephant-db` runtime synchronizes acknowledged commits
+to a write-ahead log when a persistent destination is configured; explicitly
+ephemeral library/test stores remain volatile. The
 [deployment guide](/operations/deployment) explains persistence and runtime
 configuration.
 

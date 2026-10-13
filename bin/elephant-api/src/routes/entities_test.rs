@@ -72,6 +72,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn setup_test_app() -> (Router, Arc<EntityRepository>) {
         let authz = Arc::new(AuthzService::new());
         let entity_repo = Arc::new(EntityRepository::new(
@@ -191,6 +195,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn empty_subject_scope_refuses_http_entity_body() {
         let repo = Arc::new(EntityRepository::new(
             StorageClient::new_embedded().await.unwrap(),
@@ -269,6 +277,10 @@ mod tests {
         Entity::new(base, EntityType::new("person"), name.to_string())
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn setup_security_test_app() -> (
         Router,
         Arc<EntityRepository>,
@@ -423,6 +435,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn write_without_read_refuses_before_any_entity_mutation() {
         for route in ["put", "upsert", "batch"] {
             for existing in [false, true] {
@@ -1216,6 +1232,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_restore_entity_requires_read_authorization() {
         let authz = Arc::new(AuthzService::new());
         let entity_repo = Arc::new(EntityRepository::new(

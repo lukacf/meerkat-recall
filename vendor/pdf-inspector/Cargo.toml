@@ -87,6 +87,9 @@ path = "src/bin/detect_pdf.rs"
 name = "dump_ops"
 path = "src/bin/dump_ops.rs"
 
+[dependencies.flate2]
+version = "1.1"
+
 [dependencies.include_dir]
 version = "0.7"
 

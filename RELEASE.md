@@ -24,13 +24,14 @@ tree and a secret-pattern scan alone do not establish publication safety.
 Keep private audit evidence outside the repository. If anything sensitive was
 committed, removing it from the latest tree does not remove it from history.
 
-## Candidate contract
+## Distribution contract
 
 The current source declares Meerkat Recall `0.1.0` and pins its six direct Meerkat
 family dependencies to `0.8.51`. It has no direct MobKit dependency. These
 source versions do not imply acceptance of an external MobKit or HomeCore
-runtime, or compatibility with the planned 0.9 platform. Record that
-integration's exact versions and live acceptance separately.
+runtime, or compatibility with the planned 0.9 platform. After Meerkat 0.9
+ships, upgrade Recall to that published dependency and release Recall 0.9 to
+match. Record that integration's exact versions and live acceptance separately.
 
 The initial distribution includes source and native binary downloads, without
 a registry-published Rust library. Native targets are Linux x86-64
@@ -40,9 +41,12 @@ The checked-in [installation instructions](docs/installation.mdx) use the
 workflow's flat archive layout and require a model provider for the
 default-feature demo.
 
-The public source repository is `lukacf/meerkat-recall`; candidate work remains
-private until publication is authorized. Source downloads and native archives
-share the selected `v0.1.0` source identity. Internal crates, configuration paths,
+The public source repository and release destination are both
+`lukacf/meerkat-recall`. Publish versioned releases as normal releases, with
+GitHub's prerelease flag disabled. Build candidates remain intermediate artifacts
+until qualified for promotion. Source downloads and native provenance retain
+their exact selected identities; when a distribution snapshot differs from the
+build commit, preserve its explicit mapping rather than relabeling the binary. Internal crates, configuration paths,
 environment names, database identities and HTTP/MCP wire names retain their
 existing spelling. No automatic data relocation is part of this rename.
 
@@ -52,6 +56,12 @@ Manually run `.github/workflows/release.yml` (**Build release candidates**) for
 the reviewed ref. It validates the source, builds Linux x86-64 and macOS ARM64
 binaries with RocksDB and the default Meerkat extraction feature, and uploads
 candidate archives. It does not create a GitHub release or publish crates.
+
+The native build and packaging implementation is versioned in
+`scripts/release/`; the workflow invokes the same recipe used by allocated native
+builders. The recipe compares committed source identities before and after build.
+The archive uses `meerkat-recall-native/v1`, records the complete source tar
+SHA256 and hashes every runtime file, including exact patched vendor source.
 
 Each archive contains `meerkat-recall`, an `elephant` symlink for the 0.1
 compatibility line, license texts, and `provenance.json`
@@ -108,14 +118,16 @@ provider, persistence or live-isolation evidence as pending.
 
 ## Promote verified artifacts
 
-1. Require a successful candidate workflow and verify each archive's GitHub
-   build attestation against the selected source and workflow identity. Check
-   its checksum and bundled provenance. Smoke test the executable on each
-   supported target host and record the exact binary checksum. Missing or
-   failed attestation blocks public promotion even if private testing passed.
+1. Select the exact qualified artifacts and their retained build/install
+   evidence. For workflow-built candidates, verify the successful workflow and
+   its GitHub attestation against the selected source and workflow identity.
+   Independently built releases retain their actual native build receipts and
+   must not claim a GitHub attestation. Check checksums, bundled provenance and
+   the exact executable acceptance for each supported target.
 2. Confirm the intended `vX.Y.Z` tag matches the Cargo workspace version. Tag
    the reviewed source commit after the checks pass.
-3. Create a draft GitHub release containing those verified archives, a flat
+3. Create a draft normal GitHub release in `lukacf/meerkat-recall`, with
+   `prerelease=false`, containing those verified archives, a flat
    `checksums.sha256` manifest, and accurate release notes. Verify the uploaded
    bytes and provenance before publishing the draft.
 4. Move the relevant `Unreleased` changelog entries into the published version
@@ -139,3 +151,13 @@ npm package. Crate publishing is disabled in workspace release metadata and
 is not an input to the candidate workflow. Use `make publish-dry-run` to
 inspect package eligibility and contents; enabling package publication is a
 separate release change.
+
+## Container candidate
+
+`scripts/release/build-container LOCAL_TAG OUTPUT_DIRECTORY` builds from the exact
+committed Git archive and writes an image receipt with source commit/tree/tar
+digest, local image ID and any assigned repository digests. It never pushes or
+deploys. The image embeds source/build provenance, licensed patched dependency
+source, and the native binary. A local image ID is not a registry digest.
+Qualify the published bytes by digest separately before using the rendered
+StatefulSet/PV recipe; no native receipt qualifies a different image build.

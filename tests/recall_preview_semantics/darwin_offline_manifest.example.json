@@ -1,0 +1,18 @@
+{
+  "format": "recall-darwin-native-run/v1",
+  "execution_authorized": false,
+  "expires_at": "UNALLOCATED",
+  "backend": "elephant-db",
+  "source_commit": "REPLACE_WITH_EXACT_REVIEWED_SOURCE_COMMIT",
+  "archive": "/operator/supplied/meerkat-recall-darwin-arm64.tar.gz",
+  "archive_sha256": "REPLACE_FROM_INDEPENDENT_TRUSTED_RELEASE_RECORD",
+  "binary_sha256": "REPLACE_FROM_INDEPENDENT_TRUSTED_RELEASE_RECORD",
+  "run_directory": "/operator/fresh/synthetic-recall-acceptance",
+  "python": "/operator/task/python/bin/python3.12",
+  "python_sha256": "REPLACE_WITH_REVIEWED_CANONICAL_INTERPRETER_DIGEST",
+  "host_os_version": "26.5.2",
+  "compatibility": "/operator/receipts/darwin-compatibility.json",
+  "compatibility_sha256": "REPLACE_WITH_REVIEWED_COMPATIBILITY_RECEIPT_DIGEST",
+  "review": "/operator/receipts/darwin-expectation-review.json",
+  "review_sha256": "REPLACE_WITH_INDEPENDENT_D_REVIEW_DIGEST"
+}

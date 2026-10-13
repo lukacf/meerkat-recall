@@ -2164,6 +2164,7 @@ dependencies = [
  "elephant-api",
  "elephant-embeddings",
  "elephant-identity",
+ "elephant-knowledge-views",
  "elephant-mcp",
  "elephant-migrations",
  "elephant-outbox",
@@ -2198,10 +2199,13 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
+ "tokenizers",
  "tokio",
  "tokio-test",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2262,6 +2266,7 @@ dependencies = [
  "elephant-extensions",
  "elephant-identity",
  "elephant-knowledge-views",
+ "elephant-migrations",
  "elephant-pipeline",
  "elephant-policy",
  "elephant-storage",
@@ -2269,6 +2274,7 @@ dependencies = [
  "futures",
  "globset",
  "hex",
+ "jsonwebtoken",
  "pdf-inspector",
  "reqwest 0.12.28",
  "rstest",
@@ -2276,6 +2282,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2 0.10.9",
+ "surrealdb",
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
@@ -2292,7 +2299,9 @@ dependencies = [
  "chrono",
  "elephant-storage",
  "elephant-types",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
 ]
@@ -2321,17 +2330,23 @@ name = "elephant-pipeline"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "elephant-auth",
  "elephant-embeddings",
+ "elephant-extensions",
+ "elephant-identity",
  "elephant-knowledge-views",
  "elephant-migrations",
  "elephant-outbox",
+ "elephant-policy",
  "elephant-storage",
  "elephant-types",
  "futures",
  "hex",
+ "jsonwebtoken",
  "meerkat",
  "meerkat-core",
  "meerkat-mcp",
@@ -2358,24 +2373,32 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.8.9",
  "chrono",
  "config",
+ "elephant-auth",
  "elephant-embeddings",
  "elephant-migrations",
  "elephant-outbox",
  "elephant-pipeline",
+ "elephant-policy",
  "elephant-storage",
  "elephant-types",
+ "futures",
  "hex",
+ "meerkat",
+ "meerkat-core",
  "rstest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2402,6 +2425,7 @@ dependencies = [
  "elephant-api",
  "elephant-embeddings",
  "elephant-identity",
+ "elephant-knowledge-views",
  "elephant-mcp",
  "elephant-migrations",
  "elephant-outbox",
@@ -2429,15 +2453,25 @@ name = "elephant-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
+ "elephant-auth",
  "elephant-db",
  "elephant-embeddings",
+ "elephant-policy",
  "elephant-types",
+ "getrandom 0.2.17",
+ "hex",
+ "jsonwebtoken",
+ "libc",
  "num-traits",
  "rstest",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "surrealdb",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
@@ -4179,19 +4213,19 @@ dependencies = [
 
 [[package]]
 name = "macro_rules_attribute"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65049d7923698040cd0b1ddcced9b0eb14dd22c5f86ae59c3740eab64a676520"
+checksum = "b3ae8f6d608c795738406608304d30a2dfbdc8e58e44f7ba43236da5208ded3c"
 dependencies = [
  "macro_rules_attribute-proc_macro",
- "paste",
+ "pastey 0.2.3",
 ]
 
 [[package]]
 name = "macro_rules_attribute-proc_macro"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "670fdfda89751bc4a84ac13eaa63e205cf0fd22b4c9a5fbfa085b63c1f1d3a30"
+checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
 name = "maplit"
@@ -4491,8 +4525,6 @@ dependencies = [
 [[package]]
 name = "meerkat-gemini"
 version = "0.8.51"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "528fae31a25fda3af5d9c4a01b65a6c439718068b4a380b34184437c1bb9cd89"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4559,8 +4591,6 @@ dependencies = [
 [[package]]
 name = "meerkat-llm-core"
 version = "0.8.51"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e79b75220cf9c0cd79bd229bfe8044f73776bfe885fd20dc7abf6d36714a944"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4677,8 +4707,6 @@ dependencies = [
 [[package]]
 name = "meerkat-openai"
 version = "0.8.51"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2100adbbdade7c5b2bdc15a57fedd986fc769e0297d21c4320c7ffa9ea46f73"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4721,14 +4749,17 @@ dependencies = [
  "clap",
  "elephant",
  "elephant-api",
+ "elephant-auth",
  "elephant-embeddings",
  "elephant-knowledge-views",
  "elephant-migrations",
  "elephant-pipeline",
  "elephant-pipeline-bin",
+ "elephant-policy",
  "elephant-storage",
  "elephant-types",
  "hex",
+ "jsonwebtoken",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -5629,12 +5660,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
-
-[[package]]
 name = "pastey"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5675,6 +5700,7 @@ name = "pdf-inspector"
 version = "1.25.2"
 dependencies = [
  "env_logger",
+ "flate2",
  "include_dir",
  "log",
  "lopdf",
@@ -6347,8 +6373,6 @@ checksum = "973443cf09a9c8656b574a866ab68dfa19f0867d0340648c7d2f6a71b8a8ea68"
 [[package]]
 name = "rav1e"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43b6dd56e85d9483277cde964fd1bdb0428de4fec5ebba7540995639a21cb32b"
 dependencies = [
  "aligned-vec",
  "arbitrary",
@@ -6369,7 +6393,7 @@ dependencies = [
  "noop_proc_macro",
  "num-derive",
  "num-traits",
- "paste",
+ "pastey 0.2.3",
  "profiling",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
@@ -7772,8 +7796,6 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "surrealdb"
 version = "2.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3429154a8b5a98ca39100ba45ef49ae046fb1d0869dff78d78a2670b1b278982"
 dependencies = [
  "arrayvec",
  "async-channel",
@@ -7814,8 +7836,6 @@ dependencies = [
 [[package]]
 name = "surrealdb-core"
 version = "2.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba423d9e7e665e4c735a1d4669c3a067135e4a574edf88af215f7f2b815e70ed"
 dependencies = [
  "addr",
  "affinitypool",
@@ -7847,6 +7867,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hashbrown 0.14.5",
  "hex",
+ "hmac",
  "http",
  "ipnet",
  "jsonwebtoken",
@@ -7869,6 +7890,7 @@ dependencies = [
  "rayon",
  "reblessive",
  "regex",
+ "reqwest 0.12.28",
  "revision 0.11.0",
  "ring",
  "rmpv",
@@ -8175,8 +8197,6 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 [[package]]
 name = "tokenizers"
 version = "0.22.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b238e22d44a15349529690fb07bd645cf58149a1b1e44d6cb5bd1641ff1a6223"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -8190,7 +8210,7 @@ dependencies = [
  "macro_rules_attribute",
  "monostate",
  "onig",
- "paste",
+ "pastey 0.2.3",
  "rand 0.9.4",
  "rayon",
  "rayon-cond",

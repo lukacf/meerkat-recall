@@ -1,0 +1,25 @@
+Meerkat Recall patched source distribution
+
+The accompanying third-party directory preserves the complete source trees
+used by this release candidate, including upstream copyright/license texts:
+
+- pdf-inspector 1.25.2: MIT; see pdf-inspector and THIRD_PARTY_NOTICES.md.
+- surrealkv 0.9.3: Apache-2.0; see surrealkv-0.9.3/LICENSE and the accompanying
+  backport notes, patch and upstream archive checksum record.
+- meerkat-llm-core 0.8.51, meerkat-openai 0.8.51, meerkat-gemini 0.8.51:
+  MIT OR Apache-2.0; see each crate's LICENSE-MIT, LICENSE-APACHE and
+  RECALL_PATCH.md. provider-http-backport.json identifies upstream release and
+  defensive source commits, registry archive hashes and modified file hashes.
+
+- surrealdb-core 2.6.5 and surrealdb SDK 2.6.5: Business Source License 1.1
+  (BUSL-1.1); see each tree's complete LICENSE and the separately displayed
+  licenses/surrealdb-*-LICENSE texts (container: /usr/share/licenses/meerkat-recall).
+  RECALL_SURREALDB_PATCH.md describes the native reference-token capability;
+  RECALL_PROVENANCE.json and adjacent upstream manifests record exact origins.
+  The Recall project license does not replace these component licenses.
+
+The complete patched source is included to retain source-distribution
+commitments and permit inspection against the exact artifact provenance.
+This notice does not replace the licenses in those source trees. Model weights
+are separate operator-provisioned assets and require their own origin/license
+records; the executable artifact does not bundle them.

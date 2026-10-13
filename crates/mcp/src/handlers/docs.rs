@@ -15,13 +15,14 @@
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+#[cfg(test)]
+use elephant_storage::MediaAssetRepository;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -30,27 +31,19 @@ use elephant_embeddings::{
     PartitionKey,
 };
 use elephant_pipeline::media::{probe_video_duration_ms, probe_video_duration_ms_from_bytes};
-use elephant_pipeline::renderer::default::{DefaultTextRenderer, PassthroughRenderer};
-use elephant_pipeline::renderer::multimodal::MultimodalRenderer;
-use elephant_pipeline::renderer::RendererRegistry;
+
 use elephant_pipeline::scheduler::{
-    execute_build_doc_tree, execute_render_doc,
-    ingest_work_kinds::{
-        enqueue_triage_source_work_item as enqueue_triage_source_work_item_for_source,
-        INGEST_METADATA_KIND, TRIAGE_SOURCE_KIND, UPGRADE_INGEST_MODE_KIND,
-    },
-    resolve_extraction_guidance_status, DocTreeConfig, COMMIT_ARTIFACTS_KIND,
-    EXTRACT_ASSERTIONS_KIND, PLAN_EXTRACTION_KIND, RENDER_DOC_KIND, VALIDATE_ARTIFACTS_KIND,
+    ingest_work_kinds::{INGEST_METADATA_KIND, TRIAGE_SOURCE_KIND, UPGRADE_INGEST_MODE_KIND},
+    resolve_extraction_guidance_status, COMMIT_ARTIFACTS_KIND, EXTRACT_ASSERTIONS_KIND,
+    PLAN_EXTRACTION_KIND, RENDER_DOC_KIND, VALIDATE_ARTIFACTS_KIND,
 };
 use elephant_policy::RedactionEnvelope;
 use elephant_storage::{
-    deterministic_source_id_for_ingest, find_existing_doc_for_doc, find_existing_source_for_doc,
-    find_existing_source_for_source, parse_id, persist_manual_doc_for_source_detailed,
-    preview_persisted_manual_doc_for_source, rollback_persisted_manual_doc,
-    rollback_persisted_source, update_existing_source_for_reingest, AssertionRepository,
-    DocNodeRepository, DocRepository, DocRevisionRepository, EntityRepository,
-    MediaAssetRepository, NodeEmbeddingRepository, PersistedManualDoc, Repository, SearchCriteria,
-    SearchRepository, SourceRepository, SpaceConfigRepository, StorageClient, WorkItemRepository,
+    find_existing_doc_for_doc, find_existing_source_for_doc, find_existing_source_for_source,
+    parse_id, preview_persisted_manual_doc_for_source, AssertionRepository, DocNodeRepository,
+    DocRepository, DocRevisionRepository, EntityRepository, NodeEmbeddingRepository, Repository,
+    SearchCriteria, SearchRepository, SourceRepository, SpaceConfigRepository, StorageClient,
+    WorkItemRepository,
 };
 use elephant_types::ids::TableName;
 use elephant_types::mcp_simple::{ExtractionGuidanceInput, IngestDocSimpleInput};
@@ -78,8 +71,7 @@ use crate::error::{McpError, McpResult};
 use crate::redaction::redact_doc;
 use crate::tools::ToolResponse;
 
-const AGENTIC_EXTRACTOR_ID: &str = "elephant.extractor.agentic";
-
+use super::source_intake::{accept_intake, enqueue_intake, intake_control, intake_schema};
 use super::{merge_base_fields, BatchError, ToolContext, ToolHandler};
 
 fn normalize_doc_value(doc_value: &mut Value, ctx: &ToolContext) -> McpResult<()> {
@@ -409,69 +401,6 @@ fn build_media_attachments(
     })
 }
 
-async fn persist_prepared_media_assets(
-    storage: &StorageClient,
-    assets: &[MediaAsset],
-) -> McpResult<()> {
-    let repo = MediaAssetRepository::new(storage.clone());
-    let mut persisted_ids = Vec::with_capacity(assets.len());
-    for asset in assets {
-        match repo.create(asset.clone()).await {
-            Ok(_) => persisted_ids.push(asset.base.id.clone()),
-            Err(error) => {
-                rollback_media_assets_by_ids(storage, &asset.base.space_id, &persisted_ids).await;
-                return Err(McpError::ExecutionError(format!(
-                    "failed to persist media asset metadata: {error}"
-                )));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn rollback_media_assets_by_ids(
-    storage: &StorageClient,
-    space_id: &str,
-    asset_ids: &[RecordId],
-) {
-    let repo = MediaAssetRepository::new(storage.clone());
-    for asset_id in asset_ids {
-        if let Err(error) = repo.delete(space_id, asset_id).await {
-            warn!(asset_id = %asset_id, error = %error, "failed to roll back prepared media asset");
-        }
-    }
-}
-
-async fn rollback_managed_media_attachments(
-    storage: &StorageClient,
-    space_id: &str,
-    attachments: &[DocMediaAttachment],
-) {
-    let mut asset_ids = Vec::new();
-    for attachment in attachments {
-        let DocMediaLocation::ManagedAsset { asset_id } = &attachment.location else {
-            continue;
-        };
-        let Ok(record_id) = RecordId::from_str(asset_id) else {
-            continue;
-        };
-        asset_ids.push(record_id);
-    }
-    rollback_media_assets_by_ids(storage, space_id, &asset_ids).await;
-}
-
-async fn rollback_prepared_media_assets(storage: &StorageClient, assets: &[MediaAsset]) {
-    let Some(first_asset) = assets.first() else {
-        return;
-    };
-    let asset_ids = assets
-        .iter()
-        .map(|asset| asset.base.id.clone())
-        .collect::<Vec<_>>();
-    rollback_media_assets_by_ids(storage, &first_asset.base.space_id, &asset_ids).await;
-}
-
 fn manual_source_hash(doc: &Doc) -> String {
     let mut hasher = Sha256::new();
     hasher.update(doc.title.as_bytes());
@@ -564,14 +493,25 @@ async fn stage_source_for_manual_doc(
             .map_err(|reason| McpError::ExecutionError(format!("Access denied: {reason}")))?;
     }
 
-    if let Some(existing_source) = find_existing_source_for_doc(&ctx.storage, doc).await? {
+    if let Some(existing_source) =
+        elephant_storage::source_intake::existing_source_for_manual_document(&ctx.storage, doc)
+            .await?
+    {
         ctx.authz
             .authorize_record_write(&ctx.principal, &existing_source, "write:source")
             .map_err(|reason| McpError::ExecutionError(format!("Access denied: {reason}")))?;
         let mut updated_source = existing_source.clone();
         apply_manual_doc_to_source(&mut updated_source, doc)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
-        updated_source.external_id = Some(doc.base.id.to_string());
+        // Document guidance belongs to the template; preserve independent
+        // source metadata, including an originally admitted contact capability.
+        updated_source
+            .metadata
+            .clone_from(&existing_source.metadata);
+        updated_source
+            .set_manual_doc_template(&manual_doc_template_from_doc(doc))
+            .map_err(|error| McpError::InvalidParameters(error.to_string()))?;
+        updated_source.hash = manual_source_hash(doc);
         updated_source.set_requested_ingest_mode(IngestMode::Graph);
         let updated_source = prepare_source_for_reingest(&existing_source, updated_source);
         ctx.authz
@@ -598,9 +538,23 @@ async fn stage_source_for_source_backed_doc(
             .map_err(|reason| McpError::ExecutionError(format!("Access denied: {reason}")))?;
     }
 
-    let existing_source = match find_existing_source_for_doc(&ctx.storage, doc).await? {
-        Some(existing_source) => Some(existing_source),
-        None => find_existing_source_for_source(&ctx.storage, &source).await?,
+    let existing_source = if let Some(external_id) = source.external_id.as_deref() {
+        match elephant_storage::SourcePublicationRepository::new(ctx.storage.clone())
+            .external_head(&source.base.space_id, source.type_, external_id)
+            .await?
+        {
+            Some(head) => {
+                SourceRepository::new(ctx.storage.clone())
+                    .get_with_deleted(&source.base.space_id, &head.source_id)
+                    .await?
+            }
+            None => None,
+        }
+    } else {
+        match find_existing_source_for_doc(&ctx.storage, doc).await? {
+            Some(existing) => Some(existing),
+            None => find_existing_source_for_source(&ctx.storage, &source).await?,
+        }
     };
 
     if let Some(existing_source) = existing_source {
@@ -627,7 +581,7 @@ async fn authorize_persisted_manual_doc_access(
 ) -> McpResult<()> {
     let preview = preview_persisted_manual_doc_for_source(&ctx.storage, source, doc)
         .await
-        .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+        .map_err(super::source_intake::storage_error)?;
     ctx.authz
         .authorize_record_write(&ctx.principal, &preview, "write:doc")
         .map_err(|reason| McpError::ExecutionError(format!("Access denied: {reason}")))?;
@@ -636,112 +590,21 @@ async fn authorize_persisted_manual_doc_access(
         .map_err(|reason| McpError::ExecutionError(format!("Access denied: {reason}")))
 }
 
-async fn persist_staged_manual_source_and_doc(
+async fn accepted_doc_response(
     ctx: &ToolContext,
-    source_repo: &SourceRepository,
-    source_candidate: Source,
-    previous_source: Option<Source>,
-    doc: Doc,
-) -> Result<(Source, PersistedManualDoc), McpError> {
-    if let Some(previous_source) = previous_source {
-        let updated_source =
-            update_existing_source_for_reingest(source_repo, &previous_source, source_candidate)
-                .await
-                .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-        match persist_manual_doc_for_source_detailed(&ctx.storage, &updated_source, doc).await {
-            Ok(staged_doc) => Ok((updated_source, staged_doc)),
-            Err(err) => {
-                if let Err(rollback_err) =
-                    rollback_persisted_source(&ctx.storage, &updated_source, Some(&previous_source))
-                        .await
-                {
-                    warn!(
-                        source_id = %previous_source.base.id,
-                        error = %err,
-                        rollback_error = %rollback_err,
-                        "failed to roll back staged source after manual doc persistence error"
-                    );
-                }
-                Err(McpError::ExecutionError(err.to_string()))
-            }
-        }
-    } else {
-        let created_source = source_repo
-            .create(source_candidate)
-            .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-        match persist_manual_doc_for_source_detailed(&ctx.storage, &created_source, doc).await {
-            Ok(staged_doc) => Ok((created_source, staged_doc)),
-            Err(err) => {
-                if let Err(cleanup_err) =
-                    rollback_persisted_source(&ctx.storage, &created_source, None).await
-                {
-                    warn!(
-                        source_id = %created_source.base.id,
-                        error = %err,
-                        cleanup_error = %cleanup_err,
-                        "failed to roll back staged source after manual doc persistence error"
-                    );
-                }
-                Err(McpError::ExecutionError(err.to_string()))
-            }
-        }
-    }
-}
-
-async fn rollback_staged_source_and_doc(
-    ctx: &ToolContext,
-    source: &Source,
-    previous_source: Option<&Source>,
-    staged_doc: &PersistedManualDoc,
-) {
-    if let Err(err) = rollback_persisted_manual_doc(&ctx.storage, staged_doc).await {
-        warn!(
-            doc_id = %staged_doc.doc.base.id,
-            source_id = %source.base.id,
-            rollback_error = %err,
-            "failed to roll back staged manual doc after ingest failure"
-        );
-    }
-
-    match previous_source {
-        Some(previous_source) => {
-            if let Err(err) =
-                rollback_persisted_source(&ctx.storage, source, Some(previous_source)).await
-            {
-                warn!(
-                    source_id = %previous_source.base.id,
-                    rollback_error = %err,
-                    "failed to roll back staged source after ingest failure"
-                );
-            }
-        }
-        None => {
-            if let Err(err) = rollback_persisted_source(&ctx.storage, source, None).await {
-                warn!(
-                    source_id = %source.base.id,
-                    rollback_error = %err,
-                    "failed to delete staged source after ingest failure"
-                );
-            }
-        }
-    }
-}
-
-async fn enqueue_triage_source_work_item(
-    storage: StorageClient,
-    source: &Source,
-    priority: Option<i32>,
-) -> Result<(), McpError> {
-    enqueue_triage_source_work_item_for_source(
-        &storage,
-        source,
-        "mcp.ingest_doc",
-        priority.unwrap_or(5),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| McpError::ExecutionError(e.to_string()))
+    accepted: elephant_storage::source_intake::AcceptedSourceIntake,
+) -> McpResult<Value> {
+    let work_item_id = enqueue_intake(ctx, &accepted).await;
+    let doc = accepted
+        .document
+        .ok_or_else(|| McpError::ExecutionError("accepted input has no document".into()))?;
+    Ok(json!({
+        "ok": true,
+        "data": redact_staged_doc(&ctx.principal, doc, &accepted.source.base.id),
+        "operation": accepted.operation,
+        "work_item_id": work_item_id,
+        "enqueued": work_item_id.is_some()
+    }))
 }
 
 fn redact_staged_doc(
@@ -980,6 +843,9 @@ pub struct BatchIngestDocsOutput {
     pub job_id: String,
     /// Successfully processed items.
     pub succeeded: Vec<RedactionEnvelope<Doc>>,
+    /// Original operation receipts in succeeded order.
+    #[serde(default)]
+    pub operations: Vec<elephant_types::publication::OperationReceipt>,
     /// Failed items.
     pub failed: Vec<BatchError>,
 }
@@ -1004,7 +870,7 @@ pub struct SearchDocsHandler {
     doc_repo: DocRepository,
     embedding_repo: NodeEmbeddingRepository,
     space_config_repo: SpaceConfigRepository,
-    provider_cache: EmbeddingProviderCache,
+    _provider_cache: EmbeddingProviderCache,
 }
 
 impl SearchDocsHandler {
@@ -1017,7 +883,7 @@ impl SearchDocsHandler {
             doc_repo: DocRepository::new(storage.clone()),
             embedding_repo: NodeEmbeddingRepository::new(storage.clone(), partition_manager),
             space_config_repo: SpaceConfigRepository::new(storage),
-            provider_cache: EmbeddingProviderCache::new(),
+            _provider_cache: EmbeddingProviderCache::new(),
         }
     }
 }
@@ -1042,6 +908,7 @@ impl ToolHandler for SearchDocsHandler {
             "type": "object",
             "required": ["query"],
             "properties": {
+                "use_vector": { "type": "boolean", "default": true },
                 "query": {
                     "type": "string",
                     "description": "Search query text"
@@ -1068,6 +935,10 @@ impl ToolHandler for SearchDocsHandler {
     #[allow(clippy::too_many_lines)]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
+        let use_vector = params
+            .get("use_vector")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let input: SearchDocsInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
 
@@ -1099,15 +970,41 @@ impl ToolHandler for SearchDocsHandler {
             .as_ref()
             .is_some_and(|filters| filters.include_deleted);
 
-        let policy = resolve_embedding_policy(&self.space_config_repo, &space_id).await?;
-        let provider = self
-            .provider_cache
-            .get_or_create(policy.clone(), build_embedding_provider)
-            .await;
+        if !use_vector {
+            let (docs, total) = collect_visible_text_search_results(
+                &self.doc_repo,
+                ctx,
+                &space_id,
+                &input.query,
+                input.k,
+                include_deleted,
+                input
+                    .filters
+                    .as_ref()
+                    .and_then(|filters| filters.collection.as_deref()),
+            )
+            .await?;
+            return serde_json::to_value(ToolResponse::success(SearchDocsOutput {
+                items: ranked_doc_results(&ctx.principal, docs),
+                total,
+                mode: "lexical".into(),
+            }))
+            .map_err(|error| McpError::ExecutionError(error.to_string()));
+        }
+        let (policy, provider) =
+            resolve_query_embedding(&self.space_config_repo, &space_id).await?;
 
         let embeddings = match provider.embed(std::slice::from_ref(&input.query)).await {
             Ok(embeddings) => embeddings,
             Err(err) => {
+                if err.to_string().contains("provider_authorization") {
+                    return Err(McpError::Public(
+                        elephant_types::public_error::PublicError::new(
+                            elephant_types::public_error::ErrorCode::ProviderUnapproved,
+                            "Approved query embedding is unavailable",
+                        ),
+                    ));
+                }
                 warn!("Embedding provider failed, falling back to text search: {err}");
                 let (docs, total_results) = collect_visible_text_search_results(
                     &self.doc_repo,
@@ -1280,9 +1177,7 @@ impl ToolHandler for SearchDocsHandler {
                 .filter_map(|id| doc_map.remove(&id))
                 .collect();
 
-            let docs = ctx
-                .authz
-                .filter_records(&ctx.principal, docs, "read:doc:metadata");
+            let docs = crate::current_read::filter(ctx, docs, "read:doc:metadata").await?;
 
             // Without a settled check a partition that keeps filling its
             // candidate window (every large one does, since nearest-neighbour
@@ -1369,30 +1264,23 @@ impl ToolHandler for SearchDocsHandler {
     }
 }
 
-pub(crate) async fn resolve_embedding_policy(
+pub(crate) async fn resolve_query_embedding(
     repo: &SpaceConfigRepository,
     space_id: &str,
-) -> McpResult<EmbeddingPolicy> {
-    let policy = match repo.get_by_space_id(space_id).await {
-        Ok(Some(config)) => EmbeddingPolicy::from_space_config(&config),
-        Ok(None) => EmbeddingPolicy::from_env(),
-        Err(err) => {
-            warn!("Failed to load space_config, falling back to env: {err}");
-            EmbeddingPolicy::from_env()
-        }
-    };
-
-    if policy.dims == 0 {
-        return Err(McpError::ExecutionError(
-            "Embedding policy has invalid dimensions".to_string(),
-        ));
-    }
-
-    Ok(policy)
-}
-
-pub(crate) fn build_embedding_provider(policy: &EmbeddingPolicy) -> Arc<dyn EmbeddingProvider> {
-    elephant_embeddings::provider_for_policy(policy)
+) -> McpResult<(EmbeddingPolicy, Arc<dyn EmbeddingProvider>)> {
+    let (policy, provider, _) = elephant_pipeline::provider_dispatch::ProviderDispatchContext::new(
+        repo.clone(),
+        space_id.to_owned(),
+    )
+    .embedding(elephant_types::provider_binding::ModelOperation::QueryEmbedding)
+    .await
+    .map_err(|_| {
+        McpError::Public(elephant_types::public_error::PublicError::new(
+            elephant_types::public_error::ErrorCode::ProviderUnapproved,
+            "No approved query embedding binding",
+        ))
+    })?;
+    Ok((policy, provider))
 }
 
 async fn build_partition_keys(
@@ -1576,8 +1464,7 @@ async fn collect_visible_text_search_results(
 
         let next_cursor = result.cursor.clone();
         let docs = filter_docs_by_collection(
-            ctx.authz
-                .filter_records(&ctx.principal, result.results, "read:doc:metadata"),
+            crate::current_read::filter(ctx, result.results, "read:doc:metadata").await?,
             collection,
         );
 
@@ -1630,7 +1517,7 @@ const fn semantic_candidate_limit(k: usize) -> usize {
 
 /// Handler for `ingest_doc` tool.
 pub struct IngestDocHandler {
-    source_repo: SourceRepository,
+    _source_repo: SourceRepository,
 }
 
 impl IngestDocHandler {
@@ -1638,7 +1525,7 @@ impl IngestDocHandler {
     #[must_use]
     pub const fn new(storage: StorageClient) -> Self {
         Self {
-            source_repo: SourceRepository::new(storage),
+            _source_repo: SourceRepository::new(storage),
         }
     }
 }
@@ -1667,14 +1554,31 @@ impl ToolHandler for IngestDocHandler {
             "type": "object",
             "required": ["doc"],
             "properties": {
+                "intake": intake_schema(),
                 "doc": doc_payload_schema()
             }
         })
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
+        let create_id = elephant_storage::source_intake::create_document_id(
+            &ctx.principal.space_id,
+            &params["doc"],
+            &intake,
+        )
+        .map_err(super::source_intake::storage_error)?;
         let mut params = coerce_params(params, &self.input_schema());
         if let Some(doc) = params.get_mut("doc") {
+            if doc.get("base").and_then(|base| base.get("id")).is_none() {
+                if let Some(object) = doc.as_object_mut() {
+                    object.entry("id").or_insert_with(|| json!(create_id));
+                }
+            }
             normalize_doc_value(doc, ctx)?;
         }
         let input: IngestDocInput = serde_json::from_value(params)
@@ -1716,39 +1620,15 @@ impl ToolHandler for IngestDocHandler {
             return serde_json::to_value(response)
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
-        let rollback_source = previous_source.clone();
-        let (staged_source, persisted_doc) = Box::pin(persist_staged_manual_source_and_doc(
-            ctx,
-            &self.source_repo,
-            source_candidate,
-            previous_source,
-            input.doc,
-        ))
-        .await?;
-        if let Err(err) =
-            enqueue_triage_source_work_item(ctx.storage.clone(), &staged_source, None).await
-        {
-            rollback_staged_source_and_doc(
-                ctx,
-                &staged_source,
-                rollback_source.as_ref(),
-                &persisted_doc,
-            )
-            .await;
-            return Err(err);
-        }
-        let response = ToolResponse::success(redact_staged_doc(
-            &ctx.principal,
-            persisted_doc.doc,
-            &staged_source.base.id,
-        ));
-        serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+        let _ = previous_source;
+        let accepted = accept_intake(ctx, source_candidate, Some(&input.doc), intake, &[]).await?;
+        accepted_doc_response(ctx, accepted).await
     }
 }
 
 /// Handler for `ingest_doc_simple` tool.
 pub struct IngestDocSimpleHandler {
-    source_repo: SourceRepository,
+    _source_repo: SourceRepository,
 }
 
 impl IngestDocSimpleHandler {
@@ -1756,7 +1636,7 @@ impl IngestDocSimpleHandler {
     #[must_use]
     pub const fn new(storage: StorageClient) -> Self {
         Self {
-            source_repo: SourceRepository::new(storage),
+            _source_repo: SourceRepository::new(storage),
         }
     }
 }
@@ -1791,6 +1671,7 @@ impl ToolHandler for IngestDocSimpleHandler {
                 { "required": ["media"] }
             ],
             "properties": {
+                "intake": intake_schema(),
                 "title": { "type": "string", "description": "Document title" },
                 "text": { "type": "string", "description": "Document text content" },
                 "media": {
@@ -1809,7 +1690,18 @@ impl ToolHandler for IngestDocSimpleHandler {
         })
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
+        let create_id = elephant_storage::source_intake::create_document_id(
+            &ctx.principal.space_id,
+            &params,
+            &intake,
+        )
+        .map_err(super::source_intake::storage_error)?;
         let params = coerce_params(params, &self.input_schema());
         let input: IngestDocSimpleInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
@@ -1829,11 +1721,11 @@ impl ToolHandler for IngestDocSimpleHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
         let prepared_media = build_media_attachments(&ctx.storage, &space_id, &input.media)?;
-        let rollback_assets = prepared_media.assets.clone();
 
-        let base = BaseFieldsBuilder::new(&space_id)
+        let mut base = BaseFieldsBuilder::new(&space_id)
             .for_table(TableName::Doc)
             .build();
+        base.id = create_id;
 
         let mut metadata = input
             .metadata
@@ -1874,7 +1766,8 @@ impl ToolHandler for IngestDocSimpleHandler {
             return serde_json::to_value(response)
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
-        let (source_candidate, previous_source) = stage_source_for_manual_doc(ctx, &doc).await?;
+        let (mut source_candidate, previous_source) =
+            stage_source_for_manual_doc(ctx, &doc).await?;
         if let Err(reason) =
             authorize_persisted_manual_doc_access(ctx, &source_candidate, &doc).await
         {
@@ -1882,43 +1775,17 @@ impl ToolHandler for IngestDocSimpleHandler {
             return serde_json::to_value(response)
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
-        persist_prepared_media_assets(&ctx.storage, &prepared_media.assets).await?;
-        let rollback_source = previous_source.clone();
-        let (staged_source, persisted_doc) = match Box::pin(persist_staged_manual_source_and_doc(
+        let _ = previous_source;
+        source_candidate.metadata["_intake_priority"] = json!(input.priority.unwrap_or(10));
+        let accepted = accept_intake(
             ctx,
-            &self.source_repo,
             source_candidate,
-            previous_source,
-            doc,
-        ))
-        .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                rollback_prepared_media_assets(&ctx.storage, &rollback_assets).await;
-                return Err(err);
-            }
-        };
-        if let Err(err) =
-            enqueue_triage_source_work_item(ctx.storage.clone(), &staged_source, input.priority)
-                .await
-        {
-            rollback_prepared_media_assets(&ctx.storage, &rollback_assets).await;
-            rollback_staged_source_and_doc(
-                ctx,
-                &staged_source,
-                rollback_source.as_ref(),
-                &persisted_doc,
-            )
-            .await;
-            return Err(err);
-        }
-        let response = ToolResponse::success(redact_staged_doc(
-            &ctx.principal,
-            persisted_doc.doc,
-            &staged_source.base.id,
-        ));
-        serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+            Some(&doc),
+            intake,
+            &prepared_media.assets,
+        )
+        .await?;
+        accepted_doc_response(ctx, accepted).await
     }
 }
 
@@ -1970,6 +1837,10 @@ pub struct IngestDirectoryInput {
     /// Optional priority applied to each ingestion work item.
     #[serde(default)]
     pub priority: Option<i32>,
+    /// Explicit acceptance controls keyed by normalized relative file path.
+    #[serde(default)]
+    pub intake_by_path:
+        std::collections::BTreeMap<String, elephant_storage::source_intake::IntakeControl>,
     /// Optional extraction guidance applied to each file.
     #[serde(flatten)]
     pub extraction_guidance: ExtractionGuidanceInput,
@@ -1977,7 +1848,7 @@ pub struct IngestDirectoryInput {
 
 /// Handler for `ingest_file` tool.
 pub struct IngestFileHandler {
-    source_repo: SourceRepository,
+    _source_repo: SourceRepository,
 }
 
 impl IngestFileHandler {
@@ -1985,7 +1856,7 @@ impl IngestFileHandler {
     #[must_use]
     pub const fn new(storage: StorageClient) -> Self {
         Self {
-            source_repo: SourceRepository::new(storage),
+            _source_repo: SourceRepository::new(storage),
         }
     }
 }
@@ -2011,6 +1882,7 @@ impl ToolHandler for IngestFileHandler {
             "type": "object",
             "required": ["path"],
             "properties": {
+                "intake": intake_schema(),
                 "path": { "type": "string", "description": "File path on disk" },
                 "title": { "type": "string", "description": "Optional document title override" },
                 "text": { "type": "string", "description": "Optional sidecar text metadata for media-backed files" },
@@ -2025,7 +1897,12 @@ impl ToolHandler for IngestFileHandler {
         })
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
         let params = coerce_params(params, &self.input_schema());
         let input: IngestFileInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
@@ -2047,7 +1924,16 @@ impl ToolHandler for IngestFileHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        let bytes = tokio::fs::read(&path)
+        let canonical_path = tokio::fs::canonicalize(&path).await.map_err(|error| {
+            McpError::ExecutionError(format!("Failed to resolve file: {error}"))
+        })?;
+        let file_locator = canonical_path
+            .to_str()
+            .ok_or_else(|| {
+                McpError::InvalidParameters("file path must be representable as UTF-8".into())
+            })?
+            .to_owned();
+        let bytes = tokio::fs::read(&canonical_path)
             .await
             .map_err(|e| McpError::ExecutionError(format!("Failed to read file: {e}")))?;
 
@@ -2075,14 +1961,17 @@ impl ToolHandler for IngestFileHandler {
             .for_table(TableName::Source)
             .build();
         let mut source = Source::new(base, SourceType::Drive, hash.clone());
-        source.external_id = Some(filename.clone());
-        source.path = Some(input.path.clone());
+        source.external_id = Some(format!("file:{file_locator}"));
+        source.path = Some(file_locator.clone());
         source.metadata = json!({
             "source_type": source_type,
             "size_bytes": fs_meta.len(),
         });
         source.set_requested_ingest_mode(IngestMode::Graph);
-        source.base.id = deterministic_source_id_for_ingest(&source);
+        source.base.id =
+            elephant_storage::source_intake::resolve_source_identity(&ctx.storage, &source)
+                .await
+                .map_err(super::source_intake::storage_error)?;
 
         let (media_attachments, pending_assets) = if let Some(kind) = media_kind {
             let duration_ms = if kind == DocMediaKind::Video {
@@ -2106,7 +1995,6 @@ impl ToolHandler for IngestFileHandler {
         } else {
             (Vec::new(), Vec::new())
         };
-        let rollback_attachments = media_attachments.clone();
 
         let doc_content_type = if media_kind.is_some() {
             source_type
@@ -2133,14 +2021,14 @@ impl ToolHandler for IngestFileHandler {
             "source_id".to_string(),
             Value::String(source.base.id.to_string()),
         );
-        metadata.insert("file_path".to_string(), Value::String(input.path));
+        metadata.insert("file_path".to_string(), Value::String(file_locator));
         metadata.insert(
             "size_bytes".to_string(),
             Value::Number(serde_json::Number::from(fs_meta.len())),
         );
         input.extraction_guidance.apply_to_metadata(&mut metadata);
 
-        let doc = Doc {
+        let mut doc = Doc {
             base: BaseFieldsBuilder::new(ctx.principal.space_id.clone())
                 .for_table(TableName::Doc)
                 .build(),
@@ -2153,8 +2041,12 @@ impl ToolHandler for IngestFileHandler {
             metadata: Value::Object(metadata),
         };
 
-        let (source_candidate, previous_source) =
+        let (mut source_candidate, previous_source) =
             stage_source_for_source_backed_doc(ctx, source, &doc).await?;
+        doc.source = Some(Link::new(source_candidate.base.id.clone()));
+        doc.metadata["source_id"] = json!(source_candidate.base.id);
+        elephant_storage::source_intake::attach_document(&mut source_candidate, &mut doc)
+            .map_err(super::source_intake::storage_error)?;
         if let Err(reason) =
             authorize_persisted_manual_doc_access(ctx, &source_candidate, &doc).await
         {
@@ -2162,45 +2054,49 @@ impl ToolHandler for IngestFileHandler {
             return serde_json::to_value(response)
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
-        persist_prepared_media_assets(&ctx.storage, &pending_assets).await?;
-        let rollback_source = previous_source.clone();
-        let (staged_source, persisted_doc) = match Box::pin(persist_staged_manual_source_and_doc(
-            ctx,
-            &self.source_repo,
-            source_candidate,
-            previous_source,
-            doc,
-        ))
-        .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                rollback_managed_media_attachments(&ctx.storage, &space_id, &rollback_attachments)
-                    .await;
-                return Err(err);
-            }
-        };
-        if let Err(err) =
-            enqueue_triage_source_work_item(ctx.storage.clone(), &staged_source, input.priority)
-                .await
-        {
-            rollback_staged_source_and_doc(
-                ctx,
-                &staged_source,
-                rollback_source.as_ref(),
-                &persisted_doc,
-            )
-            .await;
-            return Err(err);
-        }
-
-        let response = ToolResponse::success(redact_staged_doc(
-            &ctx.principal,
-            persisted_doc.doc,
-            &staged_source.base.id,
-        ));
-        serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+        let _ = previous_source;
+        source_candidate.metadata["_intake_priority"] = json!(input.priority.unwrap_or(10));
+        let accepted =
+            accept_intake(ctx, source_candidate, Some(&doc), intake, &pending_assets).await?;
+        accepted_doc_response(ctx, accepted).await
     }
+}
+
+const MAX_DIRECTORY_CONTROL_ENTRIES: usize = 1024;
+const MAX_DIRECTORY_CONTROL_BYTES: usize = 1_000_000;
+
+fn validate_directory_controls(
+    controls: &std::collections::BTreeMap<String, elephant_storage::source_intake::IntakeControl>,
+) -> McpResult<()> {
+    if controls.len() > MAX_DIRECTORY_CONTROL_ENTRIES
+        || serde_json::to_vec(controls)
+            .map_err(|error| McpError::InvalidParameters(error.to_string()))?
+            .len()
+            > MAX_DIRECTORY_CONTROL_BYTES
+    {
+        return Err(McpError::InvalidParameters(
+            "intake_by_path exceeds 1024 entries or 1000000 UTF-8 bytes".into(),
+        ));
+    }
+    for (path, control) in controls {
+        if path.is_empty()
+            || path.len() > 4096
+            || path.contains('\\')
+            || path.as_bytes().get(1) == Some(&b':')
+            || path
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        {
+            return Err(McpError::InvalidParameters(
+                "intake_by_path keys must be normalized relative paths using forward slashes"
+                    .into(),
+            ));
+        }
+        intake_control(&json!({"intake":control}))?
+            .validate_acceptance()
+            .map_err(|error| McpError::InvalidParameters(error.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Handler for `ingest_directory` tool.
@@ -2216,6 +2112,7 @@ impl ToolHandler for IngestDirectoryHandler {
     fn description(&self) -> &'static str {
         concat!(
             "Ingest all files in a directory matching a glob pattern.\n\n",
+            "Changed files require intake_by_path[relative_path] with revision_id, idempotency_key and expected_generation.\n\n",
             "Example:\n",
             r#"{ "path": "/path/to/docs", "pattern": "*.md" }"#,
         )
@@ -2227,6 +2124,7 @@ impl ToolHandler for IngestDirectoryHandler {
             "required": ["path"],
             "properties": {
                 "path": { "type": "string", "description": "Directory path on disk" },
+                "intake_by_path": {"type":"object", "required":[], "maxProperties":MAX_DIRECTORY_CONTROL_ENTRIES, "additionalProperties":intake_schema(), "description":"Per-file revision, stable retry key and expected generation keyed by normalized relative path, e.g. notes/day.md"},
                 "pattern": { "type": "string", "description": "Glob pattern (e.g. *.md, **/*.txt)", "default": "**/*" },
                 "source_type": { "type": "string", "description": "Optional content type hint to apply to all files" },
                 "collection": { "type": "string", "description": "Optional collection name applied to all files" },
@@ -2244,6 +2142,7 @@ impl ToolHandler for IngestDirectoryHandler {
         let input: IngestDirectoryInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
 
+        validate_directory_controls(&input.intake_by_path)?;
         let space_id = ctx.principal.space_id.clone();
         if space_id.is_empty() {
             let response: ToolResponse<()> = ToolResponse::error("Access denied: missing space_id");
@@ -2276,26 +2175,59 @@ impl ToolHandler for IngestDirectoryHandler {
         let mut ingested: Vec<serde_json::Value> = Vec::new();
         let mut failed: Vec<serde_json::Value> = Vec::new();
 
-        let ingest_file = IngestFileHandler::new(ctx.storage.clone());
-        for entry in walkdir::WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
-        {
-            let rel = entry
-                .path()
-                .strip_prefix(&root)
-                .unwrap_or_else(|_| entry.path())
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            if !matcher.is_match(&rel) {
+        // Discover and validate all control targets before accepting any input.
+        let mut files = Vec::new();
+        for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+            let entry = entry.map_err(|error| {
+                McpError::ExecutionError(format!("Failed to enumerate directory: {error}"))
+            })?;
+            if !entry.file_type().is_file() {
                 continue;
             }
-
-            let path = entry.path().to_string_lossy().to_string();
+            let relative = entry
+                .path()
+                .strip_prefix(&root)
+                .map_err(|error| McpError::ExecutionError(error.to_string()))?;
+            let rel = relative
+                .to_str()
+                .ok_or_else(|| {
+                    McpError::InvalidParameters(
+                        "directory file paths must be representable as UTF-8".into(),
+                    )
+                })?
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if matcher.is_match(&rel) {
+                let path = entry
+                    .path()
+                    .to_str()
+                    .ok_or_else(|| {
+                        McpError::InvalidParameters(
+                            "directory file paths must be representable as UTF-8".into(),
+                        )
+                    })?
+                    .to_owned();
+                files.push((rel, path));
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        for path in input.intake_by_path.keys() {
+            if !files.iter().any(|(relative, _)| relative == path) {
+                return Err(McpError::InvalidParameters(format!(
+                    "intake_by_path target is not a selected file: {path}"
+                )));
+            }
+        }
+        let ingest_file = IngestFileHandler::new(ctx.storage.clone());
+        for (rel, path) in files {
             let mut file_params = json!({ "path": path });
             if let Some(obj) = file_params.as_object_mut() {
+                if let Some(control) = input.intake_by_path.get(&rel) {
+                    obj.insert(
+                        "intake".into(),
+                        serde_json::to_value(control)
+                            .map_err(|error| McpError::InvalidParameters(error.to_string()))?,
+                    );
+                }
                 if let Some(source_type) = input.source_type.as_deref() {
                     obj.insert(
                         "source_type".to_string(),
@@ -2339,15 +2271,28 @@ impl ToolHandler for IngestDirectoryHandler {
 
             match ingest_file.execute(ctx, file_params).await {
                 Ok(value) => {
+                    let operation = value.get("operation").cloned();
+                    let work_item_id = value.get("work_item_id").cloned();
                     let decoded: Result<ToolResponse<RedactionEnvelope<Doc>>, _> =
                         serde_json::from_value(value);
                     match decoded {
                         Ok(resp) if resp.ok => {
-                            let doc_id = resp.data.as_ref().map_or_else(
-                                || "unknown".to_string(),
-                                |env| env.data.base.id.to_string(),
-                            );
-                            ingested.push(json!({ "path": rel, "doc_id": doc_id }));
+                            let data = resp.data.ok_or_else(|| {
+                                McpError::ExecutionError(
+                                    "accepted file response has no document".into(),
+                                )
+                            })?;
+                            let operation = operation.ok_or_else(|| {
+                                McpError::ExecutionError(
+                                    "accepted file response has no operation receipt".into(),
+                                )
+                            })?;
+                            let work_item_id = work_item_id.ok_or_else(|| {
+                                McpError::ExecutionError(
+                                    "accepted file response has no queue handoff field".into(),
+                                )
+                            })?;
+                            ingested.push(json!({ "path": rel, "doc_id": data.data.base.id, "operation":operation, "work_item_id":work_item_id }));
                         }
                         Ok(resp) => {
                             failed.push(json!({
@@ -2358,6 +2303,11 @@ impl ToolHandler for IngestDirectoryHandler {
                         Err(e) => failed.push(json!({ "path": rel, "error": e.to_string() })),
                     }
                 }
+                Err(
+                    error @ McpError::StorageError(
+                        elephant_storage::StorageError::ErasureInProgress,
+                    ),
+                ) => return Err(error),
                 Err(e) => failed.push(json!({ "path": rel, "error": e.to_string() })),
             }
         }
@@ -2388,7 +2338,7 @@ pub struct IngestUrlInput {
 
 /// Handler for `ingest_url` tool.
 pub struct IngestUrlHandler {
-    source_repo: SourceRepository,
+    _source_repo: SourceRepository,
     fetch_policy: elephant_pipeline::remote_source::RemoteFetchPolicy,
 }
 
@@ -2397,7 +2347,7 @@ impl IngestUrlHandler {
     #[must_use]
     pub const fn new(storage: StorageClient) -> Self {
         Self {
-            source_repo: SourceRepository::new(storage),
+            _source_repo: SourceRepository::new(storage),
             fetch_policy: elephant_pipeline::remote_source::RemoteFetchPolicy::ingest(),
         }
     }
@@ -2408,7 +2358,7 @@ impl IngestUrlHandler {
         fetch_policy: elephant_pipeline::remote_source::RemoteFetchPolicy,
     ) -> Self {
         Self {
-            source_repo: SourceRepository::new(storage),
+            _source_repo: SourceRepository::new(storage),
             fetch_policy,
         }
     }
@@ -2433,6 +2383,7 @@ impl ToolHandler for IngestUrlHandler {
             "type": "object",
             "required": ["url"],
             "properties": {
+                "intake": intake_schema(),
                 "url": { "type": "string", "description": "HTTP/HTTPS URL to fetch" },
                 "title": { "type": "string", "description": "Optional document title override" },
                 "text": { "type": "string", "description": "Optional sidecar text metadata for media-backed URLs" },
@@ -2442,7 +2393,12 @@ impl ToolHandler for IngestUrlHandler {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
         let params = coerce_params(params, &self.input_schema());
         let input: IngestUrlInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
@@ -2490,7 +2446,11 @@ impl ToolHandler for IngestUrlHandler {
         source.external_id = Some(input.url.clone());
         source.uri = Some(input.url.clone());
         source.metadata = json!({ "source_type": source_type });
-        source.base.id = deterministic_source_id_for_ingest(&source);
+        source.set_requested_ingest_mode(IngestMode::Graph);
+        source.base.id =
+            elephant_storage::source_intake::resolve_source_identity(&ctx.storage, &source)
+                .await
+                .map_err(super::source_intake::storage_error)?;
 
         let (media_attachments, pending_assets) = if let Some(kind) = media_kind {
             let duration_ms = if kind == DocMediaKind::Video {
@@ -2518,7 +2478,6 @@ impl ToolHandler for IngestUrlHandler {
         } else {
             (Vec::new(), Vec::new())
         };
-        let rollback_attachments = media_attachments.clone();
 
         let doc_content_type = if media_kind.is_some() || source_type.starts_with("text/") {
             source_type.as_str()
@@ -2533,7 +2492,7 @@ impl ToolHandler for IngestUrlHandler {
             "url": input.url,
         });
 
-        let doc = Doc {
+        let mut doc = Doc {
             base: BaseFieldsBuilder::new(ctx.principal.space_id.clone())
                 .for_table(TableName::Doc)
                 .build(),
@@ -2546,8 +2505,12 @@ impl ToolHandler for IngestUrlHandler {
             metadata,
         };
 
-        let (source_candidate, previous_source) =
+        let (mut source_candidate, previous_source) =
             stage_source_for_source_backed_doc(ctx, source, &doc).await?;
+        doc.source = Some(Link::new(source_candidate.base.id.clone()));
+        doc.metadata["source_id"] = json!(source_candidate.base.id);
+        elephant_storage::source_intake::attach_document(&mut source_candidate, &mut doc)
+            .map_err(super::source_intake::storage_error)?;
         if let Err(reason) =
             authorize_persisted_manual_doc_access(ctx, &source_candidate, &doc).await
         {
@@ -2555,43 +2518,10 @@ impl ToolHandler for IngestUrlHandler {
             return serde_json::to_value(response)
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
-        persist_prepared_media_assets(&ctx.storage, &pending_assets).await?;
-        let rollback_source = previous_source.clone();
-        let (staged_source, persisted_doc) = match Box::pin(persist_staged_manual_source_and_doc(
-            ctx,
-            &self.source_repo,
-            source_candidate,
-            previous_source,
-            doc,
-        ))
-        .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                rollback_managed_media_attachments(&ctx.storage, &space_id, &rollback_attachments)
-                    .await;
-                return Err(err);
-            }
-        };
-        if let Err(err) =
-            enqueue_triage_source_work_item(ctx.storage.clone(), &staged_source, None).await
-        {
-            rollback_staged_source_and_doc(
-                ctx,
-                &staged_source,
-                rollback_source.as_ref(),
-                &persisted_doc,
-            )
-            .await;
-            return Err(err);
-        }
-
-        let response = ToolResponse::success(redact_staged_doc(
-            &ctx.principal,
-            persisted_doc.doc,
-            &staged_source.base.id,
-        ));
-        serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+        let _ = previous_source;
+        let accepted =
+            accept_intake(ctx, source_candidate, Some(&doc), intake, &pending_assets).await?;
+        accepted_doc_response(ctx, accepted).await
     }
 }
 
@@ -2605,16 +2535,18 @@ fn url_extension_hint<'a>(url: &'a str, media_type: &'a str) -> Option<&'a str> 
 /// Handler for `extract_doc` tool.
 pub struct ExtractDocHandler {
     repo: DocRepository,
-    work_item_repo: WorkItemRepository,
 }
 
 impl ExtractDocHandler {
     /// Creates a new handler.
     #[must_use]
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "Preserve the existing runtime constructor signature."
+    )]
     pub fn new(storage: StorageClient) -> Self {
         Self {
-            repo: DocRepository::new(storage.clone()),
-            work_item_repo: WorkItemRepository::new(storage),
+            repo: DocRepository::new(storage),
         }
     }
 }
@@ -2627,9 +2559,9 @@ impl ToolHandler for ExtractDocHandler {
 
     fn description(&self) -> &'static str {
         concat!(
-            "Maintenance helper that manually replays render/build/extraction preparation for an existing document.\n\n",
+            "Reprocess an accepted source document using a new immutable revision and explicit desired-head generation.\n\n",
             "Example:\n",
-            r#"{ "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6" }"#,
+            r#"{ "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6", "intake": { "revision_id": "reprocess-v2", "idempotency_key": "reprocess-v2", "expected_generation": "<current accepted generation>" } }"#,
         )
     }
 
@@ -2638,12 +2570,24 @@ impl ToolHandler for ExtractDocHandler {
             "type": "object",
             "required": ["id"],
             "properties": {
-                "id": { "type": "string", "description": "Document ID" }
+                "id": { "type": "string", "description": "Document ID" },
+                "intake": intake_schema()
             }
         })
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
+        if intake.expected_generation.is_none()
+            || intake.revision_id.is_none()
+            || intake.idempotency_key.is_none()
+        {
+            return Err(McpError::InvalidParameters("extract_doc requires a new intake revision_id, idempotency_key and expected_generation".into()));
+        }
         let params = coerce_params(params, &self.input_schema());
         let input: ExtractDocInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
@@ -2674,82 +2618,21 @@ impl ToolHandler for ExtractDocHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        let mut registry = RendererRegistry::new();
-        registry.register(Box::new(DefaultTextRenderer::new()));
-        registry.register(Box::new(MultimodalRenderer::new()));
-        registry.register(Box::new(PassthroughRenderer::new()));
-
-        let content_type = doc
-            .metadata
-            .get("content_type")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                doc.media_attachments
-                    .first()
-                    .map(|item| item.media_type.as_str())
-            })
-            .unwrap_or("text/plain");
-
-        let render_result = execute_render_doc(&ctx.storage, &registry, &doc, Some(content_type))
+        ctx.authz
+            .authorize_record_write(&ctx.principal, &doc, "write:doc")
+            .map_err(|error| McpError::ExecutionError(format!("Access denied: {error}")))?;
+        let (source, original) =
+            elephant_storage::source_intake::source_and_publication_for_document(
+                &ctx.storage,
+                &doc,
+            )
             .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-        let config = DocTreeConfig::default();
-        execute_build_doc_tree(&ctx.storage, &render_result.revision_id, &config)
-            .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-
-        let idempotency_key = format!("{PLAN_EXTRACTION_KIND}:{}", render_result.revision_id);
-        let existing = self
-            .work_item_repo
-            .find_by_idempotency_key(&space_id, &idempotency_key)
-            .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-
-        let work_item_id = if let Some(item) = existing {
-            item.base.id
-        } else {
-            let mut base = BaseFieldsBuilder::new(space_id.clone())
-                .for_table(TableName::WorkItem)
-                .created_by(doc.base.created_by.clone())
-                .build();
-            base.security = doc.base.security.clone();
-            base.provenance = doc.base.provenance.clone();
-            base.subjects.clone_from(&doc.base.subjects);
-            base.subjects_state = doc.base.subjects_state;
-
-            let work_item = WorkItem {
-                base,
-                kind: PLAN_EXTRACTION_KIND.to_string(),
-                payload: json!({
-                    "revision_id": render_result.revision_id.to_string(),
-                    "policy_version": "default",
-                    "extractor_id": AGENTIC_EXTRACTOR_ID,
-                    "allow_raw_quotes": false,
-                    "ingest_mode": "graph"
-                }),
-                status: WorkItemStatus::Runnable,
-                priority: 50,
-                idempotency_key,
-                attempts: 0,
-                lease_expires_at: None,
-                leased_by: None,
-                run_after: None,
-                last_error: None,
-            };
-            self.work_item_repo
-                .create(work_item)
-                .await
-                .map_err(|e| McpError::ExecutionError(e.to_string()))?
-                .base
-                .id
-        };
-
-        let response = ToolResponse::success(json!({
-            "doc_id": doc.base.id.to_string(),
-            "revision_id": render_result.revision_id.to_string(),
-            "work_item_id": work_item_id.to_string()
-        }));
-        serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+            .map_err(super::source_intake::storage_error)?;
+        // A fresh revision reuses the exact accepted input, including media;
+        // it never uses rendered text as a replacement for the original input.
+        let accepted =
+            super::source_intake::reprocess_intake(ctx, source, &doc, &original, intake).await?;
+        accepted_doc_response(ctx, accepted).await
     }
 }
 
@@ -2852,11 +2735,32 @@ impl ToolHandler for GetDocPipelineStatusHandler {
             .or_else(|| revisions.first());
         let (chunks_total, chunks_embedded, revision, nodes) =
             if let Some(revision) = selected_revision {
+                if revision.base.space_id != space_id
+                    || revision.doc.id() != &doc_id
+                    || revision.base.deleted_at.is_some()
+                {
+                    return Err(McpError::Public(
+                        elephant_types::public_error::PublicError::new(
+                            elephant_types::public_error::ErrorCode::NotFound,
+                            "Document revision unavailable",
+                        ),
+                    ));
+                }
+                authorize_pipeline_status_record(ctx, revision)?;
                 let nodes = self
                     .node_repo
                     .find_by_revision(&revision.base.id)
                     .await
                     .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+                let nodes: Vec<_> = nodes
+                    .into_iter()
+                    .filter(|node| {
+                        node.base.space_id == space_id
+                            && node.revision.id() == &revision.base.id
+                            && node.base.deleted_at.is_none()
+                            && authorize_pipeline_status_record(ctx, node).is_ok()
+                    })
+                    .collect();
                 let embeddable: Vec<_> = nodes
                     .iter()
                     .filter(|node| {
@@ -2908,6 +2812,12 @@ impl ToolHandler for GetDocPipelineStatusHandler {
         } else {
             None
         };
+        if let Some(config) = &space_config {
+            authorize_pipeline_status_record(ctx, config)?;
+        }
+        if let Some(source) = &source {
+            authorize_pipeline_status_record(ctx, source)?;
+        }
         status.extraction_guidance = Some(resolve_extraction_guidance_status(
             space_config.as_ref(),
             Some(&doc),
@@ -2923,6 +2833,15 @@ impl ToolHandler for GetDocPipelineStatusHandler {
                 .find_by_revision(&space_id, revision_id, 5000)
                 .await
                 .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+            let assertions: Vec<_> = assertions
+                .into_iter()
+                .filter(|assertion| {
+                    assertion.base.space_id == space_id
+                        && assertion.evidence.revision.id() == revision_id
+                        && assertion.base.deleted_at.is_none()
+                        && authorize_pipeline_status_record(ctx, assertion).is_ok()
+                })
+                .collect();
             status.assertions_count = assertions.len();
 
             let mut entities: std::collections::HashSet<RecordId> =
@@ -2935,7 +2854,14 @@ impl ToolHandler for GetDocPipelineStatusHandler {
                     entities.insert(link.id().clone());
                 }
             }
-            status.entities_created = entities.len();
+            let entity_repo = elephant_storage::EntityRepository::new(ctx.storage.clone());
+            for entity_id in entities {
+                if let Some(entity) = entity_repo.get(&space_id, &entity_id).await? {
+                    if authorize_pipeline_status_record(ctx, &entity).is_ok() {
+                        status.entities_created += 1;
+                    }
+                }
+            }
         }
 
         let work_items = self
@@ -2957,6 +2883,11 @@ impl ToolHandler for GetDocPipelineStatusHandler {
         let source_id_str = doc.source.as_ref().map(|source| source.id().to_string());
         let relevant_statuses: Vec<WorkItemStatus> = work_items
             .into_iter()
+            .filter(|item| {
+                item.base.space_id == space_id
+                    && item.base.deleted_at.is_none()
+                    && authorize_pipeline_status_record(ctx, item).is_ok()
+            })
             .filter(|item| {
                 // Match extraction work items by revision
                 let revision_match = (item.kind == PLAN_EXTRACTION_KIND
@@ -2999,6 +2930,20 @@ impl ToolHandler for GetDocPipelineStatusHandler {
         let response = ToolResponse::success(status);
         serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
     }
+}
+
+fn authorize_pipeline_status_record(
+    ctx: &ToolContext,
+    record: &impl elephant_types::records::HasSecurity,
+) -> McpResult<()> {
+    ctx.authz
+        .authorize_record_read(&ctx.principal, record, "read:doc")
+        .map_err(|_| {
+            McpError::Public(elephant_types::public_error::PublicError::new(
+                elephant_types::public_error::ErrorCode::ForbiddenSpace,
+                "Document pipeline metadata is not authorized",
+            ))
+        })
 }
 
 fn graph_ingest_is_still_pending(source: Option<&Source>, assertions_count: usize) -> bool {
@@ -3180,6 +3125,7 @@ impl ToolHandler for GetDocHandler {
                     return serde_json::to_value(response)
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
+                let doc = crate::current_read::require(ctx, doc, "read:doc:metadata").await?;
                 let response = ToolResponse::success(redact_doc(&ctx.principal, doc));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
@@ -3290,6 +3236,7 @@ impl ToolHandler for ListDocChunksHandler {
             vec![]
         };
 
+        let nodes = crate::current_read::filter(ctx, nodes, "read:doc:raw").await?;
         let response = ToolResponse::success(nodes);
         serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
     }
@@ -3362,6 +3309,7 @@ impl ToolHandler for GetDocChunkHandler {
                     return serde_json::to_value(response)
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
+                let node = crate::current_read::require(ctx, node, "read:doc:metadata").await?;
 
                 // Redact text if principal only has metadata access
                 let mut redacted = node;
@@ -3420,6 +3368,7 @@ impl ToolHandler for DeleteDocHandler {
             "type": "object",
             "required": ["id"],
             "properties": {
+                "intake": intake_schema(),
                 "id": {
                     "type": "string",
                     "description": "Document ID"
@@ -3428,7 +3377,12 @@ impl ToolHandler for DeleteDocHandler {
         })
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
         let params = coerce_params(params, &self.input_schema());
         let input: DocIdInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
@@ -3442,7 +3396,13 @@ impl ToolHandler for DeleteDocHandler {
 
         let rid = parse_id(&input.id, TableName::Doc)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
-        match self.repo.get(&space_id, &rid).await {
+        let mutation = elephant_storage::public_mutation::PublicMutation::begin(
+            ctx.storage.clone(),
+            &space_id,
+        )
+        .await
+        .map_err(super::source_intake::storage_error)?;
+        match self.repo.get_with_deleted(&space_id, &rid).await {
             Ok(Some(doc)) => {
                 if let Err(reason) =
                     ctx.authz
@@ -3453,10 +3413,27 @@ impl ToolHandler for DeleteDocHandler {
                     return serde_json::to_value(response)
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
-                self.repo
-                    .delete(&space_id, &rid)
+                ctx.authz
+                    .authorize_record_read(&ctx.principal, &doc, "read:doc:metadata")
+                    .map_err(|error| McpError::ExecutionError(format!("Access denied: {error}")))?;
+                if let Some(source_link) = &doc.source {
+                    let source = SourceRepository::new(ctx.storage.clone())
+                        .get_with_deleted(&space_id, source_link.id())
+                        .await
+                        .map_err(super::source_intake::storage_error)?
+                        .ok_or_else(|| McpError::ExecutionError("source not found".into()))?;
+                    let operation =
+                        super::source_intake::retract_intake(ctx, &source, intake, Some(&doc))
+                            .await?;
+                    return serde_json::to_value(ToolResponse::success(
+                        json!({"deleted":true,"id":input.id,"operation":operation}),
+                    ))
+                    .map_err(|error| McpError::ExecutionError(error.to_string()));
+                }
+                mutation
+                    .delete(&doc, "mcp.delete_doc")
                     .await
-                    .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+                    .map_err(super::source_intake::storage_error)?;
 
                 let response = ToolResponse::success(json!({ "deleted": true, "id": input.id }));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
@@ -3505,6 +3482,7 @@ impl ToolHandler for RestoreDocHandler {
             "type": "object",
             "required": ["id"],
             "properties": {
+                "intake": intake_schema(),
                 "id": {
                     "type": "string",
                     "description": "Document ID"
@@ -3513,7 +3491,13 @@ impl ToolHandler for RestoreDocHandler {
         })
     }
 
+    #[expect(
+        clippy::large_futures,
+        clippy::significant_drop_tightening,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
         let params = coerce_params(params, &self.input_schema());
         let input: DocIdInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
@@ -3527,6 +3511,12 @@ impl ToolHandler for RestoreDocHandler {
 
         let rid = parse_id(&input.id, TableName::Doc)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
+        let mutation = elephant_storage::public_mutation::PublicMutation::begin(
+            ctx.storage.clone(),
+            &space_id,
+        )
+        .await
+        .map_err(super::source_intake::storage_error)?;
         match self.repo.get_with_deleted(&space_id, &rid).await {
             Ok(Some(doc)) => {
                 if let Err(reason) =
@@ -3548,11 +3538,21 @@ impl ToolHandler for RestoreDocHandler {
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
 
-                let restored = self
-                    .repo
-                    .restore(&space_id, &rid)
+                if let Some(source_link) = &doc.source {
+                    let source = SourceRepository::new(ctx.storage.clone())
+                        .get_with_deleted(&space_id, source_link.id())
+                        .await
+                        .map_err(|error| McpError::ExecutionError(error.to_string()))?
+                        .ok_or_else(|| McpError::ExecutionError("source not found".into()))?;
+                    let accepted =
+                        super::source_intake::restore_intake(ctx, source, intake, Some(&doc))
+                            .await?;
+                    return accepted_doc_response(ctx, accepted).await;
+                }
+                let restored = mutation
+                    .restore(&doc, "mcp.restore_doc")
                     .await
-                    .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+                    .map_err(super::source_intake::storage_error)?;
 
                 if let Err(reason) =
                     ctx.authz
@@ -3714,6 +3714,8 @@ impl RestampAttributionHandler {
         &self,
         space_id: &str,
         docs: &[Doc],
+        ctx: &ToolContext,
+        mutation: &mut elephant_storage::public_mutation::PublicMutation,
     ) -> McpResult<Vec<RecordId>> {
         let mut entity_ids: Vec<RecordId> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -3728,12 +3730,32 @@ impl RestampAttributionHandler {
                 if revision.base.space_id != space_id {
                     continue;
                 }
+                mutation.depend_on(
+                    elephant_storage::canonical_commit::CanonicalRecord::DocRevision(Box::new(
+                        revision.clone(),
+                    )),
+                );
                 let assertions = self
                     .assertions
                     .find_by_revision(space_id, &revision.base.id, RESTAMP_MATCH_LIMIT)
                     .await
                     .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+                if assertions.len() == RESTAMP_MATCH_LIMIT {
+                    return Err(McpError::ExecutionError(
+                        "attribution evidence exceeds bounded complete scan".into(),
+                    ));
+                }
                 for assertion in assertions {
+                    ctx.authz
+                        .authorize_record_read(&ctx.principal, &assertion, "read:assertion")
+                        .map_err(|error| {
+                            McpError::ExecutionError(format!("Access denied: {error}"))
+                        })?;
+                    mutation.depend_on(
+                        elephant_storage::canonical_commit::CanonicalRecord::Assertion(Box::new(
+                            assertion.clone(),
+                        )),
+                    );
                     for link in [&assertion.subject_entity, &assertion.object_entity]
                         .into_iter()
                         .flatten()
@@ -3758,6 +3780,8 @@ impl RestampAttributionHandler {
         entity_id: &RecordId,
         doc_protectees_cache: &mut HashMap<String, Vec<String>>,
         revision_doc_cache: &mut HashMap<String, Option<RecordId>>,
+        ctx: &ToolContext,
+        mutation: &mut elephant_storage::public_mutation::PublicMutation,
     ) -> McpResult<Vec<String>> {
         let assertions = self
             .assertions
@@ -3765,8 +3789,21 @@ impl RestampAttributionHandler {
             .await
             .map_err(|e| McpError::ExecutionError(e.to_string()))?;
 
+        if assertions.len() == RESTAMP_MATCH_LIMIT {
+            return Err(McpError::ExecutionError(
+                "attribution evidence exceeds bounded complete scan".into(),
+            ));
+        }
         let mut union: Vec<String> = Vec::new();
         for assertion in &assertions {
+            ctx.authz
+                .authorize_record_read(&ctx.principal, assertion, "read:assertion")
+                .map_err(|error| McpError::ExecutionError(format!("Access denied: {error}")))?;
+            mutation.depend_on(
+                elephant_storage::canonical_commit::CanonicalRecord::Assertion(Box::new(
+                    assertion.clone(),
+                )),
+            );
             let revision_id = assertion.evidence.revision.id();
             let revision_key = revision_id.to_string();
             if !revision_doc_cache.contains_key(&revision_key) {
@@ -3776,7 +3813,15 @@ impl RestampAttributionHandler {
                     .await
                     .map_err(|e| McpError::ExecutionError(e.to_string()))?
                     .filter(|revision| revision.base.space_id == space_id)
-                    .map(|revision| revision.doc.id().clone());
+                    .map(|revision| {
+                        let id = revision.doc.id().clone();
+                        mutation.depend_on(
+                            elephant_storage::canonical_commit::CanonicalRecord::DocRevision(
+                                Box::new(revision),
+                            ),
+                        );
+                        id
+                    });
                 revision_doc_cache.insert(revision_key.clone(), resolved);
             }
             let Some(Some(doc_id)) = revision_doc_cache.get(&revision_key).cloned() else {
@@ -3785,13 +3830,21 @@ impl RestampAttributionHandler {
 
             let doc_key = doc_id.to_string();
             if !doc_protectees_cache.contains_key(&doc_key) {
-                let protectees = self
+                let source_doc = self
                     .docs
                     .get(space_id, &doc_id)
                     .await
-                    .map_err(|e| McpError::ExecutionError(e.to_string()))?
-                    .map(|doc| angel_protectees_from_metadata(&doc.metadata))
-                    .unwrap_or_default();
+                    .map_err(|error| McpError::ExecutionError(error.to_string()))?
+                    .ok_or_else(|| {
+                        McpError::ExecutionError("attribution evidence document unavailable".into())
+                    })?;
+                ctx.authz
+                    .authorize_record_read(&ctx.principal, &source_doc, "read:doc:metadata")
+                    .map_err(|error| McpError::ExecutionError(format!("Access denied: {error}")))?;
+                let protectees = angel_protectees_from_metadata(&source_doc.metadata);
+                mutation.depend_on(elephant_storage::canonical_commit::CanonicalRecord::Doc(
+                    Box::new(source_doc),
+                ));
                 doc_protectees_cache.insert(doc_key.clone(), protectees);
             }
             if let Some(protectees) = doc_protectees_cache.get(&doc_key) {
@@ -3853,6 +3906,10 @@ impl ToolHandler for RestampAttributionHandler {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
         let input: RestampAttributionInput = serde_json::from_value(params)
@@ -3880,6 +3937,12 @@ impl ToolHandler for RestampAttributionHandler {
         protectees.sort();
         protectees.dedup();
 
+        let mut mutation = elephant_storage::public_mutation::PublicMutation::begin(
+            ctx.storage.clone(),
+            &space_id,
+        )
+        .await
+        .map_err(super::source_intake::storage_error)?;
         let docs = match self.collect_target_docs(&space_id, &input).await? {
             Ok(docs) => docs,
             Err(reason) => {
@@ -3889,31 +3952,35 @@ impl ToolHandler for RestampAttributionHandler {
             }
         };
 
-        // All-or-nothing doc authorization: refuse before mutating anything.
-        for doc in &docs {
-            if let Err(reason) = ctx
-                .authz
-                .authorize_record_write(&ctx.principal, doc, "write:doc")
-            {
-                let response: ToolResponse<()> =
-                    ToolResponse::error(format!("Access denied: {reason}"));
-                return serde_json::to_value(response)
-                    .map_err(|e| McpError::ExecutionError(e.to_string()));
-            }
-        }
-
-        // Re-stamp the docs; seed the cache so recompute sees the new lists.
+        // Prepare all document changes and authorization before any write.
+        let mut proposed_docs = Vec::with_capacity(docs.len());
         let mut doc_protectees_cache: HashMap<String, Vec<String>> = HashMap::new();
         for doc in &docs {
-            self.docs
-                .set_angel_protectees(&space_id, &doc.base.id, &protectees)
-                .await
-                .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+            ctx.authz
+                .authorize_record_read(&ctx.principal, doc, "read:doc:metadata")
+                .map_err(|error| McpError::ExecutionError(format!("Access denied: {error}")))?;
+            ctx.authz
+                .authorize_record_write(&ctx.principal, doc, "write:doc")
+                .map_err(|error| McpError::ExecutionError(format!("Access denied: {error}")))?;
+            let mut proposed = doc.clone();
+            let metadata = proposed.metadata.as_object_mut().ok_or_else(|| {
+                McpError::ExecutionError("document metadata must be an object".into())
+            })?;
+            metadata.insert(ANGEL_PROTECTEES_METADATA_KEY.into(), json!(protectees));
+            ctx.authz
+                .authorize_record_read(&ctx.principal, &proposed, "read:doc:metadata")
+                .map_err(|error| McpError::ExecutionError(format!("Access denied: {error}")))?;
+            ctx.authz
+                .authorize_record_write(&ctx.principal, &proposed, "write:doc")
+                .map_err(|error| McpError::ExecutionError(format!("Access denied: {error}")))?;
+            proposed_docs.push(proposed);
             doc_protectees_cache.insert(doc.base.id.to_string(), protectees.clone());
         }
 
         // Re-propagate onto derived entities.
-        let entity_ids = self.collect_affected_entity_ids(&space_id, &docs).await?;
+        let entity_ids = self
+            .collect_affected_entity_ids(&space_id, &docs, ctx, &mut mutation)
+            .await?;
         let mut revision_doc_cache: HashMap<String, Option<RecordId>> = HashMap::new();
         let mut entities_updated: Vec<String> = Vec::new();
         let mut entities_skipped: Vec<Value> = Vec::new();
@@ -3927,9 +3994,13 @@ impl ToolHandler for RestampAttributionHandler {
             else {
                 continue;
             };
-            if let Err(reason) =
-                ctx.authz
-                    .authorize_record_write(&ctx.principal, &entity, "write:entity")
+            if let Err(reason) = ctx
+                .authz
+                .authorize_record_read(&ctx.principal, &entity, "read:entity")
+                .and_then(|()| {
+                    ctx.authz
+                        .authorize_record_write(&ctx.principal, &entity, "write:entity")
+                })
             {
                 entities_skipped.push(json!({
                     "id": entity_id.to_string(),
@@ -3944,6 +4015,8 @@ impl ToolHandler for RestampAttributionHandler {
                     entity_id,
                     &mut doc_protectees_cache,
                     &mut revision_doc_cache,
+                    ctx,
+                    &mut mutation,
                 )
                 .await?;
 
@@ -3955,16 +4028,37 @@ impl ToolHandler for RestampAttributionHandler {
                 continue;
             }
 
-            let next = if union.is_empty() {
-                None
+            let mut proposed = entity.clone();
+            let metadata = proposed.metadata.as_object_mut().ok_or_else(|| {
+                McpError::ExecutionError("entity metadata must be an object".into())
+            })?;
+            if union.is_empty() {
+                metadata.remove(ANGEL_PROTECTEES_METADATA_KEY);
             } else {
-                Some(union.as_slice())
-            };
-            self.entities
-                .set_angel_protectees(&space_id, entity_id, next)
-                .await
-                .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+                metadata.insert(ANGEL_PROTECTEES_METADATA_KEY.into(), json!(union));
+            }
+            ctx.authz
+                .authorize_record_read(&ctx.principal, &proposed, "read:entity")
+                .map_err(|error| McpError::ExecutionError(format!("Access denied: {error}")))?;
+            ctx.authz
+                .authorize_record_write(&ctx.principal, &proposed, "write:entity")
+                .map_err(|error| McpError::ExecutionError(format!("Access denied: {error}")))?;
+            mutation
+                .stage_replace(&entity, proposed)
+                .map_err(super::source_intake::storage_error)?;
             entities_updated.push(entity_id.to_string());
+        }
+
+        if let Some((primary, proposed)) = docs.first().zip(proposed_docs.first()) {
+            for (observed, next) in docs.iter().zip(&proposed_docs).skip(1) {
+                mutation
+                    .stage_replace(observed, next.clone())
+                    .map_err(super::source_intake::storage_error)?;
+            }
+            mutation
+                .replace(primary, proposed.clone(), false, "mcp.restamp_attribution")
+                .await
+                .map_err(super::source_intake::storage_error)?;
         }
 
         let response = ToolResponse::success(json!({
@@ -3981,7 +4075,7 @@ impl ToolHandler for RestampAttributionHandler {
 
 /// Handler for `batch_ingest_docs` tool.
 pub struct BatchIngestDocsHandler {
-    source_repo: SourceRepository,
+    _source_repo: SourceRepository,
     work_items: WorkItemRepository,
 }
 
@@ -3990,7 +4084,7 @@ impl BatchIngestDocsHandler {
     #[must_use]
     pub fn new(storage: StorageClient) -> Self {
         Self {
-            source_repo: SourceRepository::new(storage.clone()),
+            _source_repo: SourceRepository::new(storage.clone()),
             work_items: WorkItemRepository::new(storage),
         }
     }
@@ -4036,17 +4130,44 @@ impl ToolHandler for BatchIngestDocsHandler {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let controls = params
+            .get("docs")
+            .and_then(Value::as_array)
+            .map(|docs| {
+                docs.iter()
+                    .map(intake_control)
+                    .collect::<McpResult<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         let mut params = coerce_params(params, &self.input_schema());
         if let Some(Value::Array(docs)) = params.get_mut("docs") {
-            for doc in docs {
-                let _ = normalize_doc_value(doc, ctx);
+            for (index, doc) in docs.iter_mut().enumerate() {
+                let control = controls.get(index).cloned().unwrap_or_default();
+                let id = elephant_storage::source_intake::create_document_id(
+                    &ctx.principal.space_id,
+                    doc,
+                    &control,
+                )
+                .map_err(super::source_intake::storage_error)?;
+                if doc.get("base").and_then(|base| base.get("id")).is_none() {
+                    if let Some(object) = doc.as_object_mut() {
+                        object.entry("id").or_insert_with(|| json!(id));
+                    }
+                }
+                normalize_doc_value(doc, ctx)?;
             }
         }
         let input: BatchIngestDocsInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
 
         let mut succeeded = Vec::new();
+        let mut operations = Vec::new();
         let mut failed = Vec::new();
         let total = input.docs.len();
 
@@ -4061,20 +4182,33 @@ impl ToolHandler for BatchIngestDocsHandler {
                 });
                 continue;
             }
-            let (source_candidate, previous_source) =
-                match stage_source_for_manual_doc(ctx, &doc).await {
-                    Ok(value) => value,
-                    Err(e) => {
-                        failed.push(BatchError {
-                            index,
-                            error: e.to_string(),
-                        });
-                        continue;
+            let (source_candidate, previous_source) = match stage_source_for_manual_doc(ctx, &doc)
+                .await
+            {
+                Ok(value) => value,
+                Err(e) => {
+                    if matches!(
+                        &e,
+                        McpError::StorageError(elephant_storage::StorageError::ErasureInProgress)
+                    ) {
+                        return Err(e);
                     }
-                };
+                    failed.push(BatchError {
+                        index,
+                        error: e.to_string(),
+                    });
+                    continue;
+                }
+            };
             if let Err(reason) =
                 authorize_persisted_manual_doc_access(ctx, &source_candidate, &doc).await
             {
+                if matches!(
+                    &reason,
+                    McpError::StorageError(elephant_storage::StorageError::ErasureInProgress)
+                ) {
+                    return Err(reason);
+                }
                 failed.push(BatchError {
                     index,
                     error: reason.to_string(),
@@ -4082,66 +4216,30 @@ impl ToolHandler for BatchIngestDocsHandler {
                 continue;
             }
 
-            let rollback_source = previous_source.clone();
-            match Box::pin(persist_staged_manual_source_and_doc(
-                ctx,
-                &self.source_repo,
-                source_candidate,
-                previous_source,
-                doc,
-            ))
-            .await
-            {
-                Ok((created_source, persisted_doc)) => {
-                    if let Err(reason) = ctx.authz.authorize_record_read(
-                        &ctx.principal,
-                        &persisted_doc.doc,
-                        "read:doc:metadata",
-                    ) {
-                        rollback_staged_source_and_doc(
-                            ctx,
-                            &created_source,
-                            rollback_source.as_ref(),
-                            &persisted_doc,
-                        )
-                        .await;
-                        failed.push(BatchError {
-                            index,
-                            error: format!("Access denied: {reason}"),
-                        });
-                    } else {
-                        if let Err(e) = enqueue_triage_source_work_item(
-                            ctx.storage.clone(),
-                            &created_source,
-                            None,
-                        )
-                        .await
-                        {
-                            rollback_staged_source_and_doc(
-                                ctx,
-                                &created_source,
-                                rollback_source.as_ref(),
-                                &persisted_doc,
-                            )
-                            .await;
-                            failed.push(BatchError {
-                                index,
-                                error: e.to_string(),
-                            });
-                            continue;
-                        }
+            let _ = previous_source;
+            let control = controls.get(index).cloned().unwrap_or_default();
+            match accept_intake(ctx, source_candidate, Some(&doc), control, &[]).await {
+                Ok(accepted) => {
+                    let _work_item_id = enqueue_intake(ctx, &accepted).await;
+                    if let Some(doc) = accepted.document {
+                        operations.push(accepted.operation);
                         succeeded.push(redact_staged_doc(
                             &ctx.principal,
-                            persisted_doc.doc,
-                            &created_source.base.id,
+                            doc,
+                            &accepted.source.base.id,
                         ));
                     }
                 }
-                Err(e) => failed.push(BatchError {
+                Err(
+                    error @ McpError::StorageError(
+                        elephant_storage::StorageError::ErasureInProgress,
+                    ),
+                ) => return Err(error),
+                Err(error) => failed.push(BatchError {
                     index,
-                    error: e.to_string(),
+                    error: error.to_string(),
                 }),
-            };
+            }
         }
 
         let job_status = if failed.is_empty() {
@@ -4179,11 +4277,12 @@ impl ToolHandler for BatchIngestDocsHandler {
             .work_items
             .create(job)
             .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+            .map_err(super::source_intake::storage_error)?;
 
         let output = BatchIngestDocsOutput {
             job_id,
             succeeded,
+            operations,
             failed,
         };
         let response = ToolResponse::success(output);
@@ -4345,6 +4444,151 @@ mod tests {
         let text =
             extract_text_by_source_type(&pdf_from_objects(&objects), "application/pdf").unwrap();
         assert!(text.trim().is_empty(), "extracted text: {text:?}");
+    }
+
+    fn pdf_declared_content(contents: &str, streams: &[String], page_box: &str) -> Vec<u8> {
+        let font_id = 4 + streams.len();
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            format!("<< /Type /Page /Parent 2 0 R {page_box} /Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {contents} >>"),
+        ];
+        objects.extend_from_slice(streams);
+        objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+        pdf_from_objects(&objects)
+    }
+
+    fn pdf_stream(data: &str, filters: &str) -> String {
+        format!(
+            "<< /Length {} {filters} >>\nstream\n{data}\nendstream",
+            data.len()
+        )
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_requires_complete_flate_stream() {
+        // Complete, truncated and checksum-damaged encodings of the same text.
+        // ASCIIHex keeps these tiny fixture objects readable and tests a filter chain.
+        let valid = "789C730A51D07733543034520849533037022203859014050DE7FCDC829CD49254856420A328B5B8383545A124B5A2445321244BC13504009C59104F>";
+        let truncated = "789C730A51D07733543034520849533037022203859014050DE7FCDC829CD49254856420A328B5B8383545A124B5A2445321244BC13504009C>";
+        let bad_checksum = "789C730A51D07733543034520849533037022203859014050DE7FCDC829CD49254856420A328B5B8383545A124B5A2445321244BC13504009C59104E>";
+        for (encoded, succeeds) in [(valid, true), (truncated, false), (bad_checksum, false)] {
+            let pdf = pdf_declared_content(
+                "4 0 R",
+                &[pdf_stream(
+                    encoded,
+                    "/Filter [/ASCIIHexDecode /FlateDecode]",
+                )],
+                "/MediaBox [0 0 612 792]",
+            );
+            let result = extract_text_by_source_type(&pdf, "application/pdf");
+            if succeeds {
+                assert_eq!(result.unwrap().trim(), "Complete compressed text");
+            } else {
+                assert!(
+                    matches!(result, Err(McpError::ExecutionError(message)) if message.contains("page 1") && message.contains("content stream"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_requires_every_declared_content_stream() {
+        let first = pdf_stream("BT /F1 12 Tf 72 720 Td (First stream) Tj ET", "");
+        let second = pdf_stream("BT /F1 12 Tf 72 700 Td (Second stream) Tj ET", "");
+        let pdf = pdf_declared_content(
+            "4 0 R",
+            &["[5 0 R 6 0 R]".to_string(), first.clone(), second],
+            "/MediaBox [0 0 612 792]",
+        );
+        assert_eq!(
+            extract_text_by_source_type(&pdf, "application/pdf")
+                .unwrap()
+                .trim(),
+            "First stream\nSecond stream"
+        );
+        for contents in ["[4 0 R 99 0 R]", "[4 0 R 123]", "99 0 R"] {
+            let pdf = pdf_declared_content(
+                contents,
+                std::slice::from_ref(&first),
+                "/MediaBox [0 0 612 792]",
+            );
+            assert!(
+                extract_text_by_source_type(&pdf, "application/pdf").is_err(),
+                "accepted incomplete Contents {contents}"
+            );
+        }
+        let pdf = pdf_declared_content("null", &[], "/MediaBox [0 0 612 792]");
+        assert!(extract_text_by_source_type(&pdf, "application/pdf")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_rejects_corrupt_later_page_without_partial_text() {
+        let good = "BT /F1 12 Tf 72 720 Td (A valid first page) Tj ET";
+        let objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R >>".to_string(),
+            pdf_stream(good, ""),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>".to_string(),
+            pdf_stream("ordinary invalid compressed data", "/Filter /FlateDecode"),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        let result = extract_text_by_source_type(&pdf_from_objects(&objects), "application/pdf");
+        assert!(
+            matches!(result, Err(McpError::ExecutionError(message)) if message.contains("page 2") && message.contains("content stream"))
+        );
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_rejects_corrupt_nested_form_stream() {
+        let mut objects = nested_form_pdf_objects("/Outer Do");
+        objects[5] = pdf_stream(
+            "ordinary invalid compressed data",
+            "/Type /XObject /Subtype /Form /BBox [0 0 300 20] /Filter /FlateDecode",
+        );
+        let result = extract_text_by_source_type(&pdf_from_objects(&objects), "application/pdf");
+        assert!(
+            matches!(result, Err(McpError::ExecutionError(message)) if message.contains("Form XObject") && message.contains("completely"))
+        );
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_clips_sparse_text_to_visible_page_box() {
+        // Clipping must apply to a single off-page run, also for a small crop.
+        for crop in ["[0 400 612 792]", "[70 710 130 740]"] {
+            let data =
+                "BT /F1 12 Tf 72 100 Td (Outside) Tj ET BT /F1 12 Tf 72 720 Td (Inside) Tj ET";
+            let pdf = pdf_declared_content(
+                "4 0 R",
+                &[pdf_stream(data, "")],
+                &format!("/MediaBox [0 0 612 792] /CropBox {crop}"),
+            );
+            assert_eq!(
+                extract_text_by_source_type(&pdf, "application/pdf")
+                    .unwrap()
+                    .trim(),
+                "Inside"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_keeps_runs_intersecting_crop_boundary() {
+        let data = "BT /F1 12 Tf 50 720 Td (Crossing boundary) Tj ET";
+        let pdf = pdf_declared_content(
+            "4 0 R",
+            &[pdf_stream(data, "")],
+            "/MediaBox [0 0 612 792] /CropBox [72 400 612 792]",
+        );
+        assert_eq!(
+            extract_text_by_source_type(&pdf, "application/pdf")
+                .unwrap()
+                .trim(),
+            "Crossing boundary"
+        );
     }
 
     #[test]
@@ -4519,14 +4763,6 @@ mod tests {
         assert_eq!(merged[1].base.id, semantic.base.id);
     }
 
-    const DOC_SCHEMA: &str = "DEFINE TABLE doc SCHEMALESS;";
-    const SOURCE_SCHEMA: &str = "DEFINE TABLE source SCHEMALESS;";
-    const WORK_ITEM_SCHEMA: &str = "DEFINE TABLE work_item SCHEMALESS;";
-    const DOC_REVISION_SCHEMA: &str = "DEFINE TABLE doc_revision SCHEMALESS;";
-    const DOC_NODE_SCHEMA: &str = "DEFINE TABLE doc_node SCHEMALESS;";
-    const DOC_CHUNK_SCHEMA: &str = "DEFINE TABLE doc_chunk SCHEMALESS;";
-    const ASSERTION_SCHEMA: &str = "DEFINE TABLE assertion SCHEMALESS;";
-
     fn env_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -4570,9 +4806,27 @@ mod tests {
             ..elephant_storage::StorageConfig::default()
         };
         let storage = StorageClient::new(config).await.expect("storage");
-        storage.query(DOC_SCHEMA).await.expect("schema");
-        storage.query(SOURCE_SCHEMA).await.expect("schema");
-        storage.query(WORK_ITEM_SCHEMA).await.expect("schema");
+        // Exercise the same complete schema and initialization receipts as the
+        // native runtime, including current physical input fencing functions.
+        Box::pin(elephant_migrations::apply_schema(&storage))
+            .await
+            .expect("complete native schema");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: elephant_types::records::base::BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    "test_space".into(),
+                    "fixture".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .expect("named space");
         storage
     }
 
@@ -4585,17 +4839,35 @@ mod tests {
             ..elephant_storage::StorageConfig::default()
         };
         let storage = StorageClient::new(config).await.expect("storage");
-        storage.query(DOC_SCHEMA).await.expect("schema");
-        storage.query(SOURCE_SCHEMA).await.expect("schema");
-        storage.query(WORK_ITEM_SCHEMA).await.expect("schema");
-        storage.query(DOC_REVISION_SCHEMA).await.expect("schema");
-        storage.query(DOC_NODE_SCHEMA).await.expect("schema");
-        storage.query(DOC_CHUNK_SCHEMA).await.expect("schema");
-        storage.query(ASSERTION_SCHEMA).await.expect("schema");
+        // Exercise the same complete schema and initialization receipts as the
+        // native runtime, including current physical input fencing functions.
+        Box::pin(elephant_migrations::apply_schema(&storage))
+            .await
+            .expect("complete native schema");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: elephant_types::records::base::BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    "test_space".into(),
+                    "fixture".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .expect("named space");
         storage
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_enqueues_triage_source_work_item() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -4629,7 +4901,12 @@ mod tests {
         );
 
         let repo = WorkItemRepository::new(storage);
-        let idempotency_key = format!("{TRIAGE_SOURCE_KIND}:{source_id}");
+        let idempotency_key = format!(
+            "{TRIAGE_SOURCE_KIND}:{source_id}:{}",
+            doc.metadata["_publication"]["generation"]
+                .as_str()
+                .expect("original generation")
+        );
         let item = repo
             .find_by_idempotency_key("test_space", &idempotency_key)
             .await
@@ -4639,6 +4916,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_simple_enqueues_triage_source_work_item() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -4671,7 +4952,12 @@ mod tests {
         );
 
         let repo = WorkItemRepository::new(storage);
-        let idempotency_key = format!("{TRIAGE_SOURCE_KIND}:{source_id}");
+        let idempotency_key = format!(
+            "{TRIAGE_SOURCE_KIND}:{source_id}:{}",
+            doc.metadata["_publication"]["generation"]
+                .as_str()
+                .expect("original generation")
+        );
         let item = repo
             .find_by_idempotency_key("test_space", &idempotency_key)
             .await
@@ -4682,6 +4968,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_simple_applies_extraction_guidance_metadata() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -4736,6 +5026,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_simple_accepts_media_without_text() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -4772,6 +5066,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_simple_persists_inline_image_as_managed_asset() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -4826,6 +5124,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_simple_multi_image_creates_ordered_assets() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -4882,6 +5184,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_simple_rejects_media_over_attachment_cap() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -4918,6 +5224,10 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_simple_rejects_inline_media_over_configured_limit() {
         let _guard = env_lock().lock().await;
         let prior_limit = std::env::var("PIPELINE_MULTIMODAL_INLINE_IMAGE_MAX_BYTES").ok();
@@ -4956,6 +5266,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_simple_persists_inline_video_as_managed_asset() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -5007,6 +5321,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_simple_rejects_zero_duration_inline_video() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -5037,6 +5355,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_simple_invalid_media_does_not_persist_prior_assets() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -5079,6 +5401,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_rejects_path_media_attachments() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -5114,6 +5440,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_doc_rejects_uri_media_attachments() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -5190,113 +5520,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ingest_doc_reuses_existing_source_for_same_doc_id() {
-        let _guard = env_lock().lock().await;
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn test_ingest_doc_replaces_same_external_identity_with_explicit_cas() {
         let storage = setup_test_storage().await;
-        let principal = make_test_principal("test_space");
-        let authz = Arc::new(AuthzService::new_with_skip_auth(true));
-        let ctx = ToolContext::with_authz(storage.clone(), authz, principal);
+        let ctx = ToolContext::with_authz(
+            storage.clone(),
+            Arc::new(AuthzService::new_with_skip_auth(true)),
+            make_test_principal("test_space"),
+        );
         let handler = IngestDocHandler::new(storage.clone());
-        let doc_id = RecordId::new_v4(TableName::Doc);
-
+        let external_id = RecordId::new_v4(TableName::Doc);
         let first = handler
             .execute(
                 &ctx,
-                serde_json::json!({
-                    "doc": {
-                        "base": {
-                            "id": doc_id.to_string(),
-                            "space_id": "test_space"
-                        },
-                        "title": "First",
-                        "text": "Body"
-                    }
-                }),
+                json!({"doc":{"id":external_id,"title":"First","text":"Body"}}),
             )
             .await
-            .expect("first execute");
-        let first_decoded: ToolResponse<RedactionEnvelope<Doc>> =
-            serde_json::from_value(first).expect("decode first");
-        let first_doc = first_decoded.data.expect("first doc").data;
-        let first_source_id = first_doc.source.expect("source link").id().to_string();
-
-        let source_id = RecordId::from_str(&first_source_id).expect("parse source id");
-        let mut existing_doc = DocRepository::new(storage.clone())
-            .get("test_space", &doc_id)
-            .await
-            .expect("load doc")
-            .expect("persisted doc");
-        existing_doc.base.security.level = 4;
-        DocRepository::new(storage.clone())
-            .update("test_space", &doc_id, existing_doc)
-            .await
-            .expect("update doc security");
-        let mut existing_source = SourceRepository::new(storage.clone())
-            .get("test_space", &source_id)
-            .await
-            .expect("load source")
-            .expect("persisted source");
-        existing_source.base.security.level = 4;
-        existing_source.lifecycle_status = SourceLifecycleStatus::GraphReady;
-        existing_source.current_ingest_mode = Some(IngestMode::Graph);
-        SourceRepository::new(storage.clone())
-            .update("test_space", &source_id, existing_source)
-            .await
-            .expect("promote source state");
-
-        let second = handler
-            .execute(
-                &ctx,
-                serde_json::json!({
-                    "doc": {
-                        "base": {
-                            "id": doc_id.to_string(),
-                            "space_id": "test_space"
-                        },
-                        "title": "Second",
-                        "text": "Updated body"
-                    }
-                }),
-            )
-            .await
-            .expect("second execute");
-        let second_decoded: ToolResponse<RedactionEnvelope<Doc>> =
-            serde_json::from_value(second).expect("decode second");
-        let second_doc = second_decoded.data.expect("second doc").data;
-
+            .expect("initial acceptance");
+        let first_doc: Doc = serde_json::from_value(first["data"]["data"].clone()).expect("doc");
+        let second = handler.execute(&ctx, json!({
+            "doc":{"id":external_id,"title":"Second","text":"Updated body"},
+            "intake":{"revision_id":"v2","idempotency_key":"v2","expected_generation":first["operation"]["source_generation"]}
+        })).await.expect("explicit replacement");
+        let second_doc: Doc = serde_json::from_value(second["data"]["data"].clone()).expect("doc");
+        assert_eq!(first_doc.source, second_doc.source);
+        assert_ne!(first_doc.base.id, second_doc.base.id);
         assert_eq!(
-            second_doc.source.expect("source link").id().to_string(),
-            first_source_id
+            DocRepository::new(storage.clone())
+                .get("test_space", &first_doc.base.id)
+                .await
+                .expect("old")
+                .expect("old doc")
+                .title,
+            "First"
         );
-        let persisted = DocRepository::new(storage.clone())
-            .get("test_space", &doc_id)
-            .await
-            .expect("load doc")
-            .expect("persisted doc");
-        assert_eq!(persisted.title, "Second");
-        assert_eq!(persisted.base.security.level, 0);
-
-        let persisted_source = SourceRepository::new(storage.clone())
-            .get("test_space", &source_id)
-            .await
-            .expect("reload source")
-            .expect("persisted source");
-        assert_eq!(persisted_source.base.security.level, 0);
         assert_eq!(
-            persisted_source.lifecycle_status,
-            SourceLifecycleStatus::Discovered
+            DocRepository::new(storage.clone())
+                .get("test_space", &second_doc.base.id)
+                .await
+                .expect("new")
+                .expect("new doc")
+                .title,
+            "Second"
         );
-        assert_eq!(persisted_source.current_ingest_mode, None);
-
-        let sources = SourceRepository::new(storage)
-            .list("test_space", 10, None)
-            .await
-            .expect("list sources");
-        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            SourceRepository::new(storage)
+                .list("test_space", 10, None)
+                .await
+                .expect("sources")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
-    async fn test_ingest_doc_restores_soft_deleted_doc() {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn test_ingest_doc_does_not_revive_unaccepted_document_tombstone() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -5350,17 +5635,23 @@ mod tests {
             serde_json::from_value(response).expect("decode response");
         assert!(decoded.ok, "response should be ok");
 
-        let restored = DocRepository::new(storage.clone())
-            .get("test_space", &doc_id)
+        let created = decoded.data.expect("new evidence").data;
+        assert_ne!(created.base.id, doc_id);
+        let original = DocRepository::new(storage.clone())
+            .get_with_deleted("test_space", &doc_id)
             .await
-            .expect("load doc")
-            .expect("restored doc");
-        assert_eq!(restored.title, "Restored");
-        assert!(restored.base.deleted_at.is_none());
+            .expect("old doc")
+            .expect("tombstone");
+        assert!(original.base.deleted_at.is_some());
+        assert_eq!(created.title, "Restored");
     }
 
     #[tokio::test]
-    async fn test_batch_ingest_docs_restores_soft_deleted_doc() {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn test_batch_ingest_docs_preserves_unaccepted_document_tombstone() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
         let authz = Arc::new(AuthzService::new_with_skip_auth(true));
@@ -5413,21 +5704,21 @@ mod tests {
         assert_eq!(output.failed.len(), 0);
         assert_eq!(output.succeeded.len(), 1);
 
-        let restored = DocRepository::new(storage.clone())
-            .get("test_space", &doc_id)
+        assert_ne!(output.succeeded[0].data.base.id, doc_id);
+        let original = DocRepository::new(storage.clone())
+            .get_with_deleted("test_space", &doc_id)
             .await
-            .expect("load doc")
-            .expect("restored doc");
-        assert!(restored.base.deleted_at.is_none());
-
-        let sources = SourceRepository::new(storage)
-            .list("test_space", 10, None)
-            .await
-            .expect("list sources");
-        assert_eq!(sources.len(), 1);
+            .expect("old doc")
+            .expect("tombstone");
+        assert!(original.base.deleted_at.is_some());
+        assert_eq!(output.operations.len(), 1);
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_file_enqueues_triage_source_work_item() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -5491,7 +5782,12 @@ mod tests {
         assert_eq!(source.requested_ingest_mode(), Some(IngestMode::Graph));
 
         let repo = WorkItemRepository::new(storage);
-        let idempotency_key = format!("{TRIAGE_SOURCE_KIND}:{source_id}");
+        let idempotency_key = format!(
+            "{TRIAGE_SOURCE_KIND}:{source_id}:{}",
+            doc.metadata["_publication"]["generation"]
+                .as_str()
+                .expect("original generation")
+        );
         let item = repo
             .find_by_idempotency_key("test_space", &idempotency_key)
             .await
@@ -5502,6 +5798,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_file_image_creates_media_backed_doc() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -5545,7 +5845,12 @@ mod tests {
 
         let source_id = doc.source.as_ref().expect("linked source").id().to_string();
         let repo = WorkItemRepository::new(storage);
-        let idempotency_key = format!("{TRIAGE_SOURCE_KIND}:{source_id}");
+        let idempotency_key = format!(
+            "{TRIAGE_SOURCE_KIND}:{source_id}:{}",
+            doc.metadata["_publication"]["generation"]
+                .as_str()
+                .expect("original generation")
+        );
         let item = repo
             .find_by_idempotency_key("test_space", &idempotency_key)
             .await
@@ -5554,6 +5859,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_file_video_preserves_sidecar_text_for_media_doc() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
@@ -5606,6 +5915,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_file_distinguishes_same_bytes_different_paths() {
         let _guard = env_lock().lock().await;
 
@@ -5619,8 +5932,16 @@ mod tests {
         tokio::fs::create_dir_all(&dir)
             .await
             .expect("create temp dir");
-        let first = dir.join("frame-a.jpg");
-        let second = dir.join("frame-b.jpg");
+        let first_dir = dir.join("a");
+        let second_dir = dir.join("b");
+        tokio::fs::create_dir_all(&first_dir)
+            .await
+            .expect("first directory");
+        tokio::fs::create_dir_all(&second_dir)
+            .await
+            .expect("second directory");
+        let first = first_dir.join("frame.jpg");
+        let second = second_dir.join("frame.jpg");
         let bytes = [0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00];
         tokio::fs::write(&first, bytes).await.expect("write first");
         tokio::fs::write(&second, bytes)
@@ -5670,6 +5991,207 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn file_replacement_resolves_current_external_identity_and_preserves_full_envelope() {
+        let storage = setup_test_storage().await;
+        let mut principal = make_test_principal("test_space");
+        principal.scopes.insert("*".into());
+        let ctx = ToolContext::with_authz(
+            storage.clone(),
+            Arc::new(AuthzService::new_with_skip_auth(true)),
+            principal,
+        );
+        let handler = IngestFileHandler::new(storage.clone());
+        let dir = std::env::temp_dir().join(format!("intake-cas-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("temp directory");
+        let path = dir.join("private.txt");
+        tokio::fs::write(&path, "First immutable file")
+            .await
+            .expect("first file");
+        let first = handler
+            .execute(&ctx, json!({"path":path.to_str().expect("UTF8 path")}))
+            .await
+            .expect("first acceptance");
+        let first_doc: ToolResponse<RedactionEnvelope<Doc>> =
+            serde_json::from_value(first.clone()).expect("first doc");
+        let first_doc = first_doc.data.expect("first data").data;
+        let source_id = first_doc.source.as_ref().expect("source").id().clone();
+        assert_eq!(first_doc.metadata["source_id"], source_id.to_string());
+        let repo = SourceRepository::new(storage.clone());
+        let mut protected = repo
+            .get("test_space", &source_id)
+            .await
+            .expect("read source")
+            .expect("source exists");
+        protected.base.security.level = 3;
+        protected.base.security.labels = vec!["private-source".into()];
+        protected.base.security.handling = vec!["no_voice".into()];
+        protected.base.subjects = vec![Link::new(RecordId::new_v4(TableName::Entity))];
+        protected.base.subjects_state = elephant_types::records::base::SubjectsState::Partial;
+        repo.update("test_space", &source_id, protected.clone())
+            .await
+            .expect("fixture classification");
+        tokio::fs::write(&path, "Replacement immutable file")
+            .await
+            .expect("replace file");
+        let params = json!({"path":path.to_str().expect("UTF8 path"),"intake":{
+            "revision_id":"file-v2","idempotency_key":"file-v2","expected_generation":first["operation"]["source_generation"]
+        }});
+        let second = handler
+            .execute(&ctx, params.clone())
+            .await
+            .expect("new content with explicit CAS");
+        let replay = handler
+            .execute(&ctx, params)
+            .await
+            .expect("same intent retry");
+        assert_eq!(
+            second["operation"]["operation_id"],
+            replay["operation"]["operation_id"]
+        );
+        let next_doc: ToolResponse<RedactionEnvelope<Doc>> =
+            serde_json::from_value(second.clone()).expect("second doc");
+        let next_doc = next_doc.data.expect("second data").data;
+        assert_eq!(next_doc.source.as_ref().expect("source").id(), &source_id);
+        assert_ne!(next_doc.base.id, first_doc.base.id);
+        assert_eq!(next_doc.base.security, protected.base.security);
+        assert_eq!(next_doc.base.subjects, protected.base.subjects);
+        assert_eq!(next_doc.base.subjects_state, protected.base.subjects_state);
+        assert_eq!(next_doc.text, "Replacement immutable file");
+        assert_eq!(
+            DocRepository::new(storage)
+                .get("test_space", &first_doc.base.id)
+                .await
+                .expect("old doc read")
+                .expect("old doc retained")
+                .text,
+            "First immutable file"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::default_trait_access,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    fn directory_controls_reject_ambiguous_paths_and_incomplete_replacement() {
+        for path in [
+            "",
+            "/absolute",
+            "../other",
+            "a/../b",
+            "a//b",
+            "./a",
+            "a\\b",
+            "C:/file",
+        ] {
+            let controls = std::collections::BTreeMap::from([(path.into(), Default::default())]);
+            assert!(validate_directory_controls(&controls).is_err(), "{path:?}");
+        }
+        let controls = std::collections::BTreeMap::from([(
+            "notes/day.md".into(),
+            elephant_storage::source_intake::IntakeControl {
+                revision_id: None,
+                idempotency_key: None,
+                expected_generation: Some("generation".into()),
+            },
+        )]);
+        assert!(validate_directory_controls(&controls).is_err());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn directory_replacement_uses_per_file_cas_and_replays_original_operation() {
+        let storage = setup_test_storage().await;
+        let mut principal = make_test_principal("test_space");
+        principal.scopes.insert("*".into());
+        let ctx = ToolContext::with_authz(
+            storage.clone(),
+            Arc::new(AuthzService::new_with_skip_auth(true)),
+            principal,
+        );
+        let handler = IngestDirectoryHandler;
+        let dir = std::env::temp_dir().join(format!("intake-cas-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("temp directory");
+        let path = dir.join("note.md");
+        tokio::fs::write(&path, "First").await.expect("write file");
+        let base = json!({"path":dir.to_str().expect("UTF8 path"),"pattern":"*.md"});
+        let mut unknown = base.clone();
+        unknown["intake_by_path"] = json!({"missing.md":{"revision_id":"r","idempotency_key":"r"}});
+        assert!(handler.execute(&ctx, unknown).await.is_err());
+        assert!(SourceRepository::new(storage.clone())
+            .list("test_space", 10, None)
+            .await
+            .expect("sources")
+            .is_empty());
+        let first = handler
+            .execute(&ctx, base.clone())
+            .await
+            .expect("first directory");
+        let accepted = &first["data"]["ingested"][0];
+        assert_eq!(accepted["path"], "note.md");
+        assert!(accepted["operation"]["operation_id"].is_string());
+        assert!(accepted["work_item_id"].is_string());
+        tokio::fs::write(&path, "Second")
+            .await
+            .expect("new file content");
+        let without_cas = handler
+            .execute(&ctx, base.clone())
+            .await
+            .expect("partial result");
+        assert_eq!(
+            without_cas["data"]["failed"]
+                .as_array()
+                .expect("failures")
+                .len(),
+            1
+        );
+        assert!(without_cas["data"]["ingested"]
+            .as_array()
+            .expect("ingested")
+            .is_empty());
+        let mut replace = base;
+        replace["intake_by_path"] = json!({"note.md":{
+            "revision_id":"note-v2","idempotency_key":"note-v2","expected_generation":accepted["operation"]["source_generation"]
+        }});
+        let second = handler
+            .execute(&ctx, replace.clone())
+            .await
+            .expect("replace directory");
+        let replay = handler
+            .execute(&ctx, replace)
+            .await
+            .expect("replay directory");
+        assert!(second["data"]["failed"]
+            .as_array()
+            .expect("failures")
+            .is_empty());
+        assert_eq!(
+            second["data"]["ingested"][0]["operation"]["operation_id"],
+            replay["data"]["ingested"][0]["operation"]["operation_id"]
+        );
+        assert_eq!(
+            second["data"]["ingested"][0]["work_item_id"],
+            replay["data"]["ingested"][0]["work_item_id"]
+        );
+        assert_ne!(second["data"]["ingested"][0]["doc_id"], accepted["doc_id"]);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_directory_glob_filters_files() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -5714,6 +6236,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_url_fetches_and_enqueues_triage_source() {
         let _guard = env_lock().lock().await;
 
@@ -5757,7 +6283,12 @@ mod tests {
         let doc = decoded.data.expect("doc data").data;
         let source_id = doc.source.as_ref().expect("linked source").id().to_string();
         let repo = WorkItemRepository::new(storage);
-        let idempotency_key = format!("{TRIAGE_SOURCE_KIND}:{source_id}");
+        let idempotency_key = format!(
+            "{TRIAGE_SOURCE_KIND}:{source_id}:{}",
+            doc.metadata["_publication"]["generation"]
+                .as_str()
+                .expect("original generation")
+        );
         let item = repo
             .find_by_idempotency_key("test_space", &idempotency_key)
             .await
@@ -5766,6 +6297,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_url_image_creates_media_backed_doc() {
         let _guard = env_lock().lock().await;
 
@@ -5826,6 +6361,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_url_video_preserves_sidecar_text_for_media_doc() {
         let _guard = env_lock().lock().await;
 
@@ -5901,6 +6440,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_ingest_url_distinguishes_same_bytes_different_urls() {
         let _guard = env_lock().lock().await;
 
@@ -5983,59 +6526,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_extract_doc_enqueues_plan_extraction_work_item() {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn test_extract_doc_requires_explicit_intent_and_registered_render_lineage() {
         let storage = setup_test_extraction_storage().await;
-        let principal = make_test_principal("test_space");
-        let authz = Arc::new(AuthzService::new_with_skip_auth(true));
-        let ctx = ToolContext::with_authz(storage.clone(), authz, principal);
-
-        let ingest = IngestDocSimpleHandler::new(storage.clone());
-        let ingest_params = serde_json::json!({
-            "title": "Test",
-            "text": "Alice works at Acme."
-        });
-        let ingest_response = ingest.execute(&ctx, ingest_params).await.expect("ingest");
-        let ingest_decoded: ToolResponse<RedactionEnvelope<Doc>> =
-            serde_json::from_value(ingest_response).expect("decode ingest");
-        let doc = ingest_decoded.data.expect("doc").data;
-
-        let handler = ExtractDocHandler::new(storage.clone());
-        let extract_params = serde_json::json!({ "id": doc.base.id.to_string() });
-        let extract_response = handler
-            .execute(&ctx, extract_params)
-            .await
-            .expect("extract");
-        let extract_decoded: ToolResponse<serde_json::Value> =
-            serde_json::from_value(extract_response).expect("decode extract");
-        assert!(extract_decoded.ok, "extract response should be ok");
-
-        let revision_id = extract_decoded
-            .data
-            .as_ref()
-            .and_then(|value| value.get("revision_id"))
-            .and_then(|value| value.as_str())
-            .expect("revision_id");
-
-        let repo = WorkItemRepository::new(storage);
-        let idempotency_key = format!("{PLAN_EXTRACTION_KIND}:{revision_id}");
-        let item = repo
-            .find_by_idempotency_key("test_space", &idempotency_key)
-            .await
-            .expect("find work item");
-
-        assert!(
-            item.is_some(),
-            "plan_extraction work item should be enqueued"
+        let ctx = ToolContext::with_authz(
+            storage.clone(),
+            Arc::new(AuthzService::new_with_skip_auth(true)),
+            make_test_principal("test_space"),
         );
-        let item = item.expect("plan_extraction work item");
+        let original = IngestDocSimpleHandler::new(storage.clone())
+            .execute(&ctx, json!({"title":"Test","text":"Alice works at Acme."}))
+            .await
+            .expect("accept");
+        let id = original["data"]["data"]["id"].clone();
+        let handler = ExtractDocHandler::new(storage.clone());
+        let missing = handler
+            .execute(&ctx, json!({"id":id}))
+            .await
+            .expect_err("missing explicit intent");
+        assert!(missing.to_string().contains("expected_generation"));
+        let unmapped = handler.execute(&ctx, json!({"id":id,"intake":{
+            "revision_id":"reprocess-2","idempotency_key":"reprocess-2","expected_generation":original["operation"]["source_generation"]
+        }})).await.expect_err("renderer has not registered this input yet");
+        assert!(unmapped.to_string().contains("mapping"));
+        let source_id: RecordId =
+            serde_json::from_value(original["operation"]["source_id"].clone()).expect("source");
+        let head = elephant_storage::SourcePublicationRepository::new(storage)
+            .head("test_space", &source_id)
+            .await
+            .expect("head")
+            .expect("head");
         assert_eq!(
-            item.payload.get("extractor_id").and_then(Value::as_str),
-            Some(AGENTIC_EXTRACTOR_ID),
-            "manual extract_doc must enqueue the active extractor"
+            head.operation_id,
+            original["operation"]["operation_id"]
+                .as_str()
+                .expect("operation")
         );
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_get_doc_pipeline_status_reports_pending_extraction() {
         let storage = setup_test_extraction_storage().await;
         let principal = make_test_principal("test_space");
@@ -6048,16 +6584,32 @@ mod tests {
             "text": "Alice works at Acme."
         });
         let ingest_response = ingest.execute(&ctx, ingest_params).await.expect("ingest");
+        assert_eq!(ingest_response["enqueued"], true);
+        let operation: elephant_types::publication::OperationReceipt =
+            serde_json::from_value(ingest_response["operation"].clone()).expect("operation");
+        let work_id: RecordId =
+            serde_json::from_value(ingest_response["work_item_id"].clone()).expect("work id");
         let ingest_decoded: ToolResponse<RedactionEnvelope<Doc>> =
             serde_json::from_value(ingest_response).expect("decode ingest");
         let doc = ingest_decoded.data.expect("doc").data;
 
-        let extract = ExtractDocHandler::new(storage.clone());
-        let extract_params = serde_json::json!({ "id": doc.base.id.to_string() });
-        let _ = extract
-            .execute(&ctx, extract_params)
+        // Acceptance persists real source work with its original fence. No
+        // worker ran, so status must not invent a revision or rendered nodes.
+        let work = WorkItemRepository::new(storage.clone())
+            .get("test_space", &work_id)
             .await
-            .expect("extract");
+            .expect("load queued work")
+            .expect("queued work");
+        assert_eq!(work.kind, TRIAGE_SOURCE_KIND);
+        assert_eq!(work.status, WorkItemStatus::Runnable);
+        let publication = elephant_pipeline::source_queue::publication_from_work(&work)
+            .expect("valid source fence")
+            .expect("original source fence");
+        assert_eq!(publication.source_id, operation.source_id);
+        assert_eq!(publication.operation_id, operation.operation_id);
+        assert_eq!(publication.generation, operation.source_generation);
+        assert_eq!(Some(publication.revision_id), operation.desired_revision);
+        assert!(operation.published_revision.is_none());
 
         let status_handler = GetDocPipelineStatusHandler::new(storage.clone());
         let status_params = serde_json::json!({ "id": doc.base.id.to_string() });
@@ -6072,13 +6624,12 @@ mod tests {
 
         assert_eq!(status.doc_id.to_string(), doc.base.id.to_string());
         assert!(
-            status.revision.is_some(),
-            "should have a revision after extract_doc"
+            status.revision.is_none(),
+            "acceptance has not rendered a revision"
         );
-        assert!(
-            status.nodes_count > 0,
-            "should have doc nodes after extract_doc"
-        );
+        assert_eq!(status.nodes_count, 0, "no renderer has produced nodes");
+        assert_eq!(status.chunks.total, 0);
+        assert_eq!(status.chunks.embedded, 0);
         assert_eq!(status.extraction_state, ExtractionState::Pending);
         assert!(
             status.extraction_guidance.is_some(),
@@ -6087,6 +6638,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_get_doc_pipeline_status_reports_pending_triage_source() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -6121,6 +6676,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_get_doc_pipeline_status_rejects_missing_doc() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -6146,8 +6705,6 @@ mod tests {
 
     // --- restamp_attribution ---
 
-    const ENTITY_SCHEMA: &str = "DEFINE TABLE entity SCHEMALESS;";
-
     async fn setup_restamp_storage() -> StorageClient {
         static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(99700);
         let db_id = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -6157,19 +6714,45 @@ mod tests {
             ..elephant_storage::StorageConfig::default()
         };
         let storage = StorageClient::new(config).await.expect("storage");
-        storage.query(DOC_SCHEMA).await.expect("schema");
-        storage.query(SOURCE_SCHEMA).await.expect("schema");
-        storage.query(DOC_REVISION_SCHEMA).await.expect("schema");
-        storage.query(ASSERTION_SCHEMA).await.expect("schema");
-        storage.query(ENTITY_SCHEMA).await.expect("schema");
+        // Exercise the same complete schema and initialization receipts as the
+        // native runtime, including current physical input fencing functions.
+        Box::pin(elephant_migrations::apply_schema(&storage))
+            .await
+            .expect("complete native schema");
+        register_restamp_space(&storage).await;
         storage
     }
 
     async fn setup_restamp_embedded_storage() -> StorageClient {
-        StorageClient::new_embedded().await.expect("storage")
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        register_restamp_space(&storage).await;
+        storage
+    }
+
+    async fn register_restamp_space(storage: &StorageClient) {
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: elephant_types::records::base::BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    "test_space".into(),
+                    "fixture".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .expect("named space");
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_lexical_search_stops_paging_once_k_visible_docs_are_found() {
         // A common term must not walk every match: each extra page re-runs the
         // ranked query at a larger offset. 60 matches, k = 5: one page of 25.
@@ -6339,6 +6922,10 @@ mod tests {
     /// - unrelated doc untouched
     /// - entity also sourced from the unrelated doc keeps its union
     /// - entity sourced only from the session doc narrows to the correction
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn assert_restamp_by_session_id_flow(storage: StorageClient) {
         let ctx = restamp_ctx(&storage);
         let handler = RestampAttributionHandler::new(storage.clone());
@@ -6421,6 +7008,18 @@ mod tests {
         assert_eq!(data["docs_updated"], serde_json::json!(1));
         assert_eq!(data["entities_updated"], serde_json::json!(1));
 
+        let audits = elephant_storage::AuditLogRepository::new(storage.clone())
+            .list("test_space", 100, None)
+            .await
+            .expect("atomic audit rows");
+        assert!(audits.iter().any(|audit| audit.record == session_doc_id));
+        assert!(audits.iter().any(|audit| audit.record == bob_id));
+        let events = elephant_storage::SystemEventRepository::new(storage.clone())
+            .list("test_space", 100, None)
+            .await
+            .expect("atomic outbox");
+        assert!(!events.is_empty());
+
         // Session doc replaced exactly; unrelated doc untouched.
         let session_doc = doc_repo
             .get("test_space", &session_doc_id)
@@ -6463,6 +7062,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_restamp_attribution_by_session_id() {
         let _guard = env_lock().lock().await;
         let storage = setup_restamp_storage().await;
@@ -6470,6 +7073,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_restamp_attribution_by_session_id_embedded() {
         let _guard = env_lock().lock().await;
         let storage = setup_restamp_embedded_storage().await;
@@ -6477,6 +7084,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_restamp_attribution_family_wide_clears_entity_attribution() {
         let _guard = env_lock().lock().await;
         let storage = setup_restamp_storage().await;
@@ -6549,6 +7160,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_restamp_attribution_by_source_uri_prefix() {
         let _guard = env_lock().lock().await;
         let storage = setup_restamp_storage().await;
@@ -6623,6 +7238,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_restamp_attribution_requires_selector() {
         let _guard = env_lock().lock().await;
         let storage = setup_restamp_storage().await;
@@ -6642,6 +7261,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_restamp_attribution_no_matches_is_a_successful_noop() {
         let _guard = env_lock().lock().await;
         let storage = setup_restamp_storage().await;
@@ -6663,5 +7286,162 @@ mod tests {
         let data = decoded.data.expect("data");
         assert_eq!(data["docs_updated"], serde_json::json!(0));
         assert_eq!(data["entities_updated"], serde_json::json!(0));
+    }
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn pipeline_status_authorizes_revision_children_and_guidance_envelopes() {
+        use elephant_types::records::doc_node::{NodeRole, TextSpan};
+        use elephant_types::records::doc_revision::{RendererMetadata, RevisionStatus};
+        use elephant_types::records::{DocNode, DocRevision, SpaceConfig};
+        for case in [
+            "allowed",
+            "revision",
+            "foreign_revision",
+            "node",
+            "foreign_node",
+            "source",
+            "space",
+        ] {
+            let storage = StorageClient::new_embedded().await.unwrap();
+            let base = |table| {
+                BaseFieldsBuilder::new("status-space")
+                    .for_table(table)
+                    .created_by("fixture")
+                    .build()
+            };
+            let mut document = Doc {
+                base: base(TableName::Doc),
+                title: "Status".into(),
+                text: "PRIVATE STATUS CONTENT".into(),
+                sidecar_text: None,
+                source: None,
+                media_attachments: vec![],
+                rendition_key: "status".into(),
+                metadata: json!({}),
+            };
+            if case == "source" {
+                let mut source = Source::new(
+                    base(TableName::Source),
+                    SourceType::Manual,
+                    "status-hash".into(),
+                );
+                source.base.security.level = 8;
+                source.metadata =
+                    json!({"extraction_guidance":{"purpose":"PRIVATE SOURCE GUIDANCE"}});
+                let source = Repository::create(&SourceRepository::new(storage.clone()), source)
+                    .await
+                    .unwrap();
+                document.source = Some(Link::new(source.base.id));
+            }
+            if case == "space" {
+                let mut config = SpaceConfig {
+                    base: base(TableName::SpaceConfig),
+                    embedding_provider: "fake".into(),
+                    embedding_model: "fixture".into(),
+                    embedding_dims: 8,
+                    processing: None,
+                    purpose: Some("PRIVATE SPACE GUIDANCE".into()),
+                    skill: None,
+                };
+                config.base.security.level = 8;
+                SpaceConfigRepository::new(storage.clone())
+                    .create(config)
+                    .await
+                    .unwrap();
+            }
+            let document = DocRepository::new(storage.clone())
+                .create(document)
+                .await
+                .unwrap();
+            let mut revision = DocRevision {
+                base: base(TableName::DocRevision),
+                doc: Link::new(document.base.id.clone()),
+                text: document.text.clone(),
+                text_hash: sha256_hex(document.text.as_bytes()),
+                renderer: RendererMetadata {
+                    name: "fixture".into(),
+                    version: "1".into(),
+                    config_hash: None,
+                },
+                manifest: None,
+                supersedes: None,
+                status: RevisionStatus::Active,
+                rendered_at: chrono::Utc::now(),
+            };
+            if case == "revision" {
+                revision.base.security.level = 8;
+            }
+            if case == "foreign_revision" {
+                revision.base.space_id = "outside".into();
+            }
+            let revision = DocRevisionRepository::new(storage.clone())
+                .create(revision)
+                .await
+                .unwrap();
+            let mut node = DocNode {
+                base: base(TableName::DocNode),
+                revision: Link::new(revision.base.id),
+                role: NodeRole::Paragraph,
+                span: TextSpan { start: 0, end: 22 },
+                node_key: "status".into(),
+                text: Some(document.text.clone()),
+                parent: None,
+                position: 0,
+                depth: 0,
+                embedding_model: None,
+                collection: None,
+            };
+            if case == "node" {
+                node.base.security.level = 8;
+            }
+            if case == "foreign_node" {
+                node.base.space_id = "outside".into();
+            }
+            DocNodeRepository::new(storage.clone())
+                .create(node)
+                .await
+                .unwrap();
+            let mut principal = make_test_principal("status-space");
+            principal.scopes.insert("read:doc".into());
+            principal.clearances.push(elephant_policy::Clearance {
+                policy_id: "default".into(),
+                max_level: 0,
+                labels: HashSet::new(),
+                handling_allow: HashSet::new(),
+            });
+            let ctx =
+                ToolContext::with_authz(storage.clone(), Arc::new(AuthzService::new()), principal);
+            let result = GetDocPipelineStatusHandler::new(storage)
+                .execute(&ctx, json!({"id":document.base.id.to_string()}))
+                .await;
+            match case {
+                "revision" | "source" | "space" => {
+                    assert!(matches!(result,Err(McpError::Public(error))
+                        if error.error_code == elephant_types::public_error::ErrorCode::ForbiddenSpace));
+                }
+                "foreign_revision" => {
+                    assert!(matches!(result,Err(McpError::Public(error))
+                        if error.error_code == elephant_types::public_error::ErrorCode::NotFound));
+                }
+                _ => {
+                    let response = result.unwrap();
+                    assert_eq!(response["ok"], true);
+                    assert_eq!(
+                        response["data"]["nodes_count"],
+                        usize::from(case == "allowed")
+                    );
+                    assert_eq!(
+                        response["data"]["chunks"]["total"],
+                        usize::from(case == "allowed")
+                    );
+                    assert!(!serde_json::to_string(&response)
+                        .unwrap()
+                        .contains("PRIVATE"));
+                }
+            }
+        }
     }
 }

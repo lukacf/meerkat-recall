@@ -1,0 +1,170 @@
+[
+  {
+    "space": "semantics-household",
+    "source_key": "home/water",
+    "revision": "water-r1",
+    "input_sha256": "0f4c9527c94066a750d37fc6ad2f0142ab1d40c2209e17d48879c388c0b5da91"
+  },
+  {
+    "space": "semantics-household",
+    "source_key": "home/water-distractor",
+    "revision": "water-guide-r1",
+    "input_sha256": "5e65dc644c8e75a1f66a0c65aa8720ed5a44e784c0cb459a1216e514ad619589"
+  },
+  {
+    "space": "semantics-household",
+    "source_key": "home/parcel",
+    "revision": "parcel-r1",
+    "input_sha256": "f906e8868557bd350ca553c3c398ba71f619e9d1a10fd4b3991a1e433930bdde"
+  },
+  {
+    "space": "semantics-household",
+    "source_key": "home/travel",
+    "revision": "travel-r1",
+    "input_sha256": "84c01f21142e15a8313e2f0b53ebc214279b6260ca68f2007100df3c309cddec"
+  },
+  {
+    "space": "semantics-household",
+    "source_key": "home/travel-distractor",
+    "revision": "timetable-r1",
+    "input_sha256": "59f9a67fb722881a89cb6c87b8b1d429de728db0c41e30667c4fcdb89f135788"
+  },
+  {
+    "space": "semantics-household",
+    "source_key": "home/repair",
+    "revision": "repair-r1",
+    "input_sha256": "1091ef2a669a02bc6c8c2096826526179c794ec035c0f5616b05a1dc002d77c6"
+  },
+  {
+    "space": "semantics-household",
+    "source_key": "home/repair-proposal",
+    "revision": "proposal-r1",
+    "input_sha256": "2c02042dd3770dcb2b0713b9fc08668ed4ff2faedae01b939932fbd442b31e1a"
+  },
+  {
+    "space": "semantics-household",
+    "source_key": "home/plants",
+    "revision": "plants-r1",
+    "input_sha256": "7b1ea55c04e78a9ba01b19e0549b3085bcf26c9cfbe112ab375562de1db5c691"
+  },
+  {
+    "space": "semantics-household",
+    "source_key": "home/library",
+    "revision": "library-r1",
+    "input_sha256": "ba4398e4359f47e44f27a1d7335f64eebd0ef041cb176f7dd170e9f0a2e5c971"
+  },
+  {
+    "space": "semantics-household",
+    "source_key": "shared/access",
+    "revision": "access-home-r1",
+    "input_sha256": "086c544c833afa004604edb20e0e94dbe57906c1cd25abe6aa4c914d19c78e09"
+  },
+  {
+    "space": "semantics-household",
+    "source_key": "home/visit",
+    "revision": "visit-r1",
+    "input_sha256": "c08a77dc18cd0875e7209fb08b2d8d8c41ec566a78e672d39aa7e61f70004f59"
+  },
+  {
+    "space": "semantics-household",
+    "source_key": "home/visit",
+    "revision": "visit-r2",
+    "input_sha256": "68972557c0f4e4a1d59246af70c541695efa0ca2d566b8a7b235b64bb922109d"
+  },
+  {
+    "space": "semantics-household",
+    "source_key": "home/visit-confirmation",
+    "revision": "confirmation-r1",
+    "input_sha256": "f57c92b8d60349bc992ea69ca56d04f70b0251976254e82275e221af52a68c61"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/contract",
+    "revision": "contract-r1",
+    "input_sha256": "ed898773370861bbafdf6f0b64e1b0d2fe5dd48eb01cdb9dc5de5ea61cf8ff05"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/contract-draft",
+    "revision": "draft-r1",
+    "input_sha256": "75e2af45876269bc3b1d83abf344b0a746e7258f32ed244448c23d19e47c08a3"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/launch",
+    "revision": "launch-r1",
+    "input_sha256": "b515d621b3c48e2cfc450bb31e4e18a27ad3cb7ff24949c41099257b7aa681fe"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/budget",
+    "revision": "budget-r1",
+    "input_sha256": "c0626637ce1a2d3fe2e99115ec3c4937ea7e63a6c3b4074585342606524240e0"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/budget-minutes",
+    "revision": "minutes-r1",
+    "input_sha256": "2f3cbfb0b36376a2d888d2c4feec8557c4fe42aa8a47588a89e1365d57e68cd9"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/ownership",
+    "revision": "ownership-r1",
+    "input_sha256": "13c0bfbe79c1d00d923fabdacf93152e60e4de012aa26d46d7919dc6f11a3850"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/ownership-distractor",
+    "revision": "ownership-other-r1",
+    "input_sha256": "6d6041e31b1ba672b2cfd085a468cf47447709dd726cc9ad3d07a3c1b419e318"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/stock",
+    "revision": "stock-r1",
+    "input_sha256": "cde1f2d271e55f61ca2a6a41bb40fce2a230789b4760ebacf2a1659b5e0d0feb"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/forecast",
+    "revision": "forecast-r1",
+    "input_sha256": "a602581ac56bf40fb06043a1e0106a92a32501733abd62d6e9050817bb9fa6c8"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/security",
+    "revision": "security-r1",
+    "input_sha256": "6116cd5e3f54d1c88acec922f323a8ea4497e69606486ba277cccb8c8f83a7f9"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/identity",
+    "revision": "identity-r1",
+    "input_sha256": "06c5e99ebae640046e458f5805e27f447927772e9e6e891f50e847794e40b525"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/incident",
+    "revision": "incident-r1",
+    "input_sha256": "51755fb920ef87535ebc134d8e9dd2398f2d1796d145a0fa50f7915326f494b0"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "shared/access",
+    "revision": "access-business-r1",
+    "input_sha256": "cf8112769331d5b263fce525cb767b58e21910e113a029158c8f47e676f18253"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/negation",
+    "revision": "negation-r1",
+    "input_sha256": "70b18030c16a4577538c465efba6638e9bd3711e8aaf5863a27abc23a01adc8b"
+  },
+  {
+    "space": "semantics-business",
+    "source_key": "business/quotation",
+    "revision": "quotation-r1",
+    "input_sha256": "aa01a4cbc134462240385e2b179dc93466fc65849e24a18c474cf3d5e487fb9c"
+  }
+]

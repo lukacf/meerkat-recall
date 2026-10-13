@@ -66,6 +66,10 @@ async fn setup_client_and_schema() -> StorageClient {
 /// must not be modified. This test verifies that evidence
 /// round-trips exactly without mutation.
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+)]
 async fn test_evidence_immutability() {
     let client = setup_client_and_schema().await;
     let repo = AssertionRepository::new(client);
@@ -152,6 +156,10 @@ async fn test_evidence_immutability() {
 /// identification. Two assertions with the same key within a space
 /// would indicate a bug in key generation or improper deduplication.
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+)]
 async fn test_assertion_key_uniqueness() {
     let client = setup_client_and_schema().await;
     let repo = AssertionRepository::new(client);
@@ -264,6 +272,10 @@ async fn test_assertion_key_uniqueness() {
 /// (like truth_slot from conflict_group) must properly inherit or
 /// derive their security context. The security field must round-trip.
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client, truth_repo in the original fixture scope through assertions and cleanup."
+)]
 async fn test_abac_inheritance() {
     let client = setup_client_and_schema().await;
     let truth_repo = TruthSlotRepository::new(client);
@@ -373,6 +385,10 @@ async fn test_abac_inheritance() {
 /// produce same slot_key. This test verifies the key format survives
 /// storage round-trip.
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+)]
 async fn test_slot_key_determinism() {
     let client = setup_client_and_schema().await;
     let repo = ConflictGroupRepository::new(client);

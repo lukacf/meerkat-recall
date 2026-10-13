@@ -19,9 +19,10 @@ pub use keys::{IdentityKey, KeyStatus};
 pub use merge::{MergeLineage, MergeResult, MergeStrategy};
 pub use resolver::{
     apply_entity_merge_rewrites, generate_id_map_entry, generate_merge_tombstone,
-    generate_rewrite_query, rewrite_declared_entity_refs_in_json,
-    rewrite_extension_rows_in_mutation, validate_merge, MergeRequest, OnMergeBehavior,
-    ReferenceCardinality, ReferenceDeclaration, ReferenceRegistry, CORE_ENTITY_REF_TABLES,
+    generate_rewrite_query, prepare_entity_merge, prepare_entity_merge_on_plan,
+    rewrite_declared_entity_refs_in_json, rewrite_extension_rows_in_mutation, validate_merge,
+    MergeRequest, OnMergeBehavior, ReferenceCardinality, ReferenceDeclaration, ReferenceRegistry,
+    CORE_ENTITY_REF_TABLES,
 };
 
 #[cfg(test)]

@@ -1,0 +1,74 @@
+{
+  "format": "recall-independent-full-workload-runtime-input-review/v1",
+  "reviewed_at": "2026-10-07T04:13:12.066289+00:00",
+  "reviewed_source": "aea585be09d4f6cd96793fd48a2d91954cc9831f",
+  "worker_source_commits": [
+    "8926f4b3",
+    "2d8bb4e7528325c03b6bcc7053a0676854ded65a"
+  ],
+  "original_worker_proposal_sha256": "9a3bc9624a85d32942a6de2ad2d76404cd6fee0d0a782d1988ca7a594877b233",
+  "source_sha256": {
+    "tests/recall_preview_semantics/full_workload_plan/assemble.py": "2f8beef122df00e794cf54f3a5eda6e4ae2ac4658bb1729b221a85b0f7b6c4c5",
+    "tests/recall_preview_semantics/full_workload_plan/candidate-expectations.json": "455d14e8d77ba76c0064e70f403a4b24be2c1ff212dd566a3ea142f76c40f9de",
+    "tests/recall_preview_semantics/full_workload_plan/case-plan.json": "8f64a3fbf8da187d88bf45821725684298e67604e490e6a0b01e2d5d6730d0d1",
+    "tests/recall_preview_semantics/full_workload_plan/test_assemble.py": "9f67df74a54c3ae7251480ff4822a984d21f7886458c08f6940c128027320693"
+  },
+  "approved_preoutput_input_scope": true,
+  "execution_authorized": false,
+  "provider_dispatch_authorized": false,
+  "product_acceptance": false,
+  "approved_scope": [
+    "exact complete queue/doc_tree/global embed construction literals in original 9a3 proposal",
+    "explicit actual observed recipes required; unsupported or changed values refuse, never infer defaults from environment presence",
+    "actual named query/document factories each 3 HTTP attempts/100 inputs/2048-byte initial segments/16 split depth",
+    "original distinct named-space full-v2 profiles and 1536/3072 dimensions unchanged",
+    "data subjects/scopes from original active space grants",
+    "explicit five management scopes and distinct management subjects",
+    "original FW10 revocable subjects and read scopes retained",
+    "original controlled synthetic credential and all spy-rule digest identity",
+    "detached pre-start runtime document preserving original named-space order and exact worker literals"
+  ],
+  "actual_source_checks": {
+    "source_commit": "4979bb883adde3d8fa884d6e820a6a1a1a76dfc4",
+    "worker_config": "bin/elephant-pipeline/src/config.rs",
+    "actual_capture": "bin/elephant-api/src/runtime_recipe.rs",
+    "runtime_construction": "bin/elephant-api/src/runtime.rs::pipeline_config_from_runtime",
+    "governed_source_embedding": "bin/elephant-pipeline/src/source_runtime.rs::ProviderDispatchContext document embedding",
+    "actual_factory_recipe": "crates/embeddings/src/provider.rs::embedding_execution_recipe"
+  },
+  "global_embedding_scope": "unconfigured is an explicit global construction template, never a fake provider or evidence of named-space embedding success. Actual per-space governed factories and current approval are separately required.",
+  "credential_sha256": "4c9b616f4526031aa6d694db880d5eda4b870670399de8f7c95f02fa7b3e3220",
+  "preserved_original_top_level_inputs": [
+    "format",
+    "review_status",
+    "execution_authorized",
+    "provider_dispatch_authorized",
+    "product_acceptance",
+    "contract_sha256",
+    "graph_manifest_sha256",
+    "configurations",
+    "space_request_templates",
+    "cases",
+    "load_plan",
+    "worker_profile_proposal"
+  ],
+  "only_changed_original_descriptive_keys": [
+    "derivation",
+    "pending_independent_decisions"
+  ],
+  "owner_obligations": [
+    "B validates actual original archive/executable/source/paired identity, canonical owned paths, loopback endpoints, original clock and shared allocation before side effects",
+    "runtime_plan_document does not itself verify actual files, paired digest syntax, endpoint reachability or allocation; its output is not authority",
+    "same original runtime:inspect read-only token and separate runtime:operator write authority; no named header on global requests",
+    "actual CLI token issuance and original named grants include data/manage/revocable; do not exceed original 16-process inventory",
+    "S binds the final runtime document to these original case-plan inputs before any output and pins the complete executed helper closure",
+    "C original runtime observations at four agreed boundaries, with current process ownership and exact recipe/config/binding comparison",
+    "no enlarged time/request/provider/capture budgets or invented future PID/token/startup receipt"
+  ],
+  "remaining": [
+    "full B owner/C inspector/G transport/S CLI composition source and exact transitive pins",
+    "actual provider/configuration epoch projection must be narrowly reviewed",
+    "real installed execution, full Graph large-source completion, original capacity export, owned service stop and measured load",
+    "external consumer adoption/twin evidence remains separate"
+  ]
+}

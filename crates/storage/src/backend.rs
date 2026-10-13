@@ -41,6 +41,7 @@ pub trait StorageBackend: Clone + Send + Sync + 'static {
         T: serde::Serialize + Send + Sync + 'static;
 
     /// Checked + retried variant of [`StorageBackend::query_bind`]:
+    ///
     /// statement-level errors inside the response are surfaced (via
     /// [`surrealdb::Response::check`]) instead of silently succeeding, and
     /// transient transaction conflicts are retried. Bindings must be `Clone`

@@ -206,6 +206,7 @@ impl Extractor for CapturingExtractor {
         *self.seen.lock().expect("captured context lock") = Some(ctx.clone());
         Ok(ExtractionResult::new(
             vec![RawAssertion {
+                support_verification: None,
                 subject_text: "alex".to_string(),
                 predicate_text: "uses".to_string(),
                 object_text: Some("Claude-Code / Terminal IDE".to_string()),

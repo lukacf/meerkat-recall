@@ -52,6 +52,7 @@ hex = { workspace = true }
 
 [dev-dependencies]
 elephant-storage = { path = "../../crates/storage", features = ["test-utils"] }
+elephant-pipeline-bin = { path = "../elephant-pipeline", package = "elephant-pipeline-bin", features = ["test-utils"] }
 tokio-test = { workspace = true }
 rstest = { workspace = true }
 serial_test = "3.2"

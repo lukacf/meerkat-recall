@@ -1,0 +1,766 @@
+{
+  "format": "recall-independent-rendered-map/v1",
+  "reviewer": "qualification (independent D lane)",
+  "execution_authorized": false,
+  "product_acceptance": false,
+  "corpus_path": "tests/recall_preview_semantics/corpus.json",
+  "corpus_sha256": "a866e3569dbec863c9214c5f4cba477333dd6629ace8a4816318e40afea90da7",
+  "renderer": {
+    "name": "elephant.renderer.text",
+    "version": "1.0.0",
+    "source_path": "crates/pipeline/src/renderer/default.rs",
+    "source_sha256": "4f970587f70b4f5bf28c08e6944eea0da7134d3fdf45469cbfb2cfd4a5464a10"
+  },
+  "tree": {
+    "source_path": "crates/pipeline/src/scheduler/evidence_work_kinds.rs",
+    "source_sha256": "312dea39a18ee392241cd852127d3d42dbd6def9ce1764f14153ff222dcbb507",
+    "configuration": {
+      "max_chunk_size": 512,
+      "chunk_overlap": 50,
+      "create_paragraphs": true,
+      "detect_sections": false,
+      "semantic_chunking": true,
+      "create_summaries": false
+    }
+  },
+  "expectation": "These exact original nonempty single-line texts have no trailing whitespace and fit one default paragraph/chunk. Rendered Doc and immutable DocRevision equal original text plus one LF. Root includes LF; paragraph/chunk spans exclude it.",
+  "unchanged": [
+    "Original submission bytes and Source content hash remain the raw input bytes.",
+    "Original corpus, typed source contract, query bytes/order/counts, relevance/latency thresholds, allocation, physical-call and cost caps remain unchanged.",
+    "Validate actual returned Doc/DocRevision/source identities and original operation completion before applying this map.",
+    "Compare observed bytes exactly; never normalize observed output or widen span bounds after execution.",
+    "Every result quote and hash is checked against this source-specific rendered UTF-8 byte sequence; default paragraph/chunk coverage must match the listed exact spans.",
+    "Renderer/tree configuration or source delta requires explicit pre-output review; no inferred compatibility from a version label."
+  ],
+  "source_count": 28,
+  "sources": [
+    {
+      "space": "semantics-business",
+      "source_key": "business/budget",
+      "revision": "budget-r1",
+      "input_sha256": "c0626637ce1a2d3fe2e99115ec3c4937ea7e63a6c3b4074585342606524240e0",
+      "input_utf8_bytes": 147,
+      "rendered_text": "The board approved EUR 18000 for the Lantern pilot. A request for EUR 80000 for wider rollout was rejected. Neither amount is reported expenditure.\n",
+      "rendered_sha256": "f33e0a066482c636113a89f5dbe7e5d4ad3d373af5abf83a25c232b48def7de7",
+      "rendered_utf8_bytes": 148,
+      "root_span": {
+        "start": 0,
+        "end": 148
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 147
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 147
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/budget-minutes",
+      "revision": "minutes-r1",
+      "input_sha256": "2f3cbfb0b36376a2d888d2c4feec8557c4fe42aa8a47588a89e1365d57e68cd9",
+      "input_utf8_bytes": 126,
+      "rendered_text": "Signed board minutes: the Lantern pilot allocation is eighteen thousand euros. The wider rollout funding request did not pass.\n",
+      "rendered_sha256": "76031090e3d618e84a98840b710f551ef6b826951427a9ecc1c804055b6eb7a2",
+      "rendered_utf8_bytes": 127,
+      "root_span": {
+        "start": 0,
+        "end": 127
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 126
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 126
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/contract",
+      "revision": "contract-r1",
+      "input_sha256": "ed898773370861bbafdf6f0b64e1b0d2fe5dd48eb01cdb9dc5de5ea61cf8ff05",
+      "input_utf8_bytes": 140,
+      "rendered_text": "For Cedar's signed supply contract, payment is due 45 days after an accepted invoice. The unsigned draft proposed 30 days and has no effect.\n",
+      "rendered_sha256": "0581eb9909ebbc51f2acd1b3be7b1dec2e3be187182eec4271dda10cb1569c74",
+      "rendered_utf8_bytes": 141,
+      "root_span": {
+        "start": 0,
+        "end": 141
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 140
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 140
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/contract-draft",
+      "revision": "draft-r1",
+      "input_sha256": "75e2af45876269bc3b1d83abf344b0a746e7258f32ed244448c23d19e47c08a3",
+      "input_utf8_bytes": 127,
+      "rendered_text": "UNSIGNED DRAFT: Cedar invoices would be payable within 30 days. This draft was rejected and is not the signed supply agreement.\n",
+      "rendered_sha256": "93fbf233c37fb1453f7a2b783418d5b308d20f6cdacbc1dff59ac8a87374d1a8",
+      "rendered_utf8_bytes": 128,
+      "root_span": {
+        "start": 0,
+        "end": 128
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 127
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 127
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/forecast",
+      "revision": "forecast-r1",
+      "input_sha256": "a602581ac56bf40fb06043a1e0106a92a32501733abd62d6e9050817bb9fa6c8",
+      "input_utf8_bytes": 124,
+      "rendered_text": "The sales forecast estimates 120 units next quarter. It is a forecast, not confirmed orders, shipments or current inventory.\n",
+      "rendered_sha256": "cab5770f3d2d44a67ddf3b6fc564b6767325be3786e1ccffb14b455ff1bfc85a",
+      "rendered_utf8_bytes": 125,
+      "root_span": {
+        "start": 0,
+        "end": 125
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 124
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 124
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/identity",
+      "revision": "identity-r1",
+      "input_sha256": "06c5e99ebae640046e458f5805e27f447927772e9e6e891f50e847794e40b525",
+      "input_utf8_bytes": 117,
+      "rendered_text": "Alex Chen in finance uses employee ID F-204. Alex Chen in research uses employee ID R-991. They are different people.\n",
+      "rendered_sha256": "704144cda1038c12cf37c0cb5a5f0999db6ff2465bd92c6a33601b63671c3f52",
+      "rendered_utf8_bytes": 118,
+      "root_span": {
+        "start": 0,
+        "end": 118
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 117
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 117
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/incident",
+      "revision": "incident-r1",
+      "input_sha256": "51755fb920ef87535ebc134d8e9dd2398f2d1796d145a0fa50f7915326f494b0",
+      "input_utf8_bytes": 164,
+      "rendered_text": "At 13:10 UTC on 6 May 2027, monitoring detected a failed backup. Service remained available. Recovery completed at 13:42 UTC; the incident was not a service outage.\n",
+      "rendered_sha256": "471cba4b22bcc8790c634db6cbbde118f7639a931fc5addae248482206f03e7a",
+      "rendered_utf8_bytes": 165,
+      "root_span": {
+        "start": 0,
+        "end": 165
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 164
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 164
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/launch",
+      "revision": "launch-r1",
+      "input_sha256": "b515d621b3c48e2cfc450bb31e4e18a27ad3cb7ff24949c41099257b7aa681fe",
+      "input_utf8_bytes": 155,
+      "rendered_text": "Project Lantern's production release is blocked until the independent accessibility audit passes. The pilot on 4 February 2027 is not a production release.\n",
+      "rendered_sha256": "97fcfb4dee0c1eb1c023b65d1a2a3d45b0920b2fc674c21bcb8e44254c6d5d8d",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/negation",
+      "revision": "negation-r1",
+      "input_sha256": "70b18030c16a4577538c465efba6638e9bd3711e8aaf5863a27abc23a01adc8b",
+      "input_utf8_bytes": 131,
+      "rendered_text": "The acquisition of Moss Ltd was discussed but never approved. No acquisition agreement was signed and Moss Ltd remains independent.\n",
+      "rendered_sha256": "56da317eee3c6c93999e633341aa0473660532b8d3ac2bf24f2f3744e234fd15",
+      "rendered_utf8_bytes": 132,
+      "root_span": {
+        "start": 0,
+        "end": 132
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 131
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 131
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/ownership",
+      "revision": "ownership-r1",
+      "input_sha256": "13c0bfbe79c1d00d923fabdacf93152e60e4de012aa26d46d7919dc6f11a3850",
+      "input_utf8_bytes": 160,
+      "rendered_text": "Leena is the incident coordinator through 31 March 2027. Omar takes over effective 1 April 2027. This changes coordination responsibility, not system ownership.\n",
+      "rendered_sha256": "b6c9d48d672737793ed68763fff72048348d45811b93efe687bdc615bc78f6de",
+      "rendered_utf8_bytes": 161,
+      "root_span": {
+        "start": 0,
+        "end": 161
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 160
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 160
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/ownership-distractor",
+      "revision": "ownership-other-r1",
+      "input_sha256": "6d6041e31b1ba672b2cfd085a468cf47447709dd726cc9ad3d07a3c1b419e318",
+      "input_utf8_bytes": 115,
+      "rendered_text": "At the unrelated Tern charity, Omar coordinates museum volunteers. This is not the business incident-response rota.\n",
+      "rendered_sha256": "95bf4381419e3d995ad5f9b9f00f79739bb6b1fe78b0ce39d61c97c8d71e0f00",
+      "rendered_utf8_bytes": 116,
+      "root_span": {
+        "start": 0,
+        "end": 116
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 115
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 115
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/quotation",
+      "revision": "quotation-r1",
+      "input_sha256": "aa01a4cbc134462240385e2b179dc93466fc65849e24a18c474cf3d5e487fb9c",
+      "input_utf8_bytes": 145,
+      "rendered_text": "The phishing exercise email said: 'The board has transferred all reserves to Moss Ltd.' The quoted claim is deliberately false training material.\n",
+      "rendered_sha256": "4132f282ebec84976867d804d7aceae00cc7b6d451c97043d9b08e363410a245",
+      "rendered_utf8_bytes": 146,
+      "root_span": {
+        "start": 0,
+        "end": 146
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 145
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 145
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/security",
+      "revision": "security-r1",
+      "input_sha256": "6116cd5e3f54d1c88acec922f323a8ea4497e69606486ba277cccb8c8f83a7f9",
+      "input_utf8_bytes": 146,
+      "rendered_text": "Vendor Birch holds a certificate valid through 30 June 2027. The certificate covers its Dublin facility only; it does not cover the Oslo facility.\n",
+      "rendered_sha256": "b4ed106a5676ff5df0f1d0f6ff6da8982d5d22a98bc987d6b8289ff3bb6ae328",
+      "rendered_utf8_bytes": 147,
+      "root_span": {
+        "start": 0,
+        "end": 147
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 146
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 146
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "business/stock",
+      "revision": "stock-r1",
+      "input_sha256": "cde1f2d271e55f61ca2a6a41bb40fce2a230789b4760ebacf2a1659b5e0d0feb",
+      "input_utf8_bytes": 138,
+      "rendered_text": "The inventory count recorded 72 sealed sensor units and 9 damaged units. Damaged units cannot be sold. No shipment has left the warehouse.\n",
+      "rendered_sha256": "35541f9fc71352d63b7a75e404aa6c18d42ad1393fe633f404a0fcd94a5831e3",
+      "rendered_utf8_bytes": 139,
+      "root_span": {
+        "start": 0,
+        "end": 139
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 138
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 138
+        }
+      ]
+    },
+    {
+      "space": "semantics-business",
+      "source_key": "shared/access",
+      "revision": "access-business-r1",
+      "input_sha256": "cf8112769331d5b263fce525cb767b58e21910e113a029158c8f47e676f18253",
+      "input_utf8_bytes": 108,
+      "rendered_text": "The spare office badge is held by reception in drawer 6. Household entrance keys are outside this procedure.\n",
+      "rendered_sha256": "d61202913481db271f42b50d7ba2b1f037a01231d9d0da051468e2a84c52ca9d",
+      "rendered_utf8_bytes": 109,
+      "root_span": {
+        "start": 0,
+        "end": 109
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 108
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 108
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "home/library",
+      "revision": "library-r1",
+      "input_sha256": "ba4398e4359f47e44f27a1d7335f64eebd0ef041cb176f7dd170e9f0a2e5c971",
+      "input_utf8_bytes": 115,
+      "rendered_text": "Nico's library card is kept in the green envelope in the desk drawer. The red envelope contains old museum tickets.\n",
+      "rendered_sha256": "e10be101f2d80b1e4cce1c0291ccd295e39315838ffc142985e0031d4d329e7c",
+      "rendered_utf8_bytes": 116,
+      "root_span": {
+        "start": 0,
+        "end": 116
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 115
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 115
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "home/parcel",
+      "revision": "parcel-r1",
+      "input_sha256": "f906e8868557bd350ca553c3c398ba71f619e9d1a10fd4b3991a1e433930bdde",
+      "input_utf8_bytes": 129,
+      "rendered_text": "If nobody answers the door, leave parcels in the lidded bench beside the east entrance. Never leave deliveries in the greenhouse.\n",
+      "rendered_sha256": "bf1211109b40b3ba71fe11dbe88993db32a0c2cec697067ba39de4c204f0f334",
+      "rendered_utf8_bytes": 130,
+      "root_span": {
+        "start": 0,
+        "end": 130
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 129
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 129
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "home/plants",
+      "revision": "plants-r1",
+      "input_sha256": "7b1ea55c04e78a9ba01b19e0549b3085bcf26c9cfbe112ab375562de1db5c691",
+      "input_utf8_bytes": 150,
+      "rendered_text": "While we are away, water the fern every third day. Leave the cactus dry. The orchid belongs to the neighbour and is not part of our care instructions.\n",
+      "rendered_sha256": "a55bed09cf33ab76fcb3b614afa72b4a12c68b97880ee4848421051e4e64ea1a",
+      "rendered_utf8_bytes": 151,
+      "root_span": {
+        "start": 0,
+        "end": 151
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 150
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 150
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "home/repair",
+      "revision": "repair-r1",
+      "input_sha256": "1091ef2a669a02bc6c8c2096826526179c794ec035c0f5616b05a1dc002d77c6",
+      "input_utf8_bytes": 117,
+      "rendered_text": "The dishwasher leaks at the inlet hose. Replacement hose part number is QH-47. No repair appointment has been booked.\n",
+      "rendered_sha256": "3a911bf2ab814468bc2090588c6db7c78d415c8bbf793eaae894f15c15c00af8",
+      "rendered_utf8_bytes": 118,
+      "root_span": {
+        "start": 0,
+        "end": 118
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 117
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 117
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "home/repair-proposal",
+      "revision": "proposal-r1",
+      "input_sha256": "2c02042dd3770dcb2b0713b9fc08668ed4ff2faedae01b939932fbd442b31e1a",
+      "input_utf8_bytes": 126,
+      "rendered_text": "A neighbour suggested asking Mara to repair the dishwasher on Thursday. Mara has not accepted and Thursday is only a proposal.\n",
+      "rendered_sha256": "21c189c3f5b703b2278c87080294f13d1d81ca49b55ae821c65d705f9054049a",
+      "rendered_utf8_bytes": 127,
+      "root_span": {
+        "start": 0,
+        "end": 127
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 126
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 126
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "home/travel",
+      "revision": "travel-r1",
+      "input_sha256": "84c01f21142e15a8313e2f0b53ebc214279b6260ca68f2007100df3c309cddec",
+      "input_utf8_bytes": 145,
+      "rendered_text": "For the ferry on 18 November 2026, arrive at the terminal by 07:20. The boat departs at 08:05. The reservation is for two adults and one bicycle.\n",
+      "rendered_sha256": "7928596bebcf15250d47539e4208b84d0b76d890affa273f8e230c52cafe14db",
+      "rendered_utf8_bytes": 146,
+      "root_span": {
+        "start": 0,
+        "end": 146
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 145
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 145
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "home/travel-distractor",
+      "revision": "timetable-r1",
+      "input_sha256": "59f9a67fb722881a89cb6c87b8b1d429de728db0c41e30667c4fcdb89f135788",
+      "input_utf8_bytes": 104,
+      "rendered_text": "Last year's ferry left at 07:20. This archived timetable is not valid for the November 2026 reservation.\n",
+      "rendered_sha256": "ae92a07ae39fbf0f4e684a9ec9ad7acab93e9ff8c2e85d5b6137506d907ddbe8",
+      "rendered_utf8_bytes": 105,
+      "root_span": {
+        "start": 0,
+        "end": 105
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 104
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 104
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "home/visit",
+      "revision": "visit-r1",
+      "input_sha256": "c08a77dc18cd0875e7209fb08b2d8d8c41ec566a78e672d39aa7e61f70004f59",
+      "input_utf8_bytes": 65,
+      "rendered_text": "The chimney inspection is scheduled for 9 December 2026 at 10:00.\n",
+      "rendered_sha256": "123394e7d08d2802c1fef498fc151574e4e2721104c314cfec1e85da7bb73c27",
+      "rendered_utf8_bytes": 66,
+      "root_span": {
+        "start": 0,
+        "end": 66
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 65
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 65
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "home/visit",
+      "revision": "visit-r2",
+      "input_sha256": "68972557c0f4e4a1d59246af70c541695efa0ca2d566b8a7b235b64bb922109d",
+      "input_utf8_bytes": 103,
+      "rendered_text": "The chimney inspection has moved to 16 December 2026 at 14:30. The 9 December appointment is cancelled.\n",
+      "rendered_sha256": "3d41a308f20e9c92feb078577b640c696515ca6f5341c526ca8c7129a4e373ed",
+      "rendered_utf8_bytes": 104,
+      "root_span": {
+        "start": 0,
+        "end": 104
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 103
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 103
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "home/visit-confirmation",
+      "revision": "confirmation-r1",
+      "input_sha256": "f57c92b8d60349bc992ea69ca56d04f70b0251976254e82275e221af52a68c61",
+      "input_utf8_bytes": 114,
+      "rendered_text": "The inspector confirmed a chimney visit on 16 December 2026 at 14:30. This confirmation replaces the earlier date.\n",
+      "rendered_sha256": "b81dab2bad7f8e2b3302b0d81dd0b66fc81d56a7cdaabcabcf4b5b5172264d3c",
+      "rendered_utf8_bytes": 115,
+      "root_span": {
+        "start": 0,
+        "end": 115
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 114
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 114
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "home/water",
+      "revision": "water-r1",
+      "input_sha256": "0f4c9527c94066a750d37fc6ad2f0142ab1d40c2209e17d48879c388c0b5da91",
+      "input_utf8_bytes": 138,
+      "rendered_text": "To stop the garden tap supply, close the small red lever inside the utility cupboard. The blue wheel isolates only the upstairs washbasin.\n",
+      "rendered_sha256": "8bbc40766e236b56f192bb456ee48a882f3aed93228a558a6ddc14a327548b4f",
+      "rendered_utf8_bytes": 139,
+      "root_span": {
+        "start": 0,
+        "end": 139
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 138
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 138
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "home/water-distractor",
+      "revision": "water-guide-r1",
+      "input_sha256": "5e65dc644c8e75a1f66a0c65aa8720ed5a44e784c0cb459a1216e514ad619589",
+      "input_utf8_bytes": 101,
+      "rendered_text": "The picture book shows a red water wheel in a garden. It is a story, not instructions for this house.\n",
+      "rendered_sha256": "33165c69d748b6de1c5a645b7cd1a2fe604086c6da3549bd7773e50feee59474",
+      "rendered_utf8_bytes": 102,
+      "root_span": {
+        "start": 0,
+        "end": 102
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 101
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 101
+        }
+      ]
+    },
+    {
+      "space": "semantics-household",
+      "source_key": "shared/access",
+      "revision": "access-home-r1",
+      "input_sha256": "086c544c833afa004604edb20e0e94dbe57906c1cd25abe6aa4c914d19c78e09",
+      "input_utf8_bytes": 110,
+      "rendered_text": "The spare entrance key is in the ceramic jar above the coat hooks. The office access badge is not stored here.\n",
+      "rendered_sha256": "9c3662284875bc81023bd459638fb6aadc599be7e5f441cf30f283576614db7f",
+      "rendered_utf8_bytes": 111,
+      "root_span": {
+        "start": 0,
+        "end": 111
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 110
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 110
+        }
+      ]
+    }
+  ]
+}

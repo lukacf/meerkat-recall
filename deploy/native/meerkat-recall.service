@@ -1,0 +1,25 @@
+[Unit]
+Description=Meerkat Recall independent knowledge service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=recall
+Group=recall
+WorkingDirectory=/var/lib/meerkat-recall
+EnvironmentFile=/etc/meerkat-recall/service.env
+ExecStart=/opt/meerkat-recall/current/meerkat-recall serve --shutdown-timeout-seconds 60
+KillSignal=SIGTERM
+TimeoutStopSec=75
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/meerkat-recall
+
+[Install]
+WantedBy=multi-user.target

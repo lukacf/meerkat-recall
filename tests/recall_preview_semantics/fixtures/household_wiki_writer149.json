@@ -1,0 +1,67 @@
+{
+  "captured_output_text": "{\n  \"language\": \"en\",\n  \"title\": \"Dishwasher repair\",\n  \"lead\": {\n    \"id\": \"lead\",\n    \"text\": \"The dishwasher leaks at the inlet hose, and the identified replacement hose is part QH-47. No repair appointment has been booked.\",\n    \"citation_ids\": [\"c5\"]\n  },\n  \"sections\": [\n    {\n      \"id\": \"repair-status\",\n      \"heading\": \"Repair details and scheduling\",\n      \"kind\": \"current_facts\",\n      \"statements\": [\n        {\n          \"id\": \"replacement-part\",\n          \"text\": \"QH-47 is the replacement part number for the inlet hose where the leak occurs.\",\n          \"citation_ids\": [\"c3\"]\n        },\n        {\n          \"id\": \"scheduling-status\",\n          \"text\": \"The repair remains unscheduled: no appointment has been booked.\",\n          \"citation_ids\": [\"c5\"]\n        }\n      ]\n    }\n  ]\n}",
+  "captured_output_text_sha256": "29bda9752419d4b4802b3c8104934e01bb852375a426a1b89a64ec8e00e09b62",
+  "catalog": [
+    {
+      "canonical_statements": [
+        "- **dishwasher** is a topic and matches this context's maintained criteria. [^c1] [^c2]"
+      ],
+      "citation_id": "c2",
+      "kind": "graph_record",
+      "record_id": "entity:292036e4-8c77-4bcb-91ab-1ac7f55d836f"
+    },
+    {
+      "canonical_statements": [],
+      "citation_id": "c3",
+      "kind": "evidence_span",
+      "record_id": "assertion:3cb8382e-1f40-4d6c-b744-5784dd58f682",
+      "source_id": "source:23e044c4-c8da-5ed3-972d-ece492b203c3",
+      "source_quote": "The dishwasher leaks at the inlet hose. Replacement hose part number is QH-47."
+    },
+    {
+      "canonical_statements": [],
+      "citation_id": "c4",
+      "kind": "evidence_span",
+      "record_id": "assertion:89d73bad-492e-4350-87c9-40f3994cb9f2",
+      "source_id": "source:23e044c4-c8da-5ed3-972d-ece492b203c3",
+      "source_quote": "The dishwasher leaks at the inlet hose."
+    },
+    {
+      "canonical_statements": [],
+      "citation_id": "c5",
+      "kind": "evidence_span",
+      "record_id": "assertion:5b8055ae-2916-440f-b3b2-42f41941673e",
+      "source_id": "source:23e044c4-c8da-5ed3-972d-ece492b203c3",
+      "source_quote": "The dishwasher leaks at the inlet hose. Replacement hose part number is QH-47. No repair appointment has been booked."
+    },
+    {
+      "canonical_statements": [
+        "Date unknown: dishwasher has_replacement_hose_part_number QH-47."
+      ],
+      "citation_id": "c6",
+      "kind": "graph_record",
+      "record_id": "event:791273c4-af6b-41bc-b4e1-829766df07ba"
+    },
+    {
+      "canonical_statements": [
+        "Date unknown: dishwasher leaks_at inlet hose."
+      ],
+      "citation_id": "c7",
+      "kind": "graph_record",
+      "record_id": "event:08df2d07-d809-4059-9e5f-bd01f8138341"
+    },
+    {
+      "canonical_statements": [
+        "Date unknown: dishwasher has_repair_appointment_booked false."
+      ],
+      "citation_id": "c8",
+      "kind": "graph_record",
+      "record_id": "event:564b68ad-a0c1-4629-bebb-b1f2ea117756"
+    }
+  ],
+  "dispatch_id": 149,
+  "evidence_class": "closed synthetic provider output; parser regression only, not semantic or lifecycle acceptance",
+  "original_request_sha256": "3ef71aa22977b505f21d37425481ded7f0d34fb3cfa3c0be296d779adad4ecac",
+  "original_response_sha256": "1d8bc7d9f73b886337dd47180f779453d92f9c0c43b820fc42480bbfa7c8ddad",
+  "original_source_commit": "15745df0399382a9579fe101b6ed7cda404951f6"
+}

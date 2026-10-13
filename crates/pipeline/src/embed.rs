@@ -6,7 +6,7 @@ use chrono::Utc;
 use elephant_embeddings::{EmbeddingProvider, EmbeddingVector};
 use elephant_storage::{DocNodeRepository, DocRevisionRepository, NodeEmbeddingRepository};
 use elephant_types::ids::RecordId;
-use elephant_types::records::doc_node::DocNode;
+use elephant_types::records::doc_node::{DocNode, NodeRole};
 use elephant_types::records::NodeEmbedding;
 use elephant_types::Link;
 
@@ -35,6 +35,8 @@ pub struct EmbedWorker<P: EmbeddingProvider> {
     revision_repo: DocRevisionRepository,
     embedding_repo: NodeEmbeddingRepository,
     provider: P,
+    source_authority:
+        Option<elephant_storage::source_publication_manifest::SourceEmbeddingWriteAuthority>,
 }
 
 impl<P: EmbeddingProvider> EmbedWorker<P> {
@@ -51,7 +53,19 @@ impl<P: EmbeddingProvider> EmbedWorker<P> {
             revision_repo,
             embedding_repo,
             provider,
+            source_authority: None,
         }
+    }
+
+    /// Bind source vector writes to the sealed original plan and lease captured
+    /// before inference. Every batch rechecks this authority in its transaction.
+    #[must_use]
+    pub fn with_source_authority(
+        mut self,
+        authority: elephant_storage::source_publication_manifest::SourceEmbeddingWriteAuthority,
+    ) -> Self {
+        self.source_authority = Some(authority);
+        self
     }
 
     /// Resolves text for a batch of nodes, fetching revision text as needed.
@@ -167,15 +181,14 @@ impl<P: EmbeddingProvider> EmbedWorker<P> {
     /// them. The sentinel occupies `embedding_model` WITHOUT a stored vector,
     /// so search never sees phantom embeddings and a repair can retry a node
     /// by nulling the field back to pending.
-    async fn dead_letter(&self, space_id: &str, mut nodes: Vec<DocNode>) -> PipelineResult<()> {
+    async fn dead_letter(&self, space_id: &str, nodes: Vec<DocNode>) -> PipelineResult<()> {
         if nodes.is_empty() {
             return Ok(());
         }
-        for node in &mut nodes {
-            node.embedding_model = Some(UNEMBEDDABLE_SENTINEL.to_string());
-            node.base.updated_at = Utc::now();
-        }
-        self.node_repo.update_many(space_id, nodes).await?;
+        let ids: Vec<_> = nodes.into_iter().map(|node| node.base.id).collect();
+        self.node_repo
+            .mark_unmanaged_embedding_failed(space_id, &ids, UNEMBEDDABLE_SENTINEL)
+            .await?;
         Ok(())
     }
 
@@ -219,14 +232,28 @@ impl<P: EmbeddingProvider> EmbedWorker<P> {
             chunk_ids.push(node.base.id);
         }
 
-        self.embedding_repo
-            .store_embeddings_and_mark_nodes(space_id, &chunk_ids, &model, now, embedding_records)
-            .await
-            .map_err(|e| {
-                PipelineError::IngestionError(format!(
-                    "Failed to atomically persist embedding batch: {e}"
-                ))
-            })?;
+        if let Some(authority) = &self.source_authority {
+            self.embedding_repo
+                .store_source_embeddings_and_mark_nodes(
+                    space_id,
+                    &chunk_ids,
+                    &model,
+                    now,
+                    embedding_records,
+                    authority,
+                )
+                .await?;
+        } else {
+            self.embedding_repo
+                .store_embeddings_and_mark_nodes(
+                    space_id,
+                    &chunk_ids,
+                    &model,
+                    now,
+                    embedding_records,
+                )
+                .await?;
+        }
 
         Ok(EmbedResult {
             chunks_processed: chunk_ids.len(),
@@ -273,6 +300,12 @@ impl<P: EmbeddingProvider> EmbedWorker<P> {
             });
         }
 
+        // A source intake may have acquired these nodes while text was loaded.
+        if self.source_authority.is_none() {
+            self.node_repo
+                .require_unmanaged_embedding_inputs(space_id, &nodes)
+                .await?;
+        }
         // Generate embeddings
         let embeddings = self.provider.embed(&texts).await?;
 
@@ -299,6 +332,12 @@ impl<P: EmbeddingProvider> EmbedWorker<P> {
             });
         }
 
+        if self.source_authority.is_none() {
+            self.node_repo
+                .require_unmanaged_embedding_inputs(space_id, &nodes)
+                .await?;
+        }
+
         // Same dead-letter discipline as process_pending: an explicit chunk
         // list is no reason to let one bad node fail its batchmates.
         let (nodes, texts, dead) = self.resolve_texts(nodes).await?;
@@ -311,10 +350,98 @@ impl<P: EmbeddingProvider> EmbedWorker<P> {
             });
         }
 
+        // A source intake may have acquired these nodes while text was loaded.
+        if self.source_authority.is_none() {
+            self.node_repo
+                .require_unmanaged_embedding_inputs(space_id, &nodes)
+                .await?;
+        }
         // Generate embeddings
         let embeddings = self.provider.embed(&texts).await?;
 
         self.persist_embeddings(space_id, nodes, embeddings).await
+    }
+
+    /// Embed an exact declared source-publication set. Any absent node, invalid
+    /// immutable span, or missing revision fails the whole requested batch;
+    /// callers cannot treat clamped text or dead-letter markers as coverage.
+    pub async fn embed_exact_nodes(
+        &self,
+        space_id: &str,
+        node_ids: &[RecordId],
+    ) -> PipelineResult<EmbedResult> {
+        let expected: HashSet<_> = node_ids.iter().cloned().collect();
+        if expected.len() != node_ids.len() {
+            return Err(PipelineError::InvalidInput(
+                "Duplicate required embedding node".into(),
+            ));
+        }
+        let nodes = self.node_repo.get_many(space_id, node_ids).await?;
+        let actual: HashSet<_> = nodes.iter().map(|node| node.base.id.clone()).collect();
+        if actual != expected {
+            return Err(PipelineError::InvalidInput(
+                "stale_input: required embedding node missing".into(),
+            ));
+        }
+        let revisions: Vec<_> = nodes
+            .iter()
+            .map(|node| node.revision.id().clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let revisions = self.revision_repo.get_many(space_id, &revisions).await?;
+        let revisions: HashMap<_, _> = revisions
+            .into_iter()
+            .map(|revision| (revision.base.id.clone(), revision))
+            .collect();
+        let mut texts = Vec::with_capacity(nodes.len());
+        for node in &nodes {
+            let revision = revisions.get(node.revision.id()).ok_or_else(|| {
+                PipelineError::InvalidInput(
+                    "stale_input: required embedding revision missing".into(),
+                )
+            })?;
+            if let Some(authority) = &self.source_authority {
+                authority.validate_embedding_input(node, revision)?;
+            }
+            let start = usize::try_from(node.span.start)
+                .map_err(|_| PipelineError::InvalidInput("Embedding span overflow".into()))?;
+            let end = usize::try_from(node.span.end)
+                .map_err(|_| PipelineError::InvalidInput("Embedding span overflow".into()))?;
+            let text = revision
+                .text
+                .get(start..end)
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| {
+                    PipelineError::InvalidInput(
+                        "stale_input: required embedding span is not exact UTF-8 evidence".into(),
+                    )
+                })?;
+            // Only a Summary has separately generated text. Paragraph/chunk
+            // evidence always comes from its exact immutable revision range.
+            texts.push(if node.role == NodeRole::Summary {
+                node.text
+                    .clone()
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| {
+                        PipelineError::InvalidInput(
+                            "stale_input: captured summary text missing".into(),
+                        )
+                    })?
+            } else {
+                text.to_string()
+            });
+        }
+        if nodes.is_empty() {
+            return self.persist_embeddings(space_id, nodes, Vec::new()).await;
+        }
+        if self.source_authority.is_none() {
+            self.node_repo
+                .require_unmanaged_embedding_inputs(space_id, &nodes)
+                .await?;
+        }
+        let vectors = self.provider.embed(&texts).await?;
+        self.persist_embeddings(space_id, nodes, vectors).await
     }
 
     /// Generates embedding for a single text without storing.
@@ -790,4 +917,155 @@ mod tests {
             "embedding rows should roll back with node failure"
         );
     }
+    #[tokio::test]
+    #[expect(
+        clippy::cloned_ref_to_slice_refs,
+        reason = "Retain the original owned request slice and post-refusal coverage checks in this embedding regression."
+    )]
+    async fn exact_source_embedding_rejects_truncation_without_marking_coverage() {
+        let ctx = setup_test_context().await;
+        let repo = DocNodeRepository::new(ctx.client.clone());
+        let mut node = create_test_node(&ctx.revision_id, 0);
+        node.text = None;
+        node.span = TextSpan::new(0, u32::MAX);
+        let id = node.base.id.clone();
+        repo.create(node).await.expect("node");
+        assert!(ctx
+            .worker
+            .embed_exact_nodes("test_space", &[id.clone()])
+            .await
+            .is_err());
+        assert!(repo
+            .get("test_space", &id)
+            .await
+            .expect("node")
+            .expect("exists")
+            .embedding_model
+            .is_none());
+        assert!(ctx
+            .worker
+            .embed_exact_nodes("test_space", &[RecordId::new_v4(TableName::DocNode)])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_source_embeddings_use_immutable_spans_and_only_typed_summary_text() {
+        struct RecordingProvider {
+            seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for RecordingProvider {
+            fn model(&self) -> &str {
+                "test-model"
+            }
+            fn dimensions(&self) -> usize {
+                3072
+            }
+            async fn embed(
+                &self,
+                texts: &[String],
+            ) -> elephant_embeddings::EmbeddingResult<Vec<EmbeddingVector>> {
+                self.seen
+                    .lock()
+                    .expect("fixture recorder")
+                    .extend_from_slice(texts);
+                FakeEmbeddingProvider::new("test-model", 3072)
+                    .embed(texts)
+                    .await
+            }
+        }
+        let ctx = setup_test_context().await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = EmbedWorker::new(
+            DocNodeRepository::new(ctx.client.clone()),
+            DocRevisionRepository::new(ctx.client.clone()),
+            NodeEmbeddingRepository::new(
+                ctx.client.clone(),
+                elephant_embeddings::PartitionManager::new(),
+            ),
+            RecordingProvider { seen: seen.clone() },
+        );
+        let repository = DocNodeRepository::new(ctx.client.clone());
+        let mut ids = Vec::new();
+        for (index, role) in [NodeRole::Paragraph, NodeRole::Chunk, NodeRole::Summary]
+            .into_iter()
+            .enumerate()
+        {
+            let mut node =
+                create_test_node(&ctx.revision_id, i32::try_from(index).expect("small index"));
+            node.role = role;
+            node.span = TextSpan::new(0, 30);
+            node.text = Some(if role == NodeRole::Summary {
+                "Captured summary.".into()
+            } else {
+                "Untrusted mutable copy.".into()
+            });
+            ids.push(node.base.id.clone());
+            repository.create(node).await.expect("node");
+        }
+        let result = worker
+            .embed_exact_nodes("test_space", &ids)
+            .await
+            .expect("exact batch");
+        assert_eq!(result.chunks_processed, 3);
+        let observed = seen.lock().expect("recorded").clone();
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|text| text.as_str() == "Test chunk text at position 0.")
+                .count(),
+            2
+        );
+        assert!(observed.iter().any(|text| text == "Captured summary."));
+        assert!(!observed
+            .iter()
+            .any(|text| text == "Untrusted mutable copy."));
+        let mut missing = create_test_node(&ctx.revision_id, 3);
+        missing.role = NodeRole::Summary;
+        missing.span = TextSpan::new(0, 30);
+        missing.text = None;
+        let missing_id = missing.base.id.clone();
+        repository
+            .create(missing)
+            .await
+            .expect("missing summary node");
+        assert!(worker
+            .embed_exact_nodes("test_space", &[missing_id])
+            .await
+            .is_err());
+        assert_eq!(
+            seen.lock().expect("recorded").len(),
+            3,
+            "missing summary cannot dispatch a substituted span"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::cloned_ref_to_slice_refs,
+        reason = "Retain the original owned request slice and exact returned identity assertion in this embedding regression."
+    )]
+    async fn exact_source_embedding_reports_full_requested_set() {
+        let ctx = setup_test_context().await;
+        let mut node = create_test_node(&ctx.revision_id, 0);
+        node.span = TextSpan::new(0, 29);
+        node.text = None;
+        let id = node.base.id.clone();
+        DocNodeRepository::new(ctx.client.clone())
+            .create(node)
+            .await
+            .expect("node");
+        let result = ctx
+            .worker
+            .embed_exact_nodes("test_space", &[id.clone()])
+            .await
+            .expect("exact embedding");
+        assert_eq!(result.chunk_ids, vec![id]);
+        assert_eq!(result.chunks_processed, 1);
+    }
 }
+
+#[cfg(test)]
+#[path = "embed_ownership_tests.rs"]
+mod ownership_tests;

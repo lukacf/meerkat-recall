@@ -175,6 +175,29 @@ impl StagedCommit {
             .map_err(PipelineError::StorageError)?
             .ok_or_else(|| PipelineError::NotFound(artifact_id.to_string()))?;
 
+        if matches!(
+            artifact.artifact_type.as_str(),
+            KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE
+                | RESOLUTION_PATCH_ARTIFACT_TYPE
+                | crate::scheduler::extraction_work_kinds::LEGACY_ASSERTION_BATCH_ARTIFACT_TYPE
+        ) || (artifact.artifact_type == COMMIT_BUNDLE_ARTIFACT_TYPE
+            && !serde_json::from_value::<CommitBundleArtifactData>(artifact.data.clone())
+                .is_ok_and(|bundle| {
+                    matches!(
+                        (&bundle.bundle_kind, &bundle.payload),
+                        (
+                            CommitBundleKind::SourceMetadata,
+                            CommitBundlePayload::SourceMetadata(_)
+                        )
+                    )
+                }))
+        {
+            return Err(PipelineError::InvalidState(
+                "Canonical artifacts require atomic source finalization or maintenance commit"
+                    .into(),
+            ));
+        }
+
         if artifact.status == ArtifactStatus::Committed {
             return Ok(artifact);
         }
@@ -456,7 +479,10 @@ pub mod validate_artifacts {
         errors
     }
 
-    fn validate_knowledge_candidates_payload(artifact: &WorkArtifact) -> Vec<String> {
+    fn validate_knowledge_candidates_payload(
+        artifact: &WorkArtifact,
+        require_support: bool,
+    ) -> Vec<String> {
         let mut errors = Vec::new();
         let payload = match serde_json::from_value::<ExtractionArtifactData>(artifact.data.clone())
         {
@@ -484,6 +510,28 @@ pub mod validate_artifacts {
             ));
         }
 
+        if let Some(window) = artifact.data.get("_source_window") {
+            let bounds = window
+                .as_array()
+                .filter(|values| values.len() == 2)
+                .and_then(|values| Some((values[0].as_u64()?, values[1].as_u64()?)));
+            match bounds {
+                Some((start, end))
+                    if start < end && end <= u64::from(payload.revision_text_len) =>
+                {
+                    if payload.assertions.iter().any(|assertion| {
+                        u64::from(assertion.evidence_start) < start
+                            || u64::from(assertion.evidence_end) > end
+                    }) {
+                        errors.push(
+                            "Assertion evidence leaves the original extraction window".into(),
+                        );
+                    }
+                }
+                _ => errors.push("Original source extraction window is invalid".into()),
+            }
+        }
+
         for (idx, assertion) in payload.assertions.iter().enumerate() {
             if assertion.subject_text.trim().is_empty() {
                 errors.push(format!("Assertion {idx} subject_text cannot be empty"));
@@ -491,11 +539,26 @@ pub mod validate_artifacts {
             if assertion.predicate_text.trim().is_empty() {
                 errors.push(format!("Assertion {idx} predicate_text cannot be empty"));
             }
-            if assertion.evidence_end < assertion.evidence_start {
+            if assertion.evidence_end <= assertion.evidence_start
+                || assertion.evidence_end > payload.revision_text_len
+            {
                 errors.push(format!(
                     "Assertion {idx} has invalid evidence span {}..{}",
                     assertion.evidence_start, assertion.evidence_end
                 ));
+            }
+            if !assertion.confidence.is_finite() || !(0.0..=1.0).contains(&assertion.confidence) {
+                errors.push(format!("Assertion {idx} has invalid confidence"));
+            }
+            if !assertion
+                .quote_hash
+                .as_deref()
+                .is_some_and(crate::extraction::AssertionValidator::is_quote_hash)
+            {
+                errors.push(format!("Assertion {idx} lacks a SHA-256 source quote hash"));
+            }
+            if require_support && assertion.support_verification.is_none() {
+                errors.push(format!("Assertion {idx} is an unsupported interpretation"));
             }
             if assertion
                 .event_lineage_key
@@ -514,10 +577,67 @@ pub mod validate_artifacts {
         space_id: &str,
         artifact: &WorkArtifact,
     ) -> Result<Vec<String>, PipelineError> {
+        validation_errors_with_support(staged_commit, space_id, artifact, true).await
+    }
+
+    async fn validation_errors_with_support(
+        staged_commit: &StagedCommit,
+        space_id: &str,
+        artifact: &WorkArtifact,
+        require_support: bool,
+    ) -> Result<Vec<String>, PipelineError> {
         let errors = match artifact.artifact_type.as_str() {
             SOURCE_METADATA_ARTIFACT_TYPE => validate_source_metadata_payload(artifact),
             KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE | LEGACY_ASSERTION_BATCH_ARTIFACT_TYPE => {
-                validate_knowledge_candidates_payload(artifact)
+                let mut errors = validate_knowledge_candidates_payload(artifact, require_support);
+                if errors.is_empty() {
+                    let payload: ExtractionArtifactData =
+                        serde_json::from_value(artifact.data.clone())
+                            .map_err(|error| PipelineError::ValidationError(error.to_string()))?;
+                    let revision = RecordId::from_str(&payload.revision_id)
+                        .map_err(|error| PipelineError::ValidationError(error.to_string()))?;
+                    let node = RecordId::from_str(&payload.node_id)
+                        .map_err(|error| PipelineError::ValidationError(error.to_string()))?;
+                    match super::super::grounding::load_grounding_lineage(
+                        &staged_commit.storage,
+                        space_id,
+                        &revision,
+                        &node,
+                    )
+                    .await
+                    {
+                        Ok(lineage) => {
+                            if usize::try_from(payload.revision_text_len).ok()
+                                != Some(lineage.revision.text.len())
+                                || payload.source_id.as_deref()
+                                    != Some(lineage.source.base.id.to_string().as_str())
+                                || !super::super::grounding::same_authorization_partition(
+                                    &artifact.base,
+                                    &lineage.source.base,
+                                )
+                            {
+                                errors.push(
+                                    "Artifact source or authorization lineage changed".into(),
+                                );
+                            }
+                            let assertions = payload
+                                .assertions
+                                .iter()
+                                .map(|assertion| assertion.to_raw(&revision, &node))
+                                .collect::<Result<Vec<_>, _>>();
+                            match assertions.and_then(|assertions| {
+                                lineage
+                                    .validate_assertions_with_support(&assertions, require_support)
+                            }) {
+                                Ok(()) => {}
+                                Err(error) => errors.push(error.to_string()),
+                            }
+                        }
+                        Err(PipelineError::ValidationError(error)) => errors.push(error),
+                        Err(error) => return Err(error),
+                    }
+                }
+                errors
             }
             RESOLUTION_PATCH_ARTIFACT_TYPE => {
                 let patch = serde_json::from_value::<ResolutionPatch>(artifact.data.clone())
@@ -538,6 +658,42 @@ pub mod validate_artifacts {
         };
 
         Ok(errors)
+    }
+
+    /// A repair may reconsider a structurally valid proposal lacking semantic
+    /// support. This never validates it for publication or manufactures support.
+    pub(crate) async fn unsupported_proposal_indices(
+        staged_commit: &StagedCommit,
+        space_id: &str,
+        artifact: &WorkArtifact,
+    ) -> Result<Option<Vec<usize>>, PipelineError> {
+        if artifact.artifact_type != KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE
+            || artifact.status != ArtifactStatus::Rejected
+            || artifact.base.is_deleted()
+            || artifact.base.space_id != space_id
+            || !validation_errors_with_support(staged_commit, space_id, artifact, false)
+                .await?
+                .is_empty()
+        {
+            return Ok(None);
+        }
+        // Compare independently regenerated diagnostics, never classify arbitrary
+        // stored error text. Mutation of a rejected outcome is not repair input.
+        let expected = validation_errors(staged_commit, space_id, artifact).await?;
+        if artifact.validation_errors.as_ref() != Some(&expected) {
+            return Ok(None);
+        }
+        let payload: ExtractionArtifactData = serde_json::from_value(artifact.data.clone())
+            .map_err(|error| PipelineError::ValidationError(error.to_string()))?;
+        let indices: Vec<_> = payload
+            .assertions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, assertion)| {
+                assertion.support_verification.is_none().then_some(index)
+            })
+            .collect();
+        Ok((!indices.is_empty()).then_some(indices))
     }
 
     /// Validates all draft artifacts for a work run.
@@ -566,10 +722,78 @@ pub mod validate_artifacts {
                     })
                     .await?;
                 results.push(validated);
+            } else if artifact.status == ArtifactStatus::Rejected {
+                // A persisted rejection remains an outcome on replay. Omitting it
+                // could turn an interrupted rejected batch into silent success.
+                results.push(artifact);
+            } else if artifact.status == ArtifactStatus::Validated
+                && matches!(
+                    artifact.artifact_type.as_str(),
+                    SOURCE_METADATA_ARTIFACT_TYPE
+                        | KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE
+                        | LEGACY_ASSERTION_BATCH_ARTIFACT_TYPE
+                        | RESOLUTION_PATCH_ARTIFACT_TYPE
+                )
+            {
+                // Validation and bundle staging are separate durable writes.
+                // Resume the original candidate after a crash between them, but
+                // recheck its current evidence and authorization before reuse.
+                if artifact.validated_at.is_none()
+                    || artifact
+                        .validation_errors
+                        .as_ref()
+                        .is_some_and(|errors| !errors.is_empty())
+                    || !validation_errors(staged_commit, space_id, &artifact)
+                        .await?
+                        .is_empty()
+                {
+                    return Err(PipelineError::ValidationError(
+                        "Previously validated artifact no longer passes validation".into(),
+                    ));
+                }
+                results.push(artifact);
+            } else if artifact.artifact_type != super::COMMIT_BUNDLE_ARTIFACT_TYPE {
+                // Preserve unexpected candidate states/types for the source
+                // batch gate; none may silently disappear beside valid siblings.
+                results.push(artifact);
             }
         }
 
         Ok(results)
+    }
+
+    /// Validate a complete source batch before any commit bundle is staged.
+    /// Rejected and missing candidates are terminal validation failures, never
+    /// empty successful extraction. Existing candidate outcomes stay durable.
+    ///
+    /// # Errors
+    /// Returns an error if any source candidate is absent, rejected, unexpected,
+    /// or no longer grounded in its current immutable source lineage.
+    pub async fn execute_source(
+        staged_commit: &StagedCommit,
+        space_id: &str,
+        work_run_id: &RecordId,
+    ) -> Result<Vec<WorkArtifact>, PipelineError> {
+        let artifacts = execute(staged_commit, space_id, work_run_id).await?;
+        if artifacts.is_empty() {
+            return Err(PipelineError::ValidationError(
+                "Source artifact validation produced no candidates".into(),
+            ));
+        }
+        if artifacts.iter().any(|artifact| {
+            artifact.status != ArtifactStatus::Validated
+                || !matches!(
+                    artifact.artifact_type.as_str(),
+                    SOURCE_METADATA_ARTIFACT_TYPE
+                        | KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE
+                        | LEGACY_ASSERTION_BATCH_ARTIFACT_TYPE
+                )
+        }) {
+            return Err(PipelineError::ValidationError(
+                "Source artifact validation rejected a candidate".into(),
+            ));
+        }
+        Ok(artifacts)
     }
 }
 

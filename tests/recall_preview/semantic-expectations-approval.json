@@ -1,0 +1,41 @@
+{
+  "record_version": 1,
+  "reviewer": "qualification (independent D lane)",
+  "reviewed_at": "2026-10-06T21:06:25Z",
+  "status": "expectations-approved-before-execution",
+  "corpus_version": "recall-preview-semantics-v1",
+  "corpus_canonical_sha256": "fa6a84149483d3511fd559ac9a13e89d6c1c041ae97d6f15084b52b7d7f21c1b",
+  "canonicalization": "UTF-8 JSON sorted object keys, ensure_ascii=false, separators=(',',':'), allow_nan=false",
+  "source_revisions": 28,
+  "original_queries": 24,
+  "unsupported_claim_counterexamples": 8,
+  "thresholds": {
+    "evidence_rank_unit": "source-revision first appearance in unchanged wire citation order",
+    "evidence_cutoff": 3,
+    "precision_denominator": 3,
+    "all_required_supporting_passages_in_cutoff": true,
+    "minimum_positive_query_macro_reciprocal_rank": 0.9,
+    "maximum_unsupported_claims": 0,
+    "required_exact_revision_completion": 1.0
+  },
+  "interpretation": [
+    "Every returned evidence quote and UTF-8 span must match the immutable corpus revision.",
+    "A covering span may establish the frozen supporting passage; source identity alone may not.",
+    "Later supporting evidence cannot rescue an earlier irrelevant source occurrence or reorder the response.",
+    "Correctly supported irrelevant search hits are distinct from unsupported answers to no-support questions.",
+    "Independent semantic review must bind actual returned text and evidence to the exact response digest.",
+    "Evidence rank cutoff is distinct from HTTP result limit; neither may be silently reinterpreted."
+  ],
+  "review_changes_before_execution": [
+    "Replaced full-note-only evidence with exact independently reviewed supporting subspans.",
+    "Prevented global later-evidence membership from rescuing an earlier rank.",
+    "Preserved subject and role context for dishwasher part/appointment, incident takeover and Birch certificate scope."
+  ],
+  "execution": "No product, provider or evaluator outcome observed for this corpus before approval.",
+  "limits": [
+    "This approval freezes D expectations; it is not an executed acceptance receipt or consumer agreement.",
+    "Offline evaluator controls and deterministic transport spies cannot qualify real provider semantics.",
+    "No paid/live model probe, benchmark, production action or Cargo validation is authorized by this record.",
+    "Future verdicts require exact source/backend/artifact/configuration/provider provenance and D custody review."
+  ]
+}

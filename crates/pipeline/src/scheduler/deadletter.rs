@@ -9,7 +9,6 @@ use elephant_storage::work_deadletter_repository::WorkDeadletterRepository;
 use elephant_storage::work_item_repository::WorkItemRepository;
 use elephant_storage::work_run_repository::WorkRunRepository;
 use elephant_storage::{Repository, StorageClient};
-use elephant_types::records::base::BaseFields;
 use elephant_types::records::work::{
     RetryPolicy, WorkDeadletter, WorkItem, WorkItemStatus, WorkRun,
 };
@@ -23,6 +22,7 @@ pub struct DeadletterHandler {
     item_repo: WorkItemRepository,
     run_repo: WorkRunRepository,
     deadletter_repo: WorkDeadletterRepository,
+    storage: StorageClient,
 }
 
 impl DeadletterHandler {
@@ -32,7 +32,8 @@ impl DeadletterHandler {
         Self {
             item_repo: WorkItemRepository::new(storage.clone()),
             run_repo: WorkRunRepository::new(storage.clone()),
-            deadletter_repo: WorkDeadletterRepository::new(storage),
+            deadletter_repo: WorkDeadletterRepository::new(storage.clone()),
+            storage,
         }
     }
 
@@ -40,6 +41,32 @@ impl DeadletterHandler {
     #[must_use]
     pub fn should_deadletter(item: &WorkItem, policy: &RetryPolicy) -> bool {
         item.attempts >= policy.max_attempts
+    }
+
+    /// Finishes the original claimed attempt before recording its deadletter.
+    /// Never reloads a successor's token. If recording fails after completion,
+    /// `deadletter` can replay the already-failed outcome without a new lease.
+    ///
+    /// # Errors
+    /// Rejects stale/expired claims and propagates accounting or storage failures.
+    pub async fn deadletter_claim(
+        &self,
+        original: &WorkItem,
+        error: &str,
+    ) -> Result<WorkDeadletter, PipelineError> {
+        let fence = elephant_storage::work_attempt_repository::fence_from_claim(original)?;
+        let queue = super::work_queue::WorkQueue::new(
+            self.storage.clone(),
+            super::work_queue::WorkQueueConfig {
+                worker_id: fence.lease_token,
+                ..Default::default()
+            },
+        );
+        queue
+            .finish_authorized(original, false, Some(error.to_owned()))
+            .await?;
+        self.deadletter(&original.base.space_id, &original.base.id, error)
+            .await
     }
 
     /// Moves a failed work item to the dead letter queue.
@@ -60,6 +87,25 @@ impl DeadletterHandler {
             .map_err(PipelineError::StorageError)?
             .ok_or_else(|| PipelineError::NotFound(item_id.to_string()))?;
 
+        if item.status != WorkItemStatus::Failed {
+            return Err(PipelineError::InvalidState(
+                "Deadletter requires an acknowledged failed attempt; use the original claim to finish Running work".into(),
+            ));
+        }
+        // Stable per-failed-outcome identity makes recovery after a successful
+        // queue acknowledgement idempotent, including after archival.
+        let identity = format!(
+            "{}:{}:{}",
+            item.base.id, item.attempts, item.base.updated_at
+        );
+        let id = RecordId::new(
+            TableName::WorkDeadletter,
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, identity.as_bytes()),
+        );
+        if let Some(existing) = self.deadletter_repo.get(space_id, &id).await? {
+            return Ok(existing);
+        }
+
         // Get all runs for this item
         let runs = self
             .run_repo
@@ -71,12 +117,12 @@ impl DeadletterHandler {
             runs.iter().map(|r| Link::new(r.base.id.clone())).collect();
 
         // Create deadletter entry
+        let mut base = item.base.clone();
+        base.id = id;
+        base.created_at = Utc::now();
+        base.updated_at = base.created_at;
         let deadletter = WorkDeadletter {
-            base: BaseFields::new(
-                RecordId::new_v4(TableName::WorkDeadletter),
-                item.base.space_id.clone(),
-                "deadletter_handler".to_string(),
-            ),
+            base,
             work_item: Link::new(item_id.clone()),
             runs: run_links,
             final_error: error.to_string(),
@@ -88,15 +134,6 @@ impl DeadletterHandler {
         let created = self
             .deadletter_repo
             .create(deadletter)
-            .await
-            .map_err(PipelineError::StorageError)?;
-
-        // Mark item as failed
-        let mut failed = item;
-        failed.status = WorkItemStatus::Failed;
-        failed.last_error = Some(error.to_string());
-        self.item_repo
-            .update(space_id, item_id, failed)
             .await
             .map_err(PipelineError::StorageError)?;
 
@@ -171,20 +208,9 @@ impl DeadletterHandler {
             .map_err(PipelineError::StorageError)?
             .ok_or_else(|| PipelineError::NotFound(entry.work_item.id().to_string()))?;
 
-        // Reset item for retry
-        let mut reset = item;
-        reset.status = WorkItemStatus::Runnable;
-        reset.attempts = 0;
-        reset.last_error = None;
-        reset.leased_by = None;
-        reset.lease_expires_at = None;
-        reset.run_after = None;
-
-        let updated = self
-            .item_repo
-            .update(space_id, entry.work_item.id(), reset)
-            .await
-            .map_err(PipelineError::StorageError)?;
+        // Preserve retry/failure history and the monotonic attempt generation.
+        // The failed pre-state and hot/archive move are checked atomically.
+        let updated = self.item_repo.retry_authorized(&item).await?;
 
         // Delete deadletter entry
         self.deadletter_repo
@@ -201,6 +227,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use elephant_types::records::base::BaseFields;
 
     const TEST_SPACE: &str = "default";
 
@@ -213,7 +240,7 @@ mod tests {
             ),
             kind: "test_kind".to_string(),
             payload: serde_json::json!({}),
-            status: WorkItemStatus::Running,
+            status: WorkItemStatus::Runnable,
             priority: 10,
             idempotency_key: format!("idem-{}", uuid::Uuid::new_v4()),
             attempts,
@@ -232,6 +259,16 @@ mod tests {
 
         let item = make_work_item(TEST_SPACE, 3);
         let created = item_repo.create(item).await.expect("create");
+        let created = item_repo
+            .claim_with_lease(
+                TEST_SPACE,
+                &created.base.id,
+                "original-worker",
+                Utc::now() + chrono::Duration::minutes(5),
+            )
+            .await
+            .expect("claim")
+            .expect("actual original claim");
 
         let policy = RetryPolicy {
             max_attempts: 3,
@@ -241,7 +278,7 @@ mod tests {
         assert!(DeadletterHandler::should_deadletter(&created, &policy));
 
         let deadletter = handler
-            .deadletter(TEST_SPACE, &created.base.id, "Max retries exceeded")
+            .deadletter_claim(&created, "Max retries exceeded")
             .await
             .expect("deadletter");
 
@@ -265,9 +302,19 @@ mod tests {
 
         let item = make_work_item(TEST_SPACE, 3);
         let created = item_repo.create(item).await.expect("create");
+        let created = item_repo
+            .claim_with_lease(
+                TEST_SPACE,
+                &created.base.id,
+                "original-worker",
+                Utc::now() + chrono::Duration::minutes(5),
+            )
+            .await
+            .expect("claim")
+            .expect("actual original claim");
 
         let deadletter = handler
-            .deadletter(TEST_SPACE, &created.base.id, "Error")
+            .deadletter_claim(&created, "Error")
             .await
             .expect("deadletter");
 
@@ -292,9 +339,19 @@ mod tests {
 
         let item = make_work_item(TEST_SPACE, 3);
         let created = item_repo.create(item).await.expect("create");
+        let created = item_repo
+            .claim_with_lease(
+                TEST_SPACE,
+                &created.base.id,
+                "original-worker",
+                Utc::now() + chrono::Duration::minutes(5),
+            )
+            .await
+            .expect("claim")
+            .expect("actual original claim");
 
         let deadletter = handler
-            .deadletter(TEST_SPACE, &created.base.id, "Error")
+            .deadletter_claim(&created, "Error")
             .await
             .expect("deadletter");
 
@@ -304,8 +361,88 @@ mod tests {
             .expect("retry");
 
         assert_eq!(retried.status, WorkItemStatus::Runnable);
-        assert_eq!(retried.attempts, 0);
-        assert!(retried.last_error.is_none());
+        assert_eq!(retried.attempts, created.attempts);
+        assert_eq!(retried.last_error.as_deref(), Some("Error"));
+    }
+
+    #[tokio::test]
+    async fn stale_deadletter_claim_cannot_fail_successor_or_create_a_letter() {
+        for storage in [
+            StorageClient::new_embedded().await.expect("embedded"),
+            StorageClient::new_memory().await.expect("native"),
+        ] {
+            let handler = DeadletterHandler::new(storage.clone());
+            let repo = WorkItemRepository::new(storage.clone());
+            let work = repo
+                .create(make_work_item(TEST_SPACE, 3))
+                .await
+                .expect("create");
+            let original = repo
+                .claim_with_lease(
+                    TEST_SPACE,
+                    &work.base.id,
+                    "same-worker-label",
+                    Utc::now() + chrono::Duration::minutes(5),
+                )
+                .await
+                .expect("claim")
+                .expect("original");
+            assert!(handler
+                .deadletter(TEST_SPACE, &work.base.id, "no original claim supplied")
+                .await
+                .is_err());
+            let fence = elephant_storage::work_attempt_repository::fence_from_claim(&original)
+                .expect("fence");
+            repo.finish_authorized(
+                &original,
+                &fence.lease_token,
+                WorkItemStatus::Failed,
+                Some("original failure".into()),
+            )
+            .await
+            .expect("fail")
+            .expect("acknowledged");
+            let first = handler
+                .deadletter(TEST_SPACE, &work.base.id, "original failure")
+                .await
+                .expect("record");
+            assert_eq!(
+                handler
+                    .deadletter(TEST_SPACE, &work.base.id, "original failure")
+                    .await
+                    .expect("replay")
+                    .base
+                    .id,
+                first.base.id
+            );
+            handler
+                .retry(TEST_SPACE, &first.base.id)
+                .await
+                .expect("retry");
+            let successor = repo
+                .claim_with_lease(
+                    TEST_SPACE,
+                    &work.base.id,
+                    "same-worker-label",
+                    Utc::now() + chrono::Duration::minutes(5),
+                )
+                .await
+                .expect("claim")
+                .expect("successor");
+            assert!(handler
+                .deadletter_claim(&original, "late worker failure")
+                .await
+                .is_err());
+            assert_eq!(
+                repo.get(TEST_SPACE, &work.base.id).await.expect("read"),
+                Some(successor)
+            );
+            assert!(handler
+                .list_unacknowledged(TEST_SPACE, 10)
+                .await
+                .expect("letters")
+                .is_empty());
+        }
     }
 
     #[tokio::test]

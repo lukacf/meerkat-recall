@@ -9,7 +9,74 @@ Source reads return authorized records, including their URI/path fields. A
 Classify sensitive source locations in the record security envelope. See
 [security](/concepts/security).
 
-## Endpoints
+## Versioned source ingestion
+
+For application synchronization, use the named-space source lifecycle. It binds
+an external identity to immutable text revisions, opaque generations and durable
+operation receipts. Source writes require `read:source` and `write:source`; reads
+require `read:source`. Select the space in the path or `X-Space-Id` as applicable.
+See [service setup](/operations/service-setup) for credentials, grants and
+processing approvals.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| PUT | `/v1/spaces/{space}/sources/{external_id}` | Accept a new immutable revision |
+| GET | `/v1/spaces/{space}/sources/{external_id}/head` | Read desired/published revision and current generation |
+| GET | `/v1/spaces/{space}/sources` | Reconcile authorized heads with an opaque cursor |
+| GET | `/v1/operations/{operation_id}` | Poll the original operation; select `X-Space-Id` |
+| POST | `/v1/spaces/{space}/sources/{external_id}:retract` | Withdraw source support using the current generation |
+| POST | `/v1/spaces/{space}/sources/{external_id}:erase` | Physically erase source-derived data under the recovery barrier |
+
+```bash
+curl -fsS -X PUT http://localhost:3000/v1/spaces/research/sources/meeting-42 \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: meeting-42-r1' \
+  -d '{
+    "revision":"r1",
+    "text":"Alice owns the Project Cedar test plan.",
+    "media_type":"text/plain",
+    "source_url":null,
+    "observed_at":"2026-10-13T12:00:00Z",
+    "labels":{},
+    "expected_generation":null
+  }'
+```
+
+Use actual observation times, authorized security/subject metadata and opaque
+revision identifiers. Creation expects a null generation; replacement uses the
+exact current generation. Text is nonempty UTF-8, at most 2,000,000 decoded bytes;
+`media_type` is `text/plain` or `text/markdown`. Percent-encode each path component
+once. Metadata keys prefixed by `_` are reserved. Changing immutable text,
+labels or security metadata requires a new revision.
+
+HTTP 202 is durable acceptance, not completion. Poll `operation_id` from that
+response with `X-Space-Id: research`, then read the current head. Operation states
+are `pending`, `running`, `complete`, `failed_retryable` and `failed_final`.
+Completed historical operations do not guarantee that their revision remains
+current after replacement or withdrawal. A reused revision with different
+immutable payload conflicts. Identical idempotent replay returns the original
+operation; on `conflict_generation`, reconcile the head before replacement.
+
+Retraction and erasure take `{"expected_generation":"generation-from-head"}`.
+They require an explicit operation; an ordinary retry must not undo them.
+Reactivation uses `reactivate:true` on PUT; recreation after erasure uses
+`recreate_after_erasure:true`. Both require the current tombstone generation.
+Physical erasure removes source-derived payload and retains an independent
+payload-free recovery journal; registered backups obey bounded retention.
+
+MCP provides `get_source_head`, `get_source_operation`, `retract_source` and
+`erase_source` using the same selected-space and generation contract. Inspect
+`tools/list` for their exact arguments. The inventory endpoint is bounded
+reconciliation, not a snapshot or lossless change feed. Retain external-to-internal
+identity mappings at admission; erased identifiers cannot be recovered from it.
+
+## Retained source-record endpoints
+
+These older ingestion and record APIs remain available with their own contracts.
+Use the versioned lifecycle above when synchronizing application revisions.
+
+### Endpoints
 
 | Method | Path | Description |
 |---|---|---|

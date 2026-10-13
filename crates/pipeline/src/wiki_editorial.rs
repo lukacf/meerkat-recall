@@ -7,11 +7,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use elephant_knowledge_views::{security_fingerprint, GraphViewCompiler};
+use elephant_knowledge_views::{security_fingerprint, GraphViewCompiler, PreparedGraphView};
+use elephant_storage::canonical_commit::CanonicalRecord;
+use elephant_storage::read_eligibility::{CurrentRead, ReadEligibility};
 use elephant_storage::{
-    AssertionRepository, AttributeRepository, DocNodeRepository, DocRevisionRepository,
-    EntityRepository, EventRepository, KnowledgeViewDefinitionRepository, KnowledgeViewRepository,
-    PredicateRegistryRepository, RelRepository, Repository, StorageClient, TruthSlotRepository,
+    AssertionRepository, AttributeRepository, EntityRepository, EventRepository,
+    KnowledgeViewDefinitionRepository, KnowledgeViewRepository, PredicateRegistryRepository,
+    PreparedKnowledgeViewAuthority, RelRepository, Repository, StorageClient, TruthSlotRepository,
     WorkItemRepository,
 };
 use elephant_types::records::base::{
@@ -30,19 +32,25 @@ use elephant_types::{Link, RecordId, TableName};
 use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-#[cfg(any(feature = "meerkat-extraction", test))]
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::{PipelineError, PipelineResult};
+use crate::maintenance_commit::{
+    request_fingerprint, wiki_inventory_sources, PlanningTruthMaintenanceStorage,
+};
+
+#[path = "wiki_input_revalidation.rs"]
+mod input_revalidation;
+use input_revalidation::WikiInputFence;
 
 /// Stable identity of the LLM article compiler.
 pub const ARTICLE_COMPILER_NAME: &str = "elephant.llm_article";
 /// Contract version of the LLM article compiler.
-pub const ARTICLE_COMPILER_VERSION: u32 = 15;
-const WRITER_PROMPT_VERSION: &str = "wiki-writer-v12";
-const VERIFIER_PROMPT_VERSION: &str = "wiki-verifier-v4";
+pub const ARTICLE_COMPILER_VERSION: u32 = 19;
+const WRITER_PROMPT_VERSION: &str = "wiki-writer-v13";
+const VERIFIER_PROMPT_VERSION: &str = "wiki-verifier-v5";
 const PLANNER_PROMPT_VERSION: &str = "wiki-planner-v12";
 const ORGANIZER_PROMPT_VERSION: &str = "wiki-organizer-v6";
 const NO_PUBLISHABLE_RELATIONS: &str = "__elephant_wiki_no_publishable_relations__";
@@ -476,6 +484,11 @@ pub struct WikiOrganization {
 /// Injection seam for the writer and verifier model calls.
 #[async_trait]
 pub trait WikiEditorialLlm: Send + Sync {
+    /// Production adapters reject reuse across named spaces.
+    fn validate_space(&self, _space_id: &str) -> PipelineResult<()> {
+        Ok(())
+    }
+
     /// Selects a curated, interlinked article set from a bounded graph inventory.
     async fn plan_wiki(&self, prompt: String) -> PipelineResult<WikiPlan>;
     /// Organizes every selected article into a small reader-facing section map.
@@ -495,6 +508,7 @@ pub trait WikiEditorialLlm: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct MeerkatWikiEditorialLlm {
     config: WikiEditorialConfig,
+    provider_context: Option<crate::provider_dispatch::ProviderDispatchContext>,
 }
 
 #[cfg(feature = "meerkat-extraction")]
@@ -506,14 +520,48 @@ struct WikiModelCallBudget {
 
 #[cfg(feature = "meerkat-extraction")]
 impl MeerkatWikiEditorialLlm {
+    /// Bind every editorial operation to the selected space's current approval.
+    pub async fn with_provider_context(
+        mut self,
+        context: crate::provider_dispatch::ProviderDispatchContext,
+    ) -> PipelineResult<Self> {
+        use elephant_types::provider_binding::ModelOperation;
+        let writer = context
+            .repository
+            .authorize_model_operation(&context.space_id, ModelOperation::WikiWriter, None)
+            .await
+            .map_err(|error| {
+                PipelineError::ConfigError(format!("provider_authorization: {error}"))
+            })?;
+        let verifier = context
+            .repository
+            .authorize_model_operation(&context.space_id, ModelOperation::WikiVerifier, None)
+            .await
+            .map_err(|error| {
+                PipelineError::ConfigError(format!("provider_authorization: {error}"))
+            })?;
+        self.config.writer_model = writer.profile.model;
+        self.config.verifier_model = verifier.profile.model;
+        self.provider_context = Some(context);
+        Ok(self)
+    }
+
     /// Creates a model adapter using Elephant's existing Meerkat runtime.
     #[must_use]
     pub const fn new(config: WikiEditorialConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            provider_context: None,
+        }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep the governed operation, model, prompts, output schema and call budget explicit at the existing provider boundary."
+    )]
     async fn run_structured(
         &self,
+        operation: elephant_types::provider_binding::ModelOperation,
         model: &str,
         system_prompt: &str,
         prompt: String,
@@ -539,6 +587,16 @@ impl MeerkatWikiEditorialLlm {
             .with_max_tokens(u64::from(budget.max_output_tokens).saturating_mul(4))
             .with_max_duration(Duration::from_secs(budget.timeout_secs));
         let mut build = AgentBuildConfig::new(model.to_string());
+        self.provider_context
+            .as_ref()
+            .ok_or_else(|| {
+                PipelineError::ConfigError(
+                    "provider_authorization: wiki requires a space context".into(),
+                )
+            })?
+            .govern_agent_build(operation, &mut build)
+            .await?;
+
         build.system_prompt = meerkat_core::SystemPromptOverride::Set(system_prompt.to_string());
         build.max_tokens = Some(budget.max_output_tokens);
         build.budget_limits = Some(limits);
@@ -606,9 +664,24 @@ fn exact_json_code_fence(text: &str) -> Option<&str> {
 #[cfg(feature = "meerkat-extraction")]
 #[async_trait]
 impl WikiEditorialLlm for MeerkatWikiEditorialLlm {
+    fn validate_space(&self, space_id: &str) -> PipelineResult<()> {
+        if self
+            .provider_context
+            .as_ref()
+            .is_some_and(|context| context.space_id == space_id)
+        {
+            Ok(())
+        } else {
+            Err(PipelineError::ConfigError(
+                "provider_authorization: wiki input space mismatch".into(),
+            ))
+        }
+    }
+
     async fn plan_wiki(&self, prompt: String) -> PipelineResult<WikiPlan> {
         let value = self
             .run_structured(
+                elephant_types::provider_binding::ModelOperation::WikiPlanner,
                 &self.config.writer_model,
                 planner_system_prompt(),
                 prompt,
@@ -632,6 +705,7 @@ impl WikiEditorialLlm for MeerkatWikiEditorialLlm {
     async fn organize_wiki(&self, prompt: String) -> PipelineResult<WikiOrganization> {
         let value = self
             .run_structured(
+                elephant_types::provider_binding::ModelOperation::WikiPlanner,
                 &self.config.writer_model,
                 organizer_system_prompt(),
                 prompt,
@@ -655,6 +729,7 @@ impl WikiEditorialLlm for MeerkatWikiEditorialLlm {
     async fn write_article(&self, prompt: String) -> PipelineResult<EditorialDraft> {
         let value = self
             .run_structured(
+                elephant_types::provider_binding::ModelOperation::WikiWriter,
                 &self.config.writer_model,
                 writer_system_prompt(),
                 prompt,
@@ -674,6 +749,7 @@ impl WikiEditorialLlm for MeerkatWikiEditorialLlm {
     async fn verify_article(&self, prompt: String) -> PipelineResult<EditorialVerification> {
         let value = self
             .run_structured(
+                elephant_types::provider_binding::ModelOperation::WikiVerifier,
                 &self.config.verifier_model,
                 verifier_system_prompt(),
                 prompt,
@@ -985,8 +1061,40 @@ pub struct CompiledWikiArticle {
     pub changed: bool,
 }
 
+/// An article prepared against one original epoch, without publication writes.
+#[derive(Debug)]
+struct PreparedWikiArticle {
+    observed_epoch: String,
+    view: KnowledgeView,
+    revision: KnowledgeViewRevision,
+    changed: bool,
+}
+
+/// Context preparation completes before the editorial future is constructed.
+/// The box transfers owned values without retaining them in the joining future.
+struct WikiArticleInputs {
+    definition: KnowledgeViewDefinition,
+    context: PreparedGraphView,
+    catalog: Vec<EditorialEvidenceItem>,
+    catalog_json: String,
+    source_inputs: Vec<(
+        elephant_types::records::Source,
+        Option<elephant_types::publication::SourceHead>,
+    )>,
+}
+
+/// Owned inputs for synchronous article assembly, outside the preparation poll frame.
+struct WikiArticleAssembly {
+    context: PreparedGraphView,
+    existing: Option<KnowledgeView>,
+    draft: EditorialDraft,
+    dependency_hash: String,
+    security_fingerprint: String,
+    key: String,
+}
+
 /// Bounds for creating a curated wiki from an existing Elephant graph.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WikiCreationConfig {
     /// Maximum article entities the planner may publish. Zero uses exhaustive
     /// automatic coverage of the eligible graph, up to the safety ceiling.
@@ -1114,6 +1222,8 @@ pub struct WikiCreationFailure {
 /// Result of planning and compiling a wiki from an existing graph inventory.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreatedWiki {
+    /// Exact durable canonical receipt for this security partition's definitions.
+    pub definition_commit_id: String,
     /// Auditable proof that curation signals were computed from the complete
     /// security-scoped graph rather than a caller-selected prefix.
     pub receipt: WikiPlanningReceipt,
@@ -1169,6 +1279,17 @@ pub struct WikiPlanningReceipt {
     pub graph_fingerprint: String,
 }
 
+/// One security partition whose complete definition transaction did not finish.
+#[derive(Debug, Clone, Serialize)]
+pub struct WikiPartitionFailure {
+    /// Stable opaque identity of the exact security envelope.
+    pub security_fingerprint: String,
+    /// Original candidate identities offered for this partition.
+    pub entity_ids: Vec<String>,
+    /// Preparation, authority or transaction refusal; no successful partial bundle.
+    pub error: String,
+}
+
 /// Result of one complete automatic reconciliation across every security
 /// envelope represented in an authorized graph.
 #[derive(Debug, Clone, Serialize)]
@@ -1194,6 +1315,38 @@ pub struct ReconciledWiki {
     pub scan_receipts: Vec<WikiPlanningReceipt>,
     /// Security-scoped plans and their full-graph receipts.
     pub wikis: Vec<CreatedWiki>,
+    /// Failed partition transactions alongside independently committed partitions.
+    pub partition_failures: Vec<WikiPartitionFailure>,
+    /// Aggregate withdrawal/successor failures after independently committed plans.
+    pub reconciliation_errors: Vec<String>,
+}
+
+fn wiki_definition_scope(candidates: &[Entity], full_graph: bool) -> PipelineResult<String> {
+    if full_graph {
+        let first = candidates.first().ok_or_else(|| {
+            PipelineError::ValidationError("Wiki partition has no candidate envelope".into())
+        })?;
+        // A queued partition retains one operation identity when membership
+        // changes. The changed inventory belongs in the input fingerprint, so
+        // it cannot silently become a second successful decision for that work.
+        request_fingerprint(&("full_graph_partition", &first.base.security))
+    } else {
+        let mut ids = candidates
+            .iter()
+            .map(|entity| entity.base.id.to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        request_fingerprint(&("explicit_candidate_subset", ids))
+    }
+}
+
+/// Durable successor work from the same transaction as every planned definition.
+#[derive(Clone, Deserialize, Serialize)]
+struct RecordedWikiPlan {
+    plan: WikiPlan,
+    organization: WikiOrganization,
+    resolved_config: WikiCreationConfig,
+    compilation_jobs: Vec<(usize, String, RecordId)>,
 }
 
 /// Uses an LLM to curate article identity and navigation, then delegates every
@@ -1211,6 +1364,60 @@ pub struct WikiGraphPlanner {
     truth_slots: TruthSlotRepository,
     llm: Arc<dyn WikiEditorialLlm>,
     editorial_config: WikiEditorialConfig,
+    attempt: Option<elephant_types::publication::AttemptFence>,
+    authority: Option<ManagedWikiAuthority>,
+    publication_authority: Option<PreparedKnowledgeViewAuthority>,
+}
+
+// Non-async so the caller retains only the boxed child, not another wrapper
+// future containing the child's entire state. Diagnostics disclose no inputs.
+fn boxed_wiki_phase<F: std::future::Future>(
+    phase: &'static str,
+    future: F,
+) -> std::pin::Pin<Box<F>> {
+    tracing::debug!(
+        phase,
+        future_bytes = std::mem::size_of::<F>(),
+        "Wiki phase future"
+    );
+    Box::pin(future)
+}
+
+/// Report only fixed phase/type labels. Never format an error payload: provider
+/// responses, source text and credential-bearing paths can be nested inside it.
+fn wiki_failure_kind(error: &PipelineError) -> &'static str {
+    match error {
+        PipelineError::StorageError(elephant_storage::StorageError::Conflict(_)) => {
+            "storage_conflict"
+        }
+        PipelineError::StorageError(elephant_storage::StorageError::ErasureInProgress) => {
+            "erasure_in_progress"
+        }
+        PipelineError::StorageError(_) => "storage_error",
+        PipelineError::ConfigError(_) => "configuration_error",
+        PipelineError::ExtractionError(_) => "model_error",
+        PipelineError::ValidationError(_) => "validation_error",
+        PipelineError::SecurityViolation(_) => "security_violation",
+        PipelineError::BudgetExceeded(_)
+        | PipelineError::BudgetBreach { .. }
+        | PipelineError::PerItemCapExceeded { .. } => "budget_exhausted",
+        _ => "pipeline_error",
+    }
+}
+
+fn wiki_phase_result<T, E>(phase: &'static str, result: Result<T, E>) -> PipelineResult<T>
+where
+    PipelineError: From<E>,
+{
+    result.map_err(|error| {
+        let error = PipelineError::from(error);
+        tracing::warn!(
+            phase,
+            error_kind = wiki_failure_kind(&error),
+            "Wiki compilation phase failed"
+        );
+        error
+    })
 }
 
 impl std::fmt::Debug for WikiGraphPlanner {
@@ -1242,7 +1449,66 @@ impl WikiGraphPlanner {
             storage,
             llm,
             editorial_config,
+            attempt: None,
+            authority: None,
+            publication_authority: None,
         }
+    }
+
+    /// Bind queued planning to the dispatcher's original work attempt.
+    #[must_use]
+    pub fn with_attempt(mut self, attempt: elephant_types::publication::AttemptFence) -> Self {
+        self.attempt = Some(attempt);
+        self
+    }
+
+    async fn capture_publication_authority(
+        &self,
+        space_id: &str,
+    ) -> PipelineResult<Option<PreparedKnowledgeViewAuthority>> {
+        if let Some(authority) = &self.publication_authority {
+            Box::pin(authority.verify_current_for_space(space_id)).await?;
+            return Ok(Some(authority.clone()));
+        }
+        if self.attempt.is_none() && self.authority.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(
+            Box::pin(self.views.prepare_managed_publication(
+                space_id,
+                self.attempt.as_ref(),
+                self.authority.as_ref().map(ManagedWikiAuthority::grant_id),
+            ))
+            .await?,
+        ))
+    }
+
+    async fn capture_preparation(
+        &self,
+        space_id: &str,
+    ) -> PipelineResult<PlanningTruthMaintenanceStorage> {
+        let preparation = Box::pin(PlanningTruthMaintenanceStorage::new(
+            self.storage.clone(),
+            space_id,
+            self.attempt.clone(),
+        ))
+        .await?;
+        if let Some(proof) = &self.publication_authority {
+            Box::pin(proof.verify_current_for_space(space_id)).await?;
+            for original in proof.original_grant_rows() {
+                preparation.observe(original)?;
+            }
+        } else if let Some(authority) = &self.authority {
+            for original in Box::pin(
+                WorkItemRepository::new(self.storage.clone())
+                    .capture_managed_wiki_grant(space_id, authority.grant_id()),
+            )
+            .await?
+            {
+                preparation.observe(&original)?;
+            }
+        }
+        Ok(preparation)
     }
 
     /// Curates and compiles a wiki from caller-authorized graph entities.
@@ -1256,113 +1522,243 @@ impl WikiGraphPlanner {
         candidates: Vec<Entity>,
         config: WikiCreationConfig,
     ) -> PipelineResult<CreatedWiki> {
+        // Keep the inventory/provider/publication orchestration future off the
+        // caller's stack, including callers that concurrently prepare wikis.
+        boxed_wiki_phase(
+            "definition.orchestration",
+            self.create_from_entities_with_inventory(space_id, candidates, config, None),
+        )
+        .await
+    }
+
+    async fn create_from_entities_with_inventory(
+        &self,
+        space_id: &str,
+        candidates: Vec<Entity>,
+        config: WikiCreationConfig,
+        original_inventory: Option<(&[Entity], &str)>,
+    ) -> PipelineResult<CreatedWiki> {
+        self.llm.validate_space(space_id)?;
         validate_creation_config(&config)?;
-        let prepared = self.build_planning_inventory(space_id, &candidates).await?;
+        // Capture once, before any inventory/provider read, and retain this exact
+        // authority through planning, context preparation and article publication.
+        let mut planner = self.clone();
+        planner.publication_authority = boxed_wiki_phase(
+            "definition.authority",
+            self.capture_publication_authority(space_id),
+        )
+        .await?;
+        let preparation =
+            boxed_wiki_phase("definition.capture", planner.capture_preparation(space_id)).await?;
+        if let Some((original_entities, _)) = original_inventory {
+            // Re-read complete membership after this partition's original epoch.
+            // Other security partitions are predicate guards only, never support.
+            let current = Box::pin(load_full_graph_entities(&self.storage, space_id)).await?;
+            let rows = |entities: &[Entity]| {
+                entities
+                    .iter()
+                    .map(|entity| (entity.base.id.clone(), entity.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            if rows(original_entities) != rows(&current) {
+                return Err(PipelineError::ValidationError(
+                    "Full-graph wiki inventory changed before partition preparation; reprepare"
+                        .into(),
+                ));
+            }
+        }
+        let prepared = boxed_wiki_phase(
+            "definition.inventory",
+            self.build_planning_inventory(space_id, &candidates),
+        )
+        .await?;
+        if original_inventory
+            .is_some_and(|(_, fingerprint)| fingerprint != prepared.receipt.graph_fingerprint)
+        {
+            return Err(PipelineError::ValidationError(
+                "Full-graph wiki curation inputs changed before partition preparation; reprepare"
+                    .into(),
+            ));
+        }
         if prepared.entities.is_empty() {
             return Err(PipelineError::ValidationError(
                 "Wiki planning requires at least one authorized semantic entity".to_string(),
             ));
         }
-        let (plan, organization, resolved_config) = self
-            .plan_complete_inventory(&prepared.entities, &config)
+        for contributor in &prepared.dependencies {
+            preparation.observe(contributor)?;
+        }
+        let mut candidate_ids = candidates
+            .iter()
+            .map(|entity| entity.base.id.to_string())
+            .collect::<Vec<_>>();
+        candidate_ids.sort();
+        let scope = wiki_definition_scope(&candidates, original_inventory.is_some())?;
+        let input = json!({
+            "candidates": candidate_ids,
+            "config": config,
+            "graph": prepared.receipt.graph_fingerprint,
+            "writer": self.llm.writer_model(),
+            "verifier": self.llm.verifier_model(),
+            "planner_prompt": PLANNER_PROMPT_VERSION,
+            "organizer_prompt": ORGANIZER_PROMPT_VERSION,
+        });
+        let definition_commit_id = preparation.commit_identity("wiki_definition_plan", &scope)?;
+        let recorded = if let Some(recorded) = boxed_wiki_phase(
+            "definition.replay",
+            preparation.replay::<RecordedWikiPlan>("wiki_definition_plan", &scope, &input),
+        )
+        .await?
+        {
+            recorded
+        } else {
+            let (plan, organization, resolved_config) = boxed_wiki_phase(
+                "definition.plan",
+                planner.plan_complete_inventory(&prepared.entities, &config),
+            )
             .await?;
-        let navigation = organization_navigation(&organization, &plan)?;
+            let navigation = organization_navigation(&organization, &plan)?;
+            let commit_id = preparation.commit_identity("wiki_definition_plan", &scope)?;
 
-        let entities = candidates
-            .into_iter()
-            .map(|entity| (entity.base.id.to_string(), entity))
-            .collect::<BTreeMap<_, _>>();
-        let compiler = WikiEditorialCompiler::new(
+            let entities = candidates
+                .into_iter()
+                .map(|entity| (entity.base.id.to_string(), entity))
+                .collect::<BTreeMap<_, _>>();
+            let mut compilation_jobs = Vec::new();
+            for (index, planned) in plan.articles.iter().enumerate() {
+                let Some(entity) = entities.get(&planned.entity_id) else {
+                    return Err(PipelineError::ValidationError(format!(
+                        "Planner selected unknown entity {}",
+                        planned.entity_id
+                    )));
+                };
+                let mut definition = planned_definition(
+                    space_id,
+                    entity,
+                    &entities,
+                    planned,
+                    PlannedDefinitionPresentation {
+                        relation_types: publishable_relation_types(planned, &prepared.entities),
+                        navigation: navigation.get(&planned.entity_id).cloned(),
+                    },
+                    &resolved_config,
+                    self.llm.writer_model(),
+                )?;
+                if let Some(scope) = &prepared.subject_scope {
+                    elephant_storage::public_mutation::inherit_public_envelope(
+                        &mut definition.base,
+                        scope,
+                    )?;
+                }
+                definition.base.provenance.sources = wiki_inventory_sources(&prepared.dependencies);
+                let definition_id = definition.base.id.clone();
+                let existing = self
+                    .definitions
+                    .get_including_deleted(space_id, &definition_id)
+                    .await?;
+                let definition_changed = existing.as_ref().is_none_or(|existing| {
+                    existing.title != definition.title
+                        || existing.publication_status != definition.publication_status
+                        || existing.related_articles != definition.related_articles
+                        || existing.navigation != definition.navigation
+                        || existing.selector != definition.selector
+                        || existing.base.security != definition.base.security
+                        || existing.base.subjects != definition.base.subjects
+                        || existing.base.subjects_state != definition.base.subjects_state
+                        || existing.base.provenance.extractor
+                            != definition.base.provenance.extractor
+                        || existing.base.provenance.prompt_id
+                            != definition.base.provenance.prompt_id
+                        || existing.base.provenance.config_id
+                            != definition.base.provenance.config_id
+                        || existing.base.provenance.sources != definition.base.provenance.sources
+                });
+                if let Some(existing) = &existing {
+                    definition.base.id = existing.base.id.clone();
+                    definition
+                        .base
+                        .created_by
+                        .clone_from(&existing.base.created_by);
+                    definition.base.created_at = existing.base.created_at;
+                    if definition_changed {
+                        definition.base.updated_at = Utc::now();
+                    } else {
+                        definition.base.updated_at = existing.base.updated_at;
+                    }
+                }
+                elephant_storage::canonical_definition::bind_definition_decision(
+                    &mut definition,
+                    &commit_id,
+                )?;
+                preparation.stage_wiki_definition(existing, definition, &prepared.dependencies)?;
+                compilation_jobs.push((index, planned.entity_id.clone(), definition_id));
+            }
+            let recorded = RecordedWikiPlan {
+                plan,
+                organization,
+                resolved_config,
+                compilation_jobs,
+            };
+            boxed_wiki_phase(
+                "definition.audit",
+                preparation.audit_pending_effects("wiki definition inventory plan"),
+            )
+            .await?;
+            boxed_wiki_phase(
+                "definition.commit",
+                preparation.commit("wiki_definition_plan", &scope, &input, &recorded),
+            )
+            .await?;
+            recorded
+        };
+        let RecordedWikiPlan {
+            plan,
+            organization,
+            resolved_config,
+            compilation_jobs,
+        } = recorded;
+        let mut compiler = WikiEditorialCompiler::new(
             self.storage.clone(),
             Arc::clone(&self.llm),
             self.editorial_config.clone(),
         );
-        let mut compilation_jobs = Vec::new();
-        for (index, planned) in plan.articles.iter().enumerate() {
-            let Some(entity) = entities.get(&planned.entity_id) else {
-                return Err(PipelineError::ValidationError(format!(
-                    "Planner selected unknown entity {}",
-                    planned.entity_id
-                )));
-            };
-            let mut definition = planned_definition(
-                space_id,
-                entity,
-                &entities,
-                planned,
-                PlannedDefinitionPresentation {
-                    relation_types: publishable_relation_types(planned, &prepared.entities),
-                    navigation: navigation.get(&planned.entity_id).cloned(),
-                },
-                &resolved_config,
-                self.llm.writer_model(),
-            )?;
-            if let Some(scope) = &prepared.subject_scope {
-                merge_subject_scope(&mut definition.base, scope);
-            }
-            let definition_id = definition.base.id.clone();
-            let existing = self.definitions.get(space_id, &definition_id).await?;
-            let definition_changed = existing.as_ref().is_none_or(|existing| {
-                existing.title != definition.title
-                    || existing.publication_status != definition.publication_status
-                    || existing.related_articles != definition.related_articles
-                    || existing.navigation != definition.navigation
-                    || existing.selector != definition.selector
-                    || existing.base.security != definition.base.security
-                    || existing.base.subjects != definition.base.subjects
-                    || existing.base.subjects_state != definition.base.subjects_state
-                    || existing.base.provenance.extractor != definition.base.provenance.extractor
-                    || existing.base.provenance.prompt_id != definition.base.provenance.prompt_id
-                    || existing.base.provenance.config_id != definition.base.provenance.config_id
-            });
-            if let Some(existing) = existing {
-                definition.base.id = existing.base.id;
-                definition.base.created_at = existing.base.created_at;
-                if definition_changed {
-                    definition.base.updated_at = Utc::now();
-                } else {
-                    definition.base.updated_at = existing.base.updated_at;
-                }
-            }
-            if definition_changed {
-                self.definitions.upsert(definition).await?;
-                self.views
-                    .mark_dirty_for_dependencies(
-                        space_id,
-                        &[definition_id.to_string()],
-                        "wiki plan or authorization scope changed",
-                    )
-                    .await?;
-            }
-            compilation_jobs.push((index, planned.entity_id.clone(), definition_id));
+        if let Some(authority) = planner.publication_authority {
+            compiler = compiler.with_publication_authority(authority);
         }
         let publish = resolved_config.publish;
-        let concurrency = wiki_article_concurrency();
-        let mut compiled = stream::iter(compilation_jobs.into_iter().map(
-            |(index, entity_id, definition_id)| {
-                let compiler = compiler.clone();
-                async move {
-                    let result = compiler.compile(space_id, &definition_id, publish).await;
-                    (index, entity_id, result)
-                }
-            },
-        ))
-        .buffer_unordered(concurrency)
-        .collect::<Vec<_>>()
+        // All siblings read and run providers under one epoch. None publishes
+        // until every parallel preparation has completed.
+        let article_epoch = boxed_wiki_phase(
+            "definition.article_epoch",
+            elephant_storage::canonical_commit::CanonicalRepository::new(self.storage.clone())
+                .epoch(space_id),
+        )
+        .await?;
+        let mut compiled = boxed_wiki_phase(
+            "definition.articles",
+            compiler.prepare_articles_at_epoch(space_id, compilation_jobs, publish, &article_epoch),
+        )
         .await;
         compiled.sort_by_key(|(index, _, _)| *index);
-        let mut articles = Vec::new();
+        let mut prepared_articles = Vec::new();
         let mut failures = Vec::new();
         for (_, entity_id, result) in compiled {
             match result {
-                Ok(article) => articles.push(article),
+                Ok(article) => prepared_articles.push((entity_id, article)),
                 Err(error) => failures.push(WikiCreationFailure {
                     entity_id,
                     error: error.to_string(),
                 }),
             }
         }
+        let (articles, publication_failures) = boxed_wiki_phase(
+            "definition.publish",
+            compiler.publish_prepared_batch(space_id, prepared_articles, &article_epoch),
+        )
+        .await;
+        failures.extend(publication_failures);
         Ok(CreatedWiki {
+            definition_commit_id,
             receipt: prepared.receipt,
             plan,
             organization,
@@ -1439,6 +1835,7 @@ impl WikiGraphPlanner {
         let mut prompt = base_prompt.clone();
         let mut last_error = None;
         for attempt in 1..=WIKI_PLANNING_MAX_ATTEMPTS {
+            verify_wiki_publication_authority(self.publication_authority.as_ref()).await?;
             match self.llm.organize_wiki(prompt.clone()).await {
                 Ok(candidate) => match validate_wiki_taxonomy(&candidate, plan) {
                     Ok(()) => {
@@ -1566,6 +1963,7 @@ impl WikiGraphPlanner {
         let mut prompt = base_prompt.clone();
         let mut last_error = None;
         for attempt in 1..=WIKI_PLANNING_MAX_ATTEMPTS {
+            verify_wiki_publication_authority(self.publication_authority.as_ref()).await?;
             match self.llm.organize_wiki(prompt.clone()).await {
                 Ok(candidate) => {
                     match validate_wiki_assignment(&candidate, &partition, &allowed_section_ids) {
@@ -1622,6 +2020,7 @@ impl WikiGraphPlanner {
         let prompt = render_planner_prompt(&inventory_json, &scoped);
         let mut last_validation_error = None;
         for attempt in 1..=WIKI_PLANNING_MAX_ATTEMPTS {
+            verify_wiki_publication_authority(self.publication_authority.as_ref()).await?;
             let mut plan = match self.llm.plan_wiki(prompt.clone()).await {
                 Ok(plan) => plan,
                 Err(error) => {
@@ -1662,8 +2061,7 @@ impl WikiGraphPlanner {
         candidates: Vec<Entity>,
         config: WikiCreationConfig,
     ) -> PipelineResult<ReconciledWiki> {
-        self.reconcile_full_graph_if_changed(space_id, candidates, config, None)
-            .await
+        Box::pin(self.reconcile_full_graph_if_changed(space_id, candidates, config, None)).await
     }
 
     /// Reconciles the complete graph unless its canonical fingerprint matches
@@ -1676,6 +2074,12 @@ impl WikiGraphPlanner {
         previous_graph_fingerprint: Option<&str>,
     ) -> PipelineResult<ReconciledWiki> {
         validate_creation_config(&config)?;
+        let canonical =
+            elephant_storage::canonical_commit::CanonicalRepository::new(self.storage.clone());
+        let discovery_epoch = canonical.epoch(space_id).await?;
+        let mut planner = self.clone();
+        planner.publication_authority = self.capture_publication_authority(space_id).await?;
+        let original_entities = candidates.clone();
         let mut groups = BTreeMap::<String, Vec<Entity>>::new();
         for entity in candidates {
             if entity.base.space_id != space_id || entity.base.deleted_at.is_some() {
@@ -1701,8 +2105,9 @@ impl WikiGraphPlanner {
         hash_wiki_editorial_contract(&mut fingerprint);
         let mut scan_receipts = Vec::new();
         let mut eligible_by_security = BTreeMap::new();
+        let mut original_fingerprints = BTreeMap::new();
         for (security_key, entities) in &groups {
-            let prepared = self.build_planning_inventory(space_id, entities).await?;
+            let prepared = Box::pin(self.build_planning_inventory(space_id, entities)).await?;
             hash_wiki_curation_input(
                 &mut fingerprint,
                 &[
@@ -1713,6 +2118,10 @@ impl WikiGraphPlanner {
                 ],
             );
             eligible_by_security.insert(security_key.clone(), prepared.receipt.eligible_entities);
+            original_fingerprints.insert(
+                security_key.clone(),
+                prepared.receipt.graph_fingerprint.clone(),
+            );
             scan_receipts.push(prepared.receipt);
         }
         let graph_fingerprint = format!("sha256:{}", hex::encode(fingerprint.finalize()));
@@ -1777,6 +2186,21 @@ impl WikiGraphPlanner {
         if previous_graph_fingerprint == Some(graph_fingerprint.as_str())
             && managed_definitions_current
         {
+            let current = load_full_graph_entities(&self.storage, space_id).await?;
+            let rows = |entities: &[Entity]| {
+                entities
+                    .iter()
+                    .map(|entity| (entity.base.id.clone(), entity.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            if rows(&current) != rows(&original_entities)
+                || canonical.epoch(space_id).await? != discovery_epoch
+            {
+                return Err(PipelineError::ValidationError(
+                    "Full-graph wiki cache discovery changed; reprepare".into(),
+                ));
+            }
+            verify_wiki_publication_authority(planner.publication_authority.as_ref()).await?;
             return Ok(ReconciledWiki {
                 graph_fingerprint,
                 changed: false,
@@ -1788,6 +2212,8 @@ impl WikiGraphPlanner {
                 hidden_articles: 0,
                 scan_receipts,
                 wikis: Vec::new(),
+                partition_failures: Vec::new(),
+                reconciliation_errors: Vec::new(),
             });
         }
         let minimum_planning_partitions = scan_receipts
@@ -1805,6 +2231,7 @@ impl WikiGraphPlanner {
         )?;
         let quotas = allocate_article_quotas(&eligible_by_security, article_budget);
         let mut wikis = Vec::new();
+        let mut partition_failures = Vec::new();
         for (security_key, candidates) in groups {
             let quota = quotas.get(&security_key).copied().unwrap_or_default();
             if quota == 0 {
@@ -1812,10 +2239,31 @@ impl WikiGraphPlanner {
             }
             let mut scoped_config = config.clone();
             scoped_config.max_articles = quota;
-            wikis.push(
-                self.create_from_entities(space_id, candidates, scoped_config)
-                    .await?,
-            );
+            let entity_ids = candidates
+                .iter()
+                .map(|entity| entity.base.id.to_string())
+                .collect();
+            let original_fingerprint =
+                original_fingerprints.get(&security_key).ok_or_else(|| {
+                    PipelineError::InvalidState(
+                        "Wiki partition has no original inventory receipt".into(),
+                    )
+                })?;
+            match Box::pin(planner.create_from_entities_with_inventory(
+                space_id,
+                candidates,
+                scoped_config,
+                Some((&original_entities, original_fingerprint)),
+            ))
+            .await
+            {
+                Ok(wiki) => wikis.push(wiki),
+                Err(error) => partition_failures.push(WikiPartitionFailure {
+                    security_fingerprint: request_fingerprint(&security_key)?,
+                    entity_ids,
+                    error: error.to_string(),
+                }),
+            }
         }
 
         let retained_definition_ids = wikis
@@ -1823,9 +2271,20 @@ impl WikiGraphPlanner {
             .flat_map(|wiki| &wiki.articles)
             .map(|article| article.view.root_record.clone())
             .collect::<BTreeSet<_>>();
-        let hidden_articles = if config.publish {
-            self.reconcile_managed_articles(space_id, &retained_definition_ids)
-                .await?
+        // A failed partition must not withdraw the prior published articles in
+        // that scope. Completed partition receipts remain durable and replayable.
+        let mut reconciliation_errors = Vec::new();
+        let hidden_articles = if config.publish && partition_failures.is_empty() {
+            match planner
+                .reconcile_managed_articles(space_id, &retained_definition_ids)
+                .await
+            {
+                Ok(hidden) => hidden,
+                Err(error) => {
+                    reconciliation_errors.push(error.to_string());
+                    0
+                }
+            }
         } else {
             0
         };
@@ -1840,6 +2299,8 @@ impl WikiGraphPlanner {
             hidden_articles,
             scan_receipts,
             wikis,
+            partition_failures,
+            reconciliation_errors,
         })
     }
 
@@ -1851,40 +2312,76 @@ impl WikiGraphPlanner {
         space_id: &str,
         retained_definition_ids: &BTreeSet<String>,
     ) -> PipelineResult<usize> {
-        let mut cursor = None;
-        let mut hidden = 0_usize;
-        loop {
-            let page = self
-                .definitions
-                .list_page(space_id, 250, cursor.as_ref())
-                .await?;
-            if page.is_empty() {
-                break;
-            }
-            cursor = page.last().map(|definition| definition.base.id.clone());
-            let last_page = page.len() < 250;
-            for mut definition in page.into_iter().filter(|definition| {
-                definition.base.created_by == "elephant.wiki_planner"
-                    && !retained_definition_ids.contains(&definition.base.id.to_string())
-            }) {
-                if definition.publication_status != KnowledgeViewPublicationStatus::Hidden {
-                    definition.publication_status = KnowledgeViewPublicationStatus::Hidden;
-                    definition.base.updated_at = Utc::now();
-                    self.definitions.upsert(definition.clone()).await?;
+        let publication_authority = self.capture_publication_authority(space_id).await?;
+        let mut planner = self.clone();
+        planner.publication_authority = publication_authority.clone();
+        let preparation = planner.capture_preparation(space_id).await?;
+        let input = json!({ "retained_definition_ids": retained_definition_ids });
+        let withdrawn_definitions = if let Some(ids) = preparation
+            .replay::<Vec<KnowledgeViewDefinition>>("wiki_definition_withdrawal", "managed", &input)
+            .await?
+        {
+            ids
+        } else {
+            let mut cursor = None;
+            let mut withdrawn_definitions = Vec::new();
+            loop {
+                let page = self
+                    .definitions
+                    .list_page(space_id, 250, cursor.as_ref())
+                    .await?;
+                if page.is_empty() {
+                    break;
                 }
-                hidden = hidden.saturating_add(
+                cursor = page.last().map(|definition| definition.base.id.clone());
+                let last_page = page.len() < 250;
+                for before in page.into_iter().filter(|definition| {
+                    definition.base.created_by == "elephant.wiki_planner"
+                        && !retained_definition_ids.contains(&definition.base.id.to_string())
+                }) {
+                    if before.publication_status != KnowledgeViewPublicationStatus::Hidden {
+                        let mut after = before.clone();
+                        after.publication_status = KnowledgeViewPublicationStatus::Hidden;
+                        after.base.updated_at = Utc::now();
+                        // A's transaction accepts only this exact visibility reduction;
+                        // it grants no replacement proof for the withdrawn content.
+                        withdrawn_definitions.push(preparation.stage(Some(before), after)?);
+                    } else {
+                        preparation.observe(&before)?;
+                        withdrawn_definitions.push(before);
+                    }
+                }
+                if last_page {
+                    break;
+                }
+            }
+            preparation
+                .audit_pending_effects("withdraw obsolete managed wiki definitions")
+                .await?;
+            preparation
+                .commit(
+                    "wiki_definition_withdrawal",
+                    "managed",
+                    &input,
+                    &withdrawn_definitions,
+                )
+                .await?;
+            withdrawn_definitions
+        };
+        let mut hidden = 0_usize;
+        for original in withdrawn_definitions {
+            // The owner checks this receipt's exact after-image in the same
+            // transaction as the idempotent visibility update. Never adopt a
+            // newer root snapshot while delivering an older successor.
+            let changed = match &publication_authority {
+                Some(authority) => {
                     self.views
-                        .set_publication_status_for_root_record(
-                            space_id,
-                            &definition.base.id.to_string(),
-                            KnowledgeViewPublicationStatus::Hidden,
-                        )
-                        .await?,
-                );
-            }
-            if last_page {
-                break;
-            }
+                        .hide_for_withdrawn_definition_with_authority(&original, authority)
+                        .await?
+                }
+                None => self.views.hide_for_withdrawn_definition(&original).await?,
+            };
+            hidden = hidden.saturating_add(changed);
         }
         Ok(hidden)
     }
@@ -1909,6 +2406,18 @@ impl WikiGraphPlanner {
                     .to_string(),
             ));
         }
+        let reader = ReadEligibility::new(self.storage.clone());
+        let mut dependencies = BTreeMap::new();
+        for candidate in candidates {
+            let stored = EntityRepository::new(self.storage.clone())
+                .get(space_id, &candidate.base.id)
+                .await?;
+            if stored.as_ref() != Some(candidate) {
+                return Err(PipelineError::ValidationError(
+                    "Wiki planning candidate differs from its exact current stored row".into(),
+                ));
+            }
+        }
         let (possible_person_duplicates, possible_person_duplicate_groups) =
             possible_person_duplicate_records(candidates);
         let by_id = candidates
@@ -1918,14 +2427,23 @@ impl WikiGraphPlanner {
         let mut subject_scope = first.base.clone();
         subject_scope.subjects.clear();
         subject_scope.subjects_state = SubjectsState::Complete;
+        subject_scope.provenance.sources.clear();
         for entity in candidates {
-            merge_record_subject_scope(&mut subject_scope, entity);
+            Box::pin(capture_inventory_dependency(
+                &self.storage,
+                &reader,
+                &mut subject_scope,
+                &mut dependencies,
+                CanonicalRecord::Entity(Box::new(entity.clone())),
+            ))
+            .await?;
         }
         let mut connections = BTreeMap::<RecordId, Vec<WikiPlanningConnection>>::new();
         let mut graph_degree = BTreeMap::<RecordId, usize>::new();
         let mut predicate_publishability = BTreeMap::<String, bool>::new();
+        let mut predicate_records = BTreeMap::new();
         let mut fingerprint = Sha256::new();
-        for entity in candidates {
+        for entity in by_id.values() {
             hash_wiki_curation_input(
                 &mut fingerprint,
                 &[serde_json::to_string(entity).map_err(|error| {
@@ -1981,6 +2499,9 @@ impl WikiGraphPlanner {
                             );
                         }
                         let publishable = registry.as_ref().is_some_and(predicate_is_publishable);
+                        if let Some(registry) = registry {
+                            predicate_records.insert(registry.predicate_id.clone(), registry);
+                        }
                         predicate_publishability.insert(relation.rel_type.clone(), publishable);
                         publishable
                     };
@@ -1989,13 +2510,30 @@ impl WikiGraphPlanner {
                         relationships_withheld_by_predicate_governance.saturating_add(1);
                     continue;
                 }
-                merge_record_subject_scope(&mut subject_scope, &relation);
                 let Some(subject) = by_id.get(relation.subject.id()) else {
                     continue;
                 };
                 let Some(object) = by_id.get(relation.object.id()) else {
                     continue;
                 };
+                Box::pin(capture_inventory_dependency(
+                    &self.storage,
+                    &reader,
+                    &mut subject_scope,
+                    &mut dependencies,
+                    CanonicalRecord::Rel(Box::new(relation.clone())),
+                ))
+                .await?;
+                if let Some(registry) = predicate_records.get(&relation.rel_type) {
+                    Box::pin(capture_inventory_dependency(
+                        &self.storage,
+                        &reader,
+                        &mut subject_scope,
+                        &mut dependencies,
+                        CanonicalRecord::PredicateRegistry(Box::new(registry.clone())),
+                    ))
+                    .await?;
+                }
                 let subject_degree = graph_degree.entry(subject.base.id.clone()).or_default();
                 *subject_degree = subject_degree.saturating_add(1);
                 let object_degree = graph_degree.entry(object.base.id.clone()).or_default();
@@ -2058,7 +2596,22 @@ impl WikiGraphPlanner {
                 {
                     continue;
                 }
-                merge_record_subject_scope(&mut subject_scope, &assertion);
+                if !assertion
+                    .subject_entity
+                    .iter()
+                    .chain(assertion.object_entity.iter())
+                    .any(|entity| by_id.contains_key(entity.id()))
+                {
+                    continue;
+                }
+                Box::pin(capture_inventory_dependency(
+                    &self.storage,
+                    &reader,
+                    &mut subject_scope,
+                    &mut dependencies,
+                    CanonicalRecord::Assertion(Box::new(assertion.clone())),
+                ))
+                .await?;
                 for entity_id in assertion
                     .subject_entity
                     .iter()
@@ -2157,11 +2710,31 @@ impl WikiGraphPlanner {
                             );
                         }
                         let publishable = registry.as_ref().is_some_and(predicate_is_publishable);
+                        if let Some(registry) = registry {
+                            predicate_records.insert(registry.predicate_id.clone(), registry);
+                        }
                         predicate_publishability.insert(attribute.attr_type.clone(), publishable);
                         publishable
                     };
                 if publishable {
-                    merge_record_subject_scope(&mut subject_scope, &attribute);
+                    Box::pin(capture_inventory_dependency(
+                        &self.storage,
+                        &reader,
+                        &mut subject_scope,
+                        &mut dependencies,
+                        CanonicalRecord::Attribute(Box::new(attribute.clone())),
+                    ))
+                    .await?;
+                    if let Some(registry) = predicate_records.get(&attribute.attr_type) {
+                        Box::pin(capture_inventory_dependency(
+                            &self.storage,
+                            &reader,
+                            &mut subject_scope,
+                            &mut dependencies,
+                            CanonicalRecord::PredicateRegistry(Box::new(registry.clone())),
+                        ))
+                        .await?;
+                    }
                     let count = attribute_facts
                         .entry(attribute.subject.id().clone())
                         .or_default();
@@ -2205,7 +2778,22 @@ impl WikiGraphPlanner {
                 {
                     continue;
                 }
-                merge_record_subject_scope(&mut subject_scope, &event);
+                if !event
+                    .base
+                    .subjects
+                    .iter()
+                    .any(|subject| by_id.contains_key(subject.id()))
+                {
+                    continue;
+                }
+                Box::pin(capture_inventory_dependency(
+                    &self.storage,
+                    &reader,
+                    &mut subject_scope,
+                    &mut dependencies,
+                    CanonicalRecord::Event(Box::new(event.clone())),
+                ))
+                .await?;
                 for subject in &event.base.subjects {
                     if by_id.contains_key(subject.id()) {
                         let count = entity_events.entry(subject.id().clone()).or_default();
@@ -2259,9 +2847,16 @@ impl WikiGraphPlanner {
                 {
                     continue;
                 }
-                merge_record_subject_scope(&mut subject_scope, &slot);
                 if let Ok(entity_id) = slot.subject_entity.parse::<RecordId>() {
                     if by_id.contains_key(&entity_id) {
+                        Box::pin(capture_inventory_dependency(
+                            &self.storage,
+                            &reader,
+                            &mut subject_scope,
+                            &mut dependencies,
+                            CanonicalRecord::TruthSlot(Box::new(slot.clone())),
+                        ))
+                        .await?;
                         let count = knowledge_issues.entry(entity_id).or_default();
                         *count = count.saturating_add(1);
                     }
@@ -2362,7 +2957,9 @@ impl WikiGraphPlanner {
         let eligible_entities = inventory.len();
         let planner_candidates = inventory.len();
         let planning_partitions = planning_partitions(&inventory).len();
+        reader.verify_current().await?;
         Ok(PreparedWikiInventory {
+            dependencies: dependencies.into_values().collect(),
             subject_scope: Some(subject_scope),
             entities: inventory,
             receipt: WikiPlanningReceipt {
@@ -2417,19 +3014,51 @@ pub async fn execute_managed_wiki_reconciliation(
     space_id: &str,
     payload: &ManagedWikiPayload,
 ) -> PipelineResult<ReconciledWiki> {
+    execute_managed_wiki_reconciliation_inner(storage, space_id, payload, None).await
+}
+
+/// Executes queued reconciliation using the original dispatcher claim fence.
+#[cfg(feature = "meerkat-extraction")]
+pub async fn execute_managed_wiki_reconciliation_with_attempt(
+    storage: StorageClient,
+    space_id: &str,
+    payload: &ManagedWikiPayload,
+    attempt: elephant_types::publication::AttemptFence,
+) -> PipelineResult<ReconciledWiki> {
+    execute_managed_wiki_reconciliation_inner(storage, space_id, payload, Some(attempt)).await
+}
+
+#[cfg(feature = "meerkat-extraction")]
+async fn execute_managed_wiki_reconciliation_inner(
+    storage: StorageClient,
+    space_id: &str,
+    payload: &ManagedWikiPayload,
+    attempt: Option<elephant_types::publication::AttemptFence>,
+) -> PipelineResult<ReconciledWiki> {
     payload.authority.ensure_active(&storage, space_id).await?;
     if !(5..=10_080).contains(&payload.refresh_interval_minutes) {
         return Err(PipelineError::ValidationError(
             "Managed wiki refresh interval must be 5-10080 minutes".to_string(),
         ));
     }
+    let publication_authority = KnowledgeViewRepository::new(storage.clone())
+        .prepare_managed_publication(
+            space_id,
+            attempt.as_ref(),
+            Some(payload.authority.grant_id()),
+        )
+        .await?;
     let candidates = load_full_graph_entities(&storage, space_id).await?;
     let editorial_config = WikiEditorialConfig {
         writer_model: payload.writer_model.clone(),
         verifier_model: payload.verifier_model.clone(),
         ..WikiEditorialConfig::default()
     };
-    WikiGraphPlanner::with_meerkat(storage, editorial_config)
+    let mut planner = WikiGraphPlanner::with_meerkat(storage, space_id, editorial_config).await?;
+    planner.attempt = attempt;
+    planner.authority = Some(payload.authority.clone());
+    planner.publication_authority = Some(publication_authority);
+    planner
         .reconcile_full_graph_if_changed(
             space_id,
             candidates,
@@ -2617,9 +3246,250 @@ async fn enqueue_managed_wiki_reconciliation_scoped(
 
 #[derive(Debug, Clone, Default)]
 struct PreparedWikiInventory {
+    dependencies: Vec<CanonicalRecord>,
     subject_scope: Option<BaseFields>,
     entities: Vec<WikiPlanningEntity>,
     receipt: WikiPlanningReceipt,
+}
+
+// This is a read set, not a second publication authority. The caller captures
+// the canonical epoch before inventory loading and commits these exact rows
+// with the existing maintenance plan after provider work.
+fn inventory_envelope_covers(scope: &BaseFields, input: &BaseFields) -> bool {
+    let mut envelope = input.clone();
+    envelope.space_id = scope.space_id.clone();
+    envelope.security = scope.security.clone();
+    elephant_knowledge_views::projection_envelope_covers(&envelope, input)
+}
+
+fn inventory_json(record: &impl Serialize) -> PipelineResult<Value> {
+    serde_json::to_value(record).map_err(|error| {
+        PipelineError::ValidationError(format!(
+            "Could not capture exact wiki inventory row: {error}"
+        ))
+    })
+}
+
+fn retain_inventory_record(
+    scope: &mut BaseFields,
+    dependencies: &mut BTreeMap<RecordId, CanonicalRecord>,
+    record: CanonicalRecord,
+) -> PipelineResult<()> {
+    if !inventory_envelope_covers(scope, record.base()) {
+        return Err(PipelineError::ValidationError(
+            "Wiki inventory dependency exceeds its original exact security partition".into(),
+        ));
+    }
+    if let Some(previous) = dependencies.get(&record.base().id) {
+        if inventory_json(previous)? != inventory_json(&record)? {
+            return Err(PipelineError::ValidationError(
+                "Wiki inventory dependency changed during preparation".into(),
+            ));
+        }
+        return Ok(());
+    }
+    retain_inventory_envelope(scope, &record)?;
+    dependencies.insert(record.base().id.clone(), record);
+    Ok(())
+}
+
+fn retain_inventory_envelope(
+    scope: &mut BaseFields,
+    record: &CanonicalRecord,
+) -> PipelineResult<()> {
+    if !inventory_envelope_covers(scope, record.base()) {
+        return Err(PipelineError::ValidationError(
+            "Wiki inventory dependency exceeds its original exact security partition".into(),
+        ));
+    }
+    let input = elephant_storage::canonical_definition::input_envelope(record)?;
+    merge_subject_scope(scope, &input);
+    scope
+        .provenance
+        .sources
+        .extend(record.base().provenance.sources.iter().cloned());
+    if matches!(record, CanonicalRecord::Source(_)) {
+        scope.provenance.sources.push(record.base().id.clone());
+    }
+    scope.provenance.sources.sort();
+    scope.provenance.sources.dedup();
+    Ok(())
+}
+
+async fn require_current_inventory<T: CurrentRead>(
+    reader: &ReadEligibility,
+    scope: &BaseFields,
+    record: &T,
+) -> PipelineResult<()> {
+    let authorize = |base: &BaseFields| inventory_envelope_covers(scope, base);
+    let projected = Box::pin(reader.project(record.clone(), &authorize)).await?;
+    if projected.as_ref().map(inventory_json).transpose()? != Some(inventory_json(record)?) {
+        return Err(PipelineError::ValidationError(
+            "Wiki inventory contributor has missing or changed current support".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn capture_inventory_dependency(
+    storage: &StorageClient,
+    reader: &ReadEligibility,
+    scope: &mut BaseFields,
+    dependencies: &mut BTreeMap<RecordId, CanonicalRecord>,
+    record: CanonicalRecord,
+) -> PipelineResult<()> {
+    let mut spans = Vec::new();
+    let mut source_ids = record.base().provenance.sources.clone();
+    match &record {
+        CanonicalRecord::Entity(row) => {
+            Box::pin(require_current_inventory(reader, scope, row.as_ref())).await?
+        }
+        CanonicalRecord::Assertion(row) => {
+            Box::pin(require_current_inventory(reader, scope, row.as_ref())).await?;
+            spans.push(row.evidence.clone());
+        }
+        CanonicalRecord::Rel(row) => {
+            Box::pin(require_current_inventory(reader, scope, row.as_ref())).await?;
+            spans.extend(row.evidence.iter().map(|evidence| evidence.span.clone()));
+        }
+        CanonicalRecord::Attribute(row) => {
+            Box::pin(require_current_inventory(reader, scope, row.as_ref())).await?;
+            spans.extend(row.evidence.iter().map(|evidence| evidence.span.clone()));
+        }
+        CanonicalRecord::Event(row) => {
+            Box::pin(require_current_inventory(reader, scope, row.as_ref())).await?;
+            source_ids.extend(row.source_refs.iter().map(|link| link.id().clone()));
+            // Event read eligibility validates these assertions, but that does
+            // not place their exact rows or immutable evidence in the later
+            // canonical transaction's read set. Retain both before planning.
+            for reference in &row.assertion_refs {
+                let assertion = elephant_storage::AssertionRepository::new(storage.clone())
+                    .get(&row.base.space_id, reference.id())
+                    .await?
+                    .ok_or_else(|| {
+                        PipelineError::ValidationError(
+                            "Wiki event evidence assertion disappeared".into(),
+                        )
+                    })?;
+                Box::pin(capture_inventory_dependency(
+                    storage,
+                    reader,
+                    scope,
+                    dependencies,
+                    CanonicalRecord::Assertion(Box::new(assertion)),
+                ))
+                .await?;
+            }
+        }
+        CanonicalRecord::TruthSlot(row) => {
+            Box::pin(require_current_inventory(reader, scope, row.as_ref())).await?;
+            spans.extend(
+                row.current_values
+                    .iter()
+                    .flat_map(|value| value.evidence.iter().map(|evidence| evidence.span.clone())),
+            );
+        }
+        CanonicalRecord::PredicateRegistry(row) => {
+            let authorize = |base: &BaseFields| inventory_envelope_covers(scope, base);
+            if !Box::pin(reader.base_support(&row.base, &authorize)).await? {
+                return Err(PipelineError::ValidationError(
+                    "Wiki predicate governance input lacks current authorized support".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(PipelineError::ValidationError(
+                "Unexpected wiki inventory contributor".into(),
+            ))
+        }
+    }
+    for span in spans {
+        let authorize = |base: &BaseFields| inventory_envelope_covers(scope, base);
+        let evidence = Box::pin(reader.evidence(&record.base().space_id, &span, &authorize))
+            .await?
+            .ok_or_else(|| {
+                PipelineError::ValidationError(
+                    "Wiki inventory evidence is no longer current".into(),
+                )
+            })?;
+        retain_inventory_record(
+            scope,
+            dependencies,
+            CanonicalRecord::DocRevision(Box::new(evidence.revision)),
+        )?;
+        retain_inventory_record(
+            scope,
+            dependencies,
+            CanonicalRecord::Doc(Box::new(evidence.doc)),
+        )?;
+        if let Some(node) = evidence.node {
+            // Evidence quotes materialize text from the immutable revision.
+            // The transaction must compare the persisted node, which commonly
+            // stores no text, against its original support fingerprint.
+            let stored = elephant_storage::DocNodeRepository::new(storage.clone())
+                .get(&record.base().space_id, &node.base.id)
+                .await?
+                .ok_or_else(|| {
+                    PipelineError::ValidationError(
+                        "Wiki inventory evidence node disappeared".into(),
+                    )
+                })?;
+            let mut without_adornment = node;
+            without_adornment.text.clone_from(&stored.text);
+            if without_adornment != stored {
+                return Err(PipelineError::ValidationError(
+                    "Wiki inventory evidence node changed during preparation".into(),
+                ));
+            }
+            Box::pin(require_current_inventory(reader, scope, &stored)).await?;
+            retain_inventory_record(
+                scope,
+                dependencies,
+                CanonicalRecord::DocNode(Box::new(stored)),
+            )?;
+        }
+        if let Some(source) = evidence.source {
+            source_ids.push(source.base.id.clone());
+            retain_inventory_record(
+                scope,
+                dependencies,
+                CanonicalRecord::Source(Box::new(source)),
+            )?;
+        }
+    }
+    let mut pending_sources: BTreeSet<_> = source_ids.into_iter().collect();
+    let mut observed_sources = BTreeSet::new();
+    while let Some(source_id) = pending_sources.pop_first() {
+        if !observed_sources.insert(source_id.clone()) {
+            continue;
+        }
+        let source = elephant_storage::SourceRepository::new(storage.clone())
+            .get(&record.base().space_id, &source_id)
+            .await?
+            .ok_or_else(|| {
+                PipelineError::ValidationError("Wiki inventory source disappeared".into())
+            })?;
+        let authorize = |base: &BaseFields| inventory_envelope_covers(scope, base);
+        let published = Box::pin(reader.project(source.clone(), &authorize))
+            .await?
+            .ok_or_else(|| {
+                PipelineError::ValidationError(
+                    "Wiki inventory source is not currently eligible".into(),
+                )
+            })?;
+        // The live Source is desired-input/control state and remains the exact
+        // CAS dependency. Its published immutable projection can legitimately
+        // differ while a successor is pending; both envelopes constrain output.
+        pending_sources.extend(source.base.provenance.sources.iter().cloned());
+        pending_sources.extend(published.base.provenance.sources.iter().cloned());
+        retain_inventory_envelope(scope, &CanonicalRecord::Source(Box::new(published)))?;
+        retain_inventory_record(
+            scope,
+            dependencies,
+            CanonicalRecord::Source(Box::new(source)),
+        )?;
+    }
+    retain_inventory_record(scope, dependencies, record)
 }
 
 fn hash_wiki_curation_input(hasher: &mut Sha256, fields: &[String]) {
@@ -3387,21 +4257,42 @@ fn organization_navigation(
 impl WikiGraphPlanner {
     /// Creates the production graph-to-wiki workflow using Meerkat model
     /// resolution for planning, writing, and verification.
-    #[must_use]
-    pub fn with_meerkat(storage: StorageClient, config: WikiEditorialConfig) -> Self {
-        let llm = Arc::new(MeerkatWikiEditorialLlm::new(config.clone()));
-        Self::new(storage, llm, config)
+    pub async fn with_meerkat(
+        storage: StorageClient,
+        space_id: &str,
+        config: WikiEditorialConfig,
+    ) -> PipelineResult<Self> {
+        let context = crate::provider_dispatch::ProviderDispatchContext::new(
+            elephant_storage::SpaceConfigRepository::new(storage.clone()),
+            space_id,
+        );
+        let llm = MeerkatWikiEditorialLlm::new(config)
+            .with_provider_context(context)
+            .await?;
+        let config = llm.config.clone();
+        Ok(Self::new(storage, Arc::new(llm), config))
     }
+}
+
+async fn verify_wiki_publication_authority(
+    authority: Option<&PreparedKnowledgeViewAuthority>,
+) -> PipelineResult<()> {
+    if let Some(authority) = authority {
+        authority.verify_current().await?;
+    }
+    Ok(())
 }
 
 /// Compiles bounded graph context into LLM-authored, verified article prose.
 #[derive(Clone)]
 pub struct WikiEditorialCompiler {
+    storage: StorageClient,
+    // Only standalone compilation can revalidate; planner siblings share one epoch.
+    allow_input_revalidation: bool,
+    publication_authority: Option<PreparedKnowledgeViewAuthority>,
     graph: GraphViewCompiler,
     definitions: KnowledgeViewDefinitionRepository,
     views: KnowledgeViewRepository,
-    revisions: DocRevisionRepository,
-    nodes: DocNodeRepository,
     assertions: AssertionRepository,
     attributes: AttributeRepository,
     events: EventRepository,
@@ -3430,11 +4321,12 @@ impl WikiEditorialCompiler {
         config: WikiEditorialConfig,
     ) -> Self {
         Self {
+            storage: storage.clone(),
+            allow_input_revalidation: false,
+            publication_authority: None,
             graph: GraphViewCompiler::new(storage.clone()),
             definitions: KnowledgeViewDefinitionRepository::new(storage.clone()),
             views: KnowledgeViewRepository::new(storage.clone()),
-            revisions: DocRevisionRepository::new(storage.clone()),
-            nodes: DocNodeRepository::new(storage.clone()),
             assertions: AssertionRepository::new(storage.clone()),
             attributes: AttributeRepository::new(storage.clone()),
             events: EventRepository::new(storage.clone()),
@@ -3444,6 +4336,41 @@ impl WikiEditorialCompiler {
             llm,
             config,
         }
+    }
+
+    /// Carry one original authority through context, providers, reuse and publish.
+    #[must_use]
+    pub fn with_publication_authority(mut self, authority: PreparedKnowledgeViewAuthority) -> Self {
+        self.graph = self.graph.with_managed_authority(authority.clone());
+        self.publication_authority = Some(authority);
+        self
+    }
+
+    async fn prepare_articles_at_epoch(
+        &self,
+        space_id: &str,
+        jobs: Vec<(usize, String, RecordId)>,
+        publish: bool,
+        observed_epoch: &str,
+    ) -> Vec<(usize, String, PipelineResult<PreparedWikiArticle>)> {
+        // Keep the unordered stream's polling frame outside definition planning.
+        // Every sibling retains the same captured epoch and concurrency bound.
+        let concurrency = wiki_article_concurrency();
+        stream::iter(jobs.into_iter().map(|(index, entity_id, definition_id)| {
+            let compiler = self.clone();
+            let article_epoch = observed_epoch.to_owned();
+            async move {
+                let result = boxed_wiki_phase(
+                    "article.prepare",
+                    compiler.prepare_at_epoch(space_id, &definition_id, publish, &article_epoch),
+                )
+                .await;
+                (index, entity_id, result)
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await
     }
 
     /// Runs the writer and independent verifier, then persists an article.
@@ -3456,30 +4383,158 @@ impl WikiEditorialCompiler {
         definition_id: &RecordId,
         publish: bool,
     ) -> PipelineResult<CompiledWikiArticle> {
-        let definition = self
-            .definitions
-            .get(space_id, definition_id)
-            .await?
-            .ok_or_else(|| PipelineError::NotFound(definition_id.to_string()))?;
+        self.llm.validate_space(space_id)?;
+        if let Some(authority) = &self.publication_authority {
+            boxed_wiki_phase(
+                "article.authority",
+                authority.verify_current_for_space(space_id),
+            )
+            .await?;
+        }
+        let observed_epoch = boxed_wiki_phase(
+            "article.epoch",
+            elephant_storage::canonical_commit::CanonicalRepository::new(self.storage.clone())
+                .epoch(space_id),
+        )
+        .await?;
+        let mut standalone = self.clone();
+        standalone.allow_input_revalidation = true;
+        let prepared = boxed_wiki_phase(
+            "article.prepare",
+            standalone.prepare_at_epoch(space_id, definition_id, publish, &observed_epoch),
+        )
+        .await?;
+        if !prepared.changed {
+            return Ok(CompiledWikiArticle {
+                view: prepared.view,
+                revision: prepared.revision,
+                changed: false,
+            });
+        }
+        let (view, revision) = match &self.publication_authority {
+            Some(authority) => {
+                boxed_wiki_phase(
+                    "article.publish",
+                    self.views.publish_at_epoch_with_authority(
+                        prepared.view,
+                        prepared.revision,
+                        &prepared.observed_epoch,
+                        authority,
+                    ),
+                )
+                .await?
+            }
+            None => {
+                boxed_wiki_phase(
+                    "article.publish",
+                    self.views.publish_at_epoch(
+                        prepared.view,
+                        prepared.revision,
+                        &prepared.observed_epoch,
+                    ),
+                )
+                .await?
+            }
+        };
+        Ok(CompiledWikiArticle {
+            view,
+            revision,
+            changed: true,
+        })
+    }
+
+    async fn prepare_at_epoch(
+        &self,
+        space_id: &str,
+        definition_id: &RecordId,
+        publish: bool,
+        observed_epoch: &str,
+    ) -> PipelineResult<PreparedWikiArticle> {
+        // Keep graph preparation off the editorial/cache/writer poll frame. A
+        // boxed future's stored size does not bound its compiled poll frame.
+        let inputs = boxed_wiki_phase(
+            "article.inputs",
+            self.prepare_article_inputs(space_id, definition_id, publish, observed_epoch),
+        )
+        .await;
+        let inputs = wiki_phase_result("article.inputs", inputs)?;
+        let contents = boxed_wiki_phase(
+            "article.contents",
+            self.prepare_article_contents(space_id, definition_id, publish, observed_epoch, inputs),
+        )
+        .await;
+        wiki_phase_result("article.contents", contents)
+    }
+
+    async fn prepare_article_inputs(
+        &self,
+        space_id: &str,
+        definition_id: &RecordId,
+        publish: bool,
+        observed_epoch: &str,
+    ) -> PipelineResult<Box<WikiArticleInputs>> {
+        self.llm.validate_space(space_id)?;
+        if let Some(authority) = &self.publication_authority {
+            boxed_wiki_phase(
+                "article.authority",
+                authority.verify_current_for_space(space_id),
+            )
+            .await?;
+        }
+        boxed_wiki_phase(
+            "article.epoch",
+            elephant_knowledge_views::verify_projection_epoch(
+                &self.storage,
+                space_id,
+                observed_epoch,
+            ),
+        )
+        .await?;
+        let definition = boxed_wiki_phase(
+            "article.definition",
+            self.definitions.get(space_id, definition_id),
+        )
+        .await?
+        .ok_or_else(|| PipelineError::NotFound(definition_id.to_string()))?;
         if publish && definition.publication_status != KnowledgeViewPublicationStatus::Published {
             return Err(PipelineError::ValidationError(
                 "Article publication requires an explicitly published context plan".to_string(),
             ));
         }
 
-        let mut context = self.graph.compile(space_id, definition_id, false).await?;
+        let mut context = boxed_wiki_phase(
+            "article.context",
+            self.graph.prepare_context(space_id, definition_id, false),
+        )
+        .await?;
+        if context.observed_epoch != observed_epoch {
+            return Err(PipelineError::ValidationError(
+                "Wiki inputs changed before context preparation".into(),
+            ));
+        }
         if publish {
             validate_publishable_context(&context.revision)?;
-            self.validate_publishable_predicates(space_id, &context.revision)
-                .await?;
+            boxed_wiki_phase(
+                "article.predicates",
+                self.validate_publishable_predicates(space_id, &context.revision),
+            )
+            .await?;
         }
-        self.augment_with_entity_source_evidence(space_id, &definition, &mut context.revision)
-            .await?;
-        self.augment_with_root_semantic_records(space_id, &definition, &mut context.revision)
-            .await?;
-        let catalog = self
-            .build_evidence_catalog(space_id, &mut context.revision)
-            .await?;
+        boxed_wiki_phase(
+            "article.source_evidence",
+            self.augment_with_entity_source_evidence(space_id, &definition, &mut context.revision),
+        )
+        .await?;
+        boxed_wiki_phase(
+            "article.semantic_records",
+            self.augment_with_root_semantic_records(space_id, &definition, &mut context.revision),
+        )
+        .await?;
+        let catalog = boxed_wiki_phase(
+            "article.catalog",
+            self.build_evidence_catalog(space_id, &mut context.revision),
+        )
+        .await?;
         if catalog.is_empty() {
             return Err(PipelineError::ValidationError(
                 "The editorial context contains no supported graph facts or source evidence"
@@ -3496,6 +4551,41 @@ impl WikiEditorialCompiler {
             )));
         }
 
+        let source_inputs = boxed_wiki_phase(
+            "article.source_heads",
+            self.capture_article_source_inputs(space_id, &definition, &context.revision),
+        )
+        .await?;
+        elephant_knowledge_views::verify_projection_epoch(&self.storage, space_id, observed_epoch)
+            .await?;
+        Ok(Box::new(WikiArticleInputs {
+            definition,
+            context,
+            catalog,
+            catalog_json,
+            source_inputs,
+        }))
+    }
+
+    // The owned box keeps the joining future small while this phase is created.
+    #[allow(clippy::boxed_local)]
+    async fn prepare_article_contents(
+        &self,
+        space_id: &str,
+        definition_id: &RecordId,
+        publish: bool,
+        observed_epoch: &str,
+        inputs: Box<WikiArticleInputs>,
+    ) -> PipelineResult<PreparedWikiArticle> {
+        let mut fence =
+            WikiInputFence::new(&inputs, observed_epoch, self.allow_input_revalidation)?;
+        let WikiArticleInputs {
+            definition,
+            context,
+            catalog,
+            catalog_json,
+            source_inputs: _,
+        } = *inputs;
         let dependency_hash = editorial_dependency_hash(
             &context.revision,
             self.llm.writer_model(),
@@ -3504,14 +4594,44 @@ impl WikiEditorialCompiler {
         )?;
         let security_fingerprint = security_fingerprint(&context.revision.base.security)?;
         let key = format!("article:{definition_id}:{security_fingerprint}");
-        let existing = self.views.find_by_key(space_id, &key).await?;
+        let existing = boxed_wiki_phase(
+            "article.cached_view",
+            self.views.find_by_key(space_id, &key),
+        )
+        .await?;
         if let Some(existing_view) = existing.as_ref() {
-            if let Some(current) = self.views.get_current_revision(existing_view).await? {
+            if let Some(current) = boxed_wiki_phase(
+                "article.cached_revision",
+                self.views.get_current_revision(existing_view),
+            )
+            .await?
+            {
                 if existing_view.state != ProjectionState::Dirty
                     && current.compiler.version == ARTICLE_COMPILER_VERSION
                     && current.compiler.dependency_hash == dependency_hash
+                    && boxed_wiki_phase(
+                        "article.current",
+                        elephant_knowledge_views::projection_is_current(&self.storage, &current),
+                    )
+                    .await?
                 {
-                    return Ok(CompiledWikiArticle {
+                    boxed_wiki_phase(
+                        "article.epoch",
+                        self.verify_article_input_fence(
+                            space_id,
+                            definition_id,
+                            publish,
+                            &mut fence,
+                        ),
+                    )
+                    .await?;
+                    boxed_wiki_phase(
+                        "article.authority",
+                        verify_wiki_publication_authority(self.publication_authority.as_ref()),
+                    )
+                    .await?;
+                    return Ok(PreparedWikiArticle {
+                        observed_epoch: fence.epoch.clone(),
                         view: existing_view.clone(),
                         revision: current,
                         changed: false,
@@ -3530,7 +4650,22 @@ impl WikiEditorialCompiler {
         let mut attempt = 0_usize;
         let draft = loop {
             attempt = attempt.saturating_add(1);
-            let candidate = match self.llm.write_article(writer_prompt.clone()).await {
+            boxed_wiki_phase(
+                "article.epoch",
+                self.verify_article_input_fence(space_id, definition_id, publish, &mut fence),
+            )
+            .await?;
+            boxed_wiki_phase(
+                "article.authority",
+                verify_wiki_publication_authority(self.publication_authority.as_ref()),
+            )
+            .await?;
+            let written = boxed_wiki_phase(
+                "article.writer",
+                self.llm.write_article(writer_prompt.clone()),
+            )
+            .await;
+            let candidate = match wiki_phase_result("article.writer", written) {
                 Ok(candidate) => candidate,
                 Err(error) if attempt < max_attempts => {
                     writer_prompt =
@@ -3540,7 +4675,10 @@ impl WikiEditorialCompiler {
                 }
                 Err(error) => return Err(error),
             };
-            if let Err(error) = validate_editorial_draft(&candidate, &catalog) {
+            if let Err(error) = wiki_phase_result(
+                "article.draft_validation",
+                validate_editorial_draft(&candidate, &catalog),
+            ) {
                 if attempt >= max_attempts {
                     return Err(error);
                 }
@@ -3557,7 +4695,24 @@ impl WikiEditorialCompiler {
             let mut verification = None;
             let mut verification_error = None;
             for verifier_attempt in 1..=3 {
-                match self.llm.verify_article(verification_prompt.clone()).await {
+                let epoch = boxed_wiki_phase(
+                    "article.epoch",
+                    self.verify_article_input_fence(space_id, definition_id, publish, &mut fence),
+                )
+                .await;
+                wiki_phase_result("article.before_verifier_epoch", epoch)?;
+                let authority = boxed_wiki_phase(
+                    "article.authority",
+                    verify_wiki_publication_authority(self.publication_authority.as_ref()),
+                )
+                .await;
+                wiki_phase_result("article.before_verifier_authority", authority)?;
+                let verified = boxed_wiki_phase(
+                    "article.verifier",
+                    self.llm.verify_article(verification_prompt.clone()),
+                )
+                .await;
+                match wiki_phase_result("article.verifier", verified) {
                     Ok(candidate) => {
                         verification = Some(candidate);
                         break;
@@ -3577,7 +4732,10 @@ impl WikiEditorialCompiler {
                     )
                 })
             })?;
-            if let Err(error) = validate_verification(&candidate, &verification) {
+            if let Err(error) = wiki_phase_result(
+                "article.verification",
+                validate_verification(&candidate, &verification),
+            ) {
                 if attempt >= max_attempts {
                     return Err(error);
                 }
@@ -3593,14 +4751,73 @@ impl WikiEditorialCompiler {
             break candidate;
         };
 
+        tracing::debug!(phase = "article.assemble");
+        let mut prepared = self.assemble_article(
+            space_id,
+            definition_id,
+            publish,
+            WikiArticleAssembly {
+                context,
+                existing,
+                draft,
+                dependency_hash,
+                security_fingerprint,
+                key,
+            },
+        )?;
+        let current = boxed_wiki_phase(
+            "article.current",
+            elephant_knowledge_views::projection_is_current(&self.storage, &prepared.revision),
+        )
+        .await;
+        if !wiki_phase_result("article.final_support", current)? {
+            return Err(PipelineError::ValidationError(
+                "Article support changed before publication".into(),
+            ));
+        }
+        let final_epoch = boxed_wiki_phase(
+            "article.epoch",
+            self.verify_article_input_fence(space_id, definition_id, publish, &mut fence),
+        )
+        .await;
+        wiki_phase_result("article.final_epoch", final_epoch)?;
+        prepared.observed_epoch.clone_from(&fence.epoch);
+        tracing::debug!(phase = "article.done");
+        Ok(prepared)
+    }
+
+    #[inline(never)]
+    fn assemble_article(
+        &self,
+        space_id: &str,
+        definition_id: &RecordId,
+        publish: bool,
+        assembly: WikiArticleAssembly,
+    ) -> PipelineResult<PreparedWikiArticle> {
+        // Building the owned view/revision no longer reserves those temporaries
+        // in every poll of the authority/context/provider preparation chain.
+        let WikiArticleAssembly {
+            context,
+            existing,
+            draft,
+            dependency_hash,
+            security_fingerprint,
+            key,
+        } = assembly;
         let (blocks, citations) = article_blocks(&draft, &context.revision.citations)?;
         let dependencies = article_dependencies(
             &context.view,
             &context.revision,
+            context.persisted,
             self.llm.writer_model(),
             self.llm.verifier_model(),
         );
-        let validation = article_validation(&blocks, &citations, &dependencies);
+        let source_backed = context
+            .revision
+            .citations
+            .iter()
+            .any(|citation| citation.kind == CitationKind::EvidenceSpan);
+        let validation = article_validation(&blocks, &citations, &dependencies, source_backed);
         if !validation.citations_resolve
             || !validation.factual_blocks_cited
             || !validation.statements_supported
@@ -3718,12 +4935,119 @@ impl WikiEditorialCompiler {
             compiled_at: now,
             supersedes: existing.and_then(|view| view.current_revision),
         };
-        let (view, revision) = self.views.publish(view, revision).await?;
-        Ok(CompiledWikiArticle {
+        Ok(PreparedWikiArticle {
+            observed_epoch: context.observed_epoch,
             view,
             revision,
             changed: true,
         })
+    }
+
+    async fn publish_prepared_batch(
+        &self,
+        space_id: &str,
+        prepared: Vec<(String, PreparedWikiArticle)>,
+        observed_epoch: &str,
+    ) -> (Vec<CompiledWikiArticle>, Vec<WikiCreationFailure>) {
+        if prepared.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let publications = prepared
+            .iter()
+            .filter(|(_, article)| article.changed)
+            .map(|(_, article)| (article.view.clone(), article.revision.clone()))
+            .collect::<Vec<_>>();
+        let published = if publications.is_empty() {
+            async {
+                if let Some(authority) = &self.publication_authority {
+                    authority.verify_current_for_space(space_id).await?;
+                }
+                elephant_knowledge_views::verify_projection_epoch(
+                    &self.storage,
+                    space_id,
+                    observed_epoch,
+                )
+                .await?;
+                Ok(Vec::new())
+            }
+            .await
+        } else {
+            self.views
+                .publish_batch_at_epoch(
+                    publications,
+                    observed_epoch,
+                    self.publication_authority.as_ref(),
+                )
+                .await
+        };
+        let published = match published {
+            Ok(published) => published,
+            Err(error) => {
+                return (
+                    Vec::new(),
+                    prepared
+                        .into_iter()
+                        .map(|(entity_id, _)| WikiCreationFailure {
+                            entity_id,
+                            error: error.to_string(),
+                        })
+                        .collect(),
+                )
+            }
+        };
+        let mut by_id = published
+            .into_iter()
+            .map(|(view, revision)| (view.base.id.clone(), (view, revision)))
+            .collect::<BTreeMap<_, _>>();
+        let mut articles = Vec::new();
+        let mut failures = Vec::new();
+        for (entity_id, article) in prepared {
+            if article.changed {
+                match by_id.remove(&article.view.base.id) {
+                    Some((view, revision)) => articles.push(CompiledWikiArticle {
+                        view,
+                        revision,
+                        changed: true,
+                    }),
+                    None => failures.push(WikiCreationFailure {
+                        entity_id,
+                        error: "Committed Wiki batch omitted an original article".into(),
+                    }),
+                }
+            } else {
+                // These were already published before this batch. Revalidate
+                // their exact current projection after our own sibling writes.
+                let current = async {
+                    if let Some(authority) = &self.publication_authority {
+                        authority.verify_current_for_space(space_id).await?;
+                    }
+                    if !elephant_knowledge_views::projection_is_current(
+                        &self.storage,
+                        &article.revision,
+                    )
+                    .await?
+                    {
+                        return Err(PipelineError::ValidationError(
+                            "Cached article support changed during sibling publication".into(),
+                        ));
+                    }
+                    Ok(())
+                }
+                .await;
+                match current {
+                    Ok(()) => articles.push(CompiledWikiArticle {
+                        view: article.view,
+                        revision: article.revision,
+                        changed: false,
+                    }),
+                    Err(error) => failures.push(WikiCreationFailure {
+                        entity_id,
+                        error: error.to_string(),
+                    }),
+                }
+            }
+        }
+        (articles, failures)
     }
 
     async fn augment_with_entity_source_evidence(
@@ -3740,16 +5064,24 @@ impl WikiEditorialCompiler {
                 _ => 32,
             }
         });
-        let roots = definition_roots(definition);
+        let roots = article_context_roots(definition, context)?;
         if roots.is_empty() {
             return Ok(());
         }
+        let reader = elephant_storage::read_eligibility::ReadEligibility::new(self.storage.clone());
+        let original_scope = context.base.clone();
+        let authorize = |base: &BaseFields| inventory_envelope_covers(&original_scope, base);
         let mut seen_spans = BTreeSet::new();
         for topic in &roots {
-            let assertions = self
-                .assertions
-                .find_by_resolved_entity(space_id, topic.id(), max_entity_assertions)
-                .await?;
+            let assertions = boxed_wiki_phase(
+                "article.evidence.assertions",
+                self.assertions.find_by_resolved_entity(
+                    space_id,
+                    topic.id(),
+                    max_entity_assertions,
+                ),
+            )
+            .await?;
             for assertion in assertions {
                 if assertion.base.security != definition.base.security
                     || assertion.resolution_status != ResolutionStatus::Resolved
@@ -3761,71 +5093,85 @@ impl WikiEditorialCompiler {
                 {
                     continue;
                 }
-                let revision = self
-                    .revisions
-                    .get(space_id, assertion.evidence.revision.id())
-                    .await?
-                    .ok_or_else(|| {
-                        PipelineError::NotFound(assertion.evidence.revision.id().to_string())
-                    })?;
-                let Some(joined_security) =
-                    policy_aware_security_join(&context.base.security, &revision.base.security)
+                let Some(assertion) = boxed_wiki_phase(
+                    "article.evidence.project",
+                    reader.project(assertion, &authorize),
+                )
+                .await?
                 else {
                     continue;
                 };
-                context.base.security = joined_security;
-                merge_record_subject_scope(&mut context.base, &assertion);
-                merge_subject_scope(&mut context.base, &revision.base);
-                let node = if let Some(node_link) = assertion.evidence.node.as_ref() {
-                    self.nodes.get(space_id, node_link.id()).await?
+                let Some(evidence) = boxed_wiki_phase(
+                    "article.evidence.span",
+                    reader.evidence(space_id, &assertion.evidence, &authorize),
+                )
+                .await?
+                else {
+                    continue;
+                };
+                let published_source = if let Some(raw) = evidence.source.as_ref() {
+                    Some(
+                        boxed_wiki_phase(
+                            "article.evidence.source",
+                            elephant_knowledge_views::published_source_for_projection(
+                                &self.storage,
+                                &reader,
+                                raw,
+                                &authorize,
+                            ),
+                        )
+                        .await?,
+                    )
                 } else {
                     None
                 };
-                let mut candidate_span = assertion.evidence.clone();
-                if candidate_span.start >= candidate_span.end {
-                    let Some(node) = node.as_ref() else {
-                        continue;
-                    };
-                    if node.revision.id() != assertion.evidence.revision.id() {
-                        continue;
-                    }
-                    let Some(joined_security) =
-                        policy_aware_security_join(&context.base.security, &node.base.security)
-                    else {
-                        continue;
-                    };
-                    context.base.security = joined_security;
-                    merge_subject_scope(&mut context.base, &node.base);
-                    candidate_span.start = node.span.start;
-                    candidate_span.end = node.span.end;
-                }
+                let revision = evidence.revision;
+                let node = evidence.node;
+                let evidence_span = assertion.evidence.clone();
                 let span_key = format!(
                     "{}:{}:{}",
-                    candidate_span.revision.id(),
-                    candidate_span.start,
-                    candidate_span.end
+                    evidence_span.revision.id(),
+                    evidence_span.start,
+                    evidence_span.end
                 );
                 if !seen_spans.insert(span_key) {
                     continue;
                 }
-                let Some(evidence_span) = reconciled_evidence_span(&revision.text, &candidate_span)
-                else {
-                    continue;
-                };
-                if evidence_span.quote_hash != assertion.evidence.quote_hash {
-                    context.validation.warnings.push(format!(
-                    "Assertion {} had a stale evidence hash; the article citation uses the hash of the immutable revision slice at the recorded offsets",
-                    assertion.base.id
-                ));
+                context.base.security =
+                    policy_aware_security_join(&context.base.security, &revision.base.security)
+                        .ok_or_else(|| {
+                            PipelineError::ValidationError(
+                                "Wiki evidence policy differs from context".into(),
+                            )
+                        })?;
+                merge_record_subject_scope(&mut context.base, &assertion);
+                merge_subject_scope(&mut context.base, &revision.base);
+                merge_subject_scope(&mut context.base, &evidence.doc.base);
+                if let Some(source) = &evidence.source {
+                    merge_subject_scope(&mut context.base, &source.base);
+                    context
+                        .base
+                        .provenance
+                        .sources
+                        .extend(source.base.provenance.sources.iter().cloned());
+                }
+                if let Some(source) = &published_source {
+                    merge_subject_scope(&mut context.base, &source.base);
+                    context
+                        .base
+                        .provenance
+                        .sources
+                        .extend(source.base.provenance.sources.iter().cloned());
+                    context.base.provenance.sources.push(source.base.id.clone());
+                }
+                if let Some(node) = &node {
+                    merge_subject_scope(&mut context.base, &node.base);
                 }
                 let citation_id = format!("c{}", context.citations.len().saturating_add(1));
-                let source_id = assertion
-                    .base
-                    .provenance
-                    .sources
-                    .first()
-                    .or_else(|| revision.base.provenance.sources.first())
-                    .map(ToString::to_string);
+                let source_id = evidence
+                    .source
+                    .as_ref()
+                    .map(|source| source.base.id.to_string());
                 context.citations.push(KnowledgeCitation {
                     id: citation_id,
                     kind: CitationKind::EvidenceSpan,
@@ -3834,6 +5180,20 @@ impl WikiEditorialCompiler {
                     source_id: source_id.clone(),
                     evidence_span: Some(evidence_span),
                 });
+                context.dependencies.push(KnowledgeDependency {
+                    record_id: evidence.doc.base.id.to_string(),
+                    record_type: "doc".into(),
+                    role: "editorial_evidence_document".into(),
+                    observed_updated_at: Some(evidence.doc.base.updated_at),
+                });
+                if let Some(source) = &published_source {
+                    context.dependencies.push(KnowledgeDependency {
+                        record_id: source.base.id.to_string(),
+                        record_type: "source".into(),
+                        role: "editorial_evidence_source".into(),
+                        observed_updated_at: Some(source.base.updated_at),
+                    });
+                }
                 context.dependencies.extend([
                     KnowledgeDependency {
                         record_id: assertion.base.id.to_string(),
@@ -3856,16 +5216,11 @@ impl WikiEditorialCompiler {
                         observed_updated_at: Some(node.base.updated_at),
                     });
                 }
-                if let Some(source_id) = source_id {
-                    context.dependencies.push(KnowledgeDependency {
-                        record_id: source_id,
-                        record_type: "source".to_string(),
-                        role: "entity_source_evidence".to_string(),
-                        observed_updated_at: None,
-                    });
-                }
             }
         }
+        context.base.provenance.sources.sort();
+        context.base.provenance.sources.dedup();
+        boxed_wiki_phase("article.evidence.current", reader.verify_current()).await?;
         Ok(())
     }
 
@@ -3877,7 +5232,7 @@ impl WikiEditorialCompiler {
     ) -> PipelineResult<()> {
         const MAX_ROOT_ATTRIBUTES: usize = 50;
         const MAX_ROOT_EVENTS: usize = 25;
-        let roots = definition_roots(definition);
+        let roots = article_context_roots(definition, context)?;
         if roots.is_empty() {
             return Ok(());
         }
@@ -4069,6 +5424,9 @@ impl WikiEditorialCompiler {
                     .insert(statement.text.clone());
             }
         }
+        let reader = elephant_storage::read_eligibility::ReadEligibility::new(self.storage.clone());
+        let original_scope = context.base.clone();
+        let authorize = |base: &BaseFields| inventory_envelope_covers(&original_scope, base);
         let mut catalog = Vec::new();
         for citation in context.citations.clone() {
             if citation.kind == CitationKind::ClaimRecord
@@ -4077,13 +5435,103 @@ impl WikiEditorialCompiler {
                 continue;
             }
             let source_quote = if let Some(span) = citation.evidence_span.as_ref() {
-                let revision = self
-                    .revisions
-                    .get(space_id, span.revision.id())
+                let evidence = boxed_wiki_phase(
+                    "article.catalog.span",
+                    reader.evidence(space_id, span, &authorize),
+                )
+                .await?
+                .ok_or_else(|| {
+                    PipelineError::ValidationError(
+                        "Wiki citation has no exact current immutable source evidence".into(),
+                    )
+                })?;
+                if citation.source_id.as_deref()
+                    != evidence
+                        .source
+                        .as_ref()
+                        .map(|source| source.base.id.to_string())
+                        .as_deref()
+                {
+                    return Err(PipelineError::ValidationError(
+                        "Wiki citation source identity differs from immutable evidence".into(),
+                    ));
+                }
+                if let Some(assertion_id) = &citation.assertion_id {
+                    let id = assertion_id
+                        .parse::<RecordId>()
+                        .map_err(|error| PipelineError::ValidationError(error.to_string()))?;
+                    let assertion = boxed_wiki_phase(
+                        "article.catalog.assertion",
+                        self.assertions.get(space_id, &id),
+                    )
                     .await?
-                    .ok_or_else(|| {
-                        PipelineError::NotFound(format!("Evidence revision {}", span.revision.id()))
-                    })?;
+                    .ok_or_else(|| PipelineError::NotFound(id.to_string()))?;
+                    if assertion.evidence != *span
+                        || boxed_wiki_phase(
+                            "article.catalog.project",
+                            reader.project(assertion, &authorize),
+                        )
+                        .await?
+                        .is_none()
+                    {
+                        return Err(PipelineError::ValidationError(
+                            "Wiki citation assertion lacks current exact support".into(),
+                        ));
+                    }
+                }
+                let published_source = if let Some(raw) = evidence.source.as_ref() {
+                    let published = boxed_wiki_phase(
+                        "article.catalog.source",
+                        elephant_knowledge_views::published_source_for_projection(
+                            &self.storage,
+                            &reader,
+                            raw,
+                            &authorize,
+                        ),
+                    )
+                    .await?;
+                    merge_subject_scope(&mut context.base, &raw.base);
+                    context
+                        .base
+                        .provenance
+                        .sources
+                        .extend(raw.base.provenance.sources.iter().cloned());
+                    context
+                        .base
+                        .provenance
+                        .sources
+                        .extend(published.base.provenance.sources.iter().cloned());
+                    context.base.provenance.sources.push(raw.base.id.clone());
+                    Some(published)
+                } else {
+                    None
+                };
+                let revision = evidence.revision;
+                for base in std::iter::once(&evidence.doc.base)
+                    .chain(published_source.as_ref().map(|source| &source.base))
+                    .chain(evidence.node.as_ref().map(|node| &node.base))
+                {
+                    context.base.security =
+                        policy_aware_security_join(&context.base.security, &base.security)
+                            .ok_or_else(|| {
+                                PipelineError::ValidationError(
+                                    "Wiki citation security policy differs".into(),
+                                )
+                            })?;
+                    merge_subject_scope(&mut context.base, base);
+                    if !context
+                        .dependencies
+                        .iter()
+                        .any(|dependency| dependency.record_id == base.id.to_string())
+                    {
+                        context.dependencies.push(KnowledgeDependency {
+                            record_id: base.id.to_string(),
+                            record_type: base.id.table().to_string(),
+                            role: "editorial_evidence_lineage".into(),
+                            observed_updated_at: Some(base.updated_at),
+                        });
+                    }
+                }
                 context.base.security =
                     policy_aware_security_join(&context.base.security, &revision.base.security)
                         .ok_or_else(|| {
@@ -4124,6 +5572,19 @@ impl WikiEditorialCompiler {
                 source_quote,
                 source_id: citation.source_id.clone(),
             });
+        }
+        context.base.provenance.sources.sort();
+        context.base.provenance.sources.dedup();
+        boxed_wiki_phase("article.catalog.current", reader.verify_current()).await?;
+        if !boxed_wiki_phase(
+            "article.current",
+            elephant_knowledge_views::projection_is_current(&self.storage, context),
+        )
+        .await?
+        {
+            return Err(PipelineError::ValidationError(
+                "Wiki context contains unsupported or withdrawn dependencies".into(),
+            ));
         }
         Ok(catalog)
     }
@@ -4407,6 +5868,57 @@ fn definition_roots(definition: &KnowledgeViewDefinition) -> Vec<Link<Entity>> {
     }
 }
 
+/// Query articles use the exact bounded selection already prepared at the
+/// caller's canonical epoch. Subject lineage alone is not membership: it can
+/// include organizers, assertion endpoints and other contributing records.
+fn article_context_roots(
+    definition: &KnowledgeViewDefinition,
+    context: &KnowledgeViewRevision,
+) -> PipelineResult<Vec<Link<Entity>>> {
+    let KnowledgeViewSelector::Query { max_members, .. } = &definition.selector else {
+        return Ok(definition_roots(definition));
+    };
+    if context.base.space_id != definition.base.space_id
+        || context.root_record != definition.base.id.to_string()
+        || context.kind != KnowledgeViewKind::Query
+    {
+        return Err(PipelineError::ValidationError(
+            "Wiki query evidence requires its original prepared context".into(),
+        ));
+    }
+    let mut roots = BTreeSet::new();
+    for dependency in context.dependencies.iter().filter(|dependency| {
+        dependency
+            .role
+            .split('+')
+            .any(|role| role == "selected_member")
+    }) {
+        let id = dependency.record_id.parse::<RecordId>().map_err(|_| {
+            PipelineError::ValidationError("Wiki selected member identity is invalid".into())
+        })?;
+        if dependency.record_type != "entity"
+            || id.table() != TableName::Entity
+            || dependency.observed_updated_at.is_none()
+            || !context
+                .base
+                .subjects
+                .iter()
+                .any(|subject| subject.id() == &id)
+        {
+            return Err(PipelineError::ValidationError(
+                "Wiki selected member has no original governed entity dependency".into(),
+            ));
+        }
+        roots.insert(id);
+    }
+    if roots.len() > usize::from(*max_members) {
+        return Err(PipelineError::ValidationError(
+            "Wiki query evidence exceeds its prepared selection bound".into(),
+        ));
+    }
+    Ok(roots.into_iter().map(Link::new).collect())
+}
+
 struct PlannedDefinitionPresentation {
     relation_types: Vec<String>,
     navigation: Option<KnowledgeViewNavigation>,
@@ -4605,20 +6117,7 @@ fn restrictive_security_join(left: &Security, right: &Security) -> Security {
 }
 
 fn policy_aware_security_join(left: &Security, right: &Security) -> Option<Security> {
-    if left.policy_id == right.policy_id {
-        return Some(restrictive_security_join(left, right));
-    }
-    if left.policy_id == "default" {
-        let mut promoted = left.clone();
-        promoted.policy_id.clone_from(&right.policy_id);
-        return Some(restrictive_security_join(&promoted, right));
-    }
-    if right.policy_id == "default" {
-        let mut promoted = right.clone();
-        promoted.policy_id.clone_from(&left.policy_id);
-        return Some(restrictive_security_join(left, &promoted));
-    }
-    None
+    (left.policy_id == right.policy_id).then(|| restrictive_security_join(left, right))
 }
 
 fn merge_record_subject_scope(target: &mut BaseFields, source: &impl HasSecurity) {
@@ -4726,10 +6225,20 @@ fn bounded_text(value: &str, max_chars: usize) -> String {
 #[cfg(feature = "meerkat-extraction")]
 impl WikiEditorialCompiler {
     /// Creates the production compiler using Meerkat model resolution.
-    #[must_use]
-    pub fn with_meerkat(storage: StorageClient, config: WikiEditorialConfig) -> Self {
-        let llm = Arc::new(MeerkatWikiEditorialLlm::new(config.clone()));
-        Self::new(storage, llm, config)
+    pub async fn with_meerkat(
+        storage: StorageClient,
+        space_id: &str,
+        config: WikiEditorialConfig,
+    ) -> PipelineResult<Self> {
+        let context = crate::provider_dispatch::ProviderDispatchContext::new(
+            elephant_storage::SpaceConfigRepository::new(storage.clone()),
+            space_id,
+        );
+        let llm = MeerkatWikiEditorialLlm::new(config)
+            .with_provider_context(context)
+            .await?;
+        let config = llm.config.clone();
+        Ok(Self::new(storage, Arc::new(llm), config))
     }
 }
 
@@ -4764,22 +6273,23 @@ fn validated_quote(text: &str, span: &EvidenceSpan) -> PipelineResult<String> {
             span.start, span.end
         ))
     })?;
-    let hash = format!("sha256:{}", hex::encode(Sha256::digest(quote.as_bytes())));
-    if hash != span.quote_hash {
+    if quote.trim().is_empty() {
+        return Err(PipelineError::ValidationError(
+            "Wiki evidence must be nonempty source text".into(),
+        ));
+    }
+    let hash = hex::encode(Sha256::digest(quote.as_bytes()));
+    if hash
+        != span
+            .quote_hash
+            .strip_prefix("sha256:")
+            .unwrap_or(&span.quote_hash)
+    {
         return Err(PipelineError::ValidationError(
             "Evidence quote hash does not match the immutable revision".to_string(),
         ));
     }
     Ok(quote.to_string())
-}
-
-fn reconciled_evidence_span(text: &str, span: &EvidenceSpan) -> Option<EvidenceSpan> {
-    let start = usize::try_from(span.start).ok()?;
-    let end = usize::try_from(span.end).ok()?;
-    let quote = text.get(start..end)?;
-    let mut reconciled = span.clone();
-    reconciled.quote_hash = format!("sha256:{}", hex::encode(Sha256::digest(quote.as_bytes())));
-    Some(reconciled)
 }
 
 fn validate_editorial_draft(
@@ -4813,7 +6323,13 @@ fn validate_editorial_draft(
         .collect::<BTreeSet<_>>();
     let source_citations = catalog
         .iter()
-        .filter(|item| item.kind == CitationKind::EvidenceSpan)
+        .filter(|item| {
+            item.kind == CitationKind::EvidenceSpan
+                && item
+                    .source_quote
+                    .as_deref()
+                    .is_some_and(|quote| !quote.trim().is_empty())
+        })
         .map(|item| item.citation_id.as_str())
         .collect::<BTreeSet<_>>();
     if !source_citations.is_empty()
@@ -4862,6 +6378,20 @@ fn validate_editorial_draft(
             )));
         }
         validate_reader_facing_prose(&statement.id, &statement.text)?;
+        // A graph status can supplement source evidence, but it must not let a
+        // synthesized sentence bypass the original source-backed contract.
+        // Graph-only contexts retain their existing governed publication path.
+        if !source_citations.is_empty()
+            && statement
+                .citation_ids
+                .iter()
+                .all(|id| !source_citations.contains(id.as_str()))
+        {
+            return Err(PipelineError::ValidationError(format!(
+                "Source-backed article statement {} must cite supplied immutable source evidence",
+                statement.id
+            )));
+        }
         if statement.citation_ids.is_empty()
             || statement
                 .citation_ids
@@ -5181,23 +6711,28 @@ fn parse_block_kind(kind: &str) -> PipelineResult<ViewBlockKind> {
 fn article_dependencies(
     context_view: &KnowledgeView,
     context: &KnowledgeViewRevision,
+    context_persisted: bool,
     writer_model: &str,
     verifier_model: &str,
 ) -> Vec<KnowledgeDependency> {
     let mut dependencies = context.dependencies.clone();
+    if context_persisted {
+        dependencies.extend([
+            KnowledgeDependency {
+                record_id: context_view.base.id.to_string(),
+                record_type: "knowledge_view".to_string(),
+                role: "editorial_context".to_string(),
+                observed_updated_at: Some(context_view.base.updated_at),
+            },
+            KnowledgeDependency {
+                record_id: context.base.id.to_string(),
+                record_type: "knowledge_view_revision".to_string(),
+                role: "editorial_context_revision".to_string(),
+                observed_updated_at: Some(context.base.updated_at),
+            },
+        ]);
+    }
     dependencies.extend([
-        KnowledgeDependency {
-            record_id: context_view.base.id.to_string(),
-            record_type: "knowledge_view".to_string(),
-            role: "editorial_context".to_string(),
-            observed_updated_at: Some(context_view.base.updated_at),
-        },
-        KnowledgeDependency {
-            record_id: context.base.id.to_string(),
-            record_type: "knowledge_view_revision".to_string(),
-            role: "editorial_context_revision".to_string(),
-            observed_updated_at: Some(context.base.updated_at),
-        },
         KnowledgeDependency {
             record_id: format!("model:{writer_model}"),
             record_type: "model".to_string(),
@@ -5270,7 +6805,10 @@ fn article_provenance(
     provenance.config_id = Some(format!("sha256:{dependency_hash}"));
     provenance.chain.push(ProvenanceStep {
         step: "wiki_editorial_compilation".to_string(),
-        input: context_revision.base.id.to_string(),
+        input: format!(
+            "context-sha256:{}",
+            context_revision.compiler.dependency_hash
+        ),
         output: output.to_string(),
     });
     provenance
@@ -5280,6 +6818,7 @@ fn article_validation(
     blocks: &[KnowledgeViewBlock],
     citations: &[KnowledgeCitation],
     dependencies: &[KnowledgeDependency],
+    source_backed: bool,
 ) -> ValidationReceipt {
     let citation_ids = citations
         .iter()
@@ -5302,8 +6841,20 @@ fn article_validation(
     let factual_blocks_cited = blocks
         .iter()
         .all(|block| !block.statements.is_empty() && !block.citations.is_empty());
+    let source_citation_ids = citations
+        .iter()
+        .filter(|citation| {
+            citation.kind == CitationKind::EvidenceSpan && citation.evidence_span.is_some()
+        })
+        .map(|citation| citation.id.as_str())
+        .collect::<BTreeSet<_>>();
     let statements_supported = statements.iter().all(|statement| {
         !statement.citations.is_empty()
+            && (!source_backed
+                || statement
+                    .citations
+                    .iter()
+                    .any(|id| source_citation_ids.contains(id.as_str())))
             && statement
                 .citations
                 .iter()
@@ -5358,7 +6909,7 @@ fn editorial_dependency_hash(
     publish: bool,
 ) -> PipelineResult<String> {
     let value = json!({
-        "context_revision": context.base.id.to_string(),
+        "context_contract": "immutable-prepared-context-v1",
         "context_dependency_hash": context.compiler.dependency_hash,
         "source_evidence_dependencies": context.dependencies,
         "source_evidence_citations": context.citations,
@@ -5430,7 +6981,7 @@ fn render_writer_prompt(
         },
     );
     format!(
-        "Write a useful English private-wiki article titled {title:?}. Set language to en. {editorial_context} Use only the evidence catalog below. The lead must convey concrete supported identity and local relevance, not repeat the title or entity type. Synthesize across the evidence: explain what matters, how facts relate, what is current, and what changed over time. A list of disconnected extracted facts is not an article. For core and overview pages, cover the major supported dimensions of the subject and use meaningful sections. For reference and archive pages, be concise and explain why the subject occurs in this knowledge space. A supported family relationship, trip, purchase, message, decision, or event can be the entire local significance of a peripheral person, place, organization, product, or concept; do not add general encyclopedia facts to make it look important. When the catalog contains evidence_span items, the lead must cite at least one. Never describe a subject as central merely because it appears in an inventory or graph. Prefer current state, meaningful relationships, events, decisions, constraints, and useful history. Clearly frame old evidence as historical and never imply it is current. Omit ingestion metadata and graph machinery. Do not add general world knowledge unless it appears in the catalog. Every sentence must help explain this article subject or its supported connection to this private knowledge space. Exclude unrelated co-mentioned facts. Return plain prose without Markdown syntax. Every statement must cite catalog IDs supporting the complete statement. Sparse evidence calls for a short, honest article with one concrete local-relevance fact, not padding or invented synthesis.\n\nEVIDENCE CATALOG:\n{catalog_json}"
+        "Write a useful English private-wiki article titled {title:?}. Set language to en. {editorial_context} Use only the evidence catalog below. The lead must convey concrete supported identity and local relevance, not repeat the title or entity type. Synthesize across the evidence: explain what matters, how facts relate, what is current, and what changed over time. A list of disconnected extracted facts is not an article. For core and overview pages, cover the major supported dimensions of the subject and use meaningful sections. For reference and archive pages, be concise and explain why the subject occurs in this knowledge space. A supported family relationship, trip, purchase, message, decision, or event can be the entire local significance of a peripheral person, place, organization, product, or concept; do not add general encyclopedia facts to make it look important. When the catalog contains evidence_span items, every statement, including each lead, section sentence, and uncertainty caveat, must cite at least one exact source passage supporting its concrete subject matter. Graph status may supplement that passage but cannot replace it. Do not turn an internal stale flag into a claim that a real-world fact changed; distinguish historical source dates from actual evidence of change. Never describe a subject as central merely because it appears in an inventory or graph. Prefer current state, meaningful relationships, events, decisions, constraints, and useful history. Clearly frame old evidence as historical and never imply it is current. Omit ingestion metadata and graph machinery. Do not add general world knowledge unless it appears in the catalog. Every sentence must help explain this article subject or its supported connection to this private knowledge space. Exclude unrelated co-mentioned facts. Return plain prose without Markdown syntax. Every statement must cite catalog IDs supporting the complete statement. Sparse evidence calls for a short, honest article with one concrete local-relevance fact, not padding or invented synthesis.\n\nEVIDENCE CATALOG:\n{catalog_json}"
     )
 }
 
@@ -5517,7 +7068,7 @@ fn render_repair_prompt(
         },
     )?;
     Ok(format!(
-        "Rewrite the rejected private-wiki article titled {title:?}. Preserve supported useful content, but remove or narrow every unsupported, embellished, generic, technical, or uncited claim identified below. The lead must contain a concrete supported fact, not merely the entity type or a claim that the subject is central to some context. Local relevance is enough for a peripheral subject: explain its supported connection to a family person, event, trip, purchase, decision, project, or source context without inventing general encyclopedia facts. If the catalog is sparse, return one short, honest lead and one semantic section rather than padding. If the catalog contains kind=evidence_span items, cite at least one of their citation_id values in the lead. Use only the evidence catalog. Return a complete replacement article, not commentary about the repair.\n\nREJECTION:\n{error}\n\nREJECTED DRAFT:\n{rejected_json}\n\nVERIFIER OUTPUT:\n{verification_json}\n\nEVIDENCE CATALOG:\n{catalog_json}"
+        "Rewrite the rejected private-wiki article titled {title:?}. Preserve supported useful content, but remove or narrow every unsupported, embellished, generic, technical, or uncited claim identified below. The lead must contain a concrete supported fact, not merely the entity type or a claim that the subject is central to some context. Local relevance is enough for a peripheral subject: explain its supported connection to a family person, event, trip, purchase, decision, project, or source context without inventing general encyclopedia facts. If the catalog is sparse, return one short, honest lead and one semantic section rather than padding. If the catalog contains kind=evidence_span items, every statement must cite at least one of their citation_id values supporting the concrete subject matter. Remove or narrow graph-status-only caveats rather than attaching an unrelated source citation. A stale internal record alone does not prove a real-world change. Use only the evidence catalog. Return a complete replacement article, not commentary about the repair.\n\nREJECTION:\n{error}\n\nREJECTED DRAFT:\n{rejected_json}\n\nVERIFIER OUTPUT:\n{verification_json}\n\nEVIDENCE CATALOG:\n{catalog_json}"
     ))
 }
 
@@ -5526,7 +7077,7 @@ fn render_verifier_prompt(draft: &EditorialDraft, catalog_json: &str) -> Pipelin
         PipelineError::ValidationError(format!("Could not serialize article draft: {error}"))
     })?;
     Ok(format!(
-        "Independently verify every article statement against only its cited evidence-catalog items. Mark entailed=false if any part is unsupported, embellished, temporally misleading, or broader than its citations. This is a private wiki, not a general encyclopedia. Mark relevant=true when an entailed statement either explains the named subject itself or explains why the subject occurs in this private knowledge space through a supported family relationship, trip, purchase, message, decision, project, event, or other meaningful local connection. Do not reject a family-specific fact merely because it would not belong in a general encyclopedia article. Still mark unrelated co-mentions and bare technical/source metadata relevant=false. Then judge the article as a whole. For a rich catalog, article_useful requires human-useful synthesis rather than disconnected facts or filler. For a sparse catalog, one concrete, entailed local-relevance fact is sufficient for a short useful article; never demand facts or synthesis absent from the catalog. article_coherent requires a lead and sections about one subject or its local connection. temporal_framing_sound requires old evidence to be framed historically rather than as current. missing_major_topics must list only major, well-supported subject dimensions in the evidence items, never catalog labels, editorial-centrality metadata, or facts absent from the catalog. Return exactly one decision per statement ID plus the whole-article judgment.\n\nARTICLE DRAFT:\n{draft_json}\n\nEVIDENCE CATALOG:\n{catalog_json}"
+        "Independently verify every article statement against only its cited evidence-catalog items. Mark entailed=false if any part is unsupported, embellished, temporally misleading, or broader than its citations. For a source-backed catalog, every statement must cite source evidence for its concrete subject matter; reject a merely decorative source citation. A graph stale flag alone does not establish that the underlying real-world fact changed. Check the complete claim using its exact cited source passage and any cited graph status together. This is a private wiki, not a general encyclopedia. Mark relevant=true when an entailed statement either explains the named subject itself or explains why the subject occurs in this private knowledge space through a supported family relationship, trip, purchase, message, decision, project, event, or other meaningful local connection. Do not reject a family-specific fact merely because it would not belong in a general encyclopedia article. Still mark unrelated co-mentions and bare technical/source metadata relevant=false. Then judge the article as a whole. For a rich catalog, article_useful requires human-useful synthesis rather than disconnected facts or filler. For a sparse catalog, one concrete, entailed local-relevance fact is sufficient for a short useful article; never demand facts or synthesis absent from the catalog. article_coherent requires a lead and sections about one subject or its local connection. temporal_framing_sound requires old evidence to be framed historically rather than as current. missing_major_topics must list only major, well-supported subject dimensions in the evidence items, never catalog labels, editorial-centrality metadata, or facts absent from the catalog. Return exactly one decision per statement ID plus the whole-article judgment.\n\nARTICLE DRAFT:\n{draft_json}\n\nEVIDENCE CATALOG:\n{catalog_json}"
     ))
 }
 
@@ -5726,13 +7277,185 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use elephant_storage::{EntityRepository, EventRepository, KnowledgeViewDefinitionRepository};
+    use elephant_storage::{
+        DocRevisionRepository, EntityRepository, EventRepository, KnowledgeViewDefinitionRepository,
+    };
     use elephant_types::records::{
         Entity, EntityType, Event, KnowledgeViewDefinition, KnowledgeViewSelector,
     };
     use elephant_types::Link;
 
     use super::*;
+
+    async fn wiki_storage() -> StorageClient {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        let mut value = serde_json::to_value(BaseFields::new(
+            RecordId::new_v4(TableName::SpaceConfig),
+            "space".into(),
+            "fixture".into(),
+        ))
+        .expect("space fields");
+        value["embedding_provider"] = serde_json::json!("not-dispatched");
+        value["embedding_model"] = serde_json::json!("fixture");
+        value["embedding_dims"] = serde_json::json!(8);
+        value["processing"] = serde_json::Value::Null;
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(
+                serde_json::from_value::<elephant_types::records::SpaceConfig>(value)
+                    .expect("space config"),
+            )
+            .await
+            .expect("register fixture space");
+        storage
+    }
+
+    #[test]
+    fn wiki_definition_inner_future_types_fit_the_default_stack_budget() {
+        fn bytes<A, F: std::future::Future>(_: impl FnOnce(A) -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        // These references are type parameters of uncalled closures. No actual
+        // planner, storage, model, future or runtime is constructed or polled.
+        let phases = [
+            (
+                "definition orchestration",
+                bytes(
+                    |(planner, entities, config): (
+                        &'static WikiGraphPlanner,
+                        Vec<Entity>,
+                        WikiCreationConfig,
+                    )| {
+                        planner.create_from_entities_with_inventory("space", entities, config, None)
+                    },
+                ),
+            ),
+            (
+                "authority capture",
+                bytes(|planner: &'static WikiGraphPlanner| {
+                    planner.capture_publication_authority("space")
+                }),
+            ),
+            (
+                "plan capture",
+                bytes(|planner: &'static WikiGraphPlanner| planner.capture_preparation("space")),
+            ),
+            (
+                "inventory",
+                bytes(
+                    |(planner, entities): (&'static WikiGraphPlanner, &'static [Entity])| {
+                        planner.build_planning_inventory("space", entities)
+                    },
+                ),
+            ),
+        ];
+        for (phase, size) in phases {
+            assert!(size <= 128 * 1024, "{phase} future is {size} bytes");
+        }
+    }
+
+    #[test]
+    fn wiki_article_preparation_future_types_keep_phase_boundaries() {
+        fn bytes<A, F: std::future::Future>(_: impl FnOnce(A) -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        // Inspect the actual private futures through uncalled typed closures.
+        // These bounds constrain stored state, not cumulative machine stack use;
+        // the original source-backed Definition scenarios still qualify runtime.
+        let phases = [
+            (
+                "article join",
+                bytes(
+                    |(compiler, jobs): (
+                        &'static WikiEditorialCompiler,
+                        Vec<(usize, String, RecordId)>,
+                    )| {
+                        compiler.prepare_articles_at_epoch("space", jobs, true, "epoch")
+                    },
+                ),
+            ),
+            (
+                "article preparation",
+                bytes(
+                    |(compiler, definition): (
+                        &'static WikiEditorialCompiler,
+                        &'static RecordId,
+                    )| {
+                        compiler.prepare_at_epoch("space", definition, true, "epoch")
+                    },
+                ),
+            ),
+            (
+                "direct article compilation",
+                bytes(
+                    |(compiler, definition): (
+                        &'static WikiEditorialCompiler,
+                        &'static RecordId,
+                    )| compiler.compile("space", definition, true),
+                ),
+            ),
+            (
+                "source evidence augmentation",
+                bytes(
+                    |(compiler, definition, revision): (
+                        &'static WikiEditorialCompiler,
+                        &'static KnowledgeViewDefinition,
+                        &'static mut KnowledgeViewRevision,
+                    )| {
+                        compiler.augment_with_entity_source_evidence("space", definition, revision)
+                    },
+                ),
+            ),
+            (
+                "evidence catalog",
+                bytes(
+                    |(compiler, revision): (
+                        &'static WikiEditorialCompiler,
+                        &'static mut KnowledgeViewRevision,
+                    )| compiler.build_evidence_catalog("space", revision),
+                ),
+            ),
+        ];
+        for (phase, size) in phases {
+            assert!(size <= 32 * 1024, "{phase} future is {size} bytes");
+        }
+    }
+
+    #[test]
+    fn wiki_context_inputs_do_not_retain_editorial_future_state() {
+        fn bytes<A, F: std::future::Future>(_: impl FnOnce(A) -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        let join = bytes(
+            |(compiler, definition): (&'static WikiEditorialCompiler, &'static RecordId)| {
+                compiler.prepare_at_epoch("space", definition, true, "epoch")
+            },
+        );
+        assert!(join <= 1024, "article phase join is {join} bytes");
+        let inputs = bytes(
+            |(compiler, definition): (&'static WikiEditorialCompiler, &'static RecordId)| {
+                compiler.prepare_article_inputs("space", definition, true, "epoch")
+            },
+        );
+        let contents = bytes(
+            |(compiler, definition, inputs): (
+                &'static WikiEditorialCompiler,
+                &'static RecordId,
+                Box<WikiArticleInputs>,
+            )| {
+                compiler.prepare_article_contents("space", definition, true, "epoch", inputs)
+            },
+        );
+        // These are stored-state guards only. The original four Definition
+        // scenarios still verify the cumulative stack and actual final article.
+        assert!(
+            inputs <= 32 * 1024,
+            "article inputs future is {inputs} bytes"
+        );
+        assert!(
+            contents <= 32 * 1024,
+            "article contents future is {contents} bytes"
+        );
+    }
 
     #[test]
     fn wiki_article_concurrency_supports_large_graph_compilation() {
@@ -5743,7 +7466,7 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct MockEditorialLlm {
+    pub(super) struct MockEditorialLlm {
         planner_calls: AtomicUsize,
         organizer_calls: AtomicUsize,
         writer_calls: AtomicUsize,
@@ -6004,9 +7727,146 @@ mod tests {
         entity
     }
 
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        clippy::cloned_ref_to_slice_refs,
+        reason = "Retain exact owned fixtures and scope-identity assertions for full membership and separate security partitions."
+    )]
+    fn full_graph_receipt_identity_survives_changed_membership_but_separates_security() {
+        let first = planning_entity("First");
+        let second = planning_entity("Added later");
+        let mut classified = second.clone();
+        classified.base.security.level = 3;
+        assert_eq!(
+            wiki_definition_scope(&[first.clone()], true).unwrap(),
+            wiki_definition_scope(&[first.clone(), second.clone()], true).unwrap()
+        );
+        assert_ne!(
+            wiki_definition_scope(&[first.clone()], true).unwrap(),
+            wiki_definition_scope(&[classified], true).unwrap()
+        );
+        assert_ne!(
+            wiki_definition_scope(&[first.clone()], false).unwrap(),
+            wiki_definition_scope(&[first, second], false).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Retain exact fixture setup and zero-provider, zero-definition-write assertions for changed graph membership."
+    )]
+    async fn full_graph_planning_refuses_new_members_before_any_provider_or_definition_write() {
+        let storage = wiki_storage().await;
+        let entities = EntityRepository::new(storage.clone());
+        let original = entities
+            .create(planning_entity("Original topic"))
+            .await
+            .unwrap();
+        let llm = Arc::new(MockEditorialLlm::default());
+        let planner =
+            WikiGraphPlanner::new(storage.clone(), llm.clone(), WikiEditorialConfig::default());
+        // The all-space caller's original discovery now misses a real new member.
+        entities
+            .create(planning_entity("New member"))
+            .await
+            .unwrap();
+        let result = planner
+            .reconcile_full_graph("space", vec![original], WikiCreationConfig::default())
+            .await
+            .unwrap();
+        assert!(result.wikis.is_empty());
+        assert_eq!(result.partition_failures.len(), 1);
+        assert!(result.partition_failures[0]
+            .error
+            .contains("inventory changed"));
+        assert_eq!(llm.planner_calls.load(Ordering::SeqCst), 0);
+        assert!(KnowledgeViewDefinitionRepository::new(storage)
+            .list_page("space", 100, None)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Retain exact receipt and definition assertions proving committed sibling isolation after a partition failure."
+    )]
+    async fn wiki_partition_failure_reports_committed_sibling_without_cross_scope_support() {
+        let storage = wiki_storage().await;
+        let first = planning_entity("First partition");
+        let mut second = planning_entity("Second partition");
+        second.base.security.level = 3;
+        let entities = EntityRepository::new(storage.clone());
+        for entity in [&first, &second] {
+            entities.create(entity.clone()).await.expect("entity");
+        }
+        let llm = Arc::new(MockEditorialLlm {
+            planner_failures_remaining: AtomicUsize::new(WIKI_PLANNING_MAX_ATTEMPTS),
+            ..MockEditorialLlm::default()
+        });
+        let planner = WikiGraphPlanner::new(storage.clone(), llm, WikiEditorialConfig::default());
+        let result = planner
+            .reconcile_full_graph(
+                "space",
+                vec![first.clone(), second.clone()],
+                WikiCreationConfig {
+                    max_articles: 2,
+                    publish: false,
+                    ..WikiCreationConfig::default()
+                },
+            )
+            .await
+            .expect("aggregate result");
+        assert_eq!(result.partition_failures.len(), 1);
+        assert_eq!(
+            result.partition_failures[0].entity_ids,
+            vec![first.base.id.to_string()]
+        );
+        assert_eq!(result.wikis.len(), 1);
+        assert_eq!(result.hidden_articles, 0);
+        assert!(
+            elephant_storage::canonical_commit::CanonicalRepository::new(storage.clone())
+                .receipt("space", &result.wikis[0].definition_commit_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let definitions = KnowledgeViewDefinitionRepository::new(storage);
+        assert!(definitions
+            .get(
+                "space",
+                &wiki_article_definition_id("space", &first.base.id.to_string())
+            )
+            .await
+            .unwrap()
+            .is_none());
+        let definition = definitions
+            .get(
+                "space",
+                &wiki_article_definition_id("space", &second.base.id.to_string()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.base.security, second.base.security);
+        assert!(definition
+            .base
+            .subjects
+            .iter()
+            .any(|subject| subject.id() == &second.base.id));
+        assert!(!definition
+            .base
+            .subjects
+            .iter()
+            .any(|subject| subject.id() == &first.base.id));
+    }
+
     #[tokio::test]
     async fn organizer_scope_includes_disconnected_inventory_subjects() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let eve = planning_entity("Eve");
         let unrelated = planning_entity("Secret project");
         let ids = [eve.base.id.clone(), unrelated.base.id.clone()];
@@ -6033,6 +7893,11 @@ mod tests {
             )
             .await
             .expect("wiki");
+        assert!(
+            result.failures.is_empty(),
+            "article publication failed: {:?}",
+            result.failures
+        );
         assert_eq!(result.articles.len(), 2);
         for article in result.articles {
             let definition = KnowledgeViewDefinitionRepository::new(storage.clone())
@@ -6059,10 +7924,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn editorial_context_preparation_is_read_only_and_memo_uses_semantics() {
+        let storage = wiki_storage().await;
+        let definition_id = seeded_definition(&storage).await;
+        let graph = GraphViewCompiler::new(storage.clone());
+        let original_epoch =
+            elephant_storage::canonical_commit::CanonicalRepository::new(storage.clone())
+                .epoch("space")
+                .await
+                .expect("epoch");
+        let first = graph
+            .prepare_context("space", &definition_id, false)
+            .await
+            .expect("first");
+        let second = graph
+            .prepare_context("space", &definition_id, false)
+            .await
+            .expect("second");
+        assert!(!first.persisted && !second.persisted);
+        assert_ne!(first.revision.base.id, second.revision.base.id);
+        assert_eq!(first.observed_epoch, original_epoch);
+        assert_eq!(second.observed_epoch, original_epoch);
+        assert!(graph
+            .repository()
+            .get_view("space", &first.view.base.id)
+            .await
+            .expect("view")
+            .is_none());
+        assert!(graph
+            .repository()
+            .get_revision("space", &first.revision.base.id)
+            .await
+            .expect("revision")
+            .is_none());
+        elephant_knowledge_views::verify_projection_epoch(&storage, "space", &original_epoch)
+            .await
+            .expect("preparation does not write");
+        let fingerprint =
+            editorial_dependency_hash(&first.revision, "model-a", "model-a", true).expect("hash");
+        assert_eq!(
+            fingerprint,
+            editorial_dependency_hash(&second.revision, "model-a", "model-a", true)
+                .expect("same inputs")
+        );
+        let mut changed = second.revision.clone();
+        changed.base.security.level = changed.base.security.level.saturating_add(1);
+        assert_ne!(
+            fingerprint,
+            editorial_dependency_hash(&changed, "model-a", "model-a", true)
+                .expect("changed policy")
+        );
+        assert_ne!(
+            fingerprint,
+            editorial_dependency_hash(&second.revision, "model-b", "model-a", true)
+                .expect("changed writer")
+        );
+        let dependencies =
+            article_dependencies(&first.view, &first.revision, false, "model-a", "model-a");
+        assert!(!dependencies.iter().any(|dependency| dependency.record_id
+            == first.view.base.id.to_string()
+            || dependency.record_id == first.revision.base.id.to_string()));
+        assert!(dependencies
+            .iter()
+            .any(|dependency| dependency.record_id == definition_id.to_string()));
+        assert_eq!(
+            dependencies
+                .iter()
+                .filter(|dependency| dependency.record_type == "model")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn evidence_catalog_joins_revision_security_and_subjects_without_root_assertions() {
+        use elephant_storage::{DocRepository, SourceRepository};
         use elephant_types::records::doc_revision::RendererMetadata;
-        use elephant_types::records::{DocRevision, RevisionStatus};
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        use elephant_types::records::{Doc, DocRevision, RevisionStatus, Source, SourceType};
+        let storage = wiki_storage().await;
         let definition_id = seeded_definition(&storage).await;
         let mut context = GraphViewCompiler::new(storage.clone())
             .compile("space", &definition_id, true)
@@ -6079,12 +8018,41 @@ mod tests {
         base.subjects = vec![Link::new(forbidden_subject.clone())];
         base.subjects_state = SubjectsState::Complete;
         let revision_id = base.id.clone();
+        let text = "Secret evidence";
+        let text_hash = hex::encode(Sha256::digest(text.as_bytes()));
+        let mut source_base = base.clone();
+        source_base.id = RecordId::new_v4(TableName::Source);
+        let source_id = source_base.id.clone();
+        SourceRepository::new(storage.clone())
+            .create(Source::new(
+                source_base,
+                SourceType::Manual,
+                text_hash.clone(),
+            ))
+            .await
+            .expect("real retained source");
+        let mut doc_base = base.clone();
+        doc_base.id = RecordId::new_v4(TableName::Doc);
+        let doc_id = doc_base.id.clone();
+        DocRepository::new(storage.clone())
+            .create(Doc {
+                base: doc_base,
+                title: "Evidence fixture".into(),
+                text: text.into(),
+                sidecar_text: None,
+                source: Some(Link::new(source_id.clone())),
+                media_attachments: Vec::new(),
+                rendition_key: "wiki-exact-evidence".into(),
+                metadata: json!({}),
+            })
+            .await
+            .expect("real current source document");
         DocRevisionRepository::new(storage.clone())
             .create(DocRevision {
                 base,
-                doc: Link::new(RecordId::new_v4(TableName::Doc)),
-                text: "Secret evidence".to_string(),
-                text_hash: "sha256:test".to_string(),
+                doc: Link::new(doc_id),
+                text: text.into(),
+                text_hash: text_hash.clone(),
                 renderer: RendererMetadata {
                     name: "test".to_string(),
                     version: "1".to_string(),
@@ -6097,30 +8065,34 @@ mod tests {
             })
             .await
             .expect("revision");
-        let span = reconciled_evidence_span(
-            "Secret evidence",
-            &EvidenceSpan {
-                revision: Link::new(revision_id.clone()),
-                node: None,
-                start: 0,
-                end: 15,
-                quote_hash: String::new(),
-            },
-        )
-        .expect("span");
+        let span = EvidenceSpan {
+            revision: Link::new(revision_id.clone()),
+            node: None,
+            start: 0,
+            end: u32::try_from(text.len()).expect("fixture bytes"),
+            quote_hash: text_hash,
+        };
         context.citations.push(KnowledgeCitation {
             id: "secret".to_string(),
             kind: CitationKind::EvidenceSpan,
-            record_id: RecordId::new_v4(TableName::Rel).to_string(),
+            record_id: revision_id.to_string(),
             assertion_id: None,
-            source_id: None,
+            source_id: Some(source_id.to_string()),
             evidence_span: Some(span),
         });
         let compiler = WikiEditorialCompiler::new(
-            storage,
+            storage.clone(),
             Arc::new(MockEditorialLlm::default()),
             WikiEditorialConfig::default(),
         );
+        // Appending a classified citation does not authorize a public context
+        // to consume it. Supply the fixture's original classified partition
+        // explicitly, then verify that all evidence subjects are retained.
+        assert!(compiler
+            .build_evidence_catalog("space", &mut context.clone())
+            .await
+            .is_err());
+        context.base.security.level = 3;
         let catalog = compiler
             .build_evidence_catalog("space", &mut context)
             .await
@@ -6138,12 +8110,49 @@ mod tests {
             .dependencies
             .iter()
             .any(|dependency| dependency.record_id == revision_id.to_string()));
+        let mut stale_context = context.clone();
+        stale_context
+            .citations
+            .last_mut()
+            .expect("evidence")
+            .evidence_span
+            .as_mut()
+            .expect("span")
+            .quote_hash = "0".repeat(64);
+        assert!(compiler
+            .build_evidence_catalog("space", &mut stale_context)
+            .await
+            .is_err());
+        let mut borrowed_context = context.clone();
+        borrowed_context
+            .citations
+            .last_mut()
+            .expect("evidence")
+            .source_id = Some(RecordId::new_v4(TableName::Source).to_string());
+        assert!(compiler
+            .build_evidence_catalog("space", &mut borrowed_context)
+            .await
+            .is_err());
+        let mut changed = DocRevisionRepository::new(storage.clone())
+            .get("space", &revision_id)
+            .await
+            .expect("read")
+            .expect("revision");
+        changed.text = "Changed evidence".into();
+        DocRevisionRepository::new(storage)
+            .update("space", &revision_id, changed)
+            .await
+            .expect("malformed input fixture");
+        assert!(compiler
+            .build_evidence_catalog("space", &mut context)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn root_truth_slot_preserves_additional_and_unknown_subject_requirements() {
         use elephant_types::records::TruthSlot;
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let definition_id = seeded_definition(&storage).await;
         let definition = KnowledgeViewDefinitionRepository::new(storage.clone())
             .get("space", &definition_id)
@@ -6207,7 +8216,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoked_wiki_cannot_resume_from_completed_history_or_after_restart() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let repository = WorkItemRepository::new(storage.clone());
         let payload = ManagedWikiPayload {
             authority: ManagedWikiAuthority::Space {
@@ -6556,10 +8565,218 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::cloned_ref_to_slice_refs,
+        reason = "Retain the owned original candidate and full disconnected-input inventory oracle."
+    )]
+    async fn wiki_inventory_captures_disconnected_inputs_and_rejects_changed_originals() {
+        let storage = wiki_storage().await;
+        let planner = WikiGraphPlanner::new(
+            storage.clone(),
+            Arc::new(MockEditorialLlm::default()),
+            WikiEditorialConfig::default(),
+        );
+        let first = planning_entity("Original selected root");
+        let second = planning_entity("Disconnected organizer contributor");
+        assert!(
+            planner
+                .build_planning_inventory("space", &[first.clone()])
+                .await
+                .is_err(),
+            "an unpersisted candidate is not current input authority"
+        );
+        let entities = EntityRepository::new(storage.clone());
+        for entity in [&first, &second] {
+            entities
+                .create(entity.clone())
+                .await
+                .expect("original entity");
+        }
+        let prepared = planner
+            .build_planning_inventory("space", &[first.clone(), second.clone()])
+            .await
+            .expect("full inventory");
+        let reversed = planner
+            .build_planning_inventory("space", &[second.clone(), first.clone()])
+            .await
+            .expect("reordered inventory");
+        assert_eq!(
+            inventory_json(&prepared.dependencies).expect("dependencies"),
+            inventory_json(&reversed.dependencies).expect("reordered dependencies")
+        );
+        assert_eq!(
+            prepared.receipt.graph_fingerprint,
+            reversed.receipt.graph_fingerprint
+        );
+        assert_eq!(prepared.dependencies.len(), 2);
+        let scope = prepared.subject_scope.expect("full input envelope");
+        for entity in [&first, &second] {
+            assert!(
+                scope
+                    .subjects
+                    .iter()
+                    .any(|subject| subject.id() == &entity.base.id),
+                "disconnected organizer input must remain in the definition envelope"
+            );
+        }
+        let mut changed = second.clone();
+        changed.summary = Some("Changed after original candidate selection".into());
+        changed.base.updated_at = Utc::now();
+        entities
+            .update("space", &changed.base.id.clone(), changed)
+            .await
+            .expect("actual changed contributor");
+        assert!(
+            planner
+                .build_planning_inventory("space", &[first, second])
+                .await
+                .is_err(),
+            "original selected candidates must not be silently replaced by latest rows"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::cloned_ref_to_slice_refs,
+        reason = "Retain the owned original candidate and unrelated security-partition rejection oracle."
+    )]
+    async fn wiki_inventory_does_not_adopt_unrelated_security_partition() {
+        let storage = wiki_storage().await;
+        let planner = WikiGraphPlanner::new(
+            storage.clone(),
+            Arc::new(MockEditorialLlm::default()),
+            WikiEditorialConfig::default(),
+        );
+        let entity = planning_entity("Public inventory");
+        EntityRepository::new(storage.clone())
+            .create(entity.clone())
+            .await
+            .expect("entity");
+        let mut event = Event::new(
+            BaseFields::new(
+                RecordId::new_v4(TableName::Event),
+                "space".into(),
+                "fixture".into(),
+            ),
+            "Unrelated restricted event",
+            Vec::new(),
+            vec![Link::new(RecordId::new_v4(TableName::Source))],
+        )
+        .expect("event shape");
+        event.status = EventStatus::Approved;
+        event.base.security.policy_id = "unrelated-policy".into();
+        event.base.subjects = vec![Link::new(entity.base.id.clone())];
+        EventRepository::new(storage)
+            .create(event)
+            .await
+            .expect("restricted row");
+        let prepared = planner
+            .build_planning_inventory("space", &[entity.clone()])
+            .await
+            .expect("partition inventory");
+        assert_eq!(
+            prepared.receipt.events_scanned, 1,
+            "complete scan receipt retained"
+        );
+        assert_eq!(
+            prepared.dependencies.len(),
+            1,
+            "filtered rows do not become content authority"
+        );
+        assert_eq!(prepared.dependencies[0].base().id, entity.base.id);
+        assert_eq!(prepared.entities[0].events, 0);
+        assert!(prepared
+            .subject_scope
+            .expect("scope")
+            .provenance
+            .sources
+            .is_empty());
+    }
+
+    #[test]
+    fn wiki_inventory_keeps_raw_source_cas_and_both_policy_envelopes() {
+        use elephant_types::records::{Source, SourceType};
+
+        let mut raw = Source::new(
+            planning_entity("Source scope").base,
+            SourceType::Manual,
+            "desired-R2".into(),
+        );
+        raw.base.id = RecordId::new_v4(TableName::Source);
+        raw.base.subjects = vec![Link::new(RecordId::new_v4(TableName::Entity))];
+        raw.metadata = json!({"original_desired_input": "R2"});
+        let mut published = raw.clone();
+        published.hash = "published-R1".into();
+        published.metadata = json!({"original_published_input": "R1"});
+        published.base.subjects = vec![Link::new(RecordId::new_v4(TableName::Entity))];
+        let original_parent = RecordId::new_v4(TableName::Source);
+        published.base.provenance.sources = vec![original_parent.clone()];
+        let mut scope = raw.base.clone();
+        let mut dependencies = BTreeMap::new();
+        retain_inventory_envelope(
+            &mut scope,
+            &CanonicalRecord::Source(Box::new(published.clone())),
+        )
+        .expect("published envelope");
+        retain_inventory_record(
+            &mut scope,
+            &mut dependencies,
+            CanonicalRecord::Source(Box::new(raw.clone())),
+        )
+        .expect("raw CAS input");
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(
+            inventory_json(&dependencies[&raw.base.id]).expect("actual input"),
+            inventory_json(&CanonicalRecord::Source(Box::new(raw.clone())))
+                .expect("original raw input")
+        );
+        assert!(scope.subjects.contains(&raw.base.subjects[0]));
+        assert!(scope.subjects.contains(&published.base.subjects[0]));
+        assert!(scope.provenance.sources.contains(&raw.base.id));
+        assert!(scope.provenance.sources.contains(&original_parent));
+        published.base.security.policy_id = "foreign-published-policy".into();
+        assert!(retain_inventory_envelope(
+            &mut scope,
+            &CanonicalRecord::Source(Box::new(published))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn wiki_inventory_rejects_conflicting_duplicate_snapshots_and_policy_union() {
+        let original = planning_entity("Original");
+        let mut scope = original.base.clone();
+        let mut dependencies = BTreeMap::new();
+        retain_inventory_record(
+            &mut scope,
+            &mut dependencies,
+            CanonicalRecord::Entity(Box::new(original.clone())),
+        )
+        .expect("original row");
+        let mut changed = original.clone();
+        changed.summary = Some("Different content under the same identity".into());
+        assert!(retain_inventory_record(
+            &mut scope,
+            &mut dependencies,
+            CanonicalRecord::Entity(Box::new(changed))
+        )
+        .is_err());
+        let mut foreign = planning_entity("Foreign policy");
+        foreign.base.security.policy_id = "different-policy".into();
+        assert!(retain_inventory_record(
+            &mut scope,
+            &mut dependencies,
+            CanonicalRecord::Entity(Box::new(foreign))
+        )
+        .is_err());
+        assert_eq!(dependencies.len(), 1);
+    }
+
+    #[tokio::test]
     async fn wiki_planning_receipt_covers_complete_security_scoped_input() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let llm = Arc::new(MockEditorialLlm::default());
-        let planner = WikiGraphPlanner::new(storage, llm, WikiEditorialConfig::default());
+        let planner = WikiGraphPlanner::new(storage.clone(), llm, WikiEditorialConfig::default());
         let candidates = vec![
             planning_entity("Eve"),
             planning_entity("Duplicate Person"),
@@ -6567,6 +8784,12 @@ mod tests {
             planning_entity("Noah"),
             planning_entity("Noah Example"),
         ];
+        for entity in &candidates {
+            EntityRepository::new(storage.clone())
+                .create(entity.clone())
+                .await
+                .expect("original inventory entity");
+        }
         let prepared = planner
             .build_planning_inventory("space", &candidates)
             .await
@@ -6607,7 +8830,7 @@ mod tests {
 
     #[tokio::test]
     async fn wiki_retries_transient_planner_and_organizer_stream_failures() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let llm = Arc::new(MockEditorialLlm {
             planner_failures_remaining: AtomicUsize::new(7),
             organizer_failures_remaining: AtomicUsize::new(7),
@@ -6640,7 +8863,7 @@ mod tests {
 
     #[tokio::test]
     async fn wiki_organizer_retries_with_exact_validation_feedback() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let llm = Arc::new(MockEditorialLlm {
             organizer_invalid_results_remaining: AtomicUsize::new(1),
             ..MockEditorialLlm::default()
@@ -6671,7 +8894,7 @@ mod tests {
 
     #[tokio::test]
     async fn wiki_taxonomy_assignment_is_bounded_and_exhaustive() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let llm = Arc::new(MockEditorialLlm::default());
         let planner = WikiGraphPlanner::new(storage, llm.clone(), WikiEditorialConfig::default());
         let inventory = (0..61)
@@ -6731,21 +8954,132 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Retain exact bounded fixture span conversions and the original approved-event-only evidence oracle."
+    )]
     async fn wiki_planning_includes_entities_supported_only_by_approved_events() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let llm = Arc::new(MockEditorialLlm::default());
         let planner = WikiGraphPlanner::new(storage.clone(), llm, WikiEditorialConfig::default());
         let mut entity = planning_entity("Rome trip");
         entity.summary = None;
+        // This retained no-head source has real immutable evidence. It does
+        // not pretend to be a newly accepted whole-source publication.
+        let text = "Family trip to Rome";
+        let hash = crate::extraction::AssertionValidator::hash_quote(text);
+        let mut source_base = BaseFields::new(
+            RecordId::new_v4(TableName::Source),
+            "space".into(),
+            "test".into(),
+        );
+        // The immutable evidence below inherits this original subject
+        // classification; it cannot turn an unknown source into a complete one.
+        source_base.subjects = vec![Link::new(entity.base.id.clone())];
+        source_base.subjects_state = SubjectsState::Complete;
+        let source = elephant_storage::SourceRepository::new(storage.clone())
+            .create(elephant_types::records::Source::new(
+                source_base,
+                elephant_types::records::SourceType::Manual,
+                hash.clone(),
+            ))
+            .await
+            .expect("retained source");
+        let evidence_base = |table| {
+            let mut base = BaseFields::new(RecordId::new_v4(table), "space".into(), "test".into());
+            base.provenance.sources = vec![source.base.id.clone()];
+            base.subjects = vec![Link::new(entity.base.id.clone())];
+            base.subjects_state = SubjectsState::Complete;
+            base
+        };
+        let doc = elephant_storage::DocRepository::new(storage.clone())
+            .create(elephant_types::records::Doc {
+                base: evidence_base(TableName::Doc),
+                title: text.into(),
+                text: text.into(),
+                sidecar_text: None,
+                source: Some(Link::new(source.base.id.clone())),
+                media_attachments: vec![],
+                rendition_key: Uuid::new_v4().to_string(),
+                metadata: json!({}),
+            })
+            .await
+            .expect("source document");
+        let revision = DocRevisionRepository::new(storage.clone())
+            .create(elephant_types::records::DocRevision {
+                base: evidence_base(TableName::DocRevision),
+                doc: Link::new(doc.base.id),
+                text: text.into(),
+                text_hash: hash.clone(),
+                renderer: elephant_types::records::doc_revision::RendererMetadata {
+                    name: "retained".into(),
+                    version: "1".into(),
+                    config_hash: None,
+                },
+                manifest: None,
+                supersedes: None,
+                status: elephant_types::records::RevisionStatus::Active,
+                rendered_at: Utc::now(),
+            })
+            .await
+            .expect("immutable revision");
+        let node = elephant_storage::DocNodeRepository::new(storage.clone())
+            .create(elephant_types::records::DocNode {
+                base: evidence_base(TableName::DocNode),
+                revision: Link::new(revision.base.id.clone()),
+                role: elephant_types::records::doc_node::NodeRole::Paragraph,
+                span: elephant_types::records::doc_node::TextSpan::new(
+                    0,
+                    u32::try_from(text.len()).unwrap(),
+                ),
+                node_key: "event-original-node".into(),
+                text: None,
+                parent: None,
+                position: 0,
+                depth: 0,
+                embedding_model: None,
+                collection: None,
+            })
+            .await
+            .expect("real immutable evidence node without materialized text");
+        let assertion = AssertionRepository::new(storage.clone())
+            .create(elephant_types::records::Assertion {
+                base: evidence_base(TableName::Assertion),
+                subject_text: "Family".into(),
+                predicate_raw: "visited".into(),
+                predicate_id: None,
+                object_text: Some("Rome".into()),
+                object_literal: None,
+                evidence: EvidenceSpan {
+                    revision: Link::new(revision.base.id),
+                    node: Some(Link::new(node.base.id.clone())),
+                    start: 0,
+                    end: u32::try_from(text.len()).unwrap(),
+                    quote_hash: hash,
+                },
+                source_event_time: None,
+                observed_at: Utc::now(),
+                asserted_at: Utc::now(),
+                assertion_key: Uuid::new_v4().to_string(),
+                resolution_status: ResolutionStatus::Pending,
+                resolution_method: None,
+                resolution_confidence: None,
+                retry_state: elephant_types::records::AssertionRetryState::default(),
+                subject_entity: None,
+                object_entity: None,
+                confidence: 1.0,
+                subject_entity_type: None,
+                object_entity_type: None,
+                significance: None,
+                lifecycle_tier: "active".into(),
+            })
+            .await
+            .expect("real event evidence assertion");
         let mut event = Event::new(
-            BaseFields::new(
-                RecordId::new_v4(TableName::Event),
-                "space".to_string(),
-                "test".to_string(),
-            ),
-            "Family trip to Rome",
-            Vec::new(),
-            vec![Link::new(RecordId::new_v4(TableName::Source))],
+            evidence_base(TableName::Event),
+            text,
+            vec![Link::new(assertion.base.id.clone())],
+            vec![Link::new(source.base.id.clone())],
         )
         .expect("event");
         event.status = EventStatus::Approved;
@@ -6754,11 +9088,15 @@ mod tests {
             .create(entity.clone())
             .await
             .expect("store entity");
-        EventRepository::new(storage)
+        EventRepository::new(storage.clone())
             .create(event)
             .await
             .expect("store event");
 
+        let preparation = planner
+            .capture_preparation("space")
+            .await
+            .expect("original epoch");
         let prepared = planner
             .build_planning_inventory("space", &[entity])
             .await
@@ -6766,12 +9104,64 @@ mod tests {
         assert_eq!(prepared.receipt.events_scanned, 1);
         assert_eq!(prepared.receipt.eligible_entities, 1);
         assert_eq!(prepared.entities[0].events, 1);
+        assert_eq!(
+            prepared.entities[0].evidence_assertions, 0,
+            "eligibility comes from the approved event"
+        );
         assert!(prepared.entities[0].latest_evidence_at.is_some());
+        assert!(prepared
+            .dependencies
+            .iter()
+            .any(|row| row.base().id == source.base.id));
+        assert!(prepared
+            .dependencies
+            .iter()
+            .any(|row| row.base().id == assertion.base.id));
+        assert!(prepared.dependencies.iter().any(|row| {
+            matches!(row, CanonicalRecord::Assertion(captured) if **captured == assertion)
+        }));
+        assert!(prepared.dependencies.iter().any(|row| {
+            matches!(row, CanonicalRecord::DocRevision(captured)
+                if &captured.base.id == assertion.evidence.revision.id())
+        }));
+        assert!(prepared.dependencies.iter().any(|row| {
+            matches!(row, CanonicalRecord::Doc(captured)
+                if &captured.base.id == revision.doc.id())
+        }));
+        assert!(
+            prepared.dependencies.iter().any(|row| {
+                matches!(row, CanonicalRecord::DocNode(captured)
+                if **captured == node && captured.text.is_none())
+            }),
+            "canonical dependencies retain the persisted node, not quoted text"
+        );
+        for contributor in &prepared.dependencies {
+            preparation
+                .observe(contributor)
+                .expect("capture original contributor");
+        }
+        preparation
+            .validate_assertion_evidence(&assertion)
+            .await
+            .expect("later maintenance validation sees the same original node");
+        let mut changed = node.clone();
+        changed.span.end -= 1;
+        elephant_storage::DocNodeRepository::new(storage)
+            .update("space", &node.base.id, changed)
+            .await
+            .expect("changed original node");
+        assert!(
+            preparation
+                .validate_assertion_evidence(&assertion)
+                .await
+                .is_err(),
+            "actual node changes still invalidate the captured read set"
+        );
     }
 
     #[tokio::test]
     async fn wiki_full_graph_loader_has_no_first_page_ceiling() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let repository = EntityRepository::new(storage.clone());
         for index in 0..525 {
             let mut entity = planning_entity(&format!("Entity {index:03}"));
@@ -7019,7 +9409,7 @@ mod tests {
 
     #[tokio::test]
     async fn wiki_unchanged_fingerprint_skips_every_llm_call() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let llm = Arc::new(MockEditorialLlm::default());
         let planner =
             WikiGraphPlanner::new(storage.clone(), llm.clone(), WikiEditorialConfig::default());
@@ -7034,10 +9424,16 @@ mod tests {
             publish: true,
             ..WikiCreationConfig::default()
         };
-        planner
+        let initial = planner
             .create_from_entities("space", vec![eve.clone()], config.clone())
             .await
             .expect("initial wiki");
+        assert!(
+            initial.failures.is_empty(),
+            "initial article publication failed: {:?}",
+            initial.failures
+        );
+        assert_eq!(initial.articles.len(), config.max_articles);
         llm.planner_calls.store(0, Ordering::SeqCst);
         llm.organizer_calls.store(0, Ordering::SeqCst);
         llm.writer_calls.store(0, Ordering::SeqCst);
@@ -7075,7 +9471,7 @@ mod tests {
 
     #[tokio::test]
     async fn wiki_graph_change_replans_globally_but_keeps_unchanged_articles_hot() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let llm = Arc::new(MockEditorialLlm::default());
         let planner =
             WikiGraphPlanner::new(storage.clone(), llm.clone(), WikiEditorialConfig::default());
@@ -7094,7 +9490,7 @@ mod tests {
             publish: true,
             ..WikiCreationConfig::default()
         };
-        planner
+        let initial = planner
             .create_from_entities(
                 "space",
                 vec![eve.clone(), unrelated.clone()],
@@ -7102,19 +9498,105 @@ mod tests {
             )
             .await
             .expect("initial wiki");
+        assert!(
+            initial.failures.is_empty(),
+            "initial article publication failed: {:?}",
+            initial.failures
+        );
+        assert_eq!(initial.articles.len(), config.max_articles);
         assert_eq!(llm.writer_calls.load(Ordering::SeqCst), 2);
         assert_eq!(llm.verifier_calls.load(Ordering::SeqCst), 2);
+        let selected = initial
+            .plan
+            .articles
+            .iter()
+            .map(|article| article.entity_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            selected,
+            BTreeSet::from([eve.base.id.to_string(), unrelated.base.id.to_string(),]),
+            "both candidates actually have published articles"
+        );
+        let eve_definition =
+            wiki_article_definition_id("space", &eve.base.id.to_string()).to_string();
+        let zebra_definition =
+            wiki_article_definition_id("space", &unrelated.base.id.to_string()).to_string();
+        let initial_eve = initial
+            .articles
+            .iter()
+            .find(|article| article.view.root_record == eve_definition)
+            .expect("original Eve article");
+        let initial_zebra = initial
+            .articles
+            .iter()
+            .find(|article| article.view.root_record == zebra_definition)
+            .expect("original Zebra article");
 
         unrelated.summary = Some("The unrelated topic has changed.".to_string());
-        planner
+        // A planning candidate is an exact current stored row. Persist the
+        // graph change and retain its returned timestamp before replanning.
+        let unrelated_id = unrelated.base.id.clone();
+        unrelated = repository
+            .update("space", &unrelated_id, unrelated)
+            .await
+            .expect("persist changed graph entity");
+        let replanned = planner
             .create_from_entities("space", vec![eve, unrelated], config)
             .await
             .expect("replanned wiki");
 
+        assert!(replanned.failures.is_empty(), "{:?}", replanned.failures);
+        assert_eq!(replanned.articles.len(), 2);
+        assert_eq!(
+            replanned
+                .plan
+                .articles
+                .iter()
+                .map(|article| article.entity_id.clone())
+                .collect::<BTreeSet<_>>(),
+            selected
+        );
+        let current_eve = replanned
+            .articles
+            .iter()
+            .find(|article| article.view.root_record == eve_definition)
+            .expect("retained Eve article");
+        assert!(!current_eve.changed);
+        assert_eq!(current_eve.view.base.id, initial_eve.view.base.id);
+        assert_eq!(
+            current_eve.view.current_revision,
+            initial_eve.view.current_revision
+        );
+        assert_eq!(current_eve.revision, initial_eve.revision);
+        let current_zebra = replanned
+            .articles
+            .iter()
+            .find(|article| article.view.root_record == zebra_definition)
+            .expect("recomputed Zebra article");
+        assert!(current_zebra.changed);
+        assert_eq!(current_zebra.view.base.id, initial_zebra.view.base.id);
+        assert_ne!(
+            current_zebra.revision.base.id,
+            initial_zebra.revision.base.id
+        );
+        assert_ne!(
+            current_zebra.revision.compiler.dependency_hash,
+            initial_zebra.revision.compiler.dependency_hash
+        );
+        assert_eq!(
+            replanned
+                .articles
+                .iter()
+                .filter(|article| article.changed)
+                .count(),
+            1
+        );
         assert_eq!(llm.planner_calls.load(Ordering::SeqCst), 2);
         assert_eq!(llm.organizer_calls.load(Ordering::SeqCst), 4);
-        assert_eq!(llm.writer_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(llm.verifier_calls.load(Ordering::SeqCst), 2);
+        // The persisted Zebra input changes its own article. Eve's exact
+        // original revision stays hot; only Zebra incurs another provider pair.
+        assert_eq!(llm.writer_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(llm.verifier_calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -7127,7 +9609,7 @@ mod tests {
         let mut granted = payload_json;
         granted["authority"] = json!({"kind": "space", "space_id": "authorized-space", "grant_id": RecordId::new_v4(TableName::WorkItem)});
         let payload: ManagedWikiPayload = serde_json::from_value(granted).expect("payload");
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let denied = enqueue_managed_wiki_reconciliation(
             &storage,
             "other-space",
@@ -7146,7 +9628,7 @@ mod tests {
 
     #[tokio::test]
     async fn wiki_managed_reconciliation_schedule_is_idempotent_per_interval_bucket() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let payload = ManagedWikiPayload {
             authority: ManagedWikiAuthority::Space {
                 space_id: "space".to_string(),
@@ -7180,7 +9662,7 @@ mod tests {
 
     #[tokio::test]
     async fn wiki_successor_does_not_reuse_cancelled_periodic_item_in_same_bucket() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let payload = ManagedWikiPayload {
             authority: ManagedWikiAuthority::Space {
                 space_id: "space".to_string(),
@@ -7239,7 +9721,7 @@ mod tests {
 
     #[tokio::test]
     async fn wiki_graph_change_replaces_periodic_work_and_forces_reconciliation() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let payload = ManagedWikiPayload {
             authority: ManagedWikiAuthority::Space {
                 space_id: "space".to_string(),
@@ -7301,7 +9783,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_graph_change_in_same_bucket_keeps_a_runnable_reconciliation() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let repository = WorkItemRepository::new(storage.clone());
         let payload = ManagedWikiPayload {
             authority: ManagedWikiAuthority::Space {
@@ -7381,7 +9863,7 @@ mod tests {
 
     #[tokio::test]
     async fn llm_article_is_verified_published_and_memoized() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let definition_id = seeded_definition(&storage).await;
 
         let llm = Arc::new(MockEditorialLlm::default());
@@ -7447,7 +9929,7 @@ mod tests {
 
     #[tokio::test]
     async fn wiki_planner_persists_llm_organized_reader_navigation() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let mut eve = planning_entity("Eve");
         eve.summary = Some("Eve is Noah's daughter and an immediate family member.".to_string());
         EntityRepository::new(storage.clone())
@@ -7468,6 +9950,11 @@ mod tests {
             )
             .await
             .expect("created wiki");
+        assert!(
+            result.failures.is_empty(),
+            "article publication failed: {:?}",
+            result.failures
+        );
         assert_eq!(result.articles.len(), 1);
         let definition_id = result.articles[0]
             .view
@@ -7488,7 +9975,7 @@ mod tests {
 
     #[tokio::test]
     async fn verifier_rejection_is_repaired_before_publication() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = wiki_storage().await;
         let definition_id = seeded_definition(&storage).await;
         let llm = Arc::new(MockEditorialLlm {
             reject_first: true,
@@ -7641,6 +10128,246 @@ mod tests {
     }
 
     #[test]
+    fn closed_household_writer_output_decodes_and_passes_original_draft_guards() {
+        // Exact synthetic CLOSED writer output and its actual evidence catalog.
+        // This exercises the active parser/guards, not provider entailment,
+        // source-currentness or the unobserved post-writer failure boundary.
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/recall_preview_semantics/fixtures/household_wiki_writer149.json"
+        ))
+        .expect("closed synthetic fixture");
+        let raw = fixture["captured_output_text"]
+            .as_str()
+            .expect("original text");
+        assert_eq!(
+            hex::encode(Sha256::digest(raw.as_bytes())),
+            fixture["captured_output_text_sha256"]
+                .as_str()
+                .expect("original hash")
+        );
+        let original: Value = serde_json::from_str(raw).expect("complete original JSON");
+        let recovered = recover_editorial_output(None, raw).expect("original SDK text fallback");
+        let mut draft = decode_editorial_draft(recovered).expect("actual draft decoder");
+        assign_missing_statement_ids(&mut draft);
+        assert_eq!(
+            serde_json::to_value(&draft).expect("lossless draft"),
+            original
+        );
+        let catalog = fixture["catalog"]
+            .as_array()
+            .expect("actual catalog")
+            .iter()
+            .map(|row| EditorialEvidenceItem {
+                citation_id: row["citation_id"].as_str().expect("citation ID").into(),
+                kind: serde_json::from_value(row["kind"].clone()).expect("citation kind"),
+                record_id: row["record_id"].as_str().expect("record ID").into(),
+                canonical_statements: serde_json::from_value(row["canonical_statements"].clone())
+                    .expect("canonical statements"),
+                source_quote: row
+                    .get("source_quote")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                source_id: row
+                    .get("source_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+            .collect::<Vec<_>>();
+        validate_editorial_draft(&draft, &catalog).expect("actual source-backed draft guards");
+        assert_eq!(draft.lead.citation_ids, ["c5"]);
+        assert_eq!(draft.sections[0].statements[0].citation_ids, ["c3"]);
+        assert_eq!(draft.sections[0].statements[1].citation_ids, ["c5"]);
+    }
+
+    #[test]
+    fn wiki_phase_diagnostics_preserve_errors_and_disclose_only_typed_labels() {
+        let sensitive =
+            "provider payload and private source text must not become diagnostic labels";
+        for (error, expected) in [
+            (
+                PipelineError::ValidationError(sensitive.into()),
+                "validation_error",
+            ),
+            (
+                PipelineError::ExtractionError(sensitive.into()),
+                "model_error",
+            ),
+            (
+                PipelineError::StorageError(elephant_storage::StorageError::Conflict(
+                    sensitive.into(),
+                )),
+                "storage_conflict",
+            ),
+        ] {
+            assert_eq!(wiki_failure_kind(&error), expected);
+            let original = error.to_string();
+            let result: PipelineResult<()> = wiki_phase_result("article.writer", Err(error));
+            let preserved = result.expect_err("original error");
+            assert_eq!(preserved.to_string(), original);
+            assert_eq!(wiki_failure_kind(&preserved), expected);
+        }
+        let success: PipelineResult<u32> =
+            wiki_phase_result("article.writer", Ok::<_, PipelineError>(7));
+        assert_eq!(success.expect("successful phase unchanged"), 7);
+    }
+
+    fn source_backed_draft_fixture() -> (EditorialDraft, Vec<EditorialEvidenceItem>) {
+        let draft = EditorialDraft {
+            language: "en".into(),
+            title: "Observatory allocation".into(),
+            lead: EditorialStatement {
+                id: "lead".into(),
+                text: "The trustees allocated twelve thousand credits to the observatory trial."
+                    .into(),
+                citation_ids: vec!["source".into()],
+            },
+            sections: vec![EditorialSection {
+                id: "decision".into(),
+                heading: "Decision".into(),
+                kind: "current_facts".into(),
+                statements: vec![EditorialStatement {
+                    id: "allocation".into(),
+                    text: "The allocation may no longer reflect the current position.".into(),
+                    citation_ids: vec!["status".into()],
+                }],
+            }],
+        };
+        let catalog = vec![
+            EditorialEvidenceItem {
+                citation_id: "source".into(),
+                kind: CitationKind::EvidenceSpan,
+                record_id: "doc_revision:fixture".into(),
+                canonical_statements: vec![],
+                source_quote: Some(
+                    "The trustees allocated twelve thousand credits to the observatory trial."
+                        .into(),
+                ),
+                source_id: Some("source:fixture".into()),
+            },
+            EditorialEvidenceItem {
+                citation_id: "status".into(),
+                kind: CitationKind::GraphRecord,
+                record_id: "truth_slot:fixture".into(),
+                canonical_statements: vec!["The recorded allocation may be stale.".into()],
+                source_quote: None,
+                source_id: None,
+            },
+        ];
+        (draft, catalog)
+    }
+
+    #[test]
+    fn source_backed_article_rejects_graph_only_section_even_with_grounded_lead() {
+        let (mut draft, catalog) = source_backed_draft_fixture();
+        let error = validate_editorial_draft(&draft, &catalog).expect_err("graph-only section");
+        assert!(error.to_string().contains("statement allocation must cite"));
+        draft.sections[0].statements[0].text =
+            "The decision allocated twelve thousand credits to the trial.".into();
+        draft.sections[0].statements[0].citation_ids = vec!["source".into()];
+        validate_editorial_draft(&draft, &catalog).expect("all statements source-backed");
+        // Citation presence is a structural condition, never a substitute for
+        // the independent verifier's rejection of an unrelated source citation.
+        draft.sections[0].statements[0].text =
+            "The trustees bought a second observatory on the northern coast.".into();
+        validate_editorial_draft(&draft, &catalog).expect("presence does not grade entailment");
+        let verification = EditorialVerification {
+            decisions: vec![
+                StatementVerificationDecision {
+                    statement_id: "lead".into(),
+                    entailed: true,
+                    relevant: true,
+                    reason: "supported".into(),
+                },
+                StatementVerificationDecision {
+                    statement_id: "allocation".into(),
+                    entailed: false,
+                    relevant: true,
+                    reason: "deliberate verifier rejection".into(),
+                },
+            ],
+            article_useful: true,
+            article_coherent: true,
+            temporal_framing_sound: true,
+            missing_major_topics: vec![],
+            article_reason: "test".into(),
+        };
+        assert!(validate_verification(&draft, &verification).is_err());
+    }
+
+    #[test]
+    fn graph_only_governed_article_remains_available_without_source_catalog() {
+        let (mut draft, mut catalog) = source_backed_draft_fixture();
+        catalog.remove(0);
+        draft.lead.citation_ids = vec!["status".into()];
+        draft.lead.text =
+            "The recorded observatory allocation has an unresolved freshness question.".into();
+        validate_editorial_draft(&draft, &catalog).expect("retained graph-only context");
+    }
+
+    #[test]
+    fn source_backed_receipt_rejects_graph_only_verified_statement() {
+        let (mut draft, _) = source_backed_draft_fixture();
+        let revision = RecordId::new_v4(TableName::DocRevision);
+        let slot = RecordId::new_v4(TableName::TruthSlot);
+        let citations = vec![
+            KnowledgeCitation {
+                id: "source".into(),
+                kind: CitationKind::EvidenceSpan,
+                record_id: revision.to_string(),
+                assertion_id: None,
+                source_id: None,
+                evidence_span: Some(EvidenceSpan {
+                    revision: Link::new(revision.clone()),
+                    node: None,
+                    start: 0,
+                    end: 7,
+                    quote_hash: hex::encode(Sha256::digest(b"fixture")),
+                }),
+            },
+            KnowledgeCitation {
+                id: "status".into(),
+                kind: CitationKind::GraphRecord,
+                record_id: slot.to_string(),
+                assertion_id: None,
+                source_id: None,
+                evidence_span: None,
+            },
+        ];
+        let dependencies = vec![revision, slot]
+            .into_iter()
+            .map(|id| KnowledgeDependency {
+                record_type: id.table().to_string(),
+                record_id: id.to_string(),
+                role: "editorial_evidence".into(),
+                observed_updated_at: None,
+            })
+            .collect::<Vec<_>>();
+        let (blocks, used) = article_blocks(&draft, &citations).expect("original ledger");
+        let receipt = article_validation(&blocks, &used, &dependencies, true);
+        assert!(
+            receipt.citations_resolve
+                && receipt.factual_blocks_cited
+                && receipt.prose_is_structured
+        );
+        assert!(
+            !receipt.statements_supported,
+            "clean rendering cannot manufacture source support"
+        );
+        draft.sections[0].statements[0]
+            .citation_ids
+            .push("source".into());
+        let (blocks, used) = article_blocks(&draft, &citations).expect("span-cited ledger");
+        assert!(article_validation(&blocks, &used, &dependencies, true).statements_supported);
+        // Removing all source citations cannot silently reclassify an article
+        // whose original context was source-backed as a graph-only article.
+        draft.lead.citation_ids = vec!["status".into()];
+        draft.sections[0].statements[0].citation_ids = vec!["status".into()];
+        let (blocks, used) = article_blocks(&draft, &citations).expect("graph-only used citations");
+        assert!(!article_validation(&blocks, &used, &dependencies, true).statements_supported);
+        assert!(article_validation(&blocks, &used, &dependencies, false).statements_supported);
+    }
+
+    #[test]
     fn editorial_validation_rejects_type_only_and_context_filler_leads() {
         assert!(validate_meaningful_lead("Alice Example is a person.").is_err());
         assert!(validate_reader_facing_prose(
@@ -7686,13 +10413,40 @@ mod tests {
             end: 9,
             quote_hash: "sha256:stale".to_string(),
         };
-        let reconciled =
-            reconciled_evidence_span("Eve likes music.", &stale_span).expect("valid span");
-        assert_ne!(reconciled.quote_hash, stale_span.quote_hash);
+        assert!(validated_quote("Eve likes music.", &stale_span).is_err());
+        let exact_span = EvidenceSpan {
+            quote_hash: hex::encode(Sha256::digest(b"Eve likes")),
+            ..stale_span.clone()
+        };
         assert_eq!(
-            validated_quote("Eve likes music.", &reconciled).expect("validated quote"),
+            validated_quote("Eve likes music.", &exact_span).expect("exact quote"),
             "Eve likes"
         );
+        let prefixed_span = EvidenceSpan {
+            quote_hash: format!("sha256:{}", exact_span.quote_hash),
+            ..exact_span.clone()
+        };
+        assert_eq!(
+            validated_quote("Eve likes music.", &prefixed_span).expect("retained digest"),
+            "Eve likes"
+        );
+        assert!(validated_quote("Eve hates music.", &exact_span).is_err());
+        assert!(validated_quote(
+            "Eve likes music.",
+            &EvidenceSpan {
+                end: 0,
+                ..exact_span.clone()
+            }
+        )
+        .is_err());
+        assert!(validated_quote(
+            "Éve likes music.",
+            &EvidenceSpan {
+                end: 1,
+                ..exact_span
+            }
+        )
+        .is_err());
 
         let joined = restrictive_security_join(
             &Security {
@@ -7712,7 +10466,7 @@ mod tests {
         assert_eq!(joined.labels, vec!["home", "school"]);
         assert_eq!(joined.handling, vec!["private"]);
 
-        let promoted = policy_aware_security_join(
+        let incompatible_default = policy_aware_security_join(
             &Security {
                 policy_id: "default".to_string(),
                 ..Security::default()
@@ -7722,10 +10476,11 @@ mod tests {
                 labels: vec!["audience:household".to_string()],
                 ..Security::default()
             },
-        )
-        .expect("default policy promotion");
-        assert_eq!(promoted.policy_id, "household-v1");
-        assert_eq!(promoted.labels, vec!["audience:household"]);
+        );
+        assert!(
+            incompatible_default.is_none(),
+            "opaque default policy must not be promoted"
+        );
         assert!(policy_aware_security_join(
             &Security {
                 policy_id: "household-v1".to_string(),
@@ -7907,4 +10662,13 @@ mod tests {
             vec!["entity:33333333-3333-4333-8333-333333333333".to_string()];
         assert!(validate_wiki_plan(&plan, &inventory, &WikiCreationConfig::default()).is_err());
     }
+    include!("wiki_input_revalidation_tests.rs");
 }
+
+#[cfg(test)]
+#[path = "wiki_publication_tests.rs"]
+mod publication_tests;
+
+#[cfg(test)]
+#[path = "wiki_query_evidence_tests.rs"]
+mod query_evidence_tests;

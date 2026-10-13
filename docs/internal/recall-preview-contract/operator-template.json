@@ -1,0 +1,117 @@
+{
+  "status": "operator-template-not-provider-approval-or-qualification",
+  "notes": [
+    "Replace account, models, immutable model versions, dimensions and credential reference with explicit approved values.",
+    "Initial active profile example applies only to an empty space. Populated spaces require staged bootstrap reindex and activation.",
+    "Five operation approvals are illustrated. Graph publication uses query/document embedding, extraction and support_verification; the default deterministic triage does not need its optional model binding.",
+    "No secret values are stored. HomeCore translates its own deployment/recall.toml; Recall has no endpoint reading it."
+  ],
+  "space_create": {
+    "method": "POST",
+    "path": "/v1/spaces",
+    "headers": {
+      "X-Space-Id": "research"
+    },
+    "body": {
+      "name": "research",
+      "embedding_provider": "openai",
+      "embedding_model": "REPLACE_WITH_APPROVED_EMBEDDING_MODEL",
+      "embedding_dims": 1536,
+      "purpose": "Maintain evidence-backed knowledge for this named research space",
+      "skill": "extraction/technical-docs",
+      "processing": {
+        "generation": 1,
+        "index_generation": 0,
+        "policy_id": "operator-approved-processing",
+        "connections": {
+          "remote": {
+            "id": "remote",
+            "provider": "openai",
+            "account_id": "REPLACE_WITH_APPROVED_ACCOUNT",
+            "endpoint": "https://api.openai.com/v1",
+            "credential_ref": "RECALL_RESEARCH_PROVIDER_KEY",
+            "credential_generation": 1,
+            "revoked": false
+          }
+        },
+        "profiles": {
+          "embedding-v1": {
+            "id": "embedding-v1",
+            "connection_id": "remote",
+            "model": "REPLACE_WITH_APPROVED_EMBEDDING_MODEL",
+            "model_version": "REPLACE_WITH_PINNED_MODEL_VERSION",
+            "dimensions": 1536,
+            "preprocessing": "text-v1"
+          },
+          "generation-v1": {
+            "id": "generation-v1",
+            "connection_id": "remote",
+            "model": "REPLACE_WITH_APPROVED_GENERATIVE_MODEL",
+            "model_version": "REPLACE_WITH_PINNED_MODEL_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          }
+        },
+        "bindings": {
+          "query_embedding": {
+            "id": "query_embedding-approval-v1",
+            "profile_id": "embedding-v1",
+            "revoked": false
+          },
+          "document_embedding": {
+            "id": "document_embedding-approval-v1",
+            "profile_id": "embedding-v1",
+            "revoked": false
+          },
+          "extraction": {
+            "id": "extraction-approval-v1",
+            "profile_id": "generation-v1",
+            "revoked": false
+          },
+          "triage": {
+            "id": "triage-approval-v1",
+            "profile_id": "generation-v1",
+            "revoked": false
+          },
+          "support_verification": {
+            "id": "support_verification-approval-v1",
+            "profile_id": "generation-v1",
+            "revoked": false
+          }
+        },
+        "active_embedding_profile_id": "embedding-v1",
+        "pending_reindex": null
+      }
+    }
+  },
+  "source_guidance": {
+    "security": {
+      "policy_id": "default",
+      "level": 0,
+      "labels": [],
+      "handling": []
+    },
+    "subjects": [],
+    "subjects_state": "unknown",
+    "metadata": {
+      "extraction_skill": "extraction/technical-docs",
+      "extraction_purpose": "Extract attributed claims while preserving exact source evidence",
+      "extraction_domain": "technical"
+    },
+    "labels": {
+      "scope": "research",
+      "initiative_name": [
+        "Preview",
+        "Evidence"
+      ]
+    }
+  },
+  "clearances": [
+    {
+      "policy_id": "default",
+      "max_level": 0,
+      "labels": [],
+      "handling_allow": []
+    }
+  ]
+}

@@ -1,6 +1,8 @@
 //! Benchmark runner for elephant-db kernel operations, backend comparisons,
 //! and embedded Elephant flows.
 
+#![recursion_limit = "256"]
+
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -1329,6 +1331,10 @@ async fn run_pipeline_concurrency_suite(selection: BenchmarkBackend) -> Result<V
 }
 
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark fixture ownership and drop order through measurements and reporting"
+)]
 async fn run_compare_suite(
     config: ScaleConfig,
     selection: BenchmarkBackend,
@@ -1498,6 +1504,10 @@ async fn run_compare_suite(
 }
 
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark fixture ownership and drop order through measurements and reporting"
+)]
 async fn run_scenario_suite(
     config: ScaleConfig,
     selection: BenchmarkBackend,
@@ -1624,6 +1634,10 @@ async fn run_scenario_suite(
     Ok(cases)
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark fixture ownership and drop order through measurements and reporting"
+)]
 async fn run_quality_suite(selection: BenchmarkBackend) -> Result<Vec<BenchmarkCase>> {
     let mut cases = Vec::new();
     let mut backend_results: HashMap<(String, String), Vec<QueryQualityResult>> = HashMap::new();
@@ -1686,6 +1700,10 @@ async fn run_quality_suite(selection: BenchmarkBackend) -> Result<Vec<BenchmarkC
 }
 
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark fixture ownership and drop order through measurements and reporting"
+)]
 async fn run_transcript_suite(
     config: ScaleConfig,
     selection: BenchmarkBackend,
@@ -1927,6 +1945,10 @@ async fn run_transcript_suite(
 }
 
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark handle ownership and drop order through each original operation"
+)]
 async fn run_alice_qa_suite(selection: BenchmarkBackend) -> Result<Vec<BenchmarkCase>> {
     let mut cases = Vec::new();
     let started = Instant::now();
@@ -2052,6 +2074,10 @@ async fn run_alice_qa_suite(selection: BenchmarkBackend) -> Result<Vec<Benchmark
 }
 
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark handle ownership and drop order through each original operation"
+)]
 async fn run_oz_qa_suite(selection: BenchmarkBackend) -> Result<Vec<BenchmarkCase>> {
     let mut cases = Vec::new();
     let started = Instant::now();
@@ -2177,6 +2203,10 @@ async fn run_oz_qa_suite(selection: BenchmarkBackend) -> Result<Vec<BenchmarkCas
 }
 
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark handle ownership and drop order through each original operation"
+)]
 async fn run_elephant_session_qa_suite(selection: BenchmarkBackend) -> Result<Vec<BenchmarkCase>> {
     let mut cases = Vec::new();
     let started = Instant::now();
@@ -4872,6 +4902,10 @@ async fn build_backend_doc_fixture(
     })
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark handle ownership and drop order through each original operation"
+)]
 async fn run_alice_pipeline_once(backend: StorageBackendKind) -> Result<AliceRun> {
     let started_total = Instant::now();
     let client = storage_client_for_backend(backend).await?;
@@ -4958,6 +4992,10 @@ async fn run_alice_pipeline_once(backend: StorageBackendKind) -> Result<AliceRun
     })
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark handle ownership and drop order through each original operation"
+)]
 async fn run_pipeline_overlap_once(backend: StorageBackendKind) -> Result<PipelineOverlapRun> {
     let started_total = Instant::now();
     let client = storage_client_for_backend(backend).await?;
@@ -5030,6 +5068,10 @@ async fn run_pipeline_overlap_once(backend: StorageBackendKind) -> Result<Pipeli
     })
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark handle ownership and drop order through each original operation"
+)]
 async fn run_pipeline_doc(
     client: StorageClient,
     barrier: Arc<Barrier>,
@@ -5092,6 +5134,10 @@ async fn run_pipeline_doc(
     })
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark handle ownership and drop order through each original operation"
+)]
 async fn run_overlap_searcher(
     client: StorageClient,
     barrier: Arc<Barrier>,
@@ -5447,6 +5493,10 @@ async fn evaluate_alice_question(
     })
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark handle ownership and drop order through each original operation"
+)]
 async fn build_alice_graph_qa_agent(client: &StorageClient) -> Result<AliceGraphQaAgentHarness> {
     let tool_bridge = Arc::new(ElephantToolBridge::new(create_graph_qa_dispatcher(
         client.clone(),
@@ -5664,6 +5714,10 @@ fn parse_alice_agent_answer(text: &str) -> Result<AliceAgentQaAnswer> {
         .context("failed to decode graph QA JSON response")
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark handle ownership and drop order through each original operation"
+)]
 async fn search_entity_candidates(
     client: &StorageClient,
     query: &str,
@@ -5684,6 +5738,10 @@ async fn search_entity_candidates(
     Ok(entities)
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark handle ownership and drop order through each original operation"
+)]
 async fn search_assertion_texts(
     client: &StorageClient,
     query: &str,
@@ -5836,6 +5894,10 @@ async fn search_titles(dispatcher: &ToolDispatcher, query: &str, k: usize) -> Re
     extract_titles_from_response(&decoded)
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "retain benchmark handle ownership and drop order through each original operation"
+)]
 async fn search_titles_raw(client: &StorageClient, query: &str, k: usize) -> Result<Vec<String>> {
     let repo = DocRepository::new(client.clone());
     let result = repo
@@ -5986,6 +6048,7 @@ fn space_config(space_id: &str, dims: usize) -> SpaceConfig {
     let mut base = base_for(TableName::SpaceConfig, space_id);
     base.created_by = "benchmark".to_string();
     SpaceConfig {
+        processing: None,
         base,
         embedding_provider: "hashed".to_string(),
         embedding_model: "hashed-bow-v1".to_string(),

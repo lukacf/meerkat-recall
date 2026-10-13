@@ -1,381 +1,185 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::mixed_attributes_style,
-    clippy::similar_names,
-    clippy::type_complexity,
-    clippy::float_cmp,
-    clippy::const_is_empty,
-    clippy::expect_used,
-    clippy::panic,
-    unused_imports,
-    dead_code,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity
-)]
-//! S4.8 Staged commit scenario test.
-//!
-//! Verifies work_artifact to canonical table commit flow.
+#![allow(clippy::expect_used, clippy::panic)]
+//! S4.8: actual accepted-source staging, rejection, retry and publication.
 
-use chrono::Utc;
+use elephant_pipeline::scheduler::extraction_work_kinds::{
+    EXTRACT_ASSERTIONS_KIND, KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE,
+};
+use elephant_pipeline::scheduler::staged_commit::{
+    validate_artifacts, StagedCommit, COMMIT_BUNDLE_ARTIFACT_TYPE,
+};
 use elephant_storage::{
-    AssertionRepository, Repository, SourceRepository, WorkArtifactRepository, WorkItemRepository,
-    WorkRunRepository,
+    AssertionRepository, Repository, SystemEventRepository, WorkArtifactRepository,
+    WorkItemRepository,
 };
-use elephant_types::ids::TableName;
-use elephant_types::records::assertion::{
-    Assertion, AssertionRetryState, EvidenceSpan, ResolutionStatus,
-};
-use elephant_types::records::base::{BaseFields, Security, SubjectsState};
-use elephant_types::records::source::{Source, SourceType};
-use elephant_types::records::work::{
-    ArtifactStatus, WorkArtifact, WorkItem, WorkItemStatus, WorkRun, WorkRunMetrics,
-};
-use elephant_types::{Link, RecordId};
+use elephant_types::publication::OperationState;
+use elephant_types::records::work::{ArtifactStatus, WorkItem, WorkItemStatus};
+use elephant_types::RecordId;
 
+use crate::grounded_source_fixture::{EmploymentExtractor, GroundedSourceFixture};
 use crate::Harness;
 
-/// S4.8: Staged commit from work artifacts to canonical tables.
-///
-/// Test invariants:
-/// 1. Extraction results written to work_artifact first
-/// 2. Promotion moves artifacts to canonical tables atomically
-/// 3. Failed promotion leaves artifacts intact for retry
-/// 4. Successful promotion cleans up work artifacts
+async fn runnable_for_run(
+    items: &WorkItemRepository,
+    space: &str,
+    kind: &str,
+    run: &RecordId,
+) -> anyhow::Result<WorkItem> {
+    let matches = items
+        .find_by_status(space, WorkItemStatus::Runnable)
+        .await?
+        .into_iter()
+        .filter(|item| item.kind == kind && item.payload["work_run_id"] == run.to_string())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(matches.len() == 1, "expected one {kind} for original run");
+    Ok(matches[0].clone())
+}
+
 #[tokio::test]
 async fn scenario_s4_8_staged_commit() -> anyhow::Result<()> {
-    let harness = Harness::new().await?;
-    let source_repo = SourceRepository::new(harness.client.clone());
-    let assertion_repo = AssertionRepository::new(harness.client.clone());
-    let work_item_repo = WorkItemRepository::new(harness.client.clone());
-    let work_run_repo = WorkRunRepository::new(harness.client.clone());
-    let work_artifact_repo = WorkArtifactRepository::new(harness.client.clone());
+    let harness = Box::pin(Harness::new()).await?;
+    let storage = &harness.client;
+    let space = "Space_StagedCommit";
+    let fixture = GroundedSourceFixture::new(storage, space).await?;
+    let extractor = EmploymentExtractor::new();
+    let accepted =
+        Box::pin(fixture.accept_text(storage, "Supported employment", "Alice works at Acme Corp."))
+            .await?;
+    let items = WorkItemRepository::new(storage.clone());
+    let artifacts = WorkArtifactRepository::new(storage.clone());
+    let assertions = AssertionRepository::new(storage.clone());
+    let events = SystemEventRepository::new(storage.clone());
 
-    let space_id = "Space_StagedCommit";
-    let now = Utc::now();
-
-    // Create prerequisite: source for provenance tracking
-    let source_id = RecordId::new_v4(TableName::Source);
-    let mut source_base =
-        BaseFields::new(source_id.clone(), space_id.to_string(), "P_sys".to_string());
-    source_base.security = Security {
-        policy_id: "default".to_string(),
-        level: 1,
-        ..Default::default()
-    };
-    source_base.subjects_state = SubjectsState::Complete;
-    let mut source = Source::new(
-        source_base,
-        SourceType::Email,
-        "hash_staged_commit".to_string(),
-    );
-    source.external_id = Some("email-staged-001".to_string());
-    source.uri = Some("mailto:sender@example.com".to_string());
-    source.metadata = serde_json::json!({
-        "subject": "Q4 Report",
-        "from": "alice@example.com"
-    });
-    source_repo.create(source).await?;
-
-    // Use placeholder doc_revision ID for evidence spans
-    // (In production, DocRevision would be created by the renderer pipeline)
-    let doc_rev_id = RecordId::new_v4(TableName::DocRevision);
-
-    // Create a work item for the extraction job
-    let work_item_id = RecordId::new_v4(TableName::WorkItem);
-    let work_item_base = BaseFields::new(
-        work_item_id.clone(),
-        space_id.to_string(),
-        "scheduler".to_string(),
-    );
-    let work_item = WorkItem {
-        base: work_item_base,
-        kind: "extract_assertions".to_string(),
-        payload: serde_json::json!({
-            "doc_revision": doc_rev_id.to_string(),
-            "source": source_id.to_string()
-        }),
-        status: WorkItemStatus::Running, // Currently executing
-        priority: 10,
-        idempotency_key: format!("extract:{}", doc_rev_id),
-        attempts: 1,
-        lease_expires_at: Some(now + chrono::Duration::minutes(5)),
-        leased_by: Some("worker-1".to_string()),
-        run_after: None,
-        last_error: None,
-    };
-    let created_work_item = work_item_repo.create(work_item).await?;
+    // Run real accepted metadata, rendering and planning, then stop immediately
+    // after the one tiny document's extraction. Every stage claims its own lease.
+    let mut extracted_run = None;
+    for _ in 0..20 {
+        let runnable = items
+            .find_by_status(space, WorkItemStatus::Runnable)
+            .await?;
+        anyhow::ensure!(!runnable.is_empty(), "extraction was never scheduled");
+        if let Some(extract) = runnable
+            .iter()
+            .find(|item| item.kind == EXTRACT_ASSERTIONS_KIND)
+        {
+            extracted_run = Some(Box::pin(fixture.run_item(storage, &extractor, extract)).await?);
+            break;
+        }
+        for item in runnable {
+            Box::pin(fixture.run_item(storage, &extractor, &item)).await?;
+        }
+    }
+    let run = extracted_run.expect("bounded source stages must reach extraction");
+    let staged = artifacts.find_by_work_run(&run).await?;
+    assert_eq!(staged.len(), 1);
+    let candidate = staged[0].clone();
+    assert_eq!(candidate.artifact_type, KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE);
+    assert_eq!(candidate.status, ArtifactStatus::Draft);
     assert_eq!(
-        created_work_item.status,
-        WorkItemStatus::Running,
-        "Work item should be running"
+        candidate.data["assertions"]
+            .as_array()
+            .expect("claims")
+            .len(),
+        1
     );
+    assert!(assertions.list(space, 10, None).await?.is_empty());
+    let outbox_before = serde_json::to_value(events.get_after_seq(space, 0, 100).await?)?;
 
-    // Create the work run
-    let work_run_id = RecordId::new_v4(TableName::WorkRun);
-    let work_run_base = BaseFields::new(
-        work_run_id.clone(),
-        space_id.to_string(),
-        "worker-1".to_string(),
-    );
-    let work_run = WorkRun {
-        base: work_run_base,
-        work_item: Link::new(work_item_id.clone()),
-        attempt: 1,
-        started_at: now,
-        completed_at: None, // Still running
-        success: false,     // Not yet determined
-        error: None,
-        metrics: WorkRunMetrics {
-            tokens_used: 0,
-            steps_taken: 0,
-            wall_time_ms: 0,
-            estimated_cost_euros: 0.0,
-            custom: std::collections::HashMap::new(),
-        },
-        worker_id: "worker-1".to_string(),
-        worker_version: "1.0.0".to_string(),
-        model_version: Some("gpt-4-turbo".to_string()),
-        prompt_id: None,
-        config_hash: Some("sha256:config_abc".to_string()),
-    };
-    let created_work_run = work_run_repo.create(work_run).await?;
-
-    // Invariant 1: Extraction results written to work_artifact first
-    // The extractor produces assertions, which are staged as artifacts
-    let artifact_1_id = RecordId::new_v4(TableName::WorkArtifact);
-    let artifact_1_base = BaseFields::new(
-        artifact_1_id.clone(),
-        space_id.to_string(),
-        "worker-1".to_string(),
-    );
-    let staged_assertion_1 = serde_json::json!({
-        "subject_text": "Q4 revenue",
-        "predicate_raw": "exceeded",
-        "object_text": "projections",
-        "evidence": {
-            "revision": doc_rev_id.to_string(),
-            "start": 0,
-            "end": 34,
-            "quote_hash": "sha256:quote_1"
-        },
-        "confidence": 0.92
-    });
-    let artifact_1 = WorkArtifact {
-        base: artifact_1_base,
-        work_run: Link::new(work_run_id.clone()),
-        artifact_type: "assertion".to_string(),
-        data: staged_assertion_1.clone(),
-        status: ArtifactStatus::Draft, // Initially staged as draft
-        validation_errors: None,
-        validated_at: None,
-        committed_at: None,
-    };
-    let created_artifact_1 = work_artifact_repo.create(artifact_1).await?;
-    assert_eq!(
-        created_artifact_1.status,
-        ArtifactStatus::Draft,
-        "Artifact should start as Draft"
-    );
-
-    let artifact_2_id = RecordId::new_v4(TableName::WorkArtifact);
-    let artifact_2_base = BaseFields::new(
-        artifact_2_id.clone(),
-        space_id.to_string(),
-        "worker-1".to_string(),
-    );
-    let staged_assertion_2 = serde_json::json!({
-        "subject_text": "John Smith",
-        "predicate_raw": "led",
-        "object_text": "the marketing campaign",
-        "evidence": {
-            "revision": doc_rev_id.to_string(),
-            "start": 36,
-            "end": 70,
-            "quote_hash": "sha256:quote_2"
-        },
-        "confidence": 0.88
-    });
-    let artifact_2 = WorkArtifact {
-        base: artifact_2_base,
-        work_run: Link::new(work_run_id.clone()),
-        artifact_type: "assertion".to_string(),
-        data: staged_assertion_2.clone(),
-        status: ArtifactStatus::Draft,
-        validation_errors: None,
-        validated_at: None,
-        committed_at: None,
-    };
-    let created_artifact_2 = work_artifact_repo.create(artifact_2).await?;
-
-    // Invariant 3: Failed validation leaves artifacts intact for retry
-    // Simulate a validation failure on artifact 2
-    let mut failed_artifact = created_artifact_2.clone();
-    failed_artifact.status = ArtifactStatus::Rejected;
-    failed_artifact.validation_errors = Some(vec![
-        "Subject 'John Smith' requires entity disambiguation".to_string(),
-    ]);
-    let rejected_artifact = work_artifact_repo
-        .update(space_id, &artifact_2_id, failed_artifact)
+    // A deliberately damaged staged interpretation must pass through the real
+    // evidence validator and remain inspectable. No test marks it rejected.
+    let mut unsupported = candidate.clone();
+    unsupported.data["assertions"][0]["support_verification"] = serde_json::Value::Null;
+    let rejected_data = unsupported.data.clone();
+    artifacts
+        .update(space, &candidate.base.id, unsupported)
         .await?;
+    let results = Box::pin(validate_artifacts::execute(
+        &StagedCommit::new(storage.clone()),
+        space,
+        &run,
+    ))
+    .await?;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, ArtifactStatus::Rejected);
+    assert_eq!(results[0].data, rejected_data);
+    assert!(results[0]
+        .validation_errors
+        .as_ref()
+        .expect("rejection reason")
+        .iter()
+        .any(|error| error.contains("unsupported interpretation")));
+    assert!(assertions.list(space, 10, None).await?.is_empty());
     assert_eq!(
-        rejected_artifact.status,
-        ArtifactStatus::Rejected,
-        "Failed validation should set Rejected status"
+        serde_json::to_value(events.get_after_seq(space, 0, 100).await?)?,
+        outbox_before
     );
+    assert!(artifacts
+        .find_by_work_run(&run)
+        .await?
+        .iter()
+        .all(|artifact| artifact.artifact_type != COMMIT_BUNDLE_ARTIFACT_TYPE));
+
+    // Repair only the test's injected staged corruption using the unchanged
+    // original supported extraction. Normal queued validation, bundle creation,
+    // registration and finalization still execute; no canonical row is seeded.
+    artifacts
+        .update_if_status(
+            space,
+            &candidate.base.id,
+            candidate.clone(),
+            ArtifactStatus::Rejected,
+        )
+        .await?
+        .expect("rejected candidate retained for retry");
+    let validate = runnable_for_run(&items, space, "validate_artifacts", &run).await?;
+    Box::pin(fixture.run_item(storage, &extractor, &validate)).await?;
+    let validated = artifacts.find_by_work_run(&run).await?;
+    let bundle = validated
+        .iter()
+        .find(|artifact| artifact.artifact_type == COMMIT_BUNDLE_ARTIFACT_TYPE)
+        .expect("actual validated bundle");
+    assert_eq!(bundle.status, ArtifactStatus::Validated);
+    assert!(assertions.list(space, 10, None).await?.is_empty());
+    let commit = runnable_for_run(&items, space, "commit_artifacts", &run).await?;
+    Box::pin(fixture.run_item(storage, &extractor, &commit)).await?;
     assert!(
-        rejected_artifact.validation_errors.is_some(),
-        "Validation errors should be recorded"
-    );
-    // Data should still be intact for inspection/retry
-    assert_eq!(
-        rejected_artifact.data["subject_text"], staged_assertion_2["subject_text"],
-        "Rejected artifact data should be preserved"
+        assertions.list(space, 10, None).await?.is_empty(),
+        "registration alone cannot expose an incomplete source"
     );
 
-    // Invariant 2: Promotion moves artifacts to canonical tables atomically
-    // Validate and commit artifact 1
-    let mut validated_artifact = created_artifact_1.clone();
-    validated_artifact.status = ArtifactStatus::Validated;
-    validated_artifact.validated_at = Some(now);
-    let validated_artifact_1 = work_artifact_repo
-        .update(space_id, &artifact_1_id, validated_artifact)
-        .await?;
+    Box::pin(fixture.drive(storage, &extractor)).await?;
+    let operation =
+        elephant_storage::source_publication::SourcePublicationRepository::new(storage.clone())
+            .operation(space, &accepted.operation.operation_id)
+            .await?
+            .expect("original operation");
+    assert_eq!(operation.state, OperationState::Completed);
     assert_eq!(
-        validated_artifact_1.status,
-        ArtifactStatus::Validated,
-        "Artifact should be validated"
+        operation.published_revision.as_deref(),
+        Some(accepted.publication.revision_id.as_str())
     );
-
-    // Create the canonical assertion from the validated artifact
-    let assertion_id = RecordId::new_v4(TableName::Assertion);
-    let assertion_base = BaseFields::new(
-        assertion_id.clone(),
-        space_id.to_string(),
-        "commit_worker".to_string(),
-    );
-    // Note: Not setting provenance.sources to avoid SurrealDB meta::tb() serialization issues
-    let assertion = Assertion {
-        base: assertion_base,
-        subject_text: staged_assertion_1["subject_text"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-        predicate_raw: staged_assertion_1["predicate_raw"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-        predicate_id: None,
-        object_text: staged_assertion_1["object_text"]
-            .as_str()
-            .map(|s| s.to_string()),
-        object_literal: None,
-        evidence: EvidenceSpan {
-            revision: Link::new(doc_rev_id.clone()),
-            node: None,
-            start: 0,
-            end: 34,
-            quote_hash: "sha256:quote_1".to_string(),
-        },
-        source_event_time: None,
-        observed_at: now,
-        asserted_at: now,
-        assertion_key: format!("{}:exceeded:0-34", doc_rev_id),
-        resolution_status: ResolutionStatus::Pending,
-        resolution_method: None,
-        resolution_confidence: None,
-        retry_state: AssertionRetryState::default(),
-        subject_entity: None,
-        object_entity: None,
-        confidence: staged_assertion_1["confidence"].as_f64().unwrap() as f32,
-        subject_entity_type: None,
-        object_entity_type: None,
-        significance: None,
-        lifecycle_tier: "active".to_string(),
-    };
-    let committed_assertion = assertion_repo.create(assertion).await?;
+    let published = assertions.list(space, 10, None).await?;
     assert_eq!(
-        committed_assertion.subject_text, "Q4 revenue",
-        "Assertion should be created in canonical table"
-    );
-
-    // Invariant 4: Successful promotion cleans up work artifacts
-    // Mark artifact as committed
-    let mut committed_artifact = validated_artifact_1.clone();
-    committed_artifact.status = ArtifactStatus::Committed;
-    committed_artifact.committed_at = Some(now);
-    let final_artifact_1 = work_artifact_repo
-        .update(space_id, &artifact_1_id, committed_artifact)
-        .await?;
-    assert_eq!(
-        final_artifact_1.status,
-        ArtifactStatus::Committed,
-        "Artifact should be marked as committed"
-    );
-    assert!(
-        final_artifact_1.committed_at.is_some(),
-        "Commit timestamp should be recorded"
-    );
-
-    // Mark work run as completed successfully
-    let mut completed_run = created_work_run.clone();
-    completed_run.completed_at = Some(now);
-    completed_run.success = true;
-    completed_run.metrics = WorkRunMetrics {
-        tokens_used: 1500,
-        steps_taken: 1,
-        wall_time_ms: 2500,
-        estimated_cost_euros: 0.003,
-        custom: std::collections::HashMap::new(),
-    };
-    let final_run = work_run_repo
-        .update(space_id, &work_run_id, completed_run)
-        .await?;
-    assert!(final_run.success, "Work run should be successful");
-    assert!(
-        final_run.completed_at.is_some(),
-        "Completion time should be recorded"
-    );
-
-    // Mark work item as done
-    let mut done_work_item = created_work_item.clone();
-    done_work_item.status = WorkItemStatus::Done;
-    done_work_item.lease_expires_at = None;
-    done_work_item.leased_by = None;
-    let final_work_item = work_item_repo
-        .update(space_id, &work_item_id, done_work_item)
-        .await?;
-    assert_eq!(
-        final_work_item.status,
-        WorkItemStatus::Done,
-        "Work item should be Done"
-    );
-
-    // Verify final state: one canonical assertion created
-    let all_assertions = assertion_repo.list(space_id, 100, None).await?;
-    assert_eq!(
-        all_assertions.len(),
+        published.len(),
         1,
-        "One assertion should be in canonical table"
+        "retry publishes one supported claim exactly once"
     );
-
-    // Verify artifact states
-    let all_artifacts = work_artifact_repo.list(space_id, 100, None).await?;
-    assert_eq!(all_artifacts.len(), 2, "Both artifacts should exist");
-
-    let committed_count = all_artifacts
-        .iter()
-        .filter(|a| a.status == ArtifactStatus::Committed)
-        .count();
-    let rejected_count = all_artifacts
-        .iter()
-        .filter(|a| a.status == ArtifactStatus::Rejected)
-        .count();
-
-    assert_eq!(committed_count, 1, "One artifact should be committed");
-    assert_eq!(
-        rejected_count, 1,
-        "One artifact should be rejected (preserved for retry)"
+    let evidence = elephant_storage::read_eligibility::ReadEligibility::new(storage.clone())
+        .evidence(space, &published[0].evidence, &|_| true)
+        .await?
+        .expect("current exact source evidence");
+    assert_eq!(evidence.quote, "Alice works at Acme Corp.");
+    let terminal = artifacts.find_by_work_run(&run).await?;
+    assert_eq!(terminal.len(), 2);
+    assert!(
+        terminal
+            .iter()
+            .all(|artifact| artifact.status == ArtifactStatus::Committed
+                && artifact.committed_at.is_some()),
+        "successful publication retires staged work durably"
     );
-
+    assert_ne!(
+        serde_json::to_value(events.get_after_seq(space, 0, 100).await?)?,
+        outbox_before
+    );
     Ok(())
 }

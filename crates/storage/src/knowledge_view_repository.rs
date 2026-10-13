@@ -1,7 +1,5 @@
 //! Storage and atomic publication for derived knowledge views.
 
-use std::fmt::Write as _;
-
 use chrono::{DateTime, Utc};
 use elephant_types::records::base::{BaseFields, Provenance, Security, SubjectsState};
 use elephant_types::records::entity::Entity;
@@ -18,6 +16,16 @@ use surrealdb::sql::Value;
 use crate::client::StorageClient;
 use crate::error::{StorageError, StorageResult};
 use crate::require::required_field;
+
+#[path = "knowledge_view_authority.rs"]
+mod authority;
+#[path = "knowledge_view_batch.rs"]
+mod batch;
+#[path = "knowledge_view_publication.rs"]
+mod publication;
+pub use authority::PreparedKnowledgeViewAuthority;
+#[path = "knowledge_view_withdrawal.rs"]
+mod withdrawal;
 
 const VIEW_PROJECTION: &str = r"
     id,
@@ -793,7 +801,7 @@ impl KnowledgeViewRepository {
             .client
             .query_bind_checked(
                 &format!(
-                    "UPDATE knowledge_view SET publication_status = $publication_status, published_at = $published_at, updated_at = time::now() WHERE space_id = $space_id AND root_record = $root_record AND deleted_at IS NONE RETURN {VIEW_PROJECTION}"
+                    "UPDATE knowledge_view SET publication_status = $publication_status, published_at = $published_at, updated_at = time::now() WHERE space_id = $space_id AND root_record = $root_record AND deleted_at IS NONE AND publication_status != $publication_status RETURN {VIEW_PROJECTION}"
                 ),
                 crate::bindings! {
                     "space_id" => space_id,
@@ -843,7 +851,7 @@ impl KnowledgeViewRepository {
         } else {
             let mut response = self
                 .client
-                .query_bind(
+                .query_bind_checked(
                     "SELECT view FROM knowledge_view_dependency WHERE space_id = $space_id AND dependency_record IN $affected AND deleted_at IS NONE",
                     crate::bindings! {
                         "space_id" => space_id,
@@ -857,8 +865,14 @@ impl KnowledgeViewRepository {
                 ))
             })?;
             rows.into_iter()
-                .filter_map(|row| row.view.map(|view| view.id().clone()))
-                .collect::<std::collections::BTreeSet<_>>()
+                .map(|row| {
+                    row.view.map(|view| view.id().clone()).ok_or_else(|| {
+                        StorageError::DataIntegrityError(
+                            "Knowledge view dependency is missing its view reference".into(),
+                        )
+                    })
+                })
+                .collect::<StorageResult<std::collections::BTreeSet<_>>>()?
         };
 
         let mut dirty_views = Vec::new();
@@ -895,108 +909,53 @@ impl KnowledgeViewRepository {
         Ok(dirty_views.len())
     }
 
-    /// Atomically publishes an immutable revision and advances its stable view.
+    /// Publishes already prepared data after checking every recorded dependency.
+    /// Compilers must use `publish_at_epoch` with their original preparation epoch.
     pub async fn publish(
         &self,
         view: KnowledgeView,
         revision: KnowledgeViewRevision,
     ) -> StorageResult<(KnowledgeView, KnowledgeViewRevision)> {
-        let revision_id = revision.base.id.to_string();
-        if view.base.space_id != revision.base.space_id
-            || view.base.security != revision.base.security
-            || view.security_fingerprint != revision.compiler.policy_fingerprint
-            || revision.view_id != view.base.id.to_string()
-            || view.current_revision.as_deref() != Some(revision_id.as_str())
-            || view.revision_count != revision.revision
-            || !revision
-                .dependencies
-                .iter()
-                .any(|dependency| dependency.record_id == view.root_record)
-        {
-            return Err(StorageError::Conflict(
-                "Knowledge-view publication receipt does not match its view".to_string(),
-            ));
-        }
+        let observed_epoch = crate::canonical_commit::CanonicalRepository::new(self.client.clone())
+            .epoch(&view.base.space_id)
+            .await?;
+        Box::pin(self.publish_at_epoch(view, revision, &observed_epoch)).await
+    }
 
-        let indexes = Self::dependency_indexes(&view, &revision);
-        if let Some(store) = self.client.embedded_store() {
-            let published_view = view.clone();
-            let published_revision = revision.clone();
-            let published_indexes = indexes.clone();
-            store
-                .mutate(move |mutation| {
-                    if mutation
-                        .get::<KnowledgeViewRevision>(
-                            &published_revision.base.space_id,
-                            &published_revision.base.id,
-                            true,
-                        )?
-                        .is_some()
-                    {
-                        return Err(StorageError::Conflict(format!(
-                            "Knowledge view revision already exists: {}",
-                            published_revision.base.id
-                        )));
-                    }
-                    let _ = mutation.create(published_revision.clone())?;
-                    if mutation
-                        .get::<KnowledgeView>(
-                            &published_view.base.space_id,
-                            &published_view.base.id,
-                            true,
-                        )?
-                        .is_some()
-                    {
-                        let _ = mutation.replace(published_view.clone())?;
-                    } else {
-                        let _ = mutation.create(published_view.clone())?;
-                    }
-                    let old_indexes = mutation.scan::<KnowledgeViewDependencyIndex>()?;
-                    for index in old_indexes.into_iter().filter(|index| {
-                        index.base.space_id == published_revision.base.space_id
-                            && index.view.id() == &published_view.base.id
-                    }) {
-                        mutation.hard_delete::<KnowledgeViewDependencyIndex>(
-                            &published_revision.base.space_id,
-                            &index.base.id,
-                        )?;
-                    }
-                    for index in published_indexes {
-                        let _ = mutation.create(index)?;
-                    }
-                    Ok(())
-                })
-                .await?;
-            return Ok((view, revision));
-        }
+    /// Atomically publishes a view, revision, dependency index and outbox receipt.
+    /// Capture `observed_epoch` before the first compilation or provider input read.
+    pub async fn publish_at_epoch(
+        &self,
+        view: KnowledgeView,
+        revision: KnowledgeViewRevision,
+        observed_epoch: &str,
+    ) -> StorageResult<(KnowledgeView, KnowledgeViewRevision)> {
+        Box::pin(self.publish_with_authority(view, revision, observed_epoch, None)).await
+    }
 
-        let mut sql = String::from(
-            "BEGIN TRANSACTION; CREATE $revision_id CONTENT $revision; UPSERT $view_id CONTENT $view; DELETE knowledge_view_dependency WHERE space_id = $space_id AND view = $view_id;",
-        );
-        let mut bindings = crate::bindings! {
-            "revision_id" => crate::surreal::thing_from_record_id(&revision.base.id),
-            "revision" => Self::revision_to_value(&revision)?,
-            "view_id" => crate::surreal::thing_from_record_id(&view.base.id),
-            "view" => Self::view_to_value(&view)?,
-            "space_id" => view.base.space_id.clone(),
-        };
-        for (position, index) in indexes.iter().enumerate() {
-            let id_key = format!("dependency_id_{position}");
-            let value_key = format!("dependency_value_{position}");
-            write!(sql, " CREATE ${id_key} CONTENT ${value_key};").map_err(|error| {
-                StorageError::DataIntegrityError(format!(
-                    "Failed to construct dependency publication query: {error}"
-                ))
-            })?;
-            bindings.insert(
-                id_key,
-                crate::surreal::thing_from_record_id(&index.base.id).into(),
-            );
-            bindings.insert(value_key, Self::dependency_index_to_value(index)?);
-        }
-        sql.push_str(" COMMIT TRANSACTION;");
-        self.client.query_bind_checked(&sql, bindings).await?;
-        Ok((view, revision))
+    /// Publish with the original queued attempt and/or managed grant captured
+    /// before the first compiler read. All authority is rechecked in this write.
+    pub async fn publish_at_epoch_with_authority(
+        &self,
+        view: KnowledgeView,
+        revision: KnowledgeViewRevision,
+        observed_epoch: &str,
+        authority: &crate::PreparedKnowledgeViewAuthority,
+    ) -> StorageResult<(KnowledgeView, KnowledgeViewRevision)> {
+        Box::pin(self.publish_with_authority(view, revision, observed_epoch, Some(authority))).await
+    }
+
+    async fn publish_with_authority(
+        &self,
+        view: KnowledgeView,
+        revision: KnowledgeViewRevision,
+        observed_epoch: &str,
+        authority: Option<&crate::PreparedKnowledgeViewAuthority>,
+    ) -> StorageResult<(KnowledgeView, KnowledgeViewRevision)> {
+        Box::pin(self.publish_batch_at_epoch(vec![(view, revision)], observed_epoch, authority))
+            .await?
+            .pop()
+            .ok_or_else(|| publication::invalid_input("knowledge_view_empty_single_publication"))
     }
 
     /// Lists the current reverse dependency edges for a stable view.
@@ -1032,3 +991,7 @@ impl KnowledgeViewRepository {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "knowledge_view_publication_tests.rs"]
+mod publication_tests;

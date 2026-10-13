@@ -448,6 +448,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_work_edge() {
         let repo = setup_test_repo().await;
         let item = create_test_work_edge();
@@ -458,6 +462,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_work_edge() {
         let repo = setup_test_repo().await;
         let item = create_test_work_edge();
@@ -470,6 +478,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_work_edge_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_work_edge();
@@ -482,6 +494,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_work_edge() {
         let repo = setup_test_repo().await;
         let item = create_test_work_edge();

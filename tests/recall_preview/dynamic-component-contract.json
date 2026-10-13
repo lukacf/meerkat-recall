@@ -1,0 +1,458 @@
+{
+  "format": "recall-dynamic-component-contract/v1",
+  "authority": "qualification",
+  "execution_authorized": false,
+  "provider_dispatch_authorized": false,
+  "product_acceptance": false,
+  "normative_predicates": "tests/recall_preview/DYNAMIC_COMPONENT_CONTRACT.md",
+  "implementation_owner": "lifecycle",
+  "independent_review_owner": "qualification",
+  "implementation_path": "tests/recall_preview_semantics/dynamic_component_validator.py",
+  "interfaces": {
+    "validate_runtime": [
+      "reviewed_static",
+      "observed_runtime",
+      "raw_evidence",
+      "controller_context"
+    ],
+    "validate_prepared": [
+      "reviewed_static",
+      "observed_preparation",
+      "runtime_component",
+      "raw_evidence",
+      "controller_context"
+    ]
+  },
+  "raw_reference_fields": [
+    "sha256",
+    "bytes",
+    "kind"
+  ],
+  "static_parameter_fields": [
+    "review",
+    "raw_sha256",
+    "raw_bytes"
+  ],
+  "static_review_format": "recall-dynamic-component-review/v2",
+  "static_review_required_fields": [
+    "format",
+    "reviewer",
+    "approved",
+    "contract_sha256",
+    "predicate_document_sha256",
+    "identities",
+    "input_refs",
+    "helper_sha256",
+    "controller_policy",
+    "bootstrap_plans",
+    "runtime_recipe",
+    "limits",
+    "expires_at"
+  ],
+  "static_review_forbidden_dynamic_fields": [
+    "future_receipt_sha256",
+    "actual_space_configurations_sha256",
+    "actual_runtime_configuration_sha256",
+    "generated_configuration_id",
+    "process_pid",
+    "capture_inventory_sha256",
+    "prepared_fixture_sha256"
+  ],
+  "runtime_evidence_format": "recall-dynamic-runtime-evidence/v2",
+  "runtime_evidence_fields": [
+    "format",
+    "identity",
+    "bootstrap",
+    "installed_offline",
+    "actual_runtime_configuration",
+    "actual_space_configurations",
+    "controller",
+    "outer_launch",
+    "current_processes",
+    "capture_inventory",
+    "command_inventory",
+    "cleanup_obligations"
+  ],
+  "runtime_identity_fields": [
+    "source_commit",
+    "artifact_sha256",
+    "binary_sha256",
+    "runtime_sha256",
+    "paired_artifact_sha256",
+    "outer_configuration_sha256",
+    "backend",
+    "endpoint",
+    "run_nonce"
+  ],
+  "runtime_component_format": "recall-installed-runtime-component/v2",
+  "runtime_component_fields": [
+    "format",
+    "verdict",
+    "scope",
+    "product_acceptance",
+    "identity",
+    "static_review_sha256",
+    "contract_sha256",
+    "evidence_sha256",
+    "controller_sha256",
+    "actual_runtime_configuration_sha256",
+    "actual_space_configurations_sha256",
+    "required_cases",
+    "remaining_cleanup_obligations",
+    "proof_limits"
+  ],
+  "runtime_scope": "installed-offline-and-current-runtime",
+  "preparation_evidence_format": "recall-dynamic-preparation-evidence/v2",
+  "preparation_evidence_fields": [
+    "format",
+    "identity",
+    "runtime_component",
+    "observation",
+    "capture_inventory",
+    "configuration_before",
+    "configuration_after",
+    "provider_cohort_begin",
+    "provider_accounting",
+    "provider_accounting_channel",
+    "controller",
+    "original_intents",
+    "immutable_revisions"
+  ],
+  "preparation_identity_fields": [
+    "source_commit",
+    "artifact_sha256",
+    "binary_sha256",
+    "runtime_sha256",
+    "paired_artifact_sha256",
+    "outer_configuration_sha256",
+    "backend",
+    "endpoint",
+    "run_nonce",
+    "corpus_sha256",
+    "workload_contract_sha256",
+    "preparation_contract_sha256",
+    "typed_delta_sha256",
+    "rendered_map_sha256",
+    "provider_allocation_sha256",
+    "preparation_nonce"
+  ],
+  "prepared_component_format": "recall-prepared-fixture-component/v2",
+  "prepared_component_fields": [
+    "format",
+    "verdict",
+    "scope",
+    "product_acceptance",
+    "identity",
+    "static_review_sha256",
+    "contract_sha256",
+    "evidence_sha256",
+    "runtime_component_sha256",
+    "controller_sha256",
+    "actual_space_configurations_sha256",
+    "source_count",
+    "sources_per_space",
+    "published_inventory",
+    "provider_accounting_sha256",
+    "remaining_cleanup_obligations",
+    "proof_limits"
+  ],
+  "prepared_scope": "prepared-public-retrieval-fixture",
+  "required_installed_cases": [
+    "verified_installed_binary",
+    "absent_service",
+    "bootstrap_unready",
+    "fresh_cli_auth",
+    "runtime_initialized_without_workers",
+    "two_named_spaces",
+    "http_auth_denied",
+    "mcp_auth_denied",
+    "wrong_space_denied",
+    "mcp_positive",
+    "grant_revocation",
+    "source_acceptance_and_idempotence",
+    "pending_is_not_complete",
+    "input_bounds",
+    "named_export",
+    "replacement_accepted",
+    "restore_original_heads",
+    "graceful_restart",
+    "read_only_capabilities"
+  ],
+  "installed_expectation_sha256": "c791d9cdf2293e83ff393c8ece8811878c9d4cc915589d4ced2ff8b5cc890719",
+  "frozen_input_sha256": {
+    "tests/recall_preview/workload-contract.json": "696e0fa0f8736306d6e66f5ce26658a21fb013255e5727b5287406008c350a5a",
+    "tests/recall_preview/workload-corpus.json": "2192437954109fc17ebbea5b3960eb6b398a2ee91a725ce70666b119e86179dc",
+    "tests/recall_preview/workload-preparation-contract.json": "b1fd4c43e1c8c506ca13e261a29d65a7d06246bf11ef53c02e97945cd3ef56d1",
+    "tests/recall_preview/workload-allocation-typed-delta.json": "51b34aec951d783a93b903a1468fba9a8833ba2f31f705bd784c66c9b26688f8",
+    "tests/recall_preview/workload-rendered-map.json": "9dbcade15daa3fb504838c2fe4f743b4b5fc37da20b2c0f29e2e3aea49ad57ab",
+    "tests/recall_preview/primary-rendered-map.json": "aa3579d3252fa6cbe396a1003d84124b1c9541857fa78176eec57317045fb7d1"
+  },
+  "runtime_recipe": {
+    "transient_retry_max_attempts": 3,
+    "embedding_max_total_http_attempts": 3,
+    "document_tree_create_summaries": false
+  },
+  "preparation_limits": {
+    "sources": 50,
+    "sources_per_space": 25,
+    "http_requests": 4096,
+    "minimum_http_requests_with_revision_inspection": 454,
+    "additional_poll_and_existing_call_remainder": 3642,
+    "prepare_seconds": 3600,
+    "request_seconds": 10,
+    "close_seconds": 130,
+    "response_bytes": 262144,
+    "capture_bytes": 268435456,
+    "embedding_nodes_per_source": 64,
+    "source_text_bytes": 512,
+    "provider_attempts_per_backend": 450,
+    "provider_attempts_per_space": 225,
+    "provider_concurrency": 2,
+    "reservation_nano_usd_per_attempt": 1064960
+  },
+  "immutable_revision_inspection": {
+    "method": "GET",
+    "route_template": "/v1/docs/:id/revisions/:revision_id",
+    "additional_requests_per_backend": 50,
+    "route_owner": "surface",
+    "exact_response_contract_status": "awaiting owner source freeze; do not guess",
+    "counts_as_measured_query": false,
+    "counts_as_paid_provider_call": false
+  },
+  "mandatory_proof_limits": [
+    "public profile markers and completed publication are not raw vector inventory",
+    "no fabricated private publication manifest or completion certificate",
+    "no per-request physical provider attribution when G reports unmet",
+    "no semantic relevance or measured load acceptance from preparation",
+    "current persistent service terminal cleanup remains an original owned obligation",
+    "no full product acceptance from either component"
+  ],
+  "unknown_or_missing_evidence": "raise ValueError with safe static code; no partially qualified component",
+  "activation": "requires independent exact validator/helper source review and actual evidence; this contract activates nothing",
+  "independent_installed_contract": "tests/recall_preview/installed-evidence-contract.json",
+  "static_limits": {
+    "runtime_raw_bytes": 369098752,
+    "runtime_capture_bytes": 155189248,
+    "installed_capture_bytes": 100663296,
+    "preparation": {
+      "sources": 50,
+      "sources_per_space": 25,
+      "http_requests": 4096,
+      "minimum_http_requests_with_revision_inspection": 454,
+      "additional_poll_and_existing_call_remainder": 3642,
+      "prepare_seconds": 3600,
+      "request_seconds": 10,
+      "close_seconds": 130,
+      "response_bytes": 262144,
+      "capture_bytes": 268435456,
+      "embedding_nodes_per_source": 64,
+      "source_text_bytes": 512,
+      "provider_attempts_per_backend": 450,
+      "provider_attempts_per_space": 225,
+      "provider_concurrency": 2,
+      "reservation_nano_usd_per_attempt": 1064960
+    },
+    "provider_capture_bytes": 21474836480,
+    "provider_cache_bytes": 268435456
+  },
+  "raw_evidence_limits": {
+    "reference_count": 16384,
+    "record_bytes": 67108864,
+    "enforce_original_channel_subcaps": true,
+    "validator_owns_io": false,
+    "eager_materialization_allowed": false
+  },
+  "runtime_validation_chain": {
+    "reference_kind": "runtime-validation-chain",
+    "format": "recall-dynamic-runtime-chain/v2",
+    "fields": [
+      "format",
+      "component",
+      "evidence",
+      "validated_monotonic_ns",
+      "validated_wall",
+      "current_custody"
+    ],
+    "component_kind": "runtime-component",
+    "evidence_kind": "runtime-evidence",
+    "current_custody_kind": "runtime-current-custody"
+  },
+  "current_runtime_custody": {
+    "format": "recall-dynamic-current-runtime-custody/v2",
+    "fields": [
+      "format",
+      "current_processes",
+      "capture_inventory",
+      "cleanup_obligations",
+      "worker_recipe_capture",
+      "provider_recipe_captures",
+      "outer_launch"
+    ],
+    "capture_pair_fields": [
+      "request_index",
+      "request",
+      "response"
+    ],
+    "request_kind": "startup-request",
+    "response_kind": "startup-response",
+    "provider_spaces": "exact two original named spaces"
+  },
+  "canonical_same_bytes_kinds": {
+    "provider_original_and_forwarded_request": "provider-request",
+    "all_process_stdout_stderr": "process-log",
+    "all_process_stat": "process-stat"
+  },
+  "provider_raw_file_kinds": [
+    "provider-request",
+    "provider-dispatch-intent",
+    "provider-response",
+    "provider-capture"
+  ],
+  "provider_accounting_reference_kinds": [
+    "provider-accounting",
+    "provider-cohort-begin",
+    "provider-cohort-close",
+    "provider-baseline",
+    "provider-phase-clock",
+    "provider-sealed",
+    "provider-capture-inventory",
+    "provider-dispatch-records"
+  ],
+  "static_expected_anchor_fields": [
+    "format",
+    "run_nonce",
+    "source_commit",
+    "proposal_sha256",
+    "corpus_sha256",
+    "allocation_sha256",
+    "artifact_sha256",
+    "paired_artifact_sha256",
+    "runtime_sha256",
+    "gateway_sha256",
+    "bindings_sha256",
+    "bridge_sha256",
+    "context_helper_sha256",
+    "command_sha256",
+    "caps"
+  ],
+  "static_expected_anchor_forbidden_fields": [
+    "manifest_sha256",
+    "configuration_sha256",
+    "input_inventory_sha256",
+    "clock",
+    "parent"
+  ],
+  "static_runtime_identity_fields": [
+    "source_commit",
+    "artifact_sha256",
+    "binary_sha256",
+    "runtime_sha256",
+    "paired_artifact_sha256",
+    "backend",
+    "endpoint",
+    "run_nonce"
+  ],
+  "paired_artifact_sha256_meaning": "Original paired executable SHA256 from G launch anchor and actual packaged binary; not an archive digest.",
+  "provider_accounting_channel": {
+    "reference_kind": "provider-accounting-channel",
+    "format": "recall-provider-accounting-channel/v2",
+    "fields": [
+      "format",
+      "anchor_sha256",
+      "sidecar",
+      "mountinfo",
+      "index",
+      "directory",
+      "caller"
+    ],
+    "reference_kinds": {
+      "sidecar": "provider-accounting-sidecar",
+      "mountinfo": "provider-mountinfo",
+      "index": "provider-accounting-index",
+      "directory": "provider-accounting-directory",
+      "caller": "workload-phase-manifest"
+    },
+    "maximum_raw_bytes": {
+      "carrier": 16384,
+      "sidecar": 16384,
+      "mountinfo": 1048576,
+      "index": 8388608,
+      "directory": 16384,
+      "caller": 131072
+    },
+    "directory_format": "recall-provider-accounting-directory/v2",
+    "directory_fields": [
+      "format",
+      "path",
+      "device",
+      "inode",
+      "uid",
+      "mode"
+    ],
+    "path": "/gateway-accounting",
+    "owner": "lifecycle",
+    "producer": "original source-pinned G observe_channel; S references original returned bytes",
+    "provider_bundle_change": false,
+    "provider_validator_api_change": false,
+    "observation_scope": "Original G lstat and effective-user guard under original verified caller and namespace custody; L checks independently supplied raw observations against original sidecar/mountinfo/index. Sidecar alone does not observe inode or owner.",
+    "caller_custody": "Exact originally saved preparation.manifest.json bytes, retained before first cohort begin, finite original evidence inventory, canonical hash equals original G index caller_sha256. New carrier applies the existing G private-input 131072-byte ceiling; original S generic file ceiling is wider."
+  },
+  "outer_launch": {
+    "reference_kind": "gateway-launch-inputs",
+    "format": "recall-gateway-launch-inputs/v2",
+    "fields": [
+      "format",
+      "manifest",
+      "spec",
+      "input_inventory"
+    ],
+    "reference_kinds": {
+      "manifest": "gateway-manifest",
+      "spec": "gateway-launch-spec",
+      "input_inventory": "input-inventory"
+    },
+    "fixed_child_paths": {
+      "manifest": "/gateway-manifest.json",
+      "spec": "/gateway-launch.json"
+    },
+    "original_parent_files": {
+      "manifest": "original run_directory/manifest.json",
+      "spec": "original run_directory/launch.json"
+    },
+    "maximum_raw_bytes": {
+      "carrier": 16384,
+      "manifest": 131072,
+      "spec": 131072,
+      "input_inventory": 8388608
+    },
+    "input_inventory_rule": "Same existing original current_processes.input_inventory reference; original G limits 256 files, 8MiB per file, 32MiB input tree remain. No duplicate authority.",
+    "acquisition": "G fixed --ro-bind of original persisted files; C original raw bytes at initial and current capture; S carries without reconstruction.",
+    "original_hashes": {
+      "manifest": "anchor.manifest_sha256 equals raw manifest SHA256",
+      "spec": "anchor.configuration_sha256 equals raw spec SHA256 and actual outer_configuration_sha256",
+      "input_inventory": "anchor.input_inventory_sha256 and spec.inputs.inventory_sha256 equal original inventory canonical hash"
+    },
+    "current_rule": "Current outer_launch reference and all original bytes equal initial outer_launch; all references occur in the respective original capture inventory.",
+    "static_expected_anchor_change": false,
+    "extra_configuration_object": false,
+    "manifest_variants": {
+      "recall-gateway-manifest/v1": {
+        "allocation_sha256_in_anchor": null,
+        "schema_owner": "gateway/policy.py original v1 required fields plus optional output_cap_mode",
+        "proposal_binding": "original proposal_sha256"
+      },
+      "recall-gateway-manifest/v2": {
+        "allocation_sha256_in_anchor": null,
+        "schema_owner": "gateway/policy.py original settlement v2 additional fields plus optional output_cap_mode",
+        "proposal_binding": "original proposal_sha256"
+      },
+      "recall-exclusive-embedding-manifest/v1": {
+        "allocation_sha256_in_anchor": "original nonnull D28 allocation SHA",
+        "schema_owner": "gateway/cohort_policy.py exact required fields and TYPED_PINS",
+        "proposal_binding": "same original allocation_sha256; no new proposal field"
+      }
+    },
+    "spec_format": "recall-gateway-launch/v1",
+    "dynamic_input_requirement": "This v2 runtime carrier requires original spec.inputs and its existing verified inventory; legacy G paths that did not request this carrier keep their own existing optional-input schema."
+  }
+}

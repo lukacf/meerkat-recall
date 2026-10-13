@@ -733,6 +733,9 @@ fn extract_positioned_text_impl(
         if let Some((bx0, by0, bx1, by1)) = clip_box {
             const TOL: f32 = 6.0;
             let outside = |it: &TextItem| {
+                if options.require_complete {
+                    return !item_overlaps_page_box(it, (bx0, by0, bx1, by1));
+                }
                 let cx = it.x + it.width / 2.0;
                 !(cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL)
             };
@@ -760,7 +763,12 @@ fn extract_positioned_text_impl(
                 })
             });
             let coherent = off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
-            if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
+            // Plain intake honors even a single off-page run and a small
+            // visible box. Formatted extraction retains its layout heuristic.
+            if options.require_complete
+                || (bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent)
+            {
+                clipped_box = Some((bx0, by0, bx1, by1));
                 let before = items.len();
                 items.retain(|it| !outside(it));
                 // The runs left out take their CMap coverage with them; a
@@ -865,6 +873,9 @@ fn extract_positioned_text_impl(
         // Annotations from the neighboring page are off-box too.
         if let Some((bx0, by0, bx1, by1)) = clipped_box {
             links.retain(|it| {
+                if options.require_complete {
+                    return item_overlaps_page_box(it, (bx0, by0, bx1, by1));
+                }
                 let cx = it.x + it.width / 2.0;
                 // Center-y, not it.y: link items carry an annotation rect,
                 // so y is a box edge — unlike text items, where y is a
@@ -887,22 +898,38 @@ fn extract_positioned_text_impl(
     let form_items: Vec<TextItem> = extract_form_fields(doc, &page_id_to_num)
         .into_iter()
         .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)))
-        .map(|mut item| {
+        .filter_map(|mut item| {
             let rotation = page_rotations
                 .get(&item.page)
                 .copied()
                 .unwrap_or(geometry::PageRotation::Upright);
-            rotation.rotate_box(&mut item.x, &mut item.y, &mut item.width, &mut item.height);
+            rotation.rotate_box(
+                &mut item.x,
+                &mut item.y,
+                &mut item.width,
+                &mut item.height,
+            );
+            if options.require_complete {
+                if let Some(b) = page_boxes.get(&item.page) {
+                    let (mut x, mut y, mut w, mut h) =
+                        (b.x0, b.y0, b.width(), b.height());
+                    rotation.rotate_box(&mut x, &mut y, &mut w, &mut h);
+                    if !item_overlaps_page_box(&item, (x, y, x + w, y + h)) {
+                        return None;
+                    }
+                }
+            }
             if frame == CoordinateFrame::VisiblePageBox {
-                let frame_box = page_boxes.get(&item.page).copied().unwrap_or_else(|| {
-                    pages
-                        .get(&item.page)
-                        .and_then(|&id| visible_page_box(doc, id))
-                        .unwrap_or(PageBox::LETTER)
-                });
+                let frame_box =
+                    page_boxes.get(&item.page).copied().unwrap_or_else(|| {
+                        pages
+                            .get(&item.page)
+                            .and_then(|&id| visible_page_box(doc, id))
+                            .unwrap_or(PageBox::LETTER)
+                    });
                 frame_box.translate_items(std::slice::from_mut(&mut item), rotation);
             }
-            item
+            Some(item)
         })
         .collect();
     all_items.extend(form_items);
@@ -914,6 +941,18 @@ fn extract_positioned_text_impl(
         page_rotations,
         cmap_coverage,
     ))
+}
+
+// Keep intersecting runs intact: item-level geometry cannot reliably crop
+// individual glyphs. Exclude wholly off-page text, images and annotations in
+// the same coordinate frame as the rotated visible page box.
+fn item_overlaps_page_box(item: &TextItem, bounds: (f32, f32, f32, f32)) -> bool {
+    let (bx0, by0, bx1, by1) = bounds;
+    let x0 = item.x.min(item.x + item.width);
+    let x1 = item.x.max(item.x + item.width);
+    let y0 = item.y.min(item.y + item.height);
+    let y1 = item.y.max(item.y + item.height);
+    x0 <= bx1 && x1 >= bx0 && y0 <= by1 && y1 >= by0
 }
 
 fn suppress_table_underlines(

@@ -1,0 +1,33 @@
+{
+  "format": "recall-preview-workload/v2",
+  "consumer_workload_reference": "OB3 2026-10-06 23:52 report and 23:59 byte-bound ACK; root 23:59:35 schedule freeze",
+  "corpus_sha256": "e3201eb81bc294391e445a431a847f88603ec0631e23b6068d6f44cf0944ff0f",
+  "request_count": 560,
+  "concurrent_callers": 140,
+  "requests_per_caller": 4,
+  "minimum_peak_in_flight": 140,
+  "sources_per_space": {
+    "qualification-household": 25,
+    "qualification-business": 25
+  },
+  "spaces": [
+    "qualification-household",
+    "qualification-business"
+  ],
+  "p95_ms": 2000,
+  "p99_ms": 5000,
+  "latency_comparison": "strict-less-than",
+  "request_timeout_ms": 8000,
+  "response_budget_bytes": 262144,
+  "duration_budget_ms": 120000,
+  "wire_limit": 50,
+  "metric_k": 3,
+  "ranking_mode": "semantic",
+  "schedule_sha256": "7ac6c3930f63c90c59312a81d131814ef2653fe7f3c51b38f921fbef5739f8b3",
+  "execution_authorized": false,
+  "provider_budget_status": "Separate semantic140 allocation required; original432 and2100 allocations are unchanged",
+  "backend_runs": "Separate 560-request semantic cohort per supported backend",
+  "profile_id": "semantic140-v1",
+  "minimum_peak_sent_waiting_response": 140,
+  "consumer_ref": "Original PLAN approximately140 concurrent searches; ROOT0816 closed successor; independent E original-intent/latency/overlap source review; no paid grant"
+}

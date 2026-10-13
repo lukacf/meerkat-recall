@@ -1,6 +1,16 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/pdf-inspector", "vendor/surrealkv-0.9.3"]
+exclude = [
+    "vendor/meerkat-llm-core-0.8.51",
+    "vendor/meerkat-openai-0.8.51",
+    "vendor/meerkat-gemini-0.8.51",
+    "vendor/pdf-inspector",
+    "vendor/surrealkv-0.9.3",
+    "vendor/surrealdb-core-2.6.5",
+    "vendor/surrealdb-2.6.5",
+    "vendor/tokenizers-0.22.2",
+    "vendor/rav1e-0.8.1",
+]
 members = [
     "crates/types",
     "crates/elephant-db",
@@ -178,5 +188,17 @@ push = true
 # Preserve reviewed PDF extraction and storage snapshot compatibility repairs.
 # Provenance is recorded beside each pinned source copy.
 [patch.crates-io]
+meerkat-openai = { path = "vendor/meerkat-openai-0.8.51" }
+meerkat-gemini = { path = "vendor/meerkat-gemini-0.8.51" }
+meerkat-llm-core = { path = "vendor/meerkat-llm-core-0.8.51" }
 pdf-inspector = { path = "vendor/pdf-inspector" }
 surrealkv = { path = "vendor/surrealkv-0.9.3" }
+
+# Exact native erasure references and private query-context inheritance.
+surrealdb-core = { path = "vendor/surrealdb-core-2.6.5" }
+surrealdb = { path = "vendor/surrealdb-2.6.5" }
+
+# Retain tokenizer/image behavior while replacing abandoned paste (RUSTSEC-2024-0436).
+# Exact source/license provenance and manifest-only deltas live beside each copy.
+tokenizers = { path = "vendor/tokenizers-0.22.2" }
+rav1e = { path = "vendor/rav1e-0.8.1" }

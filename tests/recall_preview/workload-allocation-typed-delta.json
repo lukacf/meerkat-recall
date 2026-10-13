@@ -1,0 +1,18 @@
+{
+  "format": "recall-workload-allocation-representation-delta/v1",
+  "execution_authorized": false,
+  "base_allocation_sha256": "0a54fcd4c6359e39611567a06857f2d61975b3f19a80052f6ea49691f6d1633f",
+  "preparation_contract_sha256": "b1fd4c43e1c8c506ca13e261a29d65a7d06246bf11ef53c02e97945cd3ef56d1",
+  "corpus_sha256": "2192437954109fc17ebbea5b3960eb6b398a2ee91a725ce70666b119e86179dc",
+  "reason": "normalized ingest supplies default level0; retained typed Source+Doc preserves frozen policy3/7",
+  "override": {
+    "preparation.representation": "typed Source+Doc envelope",
+    "preparation.contract": "workload-preparation-contract.json"
+  },
+  "unchanged": [
+    "all physical quotas/concurrency/bytes/time/money",
+    "original432 semantic proposal and delta",
+    "original workload corpus/schedule/queries/metrics"
+  ],
+  "requires": "G/S activation and D exact source review must bind BOTH original allocation and this explicit delta; ignoring delta cannot qualify preparation"
+}

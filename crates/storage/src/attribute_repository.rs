@@ -126,6 +126,12 @@ impl AttributeRepository {
         Self { client }
     }
 
+    /// Shares the client for preparation through the canonical transaction owner.
+    #[must_use]
+    pub fn storage_client(&self) -> StorageClient {
+        self.client.clone()
+    }
+
     /// Finds an attribute by subject, type, and literal value.
     ///
     /// # Errors
@@ -143,7 +149,7 @@ impl AttributeRepository {
     }
 
     /// Converts an Attribute to a SurrealDB value for insertion.
-    fn attribute_to_value(item: &Attribute) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn attribute_to_value(item: &Attribute) -> StorageResult<surrealdb::sql::Value> {
         use surrealdb::sql::Value;
 
         let mut obj = crate::surreal::base_fields_to_object(&item.base)?;
@@ -164,18 +170,17 @@ impl AttributeRepository {
             crate::surreal::enum_to_surreal(&item.status)?,
         );
         obj.insert("confidence".to_string(), item.confidence.into());
-        let validity_json = match &item.validity_window {
-            Some(window) => serde_json::to_value(window).map_err(|e| {
-                StorageError::SerializationError(format!(
-                    "Failed to serialize validity window: {e}"
-                ))
-            })?,
-            None => serde_json::Value::Null,
+        let validity = match &item.validity_window {
+            Some(window) => {
+                crate::surreal::json_to_surreal(serde_json::to_value(window).map_err(|e| {
+                    StorageError::SerializationError(format!(
+                        "Failed to serialize validity window: {e}"
+                    ))
+                })?)?
+            }
+            None => Value::None,
         };
-        obj.insert(
-            "validity_window".to_string(),
-            crate::surreal::json_to_surreal(validity_json)?,
-        );
+        obj.insert("validity_window".to_string(), validity);
         let evidence_json = serde_json::to_value(&item.evidence).map_err(|e| {
             StorageError::SerializationError(format!("Failed to serialize evidence: {e}"))
         })?;
@@ -183,16 +188,17 @@ impl AttributeRepository {
             "evidence".to_string(),
             crate::surreal::json_to_surreal(evidence_json)?,
         );
-        let temporal_json = match &item.temporal_audit {
-            Some(audit) => serde_json::to_value(audit).map_err(|e| {
-                StorageError::SerializationError(format!("Failed to serialize temporal audit: {e}"))
-            })?,
-            None => serde_json::Value::Null,
+        let temporal = match &item.temporal_audit {
+            Some(audit) => {
+                crate::surreal::json_to_surreal(serde_json::to_value(audit).map_err(|e| {
+                    StorageError::SerializationError(format!(
+                        "Failed to serialize temporal audit: {e}"
+                    ))
+                })?)?
+            }
+            None => Value::None,
         };
-        obj.insert(
-            "temporal_audit".to_string(),
-            crate::surreal::json_to_surreal(temporal_json)?,
-        );
+        obj.insert("temporal_audit".to_string(), temporal);
 
         Ok(Value::Object(obj))
     }
@@ -529,6 +535,87 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
+    async fn native_optional_temporal_objects_survive_create_replace_and_removal() {
+        use elephant_types::records::temporal::{RecencyBasis, TimeRefinement};
+        let repo = setup_test_repo().await;
+        // These are the actual optional-object contracts from 001_init.surql;
+        // a schemaless-only fixture would incorrectly accept JSON NULL.
+        repo.client
+            .query_checked(
+                "DEFINE FIELD validity_window ON TABLE attribute TYPE option<object> FLEXIBLE;
+             DEFINE FIELD temporal_audit ON TABLE attribute TYPE option<object> FLEXIBLE;",
+            )
+            .await
+            .unwrap();
+        let mut original = create_test_attribute();
+        original.base.security.level = 3;
+        original.base.security.labels = vec!["private".into()];
+        original.base.security.handling = vec!["restricted".into()];
+        original.base.subjects_state = SubjectsState::Partial;
+        let source = RecordId::new_v4(TableName::Source);
+        original.base.provenance.sources.push(source);
+        let id = original.base.id.clone();
+        let created = repo.create(original.clone()).await.unwrap();
+        assert_eq!(created.validity_window, None);
+        assert_eq!(created.temporal_audit, None);
+        let loaded = repo.get("test_space", &id).await.unwrap().unwrap();
+        assert_eq!(loaded.base.security, original.base.security);
+        assert_eq!(loaded.base.provenance, original.base.provenance);
+        assert_eq!(loaded.subject, original.subject);
+        let at = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let mut enriched = loaded;
+        enriched.validity_window = Some(ValidityWindow::starting_at(at));
+        enriched.temporal_audit = Some(TemporalAudit {
+            time_basis: RecencyBasis::SourceEventTime,
+            time_refinement: Some(TimeRefinement {
+                original_basis: RecencyBasis::ObservedAt,
+                original_value: at,
+                refined_by: Link::new(RecordId::new_v4(TableName::Assertion)),
+                refined_at: at,
+            }),
+        });
+        let updated = repo
+            .update("test_space", &id, enriched.clone())
+            .await
+            .unwrap();
+        assert_eq!(updated.validity_window, enriched.validity_window);
+        assert_eq!(updated.temporal_audit, enriched.temporal_audit);
+        let loaded = repo.get("test_space", &id).await.unwrap().unwrap();
+        assert_eq!(loaded.validity_window, enriched.validity_window);
+        assert_eq!(loaded.temporal_audit, enriched.temporal_audit);
+        let mut cleared = loaded;
+        cleared.validity_window = None;
+        cleared.temporal_audit = None;
+        repo.update("test_space", &id, cleared).await.unwrap();
+        let loaded = repo.get("test_space", &id).await.unwrap().unwrap();
+        assert_eq!(loaded.validity_window, None);
+        assert_eq!(loaded.temporal_audit, None);
+        assert_eq!(loaded.base.security, original.base.security);
+        assert_eq!(loaded.base.provenance, original.base.provenance);
+        assert_eq!(loaded.base.subjects_state, original.base.subjects_state);
+        assert_eq!(loaded.subject, original.subject);
+        assert_eq!(loaded.value, original.value);
+        let mut response = repo
+            .client
+            .query_bind_checked(
+                "SELECT VALUE validity_window IS NONE AND temporal_audit IS NONE FROM ONLY $id;",
+                crate::bindings! {"id" => crate::surreal::thing_from_record_id(&id)},
+            )
+            .await
+            .unwrap();
+        let absent: Option<bool> = response.take(0).unwrap();
+        assert_eq!(absent, Some(true));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_attribute() {
         let repo = setup_test_repo().await;
         let item = create_test_attribute();
@@ -540,6 +627,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_attribute() {
         let repo = setup_test_repo().await;
         let item = create_test_attribute();
@@ -553,6 +644,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_attribute_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_attribute();
@@ -567,6 +662,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_attribute() {
         let repo = setup_test_repo().await;
         let item = create_test_attribute();
@@ -582,6 +681,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_attribute() {
         let repo = setup_test_repo().await;
         let item = create_test_attribute();
@@ -595,6 +698,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_attribute_with_deleted_returns_soft_deleted() {
         let repo = setup_test_repo().await;
         let item = create_test_attribute();

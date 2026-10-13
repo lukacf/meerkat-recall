@@ -183,6 +183,83 @@ pub struct RelRepository {
 }
 
 impl RelRepository {
+    /// Replaces or restores a relationship under the authorized pre-state.
+    /// Both endpoint and envelope comparisons occur in the same mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the observed relationship is no longer current.
+    pub async fn replace_authorized(
+        &self,
+        observed: &Rel,
+        mut proposed: Rel,
+        restore: bool,
+    ) -> StorageResult<Rel> {
+        let conflict = || crate::lifecycle_guard::guard_conflict("Rel", &observed.base.id);
+        if observed.base.id != proposed.base.id
+            || observed.base.space_id != proposed.base.space_id
+            || observed.base.security != proposed.base.security
+            || observed.base.subjects != proposed.base.subjects
+            || observed.base.subjects_state != proposed.base.subjects_state
+            || (!restore && observed.base.deleted_at.is_some())
+        {
+            return Err(conflict());
+        }
+        proposed.base.deleted_at = if restore {
+            None
+        } else {
+            observed.base.deleted_at
+        };
+        proposed.base.updated_at = Utc::now();
+        if let Some(store) = self.client.embedded_store() {
+            return store
+                .mutate(|tx| {
+                    let current = tx
+                        .get::<Rel>(&observed.base.space_id, &observed.base.id, true)?
+                        .ok_or_else(conflict)?;
+                    if current.base.updated_at != observed.base.updated_at
+                        || !crate::lifecycle_guard::base_envelope_unchanged(
+                            &current.base,
+                            &observed.base,
+                        )
+                        || current.subject != observed.subject
+                        || current.object != observed.object
+                    {
+                        return Err(conflict());
+                    }
+                    Ok(tx.replace(proposed)?)
+                })
+                .await;
+        }
+        let (condition, mut bindings) =
+            crate::lifecycle_guard::base_envelope_condition(&observed.base)?;
+        bindings.extend(crate::bindings! {
+            "id" => crate::surreal::thing_from_record_id(&observed.base.id),
+            "space" => observed.base.space_id.clone(),
+            "version" => crate::surreal::datetime_from_chrono(observed.base.updated_at),
+            "old_subject" => crate::surreal::thing_from_record_id(observed.subject.id()),
+            "old_object" => crate::surreal::thing_from_record_id(observed.object.id()),
+            "subject" => crate::surreal::thing_from_record_id(proposed.subject.id()),
+            "object" => crate::surreal::thing_from_record_id(proposed.object.id()),
+            "record" => crate::surreal::rel_to_value(&proposed)?,
+        });
+        // The second update runs only when the guarded replacement matched.
+        // A failed guard cannot repoint endpoints or restore a tombstone.
+        // Explicitly return the branch result: a block's UPDATE statement by
+        // itself does not produce the IF expression's return value.
+        let mut response = self.client.query_bind_checked(
+            &format!("BEGIN TRANSACTION; LET $changed = (UPDATE $id MERGE $record WHERE space_id = $space AND updated_at = $version AND {condition} AND `in` = $old_subject AND `out` = $old_object RETURN id); IF array::len($changed) > 0 {{ RETURN (UPDATE $id SET `in` = $subject, `out` = $object RETURN {REL_PROJECTION}); }} ELSE {{ RETURN []; }}; COMMIT TRANSACTION;"),
+            bindings,
+        ).await?;
+        // RETURN inside the top-level IF ends the transaction's result stream
+        // and discards the preceding LET result. The returned rows occupy slot
+        // zero (including the empty array on a failed guard).
+        let rows: Vec<RelDb> = response
+            .take(0)
+            .map_err(|error| StorageError::QueryError(error.to_string()))?;
+        Rel::try_from(rows.into_iter().next().ok_or_else(conflict)?)
+    }
+
     /// Restores a relationship only if it is unchanged since `authorized`, the row
     /// the caller's authorization was decided on.
     ///
@@ -269,6 +346,12 @@ impl RelRepository {
     #[must_use]
     pub const fn new(client: StorageClient) -> Self {
         Self { client }
+    }
+
+    /// Shares the client for preparation through the canonical transaction owner.
+    #[must_use]
+    pub fn storage_client(&self) -> StorageClient {
+        self.client.clone()
     }
 
     /// Returns entities within N hops of the start entity.
@@ -422,14 +505,16 @@ impl Repository<Rel> for RelRepository {
         }
 
         let query = r"
-            RELATE $subject->$rel_id->$object
-            CONTENT $record;
+            BEGIN TRANSACTION;
+            LET $existing = SELECT VALUE id FROM ONLY $rel_id;
+            IF $existing != NONE { THROW 'relationship_identity_exists'; };
+            RELATE $subject->$rel_id->$object CONTENT $record;
+            COMMIT TRANSACTION;
         ";
 
         let record_value = crate::surreal::rel_to_value(&record)?;
-        let mut create_response = self
-            .client
-            .query_bind(
+        self.client
+            .query_bind_checked(
                 query,
                 crate::bindings! {
                     "record" => record_value,
@@ -438,11 +523,14 @@ impl Repository<Rel> for RelRepository {
                     "rel_id" => crate::surreal::thing_from_record_id(&record.base.id),
                 },
             )
-            .await?;
-
-        let _: surrealdb::Value = create_response.take(0).map_err(|e| {
-            StorageError::classify_query_error(format!("Failed to create rel: {e}"))
-        })?;
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("relationship_identity_exists") {
+                    StorageError::Conflict("Relationship identity already exists".into())
+                } else {
+                    error
+                }
+            })?;
 
         Ok(record)
     }
@@ -1384,6 +1472,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_rel() {
         let repo = setup_test_repo().await;
         let rel = create_test_rel("works_at");
@@ -1395,6 +1487,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_rel() {
         let repo = setup_test_repo().await;
         let rel = create_test_rel("works_at");
@@ -1408,6 +1504,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_nonexistent_rel() {
         let repo = setup_test_repo().await;
         let id = RecordId::new_v4(TableName::Rel);
@@ -1417,6 +1517,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_rel() {
         let repo = setup_test_repo().await;
         let rel = create_test_rel("works_at");
@@ -1437,6 +1541,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_soft_delete_rel() {
         let repo = setup_test_repo().await;
         let rel = create_test_rel("works_at");
@@ -1454,6 +1562,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_restore_rel() {
         let repo = setup_test_repo().await;
         let rel = create_test_rel("works_at");
@@ -1472,6 +1584,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_list_rels() {
         let repo = setup_test_repo().await;
 
@@ -1485,6 +1601,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_hard_delete() {
         let repo = setup_test_repo().await;
         let rel = create_test_rel("works_at");
@@ -1498,6 +1618,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_by_type() {
         let repo = setup_test_repo().await;
 
@@ -1540,6 +1664,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_by_subject_predicate() {
         let repo = setup_test_repo().await;
 
@@ -1611,6 +1739,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_repoint_entity() {
         let repo = setup_test_repo().await;
 
@@ -1698,6 +1830,10 @@ mod tests {
 
     /// RCT round-trip test: verifies all Rel fields survive database serialization.
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_rel_roundtrip() {
         use elephant_types::records::assertion::EvidenceSpan;
         use elephant_types::records::rel::TimeBasis;
@@ -1837,6 +1973,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_repoint_entity_skips_deleted() {
         let repo = setup_test_repo().await;
 
@@ -1944,5 +2084,103 @@ mod tests {
     async fn test_restore_guarded_lifecycle_embedded() {
         let repo = RelRepository::new(StorageClient::new_embedded().await.unwrap());
         assert_restore_guarded_lifecycle(&repo, "test_space", create_test_rel("works_at")).await;
+    }
+    async fn exercise_authorized_replacement(repo: &RelRepository) {
+        let original = repo.create(create_test_rel("guarded")).await.unwrap();
+        let mut proposed = original.clone();
+        proposed.confidence = 0.5;
+        let updated = repo
+            .replace_authorized(&original, proposed.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(updated.confidence.to_bits(), 0.5_f32.to_bits());
+        assert_eq!(
+            repo.get("test_space", &original.base.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            updated,
+            "the returned guarded replacement is the actual committed row"
+        );
+        assert!(matches!(
+            repo.replace_authorized(&original, proposed, false).await,
+            Err(StorageError::Conflict(_))
+        ));
+        let mut classified = updated.clone();
+        classified.base.security.level = 5;
+        let classified = repo
+            .update("test_space", &updated.base.id, classified)
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.replace_authorized(&updated, updated.clone(), false)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        repo.delete("test_space", &classified.base.id)
+            .await
+            .unwrap();
+        let tombstone = repo
+            .get_with_deleted("test_space", &classified.base.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut lower = tombstone.clone();
+        lower.base.security.level = 0;
+        assert!(matches!(
+            repo.replace_authorized(&tombstone, lower, true).await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(repo
+            .get_with_deleted("test_space", &classified.base.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .base
+            .deleted_at
+            .is_some());
+        let restored = repo
+            .replace_authorized(&tombstone, tombstone.clone(), true)
+            .await
+            .unwrap();
+        assert!(restored.base.deleted_at.is_none());
+        let mut repointed = restored.clone();
+        repointed.object = Link::new(RecordId::new_v4(TableName::Entity));
+        repo.update("test_space", &repointed.base.id.clone(), repointed)
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.replace_authorized(&restored, restored.clone(), false)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        let before = repo
+            .get("test_space", &restored.base.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut collision = before.clone();
+        collision.base.space_id = "foreign".into();
+        assert!(repo.create(collision).await.is_err());
+        assert_eq!(
+            repo.get("test_space", &restored.base.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_replacement_embedded() {
+        exercise_authorized_replacement(&RelRepository::new(
+            StorageClient::new_embedded().await.unwrap(),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn authorized_replacement_surreal() {
+        exercise_authorized_replacement(&setup_test_repo().await).await;
     }
 }

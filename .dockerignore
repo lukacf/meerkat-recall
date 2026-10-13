@@ -22,6 +22,15 @@ docs/architecture/*
 !README.md
 !THIRD_PARTY_NOTICES.md
 
+# Documentation copied by the production Dockerfile. Reopen only the contract
+# subtree beneath internal/; all sibling internal documentation stays excluded.
+!docs/internal/
+docs/internal/*
+!docs/internal/recall-preview-contract/
+!docs/internal/recall-preview-contract/**
+!docs/snapshot-durability.md
+!docs/embedded-durable-commits.md
+
 # Test files
 # (included so workspace members under tests/ can build)
 

@@ -1,0 +1,28 @@
+{
+  "format": "recall-ancestry-phase-diagnostics/v1",
+  "authored_at": "2026-10-07T03:58:40.725939+00:00",
+  "source_test": "tests/recall_preview/producer_ancestry_oracles.rs",
+  "reason": "Runtime16 native boundary timed out after 240 seconds; original stage was not recorded. Source construction traverses real ancestors for every original successor, so setup and tested walks must be distinguishable.",
+  "observations": [
+    "original fixture start/complete",
+    "actual Work construction every 32 nodes",
+    "original 256-node walk before/after",
+    "actual Source construction and shared walk every 32 nodes plus 257",
+    "combined original walk before/after",
+    "Source verified replay every 32 plus 257",
+    "original overflow refusals",
+    "original grant revocation refusal"
+  ],
+  "unchanged": [
+    "both backends",
+    "240-second timeout",
+    "256 Work and 257 Source positive graph",
+    "257 Work and 258 Source refusal graph",
+    "actual enqueue/claim/run and source acceptance",
+    "original fresh authority and no cache bypass",
+    "all acceptance assertions"
+  ],
+  "runtime_execution": "not executed; parent owns central focused gate",
+  "product_acceptance": false,
+  "count_scope": "Construction/replay progress counts completed nodes; *_start phases name the boundary about to be attempted, never assert it already completed."
+}

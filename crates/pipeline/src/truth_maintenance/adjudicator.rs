@@ -30,7 +30,7 @@ const ADJUDICATION_PROMPT_TEMPLATE: &str = include_str!("../../prompts/tm_adjudi
 const ADJUDICATION_MIN_BUDGET_TOKENS: u64 = 16_000;
 
 /// The value carried by a claim, rendered for the adjudicator.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum ClaimValue {
     /// A literal attribute value.
     Literal(Literal),
@@ -189,6 +189,17 @@ pub trait SlotAdjudicator: Send + Sync + std::fmt::Debug {
 
     /// Identifier for the adjudicator implementation.
     fn id(&self) -> &'static str;
+
+    /// Decision contract identity, including model/profile and prompt version.
+    /// Custom implementations should override when configuration changes.
+    fn decision_version(&self) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{}:{}",
+            self.id(),
+            hex::encode(Sha256::digest(ADJUDICATION_PROMPT_TEMPLATE.as_bytes()))
+        )
+    }
 }
 
 /// Renders the adjudication prompt for the given input.
@@ -713,26 +724,89 @@ fn adjudication_provider_params(
 
 /// Agentic adjudicator calling the LLM through meerkat structured output.
 ///
-/// Provider credentials are resolved by meerkat itself; availability is the
-/// caller's concern (an unavailable provider yields `Ok(None)` with a warn).
+/// Requires explicit current per-space model approval. Authorization failures
+/// propagate; they never permit a deterministic fallback through this adapter.
 #[cfg(feature = "meerkat-extraction")]
 #[derive(Debug, Clone)]
 pub struct AgenticSlotAdjudicator {
     config: AdjudicationConfig,
+    provider_context: Option<crate::provider_dispatch::ProviderDispatchContext>,
+    binding_version: Option<String>,
 }
 
 #[cfg(feature = "meerkat-extraction")]
 impl AgenticSlotAdjudicator {
+    /// Immutable approved model/profile/policy identity for semantic memoization.
+    pub fn approved_binding_version(&self) -> Option<&str> {
+        self.binding_version.as_deref()
+    }
+
+    /// Resolve this adapter for one explicit space; retries recheck current approval.
+    pub async fn with_provider_context(
+        mut self,
+        context: crate::provider_dispatch::ProviderDispatchContext,
+    ) -> crate::PipelineResult<Self> {
+        let binding = context
+            .repository
+            .authorize_model_operation(
+                &context.space_id,
+                elephant_types::provider_binding::ModelOperation::TruthMaintenance,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                PipelineError::ConfigError(format!("provider_authorization: {error}"))
+            })?;
+        self.binding_version = Some(
+            serde_json::to_string(&(
+                &binding.provenance.config.space_id,
+                &binding.provenance.config.config_id,
+                &binding.provenance.config.policy_id,
+                &binding.provenance.binding_id,
+                &binding.profile.id,
+                &binding.profile.connection_id,
+                &binding.profile.model_version,
+                &binding.profile.model,
+            ))
+            .map_err(|error| PipelineError::ConfigError(error.to_string()))?,
+        );
+        self.config.model = binding.profile.model;
+        self.provider_context = Some(context);
+        Ok(self)
+    }
+
     /// Creates a new agentic adjudicator with the given configuration.
     #[must_use]
     pub const fn new(config: AdjudicationConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            provider_context: None,
+            binding_version: None,
+        }
     }
 }
 
 #[cfg(feature = "meerkat-extraction")]
 #[async_trait]
 impl SlotAdjudicator for AgenticSlotAdjudicator {
+    fn decision_version(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let contract = serde_json::json!({
+            "id": self.id(),
+            "request_policy": "space-governed-defaults-v1",
+            "model": self.config.model,
+            "binding_version": self.approved_binding_version(),
+            "prompt_hash": hex::encode(Sha256::digest(ADJUDICATION_PROMPT_TEMPLATE.as_bytes())),
+            "max_tokens": self.config.max_tokens,
+            "max_wall_time_secs": self.config.max_wall_time_secs,
+        });
+        format!(
+            "{}:{}",
+            self.id(),
+            hex::encode(Sha256::digest(contract.to_string().as_bytes()))
+        )
+    }
+
     async fn adjudicate(
         &self,
         input: &AdjudicationInput,
@@ -745,6 +819,16 @@ impl SlotAdjudicator for AgenticSlotAdjudicator {
         };
         use meerkat_core::types::ContentInput;
         use meerkat_core::Config;
+
+        if self
+            .provider_context
+            .as_ref()
+            .is_none_or(|context| context.space_id != input.space_id)
+        {
+            return Err(PipelineError::ConfigError(
+                "provider_authorization: adjudication input space mismatch".into(),
+            ));
+        }
 
         if input.claims.is_empty() {
             return Ok(None);
@@ -766,6 +850,21 @@ impl SlotAdjudicator for AgenticSlotAdjudicator {
             .with_max_duration(Duration::from_secs(self.config.max_wall_time_secs));
 
         let mut build = AgentBuildConfig::new(self.config.model.clone());
+        // Governance is final; operation defaults cannot override approved policy.
+        build.provider_params = adjudication_provider_params(&self.config.model);
+        self.provider_context
+            .as_ref()
+            .ok_or_else(|| {
+                PipelineError::ConfigError(
+                    "provider_authorization: model adapter requires a space context".into(),
+                )
+            })?
+            .govern_agent_build(
+                elephant_types::provider_binding::ModelOperation::TruthMaintenance,
+                &mut build,
+            )
+            .await?;
+
         build.system_prompt =
             meerkat_core::SystemPromptOverride::Set(ADJUDICATION_SYSTEM_PROMPT.to_string());
         build.max_tokens = Some(self.config.max_tokens);
@@ -774,7 +873,6 @@ impl SlotAdjudicator for AgenticSlotAdjudicator {
         build.structured_output_retries = Some(2);
         build.override_shell = ToolCategoryOverride::Disable;
         build.override_mob = ToolCategoryOverride::Disable;
-        build.provider_params = adjudication_provider_params(&self.config.model);
 
         let prompt = render_adjudication_prompt(input);
         let factory = AgentFactory::new(PathBuf::from("/tmp/elephant-tm-adjudication"));
@@ -796,6 +894,7 @@ impl SlotAdjudicator for AgenticSlotAdjudicator {
         let timeout = Duration::from_secs(self.config.max_wall_time_secs);
         let (structured, text) = match tokio::time::timeout(timeout, llm_call).await {
             Ok(Ok(output)) => output,
+            Ok(Err(err)) if err.to_string().contains("provider_authorization:") => return Err(err),
             Ok(Err(err)) => {
                 tracing::warn!(
                     slot_key = %input.slot_key,
@@ -885,6 +984,58 @@ mod tests {
 
     fn raw_verdict(value: serde_json::Value) -> RawVerdict {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[cfg(feature = "meerkat-extraction")]
+    #[test]
+    fn truth_maintenance_keeps_governed_reasoning_on_physical_request() {
+        crate::governed_request_test_fixture::run(|| async {
+            use crate::governed_request_test_fixture::{RequestFixture, SPACE};
+            use elephant_types::provider_binding::ModelOperation;
+
+            let fixture = RequestFixture::new(ModelOperation::TruthMaintenance).await;
+            let mut input = input_with(
+                vec![claim("c1", ClaimValue::Literal(Literal::Integer(35)))],
+                Some(PredicateSemantics::default()),
+            );
+            input.space_id = SPACE.into();
+            let adjudicator = AgenticSlotAdjudicator::new(AdjudicationConfig {
+                model: "unapproved-local-model".into(),
+                max_tokens: 2_000,
+                max_wall_time_secs: 10,
+            })
+            .with_provider_context(fixture.context.clone())
+            .await
+            .unwrap();
+            // Freeze the prior fingerprint shape as a negative control: a
+            // corrected request policy must not reuse an old adjudication key.
+            use sha2::{Digest, Sha256};
+            let old_contract = json!({
+                "id": adjudicator.id(), "model": adjudicator.config.model,
+                "binding_version": adjudicator.approved_binding_version(),
+                "prompt_hash": hex::encode(Sha256::digest(ADJUDICATION_PROMPT_TEMPLATE.as_bytes())),
+                "max_tokens": adjudicator.config.max_tokens,
+                "max_wall_time_secs": adjudicator.config.max_wall_time_secs,
+            });
+            let old_version = format!(
+                "{}:{}",
+                adjudicator.id(),
+                hex::encode(Sha256::digest(old_contract.to_string().as_bytes()))
+            );
+            assert_ne!(adjudicator.decision_version(), old_version);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                adjudicator.adjudicate(&input),
+            )
+            .await
+            .expect("adjudication request deadline");
+            let body = fixture.assert_request("adjudication_verdict", 2_000).await;
+            assert!(
+                matches!(result, Ok(None)),
+                "the captured HTTP refusal must return no adjudication verdict"
+            );
+            assert!(body["input"].to_string().contains("Alice Smith"));
+        });
     }
 
     #[test]

@@ -1,0 +1,467 @@
+{
+  "contract_version": "recall-preview-1",
+  "implementation_status": "source_checkpoints_unqualified",
+  "source_text_max_utf8_bytes": 2000000,
+  "source_create": {
+    "method": "PUT",
+    "path": "/v1/spaces/research/sources/report-42",
+    "body": {
+      "revision": "capture-42",
+      "text": "The trial began in June.",
+      "media_type": "text/plain",
+      "source_url": "https://example.test/reports/42",
+      "observed_at": "2026-10-06T20:11:00Z",
+      "labels": {
+        "scope": "planning",
+        "initiative_id": "42",
+        "initiative_name": [
+          "Preview",
+          "Evidence"
+        ]
+      },
+      "expected_generation": null
+    },
+    "status": 202,
+    "response": {
+      "operation_id": "source_operation:example",
+      "generation": "opaque-head-1",
+      "desired_revision": "capture-42",
+      "published_revision": null,
+      "internal_source_id": "source:11111111-1111-4111-8111-111111111111",
+      "lifecycle": "active",
+      "cleanup_state": "not_required"
+    }
+  },
+  "identical_retry": {
+    "request": "same immutable revision and source payload as source_create",
+    "status": 202,
+    "response": {
+      "operation_id": "source_operation:example",
+      "generation": "opaque-head-1",
+      "desired_revision": "capture-42",
+      "published_revision": null,
+      "internal_source_id": "source:11111111-1111-4111-8111-111111111111",
+      "lifecycle": "active",
+      "cleanup_state": "not_required"
+    }
+  },
+  "head_conflict": {
+    "status": 409,
+    "response": {
+      "error_code": "conflict_generation",
+      "message": "Source generation changed; fetch its head before retrying.",
+      "retryable": false
+    }
+  },
+  "search": {
+    "method": "POST",
+    "path": "/v1/spaces/research/search",
+    "body": {
+      "query": "When did the trial begin?",
+      "limit": 10,
+      "filters": {},
+      "source_revision_constraints": {
+        "report-42": "capture-42"
+      }
+    },
+    "response": {
+      "results": [
+        {
+          "kind": "chunk",
+          "text": "The trial began in June.",
+          "evidence": [
+            {
+              "source_id": "report-42",
+              "revision": "capture-42",
+              "internal_doc_revision_id": "doc_revision:example",
+              "span": {
+                "start": 0,
+                "end": 23
+              },
+              "quote": "The trial began in June."
+            }
+          ],
+          "score": 0.9
+        }
+      ],
+      "coverage": {
+        "report-42": {
+          "requested_revision": "capture-42",
+          "desired_revision": "capture-42",
+          "published_revision": "capture-42",
+          "state": "complete"
+        }
+      },
+      "partial": false
+    }
+  },
+  "pending_search": {
+    "results": [],
+    "coverage": {
+      "report-42": {
+        "requested_revision": "capture-43",
+        "desired_revision": "capture-43",
+        "published_revision": "capture-42",
+        "state": "pending"
+      }
+    },
+    "partial": true
+  },
+  "retract": {
+    "method": "POST",
+    "path": "/v1/spaces/research/sources/report-42:retract",
+    "body": {
+      "expected_generation": "opaque-head-1"
+    },
+    "status": 202,
+    "response": {
+      "operation_id": "source_operation:retract",
+      "generation": "opaque-head-2",
+      "desired_revision": null,
+      "published_revision": null,
+      "lifecycle": "retracted",
+      "cleanup_state": "complete",
+      "internal_source_id": "source:11111111-1111-4111-8111-111111111111"
+    }
+  },
+  "erase": {
+    "method": "POST",
+    "path": "/v1/spaces/research/sources/report-42:erase",
+    "body": {
+      "expected_generation": "opaque-head-2"
+    },
+    "status": 202,
+    "response": {
+      "operation_id": "source_operation:erase",
+      "generation": "opaque-head-3",
+      "desired_revision": null,
+      "published_revision": null,
+      "lifecycle": "erased",
+      "cleanup_state": "pending",
+      "internal_source_id": "source:11111111-1111-4111-8111-111111111111"
+    }
+  },
+  "operation": {
+    "method": "GET",
+    "path": "/v1/operations/source_operation:example",
+    "response_schema_owner": "surface wire projection of integrity durable state",
+    "response": {
+      "operation_id": "source_operation:example",
+      "state": "pending",
+      "lifecycle": "active",
+      "cleanup_state": "not_required",
+      "generation": "opaque-head-1",
+      "desired_revision": "capture-42",
+      "published_revision": null,
+      "error_code": null,
+      "internal_source_id": "source:11111111-1111-4111-8111-111111111111"
+    }
+  },
+  "errors": [
+    {
+      "error_code": "unauthorized",
+      "status": 401,
+      "retryable": false
+    },
+    {
+      "error_code": "forbidden_space",
+      "status": 403,
+      "retryable": false
+    },
+    {
+      "error_code": "unknown_space",
+      "status": 404,
+      "retryable": false
+    },
+    {
+      "error_code": "not_ready",
+      "status": 503,
+      "retryable": true
+    },
+    {
+      "error_code": "unavailable",
+      "status": 503,
+      "retryable": true
+    },
+    {
+      "error_code": "capability_disabled",
+      "status": 403,
+      "retryable": false
+    },
+    {
+      "error_code": "conflict_generation",
+      "status": 409,
+      "retryable": false
+    },
+    {
+      "error_code": "payload_too_large",
+      "status": 413,
+      "retryable": false
+    },
+    {
+      "error_code": "provider_unapproved",
+      "status": 403,
+      "retryable": false
+    },
+    {
+      "error_code": "rate_limited",
+      "status": 429,
+      "retryable": true
+    },
+    {
+      "error_code": "invalid_request",
+      "status": 400,
+      "retryable": false
+    },
+    {
+      "error_code": "not_found",
+      "status": 404,
+      "retryable": false
+    }
+  ],
+  "public_operation_states": [
+    "pending",
+    "running",
+    "complete",
+    "failed_retryable",
+    "failed_final"
+  ],
+  "immutable_fingerprint_excludes": [
+    "expected_generation",
+    "observed_at"
+  ],
+  "idempotency_header": "Idempotency-Key (optional; derived from space/external_source_id/revision when absent)",
+  "reactivate": {
+    "method": "PUT",
+    "path": "/v1/spaces/research/sources/report-42",
+    "body": {
+      "revision": "capture-44",
+      "text": "Corrected source text.",
+      "media_type": "text/plain",
+      "source_url": "https://example.test/reports/42",
+      "observed_at": "2026-10-06T20:31:00Z",
+      "labels": {
+        "scope": "planning"
+      },
+      "expected_generation": "opaque-retracted-head",
+      "reactivate": true
+    }
+  },
+  "recreate_after_erase": {
+    "method": "PUT",
+    "path": "/v1/spaces/research/sources/report-42",
+    "body": {
+      "revision": "capture-45",
+      "text": "New authorized source text.",
+      "media_type": "text/plain",
+      "source_url": "https://example.test/reports/42",
+      "observed_at": "2026-10-06T20:35:00Z",
+      "labels": {
+        "scope": "planning"
+      },
+      "expected_generation": "opaque-erased-head",
+      "recreate_after_erasure": true
+    },
+    "semantics": "Integrity allocates a fresh physical source incarnation; old erasure replay cannot purge its successor."
+  },
+  "coverage_states": [
+    "pending",
+    "running",
+    "complete",
+    "failed_retryable",
+    "failed_final",
+    "missing",
+    "stale",
+    "retracted",
+    "erased"
+  ],
+  "heads": {
+    "active": {
+      "method": "GET",
+      "path": "/v1/spaces/research/sources/report-42/head",
+      "status": 200,
+      "response": {
+        "operation_id": "source_operation:example",
+        "generation": "opaque-head-1",
+        "desired_revision": "capture-42",
+        "published_revision": "capture-42",
+        "lifecycle": "active",
+        "cleanup_state": "not_required",
+        "state": "complete",
+        "internal_source_id": "source:11111111-1111-4111-8111-111111111111"
+      }
+    },
+    "pending_replacement": {
+      "method": "GET",
+      "path": "/v1/spaces/research/sources/report-42/head",
+      "status": 200,
+      "response": {
+        "operation_id": "source_operation:replacement",
+        "generation": "opaque-head-2",
+        "desired_revision": "capture-43",
+        "published_revision": "capture-42",
+        "lifecycle": "active",
+        "cleanup_state": "not_required",
+        "state": "running",
+        "internal_source_id": "source:11111111-1111-4111-8111-111111111111"
+      }
+    },
+    "retracted": {
+      "method": "GET",
+      "path": "/v1/spaces/research/sources/report-42/head",
+      "status": 200,
+      "response": {
+        "operation_id": "source_operation:retract",
+        "generation": "opaque-head-3",
+        "desired_revision": null,
+        "published_revision": null,
+        "lifecycle": "retracted",
+        "cleanup_state": "complete",
+        "state": "complete",
+        "internal_source_id": "source:11111111-1111-4111-8111-111111111111"
+      }
+    },
+    "erasing": {
+      "method": "GET",
+      "path": "/v1/spaces/research/sources/report-42/head",
+      "status": 200,
+      "response": {
+        "operation_id": "source_operation:erase",
+        "generation": "opaque-head-4",
+        "desired_revision": null,
+        "published_revision": null,
+        "lifecycle": "erased",
+        "cleanup_state": "pending",
+        "state": "running",
+        "internal_source_id": "source:11111111-1111-4111-8111-111111111111"
+      }
+    },
+    "erased": {
+      "method": "GET",
+      "path": "/v1/spaces/research/sources/report-42/head",
+      "status": 200,
+      "response": {
+        "operation_id": "source_operation:erase",
+        "generation": "opaque-head-4",
+        "desired_revision": null,
+        "published_revision": null,
+        "lifecycle": "erased",
+        "cleanup_state": "complete",
+        "state": "complete",
+        "internal_source_id": "source:11111111-1111-4111-8111-111111111111"
+      }
+    }
+  },
+  "public_lifecycle_values": [
+    "active",
+    "retracted",
+    "erased"
+  ],
+  "unknown_source": {
+    "status": 404,
+    "response": {
+      "error_code": "not_found",
+      "message": "Source head not found",
+      "retryable": false
+    }
+  },
+  "unknown_space": {
+    "status": 404,
+    "response": {
+      "error_code": "unknown_space",
+      "message": "Unknown space",
+      "retryable": false
+    }
+  },
+  "source_inventory": {
+    "method": "GET",
+    "path": "/v1/spaces/research/sources?limit=50",
+    "response": {
+      "sources": [
+        {
+          "operation_id": "source_operation:example",
+          "generation": "opaque-head-1",
+          "desired_revision": "capture-42",
+          "published_revision": "capture-42",
+          "lifecycle": "active",
+          "cleanup_state": "not_required",
+          "state": "complete",
+          "internal_source_id": "source:11111111-1111-4111-8111-111111111111",
+          "external_source_id": "report-42",
+          "source_type": "manual"
+        },
+        {
+          "operation_id": "source_operation:erase",
+          "generation": "opaque-head-4",
+          "desired_revision": null,
+          "published_revision": null,
+          "lifecycle": "erased",
+          "cleanup_state": "complete",
+          "state": "complete",
+          "internal_source_id": "source:22222222-2222-4222-8222-222222222222",
+          "external_source_id": null,
+          "source_type": null
+        }
+      ],
+      "next_cursor": null
+    },
+    "semantics": "Authorized-row paging over opaque physical-incarnation keys, no snapshot or lossless delta guarantee. Denied rows never create extra empty continuation pages. Persist external-to-internal mapping before erasure; erased external identifiers are not retained. Scan budget exhaustion is a typed rate_limited error without partial rows or cursor."
+  },
+  "readiness_ready": {
+    "method": "GET",
+    "path": "/v1/readiness",
+    "headers": {
+      "X-Space-Id": "research"
+    },
+    "status": 200,
+    "response": {
+      "ready": true,
+      "configured": true,
+      "runtime_mode": "local_memory",
+      "storage_ready": true,
+      "worker_ready": false,
+      "semantic_ingest_ready": false,
+      "recovery_ready": true,
+      "draining": false
+    }
+  },
+  "readiness_draining": {
+    "method": "GET",
+    "path": "/v1/readiness",
+    "headers": {
+      "X-Space-Id": "research"
+    },
+    "status": 503,
+    "response": {
+      "ready": false,
+      "configured": true,
+      "runtime_mode": "local_memory",
+      "storage_ready": false,
+      "worker_ready": false,
+      "semantic_ingest_ready": false,
+      "recovery_ready": true,
+      "draining": true,
+      "error": {
+        "error_code": "not_ready",
+        "message": "Requested service capabilities are not ready",
+        "retryable": true
+      }
+    }
+  },
+  "readiness_field_types": {
+    "ready": "boolean",
+    "configured": "boolean",
+    "runtime_mode": [
+      "local_memory",
+      "shared_memory",
+      "read_only",
+      "maintenance"
+    ],
+    "storage_ready": "boolean",
+    "worker_ready": "boolean",
+    "semantic_ingest_ready": "boolean",
+    "recovery_ready": "boolean",
+    "draining": "boolean",
+    "error": "omitted when ready; otherwise non-null {error_code:string,message:string,retryable:boolean}. Authentication errors use the top-level shared error shape."
+  }
+}

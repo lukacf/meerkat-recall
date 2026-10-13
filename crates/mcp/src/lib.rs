@@ -8,11 +8,15 @@
 
 pub mod authz;
 pub mod coercion;
+pub mod current_read;
 pub mod error;
+pub mod evidence;
 pub mod handlers;
 pub mod profile;
 pub mod redaction;
 pub mod registry;
+pub mod scoped_search;
+pub mod snapshot_control;
 pub mod tools;
 
 pub use error::{McpError, McpResult};
@@ -53,3 +57,6 @@ mod tests {
         assert!(err.to_string().contains("test"));
     }
 }
+
+#[cfg(test)]
+mod retrieval_test_support;

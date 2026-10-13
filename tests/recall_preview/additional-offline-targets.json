@@ -1,0 +1,135 @@
+{
+  "format": "recall-additional-offline-targets/v1",
+  "source_commit": "988af6f38bd773127d0ea7d0f2044191cae897c8",
+  "source_only": true,
+  "execution_authorized_by_this_file": false,
+  "target_count": 7,
+  "source_method_count_at_base": 21,
+  "targets": [
+    {
+      "package": "meerkat-recall-bin",
+      "target_kind": "test",
+      "target": "cli_readiness",
+      "source": "bin/elephant/tests/cli_readiness.rs",
+      "source_sha256": "d506e0a2f573af5994fc8f2cb14c03af6eebe1d2a5d0f51893edeb72336d7d31",
+      "tests": [
+        "readiness_exit_codes_preserve_diagnostics_and_ignore_healthy_liveness",
+        "unavailable_server_emits_json_and_exit_four",
+        "canonical_and_legacy_paths_report_the_same_version"
+      ],
+      "prerequisites": "Owned 127.0.0.1:0 Axum stub and CARGO_BIN_EXE_meerkat-recall child; temporary Unix alias; no Recall server.",
+      "evidence_limit": "CLI diagnostics only, not actual service readiness or installed archive identity.",
+      "feature_requirements": "No target-specific required-features; central joined --all-features graph retained.",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "meerkat-recall-bin",
+      "target_kind": "test",
+      "target": "cli_service_token",
+      "source": "bin/elephant/tests/cli_service_token.rs",
+      "source_sha256": "43f1ad3bf0026310c6b0f7a2ee5c8c26fdb314a33730a4a08d2ae9ad1de9f59e",
+      "tests": [
+        "bootstrap_refuses_overwrite_and_tokens_preserve_explicit_space",
+        "issuance_refuses_write_scope_in_read_only_mode_and_missing_space",
+        "multi_space_requires_explicit_selection_and_global_admin_has_no_data_scopes"
+      ],
+      "prerequisites": "Owned temp signing key/token files; actual CLI child and shared LegacyVerifier; JWT environment removed/replaced by synthetic inputs.",
+      "evidence_limit": "Actual issuing/verifying adapter, no installed HTTP/MCP bootstrap receipt.",
+      "feature_requirements": "No target-specific required-features; central joined --all-features graph retained.",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "meerkat-recall-bin",
+      "target_kind": "test",
+      "target": "cli_snapshot",
+      "source": "bin/elephant/tests/cli_snapshot.rs",
+      "source_sha256": "a33dcff9294c473373cea225bbf9f1cd1d9abe2b440cee76683044536e4bbed1",
+      "tests": [
+        "named_export_sends_bounded_quiesce_and_requires_a_manifest",
+        "verification_is_offline_and_invalid_retention_is_usage_error"
+      ],
+      "prerequisites": "Owned loopback Axum snapshot response stub; CLI child; nonexistent owned temp path for offline verify.",
+      "evidence_limit": "CLI wire and validation only; no live snapshot export/restore or physical retention proof.",
+      "feature_requirements": "No target-specific required-features; central joined --all-features graph retained.",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-auth",
+      "target_kind": "test",
+      "target": "contract_conformance",
+      "source": "crates/auth/tests/contract_conformance.rs",
+      "source_sha256": "0b2fefa3d6b34e84fc7a0c639ba8c8aaabe6761e44db1fa4b75ea16ebbb583f6",
+      "tests": [
+        "shared_v1_negotiation_corpus",
+        "pinned_shared_corpus_has_exact_upstream_bytes"
+      ],
+      "prerequisites": "Pure local typed negotiation plus include_bytes conformance corpus; no process/network.",
+      "evidence_limit": "Contract compatibility only, not ingress or resource authority.",
+      "feature_requirements": "No target-specific required-features; central joined --all-features graph retained.",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-auth",
+      "target_kind": "test",
+      "target": "information_conformance",
+      "source": "crates/auth/tests/information_conformance.rs",
+      "source_sha256": "64e293feb602ba8a3a66f7db8c1e4f612a6a4ee101b589b0481973fa28547628",
+      "tests": [
+        "shared_restriction_vectors_use_elephant_implementation",
+        "shared_dependency_and_derivation_vectors_preserve_every_input",
+        "protected_wire_refuses_missing_extra_and_ambiguous_fields",
+        "finite_intersection_laws_do_not_widen_or_discard_unknowns",
+        "restriction_debug_redacts_exact_actions_times_and_depths",
+        "corpus_bytes_match_independently_versioned_upstream"
+      ],
+      "prerequisites": "Pure local restrictions/dependency/protected-envelope algebra and fixed include_bytes corpus.",
+      "evidence_limit": "Information-flow vectors only, not live sinks, source erasure or actual principals.",
+      "feature_requirements": "No target-specific required-features; central joined --all-features graph retained.",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-pipeline",
+      "target_kind": "test",
+      "target": "model_catalog_pin",
+      "source": "crates/pipeline/tests/model_catalog_pin.rs",
+      "source_sha256": "5771027291ffdce2285af0201e034853fea627e39399c621e26ad0ab809daf9b",
+      "tests": [
+        "pinned_catalog_resolves_gpt_5_6_sol",
+        "pinned_catalog_still_resolves_the_previous_extraction_model"
+      ],
+      "prerequisites": "Pure pinned meerkat_models::infer_provider lookup; no model construction/dispatch.",
+      "evidence_limit": "Catalog recognition only, no live availability, quality or governed provider acceptance.",
+      "feature_requirements": "No target-specific required-features; central joined --all-features graph retained.",
+      "executed_by_qualification": false
+    },
+    {
+      "package": "elephant-pipeline",
+      "target_kind": "test",
+      "target": "resolution_repo_chokepoints_integration",
+      "source": "crates/pipeline/tests/resolution_repo_chokepoints_integration.rs",
+      "source_sha256": "1135670a359ae5a0a88459feb86b29d499189735a8ccecb85536842be946b111",
+      "tests": [
+        "test_resolution_bm25_search_entities_returns_hits",
+        "test_resolution_vector_search_entities_returns_hits",
+        "test_resolution_get_entities_within_n_hops_traverses_both_directions"
+      ],
+      "prerequisites": "StorageClient::new_memory + apply_schema; source-less entities/relationships; synthetic 3072-float vectors.",
+      "evidence_limit": "Actual repository lookup/traversal only; fake vectors cannot qualify semantic retrieval.",
+      "feature_requirements": "No target-specific required-features; central joined --all-features graph retained.",
+      "executed_by_qualification": false
+    }
+  ],
+  "required_join_delta": {
+    "source_commit": "31841b69ab330c99a7a4dbc2605ca96d1790ecfa",
+    "target": "cli_service_token",
+    "source": "bin/elephant/tests/cli_service_token.rs",
+    "source_sha256": "bc5007d0dbc82ac990f0df91e78716525f51aca569763679e28483cb77bb0d8c",
+    "additional_test": "classified_space_bootstrap_is_explicit_short_lived_and_not_an_ordinary_token",
+    "prerequisites": "Same synthetic temp CLI fixture, explicit household-policy clearance3, 900s bootstrap; invalid mixed flags/data scopes/TTL/missing clearances refuse."
+  },
+  "excluded": [
+    "tests/calibration/tests/calibration_llm.rs (two ignored live-provider methods)",
+    "Any unlisted integration target or ignored live test"
+  ],
+  "central_scheduling": "Append exactly these seven --test targets to the previously frozen 21-target workspace graph only after coherent source joins. Parent alone schedules Cargo via own-worktree wrapper and existing resource limits. nextest <=16; parent currently4. No D Cargo/list/binary/service execution. CLI children lack independent per-child deadlines; retain central nextest timeout/process cleanup. Sanitize proxy/provider credentials in central environment for local-only fixture custody."
+}

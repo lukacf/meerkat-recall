@@ -25,20 +25,83 @@ pub use elephant_db::{cosine_similarity, hashed_text_embedding, lexical_score};
 /// Embedded mutation view re-export.
 pub type EmbeddedMutation<'a> = elephant_db::ElephantDbTx<'a>;
 
-/// Shared in-memory store backing the embedded `elephant-db` backend.
+/// Shared kernel state with optional managed transaction-log durability.
 #[derive(Debug, Clone, Default)]
 pub struct EmbeddedStore {
     db: Arc<ElephantDb>,
     import_barrier: Arc<RwLock<()>>,
+    recovery: Option<Arc<crate::recovery_barrier::RecoveryBarrier>>,
+    durability: Option<Arc<crate::embedded_durability::EmbeddedDurability>>,
+    store_writer: Option<Arc<crate::exclusive_store_lock::StoreWriterLock>>,
 }
 
 impl EmbeddedStore {
+    /// Install original-journal runtime custody before any managed admission.
+    pub(crate) fn with_reference_guard(
+        self,
+        journal: &crate::erasure_journal::ErasureJournal,
+    ) -> StorageResult<Self> {
+        crate::reference_fence::install_kernel_reference_guard(
+            &self.db,
+            journal.identity().to_owned(),
+            *journal.reference_key_bytes(),
+        )?;
+        Ok(self)
+    }
+
+    /// Keep persistent ownership with independently cloned store handles.
+    pub(crate) fn with_store_writer(
+        mut self,
+        writer: Option<Arc<crate::exclusive_store_lock::StoreWriterLock>>,
+    ) -> Self {
+        self.store_writer = writer;
+        self
+    }
+
+    pub(crate) fn with_recovery_barrier(
+        mut self,
+        recovery: Arc<crate::recovery_barrier::RecoveryBarrier>,
+    ) -> Self {
+        self.recovery = Some(recovery);
+        self
+    }
+
+    pub(crate) fn maintenance_view(&self) -> Self {
+        let mut store = self.clone();
+        store.recovery = None;
+        store
+    }
+
+    async fn admit(&self) -> StorageResult<Option<crate::recovery_barrier::StorageAdmission>> {
+        if let Some(durability) = &self.durability {
+            durability.ensure_healthy()?;
+        }
+        match &self.recovery {
+            Some(recovery) => recovery.admit_operation().await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn require_restore_owner(&self) -> StorageResult<()> {
+        if self.recovery.is_some() {
+            return Err(StorageError::Conflict(
+                "managed stores restore through StorageClient and the erasure barrier".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn with_import_read_guard<R, F>(&self, f: F) -> StorageResult<R>
     where
         F: FnOnce(&ElephantDb) -> StorageResult<R>,
     {
+        let _admission = self.admit().await?;
         let _guard = self.import_barrier.read().await;
-        f(&self.db)
+        let result = f(&self.db);
+        if let Some(durability) = &self.durability {
+            durability.ensure_healthy()?;
+        }
+        result
     }
 
     fn ensure_snapshot_operation_quiescent(&self, operation: &str) -> StorageResult<()> {
@@ -85,7 +148,89 @@ impl EmbeddedStore {
         Self {
             db: Arc::new(ElephantDb::new()),
             import_barrier: Arc::new(RwLock::new(())),
+            recovery: None,
+            durability: None,
+            store_writer: None,
         }
+    }
+
+    /// Opens private live recovery state before any managed admission. Unlike
+    /// user backups, this preserves Running leases for normal queue recovery.
+    pub(crate) fn from_durable_path(
+        path: &Path,
+        journal: &crate::erasure_journal::ErasureJournal,
+        recovery: Arc<crate::recovery_barrier::RecoveryBarrier>,
+    ) -> StorageResult<Self> {
+        let (db, durability) =
+            crate::embedded_durability::EmbeddedDurability::open(path, journal, recovery)?;
+        Ok(Self {
+            db: Arc::new(db),
+            import_barrier: Arc::new(RwLock::new(())),
+            recovery: None,
+            durability: Some(durability),
+            store_writer: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durability_for_test(
+        &self,
+    ) -> Option<Arc<crate::embedded_durability::EmbeddedDurability>> {
+        self.durability.clone()
+    }
+
+    pub(crate) fn is_live_destination(&self, path: &Path) -> StorageResult<bool> {
+        self.durability
+            .as_ref()
+            .map_or(Ok(false), |durability| durability.owns_destination(path))
+    }
+
+    /// Physical erasure/restore uses this private checkpoint, not a quiescent
+    /// user backup. All prior WAL payload is retired before success returns.
+    pub(crate) async fn checkpoint(&self) -> StorageResult<()> {
+        let _admission = self.admit().await?;
+        let _guard = self.import_barrier.write().await;
+        if let Some(durability) = &self.durability {
+            durability.checkpoint(&self.db.export_snapshot_bytes()?, false)?;
+        }
+        Ok(())
+    }
+
+    async fn checkpoint_if_needed(&self) -> StorageResult<()> {
+        if let Some(durability) = &self.durability {
+            if durability.needs_checkpoint()? {
+                let _guard = self.import_barrier.write().await;
+                // Another transaction may have checkpointed while we waited.
+                if durability.needs_checkpoint()? {
+                    durability.checkpoint(&self.db.export_snapshot_bytes()?, false)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn install_snapshot(&self, validated: ElephantDb) -> StorageResult<()> {
+        if let Some(durability) = &self.durability {
+            durability.checkpoint(&validated.export_snapshot_bytes()?, true)?;
+        }
+        self.db.import_snapshot_db(validated).map_err(|error| {
+            if let Some(durability) = &self.durability {
+                durability.poison();
+            }
+            StorageError::from(error)
+        })
+    }
+
+    /// Only StorageClient's owned restore transaction calls this.
+    ///
+    /// Current live
+    /// Running rows may come from a crashed interrupted restore; incoming user
+    /// backup data must still pass the ordinary no-Running validation.
+    pub(crate) async fn replace_for_restore(&self, bytes: &[u8]) -> StorageResult<()> {
+        self.require_restore_owner()?;
+        let _guard = self.import_barrier.write().await;
+        let validated = Self::parse_importable_snapshot(bytes, SnapshotImportOptions::default())?;
+        self.install_snapshot(validated)
     }
 
     /// Creates a store from a snapshot file.
@@ -100,55 +245,100 @@ impl EmbeddedStore {
             bytes = bytes.len(),
             "Parsing embedded Elephant snapshot"
         );
+        let bytes = crate::snapshot::decode_live_snapshot(&bytes)?;
         let db = Self::parse_importable_snapshot(&bytes, snapshot_import_options_from_env())?;
         info!(path = %path.display(), "Loaded embedded Elephant snapshot");
         Ok(Self {
             db: Arc::new(db),
             import_barrier: Arc::new(RwLock::new(())),
+            recovery: None,
+            durability: None,
+            store_writer: None,
         })
     }
 
     /// Exports the current in-memory state to a JSON snapshot.
     pub async fn export_snapshot(&self, path: impl AsRef<Path>) -> StorageResult<()> {
+        self.require_restore_owner()?;
         let bytes = self.export_snapshot_bytes().await?;
-        tokio::fs::write(path, bytes)
-            .await
-            .map_err(|err| StorageError::SerializationError(err.to_string()))
+        crate::snapshot::write_live_snapshot(path.as_ref(), &bytes, None)
     }
 
     /// Imports a snapshot into the live in-memory store, replacing all state.
     pub async fn import_snapshot(&self, path: impl AsRef<Path>) -> StorageResult<()> {
+        self.require_restore_owner()?;
         let _guard = self.import_barrier.write().await;
         self.ensure_snapshot_operation_quiescent("import")?;
         let bytes = tokio::fs::read(path)
             .await
             .map_err(|err| StorageError::SerializationError(err.to_string()))?;
+        let bytes = crate::snapshot::decode_live_snapshot(&bytes)?;
         let validated = Self::parse_importable_snapshot(&bytes, SnapshotImportOptions::default())?;
-        self.db.import_snapshot_db(validated)?;
-        Ok(())
+        self.install_snapshot(validated)
     }
 
     /// Exports the current in-memory state to JSON bytes.
     pub async fn export_snapshot_bytes(&self) -> StorageResult<Vec<u8>> {
+        let _admission = self.admit().await?;
         let _guard = self.import_barrier.write().await;
-        {
-            let db = &self.db;
-            let bytes = db.export_snapshot_bytes()?;
-            sanitize_running_work_items_for_snapshot_export(&bytes)
-        }
+        self.ensure_snapshot_operation_quiescent("export")?;
+        self.db.export_backup_snapshot_bytes().map_err(Into::into)
     }
 
     /// Imports a snapshot from JSON bytes, replacing all state.
     pub async fn import_snapshot_bytes(&self, bytes: &[u8]) -> StorageResult<()> {
+        self.require_restore_owner()?;
         let _guard = self.import_barrier.write().await;
         self.ensure_snapshot_operation_quiescent("import")?;
         let validated = Self::parse_importable_snapshot(bytes, SnapshotImportOptions::default())?;
-        self.db.import_snapshot_db(validated).map_err(Into::into)
+        self.install_snapshot(validated)
     }
 
     /// Returns nonempty persisted tables and derived vector partition names.
     pub async fn table_names(&self) -> StorageResult<Vec<String>> {
         self.with_import_read_guard(|db| db.table_names().map_err(Into::into))
+            .await
+    }
+
+    /// Read bounded physical typed IDs under normal admission and import guards.
+    pub(crate) async fn physical_record_ids_page(
+        &self,
+        table: elephant_types::TableName,
+        space: &str,
+        after: Option<&RecordId>,
+        limit: usize,
+    ) -> StorageResult<Vec<RecordId>> {
+        self.with_import_read_guard(|db| {
+            db.physical_record_ids_page(table, space, after, limit)
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Read a bounded extension-row page without taking a mutation lock.
+    /// Restore replacement remains excluded by the import read guard.
+    pub async fn extension_rows_page(
+        &self,
+        table: &str,
+        space: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<(String, serde_json::Value)>> {
+        self.with_import_read_guard(|db| {
+            db.extension_rows_page(table, space, after, limit)
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Observe an exact physical extension key without a mutation/checkpoint.
+    /// The maintenance admission and import read guard still fence replacement.
+    pub(crate) async fn extension_row_by_key(
+        &self,
+        table: &str,
+        key: &str,
+    ) -> StorageResult<Option<serde_json::Value>> {
+        self.with_import_read_guard(|db| db.extension_row_by_key(table, key).map_err(Into::into))
             .await
     }
 
@@ -158,13 +348,22 @@ impl EmbeddedStore {
             .await
     }
 
-    /// Applies a set of in-memory mutations atomically.
+    /// Applies mutations atomically, syncing the managed WAL before visibility.
     pub async fn mutate<R, F>(&self, f: F) -> StorageResult<R>
     where
         F: FnOnce(&mut EmbeddedMutation<'_>) -> StorageResult<R> + Send,
     {
-        let _guard = self.import_barrier.read().await;
-        self.db.tx(f)
+        let _admission = self.admit().await?;
+        let result = {
+            let _guard = self.import_barrier.read().await;
+            self.db.tx_with_commit(f, |mutations| {
+                self.durability
+                    .as_ref()
+                    .map_or(Ok(()), |durability| durability.append(mutations))
+            })?
+        };
+        self.checkpoint_if_needed().await?;
+        Ok(result)
     }
 
     /// Returns `true` when the store contains no records.
@@ -178,8 +377,8 @@ impl EmbeddedStore {
     where
         T: EmbeddedRecord,
     {
-        let _guard = self.import_barrier.read().await;
-        self.db.create(record).map_err(Into::into)
+        self.mutate(|tx| tx.create(record).map_err(Into::into))
+            .await
     }
 
     /// Replaces an existing record.
@@ -187,8 +386,8 @@ impl EmbeddedStore {
     where
         T: EmbeddedRecord,
     {
-        let _guard = self.import_barrier.read().await;
-        self.db.replace(record).map_err(Into::into)
+        self.mutate(|tx| tx.replace(record).map_err(Into::into))
+            .await
     }
 
     /// Replaces an existing record after validating the target row inside one
@@ -203,18 +402,18 @@ impl EmbeddedStore {
     where
         T: EmbeddedRecord,
     {
-        let _guard = self.import_barrier.read().await;
         let target_space_id = space_id.to_string();
         let target_id = id.clone();
         record.base_mut().space_id.clone_from(&target_space_id);
         record.base_mut().id.clone_from(&target_id);
 
-        self.db.tx(move |tx| {
+        self.mutate(move |tx| {
             let Some(_existing) = tx.get::<T>(&target_space_id, &target_id, false)? else {
                 return Err(StorageError::NotFound(target_id.to_string()));
             };
             tx.replace(record).map_err(Into::into)
         })
+        .await
     }
 
     /// Replaces an existing record in any lifecycle state inside one embedded
@@ -229,18 +428,18 @@ impl EmbeddedStore {
     where
         T: EmbeddedRecord,
     {
-        let _guard = self.import_barrier.read().await;
         let target_space_id = space_id.to_string();
         let target_id = id.clone();
         record.base_mut().space_id.clone_from(&target_space_id);
         record.base_mut().id.clone_from(&target_id);
 
-        self.db.tx(move |tx| {
+        self.mutate(move |tx| {
             let Some(_existing) = tx.get::<T>(&target_space_id, &target_id, true)? else {
                 return Err(StorageError::NotFound(target_id.to_string()));
             };
             tx.replace(record).map_err(Into::into)
         })
+        .await
     }
 
     /// Replaces an existing record and clears any soft-delete flag inside one
@@ -255,19 +454,19 @@ impl EmbeddedStore {
     where
         T: EmbeddedRecord,
     {
-        let _guard = self.import_barrier.read().await;
         let target_space_id = space_id.to_string();
         let target_id = id.clone();
         record.base_mut().space_id.clone_from(&target_space_id);
         record.base_mut().id.clone_from(&target_id);
         record.base_mut().deleted_at = None;
 
-        self.db.tx(move |tx| {
+        self.mutate(move |tx| {
             let Some(_existing) = tx.get::<T>(&target_space_id, &target_id, true)? else {
                 return Err(StorageError::NotFound(target_id.to_string()));
             };
             tx.replace(record).map_err(Into::into)
         })
+        .await
     }
 
     /// Gets a record by ID, optionally including soft-deleted rows.
@@ -332,11 +531,11 @@ impl EmbeddedStore {
     where
         T: EmbeddedRecord,
     {
-        let _guard = self.import_barrier.read().await;
-        match self.db.hard_delete::<T>(space_id, id) {
+        self.mutate(|tx| match tx.hard_delete::<T>(space_id, id) {
             Ok(()) | Err(ElephantDbError::NotFound(_)) => Ok(()),
-            Err(err) => Err(err.into()),
-        }
+            Err(error) => Err(error.into()),
+        })
+        .await
     }
 
     /// Soft deletes a record by setting `deleted_at`.
@@ -344,10 +543,9 @@ impl EmbeddedStore {
     where
         T: EmbeddedRecord,
     {
-        let _guard = self.import_barrier.read().await;
         let target_space_id = space_id.to_string();
         let target_id = id.clone();
-        self.db.tx(move |tx| {
+        self.mutate(move |tx| {
             let Some(mut record) = tx.get::<T>(&target_space_id, &target_id, true)? else {
                 return Ok(());
             };
@@ -357,6 +555,7 @@ impl EmbeddedStore {
             let _ = tx.replace(record)?;
             Ok(())
         })
+        .await
     }
 
     /// Restores a soft-deleted record.
@@ -364,10 +563,9 @@ impl EmbeddedStore {
     where
         T: EmbeddedRecord,
     {
-        let _guard = self.import_barrier.read().await;
         let target_space_id = space_id.to_string();
         let target_id = id.clone();
-        self.db.tx(move |tx| {
+        self.mutate(move |tx| {
             let Some(mut record) = tx.get::<T>(&target_space_id, &target_id, true)? else {
                 return Err(StorageError::NotFound(target_id.to_string()));
             };
@@ -375,6 +573,7 @@ impl EmbeddedStore {
             record.base_mut().updated_at = Utc::now();
             tx.replace(record).map_err(Into::into)
         })
+        .await
     }
 
     /// Lists records by table and `space_id`.
@@ -612,38 +811,6 @@ fn snapshot_import_options_from_env() -> SnapshotImportOptions {
     }
 }
 
-fn sanitize_running_work_items_for_snapshot_export(bytes: &[u8]) -> StorageResult<Vec<u8>> {
-    let mut payload: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|err| StorageError::SerializationError(err.to_string()))?;
-    let Some(work_items) = payload
-        .get_mut("tables")
-        .and_then(|tables| tables.get_mut("work_item"))
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return Ok(bytes.to_vec());
-    };
-
-    for item in work_items {
-        let Some(object) = item.as_object_mut() else {
-            continue;
-        };
-        if object
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|status| status == "running")
-        {
-            object.insert(
-                "status".to_string(),
-                serde_json::Value::String("runnable".to_string()),
-            );
-            object.insert("leased_by".to_string(), serde_json::Value::Null);
-            object.insert("lease_expires_at".to_string(), serde_json::Value::Null);
-        }
-    }
-
-    serde_json::to_vec(&payload).map_err(|err| StorageError::SerializationError(err.to_string()))
-}
-
 fn cursor_with_table(table: elephant_types::TableName, cursor: &str) -> String {
     if cursor.contains(':') {
         cursor.to_string()
@@ -658,6 +825,7 @@ impl From<ElephantDbError> for StorageError {
             ElephantDbError::Serialization(message) => Self::SerializationError(message),
             ElephantDbError::NotFound(message) => Self::NotFound(message),
             ElephantDbError::Conflict(message) => Self::Conflict(message),
+            ElephantDbError::ErasureInProgress => Self::ErasureInProgress,
             ElephantDbError::Snapshot(message) | ElephantDbError::DataIntegrity(message) => {
                 Self::QueryError(message)
             }
@@ -736,7 +904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_export_snapshot_bytes_requeues_running_workers() {
+    async fn test_export_snapshot_bytes_refuses_running_workers() {
         let store = EmbeddedStore::new();
         store
             .create(WorkItem {
@@ -759,20 +927,14 @@ mod tests {
             .await
             .expect("create running work item");
 
-        let bytes = store
+        let error = store
             .export_snapshot_bytes()
             .await
-            .expect("export should produce an importable recovery snapshot");
-        let restored = EmbeddedStore::new();
-        restored
-            .import_snapshot_bytes(&bytes)
-            .await
-            .expect("import recovery snapshot");
-        let work_items = restored.scan::<WorkItem>().await.expect("scan work items");
-        assert_eq!(work_items.len(), 1);
-        assert_eq!(work_items[0].status, WorkItemStatus::Runnable);
-        assert!(work_items[0].leased_by.is_none());
-        assert!(work_items[0].lease_expires_at.is_none());
+            .expect_err("active work must drain before export");
+        assert!(matches!(error, StorageError::Conflict(_)));
+        let work_items = store.scan::<WorkItem>().await.expect("scan live work");
+        assert_eq!(work_items[0].status, WorkItemStatus::Running);
+        assert_eq!(work_items[0].leased_by.as_deref(), Some("worker-1"));
     }
 
     #[tokio::test]

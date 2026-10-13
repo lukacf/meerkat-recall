@@ -1,0 +1,18 @@
+{
+  "format": "recall-pristine-control-result/v1",
+  "source_commit": "3ac8350765f3ffba4fa94d9935eb6c15fa09ae3d",
+  "test_methods": 32,
+  "successful": 32,
+  "exit_code": 0,
+  "unittest_elapsed_seconds": 0.262,
+  "process_elapsed_seconds": 0.3278345321305096,
+  "receipt_sha256": "14466dc17f26ae9dbd22031e76da583590c540ed2166e057e684136c9aae00fa",
+  "log": {
+    "path": "/home/luka/recall-orchestration/validation/qualification-pristine-oracles-1.log",
+    "sha256": "24b645e5bd56c1a2ccec5c6812a0a922349febc6cb60e6b5d9016c2a18f0558c",
+    "bytes": 5565
+  },
+  "product_acceptance": false,
+  "scope": "32 closed-world Python controls only; no product/database/socket/provider/Cargo execution",
+  "no_rerun_required_without_new_change_or_failure": true
+}

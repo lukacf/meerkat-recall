@@ -11,23 +11,31 @@
 //! - `delete_source`
 //! - `restore_source`
 
+use super::source_intake::{accept_intake, enqueue_intake, intake_control, intake_schema};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use elephant_storage::source_intake::IntakeControl;
+#[cfg(test)]
+use elephant_storage::MediaAssetRepository;
+#[cfg(test)]
+use elephant_storage::{
+    deterministic_source_id_for_ingest, find_existing_source_for_doc,
+    find_existing_source_for_source,
+};
+#[cfg(test)]
+use elephant_types::records::{
+    prepare_source_for_reingest, prepare_source_for_reingest_preserving_acl_if_placeholder,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
-use tracing::warn;
+
 use uuid::Uuid;
 
 use elephant_storage::{
-    deterministic_source_id_for_ingest, find_existing_doc_for_doc, find_existing_source_for_doc,
-    find_existing_source_for_source, parse_id, persist_manual_doc_for_source_detailed,
-    preview_persisted_manual_doc_for_source, rollback_persisted_manual_doc,
-    rollback_persisted_source, update_existing_source_for_reingest, MediaAssetRepository,
-    PersistedManualDoc, Repository, SearchCriteria, SearchRepository, SourceRepository,
-    StorageClient,
+    parse_id, Repository, SearchCriteria, SearchRepository, SourceRepository, StorageClient,
 };
 use elephant_types::ids::TableName;
 use elephant_types::mcp_simple::{CreateSourceSimpleInput, ExtractionGuidanceInput};
@@ -38,10 +46,8 @@ use elephant_types::records::media_asset::{
 };
 use elephant_types::records::source::SourceType;
 use elephant_types::records::{
-    apply_manual_doc_to_source, prepare_source_for_reingest,
-    prepare_source_for_reingest_preserving_acl_if_placeholder, validate_manual_ingest_mode,
-    validate_simple_source_fields, DocMediaAttachment, DocMediaLocation, MediaAsset, Source,
-    SourceLifecycleStatus,
+    validate_manual_ingest_mode, validate_simple_source_fields, DocMediaAttachment,
+    DocMediaLocation, MediaAsset, Source, SourceLifecycleStatus,
 };
 use elephant_types::{BaseFieldsBuilder, RecordId, TypeError};
 
@@ -50,7 +56,7 @@ use crate::error::{McpError, McpResult};
 use crate::tools::ToolResponse;
 
 use super::{merge_base_fields, ToolContext, ToolHandler};
-use elephant_pipeline::scheduler::ingest_work_kinds::enqueue_triage_source_work_item;
+
 #[cfg(test)]
 use elephant_pipeline::scheduler::ingest_work_kinds::TRIAGE_SOURCE_KIND;
 
@@ -69,6 +75,23 @@ fn validate_simple_source_input(name: &str, uri: Option<&str>) -> McpResult<()> 
 }
 
 fn normalize_source_value(source_value: &mut Value, ctx: &ToolContext) -> McpResult<()> {
+    let generated = elephant_storage::source_intake::create_document_id(
+        &ctx.principal.space_id,
+        source_value,
+        &IntakeControl::default(),
+    )
+    .map_err(super::source_intake::storage_error)?;
+    if source_value
+        .get("base")
+        .and_then(|base| base.get("id"))
+        .is_none()
+    {
+        if let Some(object) = source_value.as_object_mut() {
+            object
+                .entry("id")
+                .or_insert_with(|| json!(RecordId::new(TableName::Source, generated.id())));
+        }
+    }
     let obj = source_value
         .as_object_mut()
         .ok_or_else(|| McpError::InvalidParameters("source must be an object".to_string()))?;
@@ -287,48 +310,6 @@ fn build_media_attachments(
     })
 }
 
-async fn persist_prepared_media_assets(
-    storage: &StorageClient,
-    assets: &[MediaAsset],
-) -> McpResult<()> {
-    let repo = MediaAssetRepository::new(storage.clone());
-    let mut persisted_ids = Vec::with_capacity(assets.len());
-    for asset in assets {
-        match repo.create(asset.clone()).await {
-            Ok(_) => persisted_ids.push(asset.base.id.clone()),
-            Err(err) => {
-                rollback_media_assets_by_ids(storage, &asset.base.space_id, &persisted_ids).await;
-                return Err(McpError::ExecutionError(err.to_string()));
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn rollback_media_assets_by_ids(
-    storage: &StorageClient,
-    space_id: &str,
-    asset_ids: &[RecordId],
-) {
-    let repo = MediaAssetRepository::new(storage.clone());
-    for asset_id in asset_ids {
-        if let Err(error) = repo.delete(space_id, asset_id).await {
-            warn!(asset_id = %asset_id, error = %error, "failed to roll back prepared media asset");
-        }
-    }
-}
-
-async fn rollback_prepared_media_assets(storage: &StorageClient, assets: &[MediaAsset]) {
-    let Some(first_asset) = assets.first() else {
-        return;
-    };
-    let asset_ids = assets
-        .iter()
-        .map(|asset| asset.base.id.clone())
-        .collect::<Vec<_>>();
-    rollback_media_assets_by_ids(storage, &first_asset.base.space_id, &asset_ids).await;
-}
-
 fn source_hash_for_staged_doc(
     name: &str,
     uri: Option<&str>,
@@ -380,7 +361,6 @@ fn source_hash_for_staged_doc(
             "title": doc.title.clone(),
             "text": doc.text.clone(),
             "sidecar_text": doc.sidecar_text.clone(),
-            "rendition_key": doc.rendition_key.clone(),
             "metadata": doc.metadata.clone(),
             "media": media,
         })),
@@ -396,20 +376,7 @@ fn apply_space_override_doc(space_id: &str, doc: &mut Doc) {
     doc.base.space_id = space_id.to_string();
 }
 
-fn source_ingest_output(
-    source: &Source,
-    work_item_id: &RecordId,
-    doc_id: Option<String>,
-) -> SourceIngestOutput {
-    SourceIngestOutput {
-        source_id: source.base.id.to_string(),
-        lifecycle_status: source.lifecycle_status,
-        current_ingest_mode: source.current_ingest_mode,
-        work_item_id: Some(work_item_id.to_string()),
-        doc_id,
-    }
-}
-
+#[cfg(test)]
 async fn stage_source_for_ingest(
     ctx: &ToolContext,
     source: Source,
@@ -441,261 +408,50 @@ async fn stage_source_for_ingest(
     Ok((source, None))
 }
 
-async fn rollback_staged_source_and_doc(
-    ctx: &ToolContext,
-    source: &Source,
-    previous_source: Option<&Source>,
-    staged_doc: Option<&PersistedManualDoc>,
-) {
-    if let Some(staged_doc) = staged_doc {
-        if let Err(err) = rollback_persisted_manual_doc(&ctx.storage, staged_doc).await {
-            warn!(
-                doc_id = %staged_doc.doc.base.id,
-                source_id = %source.base.id,
-                rollback_error = %err,
-                "failed to roll back staged manual doc after ingest failure"
-            );
-        }
-    }
-
-    match previous_source {
-        Some(previous_source) => {
-            if let Err(err) =
-                rollback_persisted_source(&ctx.storage, source, Some(previous_source)).await
-            {
-                warn!(
-                    source_id = %previous_source.base.id,
-                    rollback_error = %err,
-                    "failed to roll back staged source after ingest failure"
-                );
-            }
-        }
-        None => {
-            if let Err(err) = rollback_persisted_source(&ctx.storage, source, None).await {
-                warn!(
-                    source_id = %source.base.id,
-                    rollback_error = %err,
-                    "failed to delete staged source after ingest failure"
-                );
-            }
-        }
-    }
-}
-
-async fn authorize_persisted_source_doc_write(
-    ctx: &ToolContext,
-    source: &Source,
-    doc: &Doc,
-) -> McpResult<()> {
-    let preview = preview_persisted_manual_doc_for_source(&ctx.storage, source, doc)
-        .await
-        .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-    ctx.authz
-        .authorize_record_write(&ctx.principal, &preview, "write:doc")
-        .map_err(|reason| McpError::ExecutionError(format!("Access denied: {reason}")))
-}
-
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::large_futures,
+    reason = "Preserve the original repository lifetimes and future ownership"
+)]
 async fn ingest_source_record(
     ctx: &ToolContext,
-    repo: &SourceRepository,
+    _repo: &SourceRepository,
     mut source: Source,
     mut doc: Option<Doc>,
     pending_assets: &[MediaAsset],
     ingest_mode: Option<IngestMode>,
+    control: IntakeControl,
 ) -> McpResult<SourceIngestOutput> {
-    let space_id = ctx.principal.space_id.clone();
-    if space_id.is_empty() {
-        return Err(McpError::ExecutionError(
-            "Access denied: missing space_id".to_string(),
-        ));
+    let space_id = &ctx.principal.space_id;
+    if space_id.trim().is_empty() {
+        return Err(McpError::InvalidParameters("missing space_id".into()));
     }
-
-    apply_space_override(&space_id, &mut source);
-    if doc.is_none() {
-        source.base.id = deterministic_source_id_for_ingest(&source);
+    apply_space_override(space_id, &mut source);
+    if let Some(doc) = &mut doc {
+        apply_space_override_doc(space_id, doc);
+        elephant_storage::source_intake::attach_document(&mut source, doc)
+            .map_err(super::source_intake::storage_error)?;
     }
-
-    let doc_id = if let Some(doc) = doc.as_mut() {
-        apply_space_override_doc(&space_id, doc);
-        if source.base.space_id != doc.base.space_id {
-            return Err(McpError::InvalidParameters(format!(
-                "source/doc space mismatch: source is in `{}` but doc is in `{}`",
-                source.base.space_id, doc.base.space_id
-            )));
-        }
-        match find_existing_doc_for_doc(&ctx.storage, doc).await {
-            Ok(Some(existing_doc)) => {
-                if let Err(reason) =
-                    ctx.authz
-                        .authorize_record_write(&ctx.principal, &existing_doc, "write:doc")
-                {
-                    return Err(McpError::ExecutionError(format!("Access denied: {reason}")));
-                }
-            }
-            Ok(None) => {
-                if let Err(reason) =
-                    ctx.authz
-                        .authorize_record_write(&ctx.principal, doc, "write:doc")
-                {
-                    return Err(McpError::ExecutionError(format!("Access denied: {reason}")));
-                }
-            }
-            Err(err) => return Err(McpError::ExecutionError(err.to_string())),
-        }
-
-        Some(
-            apply_manual_doc_to_source(&mut source, doc)
-                .map_err(|e| McpError::ExecutionError(e.to_string()))?,
-        )
-    } else {
-        None
-    };
-
-    let requested_mode = ingest_mode.unwrap_or_else(|| {
-        if doc_id.is_some() {
+    let mode = ingest_mode.unwrap_or_else(|| {
+        if doc.is_some() {
             IngestMode::Graph
         } else {
             IngestMode::Metadata
         }
     });
-    validate_manual_ingest_mode(requested_mode, doc_id.is_some())
-        .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-    source.set_requested_ingest_mode(requested_mode);
-    let (source_candidate, previous_source) =
-        stage_source_for_ingest(ctx, source, doc.as_ref()).await?;
-    if let Some(doc_ref) = doc.as_ref() {
-        authorize_persisted_source_doc_write(ctx, &source_candidate, doc_ref).await?;
-    }
-    let rollback_source = previous_source.clone();
-    let (created, staged_doc, rollback_source_override) = if let Some(previous_source) =
-        previous_source
-    {
-        let updated_source =
-            update_existing_source_for_reingest(repo, &previous_source, source_candidate)
-                .await
-                .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-        if let Some(doc) = doc {
-            persist_prepared_media_assets(&ctx.storage, pending_assets).await?;
-            match persist_manual_doc_for_source_detailed(&ctx.storage, &updated_source, doc).await {
-                Ok(staged_doc) => (updated_source, Some(staged_doc), None),
-                Err(err) => {
-                    rollback_prepared_media_assets(&ctx.storage, pending_assets).await;
-                    if let Err(rollback_err) = rollback_persisted_source(
-                        &ctx.storage,
-                        &updated_source,
-                        Some(&previous_source),
-                    )
-                    .await
-                    {
-                        warn!(
-                            source_id = %previous_source.base.id,
-                            error = %err,
-                            rollback_error = %rollback_err,
-                            "failed to roll back staged source after manual doc persistence error"
-                        );
-                    }
-                    return Err(McpError::ExecutionError(err.to_string()));
-                }
-            }
-        } else {
-            (updated_source, None, None)
-        }
-    } else {
-        let (created, rollback_source_override) = match repo.create(source_candidate.clone()).await
-        {
-            Ok(created) => (created, None),
-            Err(elephant_storage::StorageError::Conflict(_)) => {
-                let existing = repo
-                    .get_with_deleted(&source_candidate.base.space_id, &source_candidate.base.id)
-                    .await
-                    .map_err(|e| McpError::ExecutionError(e.to_string()))?
-                    .ok_or_else(|| {
-                        McpError::ExecutionError(
-                            "source ingest conflict without persisted source".to_string(),
-                        )
-                    })?;
-                ctx.authz
-                    .authorize_record_write(&ctx.principal, &existing, "write:source")
-                    .map_err(|reason| {
-                        McpError::ExecutionError(format!("Access denied: {reason}"))
-                    })?;
-                let updated_source = if doc.is_some() {
-                    prepare_source_for_reingest(&existing, source_candidate.clone())
-                } else {
-                    prepare_source_for_reingest_preserving_acl_if_placeholder(
-                        &existing,
-                        source_candidate.clone(),
-                    )
-                };
-                ctx.authz
-                    .authorize_record_write(&ctx.principal, &updated_source, "write:source")
-                    .map_err(|reason| {
-                        McpError::ExecutionError(format!("Access denied: {reason}"))
-                    })?;
-                let persisted =
-                    update_existing_source_for_reingest(repo, &existing, updated_source)
-                        .await
-                        .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-                (persisted, Some(existing))
-            }
-            Err(e) => return Err(McpError::ExecutionError(e.to_string())),
-        };
-        if let Some(doc) = doc {
-            persist_prepared_media_assets(&ctx.storage, pending_assets).await?;
-            match persist_manual_doc_for_source_detailed(&ctx.storage, &created, doc).await {
-                Ok(staged_doc) => (created, Some(staged_doc), rollback_source_override),
-                Err(err) => {
-                    rollback_prepared_media_assets(&ctx.storage, pending_assets).await;
-                    match rollback_source_override
-                        .as_ref()
-                        .map_or_else(
-                            || rollback_persisted_source(&ctx.storage, &created, None),
-                            |existing_source| {
-                                rollback_persisted_source(
-                                    &ctx.storage,
-                                    &created,
-                                    Some(existing_source),
-                                )
-                            },
-                        )
-                        .await
-                    {
-                        Ok(()) => {}
-                        Err(rollback_err) => {
-                            warn!(
-                                source_id = %created.base.id,
-                                error = %err,
-                                rollback_error = %rollback_err,
-                                "failed to roll back staged source after manual doc persistence error"
-                            );
-                        }
-                    }
-                    return Err(McpError::ExecutionError(err.to_string()));
-                }
-            }
-        } else {
-            (created, None, rollback_source_override)
-        }
-    };
-    let rollback_source = rollback_source.or(rollback_source_override);
-    let work_item_id_result =
-        enqueue_triage_source_work_item(&ctx.storage, &created, "mcp.ingest_source", 5).await;
-    let work_item_id = match work_item_id_result {
-        Ok(work_item_id) => work_item_id,
-        Err(e) => {
-            rollback_prepared_media_assets(&ctx.storage, pending_assets).await;
-            rollback_staged_source_and_doc(
-                ctx,
-                &created,
-                rollback_source.as_ref(),
-                staged_doc.as_ref(),
-            )
-            .await;
-            return Err(McpError::ExecutionError(e.to_string()));
-        }
-    };
-    Ok(source_ingest_output(&created, &work_item_id, doc_id))
+    validate_manual_ingest_mode(mode, doc.is_some())
+        .map_err(|error| McpError::InvalidParameters(error.to_string()))?;
+    source.set_requested_ingest_mode(mode);
+    let accepted = accept_intake(ctx, source, doc.as_ref(), control, pending_assets).await?;
+    let work_item_id = enqueue_intake(ctx, &accepted).await;
+    Ok(SourceIngestOutput {
+        source_id: accepted.source.base.id.to_string(),
+        lifecycle_status: accepted.source.lifecycle_status,
+        current_ingest_mode: accepted.source.current_ingest_mode,
+        work_item_id: work_item_id.map(|id| id.to_string()),
+        doc_id: accepted.document.map(|doc| doc.base.id.to_string()),
+        operation: accepted.operation,
+    })
 }
 
 async fn count_visible_source_search_results(
@@ -740,9 +496,8 @@ async fn count_visible_source_search_results(
             break;
         };
 
-        if !ctx
-            .authz
-            .filter_records(&ctx.principal, vec![source], SOURCE_SEARCH_SCOPE)
+        if !crate::current_read::filter(ctx, vec![source], SOURCE_SEARCH_SCOPE)
+            .await?
             .is_empty()
         {
             total_visible = total_visible.saturating_add(1);
@@ -816,9 +571,7 @@ async fn collect_visible_source_search_results(
             break;
         };
 
-        let allowed = ctx
-            .authz
-            .filter_records(&ctx.principal, vec![source], SOURCE_SEARCH_SCOPE);
+        let allowed = crate::current_read::filter(ctx, vec![source], SOURCE_SEARCH_SCOPE).await?;
         if let Some(source) = allowed.into_iter().next() {
             if visible.len() < limit {
                 visible.push(source);
@@ -929,6 +682,9 @@ pub enum IngestSourceInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizedIngestSourceInput {
+    /// Adapter-only source revision intent.
+    #[serde(default)]
+    pub intake: IntakeControl,
     /// Source record to create as the provenance-first intake object.
     pub source: Source,
     /// Optional staged document title.
@@ -961,6 +717,9 @@ pub struct NormalizedIngestSourceInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyIngestSourceInput {
+    /// Adapter-only source revision intent.
+    #[serde(default)]
+    pub intake: IntakeControl,
     /// Source record to create as the provenance-first intake object.
     pub source: Source,
     /// Optional manual document payload to stage on the source.
@@ -987,6 +746,9 @@ pub enum IngestSourceSimpleInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizedIngestSourceSimpleInput {
+    /// Adapter-only source revision intent.
+    #[serde(default)]
+    pub intake: IntakeControl,
     /// Human-readable source name.
     pub name: String,
     /// Optional URI.
@@ -1025,6 +787,9 @@ pub struct NormalizedIngestSourceSimpleInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyIngestSourceSimpleLegacyInput {
+    /// Adapter-only source revision intent.
+    #[serde(default)]
+    pub intake: IntakeControl,
     /// Human-readable source name.
     pub name: String,
     /// Optional URI.
@@ -1089,6 +854,8 @@ pub struct SourceIdInput {
 /// Output for source-first ingest tools.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceIngestOutput {
+    /// Durable source operation; queue success is not publication.
+    pub operation: elephant_types::publication::OperationReceipt,
     /// Created source ID.
     pub source_id: String,
     /// Current source lifecycle status.
@@ -1189,7 +956,7 @@ impl NormalizedStagedDocInput {
 }
 
 impl IngestSourceInput {
-    fn into_parts(self, ctx: &ToolContext) -> McpResult<PreparedIngestSourceParts> {
+    async fn into_parts(self, ctx: &ToolContext) -> McpResult<PreparedIngestSourceParts> {
         match self {
             Self::Normalized(input) => {
                 let mut source = input.source;
@@ -1213,10 +980,21 @@ impl IngestSourceInput {
                 Ok((source, doc, pending_assets, input.ingest_mode))
             }
             Self::Legacy(input) => {
-                if let Some(doc) = &input.doc {
+                let mut source = input.source;
+                let mut doc = input.doc;
+                apply_space_override(&ctx.principal.space_id, &mut source);
+                if let Some(doc) = &mut doc {
                     validate_public_media_attachments(&doc.media_attachments)?;
+                    apply_space_override_doc(&ctx.principal.space_id, doc);
+                    elephant_storage::source_intake::bind_legacy_document_source_identity(
+                        &ctx.storage,
+                        &mut source,
+                        doc,
+                    )
+                    .await
+                    .map_err(super::source_intake::storage_error)?;
                 }
-                Ok((input.source, input.doc, Vec::new(), input.ingest_mode))
+                Ok((source, doc, Vec::new(), input.ingest_mode))
             }
         }
     }
@@ -1394,9 +1172,7 @@ impl ToolHandler for SearchSourcesHandler {
             .map_err(|e| McpError::ExecutionError(e.to_string()))?;
 
         let page_len = page.results.len();
-        let filtered = ctx
-            .authz
-            .filter_records(&ctx.principal, page.results, SOURCE_SEARCH_SCOPE);
+        let filtered = crate::current_read::filter(ctx, page.results, SOURCE_SEARCH_SCOPE).await?;
         let total_visible = count_visible_source_search_results(
             &self.repo,
             ctx,
@@ -1422,7 +1198,10 @@ impl ToolHandler for SearchSourcesHandler {
         };
 
         let output = SearchSourcesOutput {
-            items,
+            items: items
+                .into_iter()
+                .map(|source| super::source_intake::public_source(&ctx.principal, source))
+                .collect(),
             next_cursor,
             has_more,
             total: Some(total),
@@ -1500,7 +1279,11 @@ impl ToolHandler for GetSourceHandler {
                     return serde_json::to_value(response)
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
-                let response = ToolResponse::success(source);
+                let source = crate::current_read::require(ctx, source, "read:source").await?;
+                let response = ToolResponse::success(super::source_intake::public_source(
+                    &ctx.principal,
+                    source,
+                ));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
             Ok(None) => {
@@ -1515,7 +1298,7 @@ impl ToolHandler for GetSourceHandler {
 
 /// Handler for `create_source` tool.
 pub struct CreateSourceHandler {
-    repo: SourceRepository,
+    _repo: SourceRepository,
 }
 
 impl CreateSourceHandler {
@@ -1523,7 +1306,7 @@ impl CreateSourceHandler {
     #[must_use]
     pub const fn new(storage: StorageClient) -> Self {
         Self {
-            repo: SourceRepository::new(storage),
+            _repo: SourceRepository::new(storage),
         }
     }
 }
@@ -1547,6 +1330,7 @@ impl ToolHandler for CreateSourceHandler {
             "type": "object",
             "required": ["source"],
             "properties": {
+                "intake": intake_schema(),
                 "source": {
                     "type": "object",
                     "required": [],
@@ -1556,7 +1340,12 @@ impl ToolHandler for CreateSourceHandler {
         })
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original repository lifetimes and future ownership"
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
         let mut params = coerce_params(params, &self.input_schema());
         if let Some(source) = params.get_mut("source") {
             normalize_source_value(source, ctx)?;
@@ -1581,28 +1370,18 @@ impl ToolHandler for CreateSourceHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        match self.repo.create(input.source).await {
-            Ok(source) => {
-                if let Err(reason) =
-                    ctx.authz
-                        .authorize_record_read(&ctx.principal, &source, "read:source")
-                {
-                    let response: ToolResponse<Source> =
-                        ToolResponse::error(format!("Access denied: {reason}"));
-                    return serde_json::to_value(response)
-                        .map_err(|e| McpError::ExecutionError(e.to_string()));
-                }
-                let response = ToolResponse::success(source);
-                serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
-            }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
-        }
+        let accepted = accept_intake(ctx, input.source, None, intake, &[]).await?;
+        let work_item_id = enqueue_intake(ctx, &accepted).await;
+        Ok(
+            json!({"ok":true,"data":super::source_intake::public_source(&ctx.principal, accepted.source),"operation":accepted.operation,
+            "work_item_id":work_item_id,"enqueued":work_item_id.is_some()}),
+        )
     }
 }
 
 /// Handler for `create_source_simple` tool.
 pub struct CreateSourceSimpleHandler {
-    repo: SourceRepository,
+    _repo: SourceRepository,
 }
 
 /// Handler for `ingest_source` tool.
@@ -1644,6 +1423,7 @@ impl ToolHandler for IngestSourceHandler {
             "type": "object",
             "required": ["source"],
             "properties": {
+                "intake": intake_schema(),
                 "source": { "type": "object", "required": [] },
                 "title": { "type": "string", "description": "Optional staged document title" },
                 "text": { "type": "string", "description": "Optional staged document text or sidecar text for media docs" },
@@ -1667,13 +1447,14 @@ impl ToolHandler for IngestSourceHandler {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
         let mut params = coerce_params(params, &self.input_schema());
         if let Some(source) = params.get_mut("source") {
             normalize_source_value(source, ctx)?;
         }
         let input: IngestSourceInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
-        let (source, doc, pending_assets, ingest_mode) = input.into_parts(ctx)?;
+        let (source, doc, pending_assets, ingest_mode) = input.into_parts(ctx).await?;
 
         let output = Box::pin(ingest_source_record(
             ctx,
@@ -1682,6 +1463,7 @@ impl ToolHandler for IngestSourceHandler {
             doc,
             &pending_assets,
             ingest_mode,
+            intake,
         ))
         .await?;
         serde_json::to_value(ToolResponse::success(output))
@@ -1729,6 +1511,7 @@ impl ToolHandler for IngestSourceSimpleHandler {
             "type": "object",
             "required": ["name"],
             "properties": {
+                "intake": intake_schema(),
                 "name": { "type": "string" },
                 "uri": { "type": "string" },
                 "source_type": { "type": "string" },
@@ -1754,6 +1537,7 @@ impl ToolHandler for IngestSourceSimpleHandler {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
         let params = coerce_params(params, &self.input_schema());
         let input: IngestSourceSimpleInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
@@ -1801,6 +1585,7 @@ impl ToolHandler for IngestSourceSimpleHandler {
             doc,
             &pending_assets,
             ingest_mode,
+            intake,
         ))
         .await?;
         serde_json::to_value(ToolResponse::success(output))
@@ -1883,6 +1668,17 @@ impl ToolHandler for BatchIngestSourcesHandler {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let controls = params
+            .get("items")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(intake_control)
+                    .collect::<McpResult<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         let mut params = coerce_params(params, &self.input_schema());
         if let Some(items) = params.get_mut("items").and_then(Value::as_array_mut) {
             for item in items {
@@ -1897,7 +1693,7 @@ impl ToolHandler for BatchIngestSourcesHandler {
         let mut succeeded = Vec::new();
         let mut failed = Vec::new();
         for (index, item) in input.items.into_iter().enumerate() {
-            let parts = item.into_parts(ctx);
+            let parts = item.into_parts(ctx).await;
             match parts {
                 Ok((source, doc, pending_assets, ingest_mode)) => {
                     match Box::pin(ingest_source_record(
@@ -1907,6 +1703,7 @@ impl ToolHandler for BatchIngestSourcesHandler {
                         doc,
                         &pending_assets,
                         ingest_mode,
+                        controls.get(index).cloned().unwrap_or_default(),
                     ))
                     .await
                     {
@@ -1937,7 +1734,7 @@ impl CreateSourceSimpleHandler {
     #[must_use]
     pub const fn new(storage: StorageClient) -> Self {
         Self {
-            repo: SourceRepository::new(storage),
+            _repo: SourceRepository::new(storage),
         }
     }
 }
@@ -1961,6 +1758,7 @@ impl ToolHandler for CreateSourceSimpleHandler {
             "type": "object",
             "required": ["name"],
             "properties": {
+                "intake": intake_schema(),
                 "name": { "type": "string", "description": "Human-readable name" },
                 "uri": { "type": "string", "description": "Optional URI for the source" },
                 "source_type": { "type": "string", "description": "Optional source type (e.g. web, email, manual)" }
@@ -1968,7 +1766,12 @@ impl ToolHandler for CreateSourceSimpleHandler {
         })
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original repository lifetimes and future ownership"
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
         let params = coerce_params(params, &self.input_schema());
         let input: CreateSourceSimpleInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
@@ -2014,22 +1817,12 @@ impl ToolHandler for CreateSourceSimpleHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        match self.repo.create(source).await {
-            Ok(source) => {
-                if let Err(reason) =
-                    ctx.authz
-                        .authorize_record_read(&ctx.principal, &source, "read:source")
-                {
-                    let response: ToolResponse<Source> =
-                        ToolResponse::error(format!("Access denied: {reason}"));
-                    return serde_json::to_value(response)
-                        .map_err(|e| McpError::ExecutionError(e.to_string()));
-                }
-                let response = ToolResponse::success(source);
-                serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
-            }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
-        }
+        let accepted = accept_intake(ctx, source, None, intake, &[]).await?;
+        let work_item_id = enqueue_intake(ctx, &accepted).await;
+        Ok(
+            json!({"ok":true,"data":super::source_intake::public_source(&ctx.principal, accepted.source),"operation":accepted.operation,
+            "work_item_id":work_item_id,"enqueued":work_item_id.is_some()}),
+        )
     }
 }
 
@@ -2067,6 +1860,7 @@ impl ToolHandler for UpdateSourceHandler {
             "type": "object",
             "required": ["id", "fields"],
             "properties": {
+                "intake": intake_schema(),
                 "id": {
                     "type": "string",
                     "description": "Source ID"
@@ -2080,7 +1874,12 @@ impl ToolHandler for UpdateSourceHandler {
         })
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original repository lifetimes and future ownership"
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
         let params = coerce_params(params, &self.input_schema());
         let input: UpdateSourceInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
@@ -2139,22 +1938,12 @@ impl ToolHandler for UpdateSourceHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        match self.repo.update(&space_id, &rid, updated).await {
-            Ok(source) => {
-                if let Err(reason) =
-                    ctx.authz
-                        .authorize_record_read(&ctx.principal, &source, "read:source")
-                {
-                    let response: ToolResponse<Source> =
-                        ToolResponse::error(format!("Access denied: {reason}"));
-                    return serde_json::to_value(response)
-                        .map_err(|e| McpError::ExecutionError(e.to_string()));
-                }
-                let response = ToolResponse::success(source);
-                serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
-            }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
-        }
+        let accepted = accept_intake(ctx, updated, None, intake, &[]).await?;
+        let work_item_id = enqueue_intake(ctx, &accepted).await;
+        Ok(
+            json!({"ok":true,"data":super::source_intake::public_source(&ctx.principal, accepted.source),"operation":accepted.operation,
+            "work_item_id":work_item_id,"enqueued":work_item_id.is_some()}),
+        )
     }
 }
 
@@ -2192,6 +1981,7 @@ impl ToolHandler for DeleteSourceHandler {
             "type": "object",
             "required": ["id"],
             "properties": {
+                "intake": intake_schema(),
                 "id": {
                     "type": "string",
                     "description": "Source ID"
@@ -2201,6 +1991,7 @@ impl ToolHandler for DeleteSourceHandler {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
         let params = coerce_params(params, &self.input_schema());
         let input: SourceIdInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
@@ -2214,7 +2005,7 @@ impl ToolHandler for DeleteSourceHandler {
 
         let rid = parse_id(&input.id, TableName::Source)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
-        match self.repo.get(&space_id, &rid).await {
+        match self.repo.get_with_deleted(&space_id, &rid).await {
             Ok(Some(source)) => {
                 if let Err(reason) =
                     ctx.authz
@@ -2225,12 +2016,11 @@ impl ToolHandler for DeleteSourceHandler {
                     return serde_json::to_value(response)
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
-                self.repo
-                    .delete(&space_id, &rid)
-                    .await
-                    .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-
-                let response = ToolResponse::success(json!({ "deleted": true, "id": input.id }));
+                let operation =
+                    super::source_intake::retract_intake(ctx, &source, intake, None).await?;
+                let response = ToolResponse::success(
+                    json!({ "deleted": true, "id": input.id, "operation": operation }),
+                );
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
             Ok(None) => {
@@ -2277,6 +2067,7 @@ impl ToolHandler for RestoreSourceHandler {
             "type": "object",
             "required": ["id"],
             "properties": {
+                "intake": intake_schema(),
                 "id": {
                     "type": "string",
                     "description": "Source ID"
@@ -2285,7 +2076,12 @@ impl ToolHandler for RestoreSourceHandler {
         })
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Preserve the original repository lifetimes and future ownership"
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        let intake = intake_control(&params)?;
         let params = coerce_params(params, &self.input_schema());
         let input: SourceIdInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
@@ -2320,14 +2116,13 @@ impl ToolHandler for RestoreSourceHandler {
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
 
-                let restored = self
-                    .repo
-                    .restore(&space_id, &rid)
-                    .await
-                    .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-
-                let response = ToolResponse::success(restored);
-                serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+                let accepted =
+                    super::source_intake::restore_intake(ctx, source, intake, None).await?;
+                let work_item_id = enqueue_intake(ctx, &accepted).await;
+                Ok(
+                    json!({"ok":true,"data":super::source_intake::public_source(&ctx.principal, accepted.source),"operation":accepted.operation,
+                    "work_item_id":work_item_id,"enqueued":work_item_id.is_some()}),
+                )
             }
             Ok(None) => {
                 let response: ToolResponse<()> =
@@ -2360,6 +2155,89 @@ mod tests {
     use std::str::FromStr;
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
+    async fn source_reads_and_searches_never_return_private_intake_payloads() {
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let mut source = Source::new(
+            BaseFieldsBuilder::new("projection")
+                .for_table(TableName::Source)
+                .build(),
+            SourceType::Manual,
+            "projection-content-hash".into(),
+        );
+        source.external_id = Some("Projection Canary".into());
+        source.uri = Some("https://example.test/private-location".into());
+        source.path = Some("/private/source-location".into());
+        source.metadata = json!({"public_note":"kept","_manual_doc":{
+            "text":"private-template-canary", "_intake_assets":[{"bytes":"private-media-canary"}]
+        }});
+        let repo = SourceRepository::new(storage.clone());
+        let saved = repo.create(source).await.unwrap();
+        for raw in [false, true] {
+            let mut principal = Principal {
+                space_id: "projection".into(),
+                scopes: HashSet::from(["read:source".into()]),
+                clearances: vec![elephant_policy::Clearance {
+                    policy_id: "default".into(),
+                    max_level: 0,
+                    labels: HashSet::new(),
+                    handling_allow: HashSet::new(),
+                }],
+                subject_allowlist: None,
+                purpose: HashSet::new(),
+            };
+            if raw {
+                principal.scopes.insert("read:source:raw".into());
+            }
+            let ctx =
+                ToolContext::with_authz(storage.clone(), Arc::new(AuthzService::new()), principal);
+            let direct = GetSourceHandler::new(storage.clone())
+                .execute(&ctx, json!({"id":saved.base.id}))
+                .await
+                .unwrap();
+            let search = SearchSourcesHandler::new(storage.clone())
+                .execute(&ctx, json!({"limit":10}))
+                .await
+                .unwrap();
+            let unified = super::super::search::UnifiedSearchHandler::new(storage.clone())
+                .execute(
+                    &ctx,
+                    json!({"query":"Projection", "include":["sources"], "limit":10}),
+                )
+                .await
+                .unwrap();
+            for body in [
+                &direct["data"],
+                &search["data"]["items"][0],
+                &unified["data"]["sources"]["items"][0],
+            ] {
+                assert_eq!(body["id"], saved.base.id.to_string());
+                assert_eq!(body["metadata"]["public_note"], "kept");
+                assert!(body["metadata"].get("_manual_doc").is_none());
+                assert!(!body.to_string().contains("private-template-canary"));
+                assert!(!body.to_string().contains("private-media-canary"));
+                assert_eq!(body["uri"].is_string(), raw);
+                assert_eq!(body["path"].is_string(), raw);
+            }
+        }
+        assert_eq!(
+            repo.get("projection", &saved.base.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata,
+            saved.metadata
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_source_only_reingest_staging_preserves_placeholders_and_validates_explicit_acl() {
         use elephant_policy::Clearance;
         use elephant_types::records::base::SubjectsState;
@@ -2445,22 +2323,35 @@ mod tests {
             ..StorageConfig::default()
         };
         let storage = StorageClient::new(config).await.expect("storage");
-        storage
-            .query("DEFINE TABLE source SCHEMALESS;")
+        // Exercise the same complete schema and initialization receipts as the
+        // native runtime, including current physical input fencing functions.
+        Box::pin(elephant_migrations::apply_schema(&storage))
             .await
-            .expect("source schema");
-        storage
-            .query("DEFINE TABLE doc SCHEMALESS;")
+            .expect("complete native schema");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: elephant_types::records::base::BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    "test_space".into(),
+                    "fixture".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
             .await
-            .expect("doc schema");
-        storage
-            .query("DEFINE TABLE work_item SCHEMALESS;")
-            .await
-            .expect("work item schema");
+            .expect("named space");
         storage
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_enqueues_triage_source_work_item() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -2506,8 +2397,12 @@ mod tests {
         let output = decoded.data.expect("output");
 
         assert_eq!(output.lifecycle_status, SourceLifecycleStatus::Discovered);
+        let accepted_doc_id =
+            RecordId::from_str(output.doc_id.as_deref().expect("immutable doc ID"))
+                .expect("parse doc ID");
+        assert_ne!(accepted_doc_id, doc.base.id);
         let persisted = DocRepository::new(storage.clone())
-            .get("test_space", &doc.base.id)
+            .get("test_space", &accepted_doc_id)
             .await
             .expect("load doc")
             .expect("persisted doc");
@@ -2519,7 +2414,10 @@ mod tests {
         let item = repo
             .find_by_idempotency_key(
                 "test_space",
-                &format!("{TRIAGE_SOURCE_KIND}:{}", output.source_id),
+                &format!(
+                    "{TRIAGE_SOURCE_KIND}:{}:{}",
+                    output.source_id, output.operation.source_generation
+                ),
             )
             .await
             .expect("find work item");
@@ -2527,6 +2425,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_accepts_normalized_staged_doc_shape() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -2589,6 +2491,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_rejects_mixed_legacy_and_normalized_doc_shapes() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -2633,6 +2539,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_simple_enqueues_triage_source_work_item() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -2660,7 +2570,10 @@ mod tests {
         let item = repo
             .find_by_idempotency_key(
                 "test_space",
-                &format!("{TRIAGE_SOURCE_KIND}:{}", output.source_id),
+                &format!(
+                    "{TRIAGE_SOURCE_KIND}:{}:{}",
+                    output.source_id, output.operation.source_generation
+                ),
             )
             .await
             .expect("find work item");
@@ -2668,6 +2581,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_simple_applies_extraction_guidance_metadata() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -2724,6 +2641,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_simple_updates_extraction_guidance_on_reuse() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -2749,7 +2670,10 @@ mod tests {
         let first_output = first_decoded.data.expect("first output");
 
         let repo = WorkItemRepository::new(storage.clone());
-        let idempotency_key = format!("{TRIAGE_SOURCE_KIND}:{}", first_output.source_id);
+        let idempotency_key = format!(
+            "{TRIAGE_SOURCE_KIND}:{}:{}",
+            first_output.source_id, first_output.operation.source_generation
+        );
         let work_item = repo
             .find_by_idempotency_key("test_space", &idempotency_key)
             .await
@@ -2767,6 +2691,7 @@ mod tests {
                     "uri": "example://session/123/frame/1",
                     "source_type": "device_frame",
                     "ingest_mode": "metadata",
+                    "intake":{"revision_id":"guidance-v2","idempotency_key":"guidance-v2","expected_generation":first_output.operation.source_generation},
                     "extraction_skill": "extraction/example-observations-v2",
                     "extraction_purpose": "extract richer observation graph"
                 }),
@@ -2778,7 +2703,7 @@ mod tests {
         let second_output = second_decoded.data.expect("second output");
 
         assert_eq!(first_output.source_id, second_output.source_id);
-        assert_eq!(first_output.work_item_id, second_output.work_item_id);
+        assert_ne!(first_output.work_item_id, second_output.work_item_id);
 
         let source_id = RecordId::from_str(&second_output.source_id).expect("parse source id");
         let persisted = SourceRepository::new(storage.clone())
@@ -2806,10 +2731,24 @@ mod tests {
             .await
             .expect("reload work item")
             .expect("reopened work item");
-        assert_eq!(reopened.status, WorkItemStatus::Runnable);
+        assert_eq!(reopened.status, WorkItemStatus::Done); // Historical work is never reopened.
+        let new_item = repo
+            .get(
+                "test_space",
+                &RecordId::from_str(second_output.work_item_id.as_deref().expect("new queue id"))
+                    .expect("work id"),
+            )
+            .await
+            .expect("work")
+            .expect("new work");
+        assert_eq!(new_item.status, WorkItemStatus::Runnable);
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_simple_accepts_normalized_staged_doc_shape() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -2860,6 +2799,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_simple_accepts_browser_style_data_url_inline_media() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -2909,6 +2852,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_simple_invalid_media_does_not_persist_prior_assets() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -2957,6 +2904,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_rejects_uri_media_transport() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -2993,6 +2944,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_legacy_rejects_path_or_uri_media_attachments() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -3047,6 +3002,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_simple_legacy_rejects_path_or_uri_media_attachments() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -3094,6 +3053,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_simple_rejects_inline_video_without_duration() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -3125,6 +3088,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_simple_rejects_mixed_legacy_and_normalized_doc_shapes() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -3162,6 +3129,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_simple_rejects_invalid_name_or_uri() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -3196,7 +3167,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ingest_source_simple_reuses_existing_source_and_reopens_triage() {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
+    async fn test_ingest_source_simple_retry_keeps_original_operation_and_terminal_work() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
         let authz = Arc::new(AuthzService::new_with_skip_auth(true));
@@ -3218,7 +3193,10 @@ mod tests {
             serde_json::from_value(first).expect("decode first");
         let first_output = first_decoded.data.expect("first output");
         let repo = WorkItemRepository::new(storage.clone());
-        let idempotency_key = format!("{TRIAGE_SOURCE_KIND}:{}", first_output.source_id);
+        let idempotency_key = format!(
+            "{TRIAGE_SOURCE_KIND}:{}:{}",
+            first_output.source_id, first_output.operation.source_generation
+        );
         let work_item = repo
             .find_by_idempotency_key("test_space", &idempotency_key)
             .await
@@ -3251,7 +3229,8 @@ mod tests {
             .await
             .expect("reload work item")
             .expect("reopened work item");
-        assert_eq!(reopened.status, WorkItemStatus::Runnable);
+        assert_eq!(reopened.status, WorkItemStatus::Done);
+        assert_eq!(first_output.operation, second_output.operation);
 
         let sources = SourceRepository::new(storage)
             .list("test_space", 10, None)
@@ -3261,6 +3240,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_principal_space_override_allows_mismatched_payload_spaces() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -3307,6 +3290,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_simple_rejects_graph_without_doc() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -3332,6 +3319,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_ingest_source_restores_soft_deleted_doc() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -3421,235 +3412,109 @@ mod tests {
         assert_eq!(sources.len(), 1);
     }
 
-    #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn test_ingest_source_reuses_existing_source_and_resets_lifecycle() {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
+    async fn test_ingest_source_replacement_keeps_source_and_changes_immutable_document() {
         let storage = setup_test_storage().await;
-        let principal = make_test_principal("test_space");
-        let authz = Arc::new(AuthzService::new_with_skip_auth(true));
-        let ctx = ToolContext::with_authz(storage.clone(), authz, principal.clone());
-        let handler = IngestSourceHandler::new(storage.clone());
-        let doc_id = RecordId::new_v4(TableName::Doc);
-
-        let first_source = Source::new(
-            BaseFieldsBuilder::new("test_space")
-                .for_table(TableName::Source)
-                .build(),
-            SourceType::Manual,
-            "hash-1".to_string(),
+        let ctx = ToolContext::with_authz(
+            storage.clone(),
+            Arc::new(AuthzService::new_with_skip_auth(true)),
+            make_test_principal("test_space"),
         );
-        let mut first_doc = Doc {
-            base: {
-                let mut base = BaseFieldsBuilder::new("test_space")
-                    .for_table(TableName::Doc)
-                    .build();
-                base.id = doc_id.clone();
-                base
-            },
-            title: "Doc".to_string(),
-            text: "First".to_string(),
-            sidecar_text: None,
-            media_attachments: Vec::new(),
-            source: None,
-            rendition_key: "manual".to_string(),
-            metadata: serde_json::json!({}),
-        };
-        first_doc.base.security.level = 4;
-
+        let handler = IngestSourceSimpleHandler::new(storage.clone());
         let first = handler
             .execute(
                 &ctx,
-                json!({
-                    "source": first_source,
-                    "doc": first_doc,
-                    "ingest_mode": "graph"
-                }),
+                json!({"name":"stable feed","title":"Doc","text":"First","ingest_mode":"graph"}),
             )
             .await
-            .expect("first ingest");
-        let first_decoded: ToolResponse<SourceIngestOutput> =
-            serde_json::from_value(first).expect("decode first");
-        let first_output = first_decoded.data.expect("first output");
-        let source_id = RecordId::from_str(&first_output.source_id).expect("parse source id");
-
-        let mut existing_source = SourceRepository::new(storage.clone())
-            .get("test_space", &source_id)
-            .await
-            .expect("load source")
-            .expect("persisted source");
-        existing_source.base.security.level = 4;
-        existing_source.lifecycle_status = SourceLifecycleStatus::GraphReady;
-        existing_source.current_ingest_mode = Some(IngestMode::Graph);
-        SourceRepository::new(storage.clone())
-            .update("test_space", &source_id, existing_source)
-            .await
-            .expect("promote source state");
-
-        let second_source = Source::new(
-            BaseFieldsBuilder::new("test_space")
-                .for_table(TableName::Source)
-                .build(),
-            SourceType::Manual,
-            "hash-2".to_string(),
-        );
-        let mut second_doc = Doc {
-            base: {
-                let mut base = BaseFieldsBuilder::new("test_space")
-                    .for_table(TableName::Doc)
-                    .build();
-                base.id = doc_id.clone();
-                base
-            },
-            title: "Doc".to_string(),
-            text: "Second".to_string(),
-            sidecar_text: None,
-            media_attachments: Vec::new(),
-            source: None,
-            rendition_key: "manual".to_string(),
-            metadata: serde_json::json!({"revision": 2}),
-        };
-        second_doc.base.security.level = 7;
-
-        let second = handler
-            .execute(
-                &ctx,
-                json!({
-                    "source": second_source,
-                    "doc": second_doc,
-                    "ingest_mode": "graph"
-                }),
-            )
-            .await
-            .expect("second ingest");
-        let second_decoded: ToolResponse<SourceIngestOutput> =
-            serde_json::from_value(second).expect("decode second");
-        let second_output = second_decoded.data.expect("second output");
-
-        assert_eq!(first_output.source_id, second_output.source_id);
+            .expect("accept");
+        let first: ToolResponse<SourceIngestOutput> = serde_json::from_value(first).unwrap();
+        let first = first.data.unwrap();
+        let next = handler.execute(&ctx, json!({"name":"stable feed","title":"Doc","text":"Second","ingest_mode":"graph",
+            "intake":{"revision_id":"v2","idempotency_key":"v2","expected_generation":first.operation.source_generation}
+        })).await.expect("replacement");
+        let next: ToolResponse<SourceIngestOutput> = serde_json::from_value(next).unwrap();
+        let next = next.data.unwrap();
+        assert_eq!(first.source_id, next.source_id);
+        assert_ne!(first.doc_id, next.doc_id);
+        let docs = DocRepository::new(storage);
         assert_eq!(
-            second_output.lifecycle_status,
-            SourceLifecycleStatus::Discovered
-        );
-        assert_eq!(second_output.current_ingest_mode, None);
-
-        let persisted_source = SourceRepository::new(storage.clone())
-            .get("test_space", &source_id)
-            .await
-            .expect("reload source")
-            .expect("persisted source");
-        assert_eq!(persisted_source.base.security.level, 7);
-        assert_eq!(
-            persisted_source.lifecycle_status,
-            SourceLifecycleStatus::Discovered
-        );
-        assert_eq!(persisted_source.current_ingest_mode, None);
-
-        let persisted_doc = DocRepository::new(storage.clone())
-            .get("test_space", &doc_id)
-            .await
-            .expect("load doc")
-            .expect("persisted doc");
-        assert_eq!(persisted_doc.base.security.level, 7);
-
-        let sources = SourceRepository::new(storage)
-            .list("test_space", 10, None)
-            .await
-            .expect("list sources");
-        assert_eq!(sources.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_ingest_source_with_doc_restores_soft_deleted_source() {
-        let storage = setup_test_storage().await;
-        let principal = make_test_principal("test_space");
-        let authz = Arc::new(AuthzService::new_with_skip_auth(true));
-        let ctx = ToolContext::with_authz(storage.clone(), authz, principal);
-        let handler = IngestSourceHandler::new(storage.clone());
-        let source_id = RecordId::new_v4(TableName::Source);
-        let doc_id = RecordId::new_v4(TableName::Doc);
-
-        let source = Source::new(
-            {
-                let mut base = BaseFieldsBuilder::new("test_space")
-                    .for_table(TableName::Source)
-                    .build();
-                base.id = source_id.clone();
-                base
-            },
-            SourceType::Manual,
-            "same-hash".to_string(),
-        );
-        let doc = Doc {
-            base: {
-                let mut base = BaseFieldsBuilder::new("test_space")
-                    .for_table(TableName::Doc)
-                    .build();
-                base.id = doc_id.clone();
-                base
-            },
-            title: "Doc".to_string(),
-            text: "First".to_string(),
-            sidecar_text: None,
-            media_attachments: Vec::new(),
-            source: None,
-            rendition_key: "manual".to_string(),
-            metadata: serde_json::json!({}),
-        };
-
-        let first = handler
-            .execute(
-                &ctx,
-                json!({
-                    "source": source.clone(),
-                    "doc": doc.clone(),
-                    "ingest_mode": "graph"
-                }),
+            docs.get(
+                "test_space",
+                &RecordId::from_str(first.doc_id.as_deref().unwrap()).unwrap()
             )
             .await
-            .expect("first ingest");
-        let first_decoded: ToolResponse<SourceIngestOutput> =
-            serde_json::from_value(first).expect("decode first");
-        let first_output = first_decoded.data.expect("first output");
-
-        SourceRepository::new(storage.clone())
-            .delete("test_space", &source_id)
-            .await
-            .expect("delete source");
-
-        let second = handler
-            .execute(
-                &ctx,
-                json!({
-                    "source": source,
-                    "doc": doc,
-                    "ingest_mode": "graph"
-                }),
+            .unwrap()
+            .unwrap()
+            .text,
+            "First"
+        );
+        assert_eq!(
+            docs.get(
+                "test_space",
+                &RecordId::from_str(next.doc_id.as_deref().unwrap()).unwrap()
             )
             .await
-            .expect("second ingest");
-        let second_decoded: ToolResponse<SourceIngestOutput> =
-            serde_json::from_value(second).expect("decode second");
-        let second_output = second_decoded.data.expect("second output");
-
-        assert_eq!(first_output.source_id, second_output.source_id);
-        let restored = SourceRepository::new(storage.clone())
-            .get("test_space", &source_id)
-            .await
-            .expect("load source")
-            .expect("restored source");
-        assert!(restored.base.deleted_at.is_none());
-        let persisted_doc = DocRepository::new(storage.clone())
-            .get("test_space", &doc_id)
-            .await
-            .expect("load doc")
-            .expect("persisted doc");
-        assert_eq!(
-            persisted_doc.source.as_ref().expect("source link").id(),
-            &source_id
+            .unwrap()
+            .unwrap()
+            .text,
+            "Second"
         );
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
+    async fn test_source_retract_requires_explicit_restore_and_preserves_original_evidence() {
+        let storage = setup_test_storage().await;
+        let ctx = ToolContext::with_authz(
+            storage.clone(),
+            Arc::new(AuthzService::new_with_skip_auth(true)),
+            make_test_principal("test_space"),
+        );
+        let ingest = IngestSourceSimpleHandler::new(storage.clone());
+        let request =
+            json!({"name":"lifecycle feed","title":"Doc","text":"Facts","ingest_mode":"graph"});
+        let first = ingest.execute(&ctx, request.clone()).await.expect("accept");
+        let first: ToolResponse<SourceIngestOutput> = serde_json::from_value(first).unwrap();
+        let first = first.data.unwrap();
+        let deleted = DeleteSourceHandler::new(storage.clone()).execute(&ctx, json!({"id":first.source_id,"intake":{
+            "expected_generation":first.operation.source_generation,"idempotency_key":"retract-source"
+        }})).await.expect("retract");
+        let generation = deleted["data"]["operation"]["source_generation"].clone();
+        let mut replacement = request;
+        replacement["text"] = json!("New facts");
+        replacement["intake"] = json!({"revision_id":"blind-revive","idempotency_key":"blind-revive","expected_generation":generation});
+        assert!(ingest.execute(&ctx, replacement).await.is_err());
+        let restored = RestoreSourceHandler::new(storage.clone()).execute(&ctx, json!({"id":first.source_id,"intake":{
+            "revision_id":"restored","idempotency_key":"restore-source","expected_generation":generation
+        }})).await.expect("explicit restore");
+        assert_ne!(
+            restored["operation"]["operation_id"],
+            json!(first.operation.operation_id)
+        );
+        let old = DocRepository::new(storage)
+            .get_with_deleted(
+                "test_space",
+                &RecordId::from_str(first.doc_id.as_deref().unwrap()).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.text, "Facts");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_batch_ingest_sources_accepts_normalized_staged_doc_shape() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -3704,6 +3569,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_batch_ingest_sources_rejects_mixed_legacy_and_normalized_doc_shapes() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -3750,6 +3619,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete control and its original fixture ownership, futures and drop lifetimes"
+    )]
     async fn test_create_source_simple_rejects_invalid_name_or_uri() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");

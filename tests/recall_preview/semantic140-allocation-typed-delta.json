@@ -1,0 +1,18 @@
+{
+  "format": "recall-workload-allocation-representation-delta/v1",
+  "execution_authorized": false,
+  "base_allocation_sha256": "e42df2638349fea37f94eb7f9ea79d2afad170a2d36a655869a40f25f83dcd01",
+  "preparation_contract_sha256": "6129328500aa899d4995c9ff078571176af1eeb8764b78681531581418e0bc4c",
+  "corpus_sha256": "e3201eb81bc294391e445a431a847f88603ec0631e23b6068d6f44cf0944ff0f",
+  "reason": "normalized ingest supplies default level0; retained typed Source+Doc preserves frozen policy3/7",
+  "override": {
+    "preparation.representation": "typed Source+Doc envelope",
+    "preparation.contract": "semantic140-preparation-contract.json"
+  },
+  "unchanged": [
+    "Original432 and2100 allocations and historical receipts",
+    "Original typed Source+Doc wire/security/subjects/provenance and renderer expectations",
+    "All original source texts and100 complete query known-answer definitions; successor560 schedule is separately frozen"
+  ],
+  "requires": "Exact semantic140-v1 allocation/profile and explicit typed delta; original D28 branch unchanged; source approval is not execution authorization."
+}

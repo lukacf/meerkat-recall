@@ -13,7 +13,7 @@ alone as a readiness or completion check.
 | --- | --- |
 | Check ingest readiness | [Managed runtime status](#managed-runtime-status) |
 | Check dependencies | [Health](#health), [Capabilities](#capabilities) |
-| Save or restore embedded data | [Embedded snapshots](#embedded-snapshots) |
+| Save or restore a whole store | [Managed snapshots](#managed-snapshots) |
 | Configure a tenant | [Spaces](#spaces) |
 | Diagnose processing | [Work items](#work-items) |
 | Inspect current claims | [Truth slots](#truth-slots) |
@@ -28,7 +28,9 @@ Returns bootstrap/configuration state plus semantic-ingest readiness for the man
 
 <CodeGroup>
 ```bash Request
-curl http://localhost:3000/v1/runtime/status
+curl http://localhost:3000/v1/runtime/status \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Space-Id: household"
 ```
 
 ```json Response
@@ -51,7 +53,7 @@ Use this endpoint to distinguish:
 - configured but not ingest-ready
 - fully semantic-ingest ready
 
-`config_path` is intentionally not exposed here. The response is safe for unauthenticated bootstrap/readiness checks.
+`config_path` and private worker diagnostics are not exposed here. This route requires authentication and `read:status` (retained alternatives `read:system` or `read:space_config`), plus current space-grant attenuation when applicable. Only `/v1/health` is unauthenticated liveness. `/v1/readiness` reports 200/503 for the runtime role; `/v1/spaces/{space}/status` separately reports named-space provider and guidance capabilities.
 
 <ResponseField name="configured" type="boolean" required>
   Whether Meerkat Recall has a persisted config or equivalent env-driven runtime configuration.
@@ -78,7 +80,7 @@ Use this endpoint to distinguish:
 </ResponseField>
 
 <ResponseField name="semantic_ingest_ready" type="boolean" required>
-  Whether Meerkat Recall is currently allowed to expose semantic ingest tools and routes.
+  Whether the configured worker/extractor path can currently process semantic ingestion. Durable API admission can remain available while this is false; this does not certify any source revision complete.
 </ResponseField>
 
 <ResponseField name="issues" type="array" required>
@@ -89,7 +91,8 @@ Use this endpoint to distinguish:
 
 ### GET /v1/health
 
-Returns the health status of the Meerkat Recall API and its dependencies. This endpoint accepts an optional JWT -- when unauthenticated, it still returns basic health information.
+Reports process liveness without authentication, storage, worker or provider
+checks. It remains live while the runtime drains or recovers.
 
 <CodeGroup>
 ```bash Request
@@ -97,59 +100,13 @@ curl http://localhost:3000/v1/health
 ```
 
 ```json Response (200)
-{
-  "status": "healthy",
-  "backend": "surreal-db",
-  "storage": "connected",
-  "surrealdb": "connected",
-  "embedding_provider": "healthy",
-  "circuit_breakers": {
-    "storage": "closed",
-    "surrealdb": "closed",
-    "embeddings": "closed"
-  }
-}
-```
-
-```json Response (503 - Unhealthy)
-{
-  "status": "unhealthy",
-  "backend": "surreal-db",
-  "storage": "disconnected",
-  "surrealdb": "disconnected",
-  "embedding_provider": "unhealthy",
-  "circuit_breakers": {
-    "storage": "open",
-    "surrealdb": "open",
-    "embeddings": "closed"
-  }
-}
+{ "status": "healthy" }
 ```
 </CodeGroup>
 
-<ResponseField name="status" type="string" required>
-  Overall service status: `healthy` or `unhealthy`.
-</ResponseField>
-
-<ResponseField name="backend" type="string" required>
-  Active storage backend: `surreal-db` or `elephant-db`.
-</ResponseField>
-
-<ResponseField name="storage" type="string" required>
-  Backend-agnostic storage connectivity: `connected` or `disconnected`.
-</ResponseField>
-
-<ResponseField name="surrealdb" type="string" required>
-  Legacy compatibility alias for `storage`.
-</ResponseField>
-
-<ResponseField name="embedding_provider" type="string" required>
-  Embedding provider status: `healthy` or `unhealthy`.
-</ResponseField>
-
-<ResponseField name="circuit_breakers" type="object" required>
-  Circuit breaker states (`closed` = normal, `open` = tripped after consecutive failures).
-</ResponseField>
+Use authenticated `/v1/readiness` for runtime readiness and named-space status
+for configured capabilities. A live process is not a successful database,
+provider, recovery or source-publication check.
 
 ---
 
@@ -179,24 +136,56 @@ curl http://localhost:3000/v1/capabilities \
 
 ---
 
-## Embedded Snapshots
+## Managed Snapshots
 
-Snapshot import/export is only available when Meerkat Recall is running with `ELEPHANT_DB=elephant-db`.
+CLI and HTTP export/restore support `elephant-db` and retained `surreal-db`.
+MCP snapshot tools remain advertised only for globally authorized embedded hosts.
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/v1/system/snapshot/export` | Export the live embedded store to a host path |
-| POST | `/v1/system/snapshot/import` | Replace the live embedded store from a host snapshot |
+| POST | `/v1/system/snapshot/export` | Quiesce and export the live whole store into a new server directory |
+| POST | `/v1/system/snapshot/restore` | Guarded replacement from a server snapshot directory |
+| POST | `/v1/system/snapshot/import` | Retained alias for restore |
 
-Request body:
+Export request (configure `ELEPHANT_SNAPSHOT_DIR=/backups` on the server):
 
 ```json
-{ "path": "/tmp/elephant.json" }
+{
+  "path": "/backups/nightly-UNIQUE",
+  "name": "nightly",
+  "retention_seconds": 604800,
+  "quiesce_timeout_seconds": 30
+}
 ```
 
-<Warning>
-  Snapshot operations act on the entire embedded store, not one space. Under normal auth they require a global principal with the relevant system scope. In `SKIP_AUTH=true` development mode they remain available for local operator workflows.
-</Warning>
+Restore requires `{"path":"/backups/nightly-UNIQUE"}`. Success includes
+`success`, `backend`, `path`, `message` and `manifest`. The immutable directory
+contains `manifest.json` and `data.snapshot`, format `recall-snapshot-v1`:
+version, backend, original journal identity, snapshot identity/name,
+creation/expiry, byte length and SHA-256. Existing export directories are refused.
+The payload is the selected backend's real snapshot/export, not a generic legacy
+migration; restore requires the same backend and original independent journal.
+
+Paths are on the server within `ELEPHANT_SNAPSHOT_DIR` (default server working
+directory `.elephant-snapshots`). Export needs a global `read:system` principal;
+restore needs global `write:system`. A named-space service token cannot operate
+a whole-store backup. The compatibility CLI name `elephant` and positional path
+spellings remain, but consumers of an old single JSON file must adapt to the
+manifest/payload directory.
+
+Export pauses admission/scheduling and drains running work before exclusive
+capture. Quiescence defaults to 30 seconds (maximum 60); retention defaults to
+7 days (maximum 30). A request timeout is an uncertain outcome: inspect the
+operator result before retrying. Restore replaces the selected database/store
+under an exclusive barrier, including nonempty SurrealDB databases. A failed or
+interrupted restore stays unready until durable erasure replay, attempt fencing
+and final persistence finish. Native private-guard migration 039 initialization
+belongs to explicit migration; privileged restore reinstalls required current
+and historical guards under its barrier, never ordinary serve-time schema DDL.
+
+See [deployment snapshots](/operations/deployment#managed-snapshots) for CLI
+commands and bounded retention/cleanup. A successful export is not by itself a
+passing restore or source-erasure qualification receipt.
 
 ---
 
@@ -205,16 +194,15 @@ Request body:
 Space configuration stores embedding policy and optional extraction guidance.
 These routes use space names in their paths, not `space_config:` record IDs.
 
-<Warning>
-The current REST space configuration handlers authenticate callers but do not
-perform per-record space, scope, or clearance authorization. Restrict these
-administrative routes to trusted operators. Do not expose them as tenant-level
-self-service configuration. MCP space tools apply their own record checks.
-</Warning>
+Space reads require `read:space_config`; create and update require both
+`write:space_config` and read authority for the returned configuration. The
+principal must match the target space and pass the record's clearance and subject
+checks. Lists contain only authorized configurations. Configuration updates
+compare the authorized state at the storage write; a stale update returns `409`.
 
 | Method | Path | Result |
 | --- | --- | --- |
-| GET | `/v1/spaces` | Array of up to 100 space configurations |
+| GET | `/v1/spaces` | Authorized configurations for the caller's space |
 | POST | `/v1/spaces` | Create configuration, returning `201` or `409` if the name exists |
 | GET | `/v1/spaces/{space_id}` | Configuration for the named space, or `404` |
 | PUT | `/v1/spaces/{space_id}` | Update supplied configuration fields |
@@ -321,13 +309,11 @@ curl http://localhost:3000/v1/work-items/work_item:550e8400-e29b-41d4-a716-44665
 
 ### Retry Work Item
 
-<Warning>
-This REST handler scopes lookups to the authenticated space but currently does
-not check operation scopes or record read/write authorization before changing
-and returning a known failed item. Restrict it to trusted operators entitled
-to all work records in that space. It is not a tenant-level retry permission
-boundary.
-</Warning>
+Work-item reads require `read:work_item`; retry additionally requires
+`write:work_item`. Both operation scopes and record authorization apply before
+retrying or returning a record. A concurrent status, security, or payload change
+returns `409`, without reactivating stale work. Archived retries use the same
+atomic guard.
 
 `POST /v1/work-items/{id}/retry`
 

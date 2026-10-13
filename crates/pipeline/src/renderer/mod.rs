@@ -117,6 +117,17 @@ pub trait Renderer: Send + Sync {
     /// Returns an error if rendering fails.
     async fn render(&self, ctx: RenderContext) -> Result<RenderResult, PipelineError>;
 
+    /// Render for the exact admitted work item. Model-backed implementations
+    /// retain its original execution authority across every physical dispatch.
+    /// Pure renderers keep the ordinary rendering behavior.
+    async fn render_for_work(
+        &self,
+        ctx: RenderContext,
+        _original_work: &elephant_types::records::WorkItem,
+    ) -> Result<RenderResult, PipelineError> {
+        self.render(ctx).await
+    }
+
     /// Optional health check.
     async fn health_check(&self) -> Result<bool, PipelineError> {
         Ok(true)

@@ -244,7 +244,7 @@ impl PredicateAliasRepository {
     }
 
     /// Converts a PredicateAlias to a SurrealDB value for insertion.
-    fn predicate_alias_to_value(item: &PredicateAlias) -> StorageResult<Value> {
+    pub(crate) fn predicate_alias_to_value(item: &PredicateAlias) -> StorageResult<Value> {
         let mut obj = crate::surreal::base_fields_to_object(&item.base)?;
         obj.insert("alias".to_string(), item.alias.clone().into());
         obj.insert(
@@ -438,6 +438,39 @@ impl Repository<PredicateAlias> for PredicateAliasRepository {
     }
 }
 
+impl PredicateAliasRepository {
+    /// Reads physical row state for atomic source lifecycle inverse preparation.
+    pub(crate) async fn get_including_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<PredicateAlias>> {
+        if let Some(store) = self.client.embedded_store() {
+            return store.get::<PredicateAlias>(space_id, id, true).await;
+        }
+
+        let mut response = self
+            .client
+            .query_bind(
+                &format!(
+                    "SELECT {PREDICATE_ALIAS_PROJECTION} FROM predicate_alias WHERE id = $id AND space_id = $space_id"
+                ),
+                crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
+            )
+            .await?;
+
+        let items: Vec<PredicateAliasDb> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse predicate_alias: {e}"))
+        })?;
+
+        items
+            .into_iter()
+            .next()
+            .map(PredicateAlias::try_from)
+            .transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -491,6 +524,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_predicate_alias() {
         let repo = setup_test_repo().await;
         let item = create_test_predicate_alias();
@@ -502,6 +539,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_predicate_alias() {
         let repo = setup_test_repo().await;
         let item = create_test_predicate_alias();
@@ -514,6 +555,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_predicate_alias_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_predicate_alias();
@@ -530,6 +575,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_predicate_alias() {
         let repo = setup_test_repo().await;
         let item = create_test_predicate_alias();
@@ -547,6 +596,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_predicate_alias() {
         let repo = setup_test_repo().await;
         let item = create_test_predicate_alias();
@@ -560,6 +613,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_active_by_raw() {
         let repo = setup_test_repo().await;
         let mut item = create_test_predicate_alias();
@@ -595,6 +652,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_active_by_raw_ignores_proposed() {
         let repo = setup_test_repo().await;
         let mut item = create_test_predicate_alias();
@@ -612,6 +673,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_active_by_raw_returns_highest_confidence() {
         let repo = setup_test_repo().await;
 

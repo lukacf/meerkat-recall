@@ -640,3 +640,36 @@ impl SearchRepository<IdentityCandidate> for IdentityCandidateRepository {
         ))
     }
 }
+
+impl IdentityCandidateRepository {
+    /// Reads physical row state for atomic source lifecycle inverse preparation.
+    pub(crate) async fn get_including_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<IdentityCandidate>> {
+        if let Some(store) = self.client.embedded_store() {
+            return store.get::<IdentityCandidate>(space_id, id, true).await;
+        }
+
+        let mut response = self
+            .client
+            .query_bind(
+                &format!(
+                    "SELECT {IDENTITY_CANDIDATE_PROJECTION} FROM identity_candidate WHERE id = $id AND space_id = $space_id"
+                ),
+                crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
+            )
+            .await?;
+
+        let candidates: Vec<IdentityCandidateDb> = response.take(0).map_err(|e| {
+            StorageError::QueryError(format!("Failed to parse identity_candidate: {e}"))
+        })?;
+
+        candidates
+            .into_iter()
+            .next()
+            .map(IdentityCandidate::try_from)
+            .transpose()
+    }
+}

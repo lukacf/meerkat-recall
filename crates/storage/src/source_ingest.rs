@@ -114,6 +114,7 @@ pub async fn find_existing_source_for_source(
         .filter(|existing| matches_source_reingest_key(existing, source))
         .collect::<Vec<_>>();
 
+    drop(repo);
     matches.sort_by_key(|existing| {
         (
             existing.base.deleted_at.is_some(),
@@ -208,10 +209,11 @@ pub async fn preview_persisted_manual_doc_for_source(
     let repo = DocRepository::new(storage.clone());
     let doc = with_source_link(doc.clone(), source);
 
-    if let Some(existing) = repo
+    let existing = repo
         .get_with_deleted(&doc.base.space_id, &doc.base.id)
-        .await?
-    {
+        .await?;
+    drop(repo);
+    if let Some(existing) = existing {
         ensure_existing_doc_can_be_relinked(storage, &existing, source).await?;
         return Ok(preserve_immutable_doc_base_fields(&existing, doc));
     }
@@ -239,6 +241,7 @@ pub async fn persist_manual_doc_for_source_detailed(
         let updated = preserve_immutable_doc_base_fields(&existing, with_source_link(doc, source));
         let persisted =
             update_existing_doc_after_restore_if_needed(&repo, &existing, updated).await?;
+        drop(repo);
         return Ok(PersistedManualDoc {
             doc: persisted,
             previous: Some(existing),
@@ -247,10 +250,13 @@ pub async fn persist_manual_doc_for_source_detailed(
 
     let doc = with_source_link(doc, source);
     match repo.create(doc.clone()).await {
-        Ok(created) => Ok(PersistedManualDoc {
-            doc: created,
-            previous: None,
-        }),
+        Ok(created) => {
+            drop(repo);
+            Ok(PersistedManualDoc {
+                doc: created,
+                previous: None,
+            })
+        }
         Err(StorageError::Conflict(message)) => {
             let Some(existing) = repo.get_with_deleted(&space_id, &doc_id).await? else {
                 return Err(StorageError::Conflict(message));
@@ -259,6 +265,7 @@ pub async fn persist_manual_doc_for_source_detailed(
             let updated = preserve_immutable_doc_base_fields(&existing, doc);
             let persisted =
                 update_existing_doc_after_restore_if_needed(&repo, &existing, updated).await?;
+            drop(repo);
             Ok(PersistedManualDoc {
                 doc: persisted,
                 previous: Some(existing),
@@ -337,6 +344,10 @@ mod tests {
     use elephant_types::RecordId;
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn persist_manual_doc_for_source_creates_and_links_doc() {
         let storage = StorageClient::new_embedded()
             .await
@@ -376,6 +387,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn persist_manual_doc_for_source_updates_existing_doc() {
         let storage = StorageClient::new_embedded()
             .await
@@ -435,6 +450,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn persist_manual_doc_for_source_preserves_immutable_base_fields() {
         let storage = StorageClient::new_embedded()
             .await
@@ -515,6 +534,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn find_existing_source_for_doc_returns_linked_source() {
         let storage = StorageClient::new_embedded()
             .await
@@ -560,6 +583,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn find_existing_source_for_source_matches_dedup_key() {
         let storage = StorageClient::new_embedded()
             .await
@@ -599,6 +626,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn find_existing_source_for_source_returns_soft_deleted_match() {
         let storage = StorageClient::new_embedded()
             .await
@@ -630,6 +661,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn find_existing_source_for_source_returns_soft_deleted_hash_match_with_different_id() {
         let storage = StorageClient::new_embedded()
             .await
@@ -663,6 +698,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn persist_manual_doc_for_source_can_relink_from_deleted_source() {
         let storage = StorageClient::new_embedded()
             .await
@@ -741,6 +780,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn persist_manual_doc_for_source_restores_soft_deleted_doc() {
         let storage = StorageClient::new_embedded()
             .await
@@ -807,6 +850,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn persist_manual_doc_for_source_redeletes_doc_when_restore_update_fails() {
         let storage = StorageClient::new_embedded()
             .await
@@ -896,6 +943,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn rollback_persisted_manual_doc_restores_deleted_snapshot() {
         let storage = StorageClient::new_embedded()
             .await
@@ -977,6 +1028,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn rollback_persisted_source_restores_deleted_snapshot() {
         let storage = StorageClient::new_embedded()
             .await
@@ -1032,6 +1087,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn preview_persisted_manual_doc_for_source_preserves_immutable_base_fields() {
         let storage = StorageClient::new_embedded()
             .await

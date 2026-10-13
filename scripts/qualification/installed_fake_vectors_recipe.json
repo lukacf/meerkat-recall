@@ -1,0 +1,244 @@
+{
+  "format": "recall-installed-fake-vectors-recipe/v1",
+  "execution_authorized": false,
+  "product_acceptance": false,
+  "seeds": [
+    17,
+    219,
+    20261006
+  ],
+  "configurations": {
+    "local384": [
+      384,
+      384
+    ],
+    "primary": [
+      1536,
+      3072
+    ]
+  },
+  "generator": "semantic-index-negative-v1",
+  "spy_limits": {
+    "owned_spy_dispatches_per_backend": 256,
+    "owned_spy_request_bytes": 131072,
+    "owned_spy_response_bytes": 8388608,
+    "owned_spy_concurrency": 16,
+    "held_response_seconds": 15
+  },
+  "offline_control_preserved": {
+    "seeds": [
+      17,
+      219,
+      20261006
+    ],
+    "dimensions": [
+      8,
+      384,
+      1536
+    ],
+    "generator": "Python random.Random Mersenne Twister; unchanged"
+  },
+  "scope": "one seed/backend/configuration per fresh private persistent store; HTTP semantic-only",
+  "limits": {
+    "total_seconds": 1800,
+    "cleanup_seconds": 90,
+    "publication_seconds": 1200,
+    "publication_polls": 600,
+    "poll_seconds": 2,
+    "http_calls": 1024,
+    "http_seconds": 15,
+    "snapshot_http_seconds": 15,
+    "response_bytes": 262144,
+    "processes": 18,
+    "process_log_bytes": 1048576,
+    "http_capture_bytes": 134217728
+  },
+  "spaces": [
+    "semantics-household",
+    "semantics-business"
+  ],
+  "sources": [
+    [
+      "semantics-household",
+      "home/water",
+      "water-r1"
+    ],
+    [
+      "semantics-household",
+      "home/water-distractor",
+      "water-guide-r1"
+    ],
+    [
+      "semantics-household",
+      "home/parcel",
+      "parcel-r1"
+    ],
+    [
+      "semantics-household",
+      "home/travel",
+      "travel-r1"
+    ],
+    [
+      "semantics-household",
+      "home/travel-distractor",
+      "timetable-r1"
+    ],
+    [
+      "semantics-household",
+      "home/repair",
+      "repair-r1"
+    ],
+    [
+      "semantics-household",
+      "home/repair-proposal",
+      "proposal-r1"
+    ],
+    [
+      "semantics-household",
+      "home/plants",
+      "plants-r1"
+    ],
+    [
+      "semantics-household",
+      "home/library",
+      "library-r1"
+    ],
+    [
+      "semantics-household",
+      "shared/access",
+      "access-home-r1"
+    ],
+    [
+      "semantics-household",
+      "home/visit",
+      "visit-r1"
+    ],
+    [
+      "semantics-household",
+      "home/visit",
+      "visit-r2"
+    ],
+    [
+      "semantics-household",
+      "home/visit-confirmation",
+      "confirmation-r1"
+    ],
+    [
+      "semantics-business",
+      "business/contract",
+      "contract-r1"
+    ],
+    [
+      "semantics-business",
+      "business/contract-draft",
+      "draft-r1"
+    ],
+    [
+      "semantics-business",
+      "business/launch",
+      "launch-r1"
+    ],
+    [
+      "semantics-business",
+      "business/budget",
+      "budget-r1"
+    ],
+    [
+      "semantics-business",
+      "business/budget-minutes",
+      "minutes-r1"
+    ],
+    [
+      "semantics-business",
+      "business/ownership",
+      "ownership-r1"
+    ],
+    [
+      "semantics-business",
+      "business/ownership-distractor",
+      "ownership-other-r1"
+    ],
+    [
+      "semantics-business",
+      "business/stock",
+      "stock-r1"
+    ],
+    [
+      "semantics-business",
+      "business/forecast",
+      "forecast-r1"
+    ],
+    [
+      "semantics-business",
+      "business/security",
+      "security-r1"
+    ],
+    [
+      "semantics-business",
+      "business/identity",
+      "identity-r1"
+    ],
+    [
+      "semantics-business",
+      "business/incident",
+      "incident-r1"
+    ],
+    [
+      "semantics-business",
+      "shared/access",
+      "access-business-r1"
+    ],
+    [
+      "semantics-business",
+      "business/negation",
+      "negation-r1"
+    ],
+    [
+      "semantics-business",
+      "business/quotation",
+      "quotation-r1"
+    ]
+  ],
+  "queries": [
+    "h-stop-water",
+    "h-delivery",
+    "h-arrival",
+    "h-hose",
+    "h-care",
+    "h-card",
+    "h-key",
+    "h-visit",
+    "h-no-booking",
+    "h-unknown",
+    "b-payment",
+    "b-release",
+    "b-budget",
+    "b-march",
+    "b-april",
+    "b-stock",
+    "b-cert",
+    "b-identity",
+    "b-duration",
+    "b-badge",
+    "b-acquisition",
+    "b-training",
+    "b-forecast",
+    "b-unknown"
+  ],
+  "required_cases": [
+    "verified_installed_binary",
+    "fresh_cli_auth",
+    "fresh_governed_negative_spaces",
+    "original_28_ordered_publications",
+    "original_semantic_numerical_negative",
+    "actual_seeded_document_and_query_embeddings"
+  ],
+  "unqualified_gates": [
+    "real provider behavior",
+    "real local model inference",
+    "hybrid usefulness",
+    "canonical groundedness",
+    "other seeds/backends/configurations not executed",
+    "independent final D verdict"
+  ]
+}

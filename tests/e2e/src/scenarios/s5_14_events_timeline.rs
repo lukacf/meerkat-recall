@@ -54,13 +54,15 @@ use elephant_types::records::work::{
 };
 use elephant_types::{Link, RecordId};
 
+use crate::grounded_source_fixture::GroundedSourceFixture;
 use crate::Harness;
+const SPACE: &str = "grounded-events";
 
 async fn mock_auth(req: Request<Body>, next: Next) -> impl IntoResponse {
     let mut req = req;
     req.extensions_mut().insert(AuthPrincipal {
         subject: "scenario-user".to_string(),
-        space_id: Some("default".to_string()),
+        space_id: Some(SPACE.to_string()),
         scopes: vec!["read:event".to_string(), "write:event".to_string()],
         security_level: 10,
         security_labels: vec![],
@@ -106,17 +108,74 @@ impl Extractor for FixtureExtractor {
         &self.manifest
     }
 
-    async fn extract(&self, _ctx: ExtractionContext) -> Result<ExtractionResult, PipelineError> {
+    async fn extract(&self, ctx: ExtractionContext) -> Result<ExtractionResult, PipelineError> {
+        use elephant_pipeline::extraction::{verify_assertion_support, AssertionValidator};
+        let mut assertions = Vec::new();
+        for original in &self.assertions {
+            let Some(quote) = original.quote.as_deref() else {
+                continue;
+            };
+            let Some(start) = ctx.node_text.find(quote) else {
+                continue;
+            };
+            let mut raw = original.clone();
+            raw.evidence_span = EvidenceSpan {
+                revision: Link::new(ctx.revision_id.clone()),
+                node: Some(Link::new(ctx.node_id.clone())),
+                start: u32::try_from(start).unwrap(),
+                end: u32::try_from(start + quote.len()).unwrap(),
+                quote_hash: AssertionValidator::hash_quote(quote),
+            };
+            assertions.push(raw);
+        }
+        verify_assertion_support(&mut assertions, &ctx.node_text, &EventSupport).await?;
         Ok(ExtractionResult::new(
-            self.assertions.clone(),
+            assertions,
             0,
-            "fixture-model".to_string(),
+            "event-known-answer-v1".into(),
         ))
+    }
+}
+
+struct EventSupport;
+#[async_trait]
+impl elephant_pipeline::extraction::AssertionSupportVerifier for EventSupport {
+    fn identity(&self) -> &str {
+        "dated-announcement-known-answer-v1"
+    }
+    async fn verify(
+        &self,
+        candidates: &[elephant_pipeline::extraction::SupportCandidate],
+    ) -> Result<Vec<elephant_pipeline::extraction::SupportVerdict>, PipelineError> {
+        Ok(candidates
+            .iter()
+            .map(|candidate| {
+                let quoted_time = candidate
+                    .quote
+                    .strip_prefix("Alice announced Project Phoenix on ")
+                    .and_then(|text| text.strip_suffix('.'))
+                    .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok());
+                let claimed_time = candidate.claim["event_time"]
+                    .as_str()
+                    .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok());
+                elephant_pipeline::extraction::SupportVerdict {
+                    index: candidate.index,
+                    supported: quoted_time.is_some()
+                        && quoted_time == claimed_time
+                        && candidate.claim["subject"] == "Alice"
+                        && candidate.claim["predicate"] == "announced"
+                        && candidate.claim["object"] == "Project Phoenix"
+                        && candidate.claim["literal"].is_null()
+                        && candidate.claim["event_title"] == "Alice announced Project Phoenix",
+                }
+            })
+            .collect())
     }
 }
 
 fn make_event_assertion(confidence: f64, event_time: chrono::DateTime<Utc>) -> RawAssertion {
     RawAssertion {
+        support_verification: None,
         subject_text: "Alice".to_string(),
         predicate_text: "announced".to_string(),
         object_text: Some("Project Phoenix".to_string()),
@@ -129,7 +188,10 @@ fn make_event_assertion(confidence: f64, event_time: chrono::DateTime<Utc>) -> R
             quote_hash: "fixture-hash".to_string(),
         },
         confidence,
-        quote: Some("Alice announced Project Phoenix on stage.".to_string()),
+        quote: Some(format!(
+            "Alice announced Project Phoenix on {}.",
+            event_time.to_rfc3339()
+        )),
         source_event_time: Some(event_time),
         source_event_time_precision: Some(elephant_types::records::TimePrecision::Exact),
         event_title: Some("Alice announced Project Phoenix".to_string()),
@@ -142,168 +204,19 @@ fn make_event_assertion(confidence: f64, event_time: chrono::DateTime<Utc>) -> R
     }
 }
 
-async fn create_revision_with_node(
-    harness: &Harness,
-    space_id: &str,
-    actor: &str,
-    text: &str,
-) -> anyhow::Result<(RecordId, RecordId)> {
-    let doc_repo = DocRepository::new(harness.client.clone());
-    let revision_repo = DocRevisionRepository::new(harness.client.clone());
-    let node_repo = DocNodeRepository::new(harness.client.clone());
-
-    let doc_id = RecordId::new_v4(TableName::Doc);
-    let doc = Doc {
-        base: BaseFields::new(doc_id.clone(), space_id.to_string(), actor.to_string()),
-        title: "Event Notes".to_string(),
-        text: text.to_string(),
-        sidecar_text: None,
-        source: None,
-        media_attachments: Vec::new(),
-        rendition_key: format!("fixture-{}", uuid::Uuid::new_v4()),
-        metadata: serde_json::json!({}),
-    };
-    doc_repo.create(doc).await?;
-
-    let revision_id = RecordId::new_v4(TableName::DocRevision);
-    let revision = DocRevision {
-        base: BaseFields::new(revision_id.clone(), space_id.to_string(), actor.to_string()),
-        doc: Link::new(doc_id),
-        text: text.to_string(),
-        text_hash: "fixture-hash".to_string(),
-        renderer: RendererMetadata {
-            name: "fixture_renderer".to_string(),
-            version: "1.0.0".to_string(),
-            config_hash: None,
-        },
-        manifest: None,
-        supersedes: None,
-        status: RevisionStatus::Active,
-        rendered_at: Utc::now(),
-    };
-    revision_repo.create(revision).await?;
-
-    let node_id = RecordId::new_v4(TableName::DocNode);
-    let node = DocNode {
-        base: BaseFields::new(node_id.clone(), space_id.to_string(), actor.to_string()),
-        revision: Link::new(revision_id.clone()),
-        role: NodeRole::Paragraph,
-        span: TextSpan::new(0, u32::try_from(text.len()).unwrap_or(u32::MAX)),
-        node_key: format!("node:{node_id}"),
-        text: None,
-        parent: None,
-        position: 0,
-        depth: 1,
-        embedding_model: None,
-        collection: None,
-    };
-    node_repo.create(node).await?;
-
-    Ok((revision_id, node_id))
-}
-
-async fn create_work_run(
-    harness: &Harness,
-    space_id: &str,
-    actor: &str,
-) -> anyhow::Result<RecordId> {
-    let item_repo = WorkItemRepository::new(harness.client.clone());
-    let run_repo = WorkRunRepository::new(harness.client.clone());
-
-    let item_id = RecordId::new_v4(TableName::WorkItem);
-    let item = WorkItem {
-        base: BaseFields::new(item_id.clone(), space_id.to_string(), actor.to_string()),
-        kind: "extract_assertions".to_string(),
-        payload: serde_json::json!({}),
-        status: WorkItemStatus::Runnable,
-        priority: 5,
-        idempotency_key: format!("fixture:{}", uuid::Uuid::new_v4()),
-        attempts: 0,
-        lease_expires_at: None,
-        leased_by: None,
-        run_after: None,
-        last_error: None,
-    };
-    item_repo.create(item).await?;
-
-    let work_run_id = RecordId::new_v4(TableName::WorkRun);
-    let run = WorkRun {
-        base: BaseFields::new(work_run_id.clone(), space_id.to_string(), actor.to_string()),
-        work_item: Link::new(item_id),
-        attempt: 1,
-        started_at: Utc::now(),
-        completed_at: None,
-        success: false,
-        error: None,
-        metrics: WorkRunMetrics::default(),
-        worker_id: "fixture-worker".to_string(),
-        worker_version: "1.0.0".to_string(),
-        model_version: None,
-        prompt_id: None,
-        config_hash: None,
-    };
-    run_repo.create(run).await?;
-    Ok(work_run_id)
-}
-
-async fn promote_extraction_artifact(
-    storage: &elephant_storage::StorageClient,
-    space_id: &str,
-    artifact_id: &RecordId,
-    work_run_id: &RecordId,
-) -> anyhow::Result<()> {
-    let artifact_repo = WorkArtifactRepository::new(storage.clone());
-    let artifact = artifact_repo
-        .get(space_id, artifact_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("extraction artifact not found: {artifact_id}"))?;
-    let data: ExtractionArtifactData = serde_json::from_value(artifact.data)?;
-    let revision_id = RecordId::from_str(&data.revision_id)?;
-    let node_id = RecordId::from_str(&data.node_id)?;
-    let assertions = data
-        .assertions
-        .iter()
-        .map(|assertion| assertion.to_raw(&revision_id, &node_id))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    promote_assertions_inline(
-        storage,
-        space_id,
-        &assertions,
-        work_run_id,
-        &node_id,
-        &revision_id,
-        "scenario",
-    )
-    .await?;
-
-    Ok(())
-}
-
 #[tokio::test]
 async fn scenario_e2e_001_ingest_extract_yields_timeline_events() -> anyhow::Result<()> {
     let harness = Harness::new().await?;
-    let space_id = "default";
-    let actor = "scenario";
-    let text = "Alice announced Project Phoenix during the launch event.";
+    let space_id = SPACE;
     let event_time = Utc.with_ymd_and_hms(2024, 1, 15, 9, 0, 0).unwrap();
+    let text = format!(
+        "Alice announced Project Phoenix on {}.",
+        event_time.to_rfc3339()
+    );
+    let fixture = GroundedSourceFixture::new(&harness.client, space_id).await?;
 
-    let (revision_id, node_id) = create_revision_with_node(&harness, space_id, actor, text).await?;
-    let work_run_id = create_work_run(&harness, space_id, actor).await?;
     let extractor = FixtureExtractor::new(vec![make_event_assertion(0.91, event_time)]);
-
-    let result = execute_extract_assertions(
-        &harness.client,
-        &extractor,
-        &node_id,
-        &revision_id,
-        &work_run_id,
-        space_id,
-        actor,
-        None,
-    )
-    .await?;
-    promote_extraction_artifact(&harness.client, space_id, &result.artifact_id, &work_run_id)
+    Box::pin(fixture.publish_text(&harness.client, "Dated announcement", &text, &extractor))
         .await?;
 
     let event_repo = EventRepository::new(harness.client.clone());
@@ -325,19 +238,39 @@ async fn scenario_e2e_001_ingest_extract_yields_timeline_events() -> anyhow::Res
     );
 
     let tm_storage = RepositoryTruthMaintenanceStorage::new(harness.client.clone());
-    let detect = execute_tm_detect_conflicts_from_outbox_events(&event_outbox, &tm_storage).await?;
+    let detect = Box::pin(execute_tm_detect_conflicts_from_outbox_events(
+        &event_outbox,
+        &tm_storage,
+    ))
+    .await?;
     for commit in detect.direct_commits {
-        execute_tm_commit(&commit.resolution, &commit.input, space_id, &tm_storage).await?;
+        Box::pin(execute_tm_commit(
+            &commit.resolution,
+            &commit.input,
+            space_id,
+            &tm_storage,
+        ))
+        .await?;
     }
     for conflict_group_id in detect.conflict_group_ids {
         let conflict_repo = ConflictGroupRepository::new(harness.client.clone());
         let Some(group) = conflict_repo.get(space_id, &conflict_group_id).await? else {
             continue;
         };
-        let (resolution, input) =
-            resolve_conflict_group_with_storage(&TmContext::none(), &group, space_id, &tm_storage)
-                .await?;
-        execute_tm_commit(&resolution, &input, space_id, &tm_storage).await?;
+        let (resolution, input) = Box::pin(resolve_conflict_group_with_storage(
+            &TmContext::none(),
+            &group,
+            space_id,
+            &tm_storage,
+        ))
+        .await?;
+        Box::pin(execute_tm_commit(
+            &resolution,
+            &input,
+            space_id,
+            &tm_storage,
+        ))
+        .await?;
     }
 
     events = event_repo.get_recent(space_id, 10).await?;
@@ -383,82 +316,144 @@ async fn scenario_e2e_001_ingest_extract_yields_timeline_events() -> anyhow::Res
 #[tokio::test]
 async fn scenario_e2e_002_contradictory_event_candidates_resolve() -> anyhow::Result<()> {
     let harness = Harness::new().await?;
-    let space_id = "default";
-    let actor = "scenario";
-    let text = "Alice announced Project Phoenix during the launch event.";
+    let space_id = SPACE;
     let event_time = Utc.with_ymd_and_hms(2024, 1, 15, 9, 0, 0).unwrap();
-
-    let (revision_id_a, node_id_a) =
-        create_revision_with_node(&harness, space_id, actor, text).await?;
-    let (revision_id_b, node_id_b) =
-        create_revision_with_node(&harness, space_id, actor, text).await?;
-    let work_run_a = create_work_run(&harness, space_id, actor).await?;
-    let work_run_b = create_work_run(&harness, space_id, actor).await?;
+    let text = format!(
+        "Alice announced Project Phoenix on {}.",
+        event_time.to_rfc3339()
+    );
+    let fixture = GroundedSourceFixture::new(&harness.client, space_id).await?;
 
     let extractor_a = FixtureExtractor::new(vec![make_event_assertion(0.93, event_time)]);
     let extractor_b = FixtureExtractor::new(vec![make_event_assertion(0.51, event_time)]);
-
-    let result_a = execute_extract_assertions(
+    let accepted_a = Box::pin(fixture.publish_text(
         &harness.client,
+        "Announcement source A",
+        &text,
         &extractor_a,
-        &node_id_a,
-        &revision_id_a,
-        &work_run_a,
-        space_id,
-        actor,
-        None,
-    )
+    ))
     .await?;
-    promote_extraction_artifact(
+    let accepted_b = Box::pin(fixture.publish_text(
         &harness.client,
-        space_id,
-        &result_a.artifact_id,
-        &work_run_a,
-    )
-    .await?;
-    let result_b = execute_extract_assertions(
-        &harness.client,
+        "Announcement source B",
+        &text,
         &extractor_b,
-        &node_id_b,
-        &revision_id_b,
-        &work_run_b,
-        space_id,
-        actor,
-        None,
-    )
+    ))
     .await?;
-    promote_extraction_artifact(
-        &harness.client,
-        space_id,
-        &result_b.artifact_id,
-        &work_run_b,
-    )
-    .await?;
+
+    use crate::grounded_source_fixture::{
+        fixture_entity_for_revision, fixture_published_revision, merge_fixture_entity_ids,
+        FixtureMentionRole,
+    };
+    let revision_a = fixture_published_revision(&harness.client, &accepted_a).await?;
+    let revision_b = fixture_published_revision(&harness.client, &accepted_b).await?;
+    // Both the person and project are explicitly the same identities in this
+    // known-answer corpus. Preserve two independent source contributions.
+    for (mention, role) in [
+        ("Alice", FixtureMentionRole::Subject),
+        ("Project Phoenix", FixtureMentionRole::Object),
+    ] {
+        let a = fixture_entity_for_revision(&harness.client, space_id, &revision_a, mention, role)
+            .await?;
+        let b = fixture_entity_for_revision(&harness.client, space_id, &revision_b, mention, role)
+            .await?;
+        merge_fixture_entity_ids(&harness.client, space_id, &a, &b).await?;
+    }
 
     let tm_storage = RepositoryTruthMaintenanceStorage::new(harness.client.clone());
     let event_repo = EventRepository::new(harness.client.clone());
     let seeded_events = event_repo.get_recent(space_id, 10).await?;
+    assert_eq!(seeded_events.len(), 2, "retain both original source events");
     let triggers: Vec<TriggerEvent> = seeded_events
         .iter()
         .map(|event| TriggerEvent::Event(event.base.id.clone()))
         .collect();
-    let detect = execute_tm_detect_conflicts(&triggers, space_id, &tm_storage).await?;
 
-    // Value-aware detection: event slots never open conflict groups; the
-    // shared slot resolves in a single ranked direct commit.
+    use elephant_storage::canonical_commit::{CanonicalRepository, PublishedSourceFence};
+    use sha2::Digest;
+
+    // Locate the exact direct-maintenance receipt from the original epoch,
+    // before detection can change it. This independently encodes the stable
+    // receipt identity; it never prepares a new decision or refreshes a proof.
+    let canonical = CanonicalRepository::new(harness.client.clone());
+    let observed_epoch = canonical.epoch(space_id).await?;
+    let receipt_key = format!(
+        "maintenance:{:x}",
+        sha2::Sha256::digest(serde_json::to_vec(&(
+            "execute_tm_detect_conflicts",
+            "detection",
+            "direct",
+            &observed_epoch,
+        ))?)
+    );
+    assert!(canonical.receipt(space_id, &receipt_key).await?.is_none());
+    let mut original_request = serde_json::json!({"events": &triggers});
+    original_request.sort_all_objects();
+    let original_input_hash = format!(
+        "{:x}",
+        sha2::Sha256::digest(serde_json::to_vec(&original_request)?)
+    );
+    let detect = Box::pin(execute_tm_detect_conflicts(
+        &triggers,
+        space_id,
+        &tm_storage,
+    ))
+    .await?;
+
+    // Production detection applies its one ranked event-slot decision inside
+    // the detection transaction. No successor queue remains to apply twice.
     assert!(
         detect.conflict_group_ids.is_empty(),
         "event slots must resolve via direct commits, not conflict groups: {:?}",
         detect.conflict_group_ids
     );
+    assert_eq!(detect.events_processed, 2);
+    assert_eq!(detect.conflicts_detected, 1, "one shared event slot");
+    assert_eq!(detect.conflicts_updated, 0);
+    assert!(detect.direct_commits.is_empty());
+    let receipt = canonical
+        .receipt(space_id, &receipt_key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("original detection transaction receipt absent"))?;
+    assert_eq!(receipt.space_id, space_id);
+    assert_eq!(receipt.commit_id, receipt_key);
+    assert_eq!(receipt.input_fingerprint, original_input_hash);
     assert_eq!(
-        detect.direct_commits.len(),
-        1,
-        "both candidates share one event slot and one direct commit"
+        receipt.replay_output,
+        Some(serde_json::json!({"value": serde_json::to_value(&detect)?}))
     );
-    for commit in detect.direct_commits {
-        execute_tm_commit(&commit.resolution, &commit.input, space_id, &tm_storage).await?;
-    }
+    let mut original_event_ids = seeded_events
+        .iter()
+        .map(|event| event.base.id.clone())
+        .collect::<Vec<_>>();
+    original_event_ids.sort();
+    let mut committed_event_ids = receipt
+        .effect_ids
+        .iter()
+        .filter(|id| id.table() == TableName::Event)
+        .cloned()
+        .collect::<Vec<_>>();
+    committed_event_ids.sort();
+    assert_eq!(committed_event_ids, original_event_ids);
+    let mut original_authority = [&accepted_a, &accepted_b]
+        .into_iter()
+        .map(|accepted| PublishedSourceFence::Head {
+            source_id: accepted.source.base.id.clone(),
+            generation: accepted.publication.generation.clone(),
+            published_revision: accepted.publication.revision_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    original_authority.sort_by(|a, b| a.source_id().cmp(b.source_id()));
+    let mut committed_authority = receipt.maintenance_authority;
+    committed_authority.sort_by(|a, b| a.source_id().cmp(b.source_id()));
+    assert_eq!(committed_authority, original_authority);
+    let original_sources = original_authority
+        .iter()
+        .map(|fence| fence.source_id().clone())
+        .collect::<Vec<_>>();
+    let mut committed_sources = receipt.source_ids;
+    committed_sources.sort();
+    assert_eq!(committed_sources, original_sources);
 
     // The candidates differ in status (0.93 auto-approved at promotion, 0.51
     // stayed Candidate), so this is deterministic ranked supersession — NOT

@@ -67,7 +67,7 @@ pub trait PromotionDisambiguator: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// Implementations may surface infrastructure errors; callers treat them
-    /// like `None` (deterministic fallback) rather than failing promotion.
+    /// as an abort: only `Ok(None)` permits deterministic fallback.
     async fn disambiguate(
         &self,
         input: &DisambiguationRequest,
@@ -242,14 +242,39 @@ fn disambiguation_system_prompt() -> &'static str {
 #[derive(Debug, Clone)]
 pub struct AgenticPromotionDisambiguator {
     config: PromotionDisambiguationConfig,
+    provider_context: Option<crate::provider_dispatch::ProviderDispatchContext>,
 }
 
 #[cfg(feature = "meerkat-extraction")]
 impl AgenticPromotionDisambiguator {
+    /// Resolve this adapter for one explicit space; retries recheck current approval.
+    pub async fn with_provider_context(
+        mut self,
+        context: crate::provider_dispatch::ProviderDispatchContext,
+    ) -> crate::PipelineResult<Self> {
+        let binding = context
+            .repository
+            .authorize_model_operation(
+                &context.space_id,
+                elephant_types::provider_binding::ModelOperation::PromotionDisambiguation,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                PipelineError::ConfigError(format!("provider_authorization: {error}"))
+            })?;
+        self.config.model = binding.profile.model;
+        self.provider_context = Some(context);
+        Ok(self)
+    }
+
     /// Creates a disambiguator with the given config.
     #[must_use]
     pub const fn new(config: PromotionDisambiguationConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            provider_context: None,
+        }
     }
 
     async fn run_agent(
@@ -283,6 +308,19 @@ impl AgenticPromotionDisambiguator {
         let factory = AgentFactory::new(PathBuf::from("/tmp/elephant-promotion-disambiguation"));
         let meerkat_config = Config::default();
         let mut build = AgentBuildConfig::new(self.config.model.clone());
+        self.provider_context
+            .as_ref()
+            .ok_or_else(|| {
+                PipelineError::ConfigError(
+                    "provider_authorization: model adapter requires a space context".into(),
+                )
+            })?
+            .govern_agent_build(
+                elephant_types::provider_binding::ModelOperation::PromotionDisambiguation,
+                &mut build,
+            )
+            .await?;
+
         build.system_prompt =
             meerkat_core::SystemPromptOverride::Set(disambiguation_system_prompt().to_string());
         build.max_tokens = Some(PROMOTION_LLM_MAX_OUTPUT_TOKENS);
@@ -331,6 +369,7 @@ impl PromotionDisambiguator for AgenticPromotionDisambiguator {
     ) -> Result<Option<PromotionDisambiguationDecision>, PipelineError> {
         match self.run_agent(input).await {
             Ok(decision) => Ok(decision),
+            Err(error) if error.to_string().contains("provider_authorization:") => Err(error),
             Err(error) => {
                 tracing::warn!(
                     %error,

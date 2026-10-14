@@ -468,10 +468,11 @@ async fn overlapping_graph_progress(backend: provider_spy::Backend) {
                 "publication": elephant_pipeline::source_queue::publication_from_work(&claimed).ok().flatten(),
                 "lease_expires_at": claimed.lease_expires_at,
             }));
-            trace.phase("readiness_check");
+            // Enroll both original finalizers before polling dispatch. A claim
+            // can become ready after this loop examines it, so an early false
+            // readiness result must not let it bypass the overlap barrier.
             let wait_for_overlap = if claimed.kind == FINALIZE
                 && gated.len() < 2
-                && Box::pin(ready_to_prepare(&storage, &claimed)).await
                 && gated.insert(claimed.base.id.clone())
             {
                 Some(gate.clone())
@@ -485,6 +486,13 @@ async fn overlapping_graph_progress(backend: provider_spy::Backend) {
             running.push(
                 async move {
                     if let Some(mut gate) = wait_for_overlap {
+                        trace.work(&claimed, "readiness_wait", serde_json::Value::Null);
+                        // Keep the real claim and lease while prerequisite
+                        // dispatches progress in the remaining driver slot.
+                        // The unchanged outer deadline bounds this wait.
+                        while !Box::pin(ready_to_prepare(&storage, &claimed)).await {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
                         trace.work(&claimed, "overlap_wait", serde_json::Value::Null);
                         arrived.fetch_add(1, Ordering::SeqCst);
                         if !*gate.borrow() {

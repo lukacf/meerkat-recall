@@ -1441,6 +1441,11 @@ async fn auto_merge(
     context: &[BaseFields],
 ) -> Result<(), PipelineError> {
     observe_pair(planning, space, pair).await?;
+    merge_entities_for_decision(planning, storage, space, pair, decision, context).await?;
+    // This decision records the original pair. Stage it after rewriting prior
+    // references so it cannot collapse into a self-pair or leave an audit of
+    // an intermediate-only subject on a newly created candidate. The original
+    // observed entity envelopes still authorize this decision and its commit.
     stage_candidate(
         planning,
         space,
@@ -1448,8 +1453,7 @@ async fn auto_merge(
         decision,
         IdentityCandidateStatus::Approved,
         context,
-    )?;
-    merge_entities_for_decision(planning, storage, space, pair, decision, context).await
+    )
 }
 
 async fn approve_existing_candidate_and_merge(
@@ -2471,6 +2475,24 @@ mod tests {
             )
             .await
             .unwrap();
+
+        let decisions = IdentityCandidateRepository::new(storage.clone())
+            .list("test_space", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        let recorded = &decisions[0];
+        assert_eq!(recorded.status, IdentityCandidateStatus::Approved);
+        assert_eq!(recorded.entity_a.id(), &survivor.base.id);
+        assert_eq!(recorded.entity_b.id(), &merged.base.id);
+        assert!(recorded
+            .base
+            .subjects
+            .contains(&Link::new(survivor.base.id.clone())));
+        assert!(recorded
+            .base
+            .subjects
+            .contains(&Link::new(merged.base.id.clone())));
 
         let updated_survivor = entity_repo
             .get("test_space", &survivor.base.id)

@@ -884,7 +884,11 @@ mod tests {
             .persist_embeddings("test_space", nodes.clone(), embeddings)
             .await
             .expect_err("persist should fail when a node disappears");
-        assert!(err.to_string().contains("DocNode"));
+        assert!(matches!(
+            err,
+            PipelineError::StorageError(elephant_storage::StorageError::Conflict(ref code))
+                if code == "source_embedding_requires_original_claim"
+        ));
 
         let first = ctx
             .worker

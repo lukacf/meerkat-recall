@@ -855,8 +855,8 @@ async fn dispatch_contact_step(
     let before = graph_rows(storage).await;
     let run_id = RecordId::new_v4(TableName::WorkRun);
     let config = WorkQueueWorkerConfig {
-        // Use the documented minimum dependency delay through the production
-        // retry policy; never rewrite persisted run_after to accelerate a claim.
+        // Pending dependencies use the independent five-second local policy,
+        // even with a thirty-second transient cap. Never rewrite run_after.
         transient_retry_max_delay_secs: 30,
         ..WorkQueueWorkerConfig::default()
     };
@@ -869,6 +869,7 @@ async fn dispatch_contact_step(
         extractor,
     ))
     .await;
+    let dispatch_finished = Utc::now();
     match result {
         Ok(_) => true,
         Err(error) => {
@@ -898,10 +899,11 @@ async fn dispatch_contact_step(
                 .unwrap();
             assert!(!run.success && run.completed_at.is_some() && run.error.is_some());
             assert!(
-                queued.run_after.is_some_and(
-                    |due| due >= run.completed_at.unwrap() + chrono::Duration::seconds(30)
-                ),
-                "pending retry lost its production minimum delay"
+                queued.run_after.is_some_and(|due| {
+                    due >= run.completed_at.unwrap() + chrono::Duration::seconds(5)
+                        && due <= dispatch_finished + chrono::Duration::seconds(5)
+                }),
+                "pending retry left its five-second local-prerequisite window"
             );
             assert_eq!(run.work_item.id(), &item.base.id);
             let original: elephant_types::publication::AttemptFence =

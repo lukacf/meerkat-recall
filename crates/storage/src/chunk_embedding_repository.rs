@@ -1538,6 +1538,7 @@ mod tests {
             ))
             .await
             .expect("surviving indexed twins");
+        drop(client);
         let survivors: Vec<surrealdb::sql::Thing> = response.take(0).expect("survivor ids");
         assert_eq!(survivors.len(), 3, "bitmap removals must persist");
         assert!(survivors.iter().all(

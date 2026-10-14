@@ -4096,8 +4096,11 @@ async fn native_publication_index_probe_ignores_deleted_and_foreign_vector_twins
         .query_checked(&format!("REMOVE INDEX {table}_hnsw ON TABLE {table}"))
         .await
         .unwrap();
+    drop(target);
+    drop(storage);
     assert!(
         repository.check_ready(&requirements).await.is_err(),
         "actual missing index must still refuse publication"
     );
+    drop(repository);
 }

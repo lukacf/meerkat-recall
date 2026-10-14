@@ -98,6 +98,7 @@ class WorkflowContracts(unittest.TestCase):
                     self.assertTrue(excluded)
                     self.assertIn(qualified,aliases['test-e2e-model'])
                     self.assertIn('--ignored --exact',aliases['test-e2e-model'])
+                    self.assertIn('--features elephant-embeddings/fastembed',aliases['test-e2e-model'])
                 else:
                     self.assertEqual(entry['lane'],'live-provider-opt-in')
                     self.assertTrue(excluded)

@@ -2675,6 +2675,7 @@ mod tests {
             .await
             .expect("claim")
             .expect("owned");
+        drop(works);
         let attempt =
             elephant_storage::work_attempt_repository::fence_from_claim(&claim).expect("fence");
         let publication = PublicationFence {
@@ -2778,6 +2779,7 @@ mod tests {
             failed,
             "terminal history must remain immutable"
         );
+        drop(publications);
     }
 
     #[tokio::test]

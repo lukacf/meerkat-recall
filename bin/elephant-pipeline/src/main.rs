@@ -7259,7 +7259,10 @@ async fn run_work_queue_loop(
                                         ).await {
                                             warn!(%error, "Original failed disposition remains pending lease recovery");
                                         } else {
+                                            let diagnostic = failure_diagnostic::FailureDiagnostic::from_error(&err);
                                             warn!(work_item = %item.base.id, kind = %item.kind, error = %err,
+                                                failure_kind = diagnostic.kind, failure_stage = diagnostic.stage,
+                                                failure_code = diagnostic.code, failure_action = diagnostic.action(),
                                                 ?class, ?action, "Recorded failed work attempt");
                                         }
                                     }

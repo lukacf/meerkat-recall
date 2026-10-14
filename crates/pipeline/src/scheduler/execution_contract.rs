@@ -140,6 +140,9 @@ pub fn classify_failure(error: &anyhow::Error) -> FailureClass {
                     FailureClass::StaleInput
                 }
                 PipelineError::ExtractionError(message)
+                | PipelineError::ExtractionFailure {
+                    detail: message, ..
+                }
                 | PipelineError::IngestionError(message) => classify_untyped(message),
                 _ => FailureClass::Terminal,
             };

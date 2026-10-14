@@ -16,6 +16,8 @@ mod validator;
 
 #[cfg(feature = "meerkat-extraction")]
 mod agentic_extractor;
+#[cfg(feature = "meerkat-extraction")]
+mod failure;
 
 pub use allowed_tools::*;
 pub(crate) use extractor::ExtractionRepairContext;

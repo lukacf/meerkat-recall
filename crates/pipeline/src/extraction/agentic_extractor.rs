@@ -25,6 +25,7 @@ use elephant_types::records::doc_revision::DocRevision;
 use elephant_types::records::work::{Determinism, PluginManifest, RetryPolicy};
 use elephant_types::{Link, RecordId};
 
+use super::failure;
 use super::{ExtractionBudget, ExtractionContext, ExtractionResult, Extractor, RawAssertion};
 use crate::error::PipelineError;
 #[cfg(feature = "meerkat-extraction")]
@@ -1170,19 +1171,17 @@ fn parse_agent_run_output(
     if let Some(structured) = structured_output {
         return match parse_structured_output(structured) {
             Ok(assertions) => Ok(assertions),
-            Err(e) => {
-                eprintln!(
-                    "[agentic] structured parse failed for model {model}: {e}\n  value preview: {}",
-                    &structured.to_string()[..structured.to_string().len().min(500)]
-                );
-                eprintln!(
-                    "[agentic] text preview for model {model}: {}",
-                    &text[..text.len().min(500)]
+            Err(_) => {
+                // Provider output and parser errors can contain document text.
+                tracing::warn!(
+                    failure_code = "structured_output_invalid",
+                    "Extraction output could not be parsed"
                 );
                 if text.trim().is_empty() {
-                    Err(PipelineError::ExtractionError(format!(
-                        "Model {model} produced unusable extraction output: structured output was present but could not be deserialized, and fallback text output was empty"
-                    )))
+                    Err(PipelineError::ExtractionFailure {
+                        stage: "structured_output", code: "structured_output_invalid",
+                        detail: format!("Model {model} produced unusable extraction output: structured output was present but could not be deserialized, and fallback text output was empty"),
+                    })
                 } else {
                     parse_llm_output_with_repair(text)
                 }
@@ -1191,9 +1190,10 @@ fn parse_agent_run_output(
     }
 
     if text.trim().is_empty() {
-        return Err(PipelineError::ExtractionError(format!(
-            "Model {model} produced unusable extraction output: structured output was absent and text output was empty"
-        )));
+        return Err(PipelineError::ExtractionFailure {
+            stage: "structured_output", code: "output_empty",
+            detail: format!("Model {model} produced unusable extraction output: structured output was absent and text output was empty"),
+        });
     }
 
     parse_llm_output_with_repair(text)
@@ -1202,8 +1202,10 @@ fn parse_agent_run_output(
 fn is_empty_agent_output_error(err: &PipelineError) -> bool {
     matches!(
         err,
-        PipelineError::ExtractionError(message)
-            if message.contains("structured output was absent and text output was empty")
+        PipelineError::ExtractionFailure {
+            code: "output_empty",
+            ..
+        }
     )
 }
 
@@ -1920,15 +1922,21 @@ fn normalize_extracted_assertions(
 
 fn require_completed_extraction_run(result: &meerkat::RunResult) -> Result<(), PipelineError> {
     if let Some(cause) = result.terminal_cause_kind {
-        return Err(PipelineError::ExtractionError(format!(
-            "Extraction agent terminated: {cause:?}"
-        )));
+        return Err(PipelineError::ExtractionFailure {
+            stage: "agent_terminal",
+            code: failure::terminal_code(cause),
+            detail: format!("Extraction agent terminated: {cause:?}"),
+        });
     }
     if let Some(error) = &result.extraction_error {
-        return Err(PipelineError::ExtractionError(format!(
-            "Structured extraction failed after {} attempts: {}",
-            error.attempts, error.reason
-        )));
+        return Err(PipelineError::ExtractionFailure {
+            stage: "structured_output",
+            code: "structured_output_invalid",
+            detail: format!(
+                "Structured extraction failed after {} attempts: {}",
+                error.attempts, error.reason
+            ),
+        });
     }
     Ok(())
 }
@@ -2126,9 +2134,11 @@ impl AgenticExtractor {
                 boxed_extraction_phase(|| factory.build_agent(build, &verifier_config))
                     .await
                     .map_err(|error| {
-                        PipelineError::ExtractionError(format!(
-                            "Support verifier build failed: {error}"
-                        ))
+                        failure::build(
+                            "support_agent_build",
+                            "Support verifier build failed",
+                            &error,
+                        )
                     })?
             };
             let prompt = serde_json::to_string(batch)
@@ -2136,7 +2146,7 @@ impl AgenticExtractor {
             let result = boxed_extraction_phase(|| agent.run(ContentInput::Text(prompt)))
                 .await
                 .map_err(|error| {
-                    PipelineError::ExtractionError(format!("Support verifier failed: {error}"))
+                    failure::run("support_agent_run", "Support verifier failed", &error)
                 })?;
             require_completed_extraction_run(&result)?;
             if result.tool_calls != 0 {
@@ -2308,9 +2318,11 @@ impl AgenticExtractor {
                 boxed_extraction_phase(|| factory.build_agent(direct_build, &meerkat_config))
                     .await
                     .map_err(|e| {
-                        PipelineError::ExtractionError(format!(
-                            "Direct extraction agent build failed: {e}"
-                        ))
+                        failure::build(
+                            "direct_agent_build",
+                            "Direct extraction agent build failed",
+                            &e,
+                        )
                     })?;
             let agent_build_ms = agent_build_started.elapsed().as_millis();
 
@@ -2319,9 +2331,7 @@ impl AgenticExtractor {
                 boxed_extraction_phase(|| direct_agent.run(ContentInput::Text(direct_prompt)))
                     .await
                     .map_err(|e| {
-                        PipelineError::ExtractionError(format!(
-                            "Direct extraction agent run failed: {e}"
-                        ))
+                        failure::run("direct_agent_run", "Direct extraction agent run failed", &e)
                     })?;
             let run_ms = run_started.elapsed().as_millis();
             require_completed_extraction_run(&direct_result)?;
@@ -2437,7 +2447,7 @@ impl AgenticExtractor {
         let mut agent: DynAgent =
             boxed_extraction_phase(|| factory.build_agent(build, &meerkat_config))
                 .await
-                .map_err(|e| PipelineError::ExtractionError(format!("Agent build failed: {e}")))?;
+                .map_err(|e| failure::build("agent_build", "Agent build failed", &e))?;
         let agent_build_ms = agent_build_started.elapsed().as_millis();
 
         let content_input = boxed_extraction_phase(|| {
@@ -2452,7 +2462,7 @@ impl AgenticExtractor {
         let run_started = Instant::now();
         let run_result = boxed_extraction_phase(|| agent.run(content_input))
             .await
-            .map_err(|e| PipelineError::ExtractionError(format!("Agent run failed: {e}")))?;
+            .map_err(|e| failure::run("agent_run", "Agent run failed", &e))?;
         let run_ms = run_started.elapsed().as_millis();
         // Budget exhaustion is an Ok result with a machine-owned terminal
         // cause in Meerkat. Never retry it through the empty-output fallback.
@@ -2543,18 +2553,22 @@ impl AgenticExtractor {
                     boxed_extraction_phase(|| factory.build_agent(fallback_build, &meerkat_config))
                         .await
                         .map_err(|build_err| {
-                            PipelineError::ExtractionError(format!(
-                                "{err}; fallback agent build failed: {build_err}"
-                            ))
+                            failure::build(
+                                "fallback_agent_build",
+                                &format!("{err}; fallback agent build failed"),
+                                &build_err,
+                            )
                         })?;
                 let fallback_result = boxed_extraction_phase(|| {
                     fallback_agent.run(ContentInput::Text(fallback_prompt))
                 })
                 .await
                 .map_err(|run_err| {
-                    PipelineError::ExtractionError(format!(
-                        "{err}; fallback agent run failed: {run_err}"
-                    ))
+                    failure::run(
+                        "fallback_agent_run",
+                        &format!("{err}; fallback agent run failed"),
+                        &run_err,
+                    )
                 })?;
                 require_completed_extraction_run(&fallback_result)?;
                 fallback_tokens =
@@ -3158,7 +3172,7 @@ mod tests {
             .expect("support request deadline");
             let body = fixture.assert_request("assertion_support", 4_000).await;
             assert!(
-                matches!(&result, Err(PipelineError::ExtractionError(message))
+                matches!(&result, Err(PipelineError::ExtractionFailure { stage: "support_agent_run", detail: message, .. })
                     if message.starts_with("Support verifier failed:")),
                 "the captured HTTP refusal must fail the verifier run"
             );
@@ -3930,7 +3944,7 @@ mod tests {
             .expect("support request deadline");
             let body = fixture.assert_request("assertion_support", 4_000).await;
             assert!(
-                matches!(&result, Err(PipelineError::ExtractionError(message))
+                matches!(&result, Err(PipelineError::ExtractionFailure { stage: "support_agent_run", detail: message, .. })
                 if message.starts_with("Support verifier failed:"))
             );
             assert_eq!(unused_client.call_count(), 0);
@@ -4025,7 +4039,7 @@ mod tests {
             .expect("support request deadline");
             let body = fixture.assert_request("assertion_support", 4_000).await;
             assert!(
-                matches!(&result, Err(PipelineError::ExtractionError(message))
+                matches!(&result, Err(PipelineError::ExtractionFailure { stage: "support_agent_run", detail: message, .. })
                 if message.starts_with("Support verifier failed:"))
             );
             assert_eq!(unused_client.call_count(), 0);
@@ -4237,7 +4251,7 @@ mod tests {
             let result = extractor.run_agent(ctx, dispatcher, llm.clone()).await;
             assert!(matches!(
                 result,
-                Err(PipelineError::ExtractionError(ref message)) if message.contains("BudgetExhausted")
+                Err(PipelineError::ExtractionFailure { code: "extraction_budget_exceeded", detail: ref message, .. }) if message.contains("BudgetExhausted")
             ));
             assert_eq!(llm.call_count(), 1, "budget must stop a second model call");
         });
@@ -4303,7 +4317,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(PipelineError::ExtractionError(ref message))
+                Err(PipelineError::ExtractionFailure { code: "structured_output_invalid", detail: ref message, .. })
                     if message.contains("Structured extraction failed after 3 attempts")
             ));
             assert_eq!(llm.call_count(), 4, "all schema retries must be exhausted");
@@ -4446,7 +4460,11 @@ mod tests {
         let err = parse_agent_run_output("gemini-3.1-flash-lite-preview", None, "")
             .expect_err("empty unstructured result should fail");
         match err {
-            PipelineError::ExtractionError(message) => {
+            PipelineError::ExtractionFailure {
+                code: "output_empty",
+                detail: message,
+                ..
+            } => {
                 assert!(message.contains("gemini-3.1-flash-lite-preview"));
                 assert!(message.contains("structured output was absent"));
             }
@@ -4463,7 +4481,11 @@ mod tests {
         )
         .expect_err("unparseable structured result should fail when fallback text is empty");
         match err {
-            PipelineError::ExtractionError(message) => {
+            PipelineError::ExtractionFailure {
+                code: "structured_output_invalid",
+                detail: message,
+                ..
+            } => {
                 assert!(message.contains("gemini-3.1-flash-lite-preview"));
                 assert!(message.contains("could not be deserialized"));
             }

@@ -9,6 +9,14 @@ pub enum EmbeddingError {
     #[error("Embedding provider error: {0}")]
     ProviderError(String),
 
+    /// The selected representation cannot fit one complete input. No prefix
+    /// was embedded and no representation change was made automatically.
+    #[error("embedding_input_too_large: {preprocessing} requires a complete input within the model limit; for long documents create a new text-full-v2 embedding profile, reindex and activate it before resubmitting; do not relabel existing vectors")]
+    InputTooLarge {
+        /// Immutable preprocessing identity selected for this operation.
+        preprocessing: &'static str,
+    },
+
     /// Partition error.
     #[error("Partition error: {0}")]
     PartitionError(String),

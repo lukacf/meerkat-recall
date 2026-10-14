@@ -278,7 +278,14 @@ pub(super) async fn record_failed_execution(
     usage.write_metrics(&mut run.metrics)?;
     run.completed_at = Some(completed_at);
     run.success = false;
-    run.error = Some(error.to_string());
+    let diagnostic = failure_diagnostic::FailureDiagnostic::from_error(error);
+    run.error = Some(
+        if diagnostic.kind == "extraction" || diagnostic.code == "embedding_input_too_large" {
+            diagnostic.summary()
+        } else {
+            error.to_string()
+        },
+    );
     run.metrics.wall_time_ms = wall_time_ms;
     run.metrics
         .custom

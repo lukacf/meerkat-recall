@@ -839,12 +839,11 @@ impl OpenAIEmbeddingProvider {
         let error_body: Result<OpenAIErrorResponse, _> = response.json().await;
         let message = error_body.map_or_else(|_| "Unknown error".to_string(), |e| e.error.message);
         if is_request_too_large(&message) {
-            return BatchError::RequestTooLarge { message };
+            return BatchError::RequestTooLarge;
         }
         if is_input_too_long(&message) {
             return BatchError::InputTooLong {
                 index: input_index_in_error(&message),
-                message,
             };
         }
         BatchError::Provider(EmbeddingError::ProviderError(format!(
@@ -963,17 +962,17 @@ impl OpenAIEmbeddingProvider {
         match self.embed_batch(texts).await {
             Ok(embeddings) => Ok(embeddings),
             Err(BatchError::Provider(error)) => Err(error),
-            Err(BatchError::RequestTooLarge { .. }) if texts.len() > 1 => {
+            Err(BatchError::RequestTooLarge) if texts.len() > 1 => {
                 let (first, second) = texts.split_at(texts.len() / 2);
                 let mut embeddings = Box::pin(self.embed_batch_fitting(first)).await?;
                 embeddings.extend(Box::pin(self.embed_batch_fitting(second)).await?);
                 Ok(embeddings)
             }
-            Err(
-                BatchError::RequestTooLarge { message } | BatchError::InputTooLong { message, .. },
-            ) => Err(EmbeddingError::ProviderError(format!(
-                "OpenAI text-v1 complete input exceeds the provider limit: {message}"
-            ))),
+            Err(BatchError::RequestTooLarge | BatchError::InputTooLong { .. }) => {
+                Err(EmbeddingError::InputTooLarge {
+                    preprocessing: "text-v1",
+                })
+            }
         }
     }
 
@@ -997,8 +996,7 @@ impl OpenAIEmbeddingProvider {
                     }
                     Err(BatchError::Provider(error)) => return Err(error),
                     Err(
-                        BatchError::RequestTooLarge { .. }
-                        | BatchError::InputTooLong { index: None, .. },
+                        BatchError::RequestTooLarge | BatchError::InputTooLong { index: None, .. },
                     ) if batch.len() > 1 => {
                         // Isolate unindexed errors rather than guessing which
                         // input was rejected and silently losing another tail.
@@ -1021,7 +1019,7 @@ impl OpenAIEmbeddingProvider {
                             pending.push_front(segment);
                         }
                     }
-                    Err(BatchError::RequestTooLarge { .. }) => {
+                    Err(BatchError::RequestTooLarge) => {
                         let halves = batch.remove(0).split()?;
                         batch.extend(halves);
                         let retain = self.config.max_batch_size.min(batch.len());
@@ -1042,14 +1040,9 @@ enum BatchError {
     InputTooLong {
         /// Index of the rejected input, when the error names one.
         index: Option<usize>,
-        /// The API's error message.
-        message: String,
     },
     /// The API rejected the whole request as over its per-request token limit.
-    RequestTooLarge {
-        /// The API's error message.
-        message: String,
-    },
+    RequestTooLarge,
     /// Any other failure.
     Provider(EmbeddingError),
 }
@@ -1261,7 +1254,17 @@ mod tests {
             "also short".to_string(),
         ];
 
-        assert!(provider.embed(&texts).await.is_err());
+        let error = provider.embed(&texts).await.unwrap_err();
+        assert!(matches!(
+            error,
+            EmbeddingError::InputTooLarge {
+                preprocessing: "text-v1"
+            }
+        ));
+        assert!(error.to_string().contains("text-full-v2"));
+        assert!(error
+            .to_string()
+            .contains("do not relabel existing vectors"));
         let calls = calls.lock().unwrap().clone();
         assert_eq!(calls, vec![vec![5, 30_000, 10]]);
     }

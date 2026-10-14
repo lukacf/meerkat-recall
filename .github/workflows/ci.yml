@@ -113,7 +113,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Run workspace unit gate
-        run: make test-unit
+        run: make test-unit NEXTEST_ARGS=--no-fail-fast
 
   test-all:
     name: Full test suite (all features)
@@ -139,7 +139,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Run full suite
-        run: make test-all
+        run: make test-all NEXTEST_ARGS=--no-fail-fast
 
   e2e:
     name: E2E tests

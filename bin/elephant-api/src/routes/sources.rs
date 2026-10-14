@@ -2700,11 +2700,14 @@ mod tests {
             .await
             .expect("read")
             .expect("failed");
-        let source = SourceRepository::new(storage.clone())
-            .get("default", &original.source_id)
-            .await
-            .expect("read source")
-            .expect("source");
+        let source = Repository::get(
+            &SourceRepository::new(storage.clone()),
+            "default",
+            &original.source_id,
+        )
+        .await
+        .expect("read source")
+        .expect("source");
         let request = || SourceWriteRequest {
             source: source.clone(),
             intake: IntakeControl {

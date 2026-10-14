@@ -614,7 +614,7 @@ pub async fn run_api_with_client_and_shutdown(
             routes::readiness::readiness_routes()
                 .with_state(runtime.clone())
                 .layer(middleware::from_fn_with_state(
-                    runtime,
+                    runtime.clone(),
                     space_grants::enforce_space_grant,
                 ))
                 .layer(middleware::from_fn_with_state(auth_state, jwt_auth)),

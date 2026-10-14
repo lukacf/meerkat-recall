@@ -264,12 +264,14 @@ async fn coordinate_contract() -> anyhow::Result<()> {
                 tampered.text_hash = hash(tampered.text.as_bytes());
                 revisions.update(space, &id, tampered).await?;
                 let refused = Box::pin(query(&storage, space, case)).await?;
-                if case.id == "second_repeated_phrase_after_crlf_trim" {
-                    expected_queries[index] += 1;
-                }
+                // The same MCP caller/input/binding reuses its earlier vector,
+                // while current source reads must still reject the tampered
+                // render. The cache retains neither result nor read authority.
+                // The original MCP and HTTP cold queries above still require
+                // exactly one physical dispatch each; this recheck requires zero.
                 anyhow::ensure!(
                     [endpoints[0].count()?, endpoints[1].count()?] == expected_queries,
-                    "tamper recheck exceeded or bypassed its declared governed query"
+                    "tamper recheck unexpectedly redispatched the original caller query"
                 );
                 if refused["ok"] == true {
                     let refused: SearchResponse = serde_json::from_value(refused["data"].clone())?;

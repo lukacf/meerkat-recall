@@ -110,7 +110,14 @@ async fn ineligible_partition_prefix_cannot_become_complete_empty_semantic_searc
         .await?;
         // Positive control proves the public profile, physical target and fixed
         // reader work before introducing the ineligible partition prefix.
+        let before_cold_query = endpoint.count()?;
         exact_visible_result(search(&client, QUERY).await?, TARGET)?;
+        anyhow::ensure!(
+            endpoint.count()? == before_cold_query + 1,
+            "the cold original query must dispatch exactly once"
+        );
+        let cold_requests = endpoint.requests()?;
+        anyhow::ensure!(cold_requests[before_cold_query].body["input"] == json!([QUERY]));
         let text = HIDDEN_NODE.repeat(HIDDEN_NODES);
         let cuts: Vec<_> = (1..HIDDEN_NODES).map(|n| n * HIDDEN_NODE.len()).collect();
         let mut hidden = index_fixture::security("default", 0);
@@ -136,14 +143,12 @@ async fn ineligible_partition_prefix_cannot_become_complete_empty_semantic_searc
             Err(error) => return Err(error.into()),
         }
         anyhow::ensure!(
-            endpoint.count()? == before + 1,
+            // Same storage, caller, binding and literal query as the cold
+            // control. Corpus writes change read authority, not the memoized
+            // caller-input vector. No new call is needed to widen this window.
+            endpoint.count()? == before,
             "window continuation rewrote or redispatched the original query"
         );
-        let requests = endpoint.requests()?;
-        let request = requests
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("query dispatch absent"))?;
-        anyhow::ensure!(request.body["input"] == json!([QUERY]));
     }
     Ok(())
 }

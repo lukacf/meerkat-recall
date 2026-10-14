@@ -166,6 +166,11 @@ debug = true
 [profile.test.package.surrealdb-core]
 opt-level = 1
 
+# The full-book embedded scenario retains its fixed elapsed deadline while
+# exercising the real document index builder with optimization enabled.
+[profile.test.package.elephant-db]
+opt-level = 1
+
 [profile.release]
 opt-level = 3
 lto = true

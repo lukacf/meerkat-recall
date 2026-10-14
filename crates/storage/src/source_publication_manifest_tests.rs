@@ -804,10 +804,6 @@ async fn embed(fixture: &Fixture, index: usize, vector: Vec<f32>) {
 
 #[tokio::test]
 #[expect(
-    clippy::large_futures,
-    reason = "Keep the conformance helper's original await and allocation shape."
-)]
-#[expect(
     clippy::significant_drop_tightening,
     reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
 )]
@@ -868,10 +864,6 @@ async fn finished_subset_cannot_publish_or_shrink_sealed_expected_set() {
 }
 
 #[tokio::test]
-#[expect(
-    clippy::large_futures,
-    reason = "Keep the conformance helper's original await and allocation shape."
-)]
 #[expect(
     clippy::significant_drop_tightening,
     reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
@@ -1178,10 +1170,6 @@ async fn old_revision_mapping_survives_pending_replacement_and_wrong_space_is_em
 }
 
 #[tokio::test]
-#[expect(
-    clippy::large_futures,
-    reason = "Keep the conformance helper's original await and allocation shape."
-)]
 #[expect(
     clippy::significant_drop_tightening,
     reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
@@ -1929,10 +1917,6 @@ async fn planner_retry_adopts_exact_sealed_selections_without_forgiving_failed_o
 }
 
 #[tokio::test]
-#[expect(
-    clippy::large_futures,
-    reason = "Keep the conformance helper's original await and allocation shape."
-)]
 #[expect(
     clippy::significant_drop_tightening,
     reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."

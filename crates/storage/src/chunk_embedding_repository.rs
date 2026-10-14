@@ -1474,6 +1474,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filtered_hnsw_twins_do_not_consume_any_requested_result_slots() {
+        let client = StorageClient::new_memory().await.expect("memory");
+        let key =
+            PartitionKey::new("default".into(), "L0".into(), "twins".into(), 3).expect("partition");
+        let table = key.table_name();
+        client
+            .query_checked(&PartitionManager::create_partition_ddl(&key))
+            .await
+            .expect("ddl");
+        // More ineligible twins than the old fixed search overfetch allowance.
+        for index in 0..24 {
+            client.query_checked(&format!("CREATE {table}:ineligible{index} SET vector=[1,0,0], space_id='foreign', vector_norm=1")).await.expect("foreign twin");
+        }
+        for index in 0..3 {
+            client.query_checked(&format!("CREATE {table}:eligible{index} SET vector=[1,0,0], space_id='selected', vector_norm=1")).await.expect("eligible twin");
+        }
+        // Every duplicate membership, including the in-place bitmap range,
+        // must reach the durable index before predicates are considered.
+        let mut response = client
+            .query_checked(&format!(
+                "SELECT VALUE id FROM {table} WHERE vector <|27,100|> [1,0,0]"
+            ))
+            .await
+            .expect("all indexed twins");
+        let all_ids: Vec<surrealdb::sql::Thing> = response.take(0).expect("all record ids");
+        assert_eq!(all_ids.len(), 27, "bitmap inserts must persist");
+        for limit in [1, 2, 3] {
+            let query = format!("SELECT VALUE id FROM {table} WHERE vector <|{limit},100|> [1,0,0] AND space_id='selected' AND deleted_at=NONE");
+            let mut response = client.query_checked(&query).await.expect("indexed search");
+            let ids: Vec<surrealdb::sql::Thing> = response.take(0).expect("record ids");
+            assert_eq!(ids.len(), limit);
+            assert!(ids
+                .iter()
+                .all(|id| id.to_string().contains("eligible")
+                    && !id.to_string().contains("ineligible")));
+        }
+        client
+            .query_checked(&format!(
+                "UPDATE {table} SET deleted_at=time::now() WHERE space_id='selected'"
+            ))
+            .await
+            .expect("delete eligible rows");
+        let mut response = client.query_checked(&format!("SELECT VALUE id FROM {table} WHERE vector <|1,100|> [1,0,0] AND space_id='selected' AND deleted_at=NONE")).await.expect("all denied search");
+        let ids: Vec<surrealdb::sql::Thing> = response.take(0).expect("empty result");
+        assert!(ids.is_empty(), "filter must remain fail closed");
+        // Physical deletion exercises bitmap removal above eight entries and
+        // its transition back to the small representation. An unfiltered KNN
+        // query must not spend any of its three slots on stale foreign IDs.
+        client
+            .query_checked(&format!("DELETE {table} WHERE space_id='foreign'"))
+            .await
+            .expect("remove foreign twins");
+        client
+            .query_checked(&format!(
+                "UPDATE {table} SET deleted_at=NONE WHERE space_id='selected'"
+            ))
+            .await
+            .expect("restore selected fixture rows");
+        let mut response = client
+            .query_checked(&format!(
+                "SELECT VALUE id FROM {table} WHERE vector <|3,100|> [1,0,0]"
+            ))
+            .await
+            .expect("surviving indexed twins");
+        drop(client);
+        let survivors: Vec<surrealdb::sql::Thing> = response.take(0).expect("survivor ids");
+        assert_eq!(survivors.len(), 3, "bitmap removals must persist");
+        assert!(survivors.iter().all(
+            |id| id.to_string().contains("eligible") && !id.to_string().contains("ineligible")
+        ));
+    }
+
+    #[tokio::test]
     #[expect(
         clippy::significant_drop_tightening,
         reason = "Keep client in the original fixture scope through assertions and cleanup."

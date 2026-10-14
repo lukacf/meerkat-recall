@@ -85,6 +85,9 @@ pub struct StorageInitializationDiagnostic {
     pub io_error_kind: Option<&'static str>,
     /// Actual OS errno when the original I/O error carries one.
     pub raw_os_error: Option<i32>,
+    /// Fixed next step for capability failures; never derived from private errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<&'static str>,
 }
 
 /// Original initialization failure with separately serializable safe metadata.
@@ -111,6 +114,10 @@ impl StorageInitializationError {
                 io_operation: None,
                 io_error_kind: None,
                 raw_os_error: None,
+                action: match phase {
+                    InitializationPhase::ReferenceCapability => Some("Verify that the configured database is reachable and is the matching Recall-paired server with reference-token v1 and original-row/field capabilities. A stock or mismatched remote SurrealDB server is not compatible; use the paired image from this Recall release."),
+                    _ => None,
+                },
             },
             source,
         }
@@ -179,7 +186,23 @@ const fn error_kind(error: &StorageError) -> StorageFailureKind {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #[test]
+    fn reference_capability_guidance_keeps_private_error_text_private() {
+        let error = super::StorageInitializationError::new(
+            super::InitializationPhase::ReferenceCapability,
+            crate::StorageError::ConnectionError("PRIVATE URL CREDENTIAL QUERY".into()),
+        );
+        let text = serde_json::to_string(error.diagnostic()).unwrap();
+        assert!(text.contains("reference-token v1"));
+        assert!(!text.contains("PRIVATE"));
+        let other = super::StorageInitializationError::new(
+            super::InitializationPhase::NativeConnect,
+            crate::StorageError::ConnectionError("PRIVATE".into()),
+        );
+        assert!(other.diagnostic().action.is_none());
+    }
+
     use super::*;
 
     fn original_failure() -> StorageError {

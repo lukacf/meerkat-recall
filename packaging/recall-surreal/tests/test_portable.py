@@ -29,6 +29,8 @@ class PortableTests(unittest.TestCase):
                     helper.artifact.source_identity.return_value = {"source_commit": provenance["recall_commit"]}
                     helper.load_inputs.return_value = inputs
                     helper.build_limits.return_value = (8, 250 * gib, shared_gib * gib)
+                    helper.resource_mode.return_value = 'legacy-allocation'
+                    helper.resource_monitor.return_value = helper.ResourceBudget.return_value
                     with mock.patch.object(portable, "HERE", root / "packaging/recall-surreal"), \
                          mock.patch.object(portable, "release_helpers", return_value=helper), \
                          mock.patch.object(portable.build, "check_prepared", return_value=provenance), \
@@ -45,9 +47,9 @@ class PortableTests(unittest.TestCase):
                     self.assertIn("CARGO_BUILD_JOBS=8", command)
                     self.assertLessEqual(inner_gib * gib, portable.build.MAX_GROWTH_BYTES)
                     self.assertIs(budget, helper.ResourceBudget.return_value)
-                    helper.ResourceBudget.assert_called_once()
-                    self.assertEqual(helper.ResourceBudget.call_args.args[0], ledger)
-                    self.assertEqual(helper.ResourceBudget.call_args.args[-2:], (250 * gib, shared_gib * gib))
+                    helper.resource_monitor.assert_called_once()
+                    self.assertEqual(helper.resource_monitor.call_args.args[0], ledger)
+                    self.assertEqual(helper.resource_monitor.call_args.args[-2:], (250 * gib, shared_gib * gib))
                     self.assertEqual(ledger.read_text(), "original cumulative counters")
                     inspect.assert_called_once_with(["docker", "info", "--format", "{{.DockerRootDir}}"], text=True)
 

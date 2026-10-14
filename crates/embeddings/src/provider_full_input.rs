@@ -109,11 +109,9 @@ pub(super) fn local_segments(
             pending.push_front(second);
             pending.push_front(first);
         } else {
-            return Err(invalid(if preprocessing == Preprocessing::BgeEnRetrieval {
-                "bge-en-retrieval-v1 complete input including instruction exceeds the local tokenizer limit"
-            } else {
-                "text-v1 complete input exceeds the local tokenizer limit"
-            }));
+            return Err(EmbeddingError::InputTooLarge {
+                preprocessing: preprocessing.as_str(),
+            });
         }
     }
     Ok(accepted)

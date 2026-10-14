@@ -24,6 +24,7 @@ pub struct SpaceStatusState {
     storage: StorageClient,
     runtime: Arc<RuntimeManager>,
     authz: Arc<AuthzService>,
+    worker_auth: Option<crate::auth::AuthState>,
 }
 impl SpaceStatusState {
     pub const fn new(
@@ -35,7 +36,13 @@ impl SpaceStatusState {
             storage,
             runtime,
             authz,
+            worker_auth: None,
         }
+    }
+    #[must_use]
+    pub fn with_worker_auth(mut self, auth: crate::auth::AuthState) -> Self {
+        self.worker_auth = Some(auth);
+        self
     }
 }
 
@@ -168,12 +175,31 @@ async fn status(
         && runtime.storage_ready
         && state.storage.recovery_status().ready
         && !state.runtime.is_draining();
+    let workers_required = state.runtime.workers_required().await;
+    let local_worker_authority = state.runtime.extractor_uses_local_authority().await;
+    let worker_diagnostic = if workers_required && local_worker_authority {
+        if let Some(auth) = &state.worker_auth {
+            let token = std::env::var("MCP_BEARER_TOKEN").ok();
+            crate::setup_diagnostics::worker_authority(
+                auth,
+                &state.storage,
+                &space,
+                token.as_deref(),
+            )
+            .await
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let semantic_ingest_ready = storage_ready
+        && worker_diagnostic.is_none()
         && runtime.semantic_ingest_ready
         && providers_ready
         && guidance_ready
         && runtime.runtime_mode != RuntimeMode::ReadOnly;
-    let ready = storage_ready && (!state.runtime.workers_required().await || semantic_ingest_ready);
+    let ready = storage_ready && (!workers_required || semantic_ingest_ready);
     let mut body = json!({
         "space":space,
         "ready":ready,
@@ -190,6 +216,12 @@ async fn status(
     });
     if inspect_recipes {
         body["embedding_execution_recipes"] = Value::Object(embedding_recipes);
+        let diagnostics = if workers_required && !local_worker_authority {
+            vec![crate::setup_diagnostics::remote_authority_unchecked()]
+        } else {
+            worker_diagnostic.into_iter().collect::<Vec<_>>()
+        };
+        body["setup_diagnostics"] = json!(diagnostics);
     }
     Ok((
         if ready {
@@ -211,6 +243,167 @@ mod tests {
     use elephant_storage::Repository;
     use elephant_types::records::SpaceConfig;
     use elephant_types::{RecordId, TableName};
+
+    struct EnvironmentGuard(Vec<(String, Option<std::ffi::OsString>)>);
+    impl EnvironmentGuard {
+        fn set(values: &[(&str, &str)]) -> Self {
+            Self(
+                values
+                    .iter()
+                    .map(|(name, value)| {
+                        let prior = std::env::var_os(name);
+                        std::env::set_var(name, value);
+                        ((*name).into(), prior)
+                    })
+                    .collect(),
+            )
+        }
+    }
+    impl Drop for EnvironmentGuard {
+        fn drop(&mut self) {
+            for (name, prior) in &self.0 {
+                if let Some(value) = prior {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
+
+    #[serial_test::serial(cwd_env)]
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain fixture storage and runtime owners through the complete grant revocation and authorization assertions"
+    )]
+    async fn current_worker_grant_changes_named_readiness_but_details_require_config_authority(
+    ) -> anyhow::Result<()> {
+        use elephant_storage::space_grant_repository::SpaceGrantRepository;
+        use elephant_types::space_grant::SpaceGrant;
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        let storage = StorageClient::new_embedded().await?;
+        let reference = format!("RECALL_TEST_LOCAL_{}", uuid::Uuid::new_v4().simple());
+        let mut bindings = serde_json::Map::new();
+        for operation in [
+            "query_embedding",
+            "document_embedding",
+            "extraction",
+            "support_verification",
+        ] {
+            bindings.insert(operation.into(), json!({"id":operation,"profile_id":if operation.ends_with("embedding") {"embedding"} else {"generation"},"revoked":false}));
+        }
+        let config: SpaceConfig = serde_json::from_value(json!({
+            "id":RecordId::new_v4(TableName::SpaceConfig), "space_id":"alpha",
+            "created_at":chrono::Utc::now(), "updated_at":chrono::Utc::now(), "created_by":"operator",
+            "security":{"policy_id":"default","level":0,"labels":[],"handling":[]},
+            "provenance":{}, "subjects":[], "subjects_state":"complete",
+            "embedding_provider":"openai", "embedding_model":"fixture", "embedding_dims":3,
+            "purpose":null, "skill":null,
+            "processing":{"generation":1,"index_generation":0,"policy_id":"operator-approved",
+                "connections":{"remote":{"id":"remote","provider":"openai","account_id":"fixture",
+                    "endpoint":"https://example.test/v1","credential_ref":reference,"credential_generation":1,"revoked":false}},
+                "profiles":{
+                    "embedding":{"id":"embedding","connection_id":"remote","model":"fixture","model_version":"v1","dimensions":3,"preprocessing":"text-v1"},
+                    "generation":{"id":"generation","connection_id":"remote","model":"fixture","model_version":"v1","dimensions":null,"preprocessing":"text-v1"}},
+                "bindings":bindings,"active_embedding_profile_id":"embedding","pending_reindex":null}
+        }))?;
+        SpaceConfigRepository::new(storage.clone())
+            .create(config)
+            .await?;
+        let auth = crate::auth::AuthConfig {
+            secret: "synthetic-space-status-test-secret-value".into(),
+            algorithm: jsonwebtoken::Algorithm::HS256,
+            audience: None,
+            issuer: None,
+            skip_auth: false,
+        };
+        let claims: crate::auth::Claims = serde_json::from_value(
+            json!({"sub":"private-worker", "iat":chrono::Utc::now().timestamp(),"exp":chrono::Utc::now().timestamp()+600,"space_id":"alpha","spaces":["alpha"],"scopes":["read:entity","read:predicate","read:doc:metadata","read:doc:raw","read:source"]}),
+        )?;
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(auth.secret.as_bytes()),
+        )?;
+        let _environment = EnvironmentGuard::set(&[
+            ("MCP_BEARER_TOKEN", &token),
+            (&reference, "synthetic-provider-value-never-dispatched"),
+        ]);
+        let grants = SpaceGrantRepository::new(storage.clone());
+        let mut grant = grants
+            .replace(
+                SpaceGrant {
+                    space_id: "alpha".into(),
+                    subject: claims.sub.clone(),
+                    generation: String::new(),
+                    active: true,
+                    scopes: claims.scopes.iter().cloned().collect(),
+                    updated_by: "operator".into(),
+                    updated_at: chrono::Utc::now(),
+                },
+                None,
+            )
+            .await?;
+        let runtime = Arc::new(RuntimeManager::new_with_storage_for_tests(storage.clone()));
+        runtime.require_workers_for_tests().await;
+        runtime
+            .record_listener_address("0.0.0.0:3000".parse()?)
+            .await;
+        let state = Arc::new(
+            SpaceStatusState::new(storage, runtime, Arc::new(AuthzService::new()))
+                .with_worker_auth(Arc::new(auth)),
+        );
+        let reader = Principal {
+            subject: "status-reader".into(),
+            space_id: Some("alpha".into()),
+            scopes: vec!["read:status".into()],
+            ..Principal::default()
+        };
+        let (code, Json(body)) = status(
+            State(state.clone()),
+            Extension(reader.clone()),
+            Path("alpha".into()),
+        )
+        .await?;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["semantic_ingest_ready"], true);
+        assert!(body.get("setup_diagnostics").is_none());
+        grant.active = false;
+        let generation = grant.generation.clone();
+        grants.replace(grant, Some(&generation)).await?;
+        let (code, Json(body)) = status(
+            State(state.clone()),
+            Extension(reader.clone()),
+            Path("alpha".into()),
+        )
+        .await?;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["semantic_ingest_ready"], false);
+        assert!(body.get("setup_diagnostics").is_none());
+        assert!(!body.to_string().contains("private-worker"));
+        let mut operator = reader;
+        operator.scopes.push("read:space_config".into());
+        let (code, Json(body)) = status(
+            State(state.clone()),
+            Extension(operator.clone()),
+            Path("alpha".into()),
+        )
+        .await?;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body["setup_diagnostics"][0]["code"],
+            "extractor_current_grant_missing"
+        );
+        assert!(!body.to_string().contains(&token));
+        assert!(!body.to_string().contains("private-worker"));
+        assert!(
+            status(State(state), Extension(operator), Path("beta".into()))
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     #[expect(
@@ -307,6 +500,7 @@ mod tests {
         )
         .await?;
         assert!(status_only.get("embedding_execution_recipes").is_none());
+        assert!(status_only.get("setup_diagnostics").is_none());
         assert!(!status_only.to_string().contains("example.test"));
         ordinary.scopes.push("read:space_config".into());
         let (_, Json(authorized)) = status(

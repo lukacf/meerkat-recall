@@ -35,7 +35,7 @@ COPY docs/architecture/living-wiki.mdx docs/architecture/living-wiki.mdx
 RUN python3 vendor/verify_recall_surrealdb.py
 RUN --mount=type=cache,id=${RECALL_BUILD_CACHE_ID},target=/root/.cache/rust-workspaces,sharing=locked \
     test -n "$SOURCE_COMMIT" && test -n "$SOURCE_TREE" && test -n "$SOURCE_SHA256" \
-    && test "$CARGO_BUILD_JOBS" -ge 1 && test "$CARGO_BUILD_JOBS" -le 16 \
+    && test "$CARGO_BUILD_JOBS" -ge 1 && test "$CARGO_BUILD_JOBS" -le 32 \
     && test -z "${ORT_LIB_PATH:-}${ORT_LIB_LOCATION:-}${ORT_PREFER_DYNAMIC_LINK:-}${ORT_IOS_XCFWK_PATH:-}${ORT_IOS_XCFWK_LOCATION:-}" \
     && mkdir /out \
     && ./scripts/repo-cargo --print-env > /out/cargo-env \
@@ -82,6 +82,7 @@ ARG SOURCE_TREE=unversioned-development
 ARG SOURCE_SHA256=unversioned-development
 LABEL org.opencontainers.image.title="Meerkat Recall" \
       org.opencontainers.image.source="https://github.com/lukacf/meerkat-recall" \
+      org.opencontainers.image.licenses="(MIT OR Apache-2.0) AND BUSL-1.1" \
       org.opencontainers.image.revision="$SOURCE_COMMIT" \
       org.meerkat.recall.source-tree="$SOURCE_TREE" \
       org.meerkat.recall.source-tar-sha256="$SOURCE_SHA256"
@@ -95,6 +96,8 @@ RUN case "$RUNTIME_IMAGE" in *@sha256:*) ;; *) exit 1 ;; esac \
     && mkdir -p /var/lib/meerkat-recall/data /var/lib/meerkat-recall/recovery /var/lib/meerkat-recall/backups /var/lib/meerkat-recall/model-cache /var/lib/meerkat-recall/model-assets \
     && chown -R 10001:10001 /var/lib/meerkat-recall
 COPY --from=builder /out/meerkat-recall /usr/local/bin/meerkat-recall
+COPY --chmod=0755 packaging/recall-container/entrypoint.sh /usr/local/bin/recall-entrypoint
+COPY --chmod=0755 packaging/recall-container/readiness.sh /usr/local/bin/recall-readiness
 RUN ln -s meerkat-recall /usr/local/bin/elephant
 COPY --from=builder /out/provenance.json /usr/share/meerkat-recall/provenance.json
 RUN ldd /usr/local/bin/meerkat-recall > /usr/share/meerkat-recall/runtime-dependencies.txt \
@@ -130,6 +133,7 @@ ENV RUST_LOG=info ELEPHANT_HOST=0.0.0.0 ELEPHANT_PORT=3000 \
     FASTEMBED_CACHE_DIR=/var/lib/meerkat-recall/model-cache
 EXPOSE 3000
 STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/recall-entrypoint"]
 # Liveness only. Authenticated readiness belongs in the service-manager probe.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl --fail --silent --max-time 4 http://127.0.0.1:3000/v1/health > /dev/null || exit 1

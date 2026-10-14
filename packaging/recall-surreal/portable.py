@@ -41,12 +41,23 @@ def cache_identity(source: Path, provenance: dict) -> str:
         "target": "x86_64-unknown-linux-gnu", "profile": "release",
         "package": "surreal", "default_features": True,
     }
+    if os.environ.get('RECALL_BUILD_RESOURCE_MODE') == 'current-capacity':
+        compiler_recipe = (source / '.recall/Dockerfile.build').read_text().split('WORKDIR /source', 1)[0]
+        graph = {'rust_toolchain': provenance['rust_toolchain'], 'target': 'x86_64-unknown-linux-gnu',
+                 'profile': 'release', 'package': 'surreal', 'default_features': True,
+                 'inputs': json.loads((source / '.recall/container-inputs.lock.json').read_text()),
+                 'wrapper_sha256': prepare.digest(source / '.recall/repo-cargo'),
+                 'native_environment': {'LZMA_API_STATIC': '1'},
+                 'compiler_recipe_sha256': hashlib.sha256(compiler_recipe.encode()).hexdigest(),
+                 'profile_config': __import__('tomllib').loads((source / 'Cargo.toml').read_text()).get('profile', {})}
     return "recall-paired-" + hashlib.sha256(json.dumps(graph, sort_keys=True).encode()).hexdigest()
 
 
 def run_build(command: list[str], budget) -> None:
     budget.check()
-    process = subprocess.Popen(command, start_new_session=True)
+    current = os.environ.get('RECALL_BUILD_RESOURCE_MODE') == 'current-capacity'
+    environment = budget.build_environment() if current else None
+    process = subprocess.Popen(command, start_new_session=True, env=environment)
     try:
         while process.poll() is None:
             budget.check()
@@ -61,6 +72,9 @@ def run_build(command: list[str], budget) -> None:
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
+        if current:
+            source = next(value.split('=', 1)[1] for value in command if value.startswith('RECALL_SOURCE_COMMIT='))
+            budget.confirm_build_terminal(source)
     budget.check()
 
 
@@ -96,18 +110,19 @@ def build_portable(root: Path, source: Path, bundle: Path, tag: str) -> dict:
         raise ValueError("paired output must be a new bundle directory")
     budget_path = os.environ.get("RECALL_ARTIFACT_BUDGET_FILE")
     if not budget_path or not Path(budget_path).is_absolute():
-        raise ValueError("use the same required absolute RECALL_ARTIFACT_BUDGET_FILE as Recall's build")
+        raise ValueError("set absolute RECALL_ARTIFACT_BUDGET_FILE: fresh paired receipt in current-capacity; shared with Recall in legacy mode")
     jobs, minimum, allocation = helper.build_limits()
     docker_root = Path(subprocess.check_output(
         ["docker", "info", "--format", "{{.DockerRootDir}}"], text=True).strip())
     bundle.parent.mkdir(parents=True, exist_ok=True)
-    budget = helper.ResourceBudget(Path(budget_path),
+    budget = helper.resource_monitor(Path(budget_path),
         (root, source, docker_root, bundle.parent, Path(tempfile.gettempdir())), minimum, allocation)
     budget.check()
     cache = cache_identity(source, provenance)
     # The host ledger covers both artifacts. Keep the paired compiler's
     # independent, narrower growth ceiling when the shared allowance is larger.
-    paired_growth = min(allocation, build.MAX_GROWTH_BYTES)
+    paired_growth = (build.MAX_GROWTH_BYTES if helper.resource_mode() == 'current-capacity'
+                     else min(allocation, build.MAX_GROWTH_BYTES))
     with tempfile.TemporaryDirectory(prefix="recall-paired-build-") as temporary:
         scratch = Path(temporary)
         command = ["docker", "buildx", "build", "--platform", "linux/amd64",
@@ -116,13 +131,15 @@ def build_portable(root: Path, source: Path, bundle: Path, tag: str) -> dict:
         for key, value in [("BUILDER_IMAGE", inputs["builder"]["image"]),
                            ("RECALL_SOURCE_COMMIT", identity["source_commit"]),
                            ("RECALL_PAIRED_CACHE_ID", cache), ("CARGO_BUILD_JOBS", str(jobs)),
-                           ("RECALL_PAIRED_MAX_GROWTH_GIB", str(paired_growth // 1024**3))]:
+                           ("RECALL_PAIRED_MAX_GROWTH_GIB", str(paired_growth // 1024**3)),
+                           ("RECALL_BUILD_RESOURCE_MODE", helper.resource_mode())]:
             command.extend(["--build-arg", f"{key}={value}"])
         command.append(str(source))
         run_build(command, budget)
         receipt = validate_bundle(source, bundle, inputs, helper.artifact)
         runtime_command = ["docker", "buildx", "build", "--platform", "linux/amd64", "--load",
             "--file", str(HERE / "Dockerfile"), "--build-arg", f"RUNTIME_IMAGE={inputs['runtime']['image']}",
+            "--build-arg", f"RECALL_SOURCE_COMMIT={identity['source_commit']}",
             "--tag", tag, "--iidfile", str(scratch / "image-id"),
             "--metadata-file", str(scratch / "runtime.json"), str(bundle)]
         run_build(runtime_command, budget)

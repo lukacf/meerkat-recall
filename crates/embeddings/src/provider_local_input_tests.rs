@@ -89,12 +89,16 @@ fn v1_counts_actual_special_tokens_and_refuses_original_overflow() {
     assert_eq!(accepted.len(), 1);
     assert_eq!(accepted[0].0.text, "a b c d");
     assert_eq!(accepted[0].1, 6);
-    assert!(
-        local_segments(&[original.into()], Preprocessing::Exact, limit, |text| Ok(
-            tokenizer.encode(text, true).unwrap().len()
-        ))
-        .is_err()
-    );
+    let error = local_segments(&[original.into()], Preprocessing::Exact, limit, |text| {
+        Ok(tokenizer.encode(text, true).unwrap().len())
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        super::EmbeddingError::InputTooLarge {
+            preprocessing: "text-v1"
+        }
+    ));
 }
 
 #[test]

@@ -266,7 +266,7 @@ def prepare(recall: Path, expected_commit: str, archive: Path, output: Path, dow
         # Reuse the release lane's reviewed ELF/ABI authority, not a second parser.
         for name in ("artifact.py", "container-inputs.lock.json"):
             shutil.copy2(recall / "scripts/release" / name, stage / ".recall" / name)
-        for name in ("build.py", "prepare.py", "Dockerfile.build"):
+        for name in ("build.py", "prepare.py", "Dockerfile.build", "entrypoint.sh"):
             shutil.copy2(HERE / name, stage / ".recall" / name)
         receipt = {
             "format": 1, "status": "source_prepared_unbuilt_unqualified",

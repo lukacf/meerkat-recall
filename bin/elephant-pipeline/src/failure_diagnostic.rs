@@ -32,6 +32,9 @@ impl FailureDiagnostic {
     fn from_pipeline(error: &PipelineError) -> Self {
         match error {
             PipelineError::ExtractionError(message) => Self::extraction(message),
+            PipelineError::ExtractionFailure { stage, code, .. } => {
+                Self::new("extraction", stage, code)
+            }
             PipelineError::ConfigError(message) => {
                 if message.starts_with("provider_authorization: ") {
                     Self::new(
@@ -76,6 +79,9 @@ impl FailureDiagnostic {
             },
             PipelineError::StorageError(_) => Self::new("storage", "storage", "storage_error"),
             PipelineError::OutboxError(_) => Self::new("outbox", "outbox", "outbox_error"),
+            PipelineError::EmbeddingError(elephant_embeddings::EmbeddingError::InputTooLarge {
+                ..
+            }) => Self::new("embedding", "embedding", "embedding_input_too_large"),
             PipelineError::EmbeddingError(_) => {
                 Self::new("embedding", "embedding", "embedding_error")
             }
@@ -147,8 +153,31 @@ impl FailureDiagnostic {
         Self::new("extraction", "extractor", "extraction_error")
     }
 
+    pub(super) fn action(self) -> &'static str {
+        match self.code {
+            "embedding_input_too_large" => "Create a new text-full-v2 embedding profile, reindex and activate it before resubmitting; do not relabel existing vectors.",
+            "provider_context_limit" | "provider_request_too_large" => "Check the selected model input limit and extraction input size.",
+            "output_token_limit" | "output_empty" | "structured_output_invalid" | "provider_response_incomplete" => "Check the selected model output limit and structured extraction settings.",
+            "extraction_budget_exceeded" | "token_budget_exceeded" | "time_budget_exceeded" | "tool_budget_exceeded" | "turn_limit" => "Check the extraction budget and input size before starting a new attempt.",
+            "provider_quota_exhausted" => "Check the provider account quota or billing limit.",
+            "provider_authentication" | "provider_client_setup" => "Check the selected provider connection and credential configuration; never put credentials in logs.",
+            "provider_model_invalid" | "provider_request_invalid" => "Check the configured model and supported request parameters.",
+            "mcp_connect" | "mcp_transport" | "mcp_setup" | "tool_setup" | "tool_execution" => "Check extractor MCP endpoint, required tools and current named-space worker grants.",
+            "provider_operation_refused" | "provider_authority_unavailable" | "provider_route_changed" => "Check the current named-space provider binding and operation authority.",
+            "provider_observation_unavailable" => "Check protected usage observation before resubmitting.",
+            "content_filtered" | "provider_policy_stop" | "hook_denied" => "Review the provider or hook policy refusal; do not retry to bypass it.",
+            "provider_rate_limit" | "provider_server_error" | "provider_connection_reset" | "provider_network_timeout" | "provider_call_timeout" | "provider_stream_stalled" | "provider_retries_exhausted" => "Check provider availability and retained attempt disposition before resubmitting.",
+            _ => "Inspect the authorized work-run diagnostic and configuration for this stage.",
+        }
+    }
+
+    /// This summary contains only fixed diagnostic fields, never nested error text.
+    pub(super) fn summary(self) -> String {
+        format!("{} failed: {}. {}", self.stage, self.code, self.action())
+    }
+
     pub(super) fn as_json(self) -> serde_json::Value {
-        serde_json::json!({ "version": 1, "kind": self.kind, "stage": self.stage, "code": self.code })
+        serde_json::json!({ "version": 1, "kind": self.kind, "stage": self.stage, "code": self.code, "action": self.action() })
     }
 }
 
@@ -204,6 +233,37 @@ mod tests {
             .as_json()
             .to_string()
             .contains("SYNTHETIC_SECRET"));
+    }
+
+    #[test]
+    fn typed_sdk_and_embedding_causes_have_safe_actionable_summaries() {
+        for (error, expected) in [
+            (
+                PipelineError::ExtractionFailure {
+                    stage: "agent_run",
+                    code: "output_token_limit",
+                    detail: "SYNTHETIC_SECRET PRIVATE_SOURCE https://private.invalid".into(),
+                },
+                "output_token_limit",
+            ),
+            (
+                PipelineError::EmbeddingError(elephant_embeddings::EmbeddingError::InputTooLarge {
+                    preprocessing: "text-v1",
+                }),
+                "embedding_input_too_large",
+            ),
+        ] {
+            let error = anyhow::Error::new(error).context("extract_assertions failed");
+            let diagnostic = FailureDiagnostic::from_error(&error);
+            assert_eq!(diagnostic.code, expected);
+            assert!(diagnostic.summary().contains(expected));
+            assert_eq!(diagnostic.as_json()["action"], diagnostic.action());
+            for output in [diagnostic.summary(), diagnostic.as_json().to_string()] {
+                for private in ["SYNTHETIC_SECRET", "PRIVATE_SOURCE", "private.invalid"] {
+                    assert!(!output.contains(private));
+                }
+            }
+        }
     }
 
     #[test]

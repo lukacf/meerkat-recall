@@ -12,7 +12,8 @@ lifecycle; Recall adds shared, evidence-backed knowledge. It is an optional,
 independently released component. See the
 [Meerkat introduction](https://docs.rkat.ai/introduction) to choose your starting point.
 
-Recall 0.9.0 is available with the Meerkat 0.9.0 SDK.
+This branch targets Recall 0.9.1 with the Meerkat 0.9.0 SDK.
+The latest published release is Recall 0.9.0.
 Download the [v0.9.0 release](https://github.com/lukacf/meerkat-recall/releases/tag/v0.9.0).
 Find source, native downloads, supported platforms and known limits in the
 [release notes](https://github.com/lukacf/meerkat-recall/releases).

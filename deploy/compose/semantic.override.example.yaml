@@ -1,0 +1,7 @@
+# Copy to compose.override.yaml only after provisioning files and current grants.
+services:
+  recall:
+    environment:
+      MCP_BEARER_TOKEN_FILE: /var/lib/meerkat-recall/extractor.token
+      ANTHROPIC_API_KEY_FILE: /var/lib/meerkat-recall/provider-key
+      PIPELINE_AGENTIC_MCP_SPACE_ID: research

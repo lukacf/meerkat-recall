@@ -29,8 +29,10 @@ xtask = "run -p xtask --"
 # Integration tests only
 integration = "test --workspace -- --ignored"
 
-# Deterministic E2E gate. Paid live LLM scenarios are explicitly opt-in.
-test-e2e = "test --workspace --all-features -- --ignored --skip live_llm --skip real_llm --skip real_example --skip calibrate_"
+# Deterministic E2E gate. Model-resource regression has its own provisioned lane.
+# Paid live LLM and real-media scenarios remain explicitly opt-in.
+test-e2e = "test --workspace --all-features -- --ignored --skip live_llm --skip real_llm --skip real_example --skip calibrate_ --skip provider_dispatch::local_resource_tests::"
+test-e2e-model = "test -p elephant-pipeline --all-features --features elephant-embeddings/fastembed provider_dispatch::local_resource_tests::fresh_contexts_reuse_actual_model_constructor_and_keep_request_receipts_separate -- --ignored --exact --nocapture --test-threads=1"
 test-e2e-live = "test -p elephant-e2e live_llm -- --ignored --nocapture --test-threads=1"
 
 # Run specific test binary

@@ -5264,17 +5264,9 @@ async fn execute_work_item_with_extractor(
                 .map_err(|e| anyhow::Error::new(e).context("triage_source failed"))?
             };
             if publication.is_some() && triage_result.was_downgraded {
-                return Err(WorkFailure {
-                    class: FailureClass::ConfigurationBlocked,
-                    message: format!(
-                        "Accepted source mode awaits budget: {}",
-                        triage_result
-                            .downgrade_reason
-                            .as_deref()
-                            .unwrap_or("budget unavailable")
-                    ),
-                }
-                .into());
+                return Err(PipelineError::BudgetExceeded(
+                    triage_result.downgrade_reason.unwrap_or_else(|| "budget unavailable".into()),
+                ).into());
             }
 
             if publication.is_some() {
@@ -5467,17 +5459,9 @@ async fn execute_work_item_with_extractor(
 
             if !upgrade.allowed {
                 if publication.is_some() {
-                    return Err(WorkFailure {
-                        class: FailureClass::ConfigurationBlocked,
-                        message: format!(
-                            "Accepted source upgrade awaits budget: {}",
-                            upgrade
-                                .denied_reason
-                                .as_deref()
-                                .unwrap_or("budget unavailable")
-                        ),
-                    }
-                    .into());
+                    return Err(PipelineError::BudgetExceeded(
+                        upgrade.denied_reason.unwrap_or_else(|| "budget unavailable".into()),
+                    ).into());
                 }
                 return Ok(metrics);
             }
@@ -7259,7 +7243,10 @@ async fn run_work_queue_loop(
                                         ).await {
                                             warn!(%error, "Original failed disposition remains pending lease recovery");
                                         } else {
+                                            let diagnostic = failure_diagnostic::FailureDiagnostic::from_error(&err);
                                             warn!(work_item = %item.base.id, kind = %item.kind, error = %err,
+                                                failure_kind = diagnostic.kind, failure_stage = diagnostic.stage,
+                                                failure_code = diagnostic.code, failure_action = diagnostic.action(),
                                                 ?class, ?action, "Recorded failed work attempt");
                                         }
                                     }

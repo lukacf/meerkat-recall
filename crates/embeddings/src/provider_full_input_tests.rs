@@ -623,8 +623,74 @@ async fn sdk_text_v1_sends_the_entire_original_and_refuses_destructive_prefix_re
     let result = tokio::time::timeout(DEADLINE, provider(&server, "text-v1", 2).embed(&[original]))
         .await
         .unwrap();
-    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(matches!(
+        error,
+        EmbeddingError::InputTooLarge {
+            preprocessing: "text-v1"
+        }
+    ));
+    assert!(error
+        .to_string()
+        .contains("new text-full-v2 embedding profile"));
     assert_eq!(server.finish().await.len(), 1);
+}
+
+#[tokio::test]
+async fn sdk_full_input_handles_long_document_and_unbroken_run_without_losing_tail() {
+    // Synthetic reproduction of HomeCore's reported size/shape, no household
+    // text. The loopback limit models provider refusal, not a tokenizer estimate.
+    let original = "a ".repeat(10_848) + &"x".repeat(950) + "TAIL!";
+    assert_eq!(original.chars().count(), 22_651);
+    let server = Server::start(Arc::new(|_, inputs| {
+        if let Some(index) = inputs.iter().position(|input| input.chars().count() > 8192) {
+            return size_error(index);
+        }
+        success(
+            inputs
+                .iter()
+                .map(|input| {
+                    if input.ends_with("TAIL!") {
+                        vec![0.0, 1.0]
+                    } else {
+                        vec![1.0, 0.0]
+                    }
+                })
+                .collect(),
+        )
+    }))
+    .await;
+    let rejected = provider(&server, "text-v1", 100)
+        .embed(std::slice::from_ref(&original))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        rejected,
+        EmbeddingError::InputTooLarge {
+            preprocessing: "text-v1"
+        }
+    ));
+    let vectors = tokio::time::timeout(
+        DEADLINE,
+        provider(&server, "text-full-v2", 100).embed(std::slice::from_ref(&original)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let calls = server.finish().await;
+    assert_eq!(
+        calls.len(),
+        2,
+        "one exact refusal followed by one explicitly selected v2 request"
+    );
+    assert_eq!(calls[0], vec![original.clone()]);
+    assert_eq!(calls[1].concat(), original);
+    assert_eq!(calls[1].len(), 12);
+    assert_eq!(calls[1].last().unwrap().len(), 123);
+    // Independent complete byte-weighted pooling: the final 123 bytes must
+    // contribute to the returned vector, despite their position after the limit.
+    let norm = 22_528_f64.hypot(123_f64);
+    close(&vectors[0], &[22_528.0 / norm, 123.0 / norm]);
 }
 
 #[derive(Debug)]

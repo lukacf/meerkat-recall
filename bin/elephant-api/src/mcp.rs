@@ -324,6 +324,7 @@ fn runtime_patch_schema() -> Arc<serde_json::Map<String, Value>> {
             "extractor_provider": {"type": "string"},
             "extractor_required": {"type": "boolean"},
             "extractor_mcp_url": {"type": "string"},
+            "extractor_readiness_space_id": {"type": "string", "description": "Optional MCP discovery space; empty clears selection. Extraction uses each document space."},
             "extractor_model": {"type": "string"},
             "extractor_timeout_secs": {"type": "integer", "minimum": 1},
             "multimodal_model": {"type": "string"},
@@ -2121,6 +2122,7 @@ mod tests {
             extractor_ready: false,
             semantic_ingest_ready: false,
             conveyor: None,
+            setup_diagnostics: Vec::new(),
             issues: vec![],
         };
         for mode in [RuntimeMode::ReadOnly, RuntimeMode::LocalMemory] {

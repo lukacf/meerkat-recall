@@ -7,7 +7,9 @@ ARG RECALL_SOURCE_COMMIT
 ARG RECALL_PAIRED_CACHE_ID
 ARG CARGO_BUILD_JOBS=8
 ARG RECALL_PAIRED_MAX_GROWTH_GIB=150
-ENV RECALL_PAIRED_BUILDER_IMAGE=${BUILDER_IMAGE} \
+ARG RECALL_BUILD_RESOURCE_MODE=legacy-allocation
+ENV RECALL_BUILD_RESOURCE_MODE=${RECALL_BUILD_RESOURCE_MODE} \
+    RECALL_PAIRED_BUILDER_IMAGE=${BUILDER_IMAGE} \
     CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} \
     RECALL_PAIRED_MAX_GROWTH_GIB=${RECALL_PAIRED_MAX_GROWTH_GIB} \
     CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
@@ -21,7 +23,7 @@ RUN test "$(dpkg --print-architecture)" = amd64 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /source
 COPY . .
-# A distinct paired-only cache for this reviewed source, never Recall's target.
+# A distinct paired-only compatible cache, never Recall's target.
 RUN --mount=type=cache,id=${RECALL_PAIRED_CACHE_ID},target=/root/.cache/rust-workspaces,sharing=locked \
     test -n "$RECALL_PAIRED_CACHE_ID" \
     && RECALL_SOURCE_COMMIT="$RECALL_SOURCE_COMMIT" python3 -c \

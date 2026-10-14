@@ -13,7 +13,7 @@ HOOK_UNIT_ENV ?= RUST_LANE_ID=hook-unit
 HOOK_FULL_ENV ?= RUST_LANE_ID=hook-full
 HOOK_LINT_ENV ?= RUST_LANE_ID=hook-clippy
 
-.PHONY: all build release test test-unit test-all hook-test hook-test-all hook-lint test-e2e test-integration test-scenarios lint fmt fmt-check audit audit-alt ci ci-smoke clean doc docs-check doc-open coverage check verify-surface verify-version verify-version-parity release-preflight publish-dry-run install-hooks uninstall-hooks pre-commit-all update outdated bench cargo-bench run-api run-pipeline xtask help
+.PHONY: all build release test test-unit test-all hook-test hook-test-all hook-lint test-e2e test-e2e-model test-integration test-scenarios lint fmt fmt-check audit audit-alt ci ci-smoke clean doc docs-check doc-open coverage check verify-surface verify-version verify-version-parity release-preflight publish-dry-run install-hooks uninstall-hooks pre-commit-all update outdated bench cargo-bench run-api run-pipeline xtask help
 
 all: ci
 
@@ -60,6 +60,10 @@ hook-test-all:
 	else \
 		$(HOOK_FULL_ENV) $(HOOK_CARGO) test --workspace --all-features $(NEXTEST_ARGS); \
 	fi
+
+test-e2e-model:
+	@echo "$(GREEN)Running explicitly provisioned local-model regression...$(NC)"
+	$(CARGO) test-e2e-model
 
 test-e2e:
 	@echo "$(GREEN)Running E2E tests...$(NC)"
@@ -213,7 +217,8 @@ help:
 	@echo "  $(GREEN)test$(NC)               - Run fast nextest lane"
 	@echo "  $(GREEN)test-unit$(NC)          - Run workspace unit tests"
 	@echo "  $(GREEN)test-all$(NC)           - Run full workspace all-features suite"
-	@echo "  $(GREEN)test-e2e$(NC)           - Run E2E tests"
+	@echo "  $(GREEN)test-e2e$(NC)           - Run deterministic E2E tests"
+	@echo "  $(GREEN)test-e2e-model$(NC)     - Run the explicitly provisioned local-model regression"
 	@echo "  $(GREEN)test-integration$(NC)   - Run ignored integration tests"
 	@echo "  $(GREEN)test-scenarios$(NC)     - Run scenario tests"
 	@echo "  $(GREEN)coverage$(NC)           - Generate test coverage report"

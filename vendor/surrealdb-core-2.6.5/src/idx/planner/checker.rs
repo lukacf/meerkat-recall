@@ -51,6 +51,33 @@ impl<'a> HnswConditionChecker<'a> {
 		}
 	}
 
+	/// Filter each row before it consumes the result budget. Identical vectors
+	/// share an HNSW element, but their records need not share a space or policy.
+	pub(in crate::idx) async fn filter_truthy(
+		&mut self,
+		tx: &Transaction,
+		stk: &mut Stk,
+		docs: &HnswDocs,
+		doc_ids: Ids64,
+	) -> Result<Ids64, Error> {
+		let Self::HnswCondition(c) = self else {
+			return Ok(doc_ids);
+		};
+		let mut accepted = roaring::RoaringTreemap::new();
+		for doc_id in doc_ids.iter() {
+			if c.check_any_truthy(tx, stk, docs, Ids64::One(doc_id))
+				.await?
+			{
+				accepted.insert(doc_id);
+			}
+		}
+		Ok(if accepted.is_empty() {
+			Ids64::Empty
+		} else {
+			Ids64::Bits(accepted)
+		})
+	}
+
 	pub(in crate::idx) fn expire(&mut self, doc_id: u64) {
 		if let Self::HnswCondition(c) = self {
 			c.expire(doc_id)

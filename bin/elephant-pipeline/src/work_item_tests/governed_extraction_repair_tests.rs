@@ -2097,7 +2097,7 @@ async fn token_or_time_exhausted_case(context: RepairCase) {
     assert!(
         error.chain().any(|cause| matches!(
             cause.downcast_ref::<PipelineError>(),
-            Some(PipelineError::ExtractionError(message))
+            Some(PipelineError::ExtractionFailure { code: "extraction_budget_exceeded", detail: message, .. })
                 if message == "Extraction agent terminated: BudgetExhausted"
         )),
         "the actual SDK budget terminal must cause this refusal: {error:#}"

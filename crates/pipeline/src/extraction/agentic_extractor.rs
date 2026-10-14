@@ -25,6 +25,7 @@ use elephant_types::records::doc_revision::DocRevision;
 use elephant_types::records::work::{Determinism, PluginManifest, RetryPolicy};
 use elephant_types::{Link, RecordId};
 
+use super::failure;
 use super::{ExtractionBudget, ExtractionContext, ExtractionResult, Extractor, RawAssertion};
 use crate::error::PipelineError;
 #[cfg(feature = "meerkat-extraction")]
@@ -128,6 +129,8 @@ pub struct AgenticExtractorConfig {
     pub budget: ExtractionBudget,
     /// Whether to connect to MCP during initialization.
     pub connect_on_init: bool,
+    /// Optional space for discovery; extraction always selects its own context space.
+    pub readiness_space_id: Option<String>,
 }
 
 impl AgenticExtractorConfig {
@@ -139,6 +142,7 @@ impl AgenticExtractorConfig {
             model: model.into(),
             budget: ExtractionBudget::default(),
             connect_on_init: true,
+            readiness_space_id: std::env::var("PIPELINE_AGENTIC_MCP_SPACE_ID").ok(),
         }
     }
 
@@ -146,6 +150,13 @@ impl AgenticExtractorConfig {
     #[must_use]
     pub fn with_budget(mut self, budget: ExtractionBudget) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Select a discovery space without changing per-document extraction authority.
+    #[must_use]
+    pub fn with_readiness_space(mut self, space: Option<String>) -> Self {
+        self.readiness_space_id = space;
         self
     }
 
@@ -1160,19 +1171,17 @@ fn parse_agent_run_output(
     if let Some(structured) = structured_output {
         return match parse_structured_output(structured) {
             Ok(assertions) => Ok(assertions),
-            Err(e) => {
-                eprintln!(
-                    "[agentic] structured parse failed for model {model}: {e}\n  value preview: {}",
-                    &structured.to_string()[..structured.to_string().len().min(500)]
-                );
-                eprintln!(
-                    "[agentic] text preview for model {model}: {}",
-                    &text[..text.len().min(500)]
+            Err(_) => {
+                // Provider output and parser errors can contain document text.
+                tracing::warn!(
+                    failure_code = "structured_output_invalid",
+                    "Extraction output could not be parsed"
                 );
                 if text.trim().is_empty() {
-                    Err(PipelineError::ExtractionError(format!(
-                        "Model {model} produced unusable extraction output: structured output was present but could not be deserialized, and fallback text output was empty"
-                    )))
+                    Err(PipelineError::ExtractionFailure {
+                        stage: "structured_output", code: "structured_output_invalid",
+                        detail: format!("Model {model} produced unusable extraction output: structured output was present but could not be deserialized, and fallback text output was empty"),
+                    })
                 } else {
                     parse_llm_output_with_repair(text)
                 }
@@ -1181,9 +1190,10 @@ fn parse_agent_run_output(
     }
 
     if text.trim().is_empty() {
-        return Err(PipelineError::ExtractionError(format!(
-            "Model {model} produced unusable extraction output: structured output was absent and text output was empty"
-        )));
+        return Err(PipelineError::ExtractionFailure {
+            stage: "structured_output", code: "output_empty",
+            detail: format!("Model {model} produced unusable extraction output: structured output was absent and text output was empty"),
+        });
     }
 
     parse_llm_output_with_repair(text)
@@ -1192,8 +1202,10 @@ fn parse_agent_run_output(
 fn is_empty_agent_output_error(err: &PipelineError) -> bool {
     matches!(
         err,
-        PipelineError::ExtractionError(message)
-            if message.contains("structured output was absent and text output was empty")
+        PipelineError::ExtractionFailure {
+            code: "output_empty",
+            ..
+        }
     )
 }
 
@@ -1650,8 +1662,41 @@ fn llm_provider_error(message: impl Into<String>) -> LlmFailureReason {
     ))
 }
 
+// Keep discovery read-only. The remote server still verifies the signed space,
+// current grant and tool scopes; merely accepting an MCP session is insufficient.
+const REQUIRED_EXTRACTION_MCP_TOOLS: &[&str] = &[
+    "get_doc",
+    "get_doc_chunk",
+    "get_entity",
+    "search_entities",
+    "list_predicates",
+    "get_predicate",
+    "get_source",
+];
+
+fn extraction_tools_ready(names: impl Iterator<Item = impl AsRef<str>>) -> bool {
+    let names: std::collections::BTreeSet<String> =
+        names.map(|name| name.as_ref().to_owned()).collect();
+    REQUIRED_EXTRACTION_MCP_TOOLS
+        .iter()
+        .all(|name| names.contains(*name))
+}
+
+fn discovery_headers(
+    config: &AgenticExtractorConfig,
+) -> Result<HashMap<String, String>, PipelineError> {
+    let mut headers = mcp_headers_from_env();
+    if let Some(space) = &config.readiness_space_id {
+        elephant_types::validation::validate_space_id(space).map_err(|_| {
+            PipelineError::InvalidInput("Invalid extractor discovery space identifier".into())
+        })?;
+        headers.insert("X-Space-Id".into(), space.clone());
+    }
+    Ok(headers)
+}
+
 fn connect_mcp_on_init(config: &AgenticExtractorConfig) -> Result<(), PipelineError> {
-    let headers = mcp_headers_from_env();
+    let headers = discovery_headers(config)?;
     let server_config = McpServerConfig::streamable_http(
         "elephant-mcp-agent-init",
         config.mcp_url.clone(),
@@ -1877,15 +1922,21 @@ fn normalize_extracted_assertions(
 
 fn require_completed_extraction_run(result: &meerkat::RunResult) -> Result<(), PipelineError> {
     if let Some(cause) = result.terminal_cause_kind {
-        return Err(PipelineError::ExtractionError(format!(
-            "Extraction agent terminated: {cause:?}"
-        )));
+        return Err(PipelineError::ExtractionFailure {
+            stage: "agent_terminal",
+            code: failure::terminal_code(cause),
+            detail: format!("Extraction agent terminated: {cause:?}"),
+        });
     }
     if let Some(error) = &result.extraction_error {
-        return Err(PipelineError::ExtractionError(format!(
-            "Structured extraction failed after {} attempts: {}",
-            error.attempts, error.reason
-        )));
+        return Err(PipelineError::ExtractionFailure {
+            stage: "structured_output",
+            code: "structured_output_invalid",
+            detail: format!(
+                "Structured extraction failed after {} attempts: {}",
+                error.attempts, error.reason
+            ),
+        });
     }
     Ok(())
 }
@@ -2083,9 +2134,11 @@ impl AgenticExtractor {
                 boxed_extraction_phase(|| factory.build_agent(build, &verifier_config))
                     .await
                     .map_err(|error| {
-                        PipelineError::ExtractionError(format!(
-                            "Support verifier build failed: {error}"
-                        ))
+                        failure::build(
+                            "support_agent_build",
+                            "Support verifier build failed",
+                            &error,
+                        )
                     })?
             };
             let prompt = serde_json::to_string(batch)
@@ -2093,7 +2146,7 @@ impl AgenticExtractor {
             let result = boxed_extraction_phase(|| agent.run(ContentInput::Text(prompt)))
                 .await
                 .map_err(|error| {
-                    PipelineError::ExtractionError(format!("Support verifier failed: {error}"))
+                    failure::run("support_agent_run", "Support verifier failed", &error)
                 })?;
             require_completed_extraction_run(&result)?;
             if result.tool_calls != 0 {
@@ -2265,9 +2318,11 @@ impl AgenticExtractor {
                 boxed_extraction_phase(|| factory.build_agent(direct_build, &meerkat_config))
                     .await
                     .map_err(|e| {
-                        PipelineError::ExtractionError(format!(
-                            "Direct extraction agent build failed: {e}"
-                        ))
+                        failure::build(
+                            "direct_agent_build",
+                            "Direct extraction agent build failed",
+                            &e,
+                        )
                     })?;
             let agent_build_ms = agent_build_started.elapsed().as_millis();
 
@@ -2276,9 +2331,7 @@ impl AgenticExtractor {
                 boxed_extraction_phase(|| direct_agent.run(ContentInput::Text(direct_prompt)))
                     .await
                     .map_err(|e| {
-                        PipelineError::ExtractionError(format!(
-                            "Direct extraction agent run failed: {e}"
-                        ))
+                        failure::run("direct_agent_run", "Direct extraction agent run failed", &e)
                     })?;
             let run_ms = run_started.elapsed().as_millis();
             require_completed_extraction_run(&direct_result)?;
@@ -2394,7 +2447,7 @@ impl AgenticExtractor {
         let mut agent: DynAgent =
             boxed_extraction_phase(|| factory.build_agent(build, &meerkat_config))
                 .await
-                .map_err(|e| PipelineError::ExtractionError(format!("Agent build failed: {e}")))?;
+                .map_err(|e| failure::build("agent_build", "Agent build failed", &e))?;
         let agent_build_ms = agent_build_started.elapsed().as_millis();
 
         let content_input = boxed_extraction_phase(|| {
@@ -2409,7 +2462,7 @@ impl AgenticExtractor {
         let run_started = Instant::now();
         let run_result = boxed_extraction_phase(|| agent.run(content_input))
             .await
-            .map_err(|e| PipelineError::ExtractionError(format!("Agent run failed: {e}")))?;
+            .map_err(|e| failure::run("agent_run", "Agent run failed", &e))?;
         let run_ms = run_started.elapsed().as_millis();
         // Budget exhaustion is an Ok result with a machine-owned terminal
         // cause in Meerkat. Never retry it through the empty-output fallback.
@@ -2500,18 +2553,22 @@ impl AgenticExtractor {
                     boxed_extraction_phase(|| factory.build_agent(fallback_build, &meerkat_config))
                         .await
                         .map_err(|build_err| {
-                            PipelineError::ExtractionError(format!(
-                                "{err}; fallback agent build failed: {build_err}"
-                            ))
+                            failure::build(
+                                "fallback_agent_build",
+                                &format!("{err}; fallback agent build failed"),
+                                &build_err,
+                            )
                         })?;
                 let fallback_result = boxed_extraction_phase(|| {
                     fallback_agent.run(ContentInput::Text(fallback_prompt))
                 })
                 .await
                 .map_err(|run_err| {
-                    PipelineError::ExtractionError(format!(
-                        "{err}; fallback agent run failed: {run_err}"
-                    ))
+                    failure::run(
+                        "fallback_agent_run",
+                        &format!("{err}; fallback agent run failed"),
+                        &run_err,
+                    )
                 })?;
                 require_completed_extraction_run(&fallback_result)?;
                 fallback_tokens =
@@ -2799,7 +2856,7 @@ impl Extractor for AgenticExtractor {
     }
 
     async fn health_check(&self) -> Result<bool, PipelineError> {
-        let headers = mcp_headers_from_env();
+        let headers = discovery_headers(&self.config)?;
         let server_config = McpServerConfig::streamable_http(
             "elephant-mcp-health",
             self.config.mcp_url.clone(),
@@ -2818,7 +2875,10 @@ impl Extractor for AgenticExtractor {
             }
         };
 
-        let healthy = connection.list_tools("elephant-mcp-health").await.is_ok();
+        let healthy = connection
+            .list_tools("elephant-mcp-health")
+            .await
+            .is_ok_and(|tools| extraction_tools_ready(tools.iter().map(|tool| tool.name.as_str())));
         if let Err(err) = connection.close().await {
             tracing::debug!(
                 mcp_url = %self.config.mcp_url,
@@ -2840,6 +2900,48 @@ mod tests {
         unused_imports,
         dead_code
     )]
+
+    #[test]
+    fn readiness_rejects_status_only_or_missing_predicate_tools() {
+        assert!(!extraction_tools_ready(["get_runtime_status"].into_iter()));
+        assert!(extraction_tools_ready(REQUIRED_EXTRACTION_MCP_TOOLS.iter()));
+        for missing in REQUIRED_EXTRACTION_MCP_TOOLS {
+            assert!(!extraction_tools_ready(
+                REQUIRED_EXTRACTION_MCP_TOOLS
+                    .iter()
+                    .filter(|name| *name != missing)
+            ));
+        }
+    }
+
+    #[test]
+    fn discovery_space_is_explicit_and_does_not_change_extraction_context() {
+        let config = make_config().with_readiness_space(Some("alpha".into()));
+        assert_eq!(
+            discovery_headers(&config)
+                .unwrap()
+                .get("X-Space-Id")
+                .map(String::as_str),
+            Some("alpha")
+        );
+        let config = config.with_readiness_space(None);
+        assert!(!discovery_headers(&config)
+            .unwrap()
+            .contains_key("X-Space-Id"));
+        // Space identifiers preserve interior whitespace; reject only the
+        // existing contract's empty, edge-whitespace, control and byte bounds.
+        let config = config.with_readiness_space(Some("valid space".into()));
+        assert_eq!(
+            discovery_headers(&config).unwrap().get("X-Space-Id"),
+            Some(&"valid space".to_string())
+        );
+        for invalid in ["", " edge", "edge ", "control\nspace"] {
+            let config = config.clone().with_readiness_space(Some(invalid.into()));
+            assert!(discovery_headers(&config).is_err());
+        }
+        let config = config.with_readiness_space(Some("x".repeat(257)));
+        assert!(discovery_headers(&config).is_err());
+    }
 
     #[test]
     fn extraction_effort_defaults_low_for_openai_only() {
@@ -3070,7 +3172,7 @@ mod tests {
             .expect("support request deadline");
             let body = fixture.assert_request("assertion_support", 4_000).await;
             assert!(
-                matches!(&result, Err(PipelineError::ExtractionError(message))
+                matches!(&result, Err(PipelineError::ExtractionFailure { stage: "support_agent_run", detail: message, .. })
                     if message.starts_with("Support verifier failed:")),
                 "the captured HTTP refusal must fail the verifier run"
             );
@@ -3842,7 +3944,7 @@ mod tests {
             .expect("support request deadline");
             let body = fixture.assert_request("assertion_support", 4_000).await;
             assert!(
-                matches!(&result, Err(PipelineError::ExtractionError(message))
+                matches!(&result, Err(PipelineError::ExtractionFailure { stage: "support_agent_run", detail: message, .. })
                 if message.starts_with("Support verifier failed:"))
             );
             assert_eq!(unused_client.call_count(), 0);
@@ -3937,7 +4039,7 @@ mod tests {
             .expect("support request deadline");
             let body = fixture.assert_request("assertion_support", 4_000).await;
             assert!(
-                matches!(&result, Err(PipelineError::ExtractionError(message))
+                matches!(&result, Err(PipelineError::ExtractionFailure { stage: "support_agent_run", detail: message, .. })
                 if message.starts_with("Support verifier failed:"))
             );
             assert_eq!(unused_client.call_count(), 0);
@@ -4149,7 +4251,7 @@ mod tests {
             let result = extractor.run_agent(ctx, dispatcher, llm.clone()).await;
             assert!(matches!(
                 result,
-                Err(PipelineError::ExtractionError(ref message)) if message.contains("BudgetExhausted")
+                Err(PipelineError::ExtractionFailure { code: "extraction_budget_exceeded", detail: ref message, .. }) if message.contains("BudgetExhausted")
             ));
             assert_eq!(llm.call_count(), 1, "budget must stop a second model call");
         });
@@ -4215,7 +4317,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(PipelineError::ExtractionError(ref message))
+                Err(PipelineError::ExtractionFailure { code: "structured_output_invalid", detail: ref message, .. })
                     if message.contains("Structured extraction failed after 3 attempts")
             ));
             assert_eq!(llm.call_count(), 4, "all schema retries must be exhausted");
@@ -4358,7 +4460,11 @@ mod tests {
         let err = parse_agent_run_output("gemini-3.1-flash-lite-preview", None, "")
             .expect_err("empty unstructured result should fail");
         match err {
-            PipelineError::ExtractionError(message) => {
+            PipelineError::ExtractionFailure {
+                code: "output_empty",
+                detail: message,
+                ..
+            } => {
                 assert!(message.contains("gemini-3.1-flash-lite-preview"));
                 assert!(message.contains("structured output was absent"));
             }
@@ -4375,7 +4481,11 @@ mod tests {
         )
         .expect_err("unparseable structured result should fail when fallback text is empty");
         match err {
-            PipelineError::ExtractionError(message) => {
+            PipelineError::ExtractionFailure {
+                code: "structured_output_invalid",
+                detail: message,
+                ..
+            } => {
                 assert!(message.contains("gemini-3.1-flash-lite-preview"));
                 assert!(message.contains("could not be deserialized"));
             }

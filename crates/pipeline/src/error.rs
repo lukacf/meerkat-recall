@@ -13,6 +13,19 @@ pub enum PipelineError {
     #[error("Extraction error: {0}")]
     ExtractionError(String),
 
+    /// SDK extraction failure with safe, fixed diagnostic codes. The original
+    /// detail is retained unchanged for existing failure classification; it is
+    /// not a safe log field or a public diagnostic.
+    #[error("Extraction error: {detail}")]
+    ExtractionFailure {
+        /// Fixed producer stage, never provider-supplied text.
+        stage: &'static str,
+        /// Fixed cause selected from the SDK's typed error, not its message.
+        code: &'static str,
+        /// Original diagnostic context retained for failure classification.
+        detail: String,
+    },
+
     /// Promotion error.
     #[error("Promotion error: {0}")]
     PromotionError(String),

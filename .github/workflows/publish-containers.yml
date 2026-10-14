@@ -1,0 +1,93 @@
+name: Promote qualified Recall containers
+
+# Upload exact reviewed docker-save archives to the selected draft release first.
+# This job does no compilation and never starts a product container.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft release containing container-delivery.json and both docker tar assets
+        required: true
+        type: string
+      manifest_sha256:
+        description: Reviewed container-delivery.json SHA256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: recall-container-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and verify exact qualified images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          MANIFEST_SHA: ${{ inputs.manifest_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GH_REPO" == lukacf/meerkat-recall ]]
+          [[ "$RELEASE_TAG" =~ ^v0\.9\.[1-9][0-9]*$ ]]
+          [[ "$MANIFEST_SHA" =~ ^[a-f0-9]{64}$ ]]
+          mkdir "$RUNNER_TEMP/delivery"
+          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/delivery" \
+            --pattern container-delivery.json --pattern meerkat-recall.docker.tar \
+            --pattern recall-surreal.docker.tar
+          python3 scripts/release/container_delivery.py verify \
+            --directory "$RUNNER_TEMP/delivery" --sha256 "$MANIFEST_SHA"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          value=json.loads((Path(os.environ['RUNNER_TEMP'])/'delivery/container-delivery.json').read_text())
+          assert 'v'+value['version']==os.environ['RELEASE_TAG']
+          assert value['source_commit']==os.environ['GITHUB_SHA'], 'Dispatch workflow at exact qualified source commit'
+          PY
+      - name: Authenticate canonical package publisher
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Promote exact bytes without replacing version tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          MANIFEST_SHA: ${{ inputs.manifest_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release/promote_containers.py \
+            --directory "$RUNNER_TEMP/delivery" --sha256 "$MANIFEST_SHA" \
+            --release-tag "$RELEASE_TAG"
+      # New GHCR packages start private. The package owner must set each package
+      # public; repository visibility alone is not proof of anonymous access.
+      - name: Require anonymous registry access to both exact digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/anonymous-docker"
+          DOCKER_CONFIG="$RUNNER_TEMP/anonymous-docker" python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])/'delivery'
+          for item in json.loads((root/'published-images.json').read_text()).values():
+              subprocess.run(['docker','pull',item['image']],check=True)
+          PY
+      - name: Preserve publication digest record even if visibility is pending
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recall-published-container-digests
+          path: ${{ runner.temp }}/delivery/published-images.json
+          if-no-files-found: ignore

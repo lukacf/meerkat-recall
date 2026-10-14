@@ -30,6 +30,7 @@ pub mod redaction;
 pub mod routes;
 pub mod runtime;
 mod runtime_access;
+pub mod setup_diagnostics;
 mod space_grants;
 
 #[cfg(test)]
@@ -209,7 +210,8 @@ fn managed_storage_routes(
                     storage_client.clone(),
                     runtime.clone(),
                     authz_service.clone(),
-                ),
+                )
+                .with_worker_auth(auth_state.clone()),
             )),
         )
         .merge(routes::processing::processing_routes().with_state(Arc::new(
@@ -410,6 +412,9 @@ pub async fn run_api_with_managed_runtime(
     let app = managed_api_router(auth_config, runtime.clone()).await?;
     let addr = config.socket_addr()?;
     let listener = TcpListener::bind(addr).await?;
+    runtime
+        .record_listener_address(listener.local_addr()?)
+        .await;
     info!("Listening on {}", addr);
     runtime.start_workers_after_bind().await?;
     let _post_bind_refresh = runtime.clone().schedule_post_bind_readiness_refresh();
@@ -581,7 +586,8 @@ pub async fn run_api_with_client_and_shutdown(
                     storage_client.clone(),
                     runtime.clone(),
                     authz_service.clone(),
-                ),
+                )
+                .with_worker_auth(auth_state.clone()),
             )),
         )
         .merge(routes::processing::processing_routes().with_state(Arc::new(
@@ -635,6 +641,9 @@ pub async fn run_api_with_client_and_shutdown(
 
     let addr = config.socket_addr()?;
     let listener = TcpListener::bind(addr).await?;
+    runtime
+        .record_listener_address(listener.local_addr()?)
+        .await;
     info!("Listening on {}", addr);
 
     private_primary_evidence::serve(private_evidence, private_storage, async move {

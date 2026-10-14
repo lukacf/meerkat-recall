@@ -75,6 +75,9 @@ enum Commands {
 
 #[derive(Args, Debug, Clone, Default)]
 struct ServeArgs {
+    /// Explicit runtime TOML file (overrides ELEPHANT_CONFIG and project discovery).
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// Run only HTTP/MCP server routes; do not start managed workers.
     #[arg(long)]
     server_only: bool,
@@ -85,6 +88,9 @@ struct ServeArgs {
 
 #[derive(Args, Debug, Clone, Default)]
 struct MigrateArgs {
+    /// Explicit runtime TOML file, using the same storage selection as serve.
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// Optional directory containing additional .surql files to apply.
     #[arg(short, long)]
     extension_dir: Option<PathBuf>,
@@ -121,7 +127,7 @@ async fn main() -> Result<()> {
     let result = match cli.command {
         Commands::Serve(args) => run_serve(args).await,
         Commands::Worker => run_worker().await,
-        Commands::Migrate(args) => apply_schema(args.extension_dir).await,
+        Commands::Migrate(args) => apply_schema(args.extension_dir, args.config.as_deref()).await,
         Commands::Snapshot { command } => snapshot::run(&cli.api, command).await,
         Commands::Status(args) => status::run(&cli.api, args).await,
         Commands::ServiceToken { command } => service_token::run(command),
@@ -168,7 +174,9 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     auth_config
         .validate_server_config()
         .map_err(anyhow::Error::msg)?;
-    let runtime = RuntimeManager::new_with_ingest_enabled(Some(!args.server_only)).await?;
+    let runtime =
+        RuntimeManager::new_with_config_path(args.config.as_deref(), Some(!args.server_only))
+            .await?;
     let status = runtime.get_status().await;
     info!(
         configured = status.configured,
@@ -292,11 +300,14 @@ async fn run_worker() -> Result<()> {
     clippy::significant_drop_tightening,
     reason = "Keep the storage client alive through the complete explicit migration operation."
 )]
-async fn apply_schema(extension_dir: Option<PathBuf>) -> Result<()> {
+async fn apply_schema(
+    extension_dir: Option<PathBuf>,
+    config_path: Option<&std::path::Path>,
+) -> Result<()> {
     use elephant_migrations::apply_schema;
     use std::fs;
 
-    let config = elephant_api::runtime::resolve_storage_config_for_cli()?;
+    let config = elephant_api::runtime::resolve_storage_config_for_cli_with_path(config_path)?;
     if config.backend == StorageBackendKind::ElephantDb {
         anyhow::bail!("`elephant migrate` is only supported with ELEPHANT_DB=surreal-db");
     }
@@ -435,6 +446,19 @@ mod tests {
         Cli::try_parse_from(["elephant", "snapshot", "export", "state.json"]).unwrap();
         Cli::try_parse_from(["elephant", "snapshot", "import", "state.json"]).unwrap();
         Cli::try_parse_from(["elephant", "status", "--json"]).unwrap();
+    }
+
+    #[test]
+    fn parses_explicit_configuration_for_serve_and_migrate() {
+        let cli = Cli::try_parse_from(["elephant", "serve", "--config", "/etc/recall/config.toml"])
+            .unwrap();
+        assert!(
+            matches!(cli.command, Commands::Serve(args) if args.config.as_deref() == Some(std::path::Path::new("/etc/recall/config.toml")))
+        );
+        let cli = Cli::try_parse_from(["elephant", "migrate", "--config", "custom.toml"]).unwrap();
+        assert!(
+            matches!(cli.command, Commands::Migrate(args) if args.config.as_deref() == Some(std::path::Path::new("custom.toml")))
+        );
     }
 
     #[test]

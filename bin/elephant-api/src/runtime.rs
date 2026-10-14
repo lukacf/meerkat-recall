@@ -115,6 +115,9 @@ pub struct ExtractorSection {
     pub provider: String,
     pub required: bool,
     pub mcp_url: String,
+    /// Space selected for MCP readiness discovery, not a grant for other spaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_space_id: Option<String>,
     pub model: String,
     pub timeout_secs: u64,
 }
@@ -178,6 +181,7 @@ impl Default for ExtractorSection {
             provider: "meerkat-agentic".to_string(),
             required: true,
             mcp_url: "http://127.0.0.1:3000/mcp/agent".to_string(),
+            readiness_space_id: None,
             model: DEFAULT_AGENTIC_MODEL.to_string(),
             timeout_secs: 30,
         }
@@ -216,6 +220,8 @@ pub struct RuntimeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conveyor: Option<ConveyorStatus>,
     pub issues: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_diagnostics: Vec<crate::setup_diagnostics::SetupDiagnostic>,
 }
 
 /// Whether derivation work can actually flow, and if not, why.
@@ -275,6 +281,7 @@ impl RuntimeStatus {
             extractor_ready: false,
             semantic_ingest_ready: false,
             conveyor: None,
+            setup_diagnostics: Vec::new(),
             issues: vec!["runtime_not_configured".to_string()],
         }
     }
@@ -294,6 +301,7 @@ pub struct RuntimeConfigPatch {
     pub extractor_provider: Option<String>,
     pub extractor_required: Option<bool>,
     pub extractor_mcp_url: Option<String>,
+    pub extractor_readiness_space_id: Option<String>,
     pub extractor_model: Option<String>,
     pub extractor_timeout_secs: Option<u64>,
     pub multimodal_model: Option<String>,
@@ -353,6 +361,9 @@ impl RuntimeConfigPatch {
         }
         if let Some(mcp_url) = &self.extractor_mcp_url {
             config.extractor.mcp_url.clone_from(mcp_url);
+        }
+        if let Some(space) = &self.extractor_readiness_space_id {
+            config.extractor.readiness_space_id = (!space.is_empty()).then(|| space.clone());
         }
         if let Some(model) = &self.extractor_model {
             config.extractor.model.clone_from(model);
@@ -461,6 +472,7 @@ pub struct RuntimeManager {
     /// Last computed conveyor status and when. See [`CONVEYOR_STATUS_TTL`].
     conveyor_cache: Mutex<Option<(std::time::Instant, ConveyorStatus)>>,
     listener_bound: AtomicBool,
+    listener_address: RwLock<Option<std::net::SocketAddr>>,
     shutting_down: AtomicBool,
     workers_drained: AtomicBool,
     snapshot_paused: AtomicBool,
@@ -501,8 +513,21 @@ impl RuntimeManager {
     /// Returns an error if config discovery, parsing, storage initialization,
     /// or managed worker startup fails.
     pub async fn new_with_ingest_enabled(ingest_enabled: Option<bool>) -> Result<Self> {
-        let project_root = find_project_root(env::current_dir().context("current dir")?);
-        let config_path = project_root.join(CONFIG_DIR).join(CONFIG_FILE);
+        Self::new_with_config_path(None, ingest_enabled).await
+    }
+
+    /// Load an explicitly selected config, then `ELEPHANT_CONFIG`, otherwise
+    /// retain nearest-project discovery and the legacy environment fallback.
+    ///
+    /// # Errors
+    ///
+    /// An explicitly selected file must exist and parse; it never silently
+    /// selects another database or falls back to bootstrap/environment config.
+    pub async fn new_with_config_path(
+        config_path: Option<&Path>,
+        ingest_enabled: Option<bool>,
+    ) -> Result<Self> {
+        let (config_path, explicit) = selected_config_path(config_path)?;
         let mut inner = RuntimeInner {
             config_path: config_path.clone(),
             config: None,
@@ -511,7 +536,7 @@ impl RuntimeManager {
             status: RuntimeStatus::bootstrap(),
         };
 
-        if inner.config_path.exists() {
+        if explicit || inner.config_path.exists() {
             let mut config = load_config_from_path(&inner.config_path)?;
             apply_env_overrides_to_loaded_config(&mut config);
             if let Some(ingest_enabled) = ingest_enabled {
@@ -534,6 +559,7 @@ impl RuntimeManager {
             readiness_refresh: Mutex::new(()),
             conveyor_cache: Mutex::new(None),
             listener_bound: AtomicBool::new(false),
+            listener_address: RwLock::new(None),
             shutting_down: AtomicBool::new(false),
             workers_drained: AtomicBool::new(false),
             snapshot_paused: AtomicBool::new(false),
@@ -592,6 +618,7 @@ impl RuntimeManager {
                     extractor_ready: false,
                     semantic_ingest_ready: false,
                     conveyor: None,
+                    setup_diagnostics: Vec::new(),
                     issues: Vec::new(),
                 },
             }),
@@ -599,6 +626,7 @@ impl RuntimeManager {
             readiness_refresh: Mutex::new(()),
             conveyor_cache: Mutex::new(None),
             listener_bound: AtomicBool::new(false),
+            listener_address: RwLock::new(None),
             shutting_down: AtomicBool::new(false),
             workers_drained: AtomicBool::new(false),
             snapshot_paused: AtomicBool::new(false),
@@ -641,7 +669,36 @@ impl RuntimeManager {
             status.semantic_ingest_ready = false;
             status.issues.push("recovery_barrier".into());
         }
+        if status
+            .issues
+            .iter()
+            .any(|issue| issue == ISSUE_SEMANTIC_EXTRACTOR_UNAVAILABLE)
+        {
+            if let Some(config) = &inner.config {
+                status
+                    .setup_diagnostics
+                    .push(crate::setup_diagnostics::extractor_unavailable(
+                        &config.extractor.mcp_url,
+                    ));
+            }
+        }
         status
+    }
+
+    pub(crate) async fn record_listener_address(&self, address: std::net::SocketAddr) {
+        *self.listener_address.write().await = Some(address);
+    }
+
+    /// Local keys and grants can diagnose only this exact service's MCP route.
+    /// Remote and reverse-proxied endpoints retain their remote authority.
+    pub(crate) async fn extractor_uses_local_authority(&self) -> bool {
+        let Some(address) = *self.listener_address.read().await else {
+            return false;
+        };
+        let inner = self.inner.read().await;
+        inner.config.as_ref().is_some_and(|config| {
+            crate::setup_diagnostics::is_local_agent_endpoint(&config.extractor.mcp_url, address)
+        })
     }
 
     pub async fn workers_required(&self) -> bool {
@@ -661,6 +718,14 @@ impl RuntimeManager {
         inner.status.runtime_mode = mode;
         if let Some(config) = &mut inner.config {
             config.runtime.mode = mode;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn require_workers_for_tests(&self) {
+        let mut inner = self.inner.write().await;
+        if let Some(config) = &mut inner.config {
+            config.runtime.ingest_enabled = true;
         }
     }
 
@@ -1454,6 +1519,7 @@ impl ElephantConfig {
                 required: true,
                 mcp_url: env::var("PIPELINE_AGENTIC_MCP_URL")
                     .unwrap_or_else(|_| ExtractorSection::default().mcp_url),
+                readiness_space_id: env::var("PIPELINE_AGENTIC_MCP_SPACE_ID").ok(),
                 model: env::var("PIPELINE_AGENTIC_MODEL")
                     .unwrap_or_else(|_| ExtractorSection::default().model),
                 timeout_secs: ExtractorSection::default().timeout_secs,
@@ -1523,9 +1589,17 @@ impl ElephantConfig {
 /// Returns an error when the current directory or configuration cannot be
 /// read, runtime configuration is absent, or storage timeouts are invalid.
 pub fn resolve_storage_config_for_cli() -> Result<StorageConfig> {
-    let root = find_project_root(env::current_dir().context("current dir")?);
-    let path = root.join(CONFIG_DIR).join(CONFIG_FILE);
-    let mut config = if path.exists() {
+    resolve_storage_config_for_cli_with_path(None)
+}
+
+/// Resolve CLI storage from the same explicit config selection as `serve`.
+///
+/// # Errors
+///
+/// Explicit paths must exist and parse; storage timeouts must be valid.
+pub fn resolve_storage_config_for_cli_with_path(path: Option<&Path>) -> Result<StorageConfig> {
+    let (path, explicit) = selected_config_path(path)?;
+    let mut config = if explicit || path.exists() {
         let mut config = load_config_from_path(&path)?;
         apply_env_overrides_to_loaded_config(&mut config);
         config
@@ -1617,6 +1691,7 @@ async fn prepare_runtime_with_schema(
             extractor_ready,
             semantic_ingest_ready,
             conveyor: None,
+            setup_diagnostics: Vec::new(),
             issues,
         },
         config,
@@ -1679,6 +1754,7 @@ fn start_pipeline(
     let recipe = ManagedWorkerRecipe::capture(&pipeline_config);
     let extractor_mcp_url = config.extractor.mcp_url.clone();
     let extractor_model = config.extractor.model.clone();
+    let extractor_readiness_space = config.extractor.readiness_space_id.clone();
     let multimodal = config.multimodal.clone();
     let budget = config.budget.clone();
     let worker_threads = managed_pipeline_worker_threads(&pipeline_config);
@@ -1693,6 +1769,11 @@ fn start_pipeline(
         .spawn(move || {
             env::set_var("PIPELINE_AGENTIC_MCP_URL", &extractor_mcp_url);
             env::set_var("PIPELINE_AGENTIC_MODEL", &extractor_model);
+            if let Some(space) = &extractor_readiness_space {
+                env::set_var("PIPELINE_AGENTIC_MCP_SPACE_ID", space);
+            } else {
+                env::remove_var("PIPELINE_AGENTIC_MCP_SPACE_ID");
+            }
             env::set_var("PIPELINE_MULTIMODAL_RENDER_MODEL", &multimodal.model);
             env::set_var(
                 "PIPELINE_MULTIMODAL_RENDER_TIMEOUT_SECS",
@@ -1818,6 +1899,7 @@ fn extractor_config_matches(left: &ElephantConfig, right: &ElephantConfig) -> bo
         && left.extractor.provider == right.extractor.provider
         && left.extractor.required == right.extractor.required
         && left.extractor.mcp_url == right.extractor.mcp_url
+        && left.extractor.readiness_space_id == right.extractor.readiness_space_id
         && left.extractor.model == right.extractor.model
         && left.extractor.timeout_secs == right.extractor.timeout_secs
 }
@@ -1938,7 +2020,8 @@ async fn extractor_ready(config: &ElephantConfig) -> bool {
                 config.extractor.mcp_url.clone(),
                 config.extractor.model.clone(),
             )
-            .with_connect_on_init(false),
+            .with_connect_on_init(false)
+            .with_readiness_space(config.extractor.readiness_space_id.clone()),
         );
         return extractor.health_check().await.unwrap_or(false);
     }
@@ -1946,6 +2029,35 @@ async fn extractor_ready(config: &ElephantConfig) -> bool {
     {
         false
     }
+}
+
+fn selected_config_path(cli: Option<&Path>) -> Result<(PathBuf, bool)> {
+    let from_env = env::var_os("ELEPHANT_CONFIG").map(PathBuf::from);
+    select_config_path(
+        &env::current_dir().context("current dir")?,
+        cli.or(from_env.as_deref()),
+    )
+}
+
+fn select_config_path(cwd: &Path, explicit: Option<&Path>) -> Result<(PathBuf, bool)> {
+    if let Some(path) = explicit {
+        anyhow::ensure!(
+            !path.as_os_str().is_empty(),
+            "explicit configuration path is empty"
+        );
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        return Ok((path, true));
+    }
+    Ok((
+        find_project_root(cwd.to_path_buf())
+            .join(CONFIG_DIR)
+            .join(CONFIG_FILE),
+        false,
+    ))
 }
 
 fn find_project_root(start: PathBuf) -> PathBuf {
@@ -1976,6 +2088,9 @@ fn load_config_from_path(path: &Path) -> Result<ElephantConfig> {
 }
 
 fn apply_env_overrides_to_loaded_config(config: &mut ElephantConfig) {
+    if let Ok(space) = env::var("PIPELINE_AGENTIC_MCP_SPACE_ID") {
+        config.extractor.readiness_space_id = Some(space);
+    }
     if let Ok(snapshot_path) = env::var("ELEPHANT_DB_SNAPSHOT_LOAD") {
         if !snapshot_path.trim().is_empty() {
             config.storage.elephant_db.snapshot_path = PathBuf::from(snapshot_path);
@@ -1985,6 +2100,7 @@ fn apply_env_overrides_to_loaded_config(config: &mut ElephantConfig) {
 
 fn env_runtime_config_present() -> bool {
     [
+        "ELEPHANT_CONFIG",
         "ELEPHANT_DB",
         "SURREALDB_URL",
         "ELEPHANT_DB_SNAPSHOT_LOAD",
@@ -2004,6 +2120,85 @@ fn redact_config(mut config: ElephantConfig) -> ElephantConfig {
 mod tests {
 
     #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    #[test]
+    fn minimal_deployment_toml_retains_defaults_and_explicit_discovery_space() -> Result<()> {
+        let config: ElephantConfig = toml::from_str(
+            r#"
+[runtime]
+mode = "local_memory"
+ingest_enabled = true
+[storage]
+backend = "elephant-db"
+[storage.elephant_db]
+snapshot_path = "/var/lib/recall/state.json"
+[extractor]
+provider = "meerkat-agentic"
+required = true
+mcp_url = "http://127.0.0.1:3000/mcp/agent"
+readiness_space_id = "alpha"
+model = "fixture"
+timeout_secs = 30
+"#,
+        )?;
+        assert_eq!(
+            config.extractor.readiness_space_id.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(config.storage.backend, StorageBackendKind::ElephantDb);
+        assert_eq!(config.budget, Budget::default());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_config_path_does_not_follow_nearest_git_directory() -> Result<()> {
+        let root = temp_test_dir("explicit-config-selection");
+        std::fs::create_dir_all(root.join(".git"))?;
+        let cwd = root.join("nested");
+        std::fs::create_dir(&cwd)?;
+        assert_eq!(
+            select_config_path(&cwd, Some(Path::new("custom.toml")))?,
+            (cwd.join("custom.toml"), true)
+        );
+        assert_eq!(
+            select_config_path(&cwd, None)?,
+            (root.join(CONFIG_DIR).join(CONFIG_FILE), false)
+        );
+        assert!(select_config_path(&cwd, Some(Path::new(""))).is_err());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[serial_test::serial(cwd_env)]
+    #[tokio::test]
+    async fn explicit_missing_config_fails_before_environment_storage_fallback() -> Result<()> {
+        let _env = EnvVarGuard::clear(RUNTIME_CONFIG_ENV_VARS);
+        let root = temp_test_dir("explicit-config-errors");
+        fs::create_dir_all(&root)?;
+        env::set_var("ELEPHANT_DB", "elephant-db");
+        env::set_var("ELEPHANT_CONFIG", root.join("env.toml"));
+        let explicit = root.join("explicit.toml");
+        assert_eq!(
+            selected_config_path(Some(&explicit))?,
+            (explicit.clone(), true)
+        );
+        assert_eq!(selected_config_path(None)?, (root.join("env.toml"), true));
+        assert!(
+            RuntimeManager::new_with_config_path(Some(&explicit), Some(false))
+                .await
+                .is_err()
+        );
+        assert!(resolve_storage_config_for_cli_with_path(Some(&explicit)).is_err());
+        fs::write(&explicit, "[extractor broken TOML")?;
+        assert!(
+            RuntimeManager::new_with_config_path(Some(&explicit), Some(false))
+                .await
+                .is_err()
+        );
+        assert!(resolve_storage_config_for_cli_with_path(Some(&explicit)).is_err());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn empty_queue_is_never_blocked_even_with_no_budget_left() {
@@ -2187,6 +2382,21 @@ mod tests {
     }
 
     const RUNTIME_CONFIG_ENV_VARS: &[&str] = &[
+        "ELEPHANT_CONFIG",
+        "PIPELINE_AGENTIC_MCP_SPACE_ID",
+        "PIPELINE_MULTIMODAL_RENDER_MODEL",
+        "PIPELINE_MULTIMODAL_RENDER_TIMEOUT_SECS",
+        "PIPELINE_MULTIMODAL_RENDER_MAX_CONCURRENT",
+        "PIPELINE_MULTIMODAL_ASSET_ROOT",
+        "PIPELINE_MULTIMODAL_INLINE_IMAGE_MAX_BYTES",
+        "PIPELINE_MULTIMODAL_INLINE_VIDEO_MAX_BYTES",
+        "PIPELINE_BUDGET_DAILY_EUROS_RETRIEVAL",
+        "PIPELINE_BUDGET_DAILY_EUROS_GRAPH",
+        "PIPELINE_BUDGET_DAILY_ITEMS_RETRIEVAL",
+        "PIPELINE_BUDGET_DAILY_ITEMS_GRAPH",
+        "PIPELINE_BUDGET_PER_ITEM_TOKENS",
+        "PIPELINE_BUDGET_PER_ITEM_WALL_TIME_SECS",
+        "PIPELINE_BUDGET_DOWNGRADE_POLICY",
         "ELEPHANT_DB",
         "SURREALDB_URL",
         "SURREALDB_QUERY_TIMEOUT_SECS",
@@ -2359,6 +2569,7 @@ mod tests {
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
             listener_bound: AtomicBool::new(false),
+            listener_address: RwLock::new(None),
             shutting_down: AtomicBool::new(false),
             workers_drained: AtomicBool::new(false),
             snapshot_paused: AtomicBool::new(false),
@@ -2467,6 +2678,7 @@ mod tests {
                 extractor_provider: None,
                 extractor_required: None,
                 extractor_mcp_url: None,
+                extractor_readiness_space_id: None,
                 extractor_model: None,
                 extractor_timeout_secs: None,
                 multimodal_model: None,
@@ -2718,6 +2930,7 @@ mod tests {
                     extractor_ready: false,
                     semantic_ingest_ready: false,
                     conveyor: None,
+                    setup_diagnostics: Vec::new(),
                     issues: vec!["semantic_extractor_unavailable".to_string()],
                 },
             }),
@@ -2725,6 +2938,7 @@ mod tests {
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
             listener_bound: AtomicBool::new(false),
+            listener_address: RwLock::new(None),
             shutting_down: AtomicBool::new(false),
             workers_drained: AtomicBool::new(false),
             snapshot_paused: AtomicBool::new(false),
@@ -2744,6 +2958,7 @@ mod tests {
                 extractor_provider: None,
                 extractor_required: None,
                 extractor_mcp_url: Some("http://127.0.0.1:3000/mcp/agent".to_string()),
+                extractor_readiness_space_id: None,
                 extractor_model: Some("gpt-5.5".to_string()),
                 extractor_timeout_secs: None,
                 multimodal_model: Some("gemini-3.1-flash-lite-preview".to_string()),
@@ -2844,6 +3059,7 @@ mod tests {
                     extractor_ready: false,
                     semantic_ingest_ready: false,
                     conveyor: None,
+                    setup_diagnostics: Vec::new(),
                     issues: vec!["semantic_extractor_unavailable".to_string()],
                 },
             }),
@@ -2851,6 +3067,7 @@ mod tests {
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
             listener_bound: AtomicBool::new(false),
+            listener_address: RwLock::new(None),
             shutting_down: AtomicBool::new(false),
             workers_drained: AtomicBool::new(false),
             snapshot_paused: AtomicBool::new(false),
@@ -2911,6 +3128,7 @@ mod tests {
                     extractor_ready: false,
                     semantic_ingest_ready: false,
                     conveyor: None,
+                    setup_diagnostics: Vec::new(),
                     issues: vec!["semantic_extractor_unavailable".to_string()],
                 },
             }),
@@ -2918,6 +3136,7 @@ mod tests {
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
             listener_bound: AtomicBool::new(false),
+            listener_address: RwLock::new(None),
             shutting_down: AtomicBool::new(false),
             workers_drained: AtomicBool::new(false),
             snapshot_paused: AtomicBool::new(false),
@@ -2990,6 +3209,7 @@ mod tests {
                     extractor_ready: false,
                     semantic_ingest_ready: false,
                     conveyor: None,
+                    setup_diagnostics: Vec::new(),
                     issues: vec![ISSUE_SEMANTIC_EXTRACTOR_FEATURE_UNAVAILABLE.to_string()],
                 },
             }),
@@ -2997,6 +3217,7 @@ mod tests {
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
             listener_bound: AtomicBool::new(false),
+            listener_address: RwLock::new(None),
             shutting_down: AtomicBool::new(false),
             workers_drained: AtomicBool::new(false),
             snapshot_paused: AtomicBool::new(false),
@@ -3029,6 +3250,11 @@ mod tests {
         reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
     )]
     async fn test_managed_pipeline_thread_starts_and_stops_on_embedded_storage() {
+        let prior: Vec<_> = RUNTIME_CONFIG_ENV_VARS
+            .iter()
+            .map(|name| (*name, env::var_os(name)))
+            .collect();
+        let environment = EnvVarGuard::clear(RUNTIME_CONFIG_ENV_VARS);
         let storage = StorageClient::new(StorageConfig {
             backend: StorageBackendKind::ElephantDb,
             ..StorageConfig::default()
@@ -3038,12 +3264,21 @@ mod tests {
 
         let mut config = ElephantConfig::default();
         config.runtime.ingest_enabled = true;
+        config.extractor.readiness_space_id = Some("alpha".into());
 
         let pipeline = start_pipeline(&config, &storage).expect("start pipeline");
         tokio::time::sleep(Duration::from_millis(50)).await;
         stop_pipeline_handle(Some(pipeline))
             .await
             .expect("worker shutdown");
+        assert_eq!(
+            env::var("PIPELINE_AGENTIC_MCP_SPACE_ID").as_deref(),
+            Ok("alpha")
+        );
+        drop(environment);
+        for (name, value) in prior {
+            assert_eq!(env::var_os(name), value, "managed worker leaked {name}");
+        }
     }
 
     #[test]
@@ -3461,6 +3696,7 @@ mod tests {
                     extractor_ready: true,
                     semantic_ingest_ready: true,
                     conveyor: None,
+                    setup_diagnostics: Vec::new(),
                     issues: vec![],
                 },
             }),
@@ -3468,6 +3704,7 @@ mod tests {
             readiness_refresh: tokio::sync::Mutex::new(()),
             conveyor_cache: tokio::sync::Mutex::new(None),
             listener_bound: AtomicBool::new(false),
+            listener_address: RwLock::new(None),
             shutting_down: AtomicBool::new(false),
             workers_drained: AtomicBool::new(false),
             snapshot_paused: AtomicBool::new(false),

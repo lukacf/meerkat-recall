@@ -26,6 +26,8 @@ struct StatusResponse {
     health: Endpoint,
     runtime: Endpoint,
     readiness: Endpoint,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    space_readiness: Option<Endpoint>,
 }
 
 #[expect(
@@ -77,7 +79,13 @@ pub async fn run(target: &ApiTarget, args: StatusArgs) -> Result<()> {
         .context("build status client")?;
     let token = api_token_from_target(target)?;
     let base = api_base_url_from_target(target);
-    let (health, runtime, readiness) = tokio::join!(
+    if let Some(space) = args.space.as_deref() {
+        elephant_types::validation::validate_space_id(space)
+            .map_err(|_| StatusFailure(4, "invalid readiness space identifier"))?;
+    }
+    // Keep one concurrent bounded round trip. Named-space capabilities augment
+    // the existing global checks without doubling the ten-second network bound.
+    let (health, runtime, readiness, space_readiness) = tokio::join!(
         endpoint(
             &client,
             format!("{base}/v1/health"),
@@ -96,11 +104,27 @@ pub async fn run(target: &ApiTarget, args: StatusArgs) -> Result<()> {
             token.as_deref(),
             args.space.as_deref()
         ),
+        async {
+            if let Some(space) = args.space.as_deref() {
+                Some(
+                    endpoint(
+                        &client,
+                        format!("{base}/v1/spaces/{space}/status"),
+                        token.as_deref(),
+                        Some(space),
+                    )
+                    .await,
+                )
+            } else {
+                None
+            }
+        }
     );
     let payload = StatusResponse {
         health,
         runtime,
         readiness,
+        space_readiness,
     };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -112,13 +136,24 @@ pub async fn run(target: &ApiTarget, args: StatusArgs) -> Result<()> {
                 .http_status
                 .map_or_else(|| "unavailable".to_string(), |code| code.to_string())
         );
-        println!("readiness: {}", readiness_label(&payload.readiness));
+        println!(
+            "readiness: {}",
+            readiness_label(
+                payload
+                    .space_readiness
+                    .as_ref()
+                    .unwrap_or(&payload.readiness)
+            )
+        );
         if let Some(runtime) = &payload.runtime.body {
             println!("runtime: {}", serde_json::to_string(runtime)?);
         }
     }
     if args.require_ready {
         require_ready(&payload.readiness)?;
+        if let Some(space) = &payload.space_readiness {
+            require_ready(space)?;
+        }
     } else if payload.health.http_status.is_none() {
         return Err(StatusFailure(4, "service is unavailable").into());
     }
@@ -162,6 +197,63 @@ fn require_ready(endpoint: &Endpoint) -> std::result::Result<(), StatusFailure> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn selected_space_failure_cannot_hide_behind_global_ready() -> Result<()> {
+        use axum::{http::HeaderMap, routing::get, Json, Router};
+        let app = Router::new()
+            .route(
+                "/v1/health",
+                get(|| async { Json(serde_json::json!({"status":"healthy"})) }),
+            )
+            .route(
+                "/v1/runtime/status",
+                get(|| async { Json(serde_json::json!({"configured":true})) }),
+            )
+            .route(
+                "/v1/readiness",
+                get(|| async { Json(serde_json::json!({"ready":true})) }),
+            )
+            .route(
+                "/v1/spaces/alpha/status",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(
+                        headers
+                            .get("X-Space-Id")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("alpha")
+                    );
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"ready":false})),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let target = ApiTarget {
+            api_url: Some(format!("http://{address}")),
+            ..ApiTarget::default()
+        };
+        let result = run(
+            &target,
+            StatusArgs {
+                json: false,
+                require_ready: true,
+                space: Some("alpha".into()),
+            },
+        )
+        .await;
+        server.abort();
+        assert_eq!(
+            result
+                .err()
+                .and_then(|error| error.downcast_ref::<StatusFailure>().map(|error| error.0)),
+            Some(3)
+        );
+        Ok(())
+    }
+
     #[test]
     fn healthy_process_never_substitutes_for_readiness() {
         for (code, ready, expected) in [

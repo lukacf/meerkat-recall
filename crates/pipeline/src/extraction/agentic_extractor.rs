@@ -128,6 +128,8 @@ pub struct AgenticExtractorConfig {
     pub budget: ExtractionBudget,
     /// Whether to connect to MCP during initialization.
     pub connect_on_init: bool,
+    /// Optional space for discovery; extraction always selects its own context space.
+    pub readiness_space_id: Option<String>,
 }
 
 impl AgenticExtractorConfig {
@@ -139,6 +141,7 @@ impl AgenticExtractorConfig {
             model: model.into(),
             budget: ExtractionBudget::default(),
             connect_on_init: true,
+            readiness_space_id: std::env::var("PIPELINE_AGENTIC_MCP_SPACE_ID").ok(),
         }
     }
 
@@ -146,6 +149,13 @@ impl AgenticExtractorConfig {
     #[must_use]
     pub fn with_budget(mut self, budget: ExtractionBudget) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Select a discovery space without changing per-document extraction authority.
+    #[must_use]
+    pub fn with_readiness_space(mut self, space: Option<String>) -> Self {
+        self.readiness_space_id = space;
         self
     }
 
@@ -1650,8 +1660,41 @@ fn llm_provider_error(message: impl Into<String>) -> LlmFailureReason {
     ))
 }
 
+// Keep discovery read-only. The remote server still verifies the signed space,
+// current grant and tool scopes; merely accepting an MCP session is insufficient.
+const REQUIRED_EXTRACTION_MCP_TOOLS: &[&str] = &[
+    "get_doc",
+    "get_doc_chunk",
+    "get_entity",
+    "search_entities",
+    "list_predicates",
+    "get_predicate",
+    "get_source",
+];
+
+fn extraction_tools_ready(names: impl Iterator<Item = impl AsRef<str>>) -> bool {
+    let names: std::collections::BTreeSet<String> =
+        names.map(|name| name.as_ref().to_owned()).collect();
+    REQUIRED_EXTRACTION_MCP_TOOLS
+        .iter()
+        .all(|name| names.contains(*name))
+}
+
+fn discovery_headers(
+    config: &AgenticExtractorConfig,
+) -> Result<HashMap<String, String>, PipelineError> {
+    let mut headers = mcp_headers_from_env();
+    if let Some(space) = &config.readiness_space_id {
+        elephant_types::validation::validate_space_id(space).map_err(|_| {
+            PipelineError::InvalidInput("Invalid extractor discovery space identifier".into())
+        })?;
+        headers.insert("X-Space-Id".into(), space.clone());
+    }
+    Ok(headers)
+}
+
 fn connect_mcp_on_init(config: &AgenticExtractorConfig) -> Result<(), PipelineError> {
-    let headers = mcp_headers_from_env();
+    let headers = discovery_headers(config)?;
     let server_config = McpServerConfig::streamable_http(
         "elephant-mcp-agent-init",
         config.mcp_url.clone(),
@@ -2799,7 +2842,7 @@ impl Extractor for AgenticExtractor {
     }
 
     async fn health_check(&self) -> Result<bool, PipelineError> {
-        let headers = mcp_headers_from_env();
+        let headers = discovery_headers(&self.config)?;
         let server_config = McpServerConfig::streamable_http(
             "elephant-mcp-health",
             self.config.mcp_url.clone(),
@@ -2818,7 +2861,10 @@ impl Extractor for AgenticExtractor {
             }
         };
 
-        let healthy = connection.list_tools("elephant-mcp-health").await.is_ok();
+        let healthy = connection
+            .list_tools("elephant-mcp-health")
+            .await
+            .is_ok_and(|tools| extraction_tools_ready(tools.iter().map(|tool| tool.name.as_str())));
         if let Err(err) = connection.close().await {
             tracing::debug!(
                 mcp_url = %self.config.mcp_url,
@@ -2840,6 +2886,37 @@ mod tests {
         unused_imports,
         dead_code
     )]
+
+    #[test]
+    fn readiness_rejects_status_only_or_missing_predicate_tools() {
+        assert!(!extraction_tools_ready(["get_runtime_status"].into_iter()));
+        assert!(extraction_tools_ready(REQUIRED_EXTRACTION_MCP_TOOLS.iter()));
+        for missing in REQUIRED_EXTRACTION_MCP_TOOLS {
+            assert!(!extraction_tools_ready(
+                REQUIRED_EXTRACTION_MCP_TOOLS
+                    .iter()
+                    .filter(|name| *name != missing)
+            ));
+        }
+    }
+
+    #[test]
+    fn discovery_space_is_explicit_and_does_not_change_extraction_context() {
+        let config = make_config().with_readiness_space(Some("alpha".into()));
+        assert_eq!(
+            discovery_headers(&config)
+                .unwrap()
+                .get("X-Space-Id")
+                .map(String::as_str),
+            Some("alpha")
+        );
+        let config = config.with_readiness_space(None);
+        assert!(!discovery_headers(&config)
+            .unwrap()
+            .contains_key("X-Space-Id"));
+        let config = config.with_readiness_space(Some("invalid space".into()));
+        assert!(discovery_headers(&config).is_err());
+    }
 
     #[test]
     fn extraction_effort_defaults_low_for_openai_only() {

@@ -431,7 +431,7 @@ for cancellation and archival details.
 | --- | --- | --- |
 | `MCP_ALLOWED_HOSTS` | loopback hosts | Comma-separated remote hostnames or `host:port` values; loopback remains allowed |
 | `MCP_ALLOWED_ORIGINS` | unrestricted by this optional origin filter | Comma-separated exact browser origins; scheme, host, and effective port must match |
-| `MCP_BEARER_TOKEN` | _(none)_ | Bearer token for pipeline calls to authenticated Meerkat Recall MCP endpoints |
+| `MCP_BEARER_TOKEN` | _(none)_ | Private worker bearer with current named-space data grants and clearances; extraction requires `read:predicate`. See [extractor MCP setup](/operations/service-setup#configure-extractor-mcp-access). |
 
 Requests without an `Origin` header remain accepted. The opaque `null` origin
 requires an explicit entry. Host/origin checks do not replace JWT or ABAC.
@@ -560,6 +560,14 @@ See the [snapshot reference](/api/system#managed-snapshots).
 | `PIPELINE_AGENTIC_MCP_URL` | `http://127.0.0.1:3000/mcp/agent` | MCP URL for the agentic extractor |
 | `PIPELINE_AGENTIC_MODEL` | `gpt-5.6-sol` | Binary model default; Compose overrides with `claude-opus-4-6` |
 | `PIPELINE_SKILLS_DIR` | `./skills` | Extraction skill directory; Compose mounts and selects `/skills` |
+
+The extractor and maintenance URL defaults do not follow `ELEPHANT_PORT`.
+Match each URL to the reachable listener and its profile path (`/mcp/agent` or
+`/mcp/maintenance`). For config-backed bootstrap, set `extractor_mcp_url` through
+`initialize_runtime` or `configure_runtime` and check `get_runtime_config`.
+Setting `PIPELINE_AGENTIC_MCP_URL` before launch selects configured runtime mode.
+See [extractor MCP setup](/operations/service-setup#configure-extractor-mcp-access)
+for token, grant and per-space tool checks.
 
 ### Living Wiki Editorial Models
 

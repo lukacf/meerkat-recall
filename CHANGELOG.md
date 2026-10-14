@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Changes prepared for Recall 0.9.0.
+## [0.9.0] - 2026-10-14
 
 ### Meerkat 0.9 integration
 - Exact-pin the published Meerkat 0.9.0 family and align Recall workspace and
@@ -25,6 +25,11 @@ Changes prepared for Recall 0.9.0.
   from the live row but preserved in the audit's before image.
 - Scope secret-scanner fixture exceptions to both the reviewed exact value and
   its file path; different values in those paths remain subject to detection.
+
+- Preserve original approved identity decisions across successive entity merges,
+  including inherited restrictions in a single atomic merge plan.
+- Pause native background writers during snapshot inventory and export so the
+  captured records and exported history describe the same snapshot.
 
 ### Release tooling
 - Include all six active patched dependency source trees in native and container

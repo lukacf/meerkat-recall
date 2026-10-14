@@ -6,9 +6,8 @@ icon: download
 
 Download native releases for Linux x86-64 and macOS ARM64 from
 [the canonical Meerkat Recall repository](https://github.com/lukacf/meerkat-recall/releases).
-Use each archive with its matching release record. This source prepares `0.9.0`
-with published Meerkat `0.9.0`; use the version actually published in the selected
-release. Existing `0.1.0` archives retain their original dependencies and receipts. See
+Recall `0.9.0` uses Meerkat `0.9.0`. Use each archive with its matching
+release record. Existing `0.1.0` archives retain their original dependencies and receipts. See
 [release binaries](/operations/deployment#release-binaries) for the promotion process
 and build provenance requirements.
 
@@ -19,10 +18,15 @@ and build provenance requirements.
 | Linux x86-64 | `meerkat-recall-VERSION-x86_64-unknown-linux-gnu.tar.gz` |
 | macOS ARM64 (Apple Silicon) | `meerkat-recall-VERSION-aarch64-apple-darwin.tar.gz` |
 
-The build workflow targets Linux and native macOS ARM64. Check the selected
-release's actual host and dynamic-library acceptance before treating another
-OS version as supported. No Windows, Linux ARM64, or Intel macOS binary is
-specified by this release matrix.
+The macOS ARM64 archive has a conservative static minimum of **macOS 13.4**,
+set by its linked ONNX Runtime objects. Archive verification, isolated
+installation, `--help` and `--version` passed on **macOS 26.5.2**. Older macOS
+versions and macOS inference were not exercised; the executable's own macOS 11.0
+load command does not establish compatibility for the complete runtime.
+
+Check each release's actual host and dynamic-library results before treating
+another OS version as supported. No Windows, Linux ARM64, or Intel macOS binary
+is specified by this release matrix.
 
 Obtain the archive and `checksums.sha256` from the selected canonical release
 and keep them in the same directory. Use the checksum and source identity

@@ -40,6 +40,11 @@ Two practical nuances:
 - if you set runtime env vars like `ELEPHANT_DB` or `SURREALDB_URL`, Meerkat Recall starts in configured mode rather than bootstrap mode
 - self-referential extractor URLs such as `PIPELINE_AGENTIC_MCP_URL=http://127.0.0.1:3000/mcp/agent` are supported; Meerkat Recall retries extractor readiness after the listener binds, so clients can poll `get_runtime_status` instead of issuing a manual reconnect
 
+The example assumes the listener is on port `3000`. Match the extractor URL to
+the actual listener and configure `MCP_BEARER_TOKEN` with current named-space
+authority, including predicate reads. Listener retries cannot repair an incorrect
+endpoint or token. Follow [extractor MCP setup](/operations/service-setup#configure-extractor-mcp-access).
+
 ## Repository Structure
 
 ```

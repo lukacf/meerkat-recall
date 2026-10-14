@@ -1314,15 +1314,34 @@ async fn erasure_and_restore(fixture: &Fixture, first: &StageAttempt, second: &S
 /// expectations v2 (996f62013cdaa76f9fc12d029f6fff5ded89969c4ad99107925f2fa5b2a156ed).
 /// Every case runs on native `SurrealDB` memory and elephant-db. This selector is
 /// one finite stage-control batch; its pass never counts as provider acceptance.
-#[tokio::test]
+#[test]
+fn governed_whole_batch_repair_preserves_history_authority_and_completion() {
+    // The retained governed-repair qualification used RUST_MIN_STACK=8388608
+    // for the unoptimized Meerkat factory. Keep that allowance local to this
+    // scenario so CI and direct cargo test runs exercise the same environment.
+    std::thread::Builder::new()
+        .name("governed-repair-scenario".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("governed repair test runtime")
+                .block_on(governed_whole_batch_repair_scenario());
+        })
+        .expect("governed repair test thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
 #[expect(
     clippy::items_after_statements,
     reason = "Keep local diagnostic types and case definitions beside the control phase that uses them"
 )]
-async fn governed_whole_batch_repair_preserves_history_authority_and_completion() {
+async fn governed_whole_batch_repair_scenario() {
     repair_phase("batch.enter");
     // Type-only checks do not construct or poll a possibly oversized future.
-    // The original selector still exercises every phase on the default stack.
+    // The original selector still exercises every phase on its bounded test stack.
     fn phase_bytes<F: std::future::Future>(_: impl FnOnce(RepairCase) -> F) -> usize {
         std::mem::size_of::<F>()
     }

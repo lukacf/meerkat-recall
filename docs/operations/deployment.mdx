@@ -41,8 +41,12 @@ separate. Preserve them on upgrades; deleting volumes removes their contents.
 The Recall service runs without root privileges and uses an explicit config
 path. Its health check proves process liveness only. Complete named-space grants,
 provider approvals and worker credentials using [service setup](/operations/service-setup),
-then verify authenticated readiness with a separate status token. Ready gateway
-transport does not establish model access or searchable source publication.
+then verify authenticated readiness with a separate status token. The generated
+`semantic.override.example.yaml` shows how to mount a private worker bearer and
+provider key and select a granted discovery space; copy it to the active override
+only after its files, space approvals and current grants exist. Its adjacent
+README gives the complete token and provider setup. Ready gateway transport does
+not establish model access or searchable source publication.
 
 Container publication promotes the exact qualified Docker archives without
 recompilation. Both source/capability/license identities and anonymous pulls of
@@ -217,7 +221,8 @@ meerkat-recall --api-url http://127.0.0.1:3000 \
 | 5 | Readiness authorization refused |
 
 Status requests run concurrently, each with a ten-second timeout and a 1 MiB
-response limit. Readiness is a service capability check, not proof that a
+response limit. In 0.9.1, `--space` adds `space_readiness` to the JSON result and
+`--require-ready` requires both global and named-space readiness. Readiness is a service capability check, not proof that a
 requested source revision is current. Consumers retain their own optional
 startup and authorized fallback behavior.
 

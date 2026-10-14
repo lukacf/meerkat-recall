@@ -289,9 +289,14 @@ Actual extraction always selects its work item's space and rechecks authority;
 one successful discovery does not grant access to other spaces. Legacy
 single-space tokens retain their existing selection behavior.
 
-Named-space status also checks the worker token against current grants. Readers
-with `read:space_config` receive fixed diagnostic actions; status-only callers
-do not receive token, subject, grant contents or private endpoint details.
+For the exact agent route on this listener's literal loopback address,
+named-space status also verifies the worker token using this service's signing
+configuration and current grants. Remote or reverse-proxied MCP endpoints have
+their own authority: local diagnostics explicitly leave those keys and grants
+unchecked and direct the operator to the remote endpoint. Global discovery
+still establishes only the selected discovery space's tools. Readers with
+`read:space_config` receive fixed diagnostic actions; status-only callers do not
+receive token, subject, grant contents or private endpoint details.
 These checks do not call paid providers or prove that a particular revision is
 searchable. An API-only role can be ready while workers are unavailable.
 Pending operations remain pending truthfully.

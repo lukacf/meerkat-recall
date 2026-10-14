@@ -55,6 +55,7 @@ jobs:
           docker compose config --quiet
           docker compose -f docker-compose.dev.yml config --quiet
           docker compose -f deploy/compose/compose.yaml config --quiet
+          docker compose -f deploy/compose/compose.yaml -f deploy/compose/semantic.override.example.yaml config --quiet
           bash -n rebuild-fast.sh
           sh -n deploy/compose/init.sh packaging/recall-container/entrypoint.sh packaging/recall-surreal/entrypoint.sh
       - name: Check Dockerfile

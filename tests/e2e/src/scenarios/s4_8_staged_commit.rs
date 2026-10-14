@@ -73,7 +73,10 @@ async fn scenario_s4_8_staged_commit() -> anyhow::Result<()> {
     assert_eq!(staged.len(), 1);
     let candidate = staged[0].clone();
     assert_eq!(candidate.artifact_type, KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE);
-    assert_eq!(candidate.status, ArtifactStatus::Draft);
+    // Source producers validate their complete batch before reporting success.
+    // The queued validation stage must still recheck it before bundling.
+    assert_eq!(candidate.status, ArtifactStatus::Validated);
+    assert!(candidate.validated_at.is_some());
     assert_eq!(
         candidate.data["assertions"]
             .as_array()
@@ -84,10 +87,28 @@ async fn scenario_s4_8_staged_commit() -> anyhow::Result<()> {
     assert!(assertions.list(space, 10, None).await?.is_empty());
     let outbox_before = serde_json::to_value(events.get_after_seq(space, 0, 100).await?)?;
 
-    // A deliberately damaged staged interpretation must pass through the real
-    // evidence validator and remain inspectable. No test marks it rejected.
+    // A prior validation stamp cannot authorize a subsequently damaged payload.
     let mut unsupported = candidate.clone();
     unsupported.data["assertions"][0]["support_verification"] = serde_json::Value::Null;
+    artifacts
+        .update(space, &candidate.base.id, unsupported.clone())
+        .await?;
+    let replay_error = Box::pin(validate_artifacts::execute(
+        &StagedCommit::new(storage.clone()),
+        space,
+        &run,
+    ))
+    .await
+    .expect_err("changed evidence cannot reuse prior validation");
+    assert!(replay_error
+        .to_string()
+        .contains("Previously validated artifact no longer passes validation"));
+
+    // Inject the same corruption before validation by removing its old stamp.
+    // The real evidence validator must reject it and retain the damaged payload.
+    // No test marks a candidate validated, rejected or committed.
+    unsupported.status = ArtifactStatus::Draft;
+    unsupported.validated_at = None;
     let rejected_data = unsupported.data.clone();
     artifacts
         .update(space, &candidate.base.id, unsupported)
@@ -121,18 +142,23 @@ async fn scenario_s4_8_staged_commit() -> anyhow::Result<()> {
     // Repair only the test's injected staged corruption using the unchanged
     // original supported extraction. Normal queued validation, bundle creation,
     // registration and finalization still execute; no canonical row is seeded.
+    let mut retry = candidate.clone();
+    retry.status = ArtifactStatus::Draft;
+    retry.validated_at = None;
     artifacts
-        .update_if_status(
-            space,
-            &candidate.base.id,
-            candidate.clone(),
-            ArtifactStatus::Rejected,
-        )
+        .update_if_status(space, &candidate.base.id, retry, ArtifactStatus::Rejected)
         .await?
         .expect("rejected candidate retained for retry");
     let validate = runnable_for_run(&items, space, "validate_artifacts", &run).await?;
     Box::pin(fixture.run_item(storage, &extractor, &validate)).await?;
     let validated = artifacts.find_by_work_run(&run).await?;
+    let revalidated = validated
+        .iter()
+        .find(|artifact| artifact.base.id == candidate.base.id)
+        .expect("original candidate revalidated by queued work");
+    assert_eq!(revalidated.status, ArtifactStatus::Validated);
+    assert!(revalidated.validated_at.is_some());
+    assert_eq!(revalidated.data, candidate.data);
     let bundle = validated
         .iter()
         .find(|artifact| artifact.artifact_type == COMMIT_BUNDLE_ARTIFACT_TYPE)

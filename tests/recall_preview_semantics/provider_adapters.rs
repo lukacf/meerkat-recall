@@ -141,10 +141,12 @@ async fn actual_identity_resolution_uses_assertion_space_and_current_approval() 
     Ok(())
 }
 
-#[tokio::test]
-async fn actual_identity_sweep_requires_approval_and_keeps_a_revoked_retry_pending(
-) -> anyhow::Result<()> {
-    Box::pin(identity_sweep_dispatch_contract()).await
+#[test]
+fn actual_identity_sweep_requires_approval_and_keeps_a_revoked_retry_pending() -> anyhow::Result<()>
+{
+    super::run_bounded_adapter_scenario("identity-sweep-adapter", || async {
+        Box::pin(identity_sweep_dispatch_contract()).await
+    })
 }
 
 async fn identity_sweep_dispatch_contract() -> anyhow::Result<()> {
@@ -389,9 +391,13 @@ async fn wiki_call(adapter: &MeerkatWikiEditorialLlm, role: &str) -> anyhow::Res
     Ok(())
 }
 
-#[tokio::test]
-async fn actual_wiki_planner_organizer_writer_and_verifier_check_current_approval(
-) -> anyhow::Result<()> {
+#[test]
+fn actual_wiki_planner_organizer_writer_and_verifier_check_current_approval() -> anyhow::Result<()>
+{
+    super::run_bounded_adapter_scenario("wiki-editorial-adapter", wiki_dispatch_contract)
+}
+
+async fn wiki_dispatch_contract() -> anyhow::Result<()> {
     for backend in BACKENDS {
         for (space, dims) in [(SPACES[0], 8), (SPACES[1], 12)] {
             for (role, operation) in [

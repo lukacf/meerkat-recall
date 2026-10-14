@@ -2,6 +2,27 @@
 //! Loopback transports are deterministic SPIES, not provider relevance acceptance.
 //! Depends on provider owner with_credentials/index_generation successor contract.
 
+// These three unoptimized SDK adapter scenarios exceed libtest's default
+// thread stack with Meerkat 0.9. Keep a finite allowance local to each scenario;
+// the original single-thread runtime, provider limits and assertions stay intact.
+fn run_bounded_adapter_scenario<F, Fut>(name: &str, scenario: F) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(scenario())
+        })?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 #[path = "../../recall_preview_semantics/provider_spy.rs"]
 mod spy;
 

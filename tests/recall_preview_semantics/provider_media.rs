@@ -114,9 +114,11 @@ fn require_space_refusal(
     Ok(())
 }
 
-#[tokio::test]
-async fn actual_media_renderer_checks_document_space_and_current_approval() -> anyhow::Result<()> {
-    Box::pin(media_dispatch_contract()).await
+#[test]
+fn actual_media_renderer_checks_document_space_and_current_approval() -> anyhow::Result<()> {
+    super::run_bounded_adapter_scenario("media-renderer-adapter", || async {
+        Box::pin(media_dispatch_contract()).await
+    })
 }
 
 async fn media_dispatch_contract() -> anyhow::Result<()> {

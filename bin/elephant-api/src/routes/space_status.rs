@@ -39,6 +39,7 @@ impl SpaceStatusState {
             worker_auth: None,
         }
     }
+    #[must_use]
     pub fn with_worker_auth(mut self, auth: crate::auth::AuthState) -> Self {
         self.worker_auth = Some(auth);
         self
@@ -272,6 +273,10 @@ mod tests {
 
     #[serial_test::serial(cwd_env)]
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain fixture storage and runtime owners through the complete grant revocation and authorization assertions"
+    )]
     async fn current_worker_grant_changes_named_readiness_but_details_require_config_authority(
     ) -> anyhow::Result<()> {
         use elephant_storage::space_grant_repository::SpaceGrantRepository;

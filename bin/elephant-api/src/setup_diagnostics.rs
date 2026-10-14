@@ -261,6 +261,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain fixture storage and grant repository owners through the complete current grant authority assertions"
+    )]
     async fn worker_diagnostics_observe_current_grant_revocation_and_scope_intersection(
     ) -> anyhow::Result<()> {
         let auth = auth();

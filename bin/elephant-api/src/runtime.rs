@@ -647,10 +647,6 @@ impl RuntimeManager {
     /// Readiness only: configured, storage/worker/ingest readiness, mode and
     /// issues. No database work, so it is safe on every request path. This is
     /// what tool gating needs; it never reads the conveyor.
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "Retain guard, repository and runtime owners through the original response or state transition scope"
-    )]
     pub async fn get_readiness(&self) -> RuntimeStatus {
         self.refresh_pipeline_liveness().await;
         let inner = self.inner.read().await;
@@ -1481,10 +1477,9 @@ impl ElephantConfig {
             .ok()
             .and_then(|value| value.parse::<StorageBackendKind>().ok())
             .unwrap_or(StorageBackendKind::SurrealDb);
-        let mode = if backend == StorageBackendKind::ElephantDb {
-            RuntimeMode::LocalMemory
-        } else {
-            RuntimeMode::SharedMemory
+        let mode = match backend {
+            StorageBackendKind::ElephantDb => RuntimeMode::LocalMemory,
+            StorageBackendKind::SurrealDb => RuntimeMode::SharedMemory,
         };
         Self {
             runtime: RuntimeSection {

@@ -122,8 +122,9 @@ pub(super) enum FinalizerOutcome {
 async fn dispatch_finalizer(
     storage: &StorageClient,
     claimed: &WorkItem,
+    run_id: &RecordId,
 ) -> anyhow::Result<FinalizerOutcome> {
-    Box::pin(dispatch_claimed(storage, claimed, None)).await
+    Box::pin(dispatch_prepared(storage, claimed, run_id, None)).await
 }
 
 pub(super) async fn dispatch_claimed(
@@ -131,6 +132,14 @@ pub(super) async fn dispatch_claimed(
     claimed: &WorkItem,
     extractor: Option<&dyn Extractor>,
 ) -> anyhow::Result<FinalizerOutcome> {
+    let run_id = prepare_claimed_run(storage, claimed).await?;
+    Box::pin(dispatch_prepared(storage, claimed, &run_id, extractor)).await
+}
+
+async fn prepare_claimed_run(
+    storage: &StorageClient,
+    claimed: &WorkItem,
+) -> anyhow::Result<RecordId> {
     let space = claimed.base.space_id.as_str();
     let attempt = elephant_storage::work_attempt_repository::fence_from_claim(claimed)?;
     let run_id = create_work_run(storage, space, ACTOR, &claimed.base.id).await;
@@ -145,9 +154,20 @@ pub(super) async fn dispatch_claimed(
     WorkRunRepository::new(storage.clone())
         .update(space, &run_id, run)
         .await?;
+    Ok(run_id)
+}
+
+async fn dispatch_prepared(
+    storage: &StorageClient,
+    claimed: &WorkItem,
+    run_id: &RecordId,
+    extractor: Option<&dyn Extractor>,
+) -> anyhow::Result<FinalizerOutcome> {
+    let space = claimed.base.space_id.as_str();
+    let attempt = elephant_storage::work_attempt_repository::fence_from_claim(claimed)?;
     let observer = elephant_pipeline::provider_usage::DurableUsageObserver::for_attempt(
         storage.clone(),
-        &run_id,
+        run_id,
         attempt,
     );
     let config = WorkQueueWorkerConfig::default();
@@ -158,7 +178,7 @@ pub(super) async fn dispatch_claimed(
                 observer.clone(),
                 Box::pin(super::super::execute_work_item_with_extractor(
                     claimed,
-                    &run_id,
+                    run_id,
                     storage.clone(),
                     &config,
                     &TmContext::none(),
@@ -174,7 +194,7 @@ pub(super) async fn dispatch_claimed(
     match result {
         Ok(mut metrics) => {
             let mut run = WorkRunRepository::new(storage.clone())
-                .get(space, &run_id)
+                .get(space, run_id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("original run disappeared"))?;
             for (key, value) in run.metrics.custom {
@@ -186,9 +206,9 @@ pub(super) async fn dispatch_claimed(
             run.success = true;
             run.completed_at = Some(completed_at);
             WorkRunRepository::new(storage.clone())
-                .update(space, &run_id, run)
+                .update(space, run_id, run)
                 .await?;
-            elephant_pipeline::provider_usage::reconcile_finished_usage(storage, space, &run_id)
+            elephant_pipeline::provider_usage::reconcile_finished_usage(storage, space, run_id)
                 .await?;
             let queue =
                 WorkQueue::new(storage.clone(), WorkQueueConfig::default()).for_attempt(claimed)?;
@@ -205,7 +225,7 @@ pub(super) async fn dispatch_claimed(
             let (class, action) = Box::pin(source_runtime::record_failed_execution(
                 storage,
                 claimed,
-                &run_id,
+                run_id,
                 &error,
                 &usage,
                 completed_at,
@@ -331,12 +351,26 @@ async fn concurrent_publications(embedded: bool) {
                 .expect("original claimed authority before dispatch");
             claimed.push(original);
         }
+        // Run rows and their original attempt fences are fixture setup, not
+        // finalization. Finish them before concurrent canonical publication so
+        // synthetic bookkeeping does not consume the query conflict budget.
+        let run_ids = tokio::time::timeout_at(deadline, async {
+            let mut runs = Vec::with_capacity(claimed.len());
+            for item in &claimed {
+                runs.push(prepare_claimed_run(&storage, item).await?);
+            }
+            Ok::<_, anyhow::Error>(runs)
+        })
+        .await
+        .expect("bounded original run preparation")
+        .expect("prepare original claimed runs");
         let results = tokio::time::timeout_at(
             deadline,
             futures::future::join_all(
                 claimed
                     .iter()
-                    .map(|item| dispatch_finalizer(&storage, item)),
+                    .zip(&run_ids)
+                    .map(|(item, run_id)| dispatch_finalizer(&storage, item, run_id)),
             ),
         )
         .await

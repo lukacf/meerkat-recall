@@ -873,7 +873,7 @@ impl RuntimeManager {
                 .per_item_wall_time_secs
                 .or(defaults.per_item_wall_time_secs),
             concurrent_workers: defaults.concurrent_workers,
-            ..configured.clone()
+            ..configured
         };
         Some(RuntimeBudgetConfiguration {
             configured,
@@ -2162,8 +2162,7 @@ mod tests {
 
     #[tokio::test]
     async fn effective_budget_projection_matches_managed_optional_defaults() -> Result<()> {
-        let storage = StorageClient::new_embedded().await?;
-        let mut runtime = RuntimeManager::new_preconfigured(storage);
+        let mut runtime = RuntimeManager::new_preconfigured(StorageClient::new_embedded().await?);
         let config = runtime.inner.get_mut().config.as_mut().expect("config");
         config.budget.daily_euros_graph = 7.5;
         config.budget.daily_items_graph = Some(42);
@@ -2188,6 +2187,7 @@ mod tests {
         assert!(!projected.managed_workers_running);
         runtime.inner.get_mut().config = None;
         assert!(runtime.budget_configuration().await.is_none());
+        drop(runtime);
         Ok(())
     }
 

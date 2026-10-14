@@ -142,7 +142,7 @@ async fn budget_endpoint_observes_current_service_grant_attenuation_and_revocati
                 subject: caller.subject.clone(),
                 generation: String::new(),
                 active: true,
-                scopes: ["read:space_config".into()].into_iter().collect(),
+                scopes: std::iter::once("read:space_config".into()).collect(),
                 updated_by: "fixture".into(),
                 updated_at: chrono::Utc::now(),
             },
@@ -152,12 +152,13 @@ async fn budget_endpoint_observes_current_service_grant_attenuation_and_revocati
         .unwrap();
     let router = app(storage, runtime, caller, true);
     assert_eq!(request(router.clone()).await.0, StatusCode::OK);
-    grant.scopes = ["read:status".into()].into_iter().collect();
+    grant.scopes = std::iter::once("read:status".into()).collect();
     let generation = grant.generation.clone();
     grant = grants.replace(grant, Some(&generation)).await.unwrap();
     assert_eq!(request(router.clone()).await.0, StatusCode::FORBIDDEN);
     grant.active = false;
     let generation = grant.generation.clone();
     grants.replace(grant, Some(&generation)).await.unwrap();
+    drop(grants);
     assert_eq!(request(router).await.0, StatusCode::FORBIDDEN);
 }

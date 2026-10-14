@@ -153,7 +153,7 @@ impl FailureDiagnostic {
         Self::new("extraction", "extractor", "extraction_error")
     }
 
-    pub(super) const fn action(self) -> &'static str {
+    pub(super) fn action(self) -> &'static str {
         match self.code {
             "embedding_input_too_large" => "Create a new text-full-v2 embedding profile, reindex and activate it before resubmitting; do not relabel existing vectors.",
             "provider_context_limit" | "provider_request_too_large" => "Check the selected model input limit and extraction input size.",

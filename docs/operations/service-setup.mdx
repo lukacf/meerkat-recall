@@ -382,29 +382,72 @@ requesting another retry.
 
 A source operation already marked `failed_final` retains its terminal receipt;
 retrying its old work item or replaying its old idempotency key does not create a
-new source attempt. Correct the provider/profile/budget issue first, read the
-current source head, then submit a new source PUT with a **new revision and new
-idempotency key** plus the exact current `expected_generation`. Preserve the
-full original bytes, media type, metadata, classification and subjects unless
-an authorized change is intended. Retain the old failed operation for audit,
-and poll the newly returned operation to completion. A changed generation is a
-conflict to reconcile, not permission to overwrite another writer. This flow
-uses the ordinary `read:source`/`write:source` and source-envelope/current-grant
-authority; it does not require giving write access to the extractor worker.
+new source attempt. Correct the provider/profile/budget issue first and read the
+current source head for its exact generation. For a document originally submitted
+to `POST /v1/sources/ingest`, resubmit the **original importer payload** with a
+new `intake.revision_id`, a new `intake.idempotency_key` and
+`intake.expected_generation` equal to that current generation. Keep the original
+normalized `name`/document fields, or the original legacy `source` and `doc`
+objects, plus the requested ingest mode. Preserve complete text, media, metadata,
+classification, subjects and extraction guidance unless an authorized change is
+intended. The intake object is separate from document metadata:
 
-Clients using the retained raw-source API instead use `PUT /v1/sources/{id}`
-with the complete current Source fields at the top level and an `intake` object
-containing fresh `revision_id`, fresh `idempotency_key` and current
-`expected_generation`. Do not wrap Source fields inside a `source` property.
-Document-shaped inputs also need their existing document authority. Reprocess
-jobs wait for unpublished desired heads, so they are not a substitute for a
-fresh intake of a terminal failed, unpublished source.
+```json
+{"intake":{"revision_id":"fresh-recovery-revision","idempotency_key":"fresh-recovery-request","expected_generation":"actual-current-source-generation"}}
+```
+
+Add that object to the complete original request; it is not a standalone ingest
+body. Poll the newly returned operation to completion and retain the old failed
+operation for audit. A changed generation is a conflict to reconcile, not
+permission to overwrite another writer. This flow uses current source and
+document scopes, record authority and grants; it does not require giving write
+access to the extractor worker.
+
+Source GET responses strip the private `_manual_doc` template even when raw-source
+read permission is present. Do not round-trip a GET response into PUT and expect
+document reprocessing. The retained `PUT /v1/sources/{id}` API is usable when the
+caller already holds the complete intended original Source payload/template.
+Its Source fields belong at the top level beside the fresh `intake` object, not
+inside a `source` property. The versioned source PUT similarly requires its
+complete original public input. Reprocess jobs wait for unpublished desired
+heads, so they are not a substitute for fresh intake of failed, unpublished
+documents.
 
 Work-queue transient retries default to 10 attempts in Recall 0.9.1; the existing
 `PIPELINE_WORK_TRANSIENT_RETRY_MAX_ATTEMPTS` override remains authoritative.
 Exponential backoff retains its 10-second base and 120-second cap. This does
 not raise a model/provider repair budget, change storage's generic retry policy
 or make terminal failures retryable.
+
+## Recover an existing vector index
+
+The Recall 0.9.1 engine correction persists identical-vector membership changes
+and prevents filtered-out records from consuming result slots. It does not
+reconstruct membership already missing from an existing index. Restarting or
+writing the same vector again is not proof of recovery: unchanged indexed values
+can skip index maintenance. Remote storage requires the corrected paired server
+or the corresponding external engine repair; a Recall client upgrade alone is
+insufficient.
+
+For a source stuck before publication, use the original document intake and fresh
+revision/key/current-generation contract under [operator retries](#operator-retries).
+This retains the source identity and creates new physical document, node and
+vector identities under the new publication fence. A previous accepted,
+processing or retryable operation becomes superseded; an old `failed_final`
+receipt remains unchanged. Observe the **new** operation until it completes and
+verify the published source head. HTTP 202 records acceptance, not recovery.
+
+Governed embedding reindex skips unpublished source nodes and is not a repair
+for their missing index memberships. Its [staged profile migration](#long-documents-and-embedding-profiles)
+requires a distinct approved target and complete published-data coverage before
+activation. Do not change profiles merely to try to unstick an unpublished
+source. Recall does not expose a general embedded-index rebuild command; do not
+edit live database files or bypass publication guards.
+
+Fresh processing may call configured providers and consume budget. Check
+[headroom](#inspect-budget-before-an-import) before resubmission. Existing calls
+and receipts are neither replayed nor refunded by a new intake, and upgrading
+does not by itself establish that affected sources have recovered.
 
 ## Readiness, shutdown and recovery
 

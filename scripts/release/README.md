@@ -66,9 +66,11 @@ runtime acceptance or change the minimum supported system from the filename.
 
 The `meerkat-recall-native/v1` manifest additionally hashes every bundled file
 and records the compatibility symlink. Packaging includes extraction skills,
-service templates, license texts and all seven patched vendored dependency trees,
-including the minimal Meerkat HTTP backport with its per-crate licenses, patch
-notes and `provider-http-backport.json` source/checksum record. Native archives
+service templates, license texts and the six patched vendored dependency trees.
+Meerkat 0.9.0 supplies the provider HTTP defenses upstream;
+`meerkat-provider-upstream.json` records the registry source/checksums that replace
+the historical HTTP backports, with exact published license texts retained under
+`licenses/meerkat-0.9.0` (container: `/usr/share/licenses/meerkat-recall/meerkat-0.9.0`). Native archives
 and container images carry the same patched source inventory. This includes the
 pinned SurrealDB core and SDK 2.6.5, their complete Business Source License 1.1
 texts, upstream checksums and `RECALL_SURREALDB_PATCH.md`. These component
@@ -135,7 +137,7 @@ The scheduler must allocate one Recall Cargo slot and set the same absolute
 The persistent allocation receipt monitors source, Docker, output and temporary
 filesystems, deduplicating shared devices. Every positive observed usage increment
 consumes the aggregate `RECALL_ARTIFACT_MAX_GIB` allocation (default150; cannot
-exceed800). An explicit value above150 requires the host scheduler's approval.
+exceed1280). An explicit value above150 requires the host scheduler's approval.
 Increasing this setting never raises an existing ledger's limit: that requires
 a separate coordinated transition while every prior ledger reader is stopped.
 The transition must retain the original baseline and consumption, and must not

@@ -165,7 +165,10 @@ class ArtifactTests(unittest.TestCase):
             directory.mkdir(parents=True)
             (directory / "LICENSE").write_text("upstream license fixture")
             (directory / "patched.rs").write_text("exact patched source fixture")
-        (source / "vendor/provider-http-backport.json").write_text('{"fixture":true}')
+        (source / "vendor/meerkat-provider-upstream.json").write_text('{"fixture":true}')
+        (source / "scripts/release/meerkat-notices").mkdir()
+        for name in ("LICENSE-MIT", "LICENSE-APACHE"):
+            (source / "scripts/release/meerkat-notices" / name).write_text(f"upstream Meerkat {name} fixture")
         self.manifest["build"]["native_reference_capability"] = reference_fixture(source / "vendor")
         identity = {key: self.manifest[key] for key in
                     ("source_commit", "source_tree", "source_tar_sha256", "cargo_lock_sha256")}
@@ -181,7 +184,7 @@ class ArtifactTests(unittest.TestCase):
             self.assertIn(f"third-party/{name}", manifest["files"])
         for name in artifact.REFERENCE_SOURCE_TREES:
             self.assertIn(f"licenses/{name}-LICENSE", manifest["files"])
-        self.assertIn("third-party/provider-http-backport.json", manifest["files"])
+        self.assertIn("third-party/meerkat-provider-upstream.json", manifest["files"])
         self.assertIn("third-party/SOURCE_NOTICES.txt", manifest["files"])
         self.assertEqual(manifest["files"]["provision-fastembed"]["mode"], 0o755)
         expected_docs = ["README.md", *artifact.OPERATIONAL_DOCUMENTS,
@@ -189,6 +192,11 @@ class ArtifactTests(unittest.TestCase):
                            ("homecore-operations.md", "examples.json", "operator-template.json"))]
         installed = self.root / "operator-install"
         artifact.verify(archive, artifact.digest(archive), installed)
+        for name in ("LICENSE-MIT", "LICENSE-APACHE"):
+            bundled = f"licenses/meerkat-0.9.0/{name}"
+            self.assertIn(bundled, manifest["files"])
+            self.assertEqual((installed / bundled).read_bytes(),
+                             (source / "scripts/release/meerkat-notices" / name).read_bytes())
         for name in expected_docs:
             self.assertIn(name, manifest["files"])
             original = source / ("scripts/release/ARTIFACT_README.md" if name == "README.md" else name)

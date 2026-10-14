@@ -6,10 +6,15 @@ used by this release candidate, including upstream copyright/license texts:
 - pdf-inspector 1.25.2: MIT; see pdf-inspector and THIRD_PARTY_NOTICES.md.
 - surrealkv 0.9.3: Apache-2.0; see surrealkv-0.9.3/LICENSE and the accompanying
   backport notes, patch and upstream archive checksum record.
-- meerkat-llm-core 0.8.51, meerkat-openai 0.8.51, meerkat-gemini 0.8.51:
-  MIT OR Apache-2.0; see each crate's LICENSE-MIT, LICENSE-APACHE and
-  RECALL_PATCH.md. provider-http-backport.json identifies upstream release and
-  defensive source commits, registry archive hashes and modified file hashes.
+- tokenizers 0.22.2: Apache-2.0; rav1e 0.8.1: BSD-2-Clause. Each tree retains
+  its licenses and RECALL_PATCH.md describing its paste dependency replacement.
+- Meerkat 0.9.0 provider crates are unmodified registry dependencies under
+  MIT OR Apache-2.0. meerkat-provider-upstream.json records the published source
+  and package checksums whose defensive transport behavior replaces the three
+  historical Recall HTTP backports. Those old patched trees are not used or
+  bundled by this release. The exact published upstream LICENSE-MIT and
+  LICENSE-APACHE texts are retained under licenses/meerkat-0.9.0 in native
+  archives and /usr/share/licenses/meerkat-recall/meerkat-0.9.0 in containers.
 
 - surrealdb-core 2.6.5 and surrealdb SDK 2.6.5: Business Source License 1.1
   (BUSL-1.1); see each tree's complete LICENSE and the separately displayed

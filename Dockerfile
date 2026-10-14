@@ -105,16 +105,16 @@ RUN ldd /usr/local/bin/meerkat-recall > /usr/share/meerkat-recall/runtime-depend
 COPY --from=builder /app/skills /usr/share/meerkat-recall/skills
 COPY LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md /usr/share/licenses/meerkat-recall/
 COPY scripts/release/onnxruntime-notices/ /usr/share/licenses/meerkat-recall/onnxruntime-1.24.2/
+COPY scripts/release/meerkat-notices/ /usr/share/licenses/meerkat-recall/meerkat-0.9.0/
 COPY scripts/release/provision-fastembed /usr/share/meerkat-recall/provision-fastembed
 COPY scripts/release/ARTIFACT_README.md /usr/share/meerkat-recall/README.md
 COPY scripts/release/README.md scripts/release/DARWIN_BUILDER.md /usr/share/meerkat-recall/scripts/release/
 COPY docs/internal/recall-preview-contract /usr/share/meerkat-recall/docs/internal/recall-preview-contract
 COPY docs/snapshot-durability.md docs/embedded-durable-commits.md /usr/share/meerkat-recall/docs/
 COPY scripts/release/THIRD_PARTY_SOURCE_NOTICES.txt /usr/share/meerkat-recall/third-party/SOURCE_NOTICES.txt
-COPY vendor/meerkat-llm-core-0.8.51 /usr/share/meerkat-recall/third-party/meerkat-llm-core-0.8.51
-COPY vendor/meerkat-openai-0.8.51 /usr/share/meerkat-recall/third-party/meerkat-openai-0.8.51
-COPY vendor/meerkat-gemini-0.8.51 /usr/share/meerkat-recall/third-party/meerkat-gemini-0.8.51
-COPY vendor/provider-http-backport.json /usr/share/meerkat-recall/third-party/provider-http-backport.json
+COPY vendor/meerkat-provider-upstream.json /usr/share/meerkat-recall/third-party/meerkat-provider-upstream.json
+COPY vendor/tokenizers-0.22.2 /usr/share/meerkat-recall/third-party/tokenizers-0.22.2
+COPY vendor/rav1e-0.8.1 /usr/share/meerkat-recall/third-party/rav1e-0.8.1
 COPY vendor/surrealdb-core-2.6.5 /usr/share/meerkat-recall/third-party/surrealdb-core-2.6.5
 COPY vendor/surrealdb-2.6.5 /usr/share/meerkat-recall/third-party/surrealdb-2.6.5
 COPY vendor/surrealdb-core-2.6.5-upstream-sha256.json vendor/surrealdb-2.6.5-upstream-sha256.json vendor/RECALL_SURREALDB_PATCH.md /usr/share/meerkat-recall/third-party/

@@ -33,6 +33,28 @@ for pkg in sorted(packages, key=lambda item: item["name"]):
             f"{pkg['name']}: version {pkg['version']} != workspace {workspace_version}"
         )
 
+# The local helper ships from this repository alongside the native service.
+helper = json.loads((root / "elephant-local-helper/package.json").read_text())
+helper_lock = json.loads((root / "elephant-local-helper/package-lock.json").read_text())
+for label, version in (
+    ("elephant-local-helper", helper["version"]),
+    ("elephant-local-helper lock", helper_lock["version"]),
+    ("elephant-local-helper lock root", helper_lock["packages"][""]["version"]),
+):
+    if version != workspace_version:
+        mismatches.append(f"{label}: version {version} != workspace {workspace_version}")
+
+# Exact family pins keep the SDK coherent across direct dependencies.
+meerkat_versions = {
+    name: dependency["version"]
+    for name, dependency in cargo["workspace"]["dependencies"].items()
+    if name == "meerkat" or name.startswith("meerkat-")
+}
+if len(set(meerkat_versions.values())) != 1 or any(
+    not version.startswith("=") for version in meerkat_versions.values()
+):
+    mismatches.append("direct Meerkat dependencies must share one exact version")
+
 if mismatches:
     print("Version parity check failed:", file=sys.stderr)
     for mismatch in mismatches:

@@ -26,12 +26,12 @@ committed, removing it from the latest tree does not remove it from history.
 
 ## Distribution contract
 
-The current source declares Meerkat Recall `0.1.0` and pins its six direct Meerkat
-family dependencies to `0.8.51`. It has no direct MobKit dependency. These
-source versions do not imply acceptance of an external MobKit or HomeCore
-runtime, or compatibility with the planned 0.9 platform. After Meerkat 0.9
-ships, upgrade Recall to that published dependency and release Recall 0.9 to
-match. Record that integration's exact versions and live acceptance separately.
+The current source declares Meerkat Recall `0.9.0` and exact-pins its six direct
+Meerkat family dependencies to the published `0.9.0` release. It has no direct
+Meta dependency. Record this integration's exact versions and live acceptance
+separately; matching versions do not establish acceptance of external Meta or
+HomeCore runtimes. Existing Recall `v0.1.0` tags and artifacts remain immutable.
+Publish `v0.9.0` only after the corresponding source and artifacts qualify.
 
 The initial distribution includes source and native binary downloads, without
 a registry-published Rust library. Native targets are Linux x86-64

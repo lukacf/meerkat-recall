@@ -8,10 +8,10 @@ repository.workspace = true
 description = "Rust facade for embedding Elephant knowledge storage and ingestion"
 
 [dependencies]
-elephant-types = { path = "../types", version = "0.1.0" }
-elephant-storage = { path = "../storage", version = "0.1.0" }
-elephant-pipeline = { path = "../pipeline", version = "0.1.0" }
-elephant-pipeline-bin = { path = "../../bin/elephant-pipeline", package = "elephant-pipeline-bin", version = "0.1.0" }
+elephant-types = { path = "../types", version = "0.9.0" }
+elephant-storage = { path = "../storage", version = "0.9.0" }
+elephant-pipeline = { path = "../pipeline", version = "0.9.0" }
+elephant-pipeline-bin = { path = "../../bin/elephant-pipeline", package = "elephant-pipeline-bin", version = "0.9.0" }
 
 tokio = { workspace = true }
 serde = { workspace = true }

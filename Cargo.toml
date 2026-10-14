@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 exclude = [
+    # Historical Recall 0.1 provider backports; 0.9 uses unmodified registry crates.
     "vendor/meerkat-llm-core-0.8.51",
     "vendor/meerkat-openai-0.8.51",
     "vendor/meerkat-gemini-0.8.51",
@@ -55,7 +56,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["Elephant Team"]
 license = "MIT OR Apache-2.0"
@@ -64,14 +65,14 @@ rust-version = "1.94.0"
 
 [workspace.dependencies]
 # Meerkat - keep the facade and direct family dependencies on one release.
-meerkat = { version = "=0.8.51", default-features = false, features = ["anthropic", "openai", "gemini", "memory-store", "mcp", "session-compaction", "comms"] }
-meerkat-core = { version = "=0.8.51" }
-meerkat-mcp = { version = "=0.8.51" }
-meerkat-runtime = { version = "=0.8.51" }
-meerkat-skills = { version = "=0.8.51", default-features = false }
+meerkat = { version = "=0.9.0", default-features = false, features = ["anthropic", "openai", "gemini", "memory-store", "mcp", "session-compaction", "comms"] }
+meerkat-core = { version = "=0.9.0" }
+meerkat-mcp = { version = "=0.9.0" }
+meerkat-runtime = { version = "=0.9.0" }
+meerkat-skills = { version = "=0.9.0", default-features = false }
 # Test-only: pins the model-catalog regression test (gpt-5.6-sol resolution),
 # the reason this port exists. Version-unified with the meerkat facade above.
-meerkat-models = { version = "=0.8.51" }
+meerkat-models = { version = "=0.9.0" }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
@@ -188,9 +189,6 @@ push = true
 # Preserve reviewed PDF extraction and storage snapshot compatibility repairs.
 # Provenance is recorded beside each pinned source copy.
 [patch.crates-io]
-meerkat-openai = { path = "vendor/meerkat-openai-0.8.51" }
-meerkat-gemini = { path = "vendor/meerkat-gemini-0.8.51" }
-meerkat-llm-core = { path = "vendor/meerkat-llm-core-0.8.51" }
 pdf-inspector = { path = "vendor/pdf-inspector" }
 surrealkv = { path = "vendor/surrealkv-0.9.3" }
 

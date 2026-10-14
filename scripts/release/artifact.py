@@ -24,9 +24,9 @@ FORMAT = "meerkat-recall-native/v1"
 TARGETS = {"x86_64-unknown-linux-gnu", "aarch64-apple-darwin"}
 FEATURES = ["rocksdb", "fastembed"]
 PATCHED_SOURCE_TREES = (
-    "pdf-inspector", "surrealkv-0.9.3", "meerkat-llm-core-0.8.51",
-    "meerkat-openai-0.8.51", "meerkat-gemini-0.8.51",
+    "pdf-inspector", "surrealkv-0.9.3",
     "surrealdb-core-2.6.5", "surrealdb-2.6.5",
+    "tokenizers-0.22.2", "rav1e-0.8.1",
 )
 OPERATIONAL_DOCUMENTS = (
     "docs/snapshot-durability.md", "docs/embedded-durable-commits.md",
@@ -293,10 +293,12 @@ def package(root: Path, binary: Path, target: str, output: Path, receipt: Path) 
         for path in sorted((root / "vendor").glob("surrealkv-0.9.3-*")):
             if path.is_file():
                 shutil.copyfile(path, bundle / "third-party" / path.name)
-        shutil.copyfile(root / "vendor" / "provider-http-backport.json", bundle / "third-party" / "provider-http-backport.json")
+        shutil.copyfile(root / "vendor" / "meerkat-provider-upstream.json", bundle / "third-party" / "meerkat-provider-upstream.json")
         for name in REFERENCE_SOURCE_RECORDS:
             shutil.copyfile(root / "vendor" / name, bundle / "third-party" / name)
         (bundle / "licenses").mkdir()
+        shutil.copytree(root / "scripts/release/meerkat-notices",
+                        bundle / "licenses/meerkat-0.9.0")
         if target == "x86_64-unknown-linux-gnu":
             shutil.copytree(root / "scripts/release/onnxruntime-notices",
                             bundle / "licenses/onnxruntime-1.24.2")

@@ -462,6 +462,10 @@ mod model {
             self.projection_client.compile_schema(schema)
         }
 
+        fn output_token_limit(&self) -> Option<u32> {
+            self.projection_client.output_token_limit()
+        }
+
         fn request_pressure(
             &self,
             request: &LlmRequest,

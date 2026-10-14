@@ -6,8 +6,9 @@ icon: download
 
 Download native releases for Linux x86-64 and macOS ARM64 from
 [the canonical Meerkat Recall repository](https://github.com/lukacf/meerkat-recall/releases).
-Use each archive with its matching release record. The source declares `0.1.0`
-with Meerkat `0.8.51`. See
+Use each archive with its matching release record. This source prepares `0.9.0`
+with published Meerkat `0.9.0`; use the version actually published in the selected
+release. Existing `0.1.0` archives retain their original dependencies and receipts. See
 [release binaries](/operations/deployment#release-binaries) for the promotion process
 and build provenance requirements.
 
@@ -15,8 +16,8 @@ and build provenance requirements.
 
 | Target | Archive name |
 |---|---|
-| Linux x86-64 | `meerkat-recall-0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS ARM64 (Apple Silicon) | `meerkat-recall-0.1.0-aarch64-apple-darwin.tar.gz` |
+| Linux x86-64 | `meerkat-recall-VERSION-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS ARM64 (Apple Silicon) | `meerkat-recall-VERSION-aarch64-apple-darwin.tar.gz` |
 
 The build workflow targets Linux and native macOS ARM64. Check the selected
 release's actual host and dynamic-library acceptance before treating another
@@ -50,13 +51,13 @@ running executable. Retain the complete version directory for skills, licenses
 and provenance. Read the selected archive digest from the trusted manifest:
 
 ```bash
-archive=meerkat-recall-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+archive=meerkat-recall-VERSION-x86_64-unknown-linux-gnu.tar.gz
 # Use aarch64-apple-darwin on Apple Silicon.
 expected_sha256="$(awk -v name="$archive" '$2 == name { print $1 }' checksums.sha256)"
 test "${#expected_sha256}" -eq 64
 python3 scripts/release/artifact.py install \
   --archive "$archive" --sha256 "$expected_sha256" \
-  --destination /absolute/releases/recall-0.1.0-DIGEST
+  --destination /absolute/releases/recall-VERSION-DIGEST
 ```
 
 Choose a new absolute destination and retain its complete tree. Add that version

@@ -12,11 +12,11 @@ lifecycle; Recall adds shared, evidence-backed knowledge. It is an optional,
 independently released component. See the
 [ecosystem guide](https://docs.rkat.ai/ecosystem) to choose your starting point.
 
-Meerkat Recall v0.1.0 is a normal release, published in the canonical
-[repository](https://github.com/lukacf/meerkat-recall) with
-[source and native downloads](https://github.com/lukacf/meerkat-recall/releases/tag/v0.1.0).
-It remains pre-1.0 software; the release notes record supported platforms,
-actual qualification and known limits.
+This branch targets Recall 0.9.0 with the published Meerkat 0.9.0 SDK.
+The latest published Recall release is
+[v0.1.0](https://github.com/lukacf/meerkat-recall/releases/tag/v0.1.0).
+Find source, native downloads, supported platforms and known limits in the
+[release notes](https://github.com/lukacf/meerkat-recall/releases).
 
 Read the [Recall documentation](https://docs.rkat.ai/recall/introduction) for
 setup, HTTP and MCP integration, deployment, and the knowledge model.
@@ -29,15 +29,15 @@ checksums, and model-provider prerequisites. Use each archive with its matching
 release record. The source demo below is a separate build without model extraction.
 
 The command is `meerkat-recall`; native archives retain an `elephant` alias
-through the 0.1 line. Existing `.elephant` configuration, `ELEPHANT_*` variables,
+for existing deployments. Existing `.elephant` configuration, `ELEPHANT_*` variables,
 database names and HTTP/MCP wire identifiers remain unchanged. The first
 release provides source and native downloads, without a registry-published
 Rust library.
 
 For a persistent native service, follow [service setup](docs/operations/service-setup.mdx).
-Version 0.1.0 uses the pinned Meerkat 0.8.51 dependencies. Meerkat 0.9 is now
-available, and the Recall upgrade is in progress. Recall 0.9 will use Meerkat 0.9
-and match its version; the currently published Recall release remains 0.1.0.
+Recall 0.9.0 exact-pins the published Meerkat 0.9.0 family. The SDK now includes
+the native provider transport protections previously carried as Recall patches.
+The v0.1.0 artifacts continue using their original Meerkat 0.8.51 dependencies.
 Consult the release notes for tested behavior and remaining limits.
 
 ## Try the Living Wiki demo

@@ -1,0 +1,6 @@
+# This real 256-Work / 257-Source native boundary retains its original 240s
+# deadline. Give it the full test scheduler budget, as in its retained isolated
+# qualification, instead of competing with unrelated database constructors.
+[[profile.default.overrides]]
+filter = "test(=reprocess::budget::independent_producer_ancestry::native_actual_256_work_and_257_source_boundaries)"
+threads-required = "num-test-threads"

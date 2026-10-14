@@ -231,6 +231,7 @@ pub struct StorageClient {
     physical_failure_lease:
         Arc<std::sync::Mutex<Option<Arc<tokio::sync::OwnedRwLockWriteGuard<()>>>>>,
     native_maintenance_deadline: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    native_background_gate: Option<Arc<tokio::sync::RwLock<()>>>,
 }
 
 fn physical_remaining_ms(deadline: std::time::Instant) -> StorageResult<u64> {
@@ -275,6 +276,10 @@ fn native_engine_config(config: &StorageConfig) -> surrealdb::opt::Config {
 #[cfg(test)]
 #[path = "client_native_test_barrier.rs"]
 mod native_test_barrier;
+
+#[cfg(test)]
+#[path = "client_native_background_tests.rs"]
+mod native_background_tests;
 
 impl StorageClient {
     /// Verified model resources shared by repositories and fresh dispatch handles.
@@ -468,6 +473,13 @@ impl StorageClient {
         } else {
             store_writer
         };
+        let native_background_gate = (config.backend == StorageBackendKind::SurrealDb
+            && is_local_engine_url(&config.url))
+        .then(|| Arc::new(tokio::sync::RwLock::new(())));
+        let engine_config = match &native_background_gate {
+            Some(gate) => engine_config.recall_background_gate(gate.clone()),
+            None => engine_config,
+        };
         let recovery = Arc::new(RecoveryBarrier::default());
         let client = match config.backend {
             StorageBackendKind::SurrealDb => {
@@ -524,6 +536,7 @@ impl StorageClient {
                     maintenance_lease: None,
                     physical_failure_lease: Arc::new(std::sync::Mutex::new(None)),
                     native_maintenance_deadline: Arc::new(std::sync::Mutex::new(None)),
+                    native_background_gate,
                 }
             }
             StorageBackendKind::ElephantDb => {
@@ -554,6 +567,7 @@ impl StorageClient {
                     maintenance_lease: None,
                     physical_failure_lease: Arc::new(std::sync::Mutex::new(None)),
                     native_maintenance_deadline: Arc::new(std::sync::Mutex::new(None)),
+                    native_background_gate,
                 }
             }
         };
@@ -1320,6 +1334,31 @@ impl StorageClient {
             }
         }
         Ok(())
+    }
+
+    pub(crate) async fn pause_native_background(
+        &self,
+        deadline: std::time::Instant,
+    ) -> StorageResult<Option<tokio::sync::OwnedRwLockWriteGuard<()>>> {
+        if !self.maintenance || self.maintenance_lease.is_none() {
+            return Err(StorageError::Conflict(
+                "native background pause requires exclusive maintenance".into(),
+            ));
+        }
+        let Some(gate) = &self.native_background_gate else {
+            return Ok(None);
+        };
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or_else(|| crate::durability_io::io_error("original backup deadline exhausted"))?;
+        tokio::time::timeout(remaining, gate.clone().write_owned())
+            .await
+            .map(Some)
+            .map_err(|_| {
+                crate::durability_io::io_error(
+                    "native background drain exceeded original backup deadline",
+                )
+            })
     }
 
     pub(crate) async fn snapshot_bytes(

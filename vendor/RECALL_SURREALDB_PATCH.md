@@ -501,6 +501,35 @@ execution target and do not count as executed workspace tests. All controls are
 source-only until separately run. No measured speedup or ancestry PASS follows;
 the original 256-Work / 257-Source whole-case 240-second oracle is unchanged.
 
+## Snapshot background maintenance gate
+
+The local SDK Config can share a `recall_background_gate` with Recall's snapshot
+owner. All five periodic SDK operations (node refresh, expiration, cleanup,
+changefeed collection, and index compaction), plus notification-driven live-query
+cleanup, hold a read lease while changing the datastore. Pending leases remain
+cancellable on SDK shutdown. Notification cleanup drops the in-memory query-map
+read lease before removing the entry; the Wasm serial router schedules gated
+cleanup separately so it can still serve the export owner's requests.
+
+Recall first drains its existing foreground maintenance barrier, then obtains the
+write lease using the remaining original 300-second proof budget. That lease spans
+both complete native inventories, export, causal sidecar creation and sealing.
+Normal completion and error unwinding release it. Periodic operations resume;
+no timer is disabled, no metadata is omitted, and the complete before/after
+fingerprint comparison still rejects unknown or remote concurrent writers.
+Remote connectors have no local pause guarantee. SDK background workers never
+acquire Recall's foreground barrier, so the two gates have one acquisition order.
+
+This fixes an independent local writer: changefeed processing records database
+versionstamp/timestamp keys even without a configured changefeed. Those keys
+belong to the complete native history and can change during a long export even
+when application writes are drained. The storage regression uses a real 20ms
+SDK changefeed worker, verifies equal inventories across native export while
+paused, then proves SDK and foreground writes resume. The SDK cancellation test
+holds the exclusive gate while cancelling all five periodic workers. These
+source tests require runtime qualification; source provenance alone is not a
+passing test result. Original upstream manifests and archive hashes stay intact.
+
 ## Physical source checkpoint hashes
 
 The explicit allowlist covers 866 original upstream files. The following
@@ -515,6 +544,10 @@ source provenance; it does not claim compilation or runtime qualification.
 | `vendor/surrealdb-2.6.5/Cargo.toml` | `cf9d919b73102154286523f7db08f4a6111b1071a762677b5ebc8f07f1c8ee52` |
 | `vendor/surrealdb-2.6.5/RECALL_PROVENANCE.json` | `f9600d67467ad6e56230e74de68b9980626a4098ba8d9850d4bf4ccd089644a9` |
 | `vendor/surrealdb-2.6.5/src/api/conn/cmd.rs` | `2899ab6bb8785af2e6d94a66b13538b90272b6c53e80ee8c5aa3593cf0b7bbc7` |
+| `vendor/surrealdb-2.6.5/src/api/engine/local/native.rs` | `49d7fbaa345341382f2498b3ae4acc3fb9f740e2309da148373b433d72676933` |
+| `vendor/surrealdb-2.6.5/src/api/engine/local/wasm.rs` | `ccc6a6b81742d686a28cbf6688420d69d2bf62a791cf12293758b94635d149ec` |
+| `vendor/surrealdb-2.6.5/src/api/engine/tasks.rs` | `e39b48306388243f7195186e3446153c75acce94090fa6f37ae5c0b9638ab9a8` |
+| `vendor/surrealdb-2.6.5/src/api/opt/config.rs` | `c9a278e014d2277b8d7d96266500b8b297b6f288b3a2af355a2e291f29dab7ae` |
 | `vendor/surrealdb-2.6.5/src/api/engine/local/mod.rs` | `2fb383c594248e75d541f9864d0379cc282986d8e2ce4af2d33b91e94489a58b` |
 | `vendor/surrealdb-2.6.5/src/api/engine/remote/mod.rs` | `5f9ca74cda88a57b1b9208a06ca0005f603437f17711f57071220e52960b95ae` |
 | `vendor/surrealdb-2.6.5/src/api/method/mod.rs` | `494ce4da24f74dc334f462205c40133a99de817120ce98598fba26e22f400c2f` |

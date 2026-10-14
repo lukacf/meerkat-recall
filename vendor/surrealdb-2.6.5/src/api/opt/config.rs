@@ -8,6 +8,7 @@ use surrealdb_core::{dbs::Capabilities as CoreCapabilities, iam::Level};
 /// Configuration for server connection, including: strictness, notifications, query_timeout, transaction_timeout
 #[derive(Debug, Clone, Default)]
 pub struct Config {
+	pub(crate) recall_background_gate: Option<std::sync::Arc<tokio::sync::RwLock<()>>>,
 	pub(crate) strict: bool,
 	pub(crate) ast_payload: bool,
 	pub(crate) query_timeout: Option<Duration>,
@@ -33,6 +34,16 @@ impl Config {
 	/// Create a default config that can be modified to configure a connection
 	pub fn new() -> Self {
 		Default::default()
+	}
+
+	/// Share a local-engine background maintenance gate with a snapshot owner.
+	///
+	/// Each background operation holds a read lease. A caller holding the write
+	/// lease can inspect and export stable native history while foreground access
+	/// is drained separately. Remote engines do not consume this local gate.
+	pub fn recall_background_gate(mut self, gate: std::sync::Arc<tokio::sync::RwLock<()>>) -> Self {
+		self.recall_background_gate = Some(gate);
+		self
 	}
 
 	/// Set the strict value of the config to the supplied value

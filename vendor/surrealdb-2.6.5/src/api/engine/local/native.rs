@@ -134,7 +134,13 @@ pub(crate) async fn run_router(
 	if let Some(interval) = address.config.changefeed_gc_interval {
 		opt.changefeed_gc_interval = interval;
 	}
-	let tasks = tasks::init(kvs.clone(), canceller.clone(), &opt);
+	let background_gate = address.config.recall_background_gate.unwrap_or_default();
+	let tasks = tasks::init_with_gate(
+		kvs.clone(),
+		canceller.clone(),
+		&opt,
+		background_gate.clone(),
+	);
 
 	let mut notifications = kvs.notifications().map(Box::pin);
 	let mut notification_stream = poll_fn(move |cx| match &mut notifications {
@@ -180,12 +186,20 @@ pub(crate) async fn run_router(
 					data: notification.result
 				};
 
+				let background_gate = background_gate.clone();
+				let canceller = canceller.clone();
 				tokio::spawn(async move {
 					let id = notification.query_id;
-					if let Some(sender) = live_queries.read().await.get(&id) {
+					let sender = live_queries.read().await.get(&id).cloned();
+					if let Some(sender) = sender {
 
 						if sender.send(Ok(notification)).await.is_err() {
 							live_queries.write().await.remove(&id);
+							let _maintenance = tokio::select! {
+								biased;
+								_ = canceller.cancelled() => return,
+								lease = background_gate.read() => lease,
+							};
 							if let Err(error) =
 								super::kill_live_query(&kvs, id, &*session.read().await, vars.read().await.clone()).await
 							{

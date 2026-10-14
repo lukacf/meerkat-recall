@@ -231,6 +231,9 @@ async fn export_owned(
     // One native proof deadline covers inspection, export, causal derivation and
     // verification. The existing admission-drain budget remains separate.
     let origin_deadline = Instant::now() + Duration::from_secs(300);
+    // Foreground admissions have drained. The SDK has independent writers;
+    // keep them paused across the complete original inventory and sealed export.
+    let _native_background = privileged.pause_native_background(origin_deadline).await?;
     let native_origins = if client.backend() == StorageBackendKind::SurrealDb {
         let before = crate::source_history_restore::inventory(&privileged, origin_deadline).await?;
         // B layers the original live inverse planner over complete native
@@ -284,6 +287,7 @@ async fn export_owned(
     sync_directory(parent)?;
     validate_manifest(&manifest, Utc::now())?;
     drop(privileged);
+    drop(_native_background);
     guard.finish();
     Ok(manifest)
 }

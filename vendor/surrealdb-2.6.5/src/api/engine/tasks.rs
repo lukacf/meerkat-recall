@@ -42,12 +42,25 @@ impl Tasks {
 //
 // This function needs to be called before after the dbs::init and before the net::init functions.
 // It needs to be before net::init because the net::init function blocks until the web server stops.
+#[cfg(test)]
 pub fn init(dbs: Arc<Datastore>, canceller: CancellationToken, opts: &EngineOptions) -> Tasks {
-	let task1 = spawn_task_node_membership_refresh(dbs.clone(), canceller.clone(), opts);
-	let task2 = spawn_task_node_membership_check(dbs.clone(), canceller.clone(), opts);
-	let task3 = spawn_task_node_membership_cleanup(dbs.clone(), canceller.clone(), opts);
-	let task4 = spawn_task_changefeed_cleanup(dbs.clone(), canceller.clone(), opts);
-	let task5 = spawn_task_index_compaction(dbs.clone(), canceller.clone(), opts);
+	init_with_gate(dbs, canceller, opts, Arc::default())
+}
+
+pub fn init_with_gate(
+	dbs: Arc<Datastore>,
+	canceller: CancellationToken,
+	opts: &EngineOptions,
+	gate: Arc<tokio::sync::RwLock<()>>,
+) -> Tasks {
+	let task1 =
+		spawn_task_node_membership_refresh(dbs.clone(), canceller.clone(), opts, gate.clone());
+	let task2 =
+		spawn_task_node_membership_check(dbs.clone(), canceller.clone(), opts, gate.clone());
+	let task3 =
+		spawn_task_node_membership_cleanup(dbs.clone(), canceller.clone(), opts, gate.clone());
+	let task4 = spawn_task_changefeed_cleanup(dbs.clone(), canceller.clone(), opts, gate.clone());
+	let task5 = spawn_task_index_compaction(dbs.clone(), canceller.clone(), opts, gate.clone());
 	Tasks(vec![task1, task2, task3, task4, task5])
 }
 
@@ -55,6 +68,7 @@ fn spawn_task_node_membership_refresh(
 	dbs: Arc<Datastore>,
 	canceller: CancellationToken,
 	opts: &EngineOptions,
+	gate: Arc<tokio::sync::RwLock<()>>,
 ) -> Task {
 	// Get the delay interval from the config
 	let delay = opts.node_membership_refresh_interval;
@@ -72,6 +86,11 @@ fn spawn_task_node_membership_refresh(
 				_ = canceller.cancelled() => break,
 				// Receive a notification on the channel
 				Some(_) = ticker.next() => {
+					let _maintenance = tokio::select! {
+						biased;
+						_ = canceller.cancelled() => break,
+						lease = gate.read() => lease,
+					};
 					if let Err(e) = dbs.node_membership_update().await {
 						error!("Error updating node registration information: {e}");
 					}
@@ -86,6 +105,7 @@ fn spawn_task_node_membership_check(
 	dbs: Arc<Datastore>,
 	canceller: CancellationToken,
 	opts: &EngineOptions,
+	gate: Arc<tokio::sync::RwLock<()>>,
 ) -> Task {
 	// Get the delay interval from the config
 	let delay = opts.node_membership_check_interval;
@@ -103,6 +123,11 @@ fn spawn_task_node_membership_check(
 				_ = canceller.cancelled() => break,
 				// Receive a notification on the channel
 				Some(_) = ticker.next() => {
+					let _maintenance = tokio::select! {
+						biased;
+						_ = canceller.cancelled() => break,
+						lease = gate.read() => lease,
+					};
 					if let Err(e) = dbs.node_membership_expire().await {
 						error!("Error processing and archiving inactive nodes: {e}");
 					}
@@ -117,6 +142,7 @@ fn spawn_task_node_membership_cleanup(
 	dbs: Arc<Datastore>,
 	canceller: CancellationToken,
 	opts: &EngineOptions,
+	gate: Arc<tokio::sync::RwLock<()>>,
 ) -> Task {
 	// Get the delay interval from the config
 	let delay = opts.node_membership_cleanup_interval;
@@ -134,6 +160,11 @@ fn spawn_task_node_membership_cleanup(
 				_ = canceller.cancelled() => break,
 				// Receive a notification on the channel
 				Some(_) = ticker.next() => {
+					let _maintenance = tokio::select! {
+						biased;
+						_ = canceller.cancelled() => break,
+						lease = gate.read() => lease,
+					};
 					if let Err(e) = dbs.node_membership_remove().await {
 						error!("Error processing and cleaning archived nodes: {e}");
 					}
@@ -148,6 +179,7 @@ fn spawn_task_changefeed_cleanup(
 	dbs: Arc<Datastore>,
 	canceller: CancellationToken,
 	opts: &EngineOptions,
+	gate: Arc<tokio::sync::RwLock<()>>,
 ) -> Task {
 	// Get the delay interval from the config
 	let delay = opts.changefeed_gc_interval;
@@ -165,6 +197,11 @@ fn spawn_task_changefeed_cleanup(
 				_ = canceller.cancelled() => break,
 				// Receive a notification on the channel
 				Some(_) = ticker.next() => {
+					let _maintenance = tokio::select! {
+						biased;
+						_ = canceller.cancelled() => break,
+						lease = gate.read() => lease,
+					};
 					if let Err(e) = dbs.changefeed_process().await {
 						error!("Error running changefeed garbage collection: {e}");
 					}
@@ -197,6 +234,7 @@ fn spawn_task_index_compaction(
 	dbs: Arc<Datastore>,
 	canceller: CancellationToken,
 	opts: &EngineOptions,
+	gate: Arc<tokio::sync::RwLock<()>>,
 ) -> Task {
 	// Get the delay interval from the config
 	let interval = opts.index_compaction_interval;
@@ -214,6 +252,11 @@ fn spawn_task_index_compaction(
 				_ = canceller.cancelled() => break,
 				// Receive a notification on the channel
 				Some(_) = ticker.next() => {
+					let _maintenance = tokio::select! {
+						biased;
+						_ = canceller.cancelled() => break,
+						lease = gate.read() => lease,
+					};
 					if let Err(e) = dbs.index_compaction(interval).await {
 						error!("Error running index compaction: {e}");
 					}
@@ -254,6 +297,28 @@ mod test {
 		let tasks = tasks::init(dbs.clone(), can.clone(), &opt);
 		can.cancel();
 		tasks.resolve().await.unwrap();
+	}
+
+	#[test_log::test(tokio::test)]
+	pub async fn tasks_cancel_while_background_gate_is_held() {
+		let can = CancellationToken::new();
+		let opt = EngineOptions::default()
+			.with_node_membership_refresh_interval(Duration::from_millis(1))
+			.with_node_membership_check_interval(Duration::from_millis(1))
+			.with_node_membership_cleanup_interval(Duration::from_millis(1))
+			.with_changefeed_gc_interval(Duration::from_millis(1))
+			.with_index_compaction_interval(Duration::from_millis(1));
+		let dbs = Arc::new(Datastore::new("memory").await.unwrap());
+		let gate = Arc::new(tokio::sync::RwLock::new(()));
+		let paused = gate.write().await;
+		let tasks = tasks::init_with_gate(dbs, can.clone(), &opt, gate.clone());
+		tokio::time::sleep(Duration::from_millis(20)).await;
+		can.cancel();
+		tokio::time::timeout(Duration::from_secs(2), tasks.resolve())
+			.await
+			.expect("queued background reads must remain cancellable")
+			.unwrap();
+		drop(paused);
 	}
 
 	#[test_log::test(tokio::test)]

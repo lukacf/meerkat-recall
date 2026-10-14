@@ -129,7 +129,13 @@ pub(crate) async fn run_router(
 	if let Some(interval) = address.config.changefeed_gc_interval {
 		opt.changefeed_gc_interval = interval;
 	}
-	let tasks = tasks::init(kvs.clone(), canceller.clone(), &opt);
+	let background_gate = address.config.recall_background_gate.unwrap_or_default();
+	let tasks = tasks::init_with_gate(
+		kvs.clone(),
+		canceller.clone(),
+		&opt,
+		background_gate.clone(),
+	);
 
 	let mut notifications = kvs.notifications().map(Box::pin);
 	let mut notification_stream = poll_fn(move |cx| match &mut notifications {
@@ -171,7 +177,8 @@ pub(crate) async fn run_router(
 				};
 
 				let id = notification.id;
-				if let Some(sender) = live_queries.read().await.get(&id) {
+				let sender = live_queries.read().await.get(&id).cloned();
+				if let Some(sender) = sender {
 
 					let notification = Notification {
 						query_id: notification.id.0,
@@ -181,11 +188,22 @@ pub(crate) async fn run_router(
 
 					if sender.send(Ok(notification)).await.is_err() {
 						live_queries.write().await.remove(&id);
-						if let Err(error) =
-							super::kill_live_query(&kvs, *id, &*session.read().await, vars.read().await.clone()).await
-						{
-							warn!("Failed to kill live query '{id}'; {error}");
-						}
+						let (kvs, session, vars) = (kvs.clone(), session.clone(), vars.clone());
+						let background_gate = background_gate.clone();
+						let canceller = canceller.clone();
+						let id = *id;
+						spawn_local(async move {
+							let _maintenance = tokio::select! {
+								biased;
+								_ = canceller.cancelled() => return,
+								lease = background_gate.read() => lease,
+							};
+							if let Err(error) =
+								super::kill_live_query(&kvs, id, &*session.read().await, vars.read().await.clone()).await
+							{
+								warn!("Failed to kill live query '{id}'; {error}");
+							}
+						});
 					}
 				}
 			}

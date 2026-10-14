@@ -2914,7 +2914,18 @@ mod tests {
         assert!(!discovery_headers(&config)
             .unwrap()
             .contains_key("X-Space-Id"));
-        let config = config.with_readiness_space(Some("invalid space".into()));
+        // Space identifiers preserve interior whitespace; reject only the
+        // existing contract's empty, edge-whitespace, control and byte bounds.
+        let config = config.with_readiness_space(Some("valid space".into()));
+        assert_eq!(
+            discovery_headers(&config).unwrap().get("X-Space-Id"),
+            Some(&"valid space".to_string())
+        );
+        for invalid in ["", " edge", "edge ", "control\nspace"] {
+            let config = config.clone().with_readiness_space(Some(invalid.into()));
+            assert!(discovery_headers(&config).is_err());
+        }
+        let config = config.with_readiness_space(Some("x".repeat(257)));
         assert!(discovery_headers(&config).is_err());
     }
 

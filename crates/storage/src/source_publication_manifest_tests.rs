@@ -142,7 +142,37 @@ async fn fixture_with_registration(
     node_count: usize,
     complete_registration: bool,
 ) -> Fixture {
-    fixture_with_embedding_waits(storage, space, mode, node_count, complete_registration, &[]).await
+    fixture_with_embedding_waits(
+        storage,
+        space,
+        mode,
+        node_count,
+        complete_registration,
+        &[],
+        true,
+    )
+    .await
+}
+
+// Vector-positive cases retain their actual live claim until the final batch
+// is written through the source-authorized repository. Other fault fixtures
+// still finish work without vectors to exercise incomplete readiness.
+async fn embedding_fixture(
+    storage: StorageClient,
+    space: &str,
+    mode: IngestMode,
+    node_count: usize,
+) -> Fixture {
+    Box::pin(fixture_with_embedding_waits(
+        storage,
+        space,
+        mode,
+        node_count,
+        true,
+        &[],
+        false,
+    ))
+    .await
 }
 
 #[derive(Clone, Copy)]
@@ -170,6 +200,7 @@ async fn fixture_with_embedding_waits(
     node_count: usize,
     complete_registration: bool,
     embedding_waits: &[EmbeddingWait],
+    finish_embedding: bool,
 ) -> Fixture {
     let configuration = SpaceConfig {
         base: base(TableName::SpaceConfig, space),
@@ -350,7 +381,14 @@ async fn fixture_with_embedding_waits(
                 &publication,
                 &revision.base.id,
             ));
-        complete_embedding_work(&storage, &manifest, &revision.base.id, embedding_waits).await;
+        complete_embedding_work(
+            &storage,
+            &manifest,
+            &revision.base.id,
+            embedding_waits,
+            finish_embedding,
+        )
+        .await;
         for index in 0..node_count {
             let start = u32::try_from(index * 4).unwrap();
             let node = DocNode {
@@ -524,6 +562,7 @@ async fn complete_embedding_work(
     manifest: &SourcePublicationManifest,
     revision: &RecordId,
     waits: &[EmbeddingWait],
+    finish: bool,
 ) {
     let mut item = work_item(
         &manifest.space_id,
@@ -548,6 +587,11 @@ async fn complete_embedding_work(
         let fence = crate::work_attempt_repository::fence_from_claim(&claim).unwrap();
         assert_eq!(claim.attempts, 1, "waits refund the retry allowance");
         assert_eq!(fence.generation, u64::try_from(index + 1).unwrap());
+        if index == waits.len() && !finish {
+            // Keep the original successful attempt live for the source vector
+            // transaction; do not invent a completed run before persistence.
+            return;
+        }
         let mut run = WorkRun {
             base: base(TableName::WorkRun, &manifest.space_id),
             work_item: Link::new(item.base.id.clone()),
@@ -676,26 +720,86 @@ async fn register_completed(
     item
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the original claim and repository owners through vector persistence and completion."
+)]
 async fn embed(fixture: &Fixture, index: usize, vector: Vec<f32>) {
     let node = &fixture.nodes[index];
+    let space = &fixture.manifest.space_id;
     let model = embedding_model(&fixture.manifest).unwrap();
+    let items = crate::WorkItemRepository::new(fixture.storage.clone());
+    let claim = items
+        .get(
+            space,
+            &fixture
+                .manifest
+                .embedding_work_id(node.revision.id())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.status, WorkItemStatus::Running);
+    let fence = crate::work_attempt_repository::fence_from_claim(&claim).unwrap();
+    let repository = SourcePublicationManifestRepository::new(fixture.storage.clone());
+    let authority = Box::pin(repository.prepare_embedding_write(
+        space,
+        &fixture.manifest.publication,
+        &fixture.manifest.configuration,
+        &fence,
+        node.revision.id(),
+    ))
+    .await
+    .unwrap();
+    let mut embedding_base = node.base.clone();
+    embedding_base.id = RecordId::new_v4(TableName::ChunkEmbedding);
     let embedding = NodeEmbedding {
-        base: base(TableName::ChunkEmbedding, &fixture.manifest.space_id),
+        base: embedding_base,
         node: Link::new(node.base.id.clone()),
         model: model.clone(),
         dims: 3,
         vector,
     };
     crate::NodeEmbeddingRepository::new(fixture.storage.clone(), PartitionManager::new())
-        .store_embeddings_and_mark_nodes(
-            &fixture.manifest.space_id,
+        .store_source_embeddings_and_mark_nodes(
+            space,
             std::slice::from_ref(&node.base.id),
             &model,
             Utc::now(),
             vec![embedding],
+            &authority,
         )
         .await
         .unwrap();
+    if index + 1 == fixture.nodes.len() {
+        let mut run_base = claim.base.clone();
+        run_base.id = RecordId::new_v4(TableName::WorkRun);
+        let mut run = WorkRun {
+            base: run_base,
+            work_item: Link::new(claim.base.id.clone()),
+            attempt: claim.attempts,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            success: true,
+            error: None,
+            metrics: elephant_types::records::work::WorkRunMetrics::default(),
+            worker_id: "fixture".into(),
+            worker_version: "1".into(),
+            model_version: None,
+            prompt_id: None,
+            config_hash: None,
+        };
+        run.metrics.custom.insert(
+            "attempt_fence".into(),
+            serde_json::to_value(&fence).unwrap(),
+        );
+        crate::WorkRunRepository::new(fixture.storage.clone())
+            .create(run)
+            .await
+            .unwrap();
+        complete_claim(&fixture.storage, &claim).await;
+    }
 }
 
 #[tokio::test]
@@ -709,7 +813,7 @@ async fn embed(fixture: &Fixture, index: usize, vector: Vec<f32>) {
 )]
 async fn finished_subset_cannot_publish_or_shrink_sealed_expected_set() {
     for embedded in [true, false] {
-        let fixture = fixture(
+        let fixture = embedding_fixture(
             client(embedded).await,
             "quiet-business",
             IngestMode::Graph,
@@ -774,7 +878,7 @@ async fn finished_subset_cannot_publish_or_shrink_sealed_expected_set() {
 )]
 async fn missing_bundle_and_unvalidated_bundle_have_distinct_readiness_failures() {
     for embedded in [true, false] {
-        let fixture = fixture(
+        let fixture = embedding_fixture(
             client(embedded).await,
             "bundle-readiness",
             IngestMode::Graph,
@@ -930,9 +1034,34 @@ async fn model_marker_without_real_vector_is_incomplete() {
             .requirements("retrieval-space", &fixture.manifest.publication)
             .await
             .unwrap();
-        assert!(repo.check_ready(&requirements).await.is_err());
-        embed(&fixture, 0, vec![1.0, 0.0, 0.0]).await;
-        repo.check_ready(&requirements).await.unwrap();
+        let error = repo.check_ready(&requirements).await.unwrap_err();
+        assert!(
+            error.to_string().contains("required_embedding_missing"),
+            "completed work plus a marker must fail for its missing vector: {error}"
+        );
+        // The positive control uses a separate actual live source claim. A
+        // completed claim from the negative fixture cannot authorize a write.
+        let positive = embedding_fixture(
+            client(embedded).await,
+            "retrieval-vector-present",
+            IngestMode::Retrieval,
+            1,
+        )
+        .await;
+        let positive_repo = SourcePublicationManifestRepository::new(positive.storage.clone());
+        positive_repo
+            .set_operation_plan(positive.manifest.clone())
+            .await
+            .unwrap();
+        embed(&positive, 0, vec![1.0, 0.0, 0.0]).await;
+        let positive_requirements = positive_repo
+            .requirements(&positive.manifest.space_id, &positive.manifest.publication)
+            .await
+            .unwrap();
+        positive_repo
+            .check_ready(&positive_requirements)
+            .await
+            .unwrap();
     }
 }
 
@@ -1058,7 +1187,8 @@ async fn old_revision_mapping_survives_pending_replacement_and_wrong_space_is_em
     reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
 )]
 async fn source_deletion_and_config_revocation_after_preflight_block_completion() {
-    let fixture = fixture(client(true).await, "racing-space", IngestMode::Retrieval, 1).await;
+    let fixture =
+        embedding_fixture(client(true).await, "racing-space", IngestMode::Retrieval, 1).await;
     let repo = SourcePublicationManifestRepository::new(fixture.storage.clone());
     repo.set_operation_plan(fixture.manifest.clone())
         .await
@@ -1809,7 +1939,7 @@ async fn planner_retry_adopts_exact_sealed_selections_without_forgiving_failed_o
 )]
 async fn real_vectors_cannot_finish_a_pending_or_failed_embedding_job() {
     for embedded in [true, false] {
-        let fixture = fixture(
+        let fixture = embedding_fixture(
             client(embedded).await,
             "embedding-job",
             IngestMode::Retrieval,
@@ -1891,6 +2021,7 @@ async fn embedding_publication_uses_completed_fence_after_refunded_waits() {
             1,
             true,
             &[EmbeddingWait::Dependency, EmbeddingWait::Configuration],
+            false,
         )
         .await;
         let space = &fixture.manifest.space_id;

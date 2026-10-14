@@ -114,7 +114,7 @@ fn overflow_is_refused_without_truncation_or_complete_reply() {
         evidence: json!({}),
         tables: BTreeMap::from([(
             "entity".into(),
-            vec![json!({"id":"entity:one","text":"x".repeat(MAX_PAGE_BYTES)})],
+            vec![json!({"id":"entity:one","text":"x".repeat(MAX_TOTAL_BYTES + 1)})],
         )]),
     };
     assert!(prepare_packet(&request, &raw, packet, None, &Allocation::default()).is_err());

@@ -138,35 +138,31 @@ async fn contract(embedded: bool) {
     ));
 
     if !embedded {
-        #[derive(serde::Deserialize)]
-        struct EpochRead {
-            epoch: String,
-            queue_read_nonce: Option<String>,
-        }
-        let mut observed = Vec::new();
+        let read_epoch = || async {
+            let mut response = storage.query_bind_checked(
+                "SELECT * FROM ONLY $id",
+                crate::bindings! {"id"=>surrealdb::sql::Thing::from(("canonical_epoch", surrealdb::sql::Id::String(created.base.space_id.clone())))},
+            ).await.expect("read complete existing shared writer fence");
+            let epoch: surrealdb::Value = response.take(0).expect("native epoch row");
+            let epoch = epoch.into_inner();
+            assert!(
+                matches!(&epoch, surrealdb::sql::Value::Object(fields)
+                    if matches!(fields.get("epoch"), Some(surrealdb::sql::Value::Strand(value)) if !value.0.is_empty())),
+                "actual epoch record must contain its semantic fence"
+            );
+            epoch
+        };
+        let before = read_epoch().await;
         for _ in 0..2 {
             jobs.ensure_work(&created)
                 .await
                 .expect("same exact native durable handoff");
-            let mut response = storage.query_bind_checked(
-                "SELECT epoch,queue_read_nonce FROM ONLY $id",
-                crate::bindings! {"id"=>surrealdb::sql::Thing::from(("canonical_epoch", surrealdb::sql::Id::String(created.base.space_id.clone())))},
-            ).await.expect("read actual existing shared writer fence");
-            let epoch: Option<EpochRead> = response.take(0).expect("typed native epoch row");
-            let epoch = epoch.expect("actual epoch present");
-            observed.push((
-                epoch.epoch,
-                epoch.queue_read_nonce.expect("real guard write"),
-            ));
+            assert_eq!(
+                read_epoch().await,
+                before,
+                "observing an existing handoff must leave the complete epoch row unchanged"
+            );
         }
-        assert_eq!(
-            observed[0].0, observed[1].0,
-            "bookkeeping guard preserves semantic epoch"
-        );
-        assert_ne!(
-            observed[0].1, observed[1].1,
-            "native read guard cannot be optimized as unchanged"
-        );
         assert_eq!(
             jobs.get(&created.base.space_id, &created.base.id)
                 .await

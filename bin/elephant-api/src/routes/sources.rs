@@ -2623,6 +2623,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_source_replacement_requires_fresh_authorized_generation_and_is_idempotent() {
+        use elephant_types::publication::{OperationReceipt, OperationState, PublicationFence};
+        let storage = intake_test_storage().await;
+        let state = Arc::new(SourcesState::new(
+            storage.clone(),
+            Arc::new(AuthzService::new()),
+        ));
+        let principal = AuthPrincipal {
+            subject: "retry-operator".into(),
+            space_id: Some("default".into()),
+            scopes: vec!["write:source".into(), "read:source".into()],
+            bypass_abac: true,
+            ..AuthPrincipal::default()
+        };
+        let source = Source::new(
+            BaseFields::new(
+                RecordId::new_v4(TableName::Source),
+                "default".into(),
+                "retry-operator".into(),
+            ),
+            SourceType::Manual,
+            "unchanged-content".into(),
+        );
+        let (_, Json(created)) = create_source(
+            State(state.clone()),
+            axum::Extension(principal.clone()),
+            Json(SourceWriteRequest {
+                source,
+                intake: IntakeControl {
+                    revision_id: Some("attempt-1".into()),
+                    idempotency_key: Some("attempt-1".into()),
+                    expected_generation: None,
+                },
+            }),
+        )
+        .await
+        .expect("accept original");
+        let original: OperationReceipt =
+            serde_json::from_value(created["operation"].clone()).expect("receipt");
+        let work_id =
+            RecordId::from_str(created["work_item_id"].as_str().expect("work id")).expect("id");
+        let works = elephant_storage::WorkItemRepository::new(storage.clone());
+        let claim = works
+            .claim_with_lease(
+                "default",
+                &work_id,
+                "original-worker",
+                chrono::Utc::now() + chrono::Duration::seconds(60),
+            )
+            .await
+            .expect("claim")
+            .expect("owned");
+        let attempt =
+            elephant_storage::work_attempt_repository::fence_from_claim(&claim).expect("fence");
+        let publication = PublicationFence {
+            source_id: original.source_id.clone(),
+            generation: original.source_generation.clone(),
+            revision_id: "attempt-1".into(),
+            operation_id: original.operation_id.clone(),
+        };
+        let publications =
+            elephant_storage::source_publication::SourcePublicationRepository::new(storage.clone());
+        publications
+            .record_execution_state(
+                "default",
+                &publication,
+                &attempt,
+                OperationState::FailedTerminal,
+                Some("transient_failure"),
+            )
+            .await
+            .expect("actual terminal transition");
+        let failed = publications
+            .operation("default", &original.operation_id)
+            .await
+            .expect("read")
+            .expect("failed");
+        let source = SourceRepository::new(storage.clone())
+            .get("default", &original.source_id)
+            .await
+            .expect("read source")
+            .expect("source");
+        let request = || SourceWriteRequest {
+            source: source.clone(),
+            intake: IntakeControl {
+                revision_id: Some("attempt-2".into()),
+                idempotency_key: Some("attempt-2".into()),
+                expected_generation: Some(original.source_generation.clone()),
+            },
+        };
+        let mut forbidden = principal.clone();
+        forbidden.scopes = vec!["read:source".into()];
+        forbidden.bypass_abac = false;
+        assert_eq!(
+            update_source(
+                State(state.clone()),
+                axum::Extension(forbidden),
+                Path(original.source_id.to_string()),
+                Json(request())
+            )
+            .await
+            .expect_err("write scope required")
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let Json(replaced) = update_source(
+            State(state.clone()),
+            axum::Extension(principal.clone()),
+            Path(original.source_id.to_string()),
+            Json(request()),
+        )
+        .await
+        .expect("authorized fresh generation");
+        let successor: OperationReceipt =
+            serde_json::from_value(replaced["operation"].clone()).expect("successor");
+        assert_ne!(successor.source_generation, original.source_generation);
+        assert_eq!(successor.source_id, original.source_id);
+        assert_eq!(successor.state, OperationState::Accepted);
+        assert!(successor.published_revision.is_none());
+        let Json(replay) = update_source(
+            State(state.clone()),
+            axum::Extension(principal.clone()),
+            Path(original.source_id.to_string()),
+            Json(request()),
+        )
+        .await
+        .expect("idempotent receipt replay");
+        assert_eq!(replay["operation"], replaced["operation"]);
+        let mut stale = request();
+        stale.intake.revision_id = Some("attempt-3".into());
+        stale.intake.idempotency_key = Some("attempt-3".into());
+        assert_eq!(
+            update_source(
+                State(state),
+                axum::Extension(principal),
+                Path(original.source_id.to_string()),
+                Json(stale)
+            )
+            .await
+            .expect_err("stale generation refused")
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            publications
+                .operation("default", &original.operation_id)
+                .await
+                .expect("read old")
+                .expect("old receipt"),
+            failed,
+            "terminal history must remain immutable"
+        );
+    }
+
+    #[tokio::test]
     async fn test_ingest_source_same_identity_replaces_with_explicit_generation() {
         let storage = intake_test_storage().await;
         let state = Arc::new(SourcesState::new(storage, Arc::new(AuthzService::new())));

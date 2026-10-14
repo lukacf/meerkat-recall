@@ -1474,6 +1474,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filtered_hnsw_twins_do_not_consume_any_requested_result_slots() {
+        let client = StorageClient::new_memory().await.expect("memory");
+        let key =
+            PartitionKey::new("default".into(), "L0".into(), "twins".into(), 3).expect("partition");
+        let table = key.table_name();
+        client
+            .query_checked(&PartitionManager::create_partition_ddl(&key))
+            .await
+            .expect("ddl");
+        // More ineligible twins than the old fixed search overfetch allowance.
+        for index in 0..24 {
+            client.query_checked(&format!("CREATE {table}:ineligible{index} SET vector=[1,0,0], space_id='foreign', vector_norm=1")).await.expect("foreign twin");
+        }
+        for index in 0..3 {
+            client.query_checked(&format!("CREATE {table}:eligible{index} SET vector=[1,0,0], space_id='selected', vector_norm=1")).await.expect("eligible twin");
+        }
+        for limit in [1, 2, 3] {
+            let query = format!("SELECT VALUE id FROM {table} WHERE vector <|{limit},100|> [1,0,0] AND space_id='selected' AND deleted_at=NONE");
+            let mut response = client.query_checked(&query).await.expect("indexed search");
+            let ids: Vec<surrealdb::sql::Thing> = response.take(0).expect("record ids");
+            assert_eq!(ids.len(), limit);
+            assert!(ids
+                .iter()
+                .all(|id| id.to_string().contains("eligible")
+                    && !id.to_string().contains("ineligible")));
+        }
+        client
+            .query_checked(&format!(
+                "UPDATE {table} SET deleted_at=time::now() WHERE space_id='selected'"
+            ))
+            .await
+            .expect("delete eligible rows");
+        let mut response = client.query_checked(&format!("SELECT VALUE id FROM {table} WHERE vector <|1,100|> [1,0,0] AND space_id='selected' AND deleted_at=NONE")).await.expect("all denied search");
+        let ids: Vec<surrealdb::sql::Thing> = response.take(0).expect("empty result");
+        assert!(ids.is_empty(), "filter must remain fail closed");
+    }
+
+    #[tokio::test]
     #[expect(
         clippy::significant_drop_tightening,
         reason = "Keep client in the original fixture scope through assertions and cleanup."

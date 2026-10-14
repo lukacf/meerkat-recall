@@ -152,6 +152,15 @@ pub(super) async fn begin_operation(
         }
         .into());
     }
+    // A readiness poll is not progress by the child that actually hit the
+    // budget. Keep its observable wait until a real stage resumes or this
+    // finalizer commits the complete publication.
+    if item.kind == elephant_pipeline::source_finalization::FINALIZE_SOURCE_REVISION_KIND
+        && operation.state == OperationState::FailedRetryable
+        && operation.error_code.as_deref() == Some("awaits_budget")
+    {
+        return Ok(false);
+    }
     repository
         .record_execution_state(
             &item.base.space_id,
@@ -223,7 +232,14 @@ pub(super) async fn record_preflight_failure(
     config: &WorkQueueWorkerConfig,
 ) -> anyhow::Result<()> {
     let (class, action) = failure_disposition(storage, item, error, config).await?;
-    record_operation_failure(storage, item, class, action).await?;
+    record_operation_failure_with_reason(
+        storage,
+        item,
+        class,
+        action,
+        source_failure_reason(error),
+    )
+    .await?;
     elephant_pipeline::scheduler::execution_contract::record_preflight_disposition(
         storage,
         item,
@@ -298,7 +314,14 @@ pub(super) async fn record_failed_execution(
     )
     .await?;
     let disposition = failure_disposition(storage, item, error, config).await?;
-    record_operation_failure(storage, item, disposition.0, disposition.1).await?;
+    record_operation_failure_with_reason(
+        storage,
+        item,
+        disposition.0,
+        disposition.1,
+        source_failure_reason(error),
+    )
+    .await?;
     Ok(disposition)
 }
 
@@ -416,15 +439,49 @@ pub(super) async fn apply_failed_disposition(
 
 /// Record the selected queue disposition without discarding its original cause.
 /// A transient classification is terminal when its finite retry budget is spent.
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "Preserve the original repository lifetimes and future ownership"
-)]
 pub(super) async fn record_operation_failure(
     storage: &StorageClient,
     item: &WorkItem,
     class: FailureClass,
     action: RetryAction,
+) -> anyhow::Result<()> {
+    record_operation_failure_with_reason(storage, item, class, action, None).await
+}
+
+/// Only typed causes and exact private sentinels become public payload-free codes.
+fn source_failure_reason(error: &anyhow::Error) -> Option<&'static str> {
+    for cause in error.chain() {
+        match cause.downcast_ref::<PipelineError>() {
+            Some(PipelineError::BudgetExceeded(_)) => return Some("awaits_budget"),
+            Some(PipelineError::InvalidState(message)) => {
+                let reason = message.strip_prefix("Conflict: ").unwrap_or(message);
+                match reason {
+                    "source_publication_incomplete:expected_bundle_missing"
+                    | "source_publication_incomplete:expected_artifact_missing" => {
+                        return Some("awaits_source_bundle")
+                    }
+                    "source_publication_incomplete:required_index_missing" => {
+                        return Some("awaits_source_index")
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the observed repositories through the original fenced operation update."
+)]
+async fn record_operation_failure_with_reason(
+    storage: &StorageClient,
+    item: &WorkItem,
+    class: FailureClass,
+    action: RetryAction,
+    reason: Option<&str>,
 ) -> anyhow::Result<()> {
     use elephant_types::publication::OperationState;
     if class == FailureClass::LostLease {
@@ -437,6 +494,15 @@ pub(super) async fn record_operation_failure(
     let operation = source_repository
         .operation(&item.base.space_id, &publication.operation_id)
         .await?;
+    if class == FailureClass::PendingDependencies
+        && item.kind == elephant_pipeline::source_finalization::FINALIZE_SOURCE_REVISION_KIND
+        && operation.as_ref().is_some_and(|operation| {
+            operation.state == OperationState::FailedRetryable
+                && operation.error_code.as_deref() == Some("awaits_budget")
+        })
+    {
+        return Ok(());
+    }
     if !operation.is_some_and(|operation| {
         matches!(
             operation.state,
@@ -473,7 +539,7 @@ pub(super) async fn record_operation_failure(
         (FailureClass::PendingDependencies, _) => OperationState::Processing,
         _ => OperationState::FailedRetryable,
     };
-    let code = match class {
+    let code = reason.unwrap_or(match class {
         FailureClass::Transient => "transient_failure",
         FailureClass::Timeout => "execution_timeout",
         FailureClass::ConfigurationBlocked => "configuration_blocked",
@@ -481,7 +547,7 @@ pub(super) async fn record_operation_failure(
         FailureClass::StaleInput => "stale_input",
         FailureClass::LostLease => "lost_lease",
         FailureClass::Terminal => "terminal_failure",
-    };
+    });
     SourcePublicationRepository::new(storage.clone())
         .record_execution_state(
             &item.base.space_id,
@@ -1563,6 +1629,143 @@ mod tests {
             .expect("get")
             .expect("item");
         (fence, work)
+    }
+
+    #[test]
+    fn source_wait_codes_come_only_from_exact_typed_causes() {
+        let budget = anyhow::Error::new(PipelineError::BudgetExceeded("private amount".into()))
+            .context("source stage");
+        assert_eq!(source_failure_reason(&budget), Some("awaits_budget"));
+        let index = anyhow::Error::new(PipelineError::InvalidState(
+            "Conflict: source_publication_incomplete:required_index_missing".into(),
+        ));
+        assert_eq!(source_failure_reason(&index), Some("awaits_source_index"));
+        let forged =
+            anyhow::anyhow!("source_publication_incomplete:required_index_missing budget exceeded");
+        assert_eq!(source_failure_reason(&forged), None);
+        let wrong_type = anyhow::Error::new(PipelineError::SecurityViolation(
+            "source_publication_incomplete:required_index_missing".into(),
+        ));
+        assert_eq!(source_failure_reason(&wrong_type), None);
+    }
+
+    #[tokio::test]
+    async fn typed_budget_wait_is_durable_without_finishing_or_spending_an_attempt() {
+        use elephant_types::publication::OperationState;
+        for embedded in [true, false] {
+            let storage = if embedded {
+                StorageClient::new_embedded().await.expect("embedded")
+            } else {
+                StorageClient::new_memory().await.expect("memory")
+            };
+            let source = Box::pin(fixture(&storage)).await;
+            let (fence, item) = Box::pin(accepted(
+                &storage,
+                source,
+                "budget-r1",
+                SourcePrecondition::Absent,
+            ))
+            .await;
+            let repository = WorkItemRepository::new(storage.clone());
+            let claim = repository
+                .claim_with_lease(
+                    &item.base.space_id,
+                    &item.base.id,
+                    "budget-fixture",
+                    Utc::now() + Duration::seconds(60),
+                )
+                .await
+                .expect("claim")
+                .expect("owned");
+            assert!(!Box::pin(begin_operation(&storage, &claim))
+                .await
+                .expect("begin"));
+            let error = anyhow::Error::new(PipelineError::BudgetExceeded(
+                "private amount and source detail".into(),
+            ))
+            .context("triage_source failed");
+            Box::pin(record_preflight_failure(
+                &storage,
+                &claim,
+                &error,
+                &WorkQueueWorkerConfig::default(),
+            ))
+            .await
+            .expect("record budget refusal");
+            let operation = SourcePublicationRepository::new(storage.clone())
+                .operation(&item.base.space_id, &fence.operation_id)
+                .await
+                .expect("read")
+                .expect("operation");
+            assert_eq!(operation.state, OperationState::FailedRetryable);
+            assert_eq!(operation.error_code.as_deref(), Some("awaits_budget"));
+            assert!(operation.completed_at.is_none());
+            assert!(operation.published_revision.is_none());
+            let mut finalizer = item.clone();
+            finalizer.base.id = RecordId::new_v4(TableName::WorkItem);
+            finalizer.kind =
+                elephant_pipeline::source_finalization::FINALIZE_SOURCE_REVISION_KIND.into();
+            finalizer.idempotency_key = "budget-wait-finalizer".into();
+            let finalizer = repository.create(finalizer).await.expect("finalizer queue");
+            let finalizer = repository
+                .claim_with_lease(
+                    &item.base.space_id,
+                    &finalizer.base.id,
+                    "finalizer",
+                    Utc::now() + Duration::seconds(60),
+                )
+                .await
+                .expect("claim finalizer")
+                .expect("owned finalizer");
+            assert!(!Box::pin(begin_operation(&storage, &finalizer))
+                .await
+                .expect("poll does not reset child wait"));
+            Box::pin(record_operation_failure_with_reason(
+                &storage,
+                &finalizer,
+                FailureClass::PendingDependencies,
+                RetryAction::Blocked { delay_secs: 5 },
+                Some("awaits_source_bundle"),
+            ))
+            .await
+            .expect("pending poll");
+            assert_eq!(
+                SourcePublicationRepository::new(storage.clone())
+                    .operation(&item.base.space_id, &fence.operation_id)
+                    .await
+                    .expect("read retained wait")
+                    .expect("wait")
+                    .error_code
+                    .as_deref(),
+                Some("awaits_budget")
+            );
+            let queued = repository
+                .get(&item.base.space_id, &item.base.id)
+                .await
+                .expect("read queue")
+                .expect("queue");
+            assert_eq!(queued.status, WorkItemStatus::Runnable);
+            assert_eq!(queued.attempts, claim.attempts - 1);
+            assert!(
+                WorkRunRepository::new(storage.clone())
+                    .find_by_work_item(&item.base.id)
+                    .await
+                    .expect("runs")
+                    .is_empty(),
+                "preflight refusal must not fabricate a provider run"
+            );
+            assert!(
+                Box::pin(record_preflight_failure(
+                    &storage,
+                    &claim,
+                    &error,
+                    &WorkQueueWorkerConfig::default()
+                ))
+                .await
+                .is_err(),
+                "retired original claim cannot update state again"
+            );
+        }
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parent
 PATCHED = {
     'surrealdb-core-2.6.5': {
         'Cargo.toml',
+        'README.md',
         'src/ctx/context.rs',
         'src/dbs/iterator.rs',
         'src/dbs/options.rs',
@@ -21,6 +22,8 @@ PATCHED = {
         'src/fnc/mod.rs',
         'src/fnc/object.rs',
         'src/idx/index.rs',
+        'src/idx/planner/checker.rs',
+        'src/idx/trees/hnsw/index.rs',
         'src/idx/trees/store/hnsw.rs',
         'src/idx/trees/store/mod.rs',
         'src/key/debug.rs',

@@ -172,12 +172,13 @@ impl HnswIndex {
 					.await?
 			}
 		};
-		self.build_result(tx, neighbors, search.k, chk).await
+		self.build_result(tx, stk, neighbors, search.k, chk).await
 	}
 
 	async fn build_result(
 		&self,
 		tx: &Transaction,
+		stk: &mut Stk,
 		neighbors: Vec<(f64, ElementId)>,
 		n: usize,
 		chk: &mut HnswConditionChecker<'_>,
@@ -187,6 +188,10 @@ impl HnswIndex {
 			if builder.check_add(e_dist) {
 				if let Some(v) = self.hnsw.get_vector(tx, &e_id).await? {
 					if let Some(docs) = self.vec_docs.get_docs(tx, &v).await? {
+						let docs = chk.filter_truthy(tx, stk, &self.docs, docs).await?;
+						if docs.is_empty() {
+							continue;
+						}
 						let evicted_docs = builder.add(e_dist, docs);
 						chk.expires(evicted_docs);
 					}

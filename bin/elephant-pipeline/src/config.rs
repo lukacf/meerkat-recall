@@ -646,8 +646,11 @@ const fn default_work_item_timeout_secs() -> u64 {
     420
 }
 
+// Concurrent source stages can conflict repeatedly on the same canonical epoch.
+// Retain finite retries and the existing capped backoff; explicit operators can
+// still select a smaller budget. This does not change semantic repair allowance.
 const fn default_transient_retry_max_attempts() -> u32 {
-    3
+    10
 }
 
 const fn default_transient_retry_base_delay_secs() -> i64 {
@@ -939,7 +942,7 @@ mod tests {
             "default queue capacity must leave headroom for lightweight lifecycle work"
         );
         assert_eq!(config.work_item_timeout_secs, 420);
-        assert_eq!(config.transient_retry_max_attempts, 3);
+        assert_eq!(config.transient_retry_max_attempts, 10);
         assert_eq!(config.transient_retry_base_delay_secs, 10);
         assert_eq!(config.transient_retry_max_delay_secs, 120);
     }
@@ -952,9 +955,65 @@ mod tests {
         assert_eq!(decoded.work_queue.max_concurrent, 8);
         assert_eq!(decoded.work_queue.max_extract_concurrent, 4);
         assert_eq!(decoded.work_queue.work_item_timeout_secs, 420);
-        assert_eq!(decoded.work_queue.transient_retry_max_attempts, 3);
+        assert_eq!(decoded.work_queue.transient_retry_max_attempts, 10);
         assert_eq!(decoded.work_queue.transient_retry_base_delay_secs, 10);
         assert_eq!(decoded.work_queue.transient_retry_max_delay_secs, 120);
+    }
+
+    #[test]
+    fn transient_retry_default_recovers_contention_but_preserves_explicit_caps() {
+        use elephant_pipeline::scheduler::execution_contract::{
+            retry_action, FailureClass, RetryAction,
+        };
+        let config: WorkQueueWorkerConfig =
+            serde_json::from_value(serde_json::json!({})).expect("defaults");
+        for attempt in 1..10 {
+            assert!(matches!(
+                retry_action(
+                    FailureClass::Transient,
+                    attempt,
+                    config.transient_retry_max_attempts,
+                    10,
+                    120
+                ),
+                RetryAction::Retry {
+                    delay_secs: 1..=120
+                }
+            ));
+        }
+        assert_eq!(
+            retry_action(
+                FailureClass::Transient,
+                10,
+                config.transient_retry_max_attempts,
+                10,
+                120
+            ),
+            RetryAction::Fail
+        );
+        let selected: WorkQueueWorkerConfig =
+            serde_json::from_value(serde_json::json!({"transient_retry_max_attempts": 2}))
+                .expect("explicit cap");
+        assert_eq!(
+            retry_action(
+                FailureClass::Transient,
+                2,
+                selected.transient_retry_max_attempts,
+                10,
+                120
+            ),
+            RetryAction::Fail
+        );
+        assert_eq!(
+            retry_action(
+                FailureClass::Terminal,
+                1,
+                config.transient_retry_max_attempts,
+                10,
+                120
+            ),
+            RetryAction::Fail
+        );
     }
 
     #[test]

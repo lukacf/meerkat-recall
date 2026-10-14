@@ -4036,3 +4036,68 @@ mod render_proof;
 
 #[path = "../../../tests/recall_preview/source_lifecycle_contact_oracles.rs"]
 mod independent_contact_erasure_oracles;
+
+/// A filtered-out twin must never occupy the single readiness probe slot.
+/// The exact target envelope/vector guards still run before the index probe.
+#[tokio::test]
+async fn native_publication_index_probe_ignores_deleted_and_foreign_vector_twins() {
+    let storage = client(false).await;
+    let target = embedding_fixture(
+        storage.clone(),
+        "index-target-space",
+        IngestMode::Retrieval,
+        1,
+    )
+    .await;
+    let repository = SourcePublicationManifestRepository::new(storage.clone());
+    repository
+        .set_operation_plan(target.manifest.clone())
+        .await
+        .unwrap();
+    let table = &target.manifest.embeddings[0].partition_table;
+    let key = PartitionKey::from_table_name(table).unwrap();
+    storage
+        .query_checked(&PartitionManager::create_partition_ddl(&key))
+        .await
+        .unwrap();
+    // Deliberately malformed foreign row INSIDE the exact target partition.
+    // Insert it first so the old KNN k=1 implementation selects it before
+    // applying the per-row space predicate. No production input is relabeled.
+    storage.query_checked(&format!("CREATE {table}:foreign_twin SET vector=[1,0,0], space_id='foreign-fixture', vector_norm=1")).await.unwrap();
+    embed(&target, 0, vec![1.0, 0.0, 0.0]).await;
+    let requirements = repository
+        .requirements(&target.manifest.space_id, &target.manifest.publication)
+        .await
+        .unwrap();
+    repository
+        .check_ready(&requirements)
+        .await
+        .expect("foreign identical vector cannot hide target index entry");
+    storage.query_bind_checked(
+        &format!("UPDATE ONLY {table}:foreign_twin SET space_id = $target_space, deleted_at = time::now()"),
+        crate::bindings! {"target_space" => target.manifest.space_id.clone()},
+    ).await.unwrap();
+    let mut observed = storage
+        .query_checked(&format!(
+            "SELECT VALUE deleted_at != NONE FROM ONLY {table}:foreign_twin"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        observed.take::<Option<bool>>(0).unwrap(),
+        Some(true),
+        "the exact indexed twin is now deleted in the target space"
+    );
+    repository
+        .check_ready(&requirements)
+        .await
+        .expect("deleted identical vector cannot hide target index entry");
+    storage
+        .query_checked(&format!("REMOVE INDEX {table}_hnsw ON TABLE {table}"))
+        .await
+        .unwrap();
+    assert!(
+        repository.check_ready(&requirements).await.is_err(),
+        "actual missing index must still refuse publication"
+    );
+}

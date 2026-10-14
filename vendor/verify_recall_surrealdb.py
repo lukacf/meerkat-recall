@@ -25,6 +25,7 @@ PATCHED = {
         'src/idx/planner/checker.rs',
         'src/idx/trees/hnsw/docs.rs',
         'src/idx/trees/hnsw/index.rs',
+        'src/idx/trees/knn.rs',
         'src/idx/trees/store/hnsw.rs',
         'src/idx/trees/store/mod.rs',
         'src/key/debug.rs',

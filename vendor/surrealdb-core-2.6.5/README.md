@@ -31,3 +31,7 @@ records and deletion while the bitmap stays above eight must reach storage;
 otherwise live records disappear from search or deleted record IDs consume
 result slots. The filtered-twins storage regression also verifies all 27 live
 rows and the three survivors after physically deleting the 24 foreign rows.
+Deletion also checks membership before changing the set: an old damaged index
+may lack the deleted row, and removing that absent ID must not discard a live
+member of a small set. Existing missing memberships require an explicit index
+rebuild or a supported fresh intake; upgrading does not synthesize old entries.

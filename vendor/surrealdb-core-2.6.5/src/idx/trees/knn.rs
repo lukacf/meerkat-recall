@@ -374,7 +374,7 @@ impl Ids64 {
 		}
 	}
 
-	fn contains(&self, d: DocId) -> bool {
+	pub(super) fn contains(&self, d: DocId) -> bool {
 		match self {
 			Self::Empty => false,
 			Self::One(o) => *o == d,

@@ -202,6 +202,11 @@ impl VecDocs {
 		let key = self.ikb.new_hv_key(Arc::new(o.into()))?;
 		if let Some(val) = tx.get(key.clone(), None).await? {
 			let mut ed: ElementDocs = VersionedStore::try_from(val)?;
+			// Older indexes may already lack this row after a dropped bitmap
+			// insertion. Removing an absent ID must not shrink another set.
+			if !ed.docs.contains(d) {
+				return Ok(());
+			}
 			// Removal from a bitmap also changes it without returning a
 			// replacement until it shrinks back to the small representation.
 			if let Some(new_docs) = ed.docs.remove(d) {

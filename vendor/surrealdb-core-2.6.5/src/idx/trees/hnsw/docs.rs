@@ -169,10 +169,12 @@ impl VecDocs {
 			Some(val) => {
 				// We already have the vector
 				let mut ed: ElementDocs = VersionedStore::try_from(val)?;
-				ed.docs.insert(d).map(|new_docs| {
+				// Ids64::Bits mutates in place and returns no replacement.
+				// Persist both representation changes and in-place changes.
+				if let Some(new_docs) = ed.docs.insert(d) {
 					ed.docs = new_docs;
-					ed
-				})
+				}
+				Some(ed)
 			}
 			None => {
 				//  We don't have the vector, we insert it in the graph
@@ -200,15 +202,17 @@ impl VecDocs {
 		let key = self.ikb.new_hv_key(Arc::new(o.into()))?;
 		if let Some(val) = tx.get(key.clone(), None).await? {
 			let mut ed: ElementDocs = VersionedStore::try_from(val)?;
+			// Removal from a bitmap also changes it without returning a
+			// replacement until it shrinks back to the small representation.
 			if let Some(new_docs) = ed.docs.remove(d) {
-				if new_docs.is_empty() {
-					tx.del(key).await?;
-					h.remove(tx, ed.e_id).await?;
-				} else {
-					ed.docs = new_docs;
-					let val: Val = VersionedStore::try_into(&ed)?;
-					tx.set(key, val, None).await?;
-				}
+				ed.docs = new_docs;
+			}
+			if ed.docs.is_empty() {
+				tx.del(key).await?;
+				h.remove(tx, ed.e_id).await?;
+			} else {
+				let val: Val = VersionedStore::try_into(&ed)?;
+				tx.set(key, val, None).await?;
 			}
 		};
 		Ok(())

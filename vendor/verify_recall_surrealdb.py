@@ -23,6 +23,7 @@ PATCHED = {
         'src/fnc/object.rs',
         'src/idx/index.rs',
         'src/idx/planner/checker.rs',
+        'src/idx/trees/hnsw/docs.rs',
         'src/idx/trees/hnsw/index.rs',
         'src/idx/trees/store/hnsw.rs',
         'src/idx/trees/store/mod.rs',

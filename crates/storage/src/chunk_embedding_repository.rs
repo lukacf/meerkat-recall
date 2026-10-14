@@ -1490,6 +1490,16 @@ mod tests {
         for index in 0..3 {
             client.query_checked(&format!("CREATE {table}:eligible{index} SET vector=[1,0,0], space_id='selected', vector_norm=1")).await.expect("eligible twin");
         }
+        // Every duplicate membership, including the in-place bitmap range,
+        // must reach the durable index before predicates are considered.
+        let mut response = client
+            .query_checked(&format!(
+                "SELECT VALUE id FROM {table} WHERE vector <|27,100|> [1,0,0]"
+            ))
+            .await
+            .expect("all indexed twins");
+        let all_ids: Vec<surrealdb::sql::Thing> = response.take(0).expect("all record ids");
+        assert_eq!(all_ids.len(), 27, "bitmap inserts must persist");
         for limit in [1, 2, 3] {
             let query = format!("SELECT VALUE id FROM {table} WHERE vector <|{limit},100|> [1,0,0] AND space_id='selected' AND deleted_at=NONE");
             let mut response = client.query_checked(&query).await.expect("indexed search");
@@ -1509,6 +1519,30 @@ mod tests {
         let mut response = client.query_checked(&format!("SELECT VALUE id FROM {table} WHERE vector <|1,100|> [1,0,0] AND space_id='selected' AND deleted_at=NONE")).await.expect("all denied search");
         let ids: Vec<surrealdb::sql::Thing> = response.take(0).expect("empty result");
         assert!(ids.is_empty(), "filter must remain fail closed");
+        // Physical deletion exercises bitmap removal above eight entries and
+        // its transition back to the small representation. An unfiltered KNN
+        // query must not spend any of its three slots on stale foreign IDs.
+        client
+            .query_checked(&format!("DELETE {table} WHERE space_id='foreign'"))
+            .await
+            .expect("remove foreign twins");
+        client
+            .query_checked(&format!(
+                "UPDATE {table} SET deleted_at=NONE WHERE space_id='selected'"
+            ))
+            .await
+            .expect("restore selected fixture rows");
+        let mut response = client
+            .query_checked(&format!(
+                "SELECT VALUE id FROM {table} WHERE vector <|3,100|> [1,0,0]"
+            ))
+            .await
+            .expect("surviving indexed twins");
+        let survivors: Vec<surrealdb::sql::Thing> = response.take(0).expect("survivor ids");
+        assert_eq!(survivors.len(), 3, "bitmap removals must persist");
+        assert!(survivors.iter().all(
+            |id| id.to_string().contains("eligible") && !id.to_string().contains("ineligible")
+        ));
     }
 
     #[tokio::test]

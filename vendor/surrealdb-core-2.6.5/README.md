@@ -24,3 +24,10 @@ external unpatched servers do not acquire this fix from a client upgrade.
 Regressions live in Recall storage tests:
 `native_publication_index_probe_ignores_deleted_and_foreign_vector_twins` and
 `filtered_hnsw_twins_do_not_consume_any_requested_result_slots`.
+
+The same bounded HNSW backport persists duplicate-vector document membership
+when `Ids64` uses an in-place bitmap. Both insertion above nine equal-vector
+records and deletion while the bitmap stays above eight must reach storage;
+otherwise live records disappear from search or deleted record IDs consume
+result slots. The filtered-twins storage regression also verifies all 27 live
+rows and the three survivors after physically deleting the 24 foreign rows.

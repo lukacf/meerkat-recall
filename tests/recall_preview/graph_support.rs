@@ -367,7 +367,22 @@ impl GraphFixture {
         let claim = fixture.claim_fixture_work_with_id("embed_source_revision", "graph-storage-embedding",
             serde_json::json!({"_publication":fixture.publication,"revision_id":self.lineage.revision.base.id.to_string()}),
             Some(source_embedding_work_id(&fixture.space, &fixture.publication, &self.lineage.revision.base.id))).await?;
-        let run = self.start_run(&claim).await?;
+        let fence = elephant_storage::work_attempt_repository::fence_from_claim(&claim)?;
+        let authority = Box::pin(
+            SourcePublicationManifestRepository::new(fixture.client.clone())
+                .prepare_embedding_write(
+                    &fixture.space,
+                    &fixture.publication,
+                    &fixture.manifest.configuration,
+                    &fence,
+                    &self.lineage.revision.base.id,
+                ),
+        )
+        .await?;
+        let mut run = self.start_run(&claim).await?;
+        run.metrics
+            .custom
+            .insert("attempt_fence".into(), serde_json::to_value(&fence)?);
         let model = format!("recall:{}", serde_json::to_string(profile)?);
         let embeddings = self
             .nodes
@@ -385,7 +400,7 @@ impl GraphFixture {
             })
             .collect();
         NodeEmbeddingRepository::new(fixture.client.clone(), PartitionManager::new())
-            .store_embeddings_and_mark_nodes(
+            .store_source_embeddings_and_mark_nodes(
                 &fixture.space,
                 &self
                     .nodes
@@ -395,6 +410,7 @@ impl GraphFixture {
                 &model,
                 Utc::now(),
                 embeddings,
+                &authority,
             )
             .await?;
         self.finish_run(run, &claim).await

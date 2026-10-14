@@ -1338,6 +1338,10 @@ fn governed_whole_batch_repair_preserves_history_authority_and_completion() {
     clippy::items_after_statements,
     reason = "Keep local diagnostic types and case definitions beside the control phase that uses them"
 )]
+#[expect(
+    clippy::future_not_send,
+    reason = "The current-thread test runtime intentionally awaits local erased repair futures without transferring them between threads"
+)]
 async fn governed_whole_batch_repair_scenario() {
     repair_phase("batch.enter");
     // Type-only checks do not construct or poll a possibly oversized future.

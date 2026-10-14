@@ -42,7 +42,6 @@ impl Tasks {
 //
 // This function needs to be called before after the dbs::init and before the net::init functions.
 // It needs to be before net::init because the net::init function blocks until the web server stops.
-#[cfg(test)]
 pub fn init(dbs: Arc<Datastore>, canceller: CancellationToken, opts: &EngineOptions) -> Tasks {
 	init_with_gate(dbs, canceller, opts, Arc::default())
 }

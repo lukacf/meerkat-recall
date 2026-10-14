@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Deployment and diagnostics
+- Select runtime TOML explicitly with `serve --config`, `migrate --config` or
+  `ELEPHANT_CONFIG`; a missing or malformed selected file fails without fallback.
+- Diagnose worker MCP discovery and current named-space authority separately
+  from process liveness, using existing token and grant checks.
+- Prepare authenticated, digest-pinned Compose installations with persistent
+  state and a paired SurrealDB server; promote qualified container archives to
+  the canonical registry with explicit source and anonymous-pull checks.
+
+### CI reliability
+- Use a conservative reader-prose path while preserving required check names,
+  secret scanning, dependency auditing and reader-documentation validation.
+- Cache the Cargo registry and build directories actually used by the repository
+  wrapper, separated by feature/profile lane.
+- Provision a checksum-pinned local model for the existing constructor-reuse
+  regression instead of selecting it without its required fixture.
+
 ## [0.9.0] - 2026-10-14
 
 ### Meerkat 0.9 integration

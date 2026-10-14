@@ -94,10 +94,47 @@ Cargo aliases are still available through the wrapper and are defined in `.cargo
 | `./scripts/repo-cargo doc` | `./scripts/repo-cargo doc --workspace --no-deps` | Generate documentation |
 | `./scripts/repo-cargo integration` | `./scripts/repo-cargo test --workspace -- --ignored` | Run all ignored tests; may invoke live paid providers |
 | `./scripts/repo-cargo test-e2e` | See `.cargo/config.toml` for provider-test exclusions | Deterministic ignored E2E suite |
+| `./scripts/repo-cargo test-e2e-model` | Exact local-model constructor regression | Requires explicitly provisioned model endpoint and manifest digest |
 | `./scripts/repo-cargo test-e2e-live` | `./scripts/repo-cargo test -p elephant-e2e live_llm -- --ignored --nocapture --test-threads=1` | Opt-in Alice and Wizard live extraction scenarios |
 | `./scripts/repo-cargo test-api` | `./scripts/repo-cargo test --package elephant-api` | API tests only |
 | `./scripts/repo-cargo test-pipeline` | `./scripts/repo-cargo test --package elephant-pipeline` | Pipeline tests only |
 | `./scripts/repo-cargo test-storage` | `./scripts/repo-cargo test --package elephant-storage` | Storage tests only |
+
+### CI scope and resource tests
+
+CI classifies exact Git changes before selecting Rust work. Only modifications
+of reviewed reader-prose files qualify for the short path. Code examples, inline
+code, MDX expressions, frontmatter, new or renamed files, scripts, workflows,
+manifests, configuration and runtime sources use the full path. The living-wiki
+page is embedded in an executable and always uses the full path. An unavailable
+or invalid comparison fails classification; required gates cannot pass on that
+failure. Manual runs always execute the full gates.
+
+Required check names remain stable. A prose-only check explicitly reports that
+Rust execution is not applicable; secret scanning, dependency auditing,
+container configuration and reader-documentation validation still run. Rust
+caches use the paths reported by `scripts/repo-cargo --print-env`, separated by
+job and compiler/manifest/environment identity.
+
+`scripts/ci/ignored_test_lanes.json` records every ignored Rust test. The
+ordinary deterministic E2E command retains its four large storage scale tests.
+Paid provider, calibration and real-media tests remain explicit opt-in work.
+The local-model constructor regression is a separate fixture-backed command:
+
+```bash
+export RECALL_TEST_FASTEMBED_ENDPOINT=file:///absolute/path/to/model-assets
+export RECALL_TEST_FASTEMBED_MANIFEST_SHA256=YOUR_VERIFIED_MANIFEST_SHA256
+make test-e2e-model
+```
+
+The endpoint is the root containing the immutable manifest-digest directory
+created by `scripts/release/provision-fastembed`. The test refuses absent inputs;
+it does not download a model or return a false success. In CI, a dedicated setup
+step downloads the exact MIT-licensed BAAI model revision and file hashes in
+`scripts/ci/model_fixture.json`, verifies every file, then invokes that same
+provisioner. The original test checks actual initialization reuse, independent
+request receipts and revocation; deterministic tests run separately in the same
+E2E job. Updating a model pin or test inventory requires the full CI path.
 
 ### Running Specific Tests
 

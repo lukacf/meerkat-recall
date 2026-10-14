@@ -27,6 +27,31 @@ check. A matching upstream version number alone does not establish compatibility
 Its server binary is a separate artifact. The embedded managed service persists
 acknowledged mutations using its configured durable storage destination.
 
+## Select the runtime configuration
+
+Recall 0.9.1 adds explicit TOML selection for managed services and migrations:
+
+```sh
+meerkat-recall migrate --config /etc/meerkat-recall/runtime.toml
+meerkat-recall serve --config /etc/meerkat-recall/runtime.toml
+```
+
+The command option takes precedence over `ELEPHANT_CONFIG`, which takes
+precedence over the existing nearest-Git `.elephant/elephant_config.toml`
+discovery. An explicitly selected missing or malformed file is an error; it
+does not fall back to environment-only settings. These are `serve` and `migrate`
+options, not global options. The legacy standalone worker remains environment
+configured.
+
+Relative config paths and relative data paths are resolved from the process
+working directory. Use absolute paths for deployment data, snapshots and model
+assets. Loading TOML selects its database, endpoint and model settings; ordinary
+environment equivalents do not replace those fields. Snapshot-load and typed
+SurrealDB timeout overrides retain their existing behavior.
+`PIPELINE_AGENTIC_MCP_SPACE_ID` can override the configured discovery space.
+API bind settings, signing/authentication settings, provider credentials and
+`MCP_BEARER_TOKEN` remain separate environment settings.
+
 ## Credentials and space selection
 
 The local CLI creates signing material and tokens without a running API:
@@ -236,14 +261,40 @@ It is a bounded reconciliation inventory, not a snapshot or lossless change feed
 Store external-to-internal source identity mappings at admission. After physical
 erasure, inventory does not reconstruct erased external identifiers.
 
+## Operator retries
+
+A failed work item can be retried through `POST /v1/work-items/{id}/retry` or the
+MCP `retry_work_item` tool. Issue a separate operator token with both
+`read:work_item` and `write:work_item`, plus a current same-space grant and the
+record's required ABAC authority. Do not add write scopes to the read-only
+extraction worker token. The item must be Failed and its producer/dependency
+state must permit `retry_authorized`; operator authority does not bypass those
+guards. Poll the original item and operation after an uncertain response before
+requesting another retry.
+
 ## Readiness, shutdown and recovery
 
 `GET /v1/health` is process liveness. Authenticated `GET /v1/readiness` with
 `read:status` and an explicit selected space reports storage, worker, recovery
 and semantic ingestion readiness. `GET /v1/spaces/{space}/status` adds local
-provider/configuration availability. These checks do not call paid providers or
-prove that a particular revision is searchable. An API-only role can be ready
-while workers are unavailable. Pending operations remain pending truthfully.
+provider/configuration availability. Use a separate scoped status token with
+`read:status` in both its signed ceiling and its current selected-space grant.
+Normal ABAC and expiry checks still apply.
+
+From Recall 0.9.1, extractor discovery requires the seven canonical read tools;
+a successful HTTP response or status-only `tools/list` is insufficient. For a
+multi-space worker token, set `extractor.readiness_space_id` in TOML or
+`PIPELINE_AGENTIC_MCP_SPACE_ID` in the environment to select one discovery space.
+Actual extraction always selects its work item's space and rechecks authority;
+one successful discovery does not grant access to other spaces. Legacy
+single-space tokens retain their existing selection behavior.
+
+Named-space status also checks the worker token against current grants. Readers
+with `read:space_config` receive fixed diagnostic actions; status-only callers
+do not receive token, subject, grant contents or private endpoint details.
+These checks do not call paid providers or prove that a particular revision is
+searchable. An API-only role can be ready while workers are unavailable.
+Pending operations remain pending truthfully.
 
 Use the graceful shutdown path. Managed workers and requests drain before the
 storage barrier; a failed drain or flush is not a successful persistence receipt.

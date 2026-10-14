@@ -19,6 +19,26 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  changes:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Test conservative CI boundaries
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+      - name: Classify exact checked-out changes
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: >-
+          python3 scripts/ci/classify_changes.py
+          --event "$EVENT_NAME" --base "$EVENT_BASE" --head "$(git rev-parse HEAD)"
+
   container-config:
     name: Container configuration
     runs-on: ubuntu-latest
@@ -29,10 +49,14 @@ jobs:
         env:
           # Required interpolation only: config does not pull or start this image.
           RECALL_SURREAL_IMAGE: recall-surreal:config-check
+          RECALL_IMAGE: ghcr.io/lukacf/meerkat-recall@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          RECALL_PAIRED_IMAGE: ghcr.io/lukacf/recall-surreal@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         run: |
           docker compose config --quiet
           docker compose -f docker-compose.dev.yml config --quiet
+          docker compose -f deploy/compose/compose.yaml config --quiet
           bash -n rebuild-fast.sh
+          sh -n deploy/compose/init.sh packaging/recall-container/entrypoint.sh packaging/recall-surreal/entrypoint.sh
       - name: Check Dockerfile
         run: docker buildx build --call=check .
 
@@ -58,37 +82,62 @@ jobs:
 
   fmt-lint:
     name: Format, lint, and static checks
+    needs: changes
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
+      # A skipped/failed classifier must never turn required checks green.
+      - name: Require successful classification
+        env:
+          CLASSIFICATION_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+        run: |
+          test "$CLASSIFICATION_RESULT" = success
+          case "$DOCS_ONLY" in true|false) ;; *) exit 1 ;; esac
+      - name: Report prose-only scope
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo 'Reader prose only; Rust execution is not applicable. Security, secrets, container and reader-documentation checks still run.' >> "$GITHUB_STEP_SUMMARY"
       - name: Checkout
+        if: needs.changes.outputs.docs_only != 'true'
         uses: actions/checkout@v4
 
       - name: Install Rust
+        if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
           components: rustfmt, clippy
 
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+      - name: Cache wrapper Cargo paths
+        if: needs.changes.outputs.docs_only != 'true'
+        uses: ./.github/actions/cargo-cache
+        with:
+          lane: ${{ github.job }}
 
       - name: Install nextest
+        if: needs.changes.outputs.docs_only != 'true'
         uses: taiki-e/install-action@nextest
 
       - name: Check formatting
+        if: needs.changes.outputs.docs_only != 'true'
         run: make fmt-check
 
       - name: Verify active surface and legacy drift
+        if: needs.changes.outputs.docs_only != 'true'
         run: make verify-surface
 
       - name: Verify version parity
+        if: needs.changes.outputs.docs_only != 'true'
         run: make verify-version-parity
 
       - name: Clippy
+        if: needs.changes.outputs.docs_only != 'true'
         run: make lint
 
   test-unit:
     name: Workspace unit gate
+    needs: changes
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     env:
       # Same linker-pressure mitigation as test-all: the runner's ld dies with
@@ -96,54 +145,90 @@ jobs:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
+      # A skipped/failed classifier must never turn required checks green.
+      - name: Require successful classification
+        env:
+          CLASSIFICATION_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+        run: |
+          test "$CLASSIFICATION_RESULT" = success
+          case "$DOCS_ONLY" in true|false) ;; *) exit 1 ;; esac
+      - name: Report prose-only scope
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo 'Reader prose only; Rust execution is not applicable. Security, secrets, container and reader-documentation checks still run.' >> "$GITHUB_STEP_SUMMARY"
       - name: Checkout
+        if: needs.changes.outputs.docs_only != 'true'
         uses: actions/checkout@v4
 
       - name: Install Rust
+        if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
 
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+      - name: Cache wrapper Cargo paths
+        if: needs.changes.outputs.docs_only != 'true'
+        uses: ./.github/actions/cargo-cache
         with:
-          prefix-key: unit
+          lane: ${{ github.job }}
 
       - name: Install nextest
+        if: needs.changes.outputs.docs_only != 'true'
         uses: taiki-e/install-action@nextest
 
       - name: Run workspace unit gate
+        if: needs.changes.outputs.docs_only != 'true'
         run: make test-unit NEXTEST_ARGS=--no-fail-fast
 
   test-all:
     name: Full test suite (all features)
+    needs: changes
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
+      # A skipped/failed classifier must never turn required checks green.
+      - name: Require successful classification
+        env:
+          CLASSIFICATION_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+        run: |
+          test "$CLASSIFICATION_RESULT" = success
+          case "$DOCS_ONLY" in true|false) ;; *) exit 1 ;; esac
+      - name: Report prose-only scope
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo 'Reader prose only; Rust execution is not applicable. Security, secrets, container and reader-documentation checks still run.' >> "$GITHUB_STEP_SUMMARY"
       - name: Checkout
+        if: needs.changes.outputs.docs_only != 'true'
         uses: actions/checkout@v4
 
       - name: Install Rust
+        if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
 
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+      - name: Cache wrapper Cargo paths
+        if: needs.changes.outputs.docs_only != 'true'
+        uses: ./.github/actions/cargo-cache
         with:
-          prefix-key: all-features
+          lane: ${{ github.job }}
 
       - name: Install nextest
+        if: needs.changes.outputs.docs_only != 'true'
         uses: taiki-e/install-action@nextest
 
       - name: Run full suite
+        if: needs.changes.outputs.docs_only != 'true'
         run: make test-all NEXTEST_ARGS=--no-fail-fast
 
   e2e:
     name: E2E tests
+    needs: changes
     if: |
+      always() && (
       github.event_name == 'workflow_dispatch' ||
       (
         github.event_name == 'push' &&
@@ -152,26 +237,50 @@ jobs:
           startsWith(github.ref, 'refs/heads/release/')
         )
       )
+      )
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
+      # A skipped/failed classifier must never turn required checks green.
+      - name: Require successful classification
+        env:
+          CLASSIFICATION_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+        run: |
+          test "$CLASSIFICATION_RESULT" = success
+          case "$DOCS_ONLY" in true|false) ;; *) exit 1 ;; esac
+      - name: Report prose-only scope
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo 'Reader prose only; Rust execution is not applicable. Security, secrets, container and reader-documentation checks still run.' >> "$GITHUB_STEP_SUMMARY"
       - name: Checkout
+        if: needs.changes.outputs.docs_only != 'true'
         uses: actions/checkout@v4
 
       - name: Install Rust
+        if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
 
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+      - name: Cache wrapper Cargo paths
+        if: needs.changes.outputs.docs_only != 'true'
+        uses: ./.github/actions/cargo-cache
         with:
-          prefix-key: e2e
+          lane: ${{ github.job }}
 
-      - name: Run E2E tests
+      - name: Run deterministic E2E tests
+        if: needs.changes.outputs.docs_only != 'true'
         run: make test-e2e
+
+      - name: Provision pinned local model fixture
+        if: needs.changes.outputs.docs_only != 'true'
+        run: python3 scripts/ci/provision_model_fixture.py --root "$RUNNER_TEMP/recall-ci-model" --github-env "$GITHUB_ENV"
+
+      - name: Run provisioned-model constructor regression
+        if: needs.changes.outputs.docs_only != 'true'
+        run: make test-e2e-model
 
   audit:
     name: Security audit
@@ -185,10 +294,10 @@ jobs:
         with:
           toolchain: 1.94.0
 
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+      - name: Cache wrapper Cargo paths
+        uses: ./.github/actions/cargo-cache
         with:
-          prefix-key: audit
+          lane: ${{ github.job }}
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
@@ -198,8 +307,21 @@ jobs:
 
   docs:
     name: Documentation
+    needs: changes
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
+      # A skipped/failed classifier must never turn required checks green.
+      - name: Require successful classification
+        env:
+          CLASSIFICATION_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+        run: |
+          test "$CLASSIFICATION_RESULT" = success
+          case "$DOCS_ONLY" in true|false) ;; *) exit 1 ;; esac
+      - name: Report prose-only scope
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo 'Reader prose only; Rust execution is not applicable. Security, secrets, container and reader-documentation checks still run.' >> "$GITHUB_STEP_SUMMARY"
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -216,39 +338,60 @@ jobs:
           make docs-check
 
       - name: Install Rust
+        if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
 
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+      - name: Cache wrapper Cargo paths
+        if: needs.changes.outputs.docs_only != 'true'
+        uses: ./.github/actions/cargo-cache
         with:
-          prefix-key: docs
+          lane: ${{ github.job }}
 
       - name: Build docs
+        if: needs.changes.outputs.docs_only != 'true'
         run: make doc
         env:
           RUSTDOCFLAGS: -D warnings
 
   wasm-check:
     name: WASM check
+    needs: changes
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
+      # A skipped/failed classifier must never turn required checks green.
+      - name: Require successful classification
+        env:
+          CLASSIFICATION_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+        run: |
+          test "$CLASSIFICATION_RESULT" = success
+          case "$DOCS_ONLY" in true|false) ;; *) exit 1 ;; esac
+      - name: Report prose-only scope
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo 'Reader prose only; Rust execution is not applicable. Security, secrets, container and reader-documentation checks still run.' >> "$GITHUB_STEP_SUMMARY"
       - name: Checkout
+        if: needs.changes.outputs.docs_only != 'true'
         uses: actions/checkout@v4
 
       - name: Install Rust
+        if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
 
       - name: Add wasm32 target
+        if: needs.changes.outputs.docs_only != 'true'
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+      - name: Cache wrapper Cargo paths
+        if: needs.changes.outputs.docs_only != 'true'
+        uses: ./.github/actions/cargo-cache
         with:
-          prefix-key: wasm32
+          lane: ${{ github.job }}
 
       - name: Check elephant-db for wasm32
+        if: needs.changes.outputs.docs_only != 'true'
         run: ./scripts/repo-cargo check -p elephant-db --target wasm32-unknown-unknown

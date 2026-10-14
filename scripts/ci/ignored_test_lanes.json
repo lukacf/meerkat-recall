@@ -1,0 +1,330 @@
+{
+  "format": "recall-ignored-test-lanes/v1",
+  "tests": [
+    {
+      "path": "crates/pipeline/src/provider_dispatch_local_resource_tests.rs",
+      "test": "fresh_contexts_reuse_actual_model_constructor_and_keep_request_receipts_separate",
+      "lane": "provisioned-model"
+    },
+    {
+      "path": "crates/pipeline/src/renderer/multimodal.rs",
+      "test": "test_multimodal_renderer_real_example_frame_across_models",
+      "lane": "live-provider-opt-in"
+    },
+    {
+      "path": "crates/pipeline/src/renderer/multimodal.rs",
+      "test": "test_multimodal_renderer_real_example_video_across_models",
+      "lane": "live-provider-opt-in"
+    },
+    {
+      "path": "crates/storage/src/cost_ledger_daily_index_tests.rs",
+      "test": "budget_reads_stay_indexed_past_fifty_thousand_historical_ledgers",
+      "lane": "deterministic-scale"
+    },
+    {
+      "path": "crates/storage/src/event_repository.rs",
+      "test": "boundary_mode_time_range_query_respects_window",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "crates/storage/src/event_repository.rs",
+      "test": "boundary_mode_time_range_query_respects_window_on_migrated_schema",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "crates/storage/src/event_repository.rs",
+      "test": "boundary_mode_status_filter_query_respects_statuses",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "crates/storage/src/work_queue_index_tests.rs",
+      "test": "queue_indexes_scale_past_fifty_thousand_and_counts_are_exact",
+      "lane": "deterministic-scale"
+    },
+    {
+      "path": "crates/storage/src/work_queue_index_tests.rs",
+      "test": "dependency_promotion_stays_bounded_with_fifty_thousand_cold_items",
+      "lane": "deterministic-scale"
+    },
+    {
+      "path": "crates/storage/src/work_queue_index_tests.rs",
+      "test": "retention_pass_stays_bounded_with_fifty_thousand_completed_attempts",
+      "lane": "deterministic-scale"
+    },
+    {
+      "path": "tests/calibration/tests/calibration_llm.rs",
+      "test": "calibrate_tm_adjudication",
+      "lane": "live-provider-opt-in"
+    },
+    {
+      "path": "tests/calibration/tests/calibration_llm.rs",
+      "test": "calibrate_entity_disambiguation",
+      "lane": "live-provider-opt-in"
+    },
+    {
+      "path": "tests/e2e/src/api/docs_test.rs",
+      "test": "test_ingest_doc_returns_201",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/docs_test.rs",
+      "test": "test_ingest_doc_creates_chunks_and_embeddings",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/docs_test.rs",
+      "test": "test_search_docs_respects_k",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/docs_test.rs",
+      "test": "test_get_doc_returns_document",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/docs_test.rs",
+      "test": "test_get_nonexistent_doc_returns_404",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/docs_test.rs",
+      "test": "test_delete_doc_returns_204",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/docs_test.rs",
+      "test": "test_restore_deleted_doc",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/docs_test.rs",
+      "test": "test_search_docs",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/docs_test.rs",
+      "test": "test_get_collections",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/docs_test.rs",
+      "test": "test_batch_docs",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/identity_test.rs",
+      "test": "test_identity_merge_keep_a_creates_tombstone_redirect",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/identity_test.rs",
+      "test": "test_identity_merge_keep_a_moves_identity_keys_to_survivor",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/identity_test.rs",
+      "test": "test_identity_merge_combine_preserves_metadata",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/api/identity_test.rs",
+      "test": "test_identity_merge_keep_a_preserves_metadata",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "test": "scenario_m10_1_work_item_creation",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "test": "scenario_m10_2_work_item_lease_acquisition",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "test": "scenario_m10_2_runnable_item_replaces_stale_lease_metadata",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "test": "scenario_m10_3_retry_with_exponential_backoff",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "test": "scenario_m10_4_work_runs_track_execution",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "test": "scenario_m10_5_dead_letter_after_max_retries",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m10_work_queue.rs",
+      "test": "scenario_m10_6_idempotency_prevents_duplicates",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m1_tenant_isolation.rs",
+      "test": "scenario_m1_tenant_isolation_leaks",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m2_startup_ordering.rs",
+      "test": "scenario_m2_startup_ordering",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m4_cursor_stability.rs",
+      "test": "scenario_m4_cursor_stability_authorized_total",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m6_outbox_monotonicity.rs",
+      "test": "scenario_m6_outbox_monotonicity",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m7_space_embedding_policy.rs",
+      "test": "scenario_m7_space_embeddings_isolated",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m8_assertion_pipeline.rs",
+      "test": "scenario_m8_1_doc_produces_assertions",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m8_assertion_pipeline.rs",
+      "test": "scenario_m8_2_assertions_resolve_to_entities",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m8_assertion_pipeline.rs",
+      "test": "scenario_m8_3_resolved_assertions_produce_facts",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m8_assertion_pipeline.rs",
+      "test": "scenario_m8_4_partial_resolution_tracked",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "test": "scenario_m9_1_conflicting_claims_create_conflict_group",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "test": "scenario_m9_2_truth_slot_stores_current_answer",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "test": "scenario_m9_3_conflict_resolution_updates_slot",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "test": "scenario_m9_4_staleness_tracked_on_version_change",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/m9_truth_maintenance.rs",
+      "test": "scenario_m9_5_allow_parallel_keeps_all_claims",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s1_1_entity_lifecycle.rs",
+      "test": "scenario_s1_1_entity_lifecycle",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s1_2_rel_traversal.rs",
+      "test": "scenario_s1_2_ghost_edges",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s1_4_identity_key_sot.rs",
+      "test": "scenario_s1_4_identity_key_uniqueness",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s1_8_audit_inheritance.rs",
+      "test": "scenario_s1_8_audit_security_inheritance",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s2_1_zombie_key.rs",
+      "test": "scenario_s2_1_zombie_key",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s2_2_amnesia_merge.rs",
+      "test": "scenario_s2_2_amnesia_merge",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s2_4_partial_success.rs",
+      "test": "scenario_s2_4_partial_success_rollback",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s2_5_masked_truth.rs",
+      "test": "scenario_s2_5_masked_truth_redaction",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s3_1_manifest_repointing.rs",
+      "test": "scenario_s3_1_manifest_repointing",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s3_1_manifest_repointing.rs",
+      "test": "scenario_s3_1_scoped_manifest_repointing_preserves_other_space",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s5_13_alice_in_wonderland.rs",
+      "test": "scenario_s5_13_alice_in_wonderland_live_llm",
+      "lane": "live-provider-opt-in"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s5_15_wizard_of_oz.rs",
+      "test": "scenario_s5_15_wizard_of_oz_live_llm",
+      "lane": "live-provider-opt-in"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s5_18_multimodal_real_media.rs",
+      "test": "scenario_s5_18_real_example_frame_multimodal_e2e_across_models",
+      "lane": "live-provider-opt-in"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s5_18_multimodal_real_media.rs",
+      "test": "scenario_s5_18_real_example_video_multimodal_e2e_across_models",
+      "lane": "live-provider-opt-in"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s5_19_truth_adjudication.rs",
+      "test": "scenario_s5_19_truth_adjudication_real_llm",
+      "lane": "live-provider-opt-in"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s5_4_extraction_pipeline.rs",
+      "test": "scenario_s5_4_extraction_pipeline",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s5_5_manual_extraction.rs",
+      "test": "scenario_s5_5_manual_extraction",
+      "lane": "deterministic-e2e"
+    },
+    {
+      "path": "tests/e2e/src/scenarios/s5_6_pipeline_status.rs",
+      "test": "scenario_s5_6_pipeline_status",
+      "lane": "deterministic-e2e"
+    }
+  ]
+}

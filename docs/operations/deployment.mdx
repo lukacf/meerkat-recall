@@ -4,11 +4,52 @@ description: "Docker Compose setup, deployment modes, environment variable refer
 icon: "rocket"
 ---
 
-The supplied Compose file is a loopback development deployment. It uses local
-database credentials and defaults to `SKIP_AUTH=true`. Use the setup below to
-evaluate Meerkat Recall; build a production service configuration with explicit
-credentials, authentication, TLS, storage, and rollback procedures before
-serving remote callers.
+The root Compose files are development examples with local credentials and
+`SKIP_AUTH=true`. Recall 0.9.1 adds a separate authenticated installation recipe
+under `deploy/compose/`, using qualified Linux AMD64 image digests and persistent
+volumes. Use the selected release's published image record; prepared packaging
+alone does not establish that images are available from the registry. Configure
+TLS, ingress, credentials, backups and rollback before serving remote callers.
+
+## Authenticated Compose installation
+
+From a verified 0.9.1 source archive, select both exact image digests from its
+release record. The Recall image runs the HTTP/MCP gateway and managed workers;
+the paired server image supplies the required database reference capability.
+A stock SurrealDB image is not a substitute for that paired capability.
+
+```bash
+python3 scripts/release/prepare-compose \
+  --output /srv/meerkat-recall \
+  --recall-image ghcr.io/lukacf/meerkat-recall@sha256:YOUR_RECALL_DIGEST \
+  --paired-image ghcr.io/lukacf/recall-surreal@sha256:YOUR_PAIRED_DIGEST
+cd /srv/meerkat-recall
+docker compose pull
+docker compose up -d
+```
+
+The digest placeholders must be replaced; the preparation command validates
+canonical repositories and complete immutable digests. It creates a fresh
+private directory, random signing/database secrets and a complete runtime TOML;
+it refuses an existing destination and never starts Docker. Review the generated
+configuration before startup. The init service copies secrets/configuration
+into owned volumes, the database becomes healthy, migrations run, and only then
+does the Recall service start. The HTTP port binds to loopback by default.
+
+Persistent database data, Recall state and each service's secret volume remain
+separate. Preserve them on upgrades; deleting volumes removes their contents.
+The Recall service runs without root privileges and uses an explicit config
+path. Its health check proves process liveness only. Complete named-space grants,
+provider approvals and worker credentials using [service setup](/operations/service-setup),
+then verify authenticated readiness with a separate status token. Ready gateway
+transport does not establish model access or searchable source publication.
+
+Container publication promotes the exact qualified Docker archives without
+recompilation. Both source/capability/license identities and anonymous pulls of
+the resulting immutable registry digests must pass before a release advertises
+ready-to-pull images. Existing versioned tags must not be replaced with different
+bytes. Review the paired server's BSL license terms separately from Recall's
+MIT/Apache source license.
 
 ## Architecture Overview
 
@@ -81,7 +122,9 @@ Linux acceptance does not establish Darwin behavior.
 example. Install the complete verified archive, create private service-owned
 state directories, and substitute absolute paths before service registration.
 Configure the same backend, namespace and database for explicit `migrate` and
-`serve`. The server verifies schema; it does not silently migrate a store.
+`serve`. In 0.9.1, use `--config /absolute/runtime.toml` on both commands or set
+`ELEPHANT_CONFIG` to that path; invalid explicit configuration fails without
+fallback. Loaded-file precedence is described in [service setup](/operations/service-setup). The server verifies schema; it does not silently migrate a store.
 
 `deploy/kubernetes/recall.yaml` contains a single-replica StatefulSet with separate
 RWOP data, recovery-journal and backup claims. It uses an explicit schema init

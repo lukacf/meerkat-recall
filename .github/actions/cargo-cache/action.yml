@@ -1,0 +1,17 @@
+name: Cache repository Cargo paths
+description: Cache the registry and target actually selected by scripts/repo-cargo
+inputs:
+  lane:
+    description: Separate feature/profile lane; compiler and manifest hashes remain in the key
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Resolve repository wrapper paths
+      id: paths
+      shell: bash
+      run: python3 scripts/ci/cargo_cache_paths.py
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: wrapper-v2-${{ inputs.lane }}
+        workspaces: . -> ${{ steps.paths.outputs.target }}

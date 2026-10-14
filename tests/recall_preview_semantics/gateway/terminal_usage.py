@@ -38,8 +38,12 @@ def strict_value(raw: bytes) -> dict:
 
 def reasoning_projection(item: dict) -> bytes:
     """Exactly the vendored 0.8.51 summary replay projection, never ciphertext size."""
-    fields(item, {"id", "type", "summary", "encrypted_content", "status"},
+    fields(item, {"id", "type", "summary", "encrypted_content", "status", "content"},
            {"id", "type", "summary", "encrypted_content"})
+    # The native SDK omits the provider's empty content array from replay.
+    # Nonempty/unknown reasoning content is outside this reviewed subset.
+    require("content" not in item or (type(item["content"]) is list and not item["content"]),
+            "reasoning_content_unsupported")
     require(item["type"] == "reasoning" and bool(text(item["id"]))
             and bool(text(item["encrypted_content"])), "reasoning_identity_required")
     require(item.get("status", "completed") == "completed", "reasoning_incomplete")
@@ -54,6 +58,26 @@ def reasoning_projection(item: dict) -> bytes:
     return encode({"type": "reasoning", "id": item["id"],
                    "encrypted_content": item["encrypted_content"],
                    "summary": [{"type": "summary_text", "text": combined}] if combined else []})
+
+
+def terminal_item_covers(observed: bytes, final: bytes | None) -> bool:
+    """Only terminal reasoning ciphertext may replace its provisional encoding.
+
+    SDK completed coverage correlates by type/id and lowers final output. Keep
+    this accounting subset stricter: every other field must remain identical,
+    and neither provisional ciphertext nor unreviewed content grants replay.
+    """
+    if observed == final:
+        return True
+    if final is None:
+        return False
+    earlier, terminal = strict_value(observed), strict_value(final)
+    if earlier.get("type") != "reasoning" or terminal.get("type") != "reasoning":
+        return False
+    reasoning_projection(earlier)
+    reasoning_projection(terminal)
+    return {key: value for key, value in earlier.items() if key != "encrypted_content"} == {
+        key: value for key, value in terminal.items() if key != "encrypted_content"}
 
 
 @dataclass(frozen=True)
@@ -159,7 +183,8 @@ def terminal_response(body: bytes, streaming: bool) -> dict:
             identifier = text(item["id"])
             require(identifier not in final_items, "settlement_duplicate_output_item")
             final_items[identifier] = encode(item)
-    require(all(final_items.get(identifier) == value for identifier, value in completed_items.items()),
+    require(all(terminal_item_covers(value, final_items.get(identifier))
+                for identifier, value in completed_items.items()),
             "settlement_stream_terminal_item_mismatch")
     return terminal
 

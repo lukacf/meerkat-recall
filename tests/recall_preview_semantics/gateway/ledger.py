@@ -15,7 +15,7 @@ OPERATIONS = {
     # Document/query share Recall's active profile and credential. This combined
     # authenticated quota does NOT enforce separate 28/48 operation allowances.
     "embedding": 76, "triage": 0,
-    "extraction": 56, "support_verification": 56, "summary": 8,
+    "extraction": 112, "support_verification": 56, "summary": 8,
     "promotion_and_identity_disambiguation": 4, "truth_maintenance": 4,
     "wiki_planner_writer_verifier": 12,
 }
@@ -197,7 +197,7 @@ class Ledger:
                 (self.now()[0], outcome, status, response_hash, response_bytes,
                  usage[0] if usage else None, usage[1] if usage else None, identifier))
             if halt:
-                self.db.execute("UPDATE run SET halted=?", (outcome,))
+                self.db.execute("UPDATE run SET halted=COALESCE(halted,?)", (outcome,))
         # No successful/error/timeout path decreases reserved dollars or count.
 
     def receipt(self) -> dict:

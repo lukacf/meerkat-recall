@@ -194,7 +194,7 @@ class SettlementLedger(Ledger):
                             (read_completed, capture_completed, identifier))
             timely = capture_completed <= row[1] and time.monotonic() <= row[1]
             if not timely:
-                self.db.execute("UPDATE run SET halted='late_capture'")
+                self.db.execute("UPDATE run SET halted=COALESCE(halted,'late_capture')")
         return timely
 
     def before_request(self, request: Request) -> None:
@@ -231,9 +231,26 @@ class SettlementLedger(Ledger):
                 try:
                     self.settle(identifier)
                 except (Denied, OSError, ValueError, TypeError, KeyError):
-                    # Preserve the original response bytes already delivered and R.
-                    # No more sends are admitted after a strict accounting failure.
+                    # Retain the full reservation and private response capture.
+                    # The delivery barrier withholds an unsettled successful response.
                     self._halt("settlement_refused")
+
+    def authorize_response_delivery(self, identifier: int) -> None:
+        """Called after durable finish, before any successful Responses bytes.
+
+        A failed settlement cannot create client history that is ineligible for
+        replay. This hook never settles, retries, authorizes history or refunds.
+        """
+        with self.transaction():
+            row = self.db.execute("SELECT state,transport_deadline FROM settlement WHERE dispatch_id=?",
+                                  (identifier,)).fetchone()
+            require(row is not None and row[0] == "settled", "settlement_delivery_unsettled")
+            self.check_time()
+            require(type(row[1]) is float, "settlement_transport_deadline")
+            timely = time.monotonic() <= row[1]
+            if not timely:
+                self.db.execute("UPDATE run SET halted=COALESCE(halted,'late_delivery')")
+        require(timely, "settlement_late_delivery")
 
     def _evidence(self, identifier: int):
         cursor = self.db.execute("SELECT * FROM dispatch WHERE id=?", (identifier,))

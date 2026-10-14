@@ -90,14 +90,18 @@ def schema(value: object, depth: int = 0) -> None:
             schema(child, depth + 1)
 
 
-def content(value: object) -> None:
+def content(value: object, *, cache_metadata: bool = False) -> None:
     if isinstance(value, str):
         text(value)
         return
     require(type(value) is list and len(value) <= 128, "text_content_required")
     for part in value:
-        part = fields(part, {"type", "text", "annotations"}, {"type", "text"})
+        part = fields(part, {"type", "text", "annotations"}
+                      | ({"prompt_cache_breakpoint"} if cache_metadata else set()), {"type", "text"})
         require(part["type"] in ("input_text", "output_text", "summary_text"), "nontext_content")
+        if "prompt_cache_breakpoint" in part:
+            marker = fields(part["prompt_cache_breakpoint"], {"mode"}, {"mode"})
+            require(part["type"] == "input_text" and marker["mode"] == "explicit", "unsupported_fields")
         require(part.get("annotations", []) == [], "remote_annotations")
         text(part["text"])
 
@@ -169,10 +173,30 @@ def validate(raw: bytes, path: str, scope: Scope, *, output_cap_mode: str = "rej
     else:
         fields(body, {"model", "input", "instructions", "max_output_tokens", "stream", "store",
                       "service_tier", "reasoning", "include", "tools", "tool_choice", "parallel_tool_calls",
-                      "text", "temperature", "top_p", "previous_response_id"} | ({"truncation"} if full_context else set()),
+                      "text", "temperature", "top_p", "previous_response_id"}
+               | ({"truncation", "prompt_cache_key", "prompt_cache_options"} if full_context else set()),
                {"model", "input", "max_output_tokens", "reasoning"})
         require(scope.operation != "embedding", "operation_path_mismatch")
         require(scope.model == "gpt-6.1-sol", "unapproved_model")
+        # Admit only the pinned Meerkat 0.8.51 catalog defaults. These are
+        # upstream cache-placement fields, not server-side conversation IDs.
+        # The 30m TTL is a minimum cache lifetime, never an erasure guarantee.
+        cache_fields = {"prompt_cache_key", "prompt_cache_options"} & body.keys()
+        cache_metadata = bool(cache_fields)
+        if cache_metadata:
+            require(cache_fields == {"prompt_cache_key", "prompt_cache_options"}, "unsupported_fields")
+            options = fields(body["prompt_cache_options"], {"mode", "ttl"}, {"mode", "ttl"})
+            require(body["prompt_cache_key"] == "meerkat:profile:openai:gpt-6.1-sol"
+                    and options == {"mode": "implicit", "ttl": "30m"}, "unsupported_fields")
+            # The SDK default is profile-global. Preserve the complete scoped
+            # identity, including rotation, but fit the provider's 64-character
+            # limit: the previous prefix plus digest occupied 85 characters.
+            # Hash the full old scoped key and validated SDK key with a versioned
+            # domain. No context/key truncation; all other body fields stay intact.
+            scoped_key = "recall-qualification:" + scope.context_key
+            body["prompt_cache_key"] = digest(encode([
+                "recall-qualification-cache-key:v2", body["prompt_cache_key"], scoped_key]))
+            transforms.append("scoped_prompt_cache_key:sha256:v2")
         # This optional qualification transform is explicitly approved/pinned
         # separately. The ordinary/default path still refuses oversized caps.
         requested_output = integer(body["max_output_tokens"], 128000, "output_token_limit")
@@ -224,7 +248,7 @@ def validate(raw: bytes, path: str, scope: Scope, *, output_cap_mode: str = "rej
                     require(item["role"] in ("user", "assistant", "developer", "system"), "unsupported_role")
                     require(item.get("status", "completed") == "completed", "incomplete_history_item")
                     require(item.get("phase", "final_answer") in ("commentary", "final_answer"), "unsupported_phase")
-                    content(item["content"])
+                    content(item["content"], cache_metadata=cache_metadata)
                     require("id" not in item, "state_reference_forbidden")
                 elif kind == "function_call":
                     fields(item, {"type", "call_id", "name", "arguments"}, {"type", "call_id", "name", "arguments"})
@@ -233,7 +257,7 @@ def validate(raw: bytes, path: str, scope: Scope, *, output_cap_mode: str = "rej
                 elif kind == "function_call_output":
                     fields(item, {"type", "call_id", "output"}, {"type", "call_id", "output"})
                     text(item["call_id"])
-                    content(item["output"])
+                    content(item["output"], cache_metadata=cache_metadata)
                 elif kind == "reasoning":
                     require(full_context and callable(authorize_reasoning), "opaque_reasoning_forbidden")
                     fields(item, {"type", "id", "summary", "encrypted_content"},

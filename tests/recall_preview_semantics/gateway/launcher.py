@@ -348,7 +348,7 @@ def run(args) -> int:
     if socket_path.exists():
         require(stat.S_ISSOCK(socket_path.lstat().st_mode), "unsafe_gateway_socket")
         socket_path.unlink()  # exclusive ledger lock prevents concurrent owner
-    gateway = GatewayServer(socket_path, policy, forwarder)
+    gateway = GatewayServer(socket_path, policy, forwarder, diagnostic_directory=args.run_directory)
     os.chmod(socket_path, 0o600)
     mark_stage("child_command")
     child_args = launch_command(runtime, work, socket_path, source / "bridge.py", command, env, anchor_path,
@@ -373,6 +373,12 @@ def run(args) -> int:
             child.wait()
         gateway.shutdown()
         gateway.server_close()
+        try:
+            gateway.close_denial_capture()
+        except Exception:
+            # Keep ordinary ledger closure even when diagnostic custody fails.
+            sys.stderr.write(encode({"gateway_denial_capture_complete": False,
+                                     "code": "denial_capture_closure_failed"}).decode() + "\n")
         # Receipts alone never establish source/search/model quality acceptance.
         mark_stage("terminal_receipt")
         receipt = encode(ledger.receipt())

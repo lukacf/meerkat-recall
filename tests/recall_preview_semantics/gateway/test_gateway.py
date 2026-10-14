@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from capture import Capture
 from bridge import worker_environment
-from ledger import Ledger, MONEY_CAP, OPERATIONS, RESPONSE_CAP
+from ledger import Ledger, COUNT_CAP, MONEY_CAP, OPERATIONS, RESPONSE_CAP
 from policy import Policy
 from transport import Forwarder, stream_complete, usage_from_response
 from wire import Denied, Scope, digest, encode, validate
@@ -144,9 +144,11 @@ class LedgerTests(LedgerFixture):
     def test_full_proposal_arithmetic_independent_integer_calculation(self):
         generation_count = sum(v for k, v in OPERATIONS.items() if k != "embedding") * 2
         embedding_count = (28 + 48) * 2
-        self.assertEqual(generation_count + embedding_count, 432)
-        self.assertEqual(generation_count * 245760000 + embedding_count * 1064960, 68974673920)
-        self.assertLess(68974673920, MONEY_CAP)
+        # Per-operation ceilings overlap the independent global count/money caps.
+        self.assertEqual(generation_count + embedding_count, 544)
+        self.assertEqual(COUNT_CAP, 432)
+        self.assertEqual(generation_count * 245760000 + embedding_count * 1064960, 96499793920)
+        self.assertGreater(96499793920, MONEY_CAP)
 
     def test_nonrefundable_errors_and_unknown_usage(self):
         identifier, _ = self.ledger.reserve(request(), lambda: None)
@@ -186,7 +188,7 @@ class LedgerTests(LedgerFixture):
             self.ledger.reserve(request(), lambda: None)
         self.finish(first)
         self.finish(second)
-        for _ in range(54):
+        for _ in range(110):
             identifier, _ = self.ledger.reserve(request(), lambda: None)
             self.finish(identifier)
         with self.assertRaisesRegex(Denied, "operation_count_limit"):

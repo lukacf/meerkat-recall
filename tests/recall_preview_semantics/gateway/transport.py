@@ -173,7 +173,14 @@ class Forwarder:
             require(response.getheader("Content-Encoding", "identity") == "identity", "unsupported_upstream_encoding")
             # Redirect statuses are passed to the client but NEVER followed.
             content_type = response.getheader("Content-Type", "application/octet-stream")
-            start_response(status, content_type)
+            # v2 reasoning replay requires a durable terminal settlement before
+            # the native client can observe completion and issue a continuation.
+            # Reuse the existing bounded body buffer; no extra upstream request,
+            # output truncation, transport deadline or reservation is introduced.
+            deferred_delivery = (status < 300 and request.scope.operation != "embedding"
+                                 and callable(getattr(self.ledger, "authorize_response_delivery", None)))
+            if not deferred_delivery:
+                start_response(status, content_type)
             while True:
                 remaining = deadline - time.monotonic()
                 require(remaining > 0, "dispatch_deadline")
@@ -203,7 +210,8 @@ class Forwarder:
                 body.extend(block)
                 response_hash.update(block)
                 captured.write(block)
-                write(block)
+                if not deferred_delivery:
+                    write(block)
             usage = usage_from_response(bytes(body), request.streaming and status < 300)
             outcome = "upstream_error" if status >= 300 else "complete"
             if status < 300 and request.streaming and not stream_complete(bytes(body)):
@@ -222,6 +230,12 @@ class Forwarder:
                                response_hash=response_hash.hexdigest(), response_bytes=len(body),
                                usage=usage, halt=not complete)
             recorded = True
+            if deferred_delivery:
+                # Mark recorded first: denial or downstream disconnect must not
+                # finish an already settled physical dispatch a second time.
+                self.ledger.authorize_response_delivery(identifier)
+                start_response(status, content_type)
+                write(bytes(body))
         finally:
             if timer is not None:
                 timer.cancel()

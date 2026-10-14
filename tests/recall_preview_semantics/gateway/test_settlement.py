@@ -136,11 +136,14 @@ class TerminalTests(unittest.TestCase):
             "response": {"id": "resp_foreign", "status": "in_progress"}}) + b"\n\n"
         with self.assertRaises(Denied): self.check(first + valid, True)
 
-    def test_streamed_done_item_must_equal_terminal_item(self):
+    def test_streamed_done_item_preserves_identity_and_terminal_ciphertext(self):
         item = dict(REASONING, status="completed")
         done = b"data: " + encode({"type": "response.output_item.done", "sequence_number": 1, "item": item}) + b"\n\n"
         self.check(done + sse(terminal(output=[item])), True)
-        for changed in (dict(item, encrypted_content="changed"), dict(item, summary=[]), dict(item, id="foreign")):
+        changed_cipher = dict(item, encrypted_content="changed")
+        usage = self.check(done + sse(terminal(output=[changed_cipher])), True)
+        self.assertEqual(usage.replay_items, (reasoning_projection(changed_cipher),))
+        for changed in (dict(item, summary=[]), dict(item, id="foreign")):
             with self.subTest(changed=changed), self.assertRaises(Denied):
                 self.check(done + sse(terminal(output=[changed])), True)
         with self.assertRaises(Denied): self.check(done + sse(terminal(output=[])), True)
@@ -216,7 +219,8 @@ class LedgerTests(unittest.TestCase):
     def test_incomplete_and_bad_usage_keep_full_liability(self):
         value = terminal()
         value["usage"].pop("total_tokens")
-        self.forward(encode(value))
+        with self.assertRaisesRegex(Denied, "settlement_delivery_unsettled"):
+            self.forward(encode(value))
         receipt = self.ledger.receipt()
         self.assertEqual(receipt["unresolved_nano_usd"], 6_210_000_000)
         self.assertEqual(receipt["spent_upper_nano_usd"], 0)
@@ -262,13 +266,15 @@ class LedgerTests(unittest.TestCase):
 
     def test_completed_refusal_keeps_full_liability(self):
         output = [{"type": "message", "status": "completed", "content": [{"type": "refusal", "refusal": "Synthetic refusal."}]}]
-        self.forward(encode(terminal(output=output)))
+        with self.assertRaisesRegex(Denied, "settlement_delivery_unsettled"):
+            self.forward(encode(terminal(output=output)))
         self.assertEqual(self.ledger.receipt()["unresolved_nano_usd"], 6_210_000_000)
         self.assertEqual(self.ledger.receipt()["spent_upper_nano_usd"], 0)
 
     def test_duplicate_response_id_cannot_release_second_reservation(self):
         self.forward()
-        self.forward()
+        with self.assertRaisesRegex(Denied, "settlement_delivery_unsettled"):
+            self.forward()
         receipt = self.ledger.receipt()
         self.assertEqual(receipt["spent_upper_nano_usd"], 8_000_000)
         self.assertEqual(receipt["unresolved_nano_usd"], 6_210_000_000)
@@ -355,7 +361,8 @@ class LedgerTests(unittest.TestCase):
         factory = lambda identifier, req, original: LateCapture(self.directory, identifier, req, original,
                                                                 binding=self.ledger.binding(req.scope))
         with patch("time.monotonic", side_effect=lambda: tick[0]):
-            self.forward(capture=factory)
+            with self.assertRaisesRegex(Denied, "settlement_delivery_unsettled"):
+                self.forward(capture=factory)
         receipt = self.ledger.receipt()
         self.assertEqual(receipt["spent_upper_nano_usd"], 0)
         self.assertEqual(receipt["unresolved_nano_usd"], 6_210_000_000)

@@ -520,6 +520,12 @@ fingerprint comparison still rejects unknown or remote concurrent writers.
 Remote connectors have no local pause guarantee. SDK background workers never
 acquire Recall's foreground barrier, so the two gates have one acquisition order.
 
+The upstream server's non-test startup still calls the public `tasks::init`
+entrypoint. That compatibility wrapper remains available in ordinary builds and
+delegates to `init_with_gate` with a private default gate. Recall's native and
+Wasm routers keep passing their shared snapshot gate directly to `init_with_gate`;
+the compatibility wrapper does not change their pause or cancellation behavior.
+
 This fixes an independent local writer: changefeed processing records database
 versionstamp/timestamp keys even without a configured changefeed. Those keys
 belong to the complete native history and can change during a long export even
@@ -546,7 +552,7 @@ source provenance; it does not claim compilation or runtime qualification.
 | `vendor/surrealdb-2.6.5/src/api/conn/cmd.rs` | `2899ab6bb8785af2e6d94a66b13538b90272b6c53e80ee8c5aa3593cf0b7bbc7` |
 | `vendor/surrealdb-2.6.5/src/api/engine/local/native.rs` | `49d7fbaa345341382f2498b3ae4acc3fb9f740e2309da148373b433d72676933` |
 | `vendor/surrealdb-2.6.5/src/api/engine/local/wasm.rs` | `ccc6a6b81742d686a28cbf6688420d69d2bf62a791cf12293758b94635d149ec` |
-| `vendor/surrealdb-2.6.5/src/api/engine/tasks.rs` | `e39b48306388243f7195186e3446153c75acce94090fa6f37ae5c0b9638ab9a8` |
+| `vendor/surrealdb-2.6.5/src/api/engine/tasks.rs` | `c048dd66045cfc7fbb1311cd25c07706e03dcfba2c363e3c20e2e486c22b0f11` |
 | `vendor/surrealdb-2.6.5/src/api/opt/config.rs` | `c9a278e014d2277b8d7d96266500b8b297b6f288b3a2af355a2e291f29dab7ae` |
 | `vendor/surrealdb-2.6.5/src/api/engine/local/mod.rs` | `2fb383c594248e75d541f9864d0379cc282986d8e2ce4af2d33b91e94489a58b` |
 | `vendor/surrealdb-2.6.5/src/api/engine/remote/mod.rs` | `5f9ca74cda88a57b1b9208a06ca0005f603437f17711f57071220e52960b95ae` |

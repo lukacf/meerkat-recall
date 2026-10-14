@@ -61,7 +61,7 @@ PUBLIC_PROSE = frozenset({
 # living-wiki.mdx is an include_str! input to the demo-wiki executable.
 # Internal plans, other Markdown, configuration, examples and scripts never qualify.
 SHA = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
-FENCE = re.compile(r'^\s*(`{3,}|~{3,})')
+FENCE = re.compile(r'^(?:\s*>\s*)*\s*(?:(?:[-+*]|[0-9]+[.)])\s+)?(`{3,}|~{3,})')
 SENSITIVE = re.compile(r'[`<>{}]|^\s*(?:import|export)\b|^(?: {4}|\t)\S')
 
 
@@ -78,6 +78,8 @@ def protected_content(text: str) -> tuple[str, ...]:
     protected: list[str] = []
     frontmatter = bool(lines and lines[0].strip() == '---')
     fence: str | None = None
+    mdx_tag = False
+    expression_depth = 0
     for index, line in enumerate(lines):
         if frontmatter:
             protected.append(line)
@@ -85,6 +87,14 @@ def protected_content(text: str) -> tuple[str, ...]:
                 frontmatter = False
             continue
         match = FENCE.match(line)
+        # Multiline attributes and expressions are executable MDX, even when
+        # a continuation line contains none of the opening delimiters.
+        if mdx_tag or expression_depth:
+            protected.append(line)
+            if mdx_tag and '>' in line:
+                mdx_tag = False
+            expression_depth = max(0, expression_depth + line.count('{') - line.count('}'))
+            continue
         if fence:
             protected.append(line)
             if match and match[1][0] == fence[0] and len(match[1]) >= len(fence):
@@ -94,7 +104,9 @@ def protected_content(text: str) -> tuple[str, ...]:
             protected.append(line)
         elif SENSITIVE.search(line):
             protected.append(line)
-    if frontmatter or fence:
+            mdx_tag = '<' in line and '>' not in line[line.index('<'):]
+            expression_depth = max(0, line.count('{') - line.count('}'))
+    if frontmatter or fence or mdx_tag or expression_depth:
         raise ValueError('unclosed configuration or code block')
     return tuple(protected)
 

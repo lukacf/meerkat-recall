@@ -26,6 +26,17 @@ class ProseTests(unittest.TestCase):
             with self.subTest(old=old):
                 self.assertFalse(classifier.prose_only('README.md', old, new))
 
+    def test_multiline_mdx_and_nested_code_are_not_prose(self):
+        examples = [
+            '<Card\n  href="old"\n>\nText\n</Card>\n',
+            '{\n  old\n}\n',
+            '> ```sh\n> old\n> ```\n',
+            '- ~~~sh\n  old\n  ~~~\n',
+        ]
+        for old in examples:
+            with self.subTest(example=old):
+                self.assertFalse(classifier.prose_only('docs/installation.mdx',old.encode(),old.replace('old','new').encode()))
+
     def test_unchanged_examples_remain_eligible(self):
         old=b'Old words\n```sh\nmake check\n```\n'
         self.assertTrue(classifier.prose_only('README.md',old,old.replace(b'Old',b'Clear')))

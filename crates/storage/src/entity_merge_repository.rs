@@ -1932,6 +1932,10 @@ mod canonical_merge_tests {
         clippy::too_many_lines,
         reason = "Verify merge audit authority and atomic refusal against the same original plan."
     )]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep shared storage and repositories in the original fixture scope through audit and rollback assertions."
+    )]
     async fn rewritten_subject_audit_authority(embedded: bool) {
         let storage = client(embedded).await;
         let entities = EntityRepository::new(storage.clone());

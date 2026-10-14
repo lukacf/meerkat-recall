@@ -211,7 +211,7 @@ async fn semantic_boundaries(client: &StorageClient) -> TestResult {
     for table in TABLES {
         for sql in [
             "UPDATE type::thing($table,$key) SET payload='changed',canonical_read_nonce='content';",
-            "UPDATE type::thing($table,$key) SET security={level:3},canonical_read_nonce='policy';",
+            "UPDATE type::thing($table,$key) SET security={ level: 3 },canonical_read_nonce='policy';",
             "UPDATE type::thing($table,$key) SET future_field='unknown',canonical_read_nonce='future';",
             "UPDATE type::thing($table,$key) SET future_field=NULL;",
             "UPDATE type::thing($table,$key) UNSET future_field;",
@@ -354,6 +354,12 @@ async fn native_read_nonces_populated_044_requires_explicit_upgrade() -> TestRes
 
 #[tokio::test]
 async fn native_read_nonces_still_refuse_original_erasure_reservation() -> TestResult {
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct ReservationDb {
+        space_id: String,
+        erasure_reservation: String,
+    }
+
     let client = StorageClient::new_memory().await?;
     Box::pin(super::apply_schema(&client)).await?;
     seed(&client).await?;
@@ -361,11 +367,6 @@ async fn native_read_nonces_still_refuse_original_erasure_reservation() -> TestR
         "UPDATE type::thing('source_erasure_guard',$space) SET erasure_reservation='other-owner';",
         json!({"space": SPACE}),
     ).await?;
-    #[derive(Debug, Deserialize, PartialEq, Eq)]
-    struct ReservationDb {
-        space_id: String,
-        erasure_reservation: String,
-    }
     let mut response = client
         .query_bind_checked(
             "SELECT space_id,erasure_reservation FROM type::thing('source_erasure_guard',$space);",

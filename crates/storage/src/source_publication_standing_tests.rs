@@ -801,6 +801,10 @@ async fn surreal_source_progress_race_exhaustion_writes_nothing() {
     Box::pin(continuing_progress_is_bounded(false)).await;
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep each fault-injection repository in its branch scope until the original authority mutation completes."
+)]
 async fn change_original_between_commits(fixture: &Fixture, claim: &WorkItem, fault: usize) {
     let space = &fixture.manifest.space_id;
     if fault < 2 {

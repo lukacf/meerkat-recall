@@ -12,6 +12,10 @@ use std::cell::Cell;
 
 const SPACE: &str = "business-a";
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the shared client and work repository in the fixture scope until its original claim is captured."
+)]
 async fn fixture(embedded: bool) -> (SourcePublicationRepository, PublicationFence, AttemptFence) {
     let client = tests::client(embedded).await;
     if !embedded {
@@ -118,7 +122,9 @@ async fn assert_original_claim(repository: &SourcePublicationRepository, attempt
 }
 
 async fn progress_retains_unknown_fields(embedded: bool) {
-    let (repository, publication, attempt) = fixture(embedded).await;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (repository, publication, attempt) = Box::pin(fixture(embedded)).await;
     let mut original = operation_payload(&repository, &publication).await;
     original["future_authority"] = json!({"ceiling": ["private"], "version": 9});
     original["receipt"]["future_receipt_field"] = json!({"must": "survive"});
@@ -130,7 +136,7 @@ async fn progress_retains_unknown_fields(embedded: bool) {
         &original,
     )
     .await;
-    let calls = Cell::new(0);
+    let calls = AtomicUsize::new(0);
     repository
         .record_execution_state_with(
             SPACE,
@@ -139,7 +145,7 @@ async fn progress_retains_unknown_fields(embedded: bool) {
             OperationState::Processing,
             None,
             |preparation| {
-                calls.set(calls.get() + 1);
+                calls.fetch_add(1, Ordering::Relaxed);
                 let repository = &repository;
                 let publication = &publication;
                 async move {
@@ -164,7 +170,7 @@ async fn progress_retains_unknown_fields(embedded: bool) {
         )
         .await
         .expect("same original authority can record progress");
-    assert_eq!(calls.get(), if embedded { 1 } else { 2 });
+    assert_eq!(calls.load(Ordering::Relaxed), if embedded { 1 } else { 2 });
     let current = operation_payload(&repository, &publication).await;
     original["receipt"]["state"] = json!("processing");
     assert_eq!(current, original, "only requested live progress changed");

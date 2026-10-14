@@ -10,3 +10,9 @@ threads-required = "num-test-threads"
 [[profile.default.overrides]]
 filter = 'package(elephant-pipeline-bin) & test(=runtime::work_item_tests::source_finalizer_contention_tests::surreal_fourteen_same_space_source_finalizers_complete)'
 threads-required = "num-test-threads"
+
+# This full-book scenario is CPU intensive. Keep its original 300-second
+# pipeline deadline while reserving the runner's slots for the complete test.
+[[profile.default.overrides]]
+filter = 'package(elephant-scenarios) & test(=embedded_elephant_db::scenario_embedded_elephant_db_ingests_alice_and_searches_semantically)'
+threads-required = "num-test-threads"

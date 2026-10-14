@@ -161,6 +161,11 @@ unimplemented = "warn"
 opt-level = 0
 debug = true
 
+# The ancestry boundary tests validate every predecessor through the native
+# query interpreter. Optimize that dependency without changing the test workload.
+[profile.test.package.surrealdb-core]
+opt-level = 1
+
 [profile.release]
 opt-level = 3
 lto = true

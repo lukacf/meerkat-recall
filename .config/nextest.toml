@@ -4,3 +4,9 @@
 [[profile.default.overrides]]
 filter = "test(=reprocess::budget::independent_producer_ancestry::native_actual_256_work_and_257_source_boundaries)"
 threads-required = "num-test-threads"
+
+# This test already publishes fourteen sources concurrently. Reserve the runner's
+# slots so unrelated tests do not distort its unchanged 180-second deadline.
+[[profile.default.overrides]]
+filter = 'package(elephant-pipeline-bin) & test(=runtime::work_item_tests::source_finalizer_contention_tests::surreal_fourteen_same_space_source_finalizers_complete)'
+threads-required = "num-test-threads"

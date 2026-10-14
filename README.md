@@ -10,7 +10,7 @@ Use it as a standalone service through HTTP or MCP, from any agent stack.
 Within Meerkat, Core runs agents and Meta manages their application and memory
 lifecycle; Recall adds shared, evidence-backed knowledge. It is an optional,
 independently released component. See the
-[ecosystem guide](https://docs.rkat.ai/ecosystem) to choose your starting point.
+[Meerkat introduction](https://docs.rkat.ai/introduction) to choose your starting point.
 
 This branch targets Recall 0.9.0 with the published Meerkat 0.9.0 SDK.
 The latest published Recall release is

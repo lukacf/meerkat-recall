@@ -104,7 +104,8 @@ not passes. Never transfer acceptance to a rebuilt binary based on version alone
 ## Container recipe
 
 ```sh
-export RECALL_ARTIFACT_BUDGET_FILE=/absolute/artifacts/shared-allocation.json
+export RECALL_BUILD_RESOURCE_MODE=current-capacity
+export RECALL_ARTIFACT_BUDGET_FILE=/absolute/evidence/recall-current-capacity.json
 scripts/release/build-container recall-candidate:SOURCE /absolute/artifacts
 scripts/release/render-container --image registry.example/recall@sha256:DIGEST \
   --output /absolute/artifacts/recall.yaml
@@ -126,41 +127,40 @@ are installed from Debian's repositories; every installed builder/runtime packag
 version is recorded. Those recorded versions do not claim that mutable package
 repositories produce a bit-for-bit identical image on a later date.
 
-The build keeps a dedicated Bookworm Rust cache with exclusive cache-mount access,
-bound to the reviewed source identity, checkout path, compiler, target and feature
-graph. Retries of that same build reuse its cache; another checkout or source
-revision gets a separate cache. Do not seed it with Ubuntu target objects. Build
-jobs are bounded to16 (default8), with `TLC_WORKERS=8` and `BINARYEN_CORES=8`.
+The build keeps a dedicated Bookworm Rust cache with exclusive cache-mount access.
+In `current-capacity` mode its compatibility key binds the pinned image inputs,
+Rust compiler, target, release/deploy profiles, package/features, native compiler
+setup, static ONNX input and Cargo wrapper. Source revisions and checkout paths
+do not force a cold cache; Cargo still fingerprints source and dependency changes.
+Do not seed it with Ubuntu target objects. Jobs are bounded to 32 (default 8),
+with `TLC_WORKERS=8` and `BINARYEN_CORES=8`; use fewer jobs when other host work
+needs capacity.
 
-The scheduler must allocate one Recall Cargo slot and set the same absolute
-`RECALL_ARTIFACT_BUDGET_FILE` for the sequential Recall and paired-server builds.
-The persistent allocation receipt monitors source, Docker, output and temporary
-filesystems, deduplicating shared devices. Every positive observed usage increment
-consumes the aggregate `RECALL_ARTIFACT_MAX_GIB` allocation (default150; cannot
-exceed1280). An explicit value above150 requires the host scheduler's approval.
-Increasing this setting never raises an existing ledger's limit: that requires
-a separate coordinated transition while every prior ledger reader is stopped.
-The transition must retain the original baseline and consumption, and must not
-lower the free-space floor. The approved600 GiB transition also raises the stored
-floor to at least300,000,000,000 bytes (300 GB decimal). Admission, readiness and
-every recurring sample must enforce the greater of that floor and the original
-250 GiB floor; any stricter stored floor remains authoritative. Future consumers
-must explicitly request the approved allocation; the
-default remains150. Later deletion does not refund it; unrelated filesystem growth also
-counts. The wrapper checks every two seconds during the build and refuses at the
-allocation limit or below `RECALL_BUILD_MIN_FREE_GIB` (default250; cannot be lowered).
-Sampling cannot attribute bytes to processes or prevent growth between samples.
-An allocation refusal, changed filesystem set or changed capacity requires scheduler
-review. A larger ceiling does not clear an existing refusal: ordinary consumers
-continue to reject it. The separately reviewed, expiring 800 GiB transition may
-clear only the original cap-exhaustion refusal under explicit coordinator and
-host authority, with all prior readers drained and positive intervening growth
-checked under the original lock. It retains original counters and samples in immutable history, charges each
-positive observed delta before advancing the sample, and never refunds a later
-decrease; a floor refusal, unknown
-cause or exhausted new ceiling remains refused. This transition is not performed
-by the build scripts. The script never resets the allocation or prunes caches. Build cancellation
-still needs the scheduler to confirm the builder has stopped before another Cargo job.
+Use a fresh absolute `RECALL_ARTIFACT_BUDGET_FILE` for each build. In this mode
+it is a current-capacity receipt, despite the historical environment-variable
+name. It samples actual root free space (at least 265 GiB), each selected
+source/Docker/output/temporary path (at least 250 GiB), and host `MemAvailable`
+(at least 120 GiB) before, every two seconds during, and after the build/package.
+`RECALL_BUILD_MIN_FREE_GIB` may raise the disk floors but cannot lower them.
+The monitored path/device set cannot change and stored floors cannot decrease.
+A refusal remains refused; use a new receipt only after addressing its cause.
+Recall and paired-server builds use distinct receipts, so each retains its own
+path set. No cumulative allocation ceiling applies in current-capacity mode.
+The mode never resets, refunds or overwrites a historical allocation ledger.
+Sampling cannot attribute usage to processes or prevent growth between samples.
+
+On failure the launcher cancels only its owned Docker CLI process group.
+Private Buildx references and source-bound daemon history must establish that
+owned work is terminal before successful closure; unresolved daemon activity is
+an error. Preserve the cleanup receipt and reconcile active work before reusing
+the lane. The recipe never prunes caches or stops unrelated builds.
+
+Omitting `RECALL_BUILD_RESOURCE_MODE` retains `legacy-allocation` for old recipe
+reproduction: its original source/path cache identity, 16-job limit and persistent
+cumulative ledger remain unchanged. Its default allocation is 150 GiB, bounded
+to 1280 GiB, with positive observed growth charged and no refund after deletion.
+Those old ceilings and transition approvals are not scheduling gates for a fresh
+0.9.1 current-capacity build. Do not repurpose a legacy receipt for the new mode.
 
 The native archive adapter checks the immutable local image ID and platform,
 source labels, source/lock digests, pinned image inputs, compiler, production
@@ -303,11 +303,19 @@ Recall artifact receipt. A source fingerprint describes build inputs; it does
 not substitute for probing the running remote server. The runtime's journal,
 erasure replay, migration and readiness checks remain part of acceptance.
 
-The scheduled container builder may pass the keyword-only `cache_id` to
-`container_artifact.build_image` to reuse one explicitly reviewed warm Recall
-BuildKit cache across a recipe correction. The default remains derived from the
-current checkout/source/feature graph. Explicit values must have the exact
-`recall-bookworm-rust194-` plus 64 lowercase hexadecimal digest shape. Both the
-actual Docker build argument and `container-build-metadata.json` retain that
-selection. Current source identity, archive identity and dependency/native-input
-invalidation checks remain in force; cache reuse is not artifact acceptance.
+A container builder may pass `--cache-id` and `--cache-evidence` to
+`container_artifact.py build` to adopt an explicitly reviewed warm Recall
+BuildKit cache in current-capacity mode. The evidence must match the current
+compatibility contract and bind the retained build receipt, its cache identity,
+compiler/target/profile/features and installed native compiler package inventory.
+The cache ID has the exact `recall-bookworm-rust194-` plus 64 lowercase hexadecimal
+digest shape. Without this override the key is derived from the compatibility
+contract. The actual Docker argument and `container-build-metadata.json` retain
+the selection. Current source/archive identity and Cargo/native-input
+invalidation remain in force; cache reuse is not artifact acceptance.
+
+For qualified registry publication and authenticated installation, see
+[container delivery](CONTAINER_DELIVERY.md) and the
+[Compose operator guide](../../deploy/compose/README.md). Publication promotes
+already accepted image bytes and verifies anonymous access; a local image build
+alone does not make an image ready to pull.

@@ -894,23 +894,29 @@ impl PreparedEntityMerge {
             base.created_by.clone_from(&self.actor);
             let before = effect.before.as_ref().map(canonical_json).transpose()?;
             let after_value = canonical_json(after)?;
-            self.request.plan.push(
-                None,
-                Some(CanonicalRecord::AuditLog(Box::new(AuditLog {
-                    base,
-                    action: if effect.before.is_some() {
-                        AuditAction::Update
-                    } else {
-                        AuditAction::Create
-                    },
-                    actor: self.actor.clone(),
-                    record: after.base().id.clone(),
-                    before,
-                    after: Some(after_value),
-                    timestamp: self.now,
-                    reason: Some(self.request.commit_id.clone()),
-                }))),
+            let mut audit = AuditLog {
+                base,
+                action: if effect.before.is_some() {
+                    AuditAction::Update
+                } else {
+                    AuditAction::Create
+                },
+                actor: self.actor.clone(),
+                record: after.base().id.clone(),
+                before,
+                after: Some(after_value),
+                timestamp: self.now,
+                reason: Some(self.request.commit_id.clone()),
+            };
+            // A rewritten subject can leave the live row, but remains in the
+            // audit's before image. Retain both trusted target envelopes.
+            crate::canonical_commit::inherit_maintenance_audit_authority(
+                &self.request.plan,
+                &mut audit,
             )?;
+            self.request
+                .plan
+                .push(None, Some(CanonicalRecord::AuditLog(Box::new(audit))))?;
             changed.push(serde_json::json!({"id": after.base().id, "table": after.base().id.table().as_str(), "op": if effect.before.is_some() {"update"} else {"create"}}));
         }
         for envelope in self.authorizations()? {
@@ -1920,6 +1926,143 @@ mod canonical_merge_tests {
             .unwrap();
         assert!(audits.iter().any(|audit| audit.record == rel.base.id));
         assert!(audits.iter().any(|audit| audit.record == b.base.id));
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Verify merge audit authority and atomic refusal against the same original plan."
+    )]
+    async fn rewritten_subject_audit_authority(embedded: bool) {
+        let storage = client(embedded).await;
+        let entities = EntityRepository::new(storage.clone());
+        let a = entities.create(entity("Survivor")).await.unwrap();
+        let b = entities.create(entity("Merged")).await.unwrap();
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::Doc),
+            "home".into(),
+            "test".into(),
+        );
+        base.subjects = vec![Link::new(b.base.id.clone())];
+        base.subjects_state = SubjectsState::Complete;
+        base.security.level = 3;
+        let docs = crate::DocRepository::new(storage.clone());
+        let doc = docs
+            .create(elephant_types::records::Doc {
+                base,
+                title: "Retained document".into(),
+                text: "Original identity reference".into(),
+                sidecar_text: None,
+                source: None,
+                media_attachments: vec![],
+                rendition_key: "merge-audit-subject".into(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        docs.delete("home", &doc.base.id).await.unwrap();
+        let original = docs
+            .get_with_deleted("home", &doc.base.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let plan = EntityMergeRepository::new(storage.clone())
+            .prepare_merge(
+                "home",
+                &a.base.id,
+                &b.base.id,
+                MergeSelection::KeepA,
+                "test",
+            )
+            .await
+            .unwrap()
+            .into_prepared_plan()
+            .unwrap();
+        let audit_index = plan.effects.iter().position(|effect| matches!(
+            &effect.after, Some(CanonicalRecord::AuditLog(audit)) if audit.record == doc.base.id
+        )).unwrap();
+        let Some(CanonicalRecord::AuditLog(audit)) = &plan.effects[audit_index].after else {
+            unreachable!("selected audit");
+        };
+        let audit_id = audit.base.id.clone();
+        assert_eq!(audit.base.subjects.len(), 2);
+        assert!(audit.base.subjects.contains(&Link::new(a.base.id.clone())));
+        assert!(audit.base.subjects.contains(&Link::new(b.base.id.clone())));
+        assert_eq!(audit.base.security, doc.base.security);
+        assert_eq!(
+            audit.before.as_ref().unwrap()["subjects"],
+            serde_json::json!([b.base.id])
+        );
+        assert_eq!(
+            audit.after.as_ref().unwrap()["subjects"],
+            serde_json::json!([a.base.id])
+        );
+        let canonical = CanonicalRepository::new(storage.clone());
+        let request = CanonicalCommit {
+            space_id: "home".into(),
+            commit_id: "merge-audit-authority-control".into(),
+            input_fingerprint: "original-subject-union".into(),
+            replay_output: None,
+            publication: None,
+            finalization: None,
+            maintenance: Some(CanonicalMaintenanceContext {
+                origin: CanonicalMaintenanceOrigin::Derived,
+                attempt: None,
+                sources: vec![],
+            }),
+            plan,
+        };
+        for invalid_target in [false, true] {
+            let mut invalid = request.clone();
+            let Some(CanonicalRecord::AuditLog(audit)) =
+                &mut invalid.plan.effects[audit_index].after
+            else {
+                unreachable!("selected audit")
+            };
+            if invalid_target {
+                audit.record = RecordId::new_v4(TableName::Doc);
+            } else {
+                audit
+                    .base
+                    .subjects
+                    .retain(|subject| subject.id() != &b.base.id);
+            }
+            assert!(canonical.commit(invalid).await.is_err());
+            assert_eq!(
+                canonical.epoch("home").await.unwrap(),
+                request.plan.observed_epoch
+            );
+            assert_eq!(
+                docs.get_with_deleted("home", &doc.base.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                original
+            );
+            assert!(crate::AuditLogRepository::new(storage.clone())
+                .get("home", &audit_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        canonical.commit(request).await.unwrap();
+        let restored = docs.restore("home", &doc.base.id).await.unwrap();
+        assert_eq!(restored.base.subjects, vec![Link::new(a.base.id)]);
+        let audit = crate::AuditLogRepository::new(storage)
+            .get("home", &audit_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(audit.base.subjects.contains(&Link::new(b.base.id)));
+    }
+
+    #[tokio::test]
+    async fn embedded_merge_audit_retains_rewritten_subject_authority() {
+        rewritten_subject_audit_authority(true).await;
+    }
+
+    #[tokio::test]
+    async fn surreal_merge_audit_retains_rewritten_subject_authority() {
+        rewritten_subject_audit_authority(false).await;
     }
 
     #[expect(

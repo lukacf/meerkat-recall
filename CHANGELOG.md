@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   state and a paired SurrealDB server; promote qualified container archives to
   the canonical registry with explicit source and anonymous-pull checks.
 
+### Bulk ingestion
+- Inspect effective daily graph/retrieval limits, usage and reservation-aware
+  headroom through an authorized, selected-space `GET /api/v1/budget`.
+- Document complete-input `text-full-v2` profile selection, staged reindex
+  activation and fresh revision/generation retries for terminal failed sources.
+
 ### CI reliability
 - Use a conservative reader-prose path while preserving required check names,
   secret scanning, dependency auditing and reader-documentation validation.

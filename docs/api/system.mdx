@@ -15,6 +15,7 @@ alone as a readiness or completion check.
 | Check dependencies | [Health](#health), [Capabilities](#capabilities) |
 | Save or restore a whole store | [Managed snapshots](#managed-snapshots) |
 | Configure a tenant | [Spaces](#spaces) |
+| Check bulk-import headroom | [Daily budget](#daily-budget) |
 | Diagnose processing | [Work items](#work-items) |
 | Inspect current claims | [Truth slots](#truth-slots) |
 | Review duplicate identities | [Identity resolution](#identity-resolution) |
@@ -227,6 +228,37 @@ This configuration selects the provider but does not supply its credentials.
 Check [spaces](/concepts/spaces) before changing an existing embedding policy.
 
 ---
+
+## Daily budget
+
+`GET /api/v1/budget` (Recall 0.9.1) selects a space with `X-Space-Id` and
+requires `read:space_config`, record clearance and current-grant authority.
+It is available without provider calls and does not reserve budget or start work.
+
+| Field | Meaning |
+| --- | --- |
+| `space_id` | Authorized selected space |
+| `runtime.configured` | Stored deployment budget configuration |
+| `runtime.effective` | Managed-worker limits after existing optional defaults |
+| `runtime.managed_workers_running` | Whether this API runtime owns live managed workers |
+| `today.date`, `today.resets_at` | Selected UTC ledger date and next UTC midnight |
+| `today.graph`, `today.retrieval` | Mode-specific limits, usage and headroom |
+| `today.*.limit_units`, `used_units`, `remaining_units` | Abstract accounting units; outstanding reservations are included |
+| `today.*.limit_items`, `used_items`, `remaining_items` | Work-item counts, not source-document counts |
+| `today.*.usage_source` | `budget_guard`, or `ledger` before a guard exists |
+
+Historical `euros` configuration names use abstract accounting units, with
+measured tokens reconciled at one unit per million; they are not monetary
+provider charges. Remaining values saturate at zero while usage retains
+an overrun. This is an advisory read; concurrent reservations can change
+headroom immediately. Policy applies independently per space and UTC day,
+and separately configured external worker settings are not attested.
+Missing runtime configuration or invalid/unavailable accounting returns `503`.
+Unknown authorized space returns `404`; insufficient authority returns `403`.
+
+The legacy `GET /api/v1/budget/today` retains its original ledger-total contract.
+Use the [budget operator guide](/operations/service-setup#inspect-budget-before-an-import)
+for supported limit changes, defaults and import planning.
 
 ## Work Items
 

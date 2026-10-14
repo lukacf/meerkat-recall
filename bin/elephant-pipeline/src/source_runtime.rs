@@ -1744,6 +1744,7 @@ mod tests {
                 .await
                 .expect("read queue")
                 .expect("queue");
+            drop(repository);
             assert_eq!(queued.status, WorkItemStatus::Runnable);
             assert_eq!(queued.attempts, claim.attempts - 1);
             assert!(
@@ -1765,6 +1766,7 @@ mod tests {
                 .is_err(),
                 "retired original claim cannot update state again"
             );
+            drop(storage);
         }
     }
 

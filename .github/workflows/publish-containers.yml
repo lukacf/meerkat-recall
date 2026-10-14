@@ -9,14 +9,16 @@ on:
         description: Draft release containing container-delivery.json and both docker tar assets
         required: true
         type: string
+      qualified_source:
+        description: Exact immutable product source commit bound to the release tag and delivery manifest
+        required: true
+        type: string
       manifest_sha256:
         description: Reviewed container-delivery.json SHA256
         required: true
         type: string
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
 concurrency:
   group: recall-container-promotion
@@ -24,16 +26,37 @@ concurrency:
 
 jobs:
   promote:
+    if: github.repository == 'lukacf/meerkat-recall' && github.ref == 'refs/heads/main'
+    permissions:
+      # Draft release visibility requires push access; this job only reads releases.
+      contents: write
+      packages: write
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate immutable product source input
+        env:
+          QUALIFIED_SOURCE: ${{ inputs.qualified_source }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$QUALIFIED_SOURCE" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.qualified_source }}
+          path: qualified-source
+          persist-credentials: false
       - name: Download and verify exact qualified images
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           MANIFEST_SHA: ${{ inputs.manifest_sha256 }}
+          QUALIFIED_SOURCE: ${{ inputs.qualified_source }}
         shell: bash
         run: |
           set -euo pipefail
@@ -47,11 +70,12 @@ jobs:
           python3 scripts/release/container_delivery.py verify \
             --directory "$RUNNER_TEMP/delivery" --sha256 "$MANIFEST_SHA"
           python3 - <<'PY'
-          import json, os
+          import json, os, subprocess
           from pathlib import Path
           value=json.loads((Path(os.environ['RUNNER_TEMP'])/'delivery/container-delivery.json').read_text())
           assert 'v'+value['version']==os.environ['RELEASE_TAG']
-          assert value['source_commit']==os.environ['GITHUB_SHA'], 'Dispatch workflow at exact qualified source commit'
+          actual=subprocess.check_output(['git','-C','qualified-source','rev-parse','HEAD'],text=True).strip()
+          assert value['source_commit']==os.environ['QUALIFIED_SOURCE']==actual, 'Qualified checkout and manifest source differ'
           PY
       - name: Authenticate canonical package publisher
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3
@@ -64,12 +88,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           MANIFEST_SHA: ${{ inputs.manifest_sha256 }}
+          QUALIFIED_SOURCE: ${{ inputs.qualified_source }}
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/release/promote_containers.py \
             --directory "$RUNNER_TEMP/delivery" --sha256 "$MANIFEST_SHA" \
-            --release-tag "$RELEASE_TAG"
+            --release-tag "$RELEASE_TAG" --source-commit "$QUALIFIED_SOURCE" \
+            --source-directory "$GITHUB_WORKSPACE/qualified-source"
       # New GHCR packages start private. The package owner must set each package
       # public; repository visibility alone is not proof of anonymous access.
       - name: Require anonymous registry access to both exact digests
@@ -89,5 +115,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: recall-published-container-digests
-          path: ${{ runner.temp }}/delivery/published-images.json
+          path: |
+            ${{ runner.temp }}/delivery/published-images.json
+            ${{ runner.temp }}/delivery/publication-binding.json
           if-no-files-found: ignore

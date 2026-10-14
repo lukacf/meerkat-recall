@@ -61,6 +61,39 @@ def classify_manifest(status, headers, raw, expected_config):
     return digest
 
 
+def draft_release(tag):
+    # The REST tag route only returns published releases. gh resolves drafts
+    # through GraphQL, then we bind the result to the numeric REST release ID.
+    found = json.loads(subprocess.check_output([
+        'gh', 'release', 'view', tag, '--repo', 'lukacf/meerkat-recall',
+        '--json', 'databaseId'], timeout=30))
+    release_id = found.get('databaseId')
+    if type(release_id) is not int or release_id <= 0:
+        raise ValueError('positive draft release ID required')
+    release = json.loads(subprocess.check_output([
+        'gh', 'api', f'repos/lukacf/meerkat-recall/releases/{release_id}'], timeout=30))
+    if type(release.get('id')) is not int or release['id'] != release_id:
+        raise ValueError('selected release ID differs')
+    return release
+
+
+def verify_dispatch_source(source, source_directory):
+    if (os.environ.get('GITHUB_ACTIONS') != 'true'
+            or os.environ.get('GITHUB_REPOSITORY') != 'lukacf/meerkat-recall'
+            or os.environ.get('GITHUB_REF') != 'refs/heads/main'):
+        raise ValueError('canonical main GitHub Actions publisher required')
+    tooling_sha = os.environ.get('GITHUB_SHA', '')
+    if not delivery.COMMIT.fullmatch(source) or not delivery.COMMIT.fullmatch(tooling_sha):
+        raise ValueError('exact qualified source and tooling commits required')
+    tooling_root = Path(__file__).resolve().parents[2]
+    for directory, expected in ((tooling_root, tooling_sha), (Path(source_directory), source)):
+        actual = subprocess.check_output(
+            ['git', '-C', str(directory), 'rev-parse', 'HEAD'], text=True, timeout=30).strip()
+        if actual != expected:
+            raise ValueError('checked-out tooling or qualified source differs')
+    return tooling_sha
+
+
 def verify_release_binding(release, tag, source):
     if (release.get('draft') is not True or release.get('tag_name') != tag
             or release.get('prerelease') is not False):
@@ -79,16 +112,18 @@ def verify_release_binding(release, tag, source):
     raise ValueError('release tag cannot be resolved within bound')
 
 
-def promote(directory, expected_sha, release_tag):
-    if os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('GITHUB_REPOSITORY') != 'lukacf/meerkat-recall':
-        raise ValueError('canonical GitHub Actions publisher required')
+def promote(directory, expected_sha, release_tag, source_commit, source_directory):
+    tooling_sha = verify_dispatch_source(source_commit, source_directory)
     root = Path(directory)
     value = delivery.verify(root, expected_sha)
-    if 'v' + value['version'] != release_tag or value['source_commit'] != os.environ['GITHUB_SHA']:
+    if 'v' + value['version'] != release_tag or value['source_commit'] != source_commit:
         raise ValueError('dispatch, release and qualified source differ')
-    release = json.loads(subprocess.check_output(['gh', 'api',
-        'repos/lukacf/meerkat-recall/releases/tags/' + release_tag], timeout=30))
+    release = draft_release(release_tag)
     verify_release_binding(release, release_tag, value['source_commit'])
+    (root / 'publication-binding.json').write_text(json.dumps({
+        'tooling_commit': tooling_sha, 'qualified_source_commit': source_commit,
+        'release_id': release['id'], 'release_tag': release_tag,
+        'delivery_manifest_sha256': expected_sha}, indent=2) + '\n')
     # Check both destinations before any mutation. Errors never imply absence.
     for item in value['images'].values():
         registry_manifest(item['repository'], value['version'], item['image_id'])
@@ -121,8 +156,10 @@ if __name__ == '__main__':
     parser.add_argument('--directory', required=True)
     parser.add_argument('--sha256', required=True)
     parser.add_argument('--release-tag', required=True)
+    parser.add_argument('--source-commit', required=True)
+    parser.add_argument('--source-directory', required=True)
     args = parser.parse_args()
     try:
-        promote(args.directory, args.sha256, args.release_tag)
+        promote(args.directory, args.sha256, args.release_tag, args.source_commit, args.source_directory)
     except Exception as error:
         parser.exit(1, 'container promotion refused (' + type(error).__name__ + '); no credentials printed\n')

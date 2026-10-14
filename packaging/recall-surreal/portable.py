@@ -42,11 +42,13 @@ def cache_identity(source: Path, provenance: dict) -> str:
         "package": "surreal", "default_features": True,
     }
     if os.environ.get('RECALL_BUILD_RESOURCE_MODE') == 'current-capacity':
+        compiler_recipe = (source / '.recall/Dockerfile.build').read_text().split('WORKDIR /source', 1)[0]
         graph = {'rust_toolchain': provenance['rust_toolchain'], 'target': 'x86_64-unknown-linux-gnu',
                  'profile': 'release', 'package': 'surreal', 'default_features': True,
                  'inputs': json.loads((source / '.recall/container-inputs.lock.json').read_text()),
                  'wrapper_sha256': prepare.digest(source / '.recall/repo-cargo'),
                  'native_environment': {'LZMA_API_STATIC': '1'},
+                 'compiler_recipe_sha256': hashlib.sha256(compiler_recipe.encode()).hexdigest(),
                  'profile_config': __import__('tomllib').loads((source / 'Cargo.toml').read_text()).get('profile', {})}
     return "recall-paired-" + hashlib.sha256(json.dumps(graph, sort_keys=True).encode()).hexdigest()
 

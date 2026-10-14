@@ -54,6 +54,7 @@ class ContainerCacheTests(unittest.TestCase):
 
             with mock.patch.object(container.artifact, 'source_identity', return_value=identity), \
                     mock.patch.object(container, 'load_inputs', return_value=inputs), \
+                    mock.patch.object(container, 'cache_contract', return_value={'fixture_native_compiler': True}), \
                     mock.patch.object(container, 'build_limits', return_value=(8, 250 * 1024**3, 150 * 1024**3)), \
                     mock.patch.dict(os.environ, {'RECALL_ARTIFACT_BUDGET_FILE': str(root / 'budget.json')}), \
                     mock.patch.object(container, 'ResourceBudget', return_value=budget), \
@@ -72,6 +73,7 @@ class ContainerCacheTests(unittest.TestCase):
             self.assertIn('SOURCE_TREE=' + identity['source_tree'], record['command'])
             self.assertIn('SOURCE_SHA256=' + identity['source_tar_sha256'], record['command'])
             self.assertEqual(record['input_lock'], inputs)
+            self.assertEqual(record['cache_compatibility'], {'fixture_native_compiler': True})
 
     def test_default_cache_preserves_current_source_graph_identity(self):
         self.build(None)

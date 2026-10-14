@@ -18,7 +18,7 @@ class ResourceBudgetTests(unittest.TestCase):
     def test_environment_cannot_relax_shared_host_limits(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(container_artifact.build_limits(), (8, 250 * container_artifact.GIB, 150 * container_artifact.GIB))
-            for key, value in (("RECALL_BUILD_MIN_FREE_GIB", "249"), ("RECALL_ARTIFACT_MAX_GIB", "801"),
+            for key, value in (("RECALL_BUILD_MIN_FREE_GIB", "249"), ("RECALL_ARTIFACT_MAX_GIB", str(container_artifact.MAX_ALLOCATION_BYTES // container_artifact.GIB + 1)),
                                ("RECALL_ARTIFACT_MAX_GIB", "0"), ("CARGO_BUILD_JOBS", "17")):
                 with self.subTest(key=key, value=value), patch.dict(os.environ, {key: value}), self.assertRaises(ValueError):
                     container_artifact.build_limits()
@@ -36,7 +36,12 @@ class ResourceBudgetTests(unittest.TestCase):
                 unchanged = container_artifact.ResourceBudget(receipt, (root,), allocation=200 * gib).check()
                 self.assertEqual(unchanged["limit_bytes"], 150 * gib)
                 self.assertEqual(unchanged["consumed_bytes"], original["consumed_bytes"])
-            for invalid in (0, 800 * gib + 1):
+            maximum = container_artifact.MAX_ALLOCATION_BYTES
+            accepted = container_artifact.ResourceBudget(receipt, (root,), allocation=maximum)
+            self.assertEqual(accepted.allocation, maximum)
+            with patch.dict(os.environ, {"RECALL_ARTIFACT_MAX_GIB": str(maximum // gib)}, clear=True):
+                self.assertEqual(container_artifact.build_limits(), (8, 250 * gib, maximum))
+            for invalid in (0, maximum + 1):
                 with self.assertRaises(ValueError):
                     container_artifact.ResourceBudget(receipt, (root,), allocation=invalid)
 

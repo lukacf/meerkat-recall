@@ -75,7 +75,7 @@ enum Commands {
 
 #[derive(Args, Debug, Clone, Default)]
 struct ServeArgs {
-    /// Explicit runtime TOML file (overrides ELEPHANT_CONFIG and project discovery).
+    /// Explicit runtime TOML file (overrides `ELEPHANT_CONFIG` and project discovery).
     #[arg(long)]
     config: Option<PathBuf>,
     /// Run only HTTP/MCP server routes; do not start managed workers.

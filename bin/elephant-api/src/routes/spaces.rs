@@ -44,6 +44,9 @@ use crate::authz::AuthzState;
 use crate::routes::entities::ApiError;
 use crate::routes::require_space_id;
 
+#[path = "spaces_budget.rs"]
+mod budget;
+
 /// Shared state for space-scoped helpers.
 #[derive(Clone)]
 pub struct SpaceApiState {
@@ -64,6 +67,7 @@ pub struct SpaceApiState {
     pub cost_ledger_repo: CostLedgerDailyRepository,
     pub space_config_repo: SpaceConfigRepository,
     pub authz: AuthzState,
+    runtime: Option<Arc<crate::runtime::RuntimeManager>>,
 }
 
 impl SpaceApiState {
@@ -87,7 +91,14 @@ impl SpaceApiState {
             cost_ledger_repo: CostLedgerDailyRepository::new(storage.clone()),
             space_config_repo: SpaceConfigRepository::new(storage),
             authz,
+            runtime: None,
         }
+    }
+    /// Bind the runtime authority used for effective budget inspection.
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: Arc<crate::runtime::RuntimeManager>) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 }
 
@@ -123,6 +134,7 @@ pub fn space_routes() -> Router<Arc<SpaceApiState>> {
         )
         .route("/api/v1/predicates/aliases", get(list_predicate_aliases))
         .route("/api/v1/budget/today", get(get_budget_today))
+        .route("/api/v1/budget", get(budget::get_budget))
         // V1 space CRUD routes
         .route("/v1/spaces", get(list_spaces_v1).post(create_space_v1))
         .route(

@@ -636,7 +636,43 @@ for token, grant and per-space tool checks.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PIPELINE_BUDGET_DAILY_ITEMS_GRAPH` | `10000` | Daily budget limit for graph-mode items |
+| `PIPELINE_BUDGET_DAILY_EUROS_GRAPH` | `50` | Graph accounting-unit limit per space and UTC day |
+| `PIPELINE_BUDGET_DAILY_EUROS_RETRIEVAL` | `10` | Retrieval accounting-unit limit per space and UTC day |
+| `PIPELINE_BUDGET_DAILY_ITEMS_GRAPH` | `10000` | Graph work items per space and UTC day |
+| `PIPELINE_BUDGET_DAILY_ITEMS_RETRIEVAL` | `1000` | Retrieval work items per space and UTC day |
+| `PIPELINE_BUDGET_PER_ITEM_TOKENS` | `100000` | Per-item token cap |
+| `PIPELINE_BUDGET_PER_ITEM_WALL_TIME_SECS` | `300` | Per-item time cap in seconds |
+| `PIPELINE_BUDGET_DOWNGRADE_POLICY` | `degrade_mode_with_queue` | `strict`, `degrade_mode`, `degrade_mode_with_queue`, or `alert_only` |
+
+These are environment-only worker defaults. For managed TOML configuration,
+set the corresponding lower-case fields under `[budget]`, for example:
+
+```toml
+[budget]
+daily_euros_graph = 50.0
+daily_euros_retrieval = 10.0
+daily_items_graph = 10000
+daily_items_retrieval = 1000
+per_item_tokens = 100000
+per_item_wall_time_secs = 300
+downgrade_policy = "degrade_mode_with_queue"
+```
+
+Include both daily unit limits when adding a `[budget]` table; omitted numeric
+fields in that table deserialize as zero. Omitting the entire table uses the
+default budget. Omitted optional item/token/time fields become worker defaults,
+not unlimited values. The historic `euros` names are abstract token-accounting
+units (one per million measured tokens), not a provider bill; estimated
+reservations also consume headroom. Limits apply independently per space.
+`alert_only` records overruns instead of refusing admission; other policies
+retain their documented downgrade/queue behavior. Before bulk ingestion,
+[inspect effective limits and remaining headroom](/operations/service-setup#inspect-budget-before-an-import)
+with the authorized `GET /api/v1/budget` endpoint. Check separate extractor and
+worker lifecycle limits too; raising a daily budget does not remove them.
+
+For long documents, use an approved new `text-full-v2` embedding profile and
+complete any required reindex activation. See the
+[profile migration sequence](/operations/service-setup#long-documents-and-embedding-profiles).
 
 ### API Keys
 

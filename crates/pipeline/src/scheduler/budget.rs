@@ -22,6 +22,9 @@ use uuid::Uuid;
 
 use crate::error::PipelineError;
 
+mod inspection;
+pub use inspection::{BudgetInspection, ModeBudgetInspection};
+
 /// `system_event.event_type` for the durable budget-exhaustion signal.
 pub const BUDGET_EXHAUSTED_EVENT_TYPE: &str = "budget_exhausted";
 

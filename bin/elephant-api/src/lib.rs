@@ -160,10 +160,10 @@ fn managed_storage_routes(
         storage_client.clone(),
         authz_service.clone(),
     ));
-    let space_state = Arc::new(SpaceApiState::new(
-        storage_client.clone(),
-        authz_service.clone(),
-    ));
+    let space_state = Arc::new(
+        SpaceApiState::new(storage_client.clone(), authz_service.clone())
+            .with_runtime(runtime.clone()),
+    );
 
     let mut authenticated_routes = Router::new()
         .merge(routes::grants::grant_routes().with_state(Arc::new(
@@ -557,10 +557,10 @@ pub async fn run_api_with_client_and_shutdown(
         storage_client.clone(),
         authz_service.clone(),
     ));
-    let space_state = Arc::new(SpaceApiState::new(
-        storage_client.clone(),
-        authz_service.clone(),
-    ));
+    let space_state = Arc::new(
+        SpaceApiState::new(storage_client.clone(), authz_service.clone())
+            .with_runtime(runtime.clone()),
+    );
 
     let authenticated_routes = Router::new()
         .merge(routes::grants::grant_routes().with_state(Arc::new(

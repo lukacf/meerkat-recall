@@ -219,6 +219,105 @@ missing or changed bytes prevent use. Model names and installed caches do not
 grant approval. Remote account health and successful inference are separate
 from local configuration availability.
 
+## Long documents and embedding profiles
+
+For imports with documents above the selected embedding model's input limit,
+choose the existing `text-full-v2` preprocessing profile explicitly. It segments
+the complete input and pools segment vectors; it does not discard the suffix.
+`text-v1` retains its original whole-input representation and refuses oversized
+inputs with `embedding_input_too_large`. Never truncate documents or change the
+preprocessing label on existing vectors to make an import pass.
+
+Preprocessing belongs to each space's approved `processing.profiles` entry,
+not `runtime.toml` or a global environment override. Read the current space with
+`GET /v1/spaces/{space}`. Add a new immutable profile ID using the actual approved
+connection, model, version and dimensions. For example, this profile shape uses
+an operator-approved OpenAI connection and deployment identity:
+
+```json
+{"id":"embedding-full-v2","connection_id":"approved-openai","model":"text-embedding-3-large","model_version":"operator-approved-version","dimensions":3072,"preprocessing":"text-full-v2"}
+```
+
+The example is a template; `model_version` records operator configuration and
+does not independently pin a remote provider deployment. Preserve existing
+profiles, bindings, generations and authority when submitting the complete
+updated `processing` object through `PUT /v1/spaces/{space}`. This requires
+`read:space_config`, `write:space_config`, explicit `manage:provider` and the
+space's record/current-grant authority.
+
+For a fresh empty space, bind both `query_embedding` and `document_embedding`
+to the new profile and set `active_embedding_profile_id` to that profile. For a
+populated space, leave its active profile and those bindings unchanged, add an
+approved `reindex_embedding` binding to the new profile, then:
+
+1. Read `GET /v1/spaces/{space}/processing/reindex` and retain its current
+   `processing_generation`.
+2. Call `POST /v1/spaces/{space}/processing/reindex/start` with
+   `target_profile_id` and that `expected_processing_generation`.
+3. Poll the reindex status until `pending_reindex.complete` is true. Retain the
+   actual `reindex_id` and latest `processing_generation`. Concurrent content
+   changes may require another pass; incomplete coverage cannot be activated.
+4. Call `POST /v1/spaces/{space}/processing/reindex/activate` with the actual
+   `reindex_id` and latest `expected_processing_generation`.
+
+Activation updates the active profile and existing approved query/document
+binding profile IDs together, while retaining revocations. Confirm the profile
+and `embedding_execution_recipes` preprocessing in named-space status. Reindexing
+uses the configured provider and may incur charges. After correcting the profile,
+resubmit terminal failed sources using the [source retry contract](#operator-retries).
+
+## Inspect budget before an import
+
+From Recall 0.9.1, `GET /api/v1/budget` returns effective limits, current usage
+and remaining headroom for the space selected by `X-Space-Id`. Use a named-space
+operator token with `read:space_config`, its current same-space grant and the
+SpaceConfig record's clearance. A status-only or bootstrap token cannot inspect
+this endpoint.
+
+```sh
+curl --fail --silent --show-error "$RECALL_URL/api/v1/budget" \
+  -H "Authorization: Bearer $RECALL_OPERATOR_TOKEN" \
+  -H 'X-Space-Id: research'
+```
+
+Inspect `runtime.effective`, `runtime.managed_workers_running` and `today.graph`
+before bulk admission. `today.graph` and `today.retrieval` include `limit_units`,
+`used_units`, `remaining_units`, `limit_items`, `used_items` and
+`remaining_items`; `today.resets_at` gives the next UTC midnight. Usage includes
+outstanding reservations plus reconciled work, including failed provider work.
+The current guard wins over ledger aggregation, so reservations are not double
+counted. Headroom is an advisory read, not a reservation or an atomic promise
+across concurrent imports. Exhausted headroom is reported as zero, while
+`used_units` and `used_items` retain any overrun.
+
+The legacy names `daily_euros_*` and `spent_graph` are **abstract accounting
+units, not provider invoices**: measured provider tokens reconcile at one unit
+per million tokens. Reservations are estimates, and missing usage is not
+fabricated. Do not multiply a total that includes reservations into a claim of
+measured tokens or use it as a currency bill. Items count admitted work items,
+not documents; one source can consume several graph items and attempts.
+The older `GET /api/v1/budget/today` keeps its ledger-only totals and cannot
+establish effective limits or reservation-aware headroom.
+
+Budget policy is configured for the deployment but enforced independently for
+each named space and UTC day. It is not a shared global account or a SpaceConfig
+budget override. `runtime.configured` shows TOML values and `runtime.effective`
+shows their managed-worker interpretation. Omitted optional item/token/time
+caps fall back to worker defaults; they do not disable the cap. The managed
+worker does not load `budget.concurrent_workers`; use the documented work-queue
+concurrency settings. The endpoint cannot attest settings of separately launched
+workers, which must be configured consistently.
+
+To change limits for a TOML-managed deployment, edit the selected file's
+`[budget]` section and restart gracefully, or use the authorized global MCP
+`configure_runtime` tool with fields such as `budget_daily_euros_graph` and
+`budget_daily_items_graph`. Global runtime configuration requires `write:system`
+and an unrestricted global principal; ordinary space administration does not
+change the deployment's budget. Use `get_runtime_config` and the selected-space
+budget endpoint to verify the result. Environment-only workers use
+`PIPELINE_BUDGET_*` at startup; those variables do not override a loaded TOML
+budget. See [all budget settings](/operations/deployment#pipeline-budget-control).
+
 ## Admit and reconcile sources
 
 Use `PUT /v1/spaces/{space}/sources/{external_id}` with a new opaque `revision`,
@@ -271,6 +370,18 @@ extraction worker token. The item must be Failed and its producer/dependency
 state must permit `retry_authorized`; operator authority does not bypass those
 guards. Poll the original item and operation after an uncertain response before
 requesting another retry.
+
+A source operation already marked `failed_final` retains its terminal receipt;
+retrying its old work item or replaying its old idempotency key does not create a
+new source attempt. Correct the provider/profile/budget issue first, read the
+current source head, then submit a new source PUT with a **new revision and new
+idempotency key** plus the exact current `expected_generation`. Preserve the
+full original bytes, media type, metadata, classification and subjects unless
+an authorized change is intended. Retain the old failed operation for audit,
+and poll the newly returned operation to completion. A changed generation is a
+conflict to reconcile, not permission to overwrite another writer. This flow
+uses the ordinary `read:source`/`write:source` and source-envelope/current-grant
+authority; it does not require giving write access to the extractor worker.
 
 ## Readiness, shutdown and recovery
 

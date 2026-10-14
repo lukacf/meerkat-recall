@@ -62,6 +62,17 @@ impl RuntimeMode {
     }
 }
 
+/// Budget settings shared by managed workers, enforced independently per space.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeBudgetConfiguration {
+    /// Stored runtime budget, before the managed-worker environment projection.
+    pub configured: Budget,
+    /// Budget the managed worker constructs from the runtime settings.
+    pub effective: Budget,
+    /// Whether this runtime currently owns a live managed worker.
+    pub managed_workers_running: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElephantConfig {
     pub runtime: RuntimeSection,
@@ -836,6 +847,39 @@ impl RuntimeManager {
             );
         }
         Some(value)
+    }
+
+    /// Effective managed-worker configuration, without credentials or provider calls.
+    /// External worker processes may use different settings and are not attested.
+    pub async fn budget_configuration(&self) -> Option<RuntimeBudgetConfiguration> {
+        let inner = self.inner.read().await;
+        let configured = inner.config.as_ref()?.budget.clone();
+        let managed_workers_running = inner
+            .pipeline
+            .as_ref()
+            .is_some_and(|worker| !worker.is_stopped());
+        drop(inner);
+        let defaults = Budget::default();
+        // start_pipeline removes absent optional variables; the worker's env
+        // loader then retains Budget::default for those fields. It does not
+        // load concurrent_workers. Report that existing behavior faithfully.
+        let effective = Budget {
+            daily_items_graph: configured.daily_items_graph.or(defaults.daily_items_graph),
+            daily_items_retrieval: configured
+                .daily_items_retrieval
+                .or(defaults.daily_items_retrieval),
+            per_item_tokens: configured.per_item_tokens.or(defaults.per_item_tokens),
+            per_item_wall_time_secs: configured
+                .per_item_wall_time_secs
+                .or(defaults.per_item_wall_time_secs),
+            concurrent_workers: defaults.concurrent_workers,
+            ..configured.clone()
+        };
+        Some(RuntimeBudgetConfiguration {
+            configured,
+            effective,
+            managed_workers_running,
+        })
     }
 
     pub async fn current_storage(&self) -> Option<StorageClient> {
@@ -2115,6 +2159,37 @@ fn redact_config(mut config: ElephantConfig) -> ElephantConfig {
 mod tests {
 
     #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    #[tokio::test]
+    async fn effective_budget_projection_matches_managed_optional_defaults() -> Result<()> {
+        let storage = StorageClient::new_embedded().await?;
+        let mut runtime = RuntimeManager::new_preconfigured(storage);
+        let config = runtime.inner.get_mut().config.as_mut().expect("config");
+        config.budget.daily_euros_graph = 7.5;
+        config.budget.daily_items_graph = Some(42);
+        config.budget.daily_items_retrieval = None;
+        config.budget.per_item_tokens = None;
+        config.budget.concurrent_workers.insert("extract".into(), 2);
+        let projected = runtime.budget_configuration().await.expect("budget");
+        assert!(
+            (projected.effective.daily_euros_graph - projected.configured.daily_euros_graph).abs()
+                < f64::EPSILON
+        );
+        assert_eq!(projected.effective.daily_items_graph, Some(42));
+        assert_eq!(
+            projected.effective.daily_items_retrieval,
+            Budget::default().daily_items_retrieval
+        );
+        assert_eq!(
+            projected.effective.per_item_tokens,
+            Budget::default().per_item_tokens
+        );
+        assert!(projected.effective.concurrent_workers.is_empty());
+        assert!(!projected.managed_workers_running);
+        runtime.inner.get_mut().config = None;
+        assert!(runtime.budget_configuration().await.is_none());
+        Ok(())
+    }
 
     #[test]
     fn minimal_deployment_toml_retains_defaults_and_explicit_discovery_space() -> Result<()> {

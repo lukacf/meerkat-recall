@@ -299,3 +299,21 @@ An optional bootstrap snapshot can be selected with
 The `.cargo/config.toml` sets default environment variables for development:
 - `RUST_BACKTRACE=1` for full backtraces
 - `RUST_LOG=info,elephant=debug` for useful log output
+
+## Diagnose bulk ingestion
+
+Before a bulk run, inspect the selected space's effective daily budget and
+reservation-aware headroom through `GET /api/v1/budget`; see
+[operator budget setup](/operations/service-setup#inspect-budget-before-an-import).
+For oversized inputs, preserve source bytes and choose a new approved
+`text-full-v2` profile with the
+[guarded reindex sequence](/operations/service-setup#long-documents-and-embedding-profiles).
+Do not relabel existing `text-v1` vectors or silently truncate input.
+
+Authorized work-run metrics retain `custom.failure_diagnostic` with fixed
+`kind`, `stage`, `code` and `action` fields. Worker warnings expose the matching
+`failure_kind`, `failure_stage`, `failure_code` and `failure_action`. Use these
+typed causes to distinguish model input/output limits, provider quota, MCP
+transport, extraction budget and schema failures. A new diagnostic cannot
+recover a cause already absent from a historical receipt. Keep raw source text,
+provider error bodies and credentials out of shared reports.

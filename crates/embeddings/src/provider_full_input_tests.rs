@@ -689,7 +689,7 @@ async fn sdk_full_input_handles_long_document_and_unbroken_run_without_losing_ta
     assert_eq!(calls[1].last().unwrap().len(), 123);
     // Independent complete byte-weighted pooling: the final 123 bytes must
     // contribute to the returned vector, despite their position after the limit.
-    let norm = (22_528_f64.powi(2) + 123_f64.powi(2)).sqrt();
+    let norm = 22_528_f64.hypot(123_f64);
     close(&vectors[0], &[22_528.0 / norm, 123.0 / norm]);
 }
 

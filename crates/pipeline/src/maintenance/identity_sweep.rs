@@ -1441,11 +1441,8 @@ async fn auto_merge(
     context: &[BaseFields],
 ) -> Result<(), PipelineError> {
     observe_pair(planning, space, pair).await?;
-    merge_entities_for_decision(planning, storage, space, pair, decision, context).await?;
-    // This decision records the original pair. Stage it after rewriting prior
-    // references so it cannot collapse into a self-pair or leave an audit of
-    // an intermediate-only subject on a newly created candidate. The original
-    // observed entity envelopes still authorize this decision and its commit.
+    // Validate the decision while its exact contributor snapshots remain in
+    // the overlay; a later chained merge may coalesce an intermediate entity.
     stage_candidate(
         planning,
         space,
@@ -1453,7 +1450,8 @@ async fn auto_merge(
         decision,
         IdentityCandidateStatus::Approved,
         context,
-    )
+    )?;
+    merge_entities_for_decision(planning, storage, space, pair, decision, context).await
 }
 
 async fn approve_existing_candidate_and_merge(
@@ -1679,6 +1677,24 @@ async fn merge_entities_for_decision(
     let registry = elephant_extensions::load_runtime_reference_registry_from_env()
         .map_err(|error| PipelineError::ConfigError(error.to_string()))?;
     let prior = planning.prepared_plan()?;
+    // Newly approved decisions describe the exact pair observed by this sweep.
+    // Keep those already validated records out of canonical reference rewrites:
+    // rewriting them would erase the decision's original pair and authority.
+    // Pending and existing stored candidates still use the shared merge planner.
+    let mut merge_input = prior.clone();
+    let mut decisions = Vec::new();
+    merge_input.effects.retain(|effect| {
+        let new_decision = effect.before.is_none()
+            && matches!(
+                effect.after.as_ref(),
+                Some(elephant_storage::canonical_commit::CanonicalRecord::IdentityCandidate(candidate))
+                    if candidate.status == IdentityCandidateStatus::Approved
+            );
+        if new_decision {
+            decisions.push(effect.clone());
+        }
+        !new_decision
+    });
     let prepared = elephant_identity::prepare_entity_merge_on_plan(
         storage,
         space,
@@ -1687,13 +1703,15 @@ async fn merge_entities_for_decision(
         elephant_storage::entity_merge_repository::MergeSelection::KeepA,
         "maintenance_worker",
         &registry,
-        &prior,
+        &merge_input,
     )
     .await
     .map_err(|error| {
         PipelineError::InvalidState(format!("identity merge preparation failed: {error}"))
     })?;
-    planning.adopt_plan(&prior, prepared.into_prepared_plan()?)
+    let mut merged = prepared.into_prepared_plan()?;
+    merged.effects.extend(decisions);
+    planning.adopt_plan(&prior, merged)
 }
 
 fn merge_sweep_risk_and_trust(survivor: &mut Entity, merged: &Entity) {
@@ -2701,6 +2719,86 @@ mod tests {
                     .len(),
                 1
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn chained_sweep_merges_keep_original_decisions_in_one_atomic_plan() {
+        for embedded in [false, true] {
+            let storage = fixture_storage(embedded).await;
+            let repository = EntityRepository::new(storage.clone());
+            let mut originals = Vec::new();
+            for (index, suffix) in ["first", "second", "third"].iter().enumerate() {
+                let mut entity = make_entity("Morgan Vale", EntityType::new("person"));
+                // Fixed IDs ensure the candidate order is A/B, A/C, B/C and
+                // the equal-name decision successively selects B then C.
+                entity.base.id =
+                    RecordId::new(TableName::Entity, uuid::Uuid::from_u128(index as u128 + 1));
+                entity.identity_keys = vec![format!("morgan {suffix}")];
+                entity.base.security.level = index as i32 + 1;
+                entity.base.security.labels = vec![format!("original-{index}")];
+                originals.push(repository.create(entity).await.unwrap());
+            }
+            let planning =
+                PlanningTruthMaintenanceStorage::new(storage.clone(), "test_space", None)
+                    .await
+                    .unwrap();
+            let result = prepare_identity_sweep(
+                &planning,
+                &storage,
+                "test_space",
+                &MaintenanceConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.auto_merged, 2);
+            for original in &originals {
+                assert_eq!(
+                    repository
+                        .get("test_space", &original.base.id)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    Some(original),
+                    "the whole chained sweep must remain uncommitted"
+                );
+            }
+            planning
+                .commit(
+                    "identity_fixture",
+                    "chained",
+                    &serde_json::json!({"case":"three_entities"}),
+                    &result,
+                )
+                .await
+                .unwrap();
+            let decisions = IdentityCandidateRepository::new(storage.clone())
+                .list("test_space", 10, None)
+                .await
+                .unwrap();
+            assert_eq!(decisions.len(), 2);
+            for (winner, merged) in [(1, 0), (2, 1)] {
+                let decision = decisions
+                    .iter()
+                    .find(|row| row.entity_b.id() == &originals[merged].base.id)
+                    .expect("original merge decision retained");
+                assert_eq!(decision.status, IdentityCandidateStatus::Approved);
+                assert_eq!(decision.entity_a.id(), &originals[winner].base.id);
+                assert_eq!(decision.base.security.level, winner as i32 + 1);
+                for original_index in 0..=winner {
+                    assert!(decision
+                        .base
+                        .security
+                        .labels
+                        .contains(&format!("original-{original_index}")));
+                }
+                for subject in [winner, merged] {
+                    assert!(decision
+                        .base
+                        .subjects
+                        .contains(&Link::new(originals[subject].base.id.clone())));
+                }
+            }
         }
     }
 

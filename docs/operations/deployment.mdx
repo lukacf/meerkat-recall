@@ -561,7 +561,7 @@ See the [snapshot reference](/api/system#managed-snapshots).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PIPELINE_WORK_TRANSIENT_RETRY_MAX_ATTEMPTS` | `3` | Max retry attempts for transient failures |
+| `PIPELINE_WORK_TRANSIENT_RETRY_MAX_ATTEMPTS` | `10` | Bounded work-queue transient retry attempts; explicit values remain authoritative |
 | `PIPELINE_WORK_TRANSIENT_RETRY_BASE_DELAY_SECS` | `10` | Base delay for exponential backoff (seconds) |
 | `PIPELINE_WORK_TRANSIENT_RETRY_MAX_DELAY_SECS` | `120` | Maximum backoff delay cap (seconds) |
 

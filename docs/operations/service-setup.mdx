@@ -321,7 +321,8 @@ budget. See [all budget settings](/operations/deployment#pipeline-budget-control
 ## Admit and reconcile sources
 
 Use `PUT /v1/spaces/{space}/sources/{external_id}` with a new opaque `revision`,
-nonempty UTF-8 `text`, `media_type` (`text/plain` or `text/markdown`) and the
+nonempty UTF-8 `text`, `media_type` (`text/plain` or `text/markdown`), required
+`observed_at` timestamp, and the
 source's authorized metadata, labels, classification and subject lineage.
 Replacement uses the exact current `expected_generation`. Percent-encode path
 components once. Source text is limited to 2,000,000 decoded bytes. Revisions
@@ -339,6 +340,14 @@ Acceptance is durable intent. Public operation states are `pending`, `running`,
 then read the current source head. Earlier completed operations retain their
 historical outcome after replacement or withdrawal; they do not promise current
 visibility. Unfinished superseded work reports `superseded`.
+
+Operation polling exposes a fixed `error_code` when work is waiting:
+`awaits_budget` records an actual typed budget refusal; `awaits_source_bundle`
+and `awaits_source_index` identify the corresponding missing publication
+prerequisite. A finalizer poll does not clear a child's recorded budget wait.
+Inspect effective headroom and current work before changing limits or retrying;
+these wait codes do not claim that the source has completed or that every
+missing bundle has the same cause.
 
 Search using `POST /v1/spaces/{space}/search` or MCP `search_scoped`. Bind
 `source_revision_constraints` to the desired external IDs and revisions when
@@ -382,6 +391,20 @@ and poll the newly returned operation to completion. A changed generation is a
 conflict to reconcile, not permission to overwrite another writer. This flow
 uses the ordinary `read:source`/`write:source` and source-envelope/current-grant
 authority; it does not require giving write access to the extractor worker.
+
+Clients using the retained raw-source API instead use `PUT /v1/sources/{id}`
+with the complete current Source fields at the top level and an `intake` object
+containing fresh `revision_id`, fresh `idempotency_key` and current
+`expected_generation`. Do not wrap Source fields inside a `source` property.
+Document-shaped inputs also need their existing document authority. Reprocess
+jobs wait for unpublished desired heads, so they are not a substitute for a
+fresh intake of a terminal failed, unpublished source.
+
+Work-queue transient retries default to 10 attempts in Recall 0.9.1; the existing
+`PIPELINE_WORK_TRANSIENT_RETRY_MAX_ATTEMPTS` override remains authoritative.
+Exponential backoff retains its 10-second base and 120-second cap. This does
+not raise a model/provider repair budget, change storage's generic retry policy
+or make terminal failures retryable.
 
 ## Readiness, shutdown and recovery
 

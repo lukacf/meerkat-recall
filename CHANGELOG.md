@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Document complete-input `text-full-v2` profile selection, staged reindex
   activation and fresh revision/generation retries for terminal failed sources.
 
+- Preserve typed per-source budget and missing-publication wait reasons, and
+  increase the bounded worker transient retry default to 10 attempts.
+- Fix filtered HNSW candidate selection so foreign or deleted identical vectors
+  do not consume eligible result slots; the paired server carries the same fix.
+
 ### CI reliability
 - Use a conservative reader-prose path while preserving required check names,
   secret scanning, dependency auditing and reader-documentation validation.

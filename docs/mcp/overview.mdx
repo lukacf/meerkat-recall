@@ -18,7 +18,9 @@ http://localhost:3000/mcp
 ```
 
 Send `Authorization: Bearer <token>` when authentication is enabled. The token
-must select the intended space and authorize the requested operations. In local
+must authorize the requested operations. Send `X-Space-Id` to explicitly select
+one authorized named space; a multi-space token does not select its first entry.
+Current local grants intersect the signed ceiling on each request. In local
 `SKIP_AUTH` mode, `X-Space-Id` selects the development principal's space.
 
 `meerkat-recall serve` runs an HTTP server. The separate `elephant-local-helper` is a
@@ -88,13 +90,11 @@ The internal Pipeline profile provides work-queue operations to Rust callers;
 there is no `/mcp/pipeline` HTTP endpoint. Per-tool profile labels live in the
 [tool reference](/mcp/tools).
 
-<Warning>
-The Default-only `get_provenance` convenience handler currently checks scopes
-and space but does not authorize every returned claim and evidence record.
-Restrict its use to trusted callers entitled to all content in that space.
-Do not use it as a clearance-filtered evidence API. See
+The Default `get_provenance` handler checks the complete authorized evidence
+chain, including original assertions, revisions, nodes and parent documents.
+Missing or inaccessible evidence refuses the request; it does not return a
+partial chain. Raw excerpts require raw-document authority. See
 [security boundaries](/concepts/security#authorization-boundaries).
-</Warning>
 
 ## Check readiness before ingesting
 

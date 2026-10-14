@@ -12,6 +12,10 @@ fn ingress_mappings() -> Arc<IssuerMappings> {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+)]
 async fn dispatcher_retains_each_authenticated_caller_context(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage = StorageClient::new_embedded().await?;
@@ -67,6 +71,10 @@ async fn dispatcher_retains_each_authenticated_caller_context(
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the original test oracle, fixture owners, and future lifetimes intact."
+)]
 async fn authenticated_mcp_refuses_wrong_identity_and_exchange_tokens_at_real_body_sink(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use elephant_storage::Repository;

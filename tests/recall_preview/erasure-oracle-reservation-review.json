@@ -1,0 +1,25 @@
+{
+  "format": "recall-erasure-oracle-reservation-review/v1",
+  "reviewed_at": "2026-10-07T03:41:36.697870+00:00",
+  "original_validation_source": "a7e46c17fad0be72b2d483afafe8d1675356d65e",
+  "failures": [
+    "embedded_corrupt_survivor_refuses_physical_purge_then_recovers_original_intent",
+    "surreal_corrupt_survivor_refuses_physical_purge_then_recovers_original_intent"
+  ],
+  "finding": "The controlled corrupted-to-original source_effect_support repair requires its original erasure reservation owner, in addition to the existing exclusive maintenance lease. Physical inventory assertions completed before this write failed.",
+  "change": "Assert original reference membership is empty, then use existing with_erasure_reservation on original_intents[0] around only the controlled fault restoration.",
+  "preserved": [
+    "original Erasing head and operation",
+    "public reads remain blocked before recovery",
+    "complete raw physical inventory equality",
+    "original receipt payload equality",
+    "original persisted intent identity",
+    "actual recover_pending_erasures",
+    "independent surviving source support",
+    "original final journal and lifecycle assertions"
+  ],
+  "new_product_api": false,
+  "product_acceptance": false,
+  "rust_execution": "not executed; parent central validation only",
+  "owner_review": "E requested after source checkpoint"
+}

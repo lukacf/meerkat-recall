@@ -15,6 +15,10 @@ use crate::client::StorageClient;
 use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 
+#[path = "trusted_proposal_context.rs"]
+mod trusted_proposal_context;
+pub use trusted_proposal_context::create_trusted_proposal_context;
+
 pub(crate) const WORK_RUN_PROJECTION: &str = r"
     id,
     space_id,
@@ -243,6 +247,130 @@ impl Repository<WorkRun> for WorkRunRepository {
 
 /// Additional work-run-specific operations.
 impl WorkRunRepository {
+    /// Close an interrupted run only when its original lease is no longer live.
+    ///
+    /// The recorded attempt identifies the historical receipt, never authority
+    /// to execute or publish. Outcome and lease inspection share a transaction.
+    ///
+    /// # Errors
+    /// Returns malformed-receipt or storage errors. Legacy runs with no captured
+    /// fence, already finished runs, and live attempts are left unchanged.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep original lease/generation checks, renewal serialization and interrupted-run completion in one transaction on both backends."
+    )]
+    pub async fn finish_abandoned(&self, observed: &WorkRun) -> StorageResult<bool> {
+        use elephant_types::publication::AttemptFence;
+        use elephant_types::records::work::WorkItemStatus;
+        let Some(value) = observed.metrics.custom.get("attempt_fence") else {
+            return Ok(false);
+        };
+        let fence: AttemptFence = serde_json::from_value(value.clone())
+            .map_err(|error| StorageError::DataIntegrityError(error.to_string()))?;
+        if fence.space_id != observed.base.space_id
+            || &fence.work_item_id != observed.work_item.id()
+        {
+            return Err(StorageError::DataIntegrityError(
+                "work run attempt identity mismatch".into(),
+            ));
+        }
+        if let Some(store) = self.client.embedded_store() {
+            return store
+                .mutate(|tx| {
+                    let Some(mut run) =
+                        tx.get::<WorkRun>(&observed.base.space_id, &observed.base.id, false)?
+                    else {
+                        return Ok(false);
+                    };
+                    if run.completed_at.is_some()
+                        || run.work_item != observed.work_item
+                        || run.metrics.custom.get("attempt_fence") != Some(value)
+                    {
+                        return Ok(false);
+                    }
+                    let now = Utc::now();
+                    let item = tx.get::<WorkItem>(&fence.space_id, &fence.work_item_id, false)?;
+                    let authority =
+                        crate::work_attempt_repository::read_attempt(tx, &fence.work_item_id)?;
+                    let live = item.as_ref().is_some_and(|item| {
+                        item.status == WorkItemStatus::Running
+                            && item.leased_by.as_deref() == Some(fence.lease_token.as_str())
+                            && item.lease_expires_at.is_some_and(|expiry| expiry > now)
+                    }) && authority.as_ref().is_some_and(|row| {
+                        row.space_id == fence.space_id
+                            && row.work_item_id == fence.work_item_id
+                            && row.generation == fence.generation
+                            && row.lease_token == fence.lease_token
+                            && row.status == "running"
+                            && row.lease_expires_at.is_some_and(|expiry| expiry > now)
+                    });
+                    if live {
+                        return Ok(false);
+                    }
+                    // Serialize expiry observation with an overlapping renewal
+                    // of this exact generation; never touch a successor attempt.
+                    if let Some(mut row) = authority.filter(|row| {
+                        row.space_id == fence.space_id
+                            && row.work_item_id == fence.work_item_id
+                            && row.generation == fence.generation
+                            && row.lease_token == fence.lease_token
+                    }) {
+                        row.commit_nonce = uuid::Uuid::new_v4().to_string();
+                        tx.upsert_extension_row(
+                            "work_attempt",
+                            serde_json::to_value(row).map_err(|error| {
+                                StorageError::SerializationError(error.to_string())
+                            })?,
+                        )?;
+                    }
+                    run.completed_at = Some(now);
+                    run.success = false;
+                    run.error =
+                        Some("attempt_interrupted: original lease is no longer live".into());
+                    run.base.updated_at = now;
+                    run.metrics.custom.insert("interrupted".into(), true.into());
+                    tx.replace(run)?;
+                    Ok(true)
+                })
+                .await;
+        }
+        let mut response = self.client.query_bind_checked(
+            "BEGIN TRANSACTION;
+             LET $run = SELECT * FROM ONLY $run_id;
+             LET $item = SELECT * FROM ONLY $item_id;
+             LET $authority = SELECT * FROM ONLY $attempt_id;
+             LET $live = $item IS NOT NONE AND $item.space_id = $space AND $item.deleted_at IS NONE AND $item.status = 'running' AND $item.leased_by = $work_lease_token AND $item.lease_expires_at > time::now()
+                AND $authority IS NOT NONE AND $authority.space_id = $space AND $authority.work_item_id = $item_id AND $authority.generation = $generation AND $authority.lease_token = $work_lease_token AND $authority.status = 'running' AND $authority.lease_expires_at > time::now();
+             LET $changed = IF $run IS NOT NONE AND $run.space_id = $space AND $run.deleted_at IS NONE AND $run.completed_at IS NONE AND $run.work_item = $item_id AND $run.metrics.custom.attempt_fence = $fence AND $live = false {
+                UPDATE $attempt_id SET commit_nonce = $nonce WHERE space_id = $space AND work_item_id = $item_id AND generation = $generation AND lease_token = $work_lease_token;
+                UPDATE $run_id SET completed_at = time::now(), success = false, error = 'attempt_interrupted: original lease is no longer live', updated_at = time::now(), metrics.custom.interrupted = true;
+                RETURN true;
+             } ELSE { RETURN false; };
+             RETURN $changed; COMMIT TRANSACTION;",
+            crate::bindings! {
+                "run_id" => crate::surreal::thing_from_record_id(&observed.base.id),
+                "item_id" => crate::surreal::thing_from_record_id(&fence.work_item_id),
+                "attempt_id" => crate::work_attempt_repository::attempt_id(&fence.work_item_id),
+                "space" => fence.space_id,
+                "work_lease_token" => fence.lease_token,
+                "generation" => fence.generation,
+                "nonce" => uuid::Uuid::new_v4().to_string(),
+                "fence" => crate::surreal::json_to_surreal(value.clone())?,
+            },
+        ).await?;
+        let changed: Option<bool> =
+            response
+                .take(response.num_statements() - 1)
+                .map_err(|error| {
+                    StorageError::DataIntegrityError(format!(
+                        "invalid interrupted-run result: {error}"
+                    ))
+                })?;
+        changed.ok_or_else(|| {
+            StorageError::DataIntegrityError("missing interrupted-run result".into())
+        })
+    }
+
     /// Finds all runs for a specific work item.
     ///
     /// # Errors
@@ -339,6 +467,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_work_run() {
         let repo = setup_test_repo().await;
         let item = create_test_work_run();
@@ -350,6 +482,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_work_run() {
         let repo = setup_test_repo().await;
         let item = create_test_work_run();
@@ -362,6 +498,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_work_run_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_work_run();
@@ -378,6 +518,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_work_run() {
         let repo = setup_test_repo().await;
         let item = create_test_work_run();
@@ -395,6 +539,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_work_run() {
         let repo = setup_test_repo().await;
         let item = create_test_work_run();

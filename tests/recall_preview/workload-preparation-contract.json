@@ -1,0 +1,92 @@
+{
+  "format": "recall-workload-typed-preparation/v1",
+  "execution_authorized": false,
+  "corpus_sha256": "2192437954109fc17ebbea5b3960eb6b398a2ee91a725ce70666b119e86179dc",
+  "http": {
+    "method": "POST",
+    "path": "/v1/sources/ingest",
+    "authorization": "explicit selected-space Bearer and X-Space-Id"
+  },
+  "representation": "retained typed Source+Doc envelope",
+  "top_level_fields": [
+    "source",
+    "doc",
+    "ingest_mode",
+    "intake"
+  ],
+  "ingest_mode": "retrieval",
+  "fixture_timestamp": "2026-10-07T00:00:00Z",
+  "created_by": "d28-qualification",
+  "shared_input_base": {
+    "deleted_at": null,
+    "provenance": {
+      "sources": [],
+      "chain": []
+    },
+    "subjects": [],
+    "subjects_state": "unknown"
+  },
+  "security_by_space": {
+    "qualification-household": {
+      "policy_id": "household-policy",
+      "level": 3,
+      "labels": [],
+      "handling": []
+    },
+    "qualification-business": {
+      "policy_id": "business-policy",
+      "level": 7,
+      "labels": [],
+      "handling": []
+    }
+  },
+  "source": {
+    "type": "manual",
+    "external_id": "exact corpus key",
+    "hash": "exact corpus sha256",
+    "uri": "exact corpus source_url",
+    "metadata": {}
+  },
+  "doc": {
+    "title": "exact corpus key",
+    "text": "exact corpus text UTF-8 bytes",
+    "sidecar_text": null,
+    "source": null,
+    "media_attachments": [],
+    "rendition_key_rule": "d28/text/{key}/{revision}",
+    "metadata": {}
+  },
+  "intake": {
+    "revision_id": "exact corpus revision",
+    "idempotency_key": "deterministic original run nonce/backend/space/key/revision",
+    "expected_generation": "omitted; every setup head must first be absent"
+  },
+  "input_record_ids": "canonical Source/Doc UUID placeholders bound to original nonce/backend/space/key/revision/type; never output oracles",
+  "identity_oracles": [
+    "actual202 source_id equals original operation.source_id and observed head.internal_source_id",
+    "actual canonical external key and space equal original corpus identity",
+    "actual accepted Doc and rendered DocRevision associate with that returned Source",
+    "never require returned SourceID equals input placeholder or reproduce private identity algorithm"
+  ],
+  "classification_oracles": [
+    "Source and Doc input envelopes match exactly",
+    "published original Source/Doc/DocRevision/DocNode classification and subject state retain explicit policy/level/labels/handling/subjects",
+    "derived source/revision references use actual accepted identities",
+    "retain actual processing provenance steps; input must not invent extractor/work run/prompt/config claims"
+  ],
+  "readback_oracles": [
+    "original operation reaches actual Completed with same generation and exact published revision",
+    "actual immutable text bytes/hash and original source-specific evidence match corpus",
+    "actual selected embedding profile/model/dimensions and complete index coverage",
+    "Source and Doc original request capture is retained; mutable operational timestamps do not replace original immutable input proof"
+  ],
+  "retry_policy": "zero harness source resubmissions; original physical gateway cap and ordinary SDK/worker retry capacity unchanged",
+  "unchanged_obligations": [
+    "both backends",
+    "50 total sources25per space",
+    "200 measured queries per backend",
+    "independent evidence/security thresholds",
+    "primary semantic corpus and original432 proposal",
+    "larger and negative consumer workload phases"
+  ]
+}

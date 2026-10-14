@@ -1,0 +1,91 @@
+{
+  "format": "recall-fixed-process-stream-contract/v1",
+  "reviewed_at": "2026-10-07T04:05:07.690523+00:00",
+  "source_commit": "5f7e6fb3ac63e6c084ce3107daf4d84bd63c42c1",
+  "source_sha256": {
+    "scripts/qualification/installed_process_capture.py": "cdf81925249ab62770f6e4f0e2a0f2939fb13256351662e62039f1121169098a",
+    "scripts/qualification/installed_linux_offline.py": "d6465c3910ca9cdb203848338c6bad9ef520c188450f28a73fe4acdf1a8c7778"
+  },
+  "product_acceptance": false,
+  "scope": "Fixed original snapshot inspect output; shared process proof only, not installed19 expansion.",
+  "process_proof_keywords": {
+    "stream_limits": [
+      33554433,
+      1048576
+    ],
+    "stream_kinds": [
+      "snapshot-inspection",
+      "process-log"
+    ]
+  },
+  "owned_process_keywords": {
+    "cap": 1048576,
+    "stream_limits": [
+      33554433,
+      1048576
+    ],
+    "capture_proof": "same original ProcessProof"
+  },
+  "argv_after_original_reviewed_binary": [
+    "snapshot",
+    "inspect",
+    "--input",
+    "ORIGINAL_CANONICAL_ABSOLUTE_BUNDLE",
+    "--json",
+    "--include-records",
+    "--compact-records"
+  ],
+  "exceptional_intent_field": "streams",
+  "stream_row_fields": [
+    "path",
+    "kind",
+    "maximum_bytes",
+    "reserved_bytes"
+  ],
+  "streams_order": [
+    "stdout",
+    "stderr"
+  ],
+  "reserved_bytes_before_spawn": 34603009,
+  "reservation_rule": "Exactly once from the original shared capture capacity before output file or Popen; short/failed output does not refund. Original metadata/events additionally charge same callback.",
+  "ordinary_intent_change": false,
+  "ordinary_caps": {
+    "installed19_each_stream": 1048576,
+    "shared_process_proof_read_ceiling": 4194304
+  },
+  "mandatory_predicates": [
+    "exact fixed argv and canonical original bundle path",
+    "actual original reviewed Recall executable proof",
+    "original two distinct log paths",
+    "exact ordered immutable original roles/caps/reservation rows before spawn",
+    "same original process handle, clock, deadline, stdout/stderr draining",
+    "complete raw output only after actual EOF and reap without error",
+    "overflow or changed original intent is incomplete, never prefix acceptance",
+    "same stdout bytes retain only snapshot-inspection kind across inventories/parsers",
+    "installed19 refuses exceptional streams field",
+    "composed owner supplies the actual shared Capture reservation callback; a flag or arbitrary callable is not independent capacity evidence"
+  ],
+  "limits": [
+    "D selected source review only; F reports31 mocked controls at original5f7e, not run by D.",
+    "No actual installed process, physical export, database, restore or retention acceptance.",
+    "M c7e and actual B owner at464 selected source reviewed; M reports11 pure controls, not rerun by D. Central joined controls and real output capture remain separate."
+  ],
+  "joined_reviewed_at": "2026-10-07T04:23:16.756637+00:00",
+  "joined_source_reviews": {
+    "shared_predicate_commit": "c7e09936b11199148f44190aaee411634e752207",
+    "actual_owner_composition": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd",
+    "actual_owner_review": "full-workload-source-family-review.json",
+    "decision": "selected-source-ack",
+    "shared_predicate_checks": [
+      "Exact original two ordered role/cap/reservation descriptors and fixed eight-argument command.",
+      "Original intent event precedes binary capture, Popen request and launch.",
+      "Only original stdout reference gains 33554433-byte bound; aliases, substituted role/path/cap and incomplete EOF/reap refuse.",
+      "Installed nineteen-case predicate rejects the extension and retains ordinary 1048576-byte streams.",
+      "Actual shared capacity is established by F producer/B owner source composition; this pure predicate validates declarations and bytes, not callback execution or physical semantics."
+    ],
+    "source_sha256": {
+      "tests/recall_preview_semantics/installed_evidence_validator.py": "49b049bfbe4ec46c2b3491ba86bfc49889d909130080a3eaf179b411bbaee374",
+      "tests/recall_preview_semantics/installed_evidence_validator_test.py": "7d4353e941494530e2362eb0ab1a5798df4abc828f79e1c365241acb7ee46443"
+    }
+  }
+}

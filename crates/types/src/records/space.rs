@@ -20,6 +20,10 @@ pub struct SpaceConfig {
     /// Embedding vector dimensions.
     pub embedding_dims: i32,
 
+    /// Explicit processor approvals. Absence never authorizes a model call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing: Option<crate::provider_binding::SpaceProcessingConfig>,
+
     /// Optional purpose describing what kind of knowledge this space stores.
     /// Injected into extraction prompts to guide the LLM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -60,6 +64,7 @@ mod tests {
         );
 
         let cfg = SpaceConfig {
+            processing: None,
             base,
             embedding_provider: "fastembed".to_string(),
             embedding_model: "bge-small-en-v1.5".to_string(),
@@ -83,6 +88,7 @@ mod tests {
         );
 
         let cfg = SpaceConfig {
+            processing: None,
             base,
             embedding_provider: "fastembed".to_string(),
             embedding_model: "bge-small-en-v1.5".to_string(),
@@ -110,6 +116,7 @@ mod tests {
         );
 
         let cfg = SpaceConfig {
+            processing: None,
             base,
             embedding_provider: "fastembed".to_string(),
             embedding_model: "bge-small-en-v1.5".to_string(),

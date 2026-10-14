@@ -53,7 +53,7 @@ tool visibility also depends on runtime readiness and authorization.
 | Layout | How it runs | Operational boundary |
 | --- | --- | --- |
 | Managed server with SurrealDB | `meerkat-recall serve` plus a persistent SurrealDB backend | Default Compose layout; apply migrations before serving |
-| Managed embedded server | `meerkat-recall serve` with `ELEPHANT_DB=elephant-db` | API and workers share one in-memory store; snapshots provide explicit recovery points |
+| Managed embedded server | `meerkat-recall serve` with `ELEPHANT_DB=elephant-db` | API and workers share one store; a configured persistent destination synchronizes acknowledged commits to its WAL |
 | Separate worker with SurrealDB | `meerkat-recall serve --server-only` and `meerkat-recall worker` against the same database | Advanced configuration; check readiness and coordinate schema and worker configuration |
 
 `meerkat-recall worker` rejects the embedded ElephantDB backend: a separate process
@@ -61,9 +61,11 @@ would own a different in-memory store. The supplied configuration does not
 establish a tested multi-node scaling or high-availability contract. Treat
 such a topology as deployment work requiring its own acceptance tests.
 
-Embedded snapshots do not provide continuous durability. `serve` can export on
-Ctrl-C when a snapshot save/load path is configured and autosave is enabled;
-that does not protect against a crash or forced termination. See
+Managed embedded storage with a persistent destination synchronizes acknowledged
+mutations to a write-ahead log and replays it before startup admission. Shutdown
+snapshot export is not the commit durability boundary. Explicitly ephemeral
+library/test stores without a persistent destination remain volatile. See
+[managed embedded commit durability](../embedded-durable-commits.md),
 [deployment](/operations/deployment) and the [CLI reference](/cli/overview).
 
 ## Find the implementation

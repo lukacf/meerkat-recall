@@ -44,8 +44,25 @@ database credentials; they require a separate production configuration.
 
 ## Repository checks
 
-CI scans reachable Git history with the built-in Gitleaks rules. Its narrow
-allowlist covers synthetic assertion idempotency keys only. Use a manual privacy
+CI scans reachable Git history with the built-in Gitleaks rules. Narrow
+allowlists bind reviewed synthetic fixtures and public integrity digests to exact
+paths and literal matches. Use a manual privacy
 review as well: names, household data, incident narratives and private project
 paths are often not credentials and are not detected by a secret scanner.
 Source archive exclusions do not hide files from Git history or GitHub PRs.
+
+## Tracked upstream maintenance exception
+
+The pinned Meerkat 0.9.0 SDK uses `meerkat-skills` → `serde_yaml` →
+`unsafe-libyaml` 0.2.11 to parse and serialize skill frontmatter.
+[RUSTSEC-2024-0449](https://rustsec.org/advisories/RUSTSEC-2024-0449.html)
+classifies `unsafe-libyaml` as unmaintained and lists no patched version. The
+security audit permits this one advisory while that SDK remains pinned;
+this does not establish memory safety or suppress other vulnerability advisories.
+
+The Meerkat owner confirms that its 0.9 SDK also retains this dependency chain;
+the version upgrade alone will not resolve this maintenance advisory. The Recall
+release owner must re-evaluate this exception on SDK upgrades and remove it when
+Meerkat adopts a maintained safe Rust parser. Replacing the parser inside the
+pinned SDK requires a separate compatibility change; a lockfile upgrade cannot
+remove it.

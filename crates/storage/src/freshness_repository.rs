@@ -132,7 +132,7 @@ impl FreshnessRepository {
     }
 
     /// Converts a Freshness to a SurrealDB value for insertion.
-    fn freshness_to_value(item: &Freshness) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn freshness_to_value(item: &Freshness) -> StorageResult<surrealdb::sql::Value> {
         let mut obj = crate::surreal::base_fields_to_object(&item.base)?;
         obj.insert("target".to_string(), item.target.clone().into());
         obj.insert("target_type".to_string(), item.target_type.clone().into());
@@ -458,6 +458,39 @@ impl FreshnessRepository {
     }
 }
 
+impl FreshnessRepository {
+    /// Reads physical row state for atomic source lifecycle inverse preparation.
+    pub(crate) async fn get_including_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<Freshness>> {
+        if let Some(store) = self.client.embedded_store() {
+            return store.get::<Freshness>(space_id, id, true).await;
+        }
+
+        let mut response = self
+            .client
+            .query_bind(
+                &format!(
+                    "SELECT {FRESHNESS_PROJECTION} FROM freshness WHERE id = $id AND space_id = $space_id"
+                ),
+                crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
+            )
+            .await?;
+
+        let items: Vec<FreshnessDb> = response
+            .take(0)
+            .map_err(|e| StorageError::QueryError(format!("Failed to parse freshness: {e}")))?;
+
+        items
+            .into_iter()
+            .next()
+            .map(Freshness::try_from)
+            .transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -520,6 +553,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_freshness() {
         let repo = setup_test_repo().await;
         let item = create_test_freshness();
@@ -532,6 +569,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_freshness() {
         let repo = setup_test_repo().await;
         let item = create_test_freshness();
@@ -544,6 +585,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_freshness_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_freshness();
@@ -562,6 +607,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_freshness() {
         let repo = setup_test_repo().await;
         let item = create_test_freshness();
@@ -582,6 +631,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_freshness() {
         let repo = setup_test_repo().await;
         let item = create_test_freshness();

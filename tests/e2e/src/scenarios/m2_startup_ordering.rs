@@ -1,89 +1,79 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::mixed_attributes_style,
-    clippy::similar_names,
-    clippy::type_complexity,
-    clippy::float_cmp,
-    clippy::const_is_empty,
-    clippy::expect_used,
-    clippy::panic,
-    unused_imports,
-    dead_code,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity
-)]
+//! Explicit schema initialization precedes readiness; liveness is independent.
+
 use std::sync::Arc;
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     http::{Request, StatusCode},
-    middleware::{self, Next},
-    response::IntoResponse,
-    Router,
+    Extension, Router,
 };
 use tower::ServiceExt;
 
-use elephant_migrations::apply_schema;
+use elephant_api::{
+    auth::Principal,
+    routes::{health::health_routes, readiness::readiness_routes},
+    runtime::RuntimeManager,
+};
+use elephant_migrations::{apply_schema, verify_schema};
 use elephant_storage::{StorageClient, StorageConfig};
-
-use elephant_api::auth::Principal as AuthPrincipal;
-use elephant_api::authz::AuthzService;
-use elephant_api::routes::health::{health_routes, HealthState};
 
 #[tokio::test]
 #[ignore]
 async fn scenario_m2_startup_ordering() -> anyhow::Result<()> {
-    let config = StorageConfig {
+    let client = StorageClient::new(StorageConfig {
         url: "mem://".to_string(),
         namespace: "ns_startup_ordering".to_string(),
         database: "db_startup_ordering".to_string(),
         ..StorageConfig::default()
-    };
-    let client = StorageClient::new(config).await?;
+    })
+    .await?;
 
-    // Apply schema
-    apply_schema(&client)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
+    // A live listener must not imply storage initialization, nor initialize it.
+    assert_eq!(
+        get_json(health_routes(), "/v1/health").await?,
+        (StatusCode::OK, serde_json::json!({"status":"healthy"}))
+    );
+    assert!(verify_schema(&client).await.is_err());
+    assert!(client.list_tables().await?.is_empty());
 
-    // Then start API health
-    let authz = Arc::new(AuthzService::new());
-    let state = Arc::new(HealthState::new(client, authz));
-    let app = health_routes()
-        .layer(middleware::from_fn(mock_auth))
-        .with_state(state);
+    // The explicit migration step establishes the receipts serve later verifies.
+    apply_schema(&client).await.map_err(anyhow::Error::msg)?;
+    verify_schema(&client).await.map_err(anyhow::Error::msg)?;
+    let runtime = Arc::new(RuntimeManager::new_preconfigured(client));
+    let readiness = readiness_routes()
+        .with_state(runtime.clone())
+        .layer(Extension(Principal {
+            subject: "startup-status-reader".into(),
+            scopes: vec!["read:status".into()],
+            ..Principal::default()
+        }));
+    let (status, body) = get_json(readiness.clone(), "/v1/readiness").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["storage_ready"], true);
+    assert_eq!(body["recovery_ready"], true);
+    // This fixture hosts only the API; it must not invent a running worker.
+    assert_eq!(body["worker_ready"], false);
+    assert_eq!(body["semantic_ingest_ready"], false);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/health")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body)?;
-    assert_eq!(json["status"], "healthy");
-    assert_eq!(json["surrealdb"], "connected");
-
+    runtime.begin_shutdown().await;
+    let (status, body) = get_json(readiness, "/v1/readiness").await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["ready"], false);
+    assert_eq!(body["draining"], true);
+    assert_eq!(body["error"]["error_code"], "not_ready");
+    assert_eq!(
+        get_json(health_routes(), "/v1/health").await?,
+        (StatusCode::OK, serde_json::json!({"status":"healthy"}))
+    );
     Ok(())
 }
 
-async fn mock_auth(req: Request<Body>, next: Next) -> impl IntoResponse {
-    let mut req = req;
-    req.extensions_mut().insert(AuthPrincipal {
-        subject: "test-user".to_string(),
-        space_id: Some("Space_X".to_string()),
-        scopes: vec!["read:entity".to_string()],
-        security_level: 10,
-        security_labels: vec![],
-        ..AuthPrincipal::default()
-    });
-    next.run(req).await
+async fn get_json(app: Router, path: &str) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+    let response = app
+        .oneshot(Request::builder().uri(path).body(Body::empty())?)
+        .await?;
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 4096).await?;
+    Ok((status, serde_json::from_slice(&bytes)?))
 }

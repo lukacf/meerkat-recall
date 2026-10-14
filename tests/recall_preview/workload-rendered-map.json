@@ -1,0 +1,1338 @@
+{
+  "format": "recall-independent-rendered-map/v1",
+  "reviewer": "qualification (independent D lane)",
+  "execution_authorized": false,
+  "product_acceptance": false,
+  "corpus_path": "tests/recall_preview/workload-corpus.json",
+  "corpus_sha256": "2192437954109fc17ebbea5b3960eb6b398a2ee91a725ce70666b119e86179dc",
+  "renderer": {
+    "name": "elephant.renderer.text",
+    "version": "1.0.0",
+    "source_path": "crates/pipeline/src/renderer/default.rs",
+    "source_sha256": "4f970587f70b4f5bf28c08e6944eea0da7134d3fdf45469cbfb2cfd4a5464a10"
+  },
+  "tree": {
+    "source_path": "crates/pipeline/src/scheduler/evidence_work_kinds.rs",
+    "source_sha256": "312dea39a18ee392241cd852127d3d42dbd6def9ce1764f14153ff222dcbb507",
+    "configuration": {
+      "max_chunk_size": 512,
+      "chunk_overlap": 50,
+      "create_paragraphs": true,
+      "detect_sections": false,
+      "semantic_chunking": true,
+      "create_summaries": false
+    }
+  },
+  "expectation": "These exact original nonempty single-line texts have no trailing whitespace and fit one default paragraph/chunk. Rendered Doc and immutable DocRevision equal original text plus one LF. Root includes LF; paragraph/chunk spans exclude it.",
+  "unchanged": [
+    "Original submission bytes and Source content hash remain the raw input bytes.",
+    "Original corpus, typed source contract, query bytes/order/counts, relevance/latency thresholds, allocation, physical-call and cost caps remain unchanged.",
+    "Validate actual returned Doc/DocRevision/source identities and original operation completion before applying this map.",
+    "Compare observed bytes exactly; never normalize observed output or widen span bounds after execution.",
+    "Every result quote and hash is checked against this source-specific rendered UTF-8 byte sequence; default paragraph/chunk coverage must match the listed exact spans.",
+    "Renderer/tree configuration or source delta requires explicit pre-output review; no inferred compatibility from a version label."
+  ],
+  "source_count": 50,
+  "sources": [
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-00",
+      "revision": "workload-r1",
+      "input_sha256": "58b0beb2550e92b22ea8fdf1f2ac448cbc295fd185df877ee9197c3950bf39e8",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-00, the responsible custodian is Bruno-00. Its approved supply limit is 131 units. This record applies only to business scope.\n",
+      "rendered_sha256": "5b6329fcf9fb9f38e625236de673415ff53e80b0fb123665879d3c7d667e36bd",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-01",
+      "revision": "workload-r1",
+      "input_sha256": "2cf31ad4dab51bb27c5c485a52109780766514cec96334384cd8694a6e52eebe",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-01, the responsible custodian is Bruno-01. Its approved supply limit is 132 units. This record applies only to business scope.\n",
+      "rendered_sha256": "6a80db24bfa00a510b5088da68051a9e1bada109354762292ece7b77b059aa7d",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-02",
+      "revision": "workload-r1",
+      "input_sha256": "08ca0cb3757ca5c8ccc5a642e52162c71ba4c15ccf34c72148fd30562791228e",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-02, the responsible custodian is Bruno-02. Its approved supply limit is 133 units. This record applies only to business scope.\n",
+      "rendered_sha256": "cc8066a7094ff762526f34f1bea3e8d0bfab6b506f342386ed731bccc6c67bd8",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-03",
+      "revision": "workload-r1",
+      "input_sha256": "8158ea775430950e21290dc220772867288227f1662cfb82a2178ec7853e87f6",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-03, the responsible custodian is Bruno-03. Its approved supply limit is 134 units. This record applies only to business scope.\n",
+      "rendered_sha256": "27dd9093721e5a87a05a8e5cb6df38321c8b5529bceea5c47f0cb3209496b9c0",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-04",
+      "revision": "workload-r1",
+      "input_sha256": "7cab98952ce3c6ee6167919a9fa7c235a4f24f8dfdcbce38c7904b16d2c49786",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-04, the responsible custodian is Bruno-04. Its approved supply limit is 135 units. This record applies only to business scope.\n",
+      "rendered_sha256": "8edaf562e1bed9e21640f857a8cb39f2b75cdab58e5925aad78bd9942d46fc6a",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-05",
+      "revision": "workload-r1",
+      "input_sha256": "a97008a180148b97d0b02fb7ee359f01864b4efc8235ddada118231b54907343",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-05, the responsible custodian is Bruno-05. Its approved supply limit is 136 units. This record applies only to business scope.\n",
+      "rendered_sha256": "69f2904caf44c561195ebebb9551a09ea5c0c410dbc653b2b7e8c32464490610",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-06",
+      "revision": "workload-r1",
+      "input_sha256": "6407ad5964d83598f483f2f052599a971eac03cdd6faaa1f2cad8cc6d91350b6",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-06, the responsible custodian is Bruno-06. Its approved supply limit is 137 units. This record applies only to business scope.\n",
+      "rendered_sha256": "cc73ec9ff65ec46437f6440519f9a1fc77c27bcfae8b34997e8c484aaa05a615",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-07",
+      "revision": "workload-r1",
+      "input_sha256": "9ccffb436a3f23c36613c2a9482c5a3908347d82ca2eb75fdd62cd060b102006",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-07, the responsible custodian is Bruno-07. Its approved supply limit is 138 units. This record applies only to business scope.\n",
+      "rendered_sha256": "b5b9876d4a97ecd0cb37d0d955399a222797e2c1df57f942e3832df46ec320fb",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-08",
+      "revision": "workload-r1",
+      "input_sha256": "eea53bc02afba42de044fd10ebf51a2b4cc1039be3dd627d768b51a97ef5a227",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-08, the responsible custodian is Bruno-08. Its approved supply limit is 139 units. This record applies only to business scope.\n",
+      "rendered_sha256": "a2a1d7e6002beef4b45279b5fb41703d893b3b1b5bc38cfddcde49f168fb4d69",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-09",
+      "revision": "workload-r1",
+      "input_sha256": "c0659f7fa692769e4c72fc8eeeb812ed98039e5d135b1049fe5336ef17108a09",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-09, the responsible custodian is Bruno-09. Its approved supply limit is 140 units. This record applies only to business scope.\n",
+      "rendered_sha256": "4dd3f1e93a7469f39c5aa4ea4a374efccbf6b495dacae4e4c4864d2acaee5367",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-10",
+      "revision": "workload-r1",
+      "input_sha256": "3874aaf769a540a5d0812882c97e0d310f1b0ee5998246fa6e67f1cee42cc77d",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-10, the responsible custodian is Bruno-10. Its approved supply limit is 141 units. This record applies only to business scope.\n",
+      "rendered_sha256": "4531e01f7e0d6280dcd12b8f1142c4fe5f270197efe0d0768bd30f2f712c2371",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-11",
+      "revision": "workload-r1",
+      "input_sha256": "428b82565aacf58fa612bdba3e63460afe9b52a4deb640727816ce81baa5f8a9",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-11, the responsible custodian is Bruno-11. Its approved supply limit is 142 units. This record applies only to business scope.\n",
+      "rendered_sha256": "3b0917649d9137d58d525f312f2b934137cdddb3b270879fbe0024ef77910103",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-12",
+      "revision": "workload-r1",
+      "input_sha256": "d71b02b1b3768e02e58efe9fea96b033322cee799a4f0dcd5039b2b47b821456",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-12, the responsible custodian is Bruno-12. Its approved supply limit is 143 units. This record applies only to business scope.\n",
+      "rendered_sha256": "8f87b0991c1d0a29c5759a177082d3f8353958cf78baa3c2275c830c608e03be",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-13",
+      "revision": "workload-r1",
+      "input_sha256": "58b26bfed272571253712b585d4441e696475ab8808112166cd4ba6926325948",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-13, the responsible custodian is Bruno-13. Its approved supply limit is 144 units. This record applies only to business scope.\n",
+      "rendered_sha256": "7c55bcd73c2df281a73f02f6fe59b3fc6771d967faa5f47e20bb72d9882bd27e",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-14",
+      "revision": "workload-r1",
+      "input_sha256": "177e0b94bec05e9e28a0cff6f9a80d019042a972f457710a275ed262ad5311bd",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-14, the responsible custodian is Bruno-14. Its approved supply limit is 145 units. This record applies only to business scope.\n",
+      "rendered_sha256": "59e5401ec2fe54e2e54e909a3c8a202d6b3c1aba4c77c2f2263b9c2b4c9c9b9e",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-15",
+      "revision": "workload-r1",
+      "input_sha256": "1a763abecd6a9b4a906e157de1db66ca01679642e8ae14ed97cf4d370dd468af",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-15, the responsible custodian is Bruno-15. Its approved supply limit is 146 units. This record applies only to business scope.\n",
+      "rendered_sha256": "604f8c606064d6c3d7c32e65148685324225a5a0cc85df1a400926cfc59cab1e",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-16",
+      "revision": "workload-r1",
+      "input_sha256": "e905ae8b56c4b6d641b3669fe994f057535d98bc73914f0217ec64bc2fb64014",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-16, the responsible custodian is Bruno-16. Its approved supply limit is 147 units. This record applies only to business scope.\n",
+      "rendered_sha256": "01c1fc925928b45dac5afbcbbbb120ecdd2b87f687ab128b2eaa04241ea9c6bd",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-17",
+      "revision": "workload-r1",
+      "input_sha256": "88de50b92dd6075247a323710dc363d21688e30307bbce76cd2e87b7d1cd2f37",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-17, the responsible custodian is Bruno-17. Its approved supply limit is 148 units. This record applies only to business scope.\n",
+      "rendered_sha256": "cef43ab483278b1b2d850979167daabfb126de3e6fcad8f9590cbd203661e4bd",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-18",
+      "revision": "workload-r1",
+      "input_sha256": "31c1aedb57d61989ef10de7d7a599945134318043bbbf28ca8f19f7f5dd8d905",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-18, the responsible custodian is Bruno-18. Its approved supply limit is 149 units. This record applies only to business scope.\n",
+      "rendered_sha256": "7f451aa3493e18ec3c0466754320fb71bc2900c294a505c10ad217133812512b",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-19",
+      "revision": "workload-r1",
+      "input_sha256": "ad9a24f7eef8b86ebc90331e12276855223bb854c40d02f1a0dbb60b36d7e743",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-19, the responsible custodian is Bruno-19. Its approved supply limit is 150 units. This record applies only to business scope.\n",
+      "rendered_sha256": "0d02aa6bc5a1db9a72becc814707f14d55e2c6d2c0e66e90981bddd1f9959fd7",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-20",
+      "revision": "workload-r1",
+      "input_sha256": "88177c21cd533f1b87ae9c25e23293dd1335667951ce78d1c684689854641951",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-20, the responsible custodian is Bruno-20. Its approved supply limit is 151 units. This record applies only to business scope.\n",
+      "rendered_sha256": "975d2317de207ef19071bd36ed688cc3f1cb7d552fd2a030062b6b3b93105e94",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-21",
+      "revision": "workload-r1",
+      "input_sha256": "1ad00ed8ee22e164e7c395ff2bb935d79e859c1b6d28dff4ae6abcb0e98eda4c",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-21, the responsible custodian is Bruno-21. Its approved supply limit is 152 units. This record applies only to business scope.\n",
+      "rendered_sha256": "c63eba1cbc8903c184dcece161ad0f3c3a216f839c727d33e7af55583350bea2",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-22",
+      "revision": "workload-r1",
+      "input_sha256": "4299e64e477d802c1b1fed8d71b86dbba27f9778a5cc3a8299f1b7846307411d",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-22, the responsible custodian is Bruno-22. Its approved supply limit is 153 units. This record applies only to business scope.\n",
+      "rendered_sha256": "7e97e2b672f5637c4d6549e10b8840a21cacca9b9cd27cafef9fd0a3e718f413",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-23",
+      "revision": "workload-r1",
+      "input_sha256": "6294213e7348f59b677acfe272af277c077f098d3898b32e72458dee4139009d",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-23, the responsible custodian is Bruno-23. Its approved supply limit is 154 units. This record applies only to business scope.\n",
+      "rendered_sha256": "21ed840753fdcb149e8fbca8221e6c898980630677542aa9dc87ca717f00ad88",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-business",
+      "source_key": "workload/atlas-24",
+      "revision": "workload-r1",
+      "input_sha256": "e79f3443680d86aff6a73de104d6a88179805a2364c5162c26afdfe0a97ab45b",
+      "input_utf8_bytes": 153,
+      "rendered_text": "For business project Atlas-24, the responsible custodian is Bruno-24. Its approved supply limit is 155 units. This record applies only to business scope.\n",
+      "rendered_sha256": "dbc1109e3d9494b3d8fd65c1abd42721ee1aabeb18f03b9d37a3e8350cfffead",
+      "rendered_utf8_bytes": 154,
+      "root_span": {
+        "start": 0,
+        "end": 154
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 153
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-00",
+      "revision": "workload-r1",
+      "input_sha256": "216dfa58d7906f80e42e778b6bd705dcbcb79417f379d0469a03407d1cc2a592",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-00, the responsible custodian is Helena-00. Its approved supply limit is 31 units. This record applies only to household scope.\n",
+      "rendered_sha256": "f9e9c7fccf3fe4fbf77b81ccf208f21429c6d23c0787c223e452c8ee7e614ea4",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-01",
+      "revision": "workload-r1",
+      "input_sha256": "3abe482b1b990e2d442ed4992d52179c9ab4267970f1080cf8672108c739528c",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-01, the responsible custodian is Helena-01. Its approved supply limit is 32 units. This record applies only to household scope.\n",
+      "rendered_sha256": "edb4fb6900749054ca976e717f459f975bc7665b9fe220ed66576d8852d397d8",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-02",
+      "revision": "workload-r1",
+      "input_sha256": "b50f54a3124a6314745c2e683df7efb38fb1b946925dade38fb9d89241520756",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-02, the responsible custodian is Helena-02. Its approved supply limit is 33 units. This record applies only to household scope.\n",
+      "rendered_sha256": "108930aeb2b7a30cbc2d8def9a16eceab4a3da2c1806e1ca18d9c215e289c203",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-03",
+      "revision": "workload-r1",
+      "input_sha256": "10b2980e9f839aaae05f913a34ab24bce0907d8412163fa4e278c2427c76d7aa",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-03, the responsible custodian is Helena-03. Its approved supply limit is 34 units. This record applies only to household scope.\n",
+      "rendered_sha256": "17fb954b7db2112b3ab8c7e3bfd6ab9c6db4cbd5d893d88dd7805810b461b392",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-04",
+      "revision": "workload-r1",
+      "input_sha256": "3c24362870f7e7fd48ee4443e3d5d499fb17fbecaa913824ec0ae7ce29bca4f3",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-04, the responsible custodian is Helena-04. Its approved supply limit is 35 units. This record applies only to household scope.\n",
+      "rendered_sha256": "f1b23ea6397748daecde59814ed8eb2c5e374703db974e33dc0cb2340dc074cd",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-05",
+      "revision": "workload-r1",
+      "input_sha256": "839658e5a5261dd39d161d7f1d635a59f4570c9fa2e7727fc3c0d00d275ab1dd",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-05, the responsible custodian is Helena-05. Its approved supply limit is 36 units. This record applies only to household scope.\n",
+      "rendered_sha256": "9c1193f5c7d74f193c151d511ff419f793dd1db7bab1d923a1a698ad4ddfb482",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-06",
+      "revision": "workload-r1",
+      "input_sha256": "e179ae5522173e6dc1521856a1b042f6f5124b241954afe2f6e6319e88af3aea",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-06, the responsible custodian is Helena-06. Its approved supply limit is 37 units. This record applies only to household scope.\n",
+      "rendered_sha256": "d0b4edb0ad9b88f29597eb3dc81765fb171e6eb82e66b19935abf00ccccae8f4",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-07",
+      "revision": "workload-r1",
+      "input_sha256": "154359056ee3c415745f96c9ed8e71f7dc18b69013b53a9f8b207af7dd6c077b",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-07, the responsible custodian is Helena-07. Its approved supply limit is 38 units. This record applies only to household scope.\n",
+      "rendered_sha256": "1a5a98ff4569764d432aba28ca74e232b99ad77c1b09f3254a9063c7e04a6a9f",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-08",
+      "revision": "workload-r1",
+      "input_sha256": "68fc4fec7988fae37b3d23637873084354da1120b2fac11368a803e5ee286364",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-08, the responsible custodian is Helena-08. Its approved supply limit is 39 units. This record applies only to household scope.\n",
+      "rendered_sha256": "ffc474912be24f53bddfbdebf40af0df677f8282affa8fa9d9982b60ae076f29",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-09",
+      "revision": "workload-r1",
+      "input_sha256": "591709db01dafd08acfb223cb1cad6c2957173c5ca923ba364e83477f5338289",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-09, the responsible custodian is Helena-09. Its approved supply limit is 40 units. This record applies only to household scope.\n",
+      "rendered_sha256": "b3b840bb276fbe546102f98298424c5a9c5f333759be9fab546fedeb43e7f4e3",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-10",
+      "revision": "workload-r1",
+      "input_sha256": "975b048c9395ada65fa7f165b69e51710480f67230b9ff22f5eff1c36de377b0",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-10, the responsible custodian is Helena-10. Its approved supply limit is 41 units. This record applies only to household scope.\n",
+      "rendered_sha256": "e2415a3ede7711a77695f953a755729add0e1190c4ed01ff086748128af6c7cc",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-11",
+      "revision": "workload-r1",
+      "input_sha256": "e997d29a99566f4394d66ddd6ed29a9127c90cad320ec240ddd9370f615e3d95",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-11, the responsible custodian is Helena-11. Its approved supply limit is 42 units. This record applies only to household scope.\n",
+      "rendered_sha256": "d3682957ab97dfc1ffbe56f70629e10aa419307fbb19cf7c4e70a37bc4a769a6",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-12",
+      "revision": "workload-r1",
+      "input_sha256": "4daa5795deaaf936396e0b4a8c0b1987abf8543bb9f712fa5665b17f6a60ac90",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-12, the responsible custodian is Helena-12. Its approved supply limit is 43 units. This record applies only to household scope.\n",
+      "rendered_sha256": "f427a16e709ce6964ae1517a67cb1004dfb33a93a588f0ba7c1e9e5ad201cd49",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-13",
+      "revision": "workload-r1",
+      "input_sha256": "fc339c59470ce427b5e6d6fa982b0c340ff553977de64777b632fd5576d893b8",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-13, the responsible custodian is Helena-13. Its approved supply limit is 44 units. This record applies only to household scope.\n",
+      "rendered_sha256": "4ce142401ca8e210df1621fcaff57ee8a40930556a2ded1969756fce66d39e6b",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-14",
+      "revision": "workload-r1",
+      "input_sha256": "275a4ed3c537d5e12f3de65c7bce6ef35159bc8e225b3fa7cad35dd8aec46b2f",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-14, the responsible custodian is Helena-14. Its approved supply limit is 45 units. This record applies only to household scope.\n",
+      "rendered_sha256": "cd5e1643ed4418d4b3e8b3179b7e0c25b761b8b9c45e57a108edd71e77e30ffd",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-15",
+      "revision": "workload-r1",
+      "input_sha256": "81f1d8a6a0c8fa42c324ab1d1de7cf3f9d722c7855171e3f971d09095167a6ea",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-15, the responsible custodian is Helena-15. Its approved supply limit is 46 units. This record applies only to household scope.\n",
+      "rendered_sha256": "4bb28a7fee80d84d465954194e3f418acddde42f59378f242549091ae8d7a515",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-16",
+      "revision": "workload-r1",
+      "input_sha256": "2430b1ba93b8084b7328a558419ce32b04085d620911b6ed294b29650760904c",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-16, the responsible custodian is Helena-16. Its approved supply limit is 47 units. This record applies only to household scope.\n",
+      "rendered_sha256": "b57674547c6f424e539bc15c7eaf4f5ea0377fa654a5ea9c6f201791bd0ef7a1",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-17",
+      "revision": "workload-r1",
+      "input_sha256": "c286ac6401c22fe334a92ded88a3a95ffb9c970a652bb990f7653a11bbe6f761",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-17, the responsible custodian is Helena-17. Its approved supply limit is 48 units. This record applies only to household scope.\n",
+      "rendered_sha256": "4100e6a797722f34ab4aa2f3ab6200b85f2017491d05b654bcd1b375c12254b2",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-18",
+      "revision": "workload-r1",
+      "input_sha256": "ac0daf1001549e5397044db737034d1fbf9d78fbff3b0ed87316bac86a8670dd",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-18, the responsible custodian is Helena-18. Its approved supply limit is 49 units. This record applies only to household scope.\n",
+      "rendered_sha256": "c7af78e068b1afae16385c725dab3d273b2b1045ddd49e1c076c49aeb4df7c65",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-19",
+      "revision": "workload-r1",
+      "input_sha256": "a424341b51159f09e572d8216640459c591c88765806b395e8d92e20eca86bc0",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-19, the responsible custodian is Helena-19. Its approved supply limit is 50 units. This record applies only to household scope.\n",
+      "rendered_sha256": "f71c9c3ba6a0c78387a72242d5fb778d0a03851e9e19186bcf28b0fc18fa776e",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-20",
+      "revision": "workload-r1",
+      "input_sha256": "35b3ee13e3b3bbc1b0f8df433f540c7de0ef686c2b88a6d5106e95c7ce8f0708",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-20, the responsible custodian is Helena-20. Its approved supply limit is 51 units. This record applies only to household scope.\n",
+      "rendered_sha256": "934812dfae8e851abfce72702d836ecc3f9c29aaf56115da0cad6545121d35d6",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-21",
+      "revision": "workload-r1",
+      "input_sha256": "5d860af29c2f9a0e108f3b1a9701e483d28ac7d6a65da69da80d22e5301ab3ff",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-21, the responsible custodian is Helena-21. Its approved supply limit is 52 units. This record applies only to household scope.\n",
+      "rendered_sha256": "4ea10da48285f8e91b6691ac56b425ff027a02612be3dbaabd95335150da1f89",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-22",
+      "revision": "workload-r1",
+      "input_sha256": "e5c2029ca43d0906053e95824701eaebcef5159a809e3b52cea1d43ac0ab5909",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-22, the responsible custodian is Helena-22. Its approved supply limit is 53 units. This record applies only to household scope.\n",
+      "rendered_sha256": "b035b0a34de61a4c81b2b946ad1917f12693781e900a678e15dc8c1abf38c6f4",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-23",
+      "revision": "workload-r1",
+      "input_sha256": "d86398271fd5aa5e950a19c6413a4f43137f4388f814404f1067ee5b888b08ca",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-23, the responsible custodian is Helena-23. Its approved supply limit is 54 units. This record applies only to household scope.\n",
+      "rendered_sha256": "85e8ee6d7b78b3b410ca64fdb4b861962a46fecc77d991d3b686785ae07f2cf0",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    },
+    {
+      "space": "qualification-household",
+      "source_key": "workload/atlas-24",
+      "revision": "workload-r1",
+      "input_sha256": "34771332e350513f64d3615b4c9d581372c27b39f2c54859e326bf053aa06526",
+      "input_utf8_bytes": 155,
+      "rendered_text": "For household project Atlas-24, the responsible custodian is Helena-24. Its approved supply limit is 55 units. This record applies only to household scope.\n",
+      "rendered_sha256": "7dfb068355ffe4d6ac0a4c8d9db8483e4b734af1acd329fea4037c16ca451b68",
+      "rendered_utf8_bytes": 156,
+      "root_span": {
+        "start": 0,
+        "end": 156
+      },
+      "paragraph_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ],
+      "chunk_spans": [
+        {
+          "start": 0,
+          "end": 155
+        }
+      ]
+    }
+  ]
+}

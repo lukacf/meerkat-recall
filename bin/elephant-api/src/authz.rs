@@ -13,9 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use elephant_policy::{
-    AbacEngine, AccessDecision, Clearance, Principal as AbacPrincipal, RecordAttributes,
-};
+use elephant_policy::{AbacEngine, AccessDecision, Principal as AbacPrincipal, RecordAttributes};
 use elephant_types::records::base::{Security, SubjectsState};
 use elephant_types::records::{Entity, HasSecurity};
 use elephant_types::Link;
@@ -86,68 +84,12 @@ impl AuthzService {
     #[must_use]
     #[allow(clippy::unused_self)]
     pub fn to_abac_principal(&self, auth_principal: &AuthPrincipal) -> AbacPrincipal {
-        let mut scopes: HashSet<String> = auth_principal.scopes.iter().cloned().collect();
-
-        // Backward-compatible scope aliases (spec-driven).
-        //
-        // docs/spec.md uses `read:doc:metadata` for metadata access, while older
-        // clients used `read:doc`. Treat these as equivalent.
-        if scopes.contains("read:doc") {
-            scopes.insert("read:doc:metadata".to_string());
-        }
-        if scopes.contains("read:doc:metadata") {
-            scopes.insert("read:doc".to_string());
-        }
-        // Raw doc access implies metadata access.
-        if scopes.contains("read:doc:raw") {
-            scopes.insert("read:doc:metadata".to_string());
-            scopes.insert("read:doc".to_string());
-        }
-
-        // Raw source access implies metadata access.
-        if scopes.contains("read:source:raw") {
-            scopes.insert("read:source".to_string());
-        }
-
-        // docs/spec.md uses `read:event` / `write:event` while older clients used
-        // `read:timeline` / `write:timeline`.
-        if scopes.contains("read:timeline") {
-            scopes.insert("read:event".to_string());
-        }
-        if scopes.contains("read:event") {
-            scopes.insert("read:timeline".to_string());
-        }
-        if scopes.contains("write:timeline") {
-            scopes.insert("write:event".to_string());
-        }
-        if scopes.contains("write:event") {
-            scopes.insert("write:timeline".to_string());
-        }
-
-        let clearances = if auth_principal.clearances.is_empty() {
-            // Backward-compatible fallback for older tokens that only provide a flat
-            // security_level + security_labels. Prefer explicit clearances when present.
-            let labels: HashSet<String> = auth_principal.security_labels.iter().cloned().collect();
-
-            let default_clearance = Clearance {
-                policy_id: "default".to_string(),
-                max_level: auth_principal.security_level,
-                labels: labels.clone(),
-                handling_allow: HashSet::new(),
-            };
-
-            // Additional clearance for the generic tenant policy used in examples.
-            let tenant_clearance = Clearance {
-                policy_id: "tenant_policy_v1".to_string(),
-                max_level: auth_principal.security_level,
-                labels,
-                handling_allow: std::iter::once("handling:trusted_context".to_string()).collect(),
-            };
-
-            vec![default_clearance, tenant_clearance]
-        } else {
-            auth_principal.clearances.clone()
-        };
+        let scopes = elephant_auth::projection::operation_scopes(&auth_principal.scopes);
+        let clearances = elephant_auth::projection::clearances(
+            &auth_principal.clearances,
+            auth_principal.security_level,
+            &auth_principal.security_labels,
+        );
 
         // An absent allowlist is unrestricted; an explicit empty allowlist is
         // still an attenuation and must retain its restriction.
@@ -255,6 +197,35 @@ impl AuthzService {
         self.evaluate(auth_principal, &record_attrs, required_scope)
     }
 
+    /// Checks operation and tenant authority before looking up an administrative
+    /// record. Record clearance and subject checks are still required afterward.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scope or target space is not granted.
+    #[allow(clippy::unused_self)]
+    pub fn authorize_space_scope(
+        &self,
+        principal: &AuthPrincipal,
+        space_id: &str,
+        scope: &str,
+    ) -> Result<(), AuthzError> {
+        if principal.bypass_abac {
+            return Ok(());
+        }
+        if space_id.is_empty() || principal.space_id.as_deref() != Some(space_id) {
+            return Err(AuthzError::access_denied("space_id mismatch"));
+        }
+        if !principal
+            .scopes
+            .iter()
+            .any(|value| value == scope || value == "*")
+        {
+            return Err(AuthzError::access_denied("missing operation scope"));
+        }
+        Ok(())
+    }
+
     /// Generic record list filtering.
     #[must_use]
     pub fn filter_records<T: HasSecurity>(
@@ -301,6 +272,7 @@ mod tests {
         clippy::cognitive_complexity
     )]
     use super::*;
+    use elephant_policy::Clearance;
     use elephant_types::ids::TableName;
     use elephant_types::records::base::{BaseFields, Provenance};
     use elephant_types::records::entity::EntityType;
@@ -350,6 +322,65 @@ mod tests {
         assert!(abac.scopes.contains("write:entity"));
         assert_eq!(abac.clearances.len(), 2);
         assert_eq!(abac.clearances[0].max_level, 2);
+    }
+
+    #[test]
+    fn actual_api_projection_can_register_and_retain_a_standing_watch() {
+        use elephant_auth::standing_watch::{attenuate_current_grant, StandingWatchAdmission};
+        use elephant_auth::{Claims, LegacyVerifier};
+        use elephant_types::space_grant::{intersect_scopes, SpaceGrant};
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let now = chrono::Utc::now();
+        let key = "api-standing-watch-projection-unit-test-key";
+        let claims: Claims = serde_json::from_value(serde_json::json!({
+            "sub": "watch-service", "iat": now.timestamp(), "exp": now.timestamp() + 3600,
+            "space_id": "household", "spaces": ["household"],
+            "scopes": ["read:source:raw", "write:source", "read:doc:raw", "write:doc", "read:event"],
+            "security_level": 3, "security_labels": ["private"], "subject_allowlist": []
+        })).unwrap();
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(key.as_bytes()),
+        )
+        .unwrap();
+        let caller = LegacyVerifier {
+            secret: key,
+            algorithm: Algorithm::HS256,
+            issuer: None,
+            audience: None,
+            mappings: None,
+        }
+        .verify(&token)
+        .unwrap();
+        let grant = SpaceGrant {
+            space_id: "household".into(),
+            subject: claims.sub.clone(),
+            generation: "original".into(),
+            active: true,
+            scopes: claims.scopes.iter().cloned().collect(),
+            updated_by: "operator".into(),
+            updated_at: now,
+        };
+        let mut auth = AuthPrincipal::from(claims.clone());
+        auth.scopes = intersect_scopes(&claims.scopes, &grant.scopes);
+        let effective = AuthzService::new().to_abac_principal(&auth);
+        let admission = StandingWatchAdmission::verified(&caller, &effective, &grant).unwrap();
+        let recurring =
+            attenuate_current_grant(admission.principal(), &claims.sub, &grant).unwrap();
+        assert_eq!(recurring.scopes, effective.scopes);
+        assert_eq!(recurring.subject_allowlist, effective.subject_allowlist);
+        assert_eq!(recurring.purpose, effective.purpose);
+        for (current, original) in recurring.clearances.iter().zip(&effective.clearances) {
+            assert_eq!(current.policy_id, original.policy_id);
+            assert_eq!(current.max_level, original.max_level);
+            assert_eq!(current.labels, original.labels);
+            assert_eq!(current.handling_allow, original.handling_allow);
+        }
+        assert!(recurring.scopes.contains("read:doc:metadata"));
+        assert!(recurring.scopes.contains("read:timeline"));
+        assert_eq!(recurring.clearances.len(), 2);
     }
 
     #[test]
@@ -462,6 +493,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test oracle and fixture lifetimes intact."
+    )]
     async fn test_empty_subject_allowlist_does_not_grant_wiki_management() {
         use elephant_mcp::handlers::StopManagedWikiHandler;
         use elephant_mcp::{ToolContext, ToolHandler};

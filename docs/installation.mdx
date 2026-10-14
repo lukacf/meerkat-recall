@@ -1,13 +1,14 @@
 ---
 title: Binary installation
-description: Verify and install a Meerkat Recall candidate archive, then configure its model-backed demo.
+description: Verify and install a Meerkat Recall release archive, then configure its model-backed demo.
 icon: download
 ---
 
-Candidate archives are prepared for Linux x86-64 and macOS ARM64. This page
-explains how to install an archive supplied with its matching release record;
-it does not announce a public release or an available download. The source
-currently declares `0.1.0` with Meerkat `0.8.51`. See
+Download native releases for Linux x86-64 and macOS ARM64 from
+[the canonical Meerkat Recall repository](https://github.com/lukacf/meerkat-recall/releases).
+Use each archive with its matching release record. This source prepares `0.9.0`
+with published Meerkat `0.9.0`; use the version actually published in the selected
+release. Existing `0.1.0` archives retain their original dependencies and receipts. See
 [release binaries](/operations/deployment#release-binaries) for the promotion process
 and build provenance requirements.
 
@@ -15,85 +16,69 @@ and build provenance requirements.
 
 | Target | Archive name |
 |---|---|
-| Linux x86-64 | `meerkat-recall-0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS ARM64 (Apple Silicon) | `meerkat-recall-0.1.0-aarch64-apple-darwin.tar.gz` |
+| Linux x86-64 | `meerkat-recall-VERSION-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS ARM64 (Apple Silicon) | `meerkat-recall-VERSION-aarch64-apple-darwin.tar.gz` |
 
-The candidate workflow builds Linux on Ubuntu 22.04 and macOS on a native
-ARM64 runner. Check the selected release's actual host and dynamic-library
-acceptance before treating another OS version as supported. No Windows,
-Linux ARM64, or Intel macOS binary is specified by this candidate matrix.
+The build workflow targets Linux and native macOS ARM64. Check the selected
+release's actual host and dynamic-library acceptance before treating another
+OS version as supported. No Windows, Linux ARM64, or Intel macOS binary is
+specified by this release matrix.
 
-Obtain the archive and its adjacent `.sha256` file from the release owner or,
-when published, the verified release assets. Keep them in the same directory.
-Use the checksum and source identity recorded for that candidate; a checksum
-bundled with an untrusted download does not establish its origin.
+Obtain the archive and `checksums.sha256` from the selected canonical release
+and keep them in the same directory. Use the checksum and source identity
+recorded for that release; a checksum bundled with an untrusted download does
+not establish its origin.
 
-The commands below require `tar`, `jq`, and the platform checksum tool. Run
-them from the directory containing the supplied files. They are installation
-instructions, not a record that either target has passed a clean-machine test.
+The `meerkat-recall-native/v1` manifest records the exact source commit/tree,
+SHA256 of `git archive --format=tar HEAD`, Cargo.lock and executable digests,
+build profile/features/compiler, and every bundled file. The third-party tree
+includes the exact patched PDF parser and SurrealKV source and notices.
+An external trusted archive SHA256 authenticates the manifest itself.
 
-## Verify, unpack, and install
+For a complete offline install using Python 3.12+, use the matching trusted
+source's `scripts/release/artifact.py`:
 
-The archives have a flat layout: `meerkat-recall`, its `elephant` compatibility
-symlink, `LICENSE`, `LICENSE-MIT`, `LICENSE-APACHE`, `THIRD_PARTY_NOTICES.md`,
-`provenance.json`, `third-party/`, and the `skills/` tree are at the archive root. A private candidate may also include `CANDIDATE.txt`. There is no nested
-version directory and no `bin/` prefix. Extract into a new directory
-so the bundled license and provenance files remain together.
+```bash
+python3 scripts/release/artifact.py install \
+  --archive meerkat-recall-VERSION-TARGET.tar.gz \
+  --sha256 TRUSTED_ARCHIVE_SHA256 \
+  --destination /absolute/releases/recall-VERSION-DIGEST
+```
 
-<Tabs>
-  <Tab title="Linux x86-64">
-    ```bash
-    (
-    set -eu
-    archive=meerkat-recall-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-    sha256sum --check "${archive%.tar.gz}.sha256"
-    bundle_dir="$PWD/${archive%.tar.gz}"
-    mkdir "$bundle_dir"
-    tar -xzf "$archive" -C "$bundle_dir"
-    jq . "$bundle_dir/provenance.json"
-    printf '%s  %s\n' "$(jq -r '.binary_sha256' "$bundle_dir/provenance.json")" \
-      "$bundle_dir/meerkat-recall" | sha256sum --check
-    "$bundle_dir/meerkat-recall" --version
-    "$bundle_dir/elephant" --version
-    "$bundle_dir/meerkat-recall" --help
-    install -d "$HOME/.local/bin"
-    install -m 0755 "$bundle_dir/meerkat-recall" "$HOME/.local/bin/meerkat-recall"
-    ln -s meerkat-recall "$HOME/.local/bin/elephant"
-    "$HOME/.local/bin/meerkat-recall" --version
-    )
-    ```
-  </Tab>
-  <Tab title="macOS ARM64">
-    ```bash
-    (
-    set -eu
-    archive=meerkat-recall-0.1.0-aarch64-apple-darwin.tar.gz
-    shasum -a 256 --check "${archive%.tar.gz}.sha256"
-    bundle_dir="$PWD/${archive%.tar.gz}"
-    mkdir "$bundle_dir"
-    tar -xzf "$archive" -C "$bundle_dir"
-    jq . "$bundle_dir/provenance.json"
-    printf '%s  %s\n' "$(jq -r '.binary_sha256' "$bundle_dir/provenance.json")" \
-      "$bundle_dir/meerkat-recall" | shasum -a 256 --check
-    "$bundle_dir/meerkat-recall" --version
-    "$bundle_dir/elephant" --version
-    "$bundle_dir/meerkat-recall" --help
-    install -d "$HOME/.local/bin"
-    install -m 0755 "$bundle_dir/meerkat-recall" "$HOME/.local/bin/meerkat-recall"
-    ln -s meerkat-recall "$HOME/.local/bin/elephant"
-    "$HOME/.local/bin/meerkat-recall" --version
-    )
-    ```
-  </Tab>
-</Tabs>
+The installer verifies all contents before publishing a new directory. It
+refuses an existing destination and does not start a service or replace a
+running executable. Retain the complete version directory for skills, licenses
+and provenance. Read the selected archive digest from the trusted manifest:
 
-Stop if a checksum check fails or the provenance does not match the supplied
-release record. Retain the extracted licenses and provenance. Add
-`$HOME/.local/bin` to your shell's normal `PATH` configuration for future
-sessions. These commands assume a fresh installation. If the legacy `elephant`
-path already exists, retain its rollback copy before replacing it with the
-compatibility alias. `--version` identifies the package version; provenance and
-the executable digest identify the exact build.
+```bash
+archive=meerkat-recall-VERSION-x86_64-unknown-linux-gnu.tar.gz
+# Use aarch64-apple-darwin on Apple Silicon.
+expected_sha256="$(awk -v name="$archive" '$2 == name { print $1 }' checksums.sha256)"
+test "${#expected_sha256}" -eq 64
+python3 scripts/release/artifact.py install \
+  --archive "$archive" --sha256 "$expected_sha256" \
+  --destination /absolute/releases/recall-VERSION-DIGEST
+```
+
+Choose a new absolute destination and retain its complete tree. Add that version
+directory to your `PATH`, or use its absolute `meerkat-recall` path. Set
+`PIPELINE_SKILLS_DIR` to its installed `skills` directory. Installation does not
+start a service, initialize storage, provide credentials or approve model use.
+Continue with [service setup](/operations/service-setup) for those steps.
+
+## Archive layout and provenance
+
+Archives have a flat layout: `meerkat-recall`, the `elephant` compatibility
+symlink, licenses, `provenance.json`, `artifact.py`, `service/`, `third-party/`,
+`docs/` and `skills/`. Keep these together. Model weights and provider credentials
+are separate. The source release also retains the patched dependency sources.
+
+The original build commit and selected public source snapshot can differ.
+`public_derivation` records that mapping and the unchanged executable digest;
+it does not claim a rebuild or third-party build attestation. The canonical
+release preserves the original artifact identities even if earlier derivation
+metadata names its original staging repository. Use the canonical release URL
+for current downloads. `--version` alone does not identify an exact build.
 
 ## Run the model-backed demo
 
@@ -102,19 +87,26 @@ models to plan articles, write them, and verify their statements before it
 starts serving the demo. It needs provider credentials and model access;
 provider calls can incur charges. No database service is required.
 
-The writer is selected by `ELEPHANT_WIKI_WRITER_MODEL`, then
-`PIPELINE_AGENTIC_MODEL`, then the source default `gpt-5.6-sol`. The verifier
-uses `ELEPHANT_WIKI_VERIFIER_MODEL` or the writer's model. For the default
-selection, configure `OPENAI_API_KEY` through your normal secret configuration
-and ensure that account has access to the selected model. If selecting another
-provider or a different verifier, configure credentials for both selections.
+The demo uses the explicitly named `default` space inside its isolated memory
+store. Copy `service/demo-wiki-processing.example.json` from the native archive
+(or `deploy/native/demo-wiki-processing.example.json` in a source checkout) and
+replace the account, model and immutable model-version placeholders with your
+approved values. It uses the same `SpaceProcessingConfig` contract as the service:
+`wiki_planner`, `wiki_writer` and `wiki_verifier` each need an unrevoked binding.
+A separate verifier may use a separate profile and connection. Other provider
+connections remain available through that shared contract.
+
+`credential_ref` names an environment variable, never a key value. Configure that
+variable through your normal secret configuration before running. The example
+uses `RECALL_DEMO_PROVIDER_KEY`; it does not infer authorization from conventional
+ambient API keys or select a default model. Supplying the file approves those
+operations only in the isolated demo store. It does not modify a running service.
 
 ```bash
-# Configure provider credentials in this shell before running the demo.
-meerkat-recall demo-wiki
+meerkat-recall demo-wiki --processing-config /private/demo-processing.json
 ```
 
-Use `meerkat-recall demo-wiki --port 3100` if port 3000 is occupied. When startup
+Add `--port 3100` if port 3000 is occupied. When startup
 finishes, inspect the printed article-generation results and the context
 projection, compilation receipt, and source evidence at the printed loopback
 URLs. Do not count missing credentials, failed model calls, or blocked articles

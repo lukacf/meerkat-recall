@@ -1,0 +1,18 @@
+# This real 256-Work / 257-Source native boundary retains its original 240s
+# deadline. Give it the full test scheduler budget, as in its retained isolated
+# qualification, instead of competing with unrelated database constructors.
+[[profile.default.overrides]]
+filter = "test(=reprocess::budget::independent_producer_ancestry::native_actual_256_work_and_257_source_boundaries)"
+threads-required = "num-test-threads"
+
+# This test already publishes fourteen sources concurrently. Reserve the runner's
+# slots so unrelated tests do not distort its unchanged 180-second deadline.
+[[profile.default.overrides]]
+filter = 'package(elephant-pipeline-bin) & test(=runtime::work_item_tests::source_finalizer_contention_tests::surreal_fourteen_same_space_source_finalizers_complete)'
+threads-required = "num-test-threads"
+
+# This full-book scenario is CPU intensive. Keep its original 300-second
+# pipeline deadline while reserving the runner's slots for the complete test.
+[[profile.default.overrides]]
+filter = 'package(elephant-scenarios) & test(=embedded_elephant_db::scenario_embedded_elephant_db_ingests_alice_and_searches_semantically)'
+threads-required = "num-test-threads"

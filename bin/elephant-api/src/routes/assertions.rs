@@ -18,6 +18,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use elephant_storage::canonical_commit::CanonicalRecord;
+use elephant_storage::public_mutation::{inherit_public_envelope, PublicMutation};
 use elephant_storage::{parse_id, AssertionRepository, Repository, StorageClient, StorageResult};
 use elephant_types::ids::TableName;
 use elephant_types::records::assertion::{Assertion, ResolutionStatus};
@@ -30,6 +32,11 @@ use crate::routes::require_space_id;
 
 /// Shared state for assertion handlers.
 pub struct AssertionsState {
+    /// Current source authority; absent only in repository unit fixtures.
+    pub storage: Option<StorageClient>,
+    /// Canonical client, absent only in isolated repository mocks.
+    pub mutation_storage: Option<StorageClient>,
+
     /// Assertion repository.
     pub assertion_repo: Arc<dyn AssertionRepo>,
     /// Authorization service.
@@ -367,7 +374,10 @@ impl AssertionsState {
     #[must_use]
     pub fn new(client: StorageClient, authz: AuthzState) -> Self {
         Self {
-            assertion_repo: Arc::new(AssertionRepository::new(client)),
+            storage: Some(client.clone()),
+            assertion_repo: Arc::new(AssertionRepository::new(client.clone())),
+            mutation_storage: Some(client),
+
             authz,
         }
     }
@@ -377,8 +387,10 @@ impl AssertionsState {
     #[cfg(test)]
     pub fn new_with_repo(assertion_repo: Arc<dyn AssertionRepo>, authz: AuthzState) -> Self {
         Self {
+            storage: None,
             assertion_repo,
             authz,
+            mutation_storage: None,
         }
     }
 }
@@ -661,10 +673,14 @@ async fn search_assertions(
             })
             .collect();
 
-        let filtered_batch =
-            state
-                .authz
-                .filter_records(&principal, filtered_batch, "read:assertion");
+        let filtered_batch = super::current_read::filter(
+            state.storage.as_ref(),
+            &state.authz,
+            &principal,
+            filtered_batch,
+            "read:assertion",
+        )
+        .await?;
 
         if let Some(query_lower) = query_lower.as_deref() {
             for assertion in filtered_batch {
@@ -797,7 +813,16 @@ async fn get_assertion(
                         }),
                     )
                 })?;
-            Ok(Json(assertion))
+            Ok(Json(
+                super::current_read::require(
+                    state.storage.as_ref(),
+                    &state.authz,
+                    &principal,
+                    assertion,
+                    "read:assertion",
+                )
+                .await?,
+            ))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -810,7 +835,178 @@ async fn get_assertion(
     }
 }
 
+async fn begin_assertion_mutation(
+    state: &AssertionsState,
+    space: &str,
+) -> StorageResult<Option<PublicMutation>> {
+    match &state.mutation_storage {
+        Some(storage) => PublicMutation::begin(storage.clone(), space)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+#[expect(
+    clippy::items_after_statements,
+    clippy::significant_drop_tightening,
+    clippy::too_many_lines,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
+async fn authorize_assertion_inputs(
+    state: &AssertionsState,
+    principal: &AuthPrincipal,
+    mutation: &mut PublicMutation,
+    assertion: &mut Assertion,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let Some(storage) = &state.mutation_storage else {
+        return Ok(());
+    };
+    let entity_repo = elephant_storage::EntityRepository::new(storage.clone());
+    for id in assertion
+        .subject_entity
+        .iter()
+        .chain(assertion.object_entity.iter())
+        .map(elephant_types::Link::id)
+    {
+        let entity = entity_repo
+            .get(&assertion.base.space_id, id)
+            .await
+            .map_err(|error| assertion_storage_error(&error))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiError::not_found("Assertion entity", &id.to_string())),
+                )
+            })?;
+        state
+            .authz
+            .authorize_record_read(principal, &entity, "read:entity")
+            .map_err(assertion_forbidden)?;
+        inherit_public_envelope(&mut assertion.base, &entity.base).map_err(|error| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::validation(error.to_string())),
+            )
+        })?;
+        mutation.depend_on(CanonicalRecord::Entity(Box::new(entity)));
+    }
+    let revision = elephant_storage::DocRevisionRepository::new(storage.clone())
+        .get(&assertion.base.space_id, assertion.evidence.revision.id())
+        .await
+        .map_err(|error| assertion_storage_error(&error))?
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::validation(
+                    "Assertion requires an actual immutable evidence revision",
+                )),
+            )
+        })?;
+    let doc = elephant_storage::DocRepository::new(storage.clone())
+        .get(&assertion.base.space_id, revision.doc.id())
+        .await
+        .map_err(|error| assertion_storage_error(&error))?
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::validation(
+                    "Assertion evidence document must be live",
+                )),
+            )
+        })?;
+    state
+        .authz
+        .authorize_record_read(principal, &revision, "read:doc:raw")
+        .map_err(assertion_forbidden)?;
+    state
+        .authz
+        .authorize_record_read(principal, &doc, "read:doc:raw")
+        .map_err(assertion_forbidden)?;
+    if let Some(node_id) = assertion.evidence.node.as_ref() {
+        let node = elephant_storage::DocNodeRepository::new(storage.clone())
+            .get(&assertion.base.space_id, node_id.id())
+            .await
+            .map_err(|error| assertion_storage_error(&error))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError::validation("Assertion evidence node is absent")),
+                )
+            })?;
+        if node.revision.id() != &revision.base.id
+            || assertion.evidence.start < node.span.start
+            || assertion.evidence.end > node.span.end
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::validation(
+                    "Assertion span does not belong to its evidence node",
+                )),
+            ));
+        }
+        state
+            .authz
+            .authorize_record_read(principal, &node, "read:doc:raw")
+            .map_err(assertion_forbidden)?;
+        inherit_public_envelope(&mut assertion.base, &node.base).map_err(|error| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::validation(error.to_string())),
+            )
+        })?;
+        mutation.depend_on(CanonicalRecord::DocNode(Box::new(node)));
+    }
+    let span = &assertion.evidence;
+    let quote = revision
+        .text
+        .get(span.start as usize..span.end as usize)
+        .filter(|quote| !quote.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::validation(
+                    "Assertion evidence span is not a nonempty UTF-8 range",
+                )),
+            )
+        })?;
+    use sha2::Digest;
+    let hash = format!("sha256:{:x}", sha2::Sha256::digest(quote.as_bytes()));
+    if span.quote_hash != hash {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::validation(
+                "Assertion quote hash does not match immutable evidence",
+            )),
+        ));
+    }
+    inherit_public_envelope(&mut assertion.base, &revision.base).map_err(|error| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(ApiError::validation(error.to_string())),
+        )
+    })?;
+    inherit_public_envelope(&mut assertion.base, &doc.base).map_err(|error| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(ApiError::validation(error.to_string())),
+        )
+    })?;
+    if let Some(source) = &doc.source {
+        if !assertion.base.provenance.sources.contains(source.id()) {
+            assertion.base.provenance.sources.push(source.id().clone());
+        }
+    }
+    mutation.depend_on(CanonicalRecord::Doc(Box::new(doc)));
+    mutation.depend_on(CanonicalRecord::DocRevision(Box::new(revision)));
+    Ok(())
+}
+
 /// POST /v1/assertions - Create manual assertion.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn create_assertion(
     State(state): State<Arc<AssertionsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -820,6 +1016,12 @@ async fn create_assertion(
     let mut assertion = assertion;
     assertion.base.space_id = require_space_id(&principal)?;
 
+    let mut mutation = begin_assertion_mutation(&state, &assertion.base.space_id)
+        .await
+        .map_err(|error| assertion_storage_error(&error))?;
+    if let Some(mutation) = &mut mutation {
+        authorize_assertion_inputs(&state, &principal, mutation, &mut assertion).await?;
+    }
     state
         .authz
         .authorize_record_write(&principal, &assertion, "write:assertion")
@@ -834,16 +1036,25 @@ async fn create_assertion(
             )
         })?;
 
-    match state.assertion_repo.create(assertion).await {
+    state
+        .authz
+        .authorize_record_read(&principal, &assertion, "read:assertion")
+        .map_err(assertion_forbidden)?;
+    let result = match mutation {
+        Some(mutation) => mutation.create(assertion, &principal.subject).await,
+        None => state.assertion_repo.create(assertion).await,
+    };
+    match result {
         Ok(created) => Ok((StatusCode::CREATED, Json(created))),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 
 /// PATCH /v1/assertions/{id}/resolution - Update resolution status.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn update_resolution(
     State(state): State<Arc<AssertionsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -851,6 +1062,9 @@ async fn update_resolution(
     Json(req): Json<ResolutionUpdateRequest>,
 ) -> ApiResult<Assertion> {
     let space_id = require_space_id(&principal)?;
+    let mutation = begin_assertion_mutation(&state, &space_id)
+        .await
+        .map_err(|error| assertion_storage_error(&error))?;
     let rid = parse_id(&id, TableName::Assertion).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -866,12 +1080,7 @@ async fn update_resolution(
                 Json(ApiError::not_found("Assertion", &id)),
             ))
         }
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            ))
-        }
+        Err(e) => return Err(ApiError::storage(&e)),
     };
 
     state
@@ -905,17 +1114,35 @@ async fn update_resolution(
     // Only the resolution fields are written, and only while the row still
     // has the envelope authorized above: a stale snapshot never overwrites a
     // newer classification, subject set or entity link.
-    state
-        .assertion_repo
-        .resolve_guarded(&space_id, &rid, &assertion, req.status, req.rationale)
-        .await
+    let result = match mutation {
+        Some(mutation) => {
+            let mut proposed = assertion.clone();
+            proposed.resolution_status = req.status;
+            if let Some(rationale) = req.rationale {
+                proposed.retry_state.abstention_reason = Some(rationale);
+            }
+            mutation
+                .replace(&assertion, proposed, false, &principal.subject)
+                .await
+        }
+        None => {
+            state
+                .assertion_repo
+                .resolve_guarded(&space_id, &rid, &assertion, req.status, req.rationale)
+                .await
+        }
+    };
+    result
         .map(Json)
-        .map_err(|e| assertion_storage_error(&e))
+        .map_err(|error| assertion_storage_error(&error))
 }
 
 /// Storage failure as an API error: a guard conflict is 409 and carries no
 /// record content.
 fn assertion_storage_error(error: &elephant_storage::StorageError) -> (StatusCode, Json<ApiError>) {
+    if matches!(error, elephant_storage::StorageError::ErasureInProgress) {
+        return ApiError::storage(error);
+    }
     if matches!(error, elephant_storage::StorageError::Conflict(_)) {
         return (
             StatusCode::CONFLICT,
@@ -947,12 +1174,19 @@ fn assertion_forbidden(error: crate::authz::AuthzError) -> (StatusCode, Json<Api
 ///
 /// Sets `deleted_at`; search and reads skip the assertion from then on.
 /// Undo with `POST /v1/assertions/{id}/restore`.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn delete_assertion(
     State(state): State<Arc<AssertionsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     let space_id = require_space_id(&principal)?;
+    let mutation = begin_assertion_mutation(&state, &space_id)
+        .await
+        .map_err(|error| assertion_storage_error(&error))?;
     let rid = parse_id(&id, TableName::Assertion).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -967,10 +1201,19 @@ async fn delete_assertion(
                 .map_err(assertion_forbidden)?;
             // Guarded: the delete applies only if the row still has the
             // envelope authorized above.
-            state
-                .assertion_repo
-                .delete_guarded(&space_id, &rid, &existing)
-                .await
+            let result = match mutation {
+                Some(mutation) => mutation
+                    .delete(&existing, &principal.subject)
+                    .await
+                    .map(|_| ()),
+                None => {
+                    state
+                        .assertion_repo
+                        .delete_guarded(&space_id, &rid, &existing)
+                        .await
+                }
+            };
+            result
                 .map(|()| StatusCode::NO_CONTENT)
                 .map_err(|e| assertion_storage_error(&e))
         }
@@ -978,10 +1221,7 @@ async fn delete_assertion(
             StatusCode::NOT_FOUND,
             Json(ApiError::not_found("Assertion", &id)),
         )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 
@@ -989,12 +1229,19 @@ async fn delete_assertion(
 ///
 /// Returns the restored record, so the caller must hold read as well as
 /// write authorization for it; both are checked before anything changes.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn restore_assertion(
     State(state): State<Arc<AssertionsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(id): Path<String>,
 ) -> ApiResult<Assertion> {
     let space_id = require_space_id(&principal)?;
+    let mutation = begin_assertion_mutation(&state, &space_id)
+        .await
+        .map_err(|error| assertion_storage_error(&error))?;
     let rid = parse_id(&id, TableName::Assertion).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -1012,21 +1259,22 @@ async fn restore_assertion(
                 .authorize_record_read(&principal, &existing, "read:assertion")
                 .map_err(assertion_forbidden)?;
             // Guarded: restores, and returns, only the row authorized above.
-            state
-                .assertion_repo
-                .restore_guarded(&space_id, &rid, &existing)
-                .await
-                .map(Json)
-                .map_err(|e| assertion_storage_error(&e))
+            let result = match mutation {
+                Some(mutation) => mutation.restore(&existing, &principal.subject).await,
+                None => {
+                    state
+                        .assertion_repo
+                        .restore_guarded(&space_id, &rid, &existing)
+                        .await
+                }
+            };
+            result.map(Json).map_err(|e| assertion_storage_error(&e))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ApiError::not_found("Assertion", &id)),
         )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 

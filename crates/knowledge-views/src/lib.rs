@@ -20,7 +20,7 @@ use elephant_types::records::{
     Assertion, Attribute, CitationKind, CompilerReceipt, Entity, Event, Freshness, HasSecurity,
     KnowledgeCitation, KnowledgeDependency, KnowledgeStatement, KnowledgeView, KnowledgeViewBlock,
     KnowledgeViewKind, KnowledgeViewPublicationStatus, KnowledgeViewRevision, KnowledgeViewSurface,
-    ProjectionFreshness, ProjectionState, Rel, StatementDerivation, StatementVerification,
+    ProjectionFreshness, ProjectionState, Rel, Source, StatementDerivation, StatementVerification,
     TruthSlot, ValidationReceipt, ViewBlockKind,
 };
 use elephant_types::{Link, RecordId, TableName};
@@ -30,13 +30,13 @@ use uuid::Uuid;
 mod graph_views;
 mod source;
 
-pub use graph_views::{CompiledGraphView, GraphViewCompiler};
+pub use graph_views::{CompiledGraphView, GraphViewCompiler, PreparedGraphView};
 pub use source::{CompiledSourceView, SourceViewCompiler, SourceViewLimits};
 
 /// Stable identity of the deterministic entity-view compiler.
 pub const ENTITY_COMPILER_NAME: &str = "elephant.entity_view";
 /// Contract version of the deterministic entity-view compiler.
-pub const ENTITY_COMPILER_VERSION: u32 = 4;
+pub const ENTITY_COMPILER_VERSION: u32 = 6;
 
 /// Bounds for one entity projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,9 +73,85 @@ pub struct CompiledEntityView {
     pub changed: bool,
 }
 
+/// Require every contributing record to fit the complete derived envelope.
+/// Policy names are opaque: `default` is not a universal weaker policy.
+#[must_use]
+pub fn projection_envelope_covers(output: &BaseFields, input: &BaseFields) -> bool {
+    output.space_id == input.space_id
+        && !input.is_deleted()
+        && output.security.policy_id == input.security.policy_id
+        && output.security.level >= input.security.level
+        && input
+            .security
+            .labels
+            .iter()
+            .all(|label| output.security.labels.contains(label))
+        && input
+            .security
+            .handling
+            .iter()
+            .filter(|flag| flag.as_str() != "handling:subjectless_ok")
+            .all(|flag| output.security.handling.contains(flag))
+        && (!output
+            .security
+            .handling
+            .iter()
+            .any(|flag| flag == "handling:subjectless_ok")
+            || input
+                .security
+                .handling
+                .iter()
+                .any(|flag| flag == "handling:subjectless_ok"))
+        && input
+            .subjects
+            .iter()
+            .all(|subject| output.subjects.contains(subject))
+        && match input.subjects_state {
+            SubjectsState::Complete => true,
+            SubjectsState::Partial => output.subjects_state != SubjectsState::Complete,
+            SubjectsState::Unknown => output.subjects_state == SubjectsState::Unknown,
+        }
+}
+
+/// Validate exact current evidence, support and recorded dependency versions.
+/// Used for both cache reuse and newly prepared immutable projections.
+pub async fn projection_is_current(
+    storage: &StorageClient,
+    revision: &KnowledgeViewRevision,
+) -> StorageResult<bool> {
+    let reader = elephant_storage::read_eligibility::ReadEligibility::new(storage.clone());
+    Ok(reader
+        .project(revision.clone(), &|base| {
+            projection_envelope_covers(&revision.base, base)
+        })
+        .await?
+        .is_some())
+}
+
+/// Fence read-only preparation/cache returns against the original read epoch.
+/// Verification never initializes a missing epoch or grants space authority.
+pub async fn verify_projection_epoch(
+    storage: &StorageClient,
+    space: &str,
+    observed_epoch: &str,
+) -> StorageResult<()> {
+    if observed_epoch.is_empty()
+        || elephant_storage::canonical_commit::CanonicalRepository::new(storage.clone())
+            .current_epoch(space)
+            .await?
+            != observed_epoch
+    {
+        return Err(StorageError::Conflict(
+            "Wiki inputs changed during preparation".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Compiler and publication service for entity-rooted knowledge views.
 #[derive(Clone, Debug)]
 pub struct EntityViewCompiler {
+    storage: StorageClient,
     views: KnowledgeViewRepository,
     entities: EntityRepository,
     relations: RelRepository,
@@ -91,6 +167,7 @@ impl EntityViewCompiler {
     #[must_use]
     pub fn new(storage: StorageClient) -> Self {
         Self {
+            storage: storage.clone(),
             views: KnowledgeViewRepository::new(storage.clone()),
             entities: EntityRepository::new(storage.clone()),
             relations: RelRepository::new(storage.clone()),
@@ -122,7 +199,6 @@ impl EntityViewCompiler {
 
     /// Compiles and atomically publishes an entity view unless its exact input
     /// receipt already matches the current revision.
-    #[allow(clippy::too_many_lines)] // Coordinates snapshot-consistent reads and atomic publication.
     pub async fn compile(
         &self,
         space_id: &str,
@@ -130,31 +206,53 @@ impl EntityViewCompiler {
         limits: EntityViewLimits,
         force: bool,
     ) -> StorageResult<CompiledEntityView> {
-        let entity = self
-            .entities
-            .get(space_id, entity_id)
+        let observed_epoch = Box::pin(
+            elephant_storage::canonical_commit::CanonicalRepository::new(self.storage.clone())
+                .epoch(space_id),
+        )
+        .await?;
+        // The selection future returns before grounding is constructed; the
+        // grounding future returns before publication is constructed. Their
+        // compiled poll frames are never retained beneath one another.
+        let inputs = Box::pin(self.prepare_material(space_id, entity_id, limits)).await?;
+        let prepared =
+            Box::pin(self.prepare_revision(space_id, entity_id, force, &observed_epoch, inputs))
+                .await?;
+        if !prepared.changed {
+            return Ok(*prepared);
+        }
+        let (view, revision) = Box::pin(self.views.publish_at_epoch(
+            prepared.view,
+            prepared.revision,
+            &observed_epoch,
+        ))
+        .await?;
+        Ok(CompiledEntityView {
+            view,
+            revision,
+            changed: true,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)] // Preserves the original ordered, bounded selection.
+    async fn prepare_material(
+        &self,
+        space_id: &str,
+        entity_id: &RecordId,
+        limits: EntityViewLimits,
+    ) -> StorageResult<Box<EntityViewInputs>> {
+        let entity = Box::pin(self.entities.get(space_id, entity_id))
             .await?
             .ok_or_else(|| StorageError::NotFound(entity_id.to_string()))?;
         let security = entity.base.security.clone();
         let fingerprint = security_fingerprint(&security)?;
         let key = entity_view_key(entity_id, &fingerprint);
-        let existing = self.views.find_by_key(space_id, &key).await?;
-        if !force {
-            if let Some(existing_view) = existing.as_ref() {
-                if let Some(current) = self.views.get_current_revision(existing_view).await? {
-                    if reusable_current_revision(existing_view, &current, ENTITY_COMPILER_VERSION) {
-                        return Ok(CompiledEntityView {
-                            view: existing_view.clone(),
-                            revision: current,
-                            changed: false,
-                        });
-                    }
-                }
-            }
-        }
+        let existing = Box::pin(self.views.find_by_key(space_id, &key)).await?;
+        // Recompute the bounded selection before cache reuse: an old dependency
+        // list cannot prove that no new matching relation or document appeared.
 
-        let mut outgoing = self.relations.find_outgoing(space_id, entity_id).await?;
-        let mut incoming = self.relations.find_incoming(space_id, entity_id).await?;
+        let mut outgoing = Box::pin(self.relations.find_outgoing(space_id, entity_id)).await?;
+        let mut incoming = Box::pin(self.relations.find_incoming(space_id, entity_id)).await?;
         outgoing.retain(|record| record.base.security == security);
         incoming.retain(|record| record.base.security == security);
         sort_relations(&mut outgoing);
@@ -162,10 +260,8 @@ impl EntityViewCompiler {
         outgoing.truncate(limits.outgoing_relations);
         incoming.truncate(limits.incoming_relations);
 
-        let mut attributes = self
-            .attributes
-            .find_by_subject_entity(space_id, entity_id)
-            .await?;
+        let mut attributes =
+            Box::pin(self.attributes.find_by_subject_entity(space_id, entity_id)).await?;
         attributes.retain(|record| record.base.security == security);
         attributes.sort_by(|left, right| {
             left.attr_type
@@ -174,17 +270,20 @@ impl EntityViewCompiler {
         });
         attributes.truncate(limits.attributes);
 
-        let mut events = self
-            .events
-            .find_by_subject_entity(space_id, entity_id, limits.events.saturating_mul(2))
-            .await?;
+        let mut events = Box::pin(self.events.find_by_subject_entity(
+            space_id,
+            entity_id,
+            limits.events.saturating_mul(2),
+        ))
+        .await?;
         events.retain(|record| record.base.security == security);
         events.truncate(limits.events);
 
-        let mut truth_slots = self
-            .truth_slots
-            .find_by_subject_entity(space_id, &entity_id.to_string())
-            .await?;
+        let mut truth_slots = Box::pin(
+            self.truth_slots
+                .find_by_subject_entity(space_id, &entity_id.to_string()),
+        )
+        .await?;
         truth_slots.retain(|record| record.base.security == security);
 
         let counterpart_ids = outgoing
@@ -194,7 +293,9 @@ impl EntityViewCompiler {
             .collect::<BTreeSet<_>>();
         let mut counterparts = HashMap::new();
         for counterpart_id in counterpart_ids {
-            if let Some(counterpart) = self.entities.get(space_id, &counterpart_id).await? {
+            if let Some(counterpart) =
+                Box::pin(self.entities.get(space_id, &counterpart_id)).await?
+            {
                 if counterpart.base.security == security {
                     counterparts.insert(counterpart_id, counterpart);
                 }
@@ -204,7 +305,7 @@ impl EntityViewCompiler {
         let assertion_ids = referenced_assertion_ids(&outgoing, &incoming, &attributes, &events);
         let mut assertions = HashMap::new();
         for assertion_id in assertion_ids {
-            if let Some(assertion) = self.assertions.get(space_id, &assertion_id).await? {
+            if let Some(assertion) = Box::pin(self.assertions.get(space_id, &assertion_id)).await? {
                 if assertion.base.security == security {
                     assertions.insert(assertion_id, assertion);
                 }
@@ -222,7 +323,9 @@ impl EntityViewCompiler {
             .collect::<BTreeSet<_>>();
         let mut freshness_records = HashMap::new();
         for claim_id in claim_ids {
-            if let Some(record) = self.freshness.find_by_target(space_id, &claim_id).await? {
+            if let Some(record) =
+                Box::pin(self.freshness.find_by_target(space_id, &claim_id)).await?
+            {
                 if record.base.security == security {
                     freshness_records.insert(claim_id, record);
                 }
@@ -241,11 +344,47 @@ impl EntityViewCompiler {
             freshness: freshness_records,
             security_fingerprint: fingerprint,
         };
-        let draft = build_revision_draft(&material)?;
+        Ok(Box::new(EntityViewInputs {
+            material,
+            security,
+            key,
+            existing,
+        }))
+    }
+
+    // Move selected inputs between phases without retaining their poll frames.
+    #[allow(clippy::boxed_local)]
+    async fn prepare_revision(
+        &self,
+        space_id: &str,
+        entity_id: &RecordId,
+        force: bool,
+        observed_epoch: &str,
+        inputs: Box<EntityViewInputs>,
+    ) -> StorageResult<Box<CompiledEntityView>> {
+        let EntityViewInputs {
+            material,
+            security,
+            key,
+            existing,
+        } = *inputs;
+        let mut draft = build_revision_draft(&material)?;
+        let evidence_envelopes = Box::pin(ground_citation_evidence(
+            &self.storage,
+            space_id,
+            &security,
+            &mut draft,
+            ENTITY_COMPILER_NAME,
+            ENTITY_COMPILER_VERSION,
+            &[],
+        ))
+        .await?;
 
         if !force {
             if let Some(existing_view) = existing.as_ref() {
-                if let Some(current) = self.views.get_current_revision(existing_view).await? {
+                if let Some(current) =
+                    Box::pin(self.views.get_current_revision(existing_view)).await?
+                {
                     let freshness_due = current
                         .freshness
                         .valid_until
@@ -254,133 +393,196 @@ impl EntityViewCompiler {
                         && (!freshness_due || current.freshness.expired_claims > 0)
                         && current.compiler.dependency_hash == draft.dependency_hash
                         && current.compiler.version == ENTITY_COMPILER_VERSION
+                        && Box::pin(projection_is_current(&self.storage, &current)).await?
                     {
-                        return Ok(CompiledEntityView {
+                        Box::pin(verify_projection_epoch(
+                            &self.storage,
+                            space_id,
+                            observed_epoch,
+                        ))
+                        .await?;
+                        return Ok(Box::new(CompiledEntityView {
                             view: existing_view.clone(),
                             revision: current,
                             changed: false,
-                        });
+                        }));
                     }
                 }
             }
         }
 
-        let now = Utc::now();
-        let view_id = existing
-            .as_ref()
-            .map_or_else(|| deterministic_view_id(&key), |view| view.base.id.clone());
-        let revision_number = existing
-            .as_ref()
-            .map_or(1, |view| view.revision_count.saturating_add(1));
-        let revision_id = RecordId::new_v7(TableName::KnowledgeViewRevision);
-        let mut scope = ProjectionSubjects::default();
-        scope.include(&material.entity);
-        for record in material.outgoing.iter().chain(&material.incoming) {
-            scope.include(record);
-        }
-        for record in &material.attributes {
-            scope.include(record);
-        }
-        for record in &material.events {
-            scope.include(record);
-        }
-        for record in &material.truth_slots {
-            scope.include(record);
-        }
-        for record in material.counterparts.values() {
-            scope.include(record);
-        }
-        for record in material.assertions.values() {
-            scope.include(record);
-        }
-        for record in material.freshness.values() {
-            scope.include(record);
-        }
-        let (subjects, subjects_state) = scope.finish();
-        let provenance = projection_provenance(
-            &draft.citations,
-            &draft.dependency_hash,
-            ENTITY_COMPILER_NAME,
-            ENTITY_COMPILER_VERSION,
-        );
-
-        let mut view_base = existing.as_ref().map_or_else(
-            || {
-                let mut base = BaseFields::new(
-                    view_id.clone(),
-                    space_id.to_string(),
-                    ENTITY_COMPILER_NAME.to_string(),
-                );
-                base.security = security.clone();
-                base.subjects.clone_from(&subjects);
-                base.subjects_state = subjects_state;
-                base.provenance = provenance.clone();
-                base
+        let compiled = assemble_entity_revision(
+            space_id,
+            entity_id,
+            EntityRevisionAssembly {
+                material,
+                security,
+                key,
+                existing,
+                draft,
+                evidence_envelopes,
             },
-            |view| view.base.clone(),
         );
-        view_base.updated_at = now;
-        view_base.deleted_at = None;
-        view_base.security.clone_from(&security);
-        view_base.subjects.clone_from(&subjects);
-        view_base.subjects_state = subjects_state;
-        view_base.provenance.clone_from(&provenance);
+        if !Box::pin(projection_is_current(&self.storage, &compiled.revision)).await? {
+            return Err(StorageError::Conflict(
+                "Projection has invalid or withdrawn evidence".into(),
+            ));
+        }
+        Ok(Box::new(compiled))
+    }
+}
 
-        let state = draft.freshness.state;
-        let state_reason = projection_state_reason(&draft.freshness);
-        let view = KnowledgeView {
-            base: view_base,
-            key,
-            kind: KnowledgeViewKind::Entity,
-            surface: KnowledgeViewSurface::Inspector,
-            publication_status: KnowledgeViewPublicationStatus::Published,
-            root_record: entity_id.to_string(),
-            title: material.entity.display_name.clone(),
-            slug: entity_slug(&material.entity),
-            security_fingerprint: material.security_fingerprint.clone(),
-            current_revision: Some(revision_id.to_string()),
-            revision_count: revision_number,
-            state,
-            state_reason,
-            published_at: Some(now),
-        };
+struct EntityViewInputs {
+    material: EntityViewMaterial,
+    security: Security,
+    key: String,
+    existing: Option<KnowledgeView>,
+}
 
-        let mut revision_base = BaseFields::new(
-            revision_id,
-            space_id.to_string(),
-            ENTITY_COMPILER_NAME.to_string(),
-        );
-        revision_base.security = security;
-        revision_base.subjects = subjects;
-        revision_base.subjects_state = subjects_state;
-        revision_base.provenance = provenance;
-        let revision = KnowledgeViewRevision {
-            base: revision_base,
-            view_id: view.base.id.to_string(),
-            revision: revision_number,
-            kind: KnowledgeViewKind::Entity,
-            root_record: entity_id.to_string(),
-            blocks: draft.blocks,
-            rendered_markdown: draft.rendered_markdown,
-            citations: draft.citations,
-            dependencies: draft.dependencies,
-            freshness: draft.freshness,
-            validation: draft.validation,
-            compiler: CompilerReceipt {
-                compiler: ENTITY_COMPILER_NAME.to_string(),
-                version: ENTITY_COMPILER_VERSION,
-                dependency_hash: draft.dependency_hash,
-                policy_fingerprint: material.security_fingerprint,
-            },
-            compiled_at: now,
-            supersedes: existing.and_then(|view| view.current_revision),
-        };
-        let (view, revision) = self.views.publish(view, revision).await?;
-        Ok(CompiledEntityView {
-            view,
-            revision,
-            changed: true,
-        })
+struct EntityRevisionAssembly {
+    material: EntityViewMaterial,
+    security: Security,
+    key: String,
+    existing: Option<KnowledgeView>,
+    draft: RevisionDraft,
+    evidence_envelopes: Vec<BaseFields>,
+}
+
+// This pure assembly has no storage future. Its frame is gone before the
+// original current-evidence validation and epoch-fenced publication are polled.
+#[inline(never)]
+#[allow(clippy::too_many_lines)]
+fn assemble_entity_revision(
+    space_id: &str,
+    entity_id: &RecordId,
+    assembly: EntityRevisionAssembly,
+) -> CompiledEntityView {
+    let EntityRevisionAssembly {
+        material,
+        security,
+        key,
+        existing,
+        draft,
+        evidence_envelopes,
+    } = assembly;
+    let now = Utc::now();
+    let view_id = existing
+        .as_ref()
+        .map_or_else(|| deterministic_view_id(&key), |view| view.base.id.clone());
+    let revision_number = existing
+        .as_ref()
+        .map_or(1, |view| view.revision_count.saturating_add(1));
+    let revision_id = RecordId::new_v7(TableName::KnowledgeViewRevision);
+    let mut scope = ProjectionSubjects::default();
+    scope.include(&material.entity);
+    for record in material.outgoing.iter().chain(&material.incoming) {
+        scope.include(record);
+    }
+    for record in &material.attributes {
+        scope.include(record);
+    }
+    for record in &material.events {
+        scope.include(record);
+    }
+    for record in &material.truth_slots {
+        scope.include(record);
+    }
+    for record in material.counterparts.values() {
+        scope.include(record);
+    }
+    for record in material.assertions.values() {
+        scope.include(record);
+    }
+    for record in material.freshness.values() {
+        scope.include(record);
+    }
+    for base in &evidence_envelopes {
+        scope.include_base(base);
+    }
+    let (subjects, subjects_state) = scope.finish();
+    let mut provenance = projection_provenance(
+        &draft.citations,
+        &draft.dependency_hash,
+        ENTITY_COMPILER_NAME,
+        ENTITY_COMPILER_VERSION,
+    );
+    extend_projection_sources(&mut provenance, &evidence_envelopes);
+
+    let mut view_base = existing.as_ref().map_or_else(
+        || {
+            let mut base = BaseFields::new(
+                view_id.clone(),
+                space_id.to_string(),
+                ENTITY_COMPILER_NAME.to_string(),
+            );
+            base.security = security.clone();
+            base.subjects.clone_from(&subjects);
+            base.subjects_state = subjects_state;
+            base.provenance = provenance.clone();
+            base
+        },
+        |view| view.base.clone(),
+    );
+    view_base.updated_at = now;
+    view_base.deleted_at = None;
+    view_base.security.clone_from(&security);
+    view_base.subjects.clone_from(&subjects);
+    view_base.subjects_state = subjects_state;
+    view_base.provenance.clone_from(&provenance);
+
+    let state = draft.freshness.state;
+    let state_reason = projection_state_reason(&draft.freshness);
+    let view = KnowledgeView {
+        base: view_base,
+        key,
+        kind: KnowledgeViewKind::Entity,
+        surface: KnowledgeViewSurface::Inspector,
+        publication_status: KnowledgeViewPublicationStatus::Published,
+        root_record: entity_id.to_string(),
+        title: material.entity.display_name.clone(),
+        slug: entity_slug(&material.entity),
+        security_fingerprint: material.security_fingerprint.clone(),
+        current_revision: Some(revision_id.to_string()),
+        revision_count: revision_number,
+        state,
+        state_reason,
+        published_at: Some(now),
+    };
+
+    let mut revision_base = BaseFields::new(
+        revision_id,
+        space_id.to_string(),
+        ENTITY_COMPILER_NAME.to_string(),
+    );
+    revision_base.security = security;
+    revision_base.subjects = subjects;
+    revision_base.subjects_state = subjects_state;
+    revision_base.provenance = provenance;
+    let revision = KnowledgeViewRevision {
+        base: revision_base,
+        view_id: view.base.id.to_string(),
+        revision: revision_number,
+        kind: KnowledgeViewKind::Entity,
+        root_record: entity_id.to_string(),
+        blocks: draft.blocks,
+        rendered_markdown: draft.rendered_markdown,
+        citations: draft.citations,
+        dependencies: draft.dependencies,
+        freshness: draft.freshness,
+        validation: draft.validation,
+        compiler: CompilerReceipt {
+            compiler: ENTITY_COMPILER_NAME.to_string(),
+            version: ENTITY_COMPILER_VERSION,
+            dependency_hash: draft.dependency_hash,
+            policy_fingerprint: material.security_fingerprint,
+        },
+        compiled_at: now,
+        supersedes: existing.and_then(|view| view.current_revision),
+    };
+    CompiledEntityView {
+        view,
+        revision,
+        changed: true,
     }
 }
 
@@ -1158,20 +1360,6 @@ fn overview_markdown(entity: &Entity, citation: &str) -> String {
     overview
 }
 
-fn reusable_current_revision(
-    view: &KnowledgeView,
-    revision: &KnowledgeViewRevision,
-    compiler_version: u32,
-) -> bool {
-    let freshness_due = revision
-        .freshness
-        .valid_until
-        .is_some_and(|deadline| deadline <= Utc::now());
-    view.state != ProjectionState::Dirty
-        && revision.compiler.version == compiler_version
-        && (!freshness_due || revision.freshness.expired_claims > 0)
-}
-
 fn literal_text(value: &elephant_types::records::attribute::Literal) -> String {
     use elephant_types::records::attribute::Literal;
     match value {
@@ -1248,6 +1436,191 @@ fn dedupe_strings(values: Vec<String>) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// Resolve published semantic source content from an exact live source read.
+///
+/// Callers retain both envelopes, and persist only the returned source's
+/// immutable timestamp as the semantic dependency. Their original epoch and
+/// publication authority remain independent guards.
+pub async fn published_source_for_projection(
+    storage: &StorageClient,
+    reader: &elephant_storage::read_eligibility::ReadEligibility,
+    original_raw: &Source,
+    authorize: &elephant_storage::read_eligibility::ReadAuthorization<'_>,
+) -> StorageResult<Source> {
+    let current = Box::pin(
+        elephant_storage::SourceRepository::new(storage.clone())
+            .get(&original_raw.base.space_id, &original_raw.base.id),
+    )
+    .await?;
+    if current.as_ref() != Some(original_raw) {
+        return Err(StorageError::Conflict(
+            "Projection raw source changed during preparation".into(),
+        ));
+    }
+    Box::pin(reader.project(original_raw.clone(), authorize))
+        .await?
+        .ok_or_else(|| {
+            StorageError::Conflict("Projection source is not currently published".into())
+        })
+}
+
+fn extend_projection_sources(
+    provenance: &mut elephant_types::records::base::Provenance,
+    envelopes: &[BaseFields],
+) {
+    for base in envelopes {
+        provenance
+            .sources
+            .extend(base.provenance.sources.iter().cloned());
+        if base.id.table() == TableName::Source {
+            provenance.sources.push(base.id.clone());
+        }
+    }
+    provenance.sources.sort();
+    provenance.sources.dedup();
+}
+
+/// Resolve each cited immutable span through the shared current-read authority.
+/// Parent envelopes contribute both subjects and exact dependency versions;
+/// graph endpoints alone cannot establish the source's subject completeness.
+/// Explicit input lineage also contributes when no span citation was selected.
+#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reader and its captured lineage observations alive until citation dependencies and their hash are assembled."
+)]
+async fn ground_citation_evidence(
+    storage: &StorageClient,
+    space_id: &str,
+    security: &Security,
+    draft: &mut RevisionDraft,
+    compiler_name: &str,
+    compiler_version: u32,
+    source_ids: &[RecordId],
+) -> StorageResult<Vec<BaseFields>> {
+    let reader = elephant_storage::read_eligibility::ReadEligibility::new(storage.clone());
+    let mut envelopes = BTreeMap::new();
+    let mut raw_envelopes = BTreeMap::new();
+    let authorize = |base: &BaseFields| {
+        // Subject requirements are inherited below. The fixed partition must
+        // already cover both the current and published parent policies.
+        let mut output = base.clone();
+        output.security = security.clone();
+        base.space_id == space_id && projection_envelope_covers(&output, base)
+    };
+    for citation in &draft.citations {
+        let Some(span) = &citation.evidence_span else {
+            continue;
+        };
+        let evidence = Box::pin(reader.evidence(space_id, span, &authorize))
+            .await?
+            .ok_or_else(|| {
+                StorageError::Conflict(
+                    "Projection citation has invalid or out-of-envelope evidence".into(),
+                )
+            })?;
+        let published_source = if let Some(raw) = evidence.source.as_ref() {
+            let published = Box::pin(published_source_for_projection(
+                storage, &reader, raw, &authorize,
+            ))
+            .await?;
+            if raw_envelopes
+                .insert(raw.base.id.clone(), raw.base.clone())
+                .is_some_and(|previous| previous != raw.base)
+            {
+                return Err(StorageError::Conflict(
+                    "Projection raw source envelope changed during preparation".into(),
+                ));
+            }
+            Some(published)
+        } else {
+            None
+        };
+        for base in std::iter::once(evidence.revision.base)
+            .chain(std::iter::once(evidence.doc.base))
+            .chain(published_source.map(|source| source.base))
+            .chain(evidence.node.map(|node| node.base))
+        {
+            if envelopes
+                .insert(base.id.to_string(), base.clone())
+                .is_some_and(|previous| previous != base)
+            {
+                return Err(StorageError::Conflict(
+                    "Projection evidence envelope changed during preparation".into(),
+                ));
+            }
+        }
+    }
+    for source_id in source_ids {
+        if source_id.table() != TableName::Source {
+            return Err(StorageError::Conflict(
+                "Projection input lineage must name a Source".into(),
+            ));
+        }
+        let raw = Box::pin(
+            elephant_storage::SourceRepository::new(storage.clone()).get(space_id, source_id),
+        )
+        .await?
+        .ok_or_else(|| StorageError::Conflict("Projection input Source is absent".into()))?;
+        let published = Box::pin(published_source_for_projection(
+            storage, &reader, &raw, &authorize,
+        ))
+        .await?;
+        if raw_envelopes
+            .insert(raw.base.id.clone(), raw.base.clone())
+            .is_some_and(|previous| previous != raw.base)
+        {
+            return Err(StorageError::Conflict(
+                "Projection raw source envelope changed during preparation".into(),
+            ));
+        }
+        if envelopes
+            .insert(published.base.id.to_string(), published.base.clone())
+            .is_some_and(|previous| previous != published.base)
+        {
+            return Err(StorageError::Conflict(
+                "Projection published source envelope changed during preparation".into(),
+            ));
+        }
+    }
+    Box::pin(reader.verify_current()).await?;
+    let mut dependencies = draft
+        .dependencies
+        .iter()
+        .cloned()
+        .map(|dependency| (dependency.record_id.clone(), dependency))
+        .collect::<BTreeMap<_, _>>();
+    for base in envelopes.values() {
+        if dependencies
+            .get(&base.id.to_string())
+            .and_then(|dependency| dependency.observed_updated_at)
+            .is_some_and(|observed| observed != base.updated_at)
+        {
+            return Err(StorageError::Conflict(
+                "Projection evidence dependency changed during preparation".into(),
+            ));
+        }
+        add_dependency(
+            &mut dependencies,
+            &base.id,
+            base.id.table().as_str(),
+            "evidence_lineage",
+            Some(base.updated_at),
+        );
+    }
+    draft.dependencies = dependencies.into_values().collect();
+    draft.dependency_hash = dependency_hash(
+        &draft.dependencies,
+        &security_fingerprint(security)?,
+        compiler_name,
+        compiler_version,
+    )?;
+    Ok(envelopes
+        .into_values()
+        .chain(raw_envelopes.into_values())
+        .collect())
 }
 
 /// Combined authorization requirements of every record contributing to a view.
@@ -1470,6 +1843,109 @@ mod tests {
     use elephant_types::records::base::BaseFields;
     use elephant_types::records::{ClaimStatus, EntityStatus, EntityType};
 
+    #[test]
+    fn entity_compilation_phases_do_not_retain_selection_state() {
+        fn bytes<A, F: std::future::Future>(_: impl FnOnce(A) -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        let join = bytes(
+            |(compiler, entity): (&'static EntityViewCompiler, &'static RecordId)| {
+                compiler.compile("space", entity, EntityViewLimits::default(), true)
+            },
+        );
+        let material = bytes(
+            |(compiler, entity): (&'static EntityViewCompiler, &'static RecordId)| {
+                compiler.prepare_material("space", entity, EntityViewLimits::default())
+            },
+        );
+        let revision = bytes(
+            |(compiler, entity, inputs): (
+                &'static EntityViewCompiler,
+                &'static RecordId,
+                Box<EntityViewInputs>,
+            )| {
+                compiler.prepare_revision("space", entity, true, "original-epoch", inputs)
+            },
+        );
+        // Stored-state controls, not a compiled-frame or runtime-stack proof.
+        // The original mixed-source erasure scenario keeps its full assertions.
+        assert!(join <= 16 * 1024, "entity phase join is {join} bytes");
+        assert!(material <= 32 * 1024, "entity material is {material} bytes");
+        assert!(revision <= 32 * 1024, "entity revision is {revision} bytes");
+    }
+
+    #[test]
+    fn citation_grounding_child_future_types_are_bounded() {
+        fn bytes<A, F: std::future::Future>(_: impl FnOnce(A) -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        // Inspect the actual private futures without constructing a backend,
+        // evidence row or runtime. Original evidence regressions remain the
+        // behavioral oracle; object size does not bound nested poll frames.
+        let phases = [
+            (
+                "citation grounding",
+                bytes(
+                    |(storage, security, draft): (
+                        &'static StorageClient,
+                        &'static Security,
+                        &'static mut RevisionDraft,
+                    )| {
+                        ground_citation_evidence(
+                            storage,
+                            "space",
+                            security,
+                            draft,
+                            "fixture",
+                            1,
+                            &[],
+                        )
+                    },
+                ),
+            ),
+            (
+                "published source",
+                bytes(
+                    |(storage, reader, raw, authorize): (
+                        &'static StorageClient,
+                        &'static elephant_storage::read_eligibility::ReadEligibility,
+                        &'static Source,
+                        &'static elephant_storage::read_eligibility::ReadAuthorization<'static>,
+                    )| {
+                        published_source_for_projection(storage, reader, raw, authorize)
+                    },
+                ),
+            ),
+        ];
+        for (phase, size) in phases {
+            assert!(size <= 32 * 1024, "{phase} future is {size} bytes");
+        }
+    }
+
+    #[expect(
+        clippy::redundant_pub_crate,
+        reason = "Keep the explicit crate-only boundary of the fixture shared with sibling test modules."
+    )]
+    pub(crate) async fn register_space(storage: &StorageClient) {
+        let mut value = serde_json::to_value(BaseFields::new(
+            RecordId::new_v4(TableName::SpaceConfig),
+            "space".into(),
+            "fixture".into(),
+        ))
+        .expect("space fields");
+        value["embedding_provider"] = serde_json::json!("not-dispatched");
+        value["embedding_model"] = serde_json::json!("fixture");
+        value["embedding_dims"] = serde_json::json!(8);
+        value["processing"] = serde_json::Value::Null;
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(
+                serde_json::from_value::<elephant_types::records::SpaceConfig>(value)
+                    .expect("space config"),
+            )
+            .await
+            .expect("register fixture space");
+    }
+
     fn entity(name: &str) -> Entity {
         Entity {
             base: BaseFields::new(
@@ -1516,20 +1992,76 @@ mod tests {
     }
 
     #[test]
+    fn projection_envelope_requires_full_policy_subject_and_handling_lineage() {
+        let mut input = entity("evidence").base;
+        input.subjects = vec![Link::new(RecordId::new_v4(TableName::Entity))];
+        input.subjects_state = SubjectsState::Partial;
+        input.security.policy_id = "family-policy".into();
+        input.security.level = 2;
+        input.security.labels = vec!["family".into(), "health".into()];
+        input.security.handling = vec!["restricted".into()];
+        let mut output = input.clone();
+        output.id = RecordId::new_v4(TableName::KnowledgeViewRevision);
+        output.subjects_state = SubjectsState::Unknown;
+        output.security.level = 3;
+        output.security.labels.reverse();
+        assert!(projection_envelope_covers(&output, &input));
+        for field in [
+            "policy",
+            "level",
+            "label",
+            "handling",
+            "subject",
+            "completeness",
+            "grant",
+        ] {
+            let mut invalid = output.clone();
+            match field {
+                "policy" => invalid.security.policy_id = "default".into(),
+                "level" => invalid.security.level = 1,
+                "label" => invalid.security.labels.clear(),
+                "handling" => invalid.security.handling.clear(),
+                "subject" => invalid.subjects.clear(),
+                "completeness" => invalid.subjects_state = SubjectsState::Complete,
+                "grant" => invalid
+                    .security
+                    .handling
+                    .push("handling:subjectless_ok".into()),
+                _ => unreachable!(),
+            }
+            assert!(
+                !projection_envelope_covers(&invalid, &input),
+                "widened {field}"
+            );
+        }
+        input.subjects_state = SubjectsState::Unknown;
+        output.subjects_state = SubjectsState::Partial;
+        assert!(!projection_envelope_covers(&output, &input));
+    }
+
+    #[test]
     fn old_projection_subject_contract_is_rejected() {
-        let mut base = entity("root").base;
-        base.provenance.extractor = Some(Extractor {
-            name: Some(ENTITY_COMPILER_NAME.to_string()),
-            version: Some((ENTITY_COMPILER_VERSION - 1).to_string()),
-            model: None,
-        });
-        assert!(!has_complete_subject_contract(&base));
-        base.provenance
-            .extractor
-            .as_mut()
-            .expect("extractor")
-            .version = Some(ENTITY_COMPILER_VERSION.to_string());
-        assert!(has_complete_subject_contract(&base));
+        for (name, version) in [
+            (ENTITY_COMPILER_NAME, ENTITY_COMPILER_VERSION),
+            (
+                graph_views::GRAPH_COMPILER_NAME,
+                graph_views::GRAPH_COMPILER_VERSION,
+            ),
+        ] {
+            let mut base = entity("root").base;
+            base.provenance.extractor = Some(Extractor {
+                name: Some(name.to_string()),
+                version: Some((version - 1).to_string()),
+                model: None,
+            });
+            assert!(!has_complete_subject_contract(&base));
+            base.provenance
+                .extractor
+                .as_mut()
+                .expect("extractor")
+                .version = Some(version.to_string());
+            assert!(has_complete_subject_contract(&base));
+        }
     }
 
     #[test]
@@ -1636,10 +2168,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep original entity/relation/compiler ownership through publication, reuse and revision checks."
+    )]
     async fn entity_view_publishes_reuses_and_revises() {
         let storage = StorageClient::new_embedded()
             .await
             .expect("embedded storage");
+        register_space(&storage).await;
         let entities = EntityRepository::new(storage.clone());
         let relations = RelRepository::new(storage.clone());
 
@@ -1733,6 +2270,65 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Preserve original repository/compiler cleanup after all changed and unchanged selection assertions."
+    )]
+    async fn entity_view_recomputes_selection_before_reusing_a_clean_revision() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        register_space(&storage).await;
+        let root = entity("Ada");
+        let target = entity("Analytical Engine");
+        let root_id = root.base.id.clone();
+        let target_id = target.base.id.clone();
+        let entities = EntityRepository::new(storage.clone());
+        entities.create(root).await.expect("root");
+        entities.create(target).await.expect("target");
+        let compiler = EntityViewCompiler::new(storage.clone());
+        let first = compiler
+            .compile("space", &root_id, EntityViewLimits::default(), false)
+            .await
+            .expect("initial view");
+        let new_relation_id = RecordId::new_v4(TableName::Rel);
+        RelRepository::new(storage)
+            .create(Rel {
+                base: BaseFields::new(new_relation_id.clone(), "space".into(), "test".into()),
+                subject: Link::new(root_id.clone()),
+                object: Link::new(target_id),
+                rel_type: "worked_on".into(),
+                status: ClaimStatus::Approved,
+                confidence: 1.0,
+                validity_window: None,
+                evidence: Vec::new(),
+                temporal_audit: None,
+            })
+            .await
+            .expect("new intrinsic authorized relationship");
+        // No explicit dirty notification: the old dependency index never named
+        // this newly inserted row and cannot establish selection completeness.
+        let next = compiler
+            .compile("space", &root_id, EntityViewLimits::default(), false)
+            .await
+            .expect("updated selection");
+        assert!(next.changed);
+        assert_ne!(first.revision.base.id, next.revision.base.id);
+        assert!(next
+            .revision
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.record_id == new_relation_id.to_string()));
+        let same = compiler
+            .compile("space", &root_id, EntityViewLimits::default(), false)
+            .await
+            .expect("unchanged selection");
+        assert!(!same.changed);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep migrated fixture/repository ownership through the original revision and index assertions."
+    )]
     async fn entity_view_round_trips_through_migrated_surreal_store() {
         let storage = StorageClient::new(elephant_storage::StorageConfig {
             url: "mem://".to_string(),
@@ -1744,6 +2340,7 @@ mod tests {
         elephant_migrations::apply_schema(&storage)
             .await
             .expect("schema");
+        register_space(&storage).await;
         let ada = entity("Ada Lovelace");
         let ada_id = ada.base.id.clone();
         EntityRepository::new(storage.clone())
@@ -1771,4 +2368,5 @@ mod tests {
             .expect("load dependency indexes");
         assert_eq!(indexes.len(), loaded.dependencies.len());
     }
+    include!("projection_epoch_counterexamples.rs");
 }

@@ -1,0 +1,82 @@
+{
+  "format": "recall-public-graph-fixture/v1",
+  "source_request": {
+    "source": {
+      "id": "source:d665b0db-2cf7-5356-9b44-7032743f395d",
+      "space_id": "default",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "default",
+        "level": 0,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "type": "manual",
+      "hash": "2f3d4ef4c87a7298e1dc9cd129a9be0be7323468a0fc181a93d76baf1f0e6972",
+      "external_id": "boundary/graph-positive",
+      "uri": "https://example.invalid/recall-graph/boundary/graph-positive",
+      "metadata": {}
+    },
+    "doc": {
+      "id": "doc:e55d980c-c8c8-59f2-a8cf-556d57c1fab6",
+      "space_id": "default",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "default",
+        "level": 0,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "title": "boundary/graph-positive",
+      "text": "Mira maintains the Boundary positive notebook.",
+      "source": null,
+      "sidecar_text": null,
+      "media_attachments": [],
+      "rendition_key": "d28/text/boundary/graph-positive/boundary-graph-r1",
+      "metadata": {}
+    },
+    "ingest_mode": "graph",
+    "intake": {
+      "revision_id": "boundary-graph-r1",
+      "idempotency_key": "literal-00b907f5cc539fdaf2ec9c81b68d87e5a2a06bc0585a05630e6bd44832153d7c"
+    }
+  },
+  "rendered_text": "Mira maintains the Boundary positive notebook.\n",
+  "rendered_sha256": "541d33830d5ad35a919fe2a3ebcaacec277551b1d78353997929b34a60c5b314",
+  "expected_assertions": [
+    {
+      "subject_text": "Mira",
+      "predicate_raw": "maintains",
+      "object_text": "Boundary positive notebook",
+      "object_literal": null,
+      "subject_entity_type": "person",
+      "object_entity_type": "document",
+      "confidence": 1.0,
+      "significance": "medium",
+      "source_event_time": null,
+      "start": 0,
+      "end": 46,
+      "quote": "Mira maintains the Boundary positive notebook.",
+      "quote_hash": "2f3d4ef4c87a7298e1dc9cd129a9be0be7323468a0fc181a93d76baf1f0e6972"
+    }
+  ],
+  "extract_rule_id": "container-positive-extract"
+}

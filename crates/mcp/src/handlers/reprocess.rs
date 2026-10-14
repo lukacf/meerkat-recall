@@ -9,16 +9,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+#[cfg(test)]
 use elephant_pipeline::reprocess::WORK_KIND_EXECUTE_REPROCESS_JOB;
-use elephant_storage::{
-    parse_id, Repository, ReprocessJobRepository, StorageClient, WorkItemRepository,
-};
+use elephant_storage::{parse_id, Repository, ReprocessJobRepository, StorageClient};
 use elephant_types::ids::{RecordId, TableName};
 use elephant_types::records::base::BaseFields;
 use elephant_types::records::reprocess::{
     ReprocessJob, ReprocessProgress, ReprocessStatus, ReprocessTargetStage, SelectionCriteria,
 };
-use elephant_types::records::work::{WorkItem, WorkItemStatus};
 
 use crate::coercion::coerce_params;
 use crate::error::{McpError, McpResult};
@@ -213,24 +211,40 @@ impl ToolHandler for CreateReprocessJobHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        let space_id = ctx.principal.space_id.clone();
-        if space_id.is_empty() {
-            let response: ToolResponse<()> = ToolResponse::error("Access denied: missing space_id");
+        if let Err(message) = crate::authz::authorize_preflight_scope(
+            &ctx.authz,
+            &ctx.principal,
+            "write:reprocess_job",
+        ) {
+            let response: ToolResponse<()> = ToolResponse::error(message);
             return serde_json::to_value(response)
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
-
-        // Parse dates if provided
-        let date_from = input
-            .selection_criteria
-            .date_from
-            .as_deref()
-            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
-        let date_to = input
-            .selection_criteria
-            .date_to
-            .as_deref()
-            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+        let space_id = ctx.principal.space_id.clone();
+        let parse_date = |value: Option<&str>| {
+            value
+                .map(|date| {
+                    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|error| {
+                        McpError::InvalidParameters(format!("Invalid selection date: {error}"))
+                    })
+                })
+                .transpose()
+        };
+        let date_from = parse_date(input.selection_criteria.date_from.as_deref())?;
+        let date_to = parse_date(input.selection_criteria.date_to.as_deref())?;
+        if date_from.zip(date_to).is_some_and(|(from, to)| from > to) {
+            return Err(McpError::InvalidParameters(
+                "date_from must not follow date_to".into(),
+            ));
+        }
+        if input
+            .budget_limit_euros
+            .is_some_and(|amount| !amount.is_finite() || amount < 0.0)
+        {
+            return Err(McpError::InvalidParameters(
+                "budget_limit_euros must be finite and nonnegative".into(),
+            ));
+        }
 
         // Create the selection criteria
         let selection_criteria = SelectionCriteria {
@@ -264,39 +278,24 @@ impl ToolHandler for CreateReprocessJobHandler {
             reason: input.reason,
         };
 
-        match self.repo.create(job).await {
-            Ok(created) => {
-                let work_item_repo = WorkItemRepository::new(ctx.storage.clone());
-                let idempotency_key =
-                    format!("{WORK_KIND_EXECUTE_REPROCESS_JOB}:{}", created.base.id);
-                let existing = work_item_repo
-                    .find_by_idempotency_key(&space_id, &idempotency_key)
-                    .await
-                    .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-                if existing.is_none() {
-                    let work_item = WorkItem {
-                        base: BaseFields::new(
-                            RecordId::new_v4(TableName::WorkItem),
-                            space_id.clone(),
-                            "mcp_tool".to_string(),
-                        ),
-                        kind: WORK_KIND_EXECUTE_REPROCESS_JOB.to_string(),
-                        payload: json!({ "job_id": created.base.id.to_string() }),
-                        status: WorkItemStatus::Runnable,
-                        priority: created.priority,
-                        idempotency_key,
-                        attempts: 0,
-                        lease_expires_at: None,
-                        leased_by: None,
-                        run_after: None,
-                        last_error: None,
-                    };
-                    work_item_repo
-                        .create(work_item)
-                        .await
-                        .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-                }
+        // Resolve the new job's envelope from the actual selected space before
+        // authorizing it. The owner rechecks that exact configuration alongside
+        // the job, original producer and initial queue insertion.
+        let prepared = self.repo.prepare_creation(job).await?;
 
+        if let Err(message) = ctx.authz.authorize_record_write(
+            &ctx.principal,
+            &prepared.job().base,
+            "write:reprocess_job",
+        ) {
+            let response: ToolResponse<()> = ToolResponse::error(message);
+            return serde_json::to_value(response)
+                .map_err(|e| McpError::ExecutionError(e.to_string()));
+        }
+        // The durable job and its deterministic initial handoff share the
+        // storage owner's transaction. No success with a stranded job.
+        match self.repo.create_prepared_with_work(prepared).await {
+            Ok(created) => {
                 let response = ToolResponse::success(json!({
                     "id": created.base.id.to_string(),
                     "name": created.name,
@@ -304,7 +303,7 @@ impl ToolHandler for CreateReprocessJobHandler {
                 }));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
@@ -366,8 +365,26 @@ impl ToolHandler for GetReprocessJobProgressHandler {
         let rid = parse_id(&input.id, TableName::ReprocessJob)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
 
+        if let Err(message) = crate::authz::authorize_preflight_scope(
+            &ctx.authz,
+            &ctx.principal,
+            "read:reprocess_job",
+        ) {
+            let response: ToolResponse<()> = ToolResponse::error(message);
+            return serde_json::to_value(response)
+                .map_err(|e| McpError::ExecutionError(e.to_string()));
+        }
+
         match self.repo.get(&space_id, &rid).await {
             Ok(Some(job)) => {
+                if let Err(message) =
+                    ctx.authz
+                        .authorize_record_read(&ctx.principal, &job.base, "read:reprocess_job")
+                {
+                    let response: ToolResponse<()> = ToolResponse::error(message);
+                    return serde_json::to_value(response)
+                        .map_err(|e| McpError::ExecutionError(e.to_string()));
+                }
                 let output = ReprocessJobProgressOutput {
                     id: job.base.id.to_string(),
                     name: job.name,
@@ -385,7 +402,7 @@ impl ToolHandler for GetReprocessJobProgressHandler {
                     ToolResponse::error(format!("Reprocess job not found: {}", input.id));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
@@ -408,35 +425,163 @@ mod tests {
     )]
     use super::*;
     use elephant_policy::Principal;
-    use elephant_storage::{StorageConfig, WorkItemRepository};
+    use elephant_storage::WorkItemRepository;
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    const REPROCESS_SCHEMA: &str = "DEFINE TABLE reprocess_job SCHEMALESS;";
-    const WORK_ITEM_SCHEMA: &str = "DEFINE TABLE work_item SCHEMALESS;";
 
     fn make_test_principal(space_id: &str) -> Principal {
         Principal {
             space_id: space_id.to_string(),
-            scopes: HashSet::new(),
-            clearances: Vec::new(),
+            scopes: HashSet::from(["write:reprocess_job".into(), "read:reprocess_job".into()]),
+            clearances: vec![elephant_policy::Clearance {
+                policy_id: "default".into(),
+                max_level: 0,
+                labels: HashSet::new(),
+                handling_allow: HashSet::new(),
+            }],
             subject_allowlist: None,
             purpose: HashSet::new(),
         }
     }
 
     async fn setup_test_storage() -> StorageClient {
-        static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(99400);
-        let db_id = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        setup_test_storage_with_base(BaseFields::new(
+            RecordId::new_v4(TableName::SpaceConfig),
+            "test_space".into(),
+            "test".into(),
+        ))
+        .await
+    }
 
-        let config = StorageConfig {
-            database: format!("mcp_reprocess_test_{db_id}"),
-            ..StorageConfig::default()
-        };
-        let storage = StorageClient::new(config).await.expect("storage");
-        storage.query(REPROCESS_SCHEMA).await.expect("schema");
-        storage.query(WORK_ITEM_SCHEMA).await.expect("schema");
+    async fn setup_test_storage_with_base(base: BaseFields) -> StorageClient {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base,
+                embedding_provider: "unconfigured".into(),
+                embedding_model: "unconfigured".into(),
+                embedding_dims: 1,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .expect("explicit selected space configuration");
         storage
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn classified_space_creates_and_reads_jobs_without_unrelated_default_clearance() {
+        for level in [3, 7] {
+            let policy = format!("classified-{level}");
+            let mut base = BaseFields::new(
+                RecordId::new_v4(TableName::SpaceConfig),
+                "test_space".into(),
+                "test".into(),
+            );
+            base.security.policy_id = policy.clone();
+            base.security.level = level;
+            base.security.labels = vec!["private".into()];
+            base.security.handling = vec!["no-export".into()];
+            base.subjects = vec![elephant_types::Link::new(RecordId::new_v4(
+                TableName::Entity,
+            ))];
+            base.subjects_state = elephant_types::records::SubjectsState::Complete;
+            // The envelope is original fixture authority. Repository updates
+            // deliberately cannot reclassify an existing authorized config.
+            let storage = setup_test_storage_with_base(base).await;
+            let config = elephant_storage::SpaceConfigRepository::new(storage.clone())
+                .get_by_space_id("test_space")
+                .await
+                .unwrap()
+                .unwrap();
+            let mut principal = make_test_principal("test_space");
+            principal.clearances = vec![elephant_policy::Clearance {
+                policy_id: policy,
+                max_level: level,
+                labels: HashSet::from(["private".into()]),
+                handling_allow: HashSet::from(["no-export".into()]),
+            }];
+            let context = ToolContext::new(storage.clone(), principal.clone());
+            let params = json!({"name":"classified job", "selection_criteria":{}, "target_stages":["re-maintain"]});
+            let result = CreateReprocessJobHandler::new(storage.clone())
+                .execute(&context, params.clone())
+                .await
+                .unwrap();
+            assert_eq!(result["ok"], true, "{result}");
+            let id = parse_id(
+                result["data"]["id"].as_str().unwrap(),
+                TableName::ReprocessJob,
+            )
+            .unwrap();
+            let jobs = ReprocessJobRepository::new(storage.clone());
+            let job = jobs.get("test_space", &id).await.unwrap().unwrap();
+            assert_eq!(job.base.security, config.base.security);
+            assert_eq!(job.base.subjects, config.base.subjects);
+            assert_eq!(job.base.subjects_state, config.base.subjects_state);
+            let work = WorkItemRepository::new(storage.clone())
+                .find_by_idempotency_key(
+                    "test_space",
+                    &format!("{WORK_KIND_EXECUTE_REPROCESS_JOB}:{id}"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(work.base.security, job.base.security);
+            assert_eq!(work.base.subjects, job.base.subjects);
+            let progress = GetReprocessJobProgressHandler::new(storage.clone())
+                .execute(&context, json!({"id": id.to_string()}))
+                .await
+                .unwrap();
+            assert_eq!(progress["ok"], true, "{progress}");
+            assert_eq!(progress["data"]["name"], "classified job");
+
+            // Revoking this principal's clearance cannot expose progress or
+            // create a second job under an unrelated default-policy envelope.
+            principal.clearances.clear();
+            let revoked = ToolContext::new(storage.clone(), principal);
+            let denied = CreateReprocessJobHandler::new(storage.clone())
+                .execute(&revoked, params)
+                .await
+                .unwrap();
+            assert_eq!(denied["ok"], false);
+            let denied = GetReprocessJobProgressHandler::new(storage.clone())
+                .execute(&revoked, json!({"id":id.to_string()}))
+                .await
+                .unwrap();
+            assert_eq!(denied["ok"], false);
+            assert!(!denied.to_string().contains("classified job"));
+            assert_eq!(jobs.list("test_space", 10, None).await.unwrap(), vec![job]);
+            assert_eq!(
+                WorkItemRepository::new(storage)
+                    .list("test_space", 10, None)
+                    .await
+                    .unwrap(),
+                vec![work]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfigured_space_never_creates_a_default_policy_job_or_handoff() {
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let context = ToolContext::new(storage.clone(), make_test_principal("test_space"));
+        assert!(CreateReprocessJobHandler::new(storage.clone()).execute(&context, json!({
+            "name":"missing configuration", "selection_criteria":{}, "target_stages":["re-maintain"]
+        })).await.is_err());
+        assert!(ReprocessJobRepository::new(storage.clone())
+            .list("test_space", 10, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(WorkItemRepository::new(storage)
+            .list("test_space", 10, None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -454,6 +599,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_create_reprocess_job_enqueues_work_item() {
         let storage = setup_test_storage().await;
         let principal = make_test_principal("test_space");
@@ -486,5 +635,100 @@ mod tests {
             .expect("find work item");
 
         assert!(item.is_some(), "reprocess work item should be enqueued");
+    }
+    #[tokio::test]
+    async fn create_requires_write_scope_and_complete_job_abac_before_allocation() {
+        for restricted in [false, true] {
+            let storage = setup_test_storage().await;
+            let mut principal = make_test_principal("test_space");
+            if restricted {
+                principal.subject_allowlist =
+                    Some(HashSet::from([RecordId::new_v4(TableName::Entity)]));
+            } else {
+                principal.scopes.clear();
+            }
+            let ctx = ToolContext::new(storage.clone(), principal);
+            let result = CreateReprocessJobHandler::new(storage.clone())
+                .execute(
+                    &ctx,
+                    json!({
+                        "name":"denied", "selection_criteria":{}, "target_stages":["re-extract"]
+                    }),
+                )
+                .await
+                .expect("response");
+            let response: ToolResponse<Value> = serde_json::from_value(result).expect("decode");
+            assert!(!response.ok);
+            assert!(ReprocessJobRepository::new(storage.clone())
+                .list("test_space", 10, None)
+                .await
+                .expect("jobs")
+                .is_empty());
+            assert!(WorkItemRepository::new(storage)
+                .list("test_space", 10, None)
+                .await
+                .expect("work")
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_selection_date_never_broadens_the_job() {
+        let storage = setup_test_storage().await;
+        let ctx = ToolContext::new(storage.clone(), make_test_principal("test_space"));
+        let result = CreateReprocessJobHandler::new(storage.clone()).execute(&ctx, json!({
+            "name":"bad date", "selection_criteria":{"date_from":"invalid"}, "target_stages":["re-extract"]
+        })).await;
+        assert!(matches!(result, Err(McpError::InvalidParameters(_))));
+        assert!(ReprocessJobRepository::new(storage)
+            .list("test_space", 10, None)
+            .await
+            .expect("jobs")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::if_not_else,
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn progress_requires_scope_and_full_job_authority_before_disclosing_details() {
+        let storage = setup_test_storage().await;
+        let ctx = ToolContext::new(storage.clone(), make_test_principal("test_space"));
+        let created = CreateReprocessJobHandler::new(storage.clone()).execute(&ctx, json!({
+            "name":"private job detail", "selection_criteria":{}, "target_stages":["re-maintain"]
+        })).await.unwrap();
+        let id = created["data"]["id"].as_str().unwrap();
+        let id = parse_id(id, TableName::ReprocessJob).unwrap();
+        let repo = ReprocessJobRepository::new(storage.clone());
+        let mut job = repo.get("test_space", &id).await.unwrap().unwrap();
+        job.base.security.level = 2;
+        job.error = Some("private failure detail".into());
+        repo.update("test_space", &id, job).await.unwrap();
+        let handler = GetReprocessJobProgressHandler::new(storage.clone());
+        for mode in 0..3 {
+            let mut principal = make_test_principal("test_space");
+            if mode != 1 {
+                principal.clearances[0].max_level = 2;
+            }
+            if mode == 0 {
+                principal.scopes.clear();
+            }
+            let context = ToolContext::new(storage.clone(), principal);
+            let output = handler
+                .execute(&context, json!({"id":id.to_string()}))
+                .await
+                .unwrap();
+            let response: ToolResponse<Value> = serde_json::from_value(output.clone()).unwrap();
+            assert_eq!(response.ok, mode == 2);
+            if mode != 2 {
+                assert!(!output.to_string().contains("private job detail"));
+                assert!(!output.to_string().contains("private failure detail"));
+                assert!(response.data.is_none());
+            } else {
+                assert_eq!(response.data.unwrap()["name"], "private job detail");
+            }
+        }
     }
 }

@@ -15,6 +15,16 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
+mod durable_commit;
+mod erasure_guard;
+#[cfg(test)]
+mod erasure_guard_tests;
+pub use durable_commit::KernelMutation;
+pub use erasure_guard::ReferenceTokenNormalizer;
+mod index_generation;
+#[cfg(test)]
+mod publication_tests;
+
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
@@ -40,7 +50,7 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, ElephantDbError>;
 
 /// Storage-kernel error.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ElephantDbError {
     /// Serialization or deserialization failure.
     #[error("serialization error: {0}")]
@@ -51,6 +61,9 @@ pub enum ElephantDbError {
     /// Duplicate record or unique conflict.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// The original erasure intent temporarily owns admission in this space.
+    #[error("Source erasure is in progress; retry after cleanup")]
+    ErasureInProgress,
     /// Invalid or unsupported snapshot payload.
     #[error("snapshot error: {0}")]
     Snapshot(String),
@@ -147,6 +160,7 @@ struct ElephantDbState {
     tables: HashMap<TableName, HashMap<RecordId, serde_json::Value>>,
     extension_tables: HashMap<String, HashMap<String, serde_json::Value>>,
     indexes: IndexState,
+    reference_guard: Option<erasure_guard::RuntimeReferenceGuard>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -248,11 +262,110 @@ pub struct ElephantDb {
     state: RwLock<ElephantDbState>,
 }
 
+/// Tables whose mutations can change canonical preparation reads or selectors.
+/// Queue leases and outbox delivery do not alter semantic planning inputs.
+#[must_use]
+pub const fn fences_canonical_reads(table: TableName) -> bool {
+    !matches!(
+        table,
+        TableName::WorkItem
+            | TableName::WorkItemArchive
+            | TableName::WorkEdge
+            | TableName::WorkRun
+            | TableName::WorkRunArchive
+            | TableName::WorkArtifact
+            | TableName::WorkDeadletter
+            | TableName::SystemEvent
+            | TableName::CostLedgerDaily
+            | TableName::AuditLog
+    )
+}
+
+/// Saved reprocessing selections are canonical admission inputs even though
+/// ordinary extraction staging artifacts intentionally do not invalidate plans.
+fn fences_canonical_row(table: TableName, row: &serde_json::Value) -> bool {
+    fences_canonical_reads(table)
+        || (table == TableName::WorkArtifact
+            && matches!(
+                row.get("artifact_type").and_then(serde_json::Value::as_str),
+                Some("reprocess_selection/v1" | "reprocess_source_intent/v1")
+            ))
+}
+
+fn fences_canonical_extension_reads(table: &str) -> bool {
+    // Unknown extension tables may participate in declared identity selectors.
+    // Only bookkeeping with separate exact fences is excluded. Never recurse.
+    !matches!(
+        table,
+        "canonical_epoch"
+            | "work_attempt"
+            | "outbox_checkpoint"
+            | "provider_call_receipt"
+            | "source_operation"
+            | "source_commit_receipt"
+            | "source_decision_sequence"
+            | "source_erasure_files"
+            | "source_erasure_guard"
+            | "source_erasure_membership"
+    )
+}
+
+fn fences_canonical_extension_change(
+    table: &str,
+    before: Option<&serde_json::Value>,
+    after: Option<&serde_json::Value>,
+) -> bool {
+    if table != "work_producer_origin" {
+        return fences_canonical_extension_reads(table);
+    }
+    let Some(before) = before else {
+        return false;
+    };
+    let Some(after) = after else {
+        return true;
+    };
+    let semantic = |value: &serde_json::Value| {
+        let mut value = value.clone();
+        if let Some(fields) = value.as_object_mut() {
+            fields.remove("read_nonce");
+        }
+        value
+    };
+    semantic(before) != semantic(after)
+}
+
+fn checks_extension_erasure_refs(table: &str) -> bool {
+    !matches!(
+        table,
+        "canonical_epoch"
+            | "source_head"
+            | "source_identity"
+            | "source_authorization"
+            | "source_operation"
+            | "source_tombstone_ref"
+            | "source_erasure_files"
+            | "source_erasure_guard"
+            | "source_erasure_membership"
+            | "source_decision_sequence"
+    )
+}
+
+fn canonical_epoch_row(space_id: &str) -> (String, serde_json::Value) {
+    let key = format!("canonical_epoch:{space_id}");
+    let epoch = RecordId::new_v4(TableName::Source).id().to_string();
+    (
+        key.clone(),
+        serde_json::json!({"id": key, "space_id": space_id, "epoch": epoch}),
+    )
+}
+
 /// Mutable transaction view over the kernel.
 pub struct ElephantDbTx<'a> {
     state: &'a mut ElephantDbState,
     dirty_tables: HashSet<TableName>,
     undo_log: Vec<UndoEntry>,
+    reference_permit: Option<String>,
+    erasure_failure: Option<ElephantDbError>,
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +450,36 @@ impl ElephantDb {
         Ok(db)
     }
 
+    /// Loads a private, identity-verified live checkpoint during exclusive recovery.
+    /// Running work is preserved for lease recovery; ordinary backup imports remain guarded.
+    pub fn from_recovery_snapshot_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::from_recovery_snapshot_bytes_with_options(bytes, SnapshotImportOptions::default())
+    }
+
+    /// Loads a trusted live checkpoint using explicit index rebuild options.
+    pub fn from_recovery_snapshot_bytes_with_options(
+        bytes: &[u8],
+        options: SnapshotImportOptions,
+    ) -> Result<Self> {
+        let db = Self::new();
+        db.import_snapshot_bytes_internal(bytes, options, true)?;
+        Ok(db)
+    }
+
+    /// Installs runtime-only reference normalization from the storage adapter.
+    /// The private key remains inside the adapter and never enters snapshots.
+    pub fn install_reference_token_normalizer(
+        &self,
+        normalizer: std::sync::Arc<dyn ReferenceTokenNormalizer>,
+    ) -> Result<()> {
+        let guard = erasure_guard::RuntimeReferenceGuard(normalizer);
+        let mut state = self.write_state();
+        guard.validate_anchors(&state)?;
+        state.reference_guard = Some(guard);
+        drop(state);
+        Ok(())
+    }
+
     /// Returns nonempty persisted tables and derived vector partition names.
     pub fn table_names(&self) -> Result<Vec<String>> {
         let state = self.read_state();
@@ -362,6 +505,16 @@ impl ElephantDb {
             .map_err(|err| ElephantDbError::Serialization(err.to_string()))
     }
 
+    /// Exports an ordinary backup without private erasure membership tokens.
+    /// The anchor/count remain so importing without independent journal replay
+    /// cannot admit writes. Private live checkpoints use `export_snapshot_bytes`.
+    pub fn export_backup_snapshot_bytes(&self) -> Result<Vec<u8>> {
+        let mut payload = self.read_state().snapshot_payload();
+        payload.tables.remove("source_erasure_membership");
+        serde_json::to_vec_pretty(&payload)
+            .map_err(|error| ElephantDbError::Serialization(error.to_string()))
+    }
+
     /// Writes a snapshot to an arbitrary writer.
     pub fn export_snapshot_to_writer<W>(&self, mut writer: W) -> Result<()>
     where
@@ -383,6 +536,15 @@ impl ElephantDb {
         &self,
         bytes: &[u8],
         options: SnapshotImportOptions,
+    ) -> Result<()> {
+        self.import_snapshot_bytes_internal(bytes, options, false)
+    }
+
+    fn import_snapshot_bytes_internal(
+        &self,
+        bytes: &[u8],
+        options: SnapshotImportOptions,
+        allow_running: bool,
     ) -> Result<()> {
         let payload: SnapshotPayload = serde_json::from_slice(bytes)
             .map_err(|err| ElephantDbError::Snapshot(err.to_string()))?;
@@ -433,11 +595,14 @@ impl ElephantDb {
             extension_tables,
             ..ElephantDbState::default()
         };
-        state.ensure_no_running_work_items()?;
+        if !allow_running {
+            state.ensure_no_running_work_items()?;
+        }
         state.validate_unique_constraints()?;
         state.rebuild_all_indexes_with_options(options.rebuild_vector_indexes)?;
 
         let mut guard = self.write_state();
+        state.reference_guard.clone_from(&guard.reference_guard);
         *guard = state;
         drop(guard);
         Ok(())
@@ -445,9 +610,10 @@ impl ElephantDb {
 
     /// Imports a pre-validated snapshot kernel, replacing the live state.
     pub fn import_snapshot_db(&self, snapshot: Self) -> Result<()> {
-        let state = snapshot.state.into_inner();
+        let mut state = snapshot.state.into_inner();
         state.ensure_no_running_work_items()?;
         let mut guard = self.write_state();
+        state.reference_guard.clone_from(&guard.reference_guard);
         *guard = state;
         drop(guard);
         Ok(())
@@ -471,11 +637,31 @@ impl ElephantDb {
         F: FnOnce(&mut ElephantDbTx<'_>) -> std::result::Result<R, E>,
         E: From<ElephantDbError>,
     {
+        self.tx_with_commit(f, |_| Ok(()))
+    }
+
+    /// Runs a transaction with a storage-owned durability acknowledgement.
+    /// The callback runs under the write lock after index validation. Returning
+    /// an error rolls back all rows and indexes before any reader sees the write.
+    pub fn tx_with_commit<R, E, F, C>(&self, f: F, commit: C) -> std::result::Result<R, E>
+    where
+        F: FnOnce(&mut ElephantDbTx<'_>) -> std::result::Result<R, E>,
+        E: From<ElephantDbError>,
+        C: FnOnce(&[KernelMutation]) -> std::result::Result<(), E>,
+    {
         let mut guard = self.write_state();
+        // Seal the original journal-qualified maintenance scope once, before
+        // executing any user mutation closure. It cannot change mid-transaction.
+        let reference_permit = guard
+            .reference_guard
+            .as_ref()
+            .and_then(|runtime| runtime.0.erasure_reservation());
         let mut tx = ElephantDbTx {
             state: &mut guard,
             dirty_tables: HashSet::new(),
             undo_log: Vec::new(),
+            reference_permit,
+            erasure_failure: None,
         };
 
         let result = match f(&mut tx) {
@@ -485,6 +671,10 @@ impl ElephantDb {
                 return Err(err);
             }
         };
+        if let Some(error) = tx.erasure_failure.take() {
+            tx.rollback();
+            return Err(E::from(error));
+        }
         let dirty_tables = tx.dirty_tables.clone();
         let revert_tables = dirty_tables.clone();
         let undo_log = tx.undo_log.clone();
@@ -495,6 +685,14 @@ impl ElephantDb {
             drop(guard);
             return Err(E::from(err));
         }
+        let delta = durable_commit::committed_delta(&guard, &undo_log);
+        if !delta.is_empty() {
+            if let Err(error) = commit(&delta) {
+                ElephantDbTx::rollback_state(&mut guard, &undo_log);
+                guard.rebuild_for_tables(&revert_tables).map_err(E::from)?;
+                return Err(error);
+            }
+        }
         drop(guard);
         Ok(result)
     }
@@ -504,7 +702,30 @@ impl ElephantDb {
     where
         T: ElephantDbRecord,
     {
+        let private_fencing = {
+            let state = self.read_state();
+            state.reference_guard.is_some()
+                || state.extension_tables.contains_key("source_erasure_guard")
+        };
+        if private_fencing
+            || matches!(
+                T::TABLE,
+                TableName::Source
+                    | TableName::Doc
+                    | TableName::DocRevision
+                    | TableName::DocNode
+                    | TableName::Entity
+            )
+        {
+            return self.tx(|tx| tx.create(record));
+        }
         let mut state = self.write_state();
+        if state.reference_guard.is_some()
+            || state.extension_tables.contains_key("source_erasure_guard")
+        {
+            drop(state);
+            return self.tx(|tx| tx.create(record));
+        }
         state.create_record(record)
     }
 
@@ -513,7 +734,30 @@ impl ElephantDb {
     where
         T: ElephantDbRecord,
     {
+        let private_fencing = {
+            let state = self.read_state();
+            state.reference_guard.is_some()
+                || state.extension_tables.contains_key("source_erasure_guard")
+        };
+        if private_fencing
+            || matches!(
+                T::TABLE,
+                TableName::Source
+                    | TableName::Doc
+                    | TableName::DocRevision
+                    | TableName::DocNode
+                    | TableName::Entity
+            )
+        {
+            return self.tx(|tx| tx.replace(record));
+        }
         let mut state = self.write_state();
+        if state.reference_guard.is_some()
+            || state.extension_tables.contains_key("source_erasure_guard")
+        {
+            drop(state);
+            return self.tx(|tx| tx.replace(record));
+        }
         state.replace_record(record)
     }
 
@@ -624,8 +868,47 @@ impl ElephantDb {
     where
         T: ElephantDbRecord,
     {
+        let private_fencing = {
+            let state = self.read_state();
+            state.reference_guard.is_some()
+                || state.extension_tables.contains_key("source_erasure_guard")
+        };
+        if private_fencing
+            || matches!(
+                T::TABLE,
+                TableName::Source
+                    | TableName::Doc
+                    | TableName::DocRevision
+                    | TableName::DocNode
+                    | TableName::Entity
+            )
+        {
+            return self.tx(|tx| tx.hard_delete::<T>(space_id, id));
+        }
         let mut state = self.write_state();
+        if state.reference_guard.is_some()
+            || state.extension_tables.contains_key("source_erasure_guard")
+        {
+            drop(state);
+            return self.tx(|tx| tx.hard_delete::<T>(space_id, id));
+        }
         state.hard_delete_record::<T>(space_id, id)
+    }
+
+    /// Reads one physical extension key under the state read lock. The key is
+    /// fully qualified (`table:id`); no space filter or row scan is applied.
+    /// This internal storage observation does not authorize access to its payload.
+    pub fn extension_row_by_key(
+        &self,
+        table_name: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let state = self.read_state();
+        Ok(state
+            .extension_tables
+            .get(table_name)
+            .and_then(|rows| rows.get(key))
+            .cloned())
     }
 
     /// Scans an opaque extension table, returning stable row-key/value pairs.
@@ -635,6 +918,82 @@ impl ElephantDb {
     ) -> Result<Vec<(String, serde_json::Value)>> {
         let state = self.read_state();
         Ok(state.scan_extension_table(table_name))
+    }
+
+    /// Physical typed IDs, including deletion markers, in stable ID order.
+    /// Only bounded IDs are cloned; no unbounded payload snapshot is allocated.
+    pub fn physical_record_ids_page(
+        &self,
+        table: TableName,
+        space: &str,
+        after: Option<&RecordId>,
+        limit: usize,
+    ) -> Result<Vec<RecordId>> {
+        let limit = limit.min(128);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let state = self.read_state();
+        let mut page = std::collections::BTreeSet::new();
+        if let Some(rows) = state.tables.get(&table) {
+            for (id, row) in rows {
+                if after.is_some_and(|cursor| id <= cursor)
+                    || row.get("space_id").and_then(serde_json::Value::as_str) != Some(space)
+                {
+                    continue;
+                }
+                page.insert(id);
+                if page.len() > limit {
+                    page.pop_last();
+                }
+            }
+        }
+        let page = page.into_iter().cloned().collect();
+        drop(state);
+        Ok(page)
+    }
+
+    /// Reads a bounded page of opaque extension rows in stable key order.
+    ///
+    /// Selects at most `min(limit, 101)` rows in one exact space after the given
+    /// full row key. The hash table requires a key scan, but only the bounded
+    /// selected payloads are cloned; no full-table payload snapshot is made.
+    pub fn extension_rows_page(
+        &self,
+        table_name: &str,
+        space_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, serde_json::Value)>> {
+        let limit = limit.min(101);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let state = self.read_state();
+        let Some(table) = state.extension_tables.get(table_name) else {
+            return Ok(Vec::new());
+        };
+        let mut page = std::collections::BTreeMap::new();
+        for (key, row) in table {
+            if after.is_some_and(|after| key.as_str() <= after)
+                || row.get("space_id").and_then(serde_json::Value::as_str) != Some(space_id)
+            {
+                continue;
+            }
+            if page.len() == limit && page.last_key_value().is_some_and(|(last, _)| key >= *last) {
+                continue;
+            }
+            let _ = page.insert(key, row);
+            if page.len() > limit {
+                let _ = page.pop_last();
+            }
+        }
+        let rows = page
+            .into_iter()
+            .map(|(key, row)| (key.clone(), row.clone()))
+            .collect();
+        drop(state);
+        Ok(rows)
     }
 
     /// Returns graph neighbors within `hops` traversing both directions.
@@ -861,6 +1220,13 @@ impl ElephantDbTx<'_> {
         T: ElephantDbRecord,
     {
         let value = serialize_record("create", &record)?;
+        let guarded = erasure_guard::check_erasure_guard(
+            self.state,
+            T::TABLE,
+            &value,
+            self.reference_permit.as_deref(),
+        );
+        self.record_erasure_result(guarded)?;
         let id = record.base().id.clone();
         self.state
             .ensure_unique_constraints_scan(T::TABLE, &id, &value)?;
@@ -868,6 +1234,7 @@ impl ElephantDbTx<'_> {
         if table.contains_key(&id) {
             return Err(ElephantDbError::Conflict(id.to_string()));
         }
+        let canonical_changed = fences_canonical_row(T::TABLE, &value);
         table.insert(id.clone(), value);
         let _ = self.dirty_tables.insert(T::TABLE);
         self.undo_log.push(UndoEntry::TableRow {
@@ -875,6 +1242,11 @@ impl ElephantDbTx<'_> {
             id,
             previous: None,
         });
+        if canonical_changed {
+            self.advance_canonical_epoch(&record.base().space_id)?;
+        }
+        self.bump_index_generation(T::TABLE, &record.base().space_id)?;
+        self.advance_reference_guard_revision(&record.base().space_id)?;
         Ok(record)
     }
 
@@ -884,6 +1256,13 @@ impl ElephantDbTx<'_> {
         T: ElephantDbRecord,
     {
         let value = serialize_record("replace", &record)?;
+        let guarded = erasure_guard::check_erasure_guard(
+            self.state,
+            T::TABLE,
+            &value,
+            self.reference_permit.as_deref(),
+        );
+        self.record_erasure_result(guarded)?;
         let id = record.base().id.clone();
         self.state
             .ensure_unique_constraints_scan(T::TABLE, &id, &value)?;
@@ -891,6 +1270,9 @@ impl ElephantDbTx<'_> {
         let Some(previous) = table.get(&id).cloned() else {
             return Err(ElephantDbError::NotFound(id.to_string()));
         };
+        let previous_space = json_string_field(&previous, "space_id").map(str::to_owned);
+        let canonical_changed =
+            fences_canonical_row(T::TABLE, &previous) || fences_canonical_row(T::TABLE, &value);
         let _ = table.insert(id.clone(), value);
         let _ = self.dirty_tables.insert(T::TABLE);
         self.undo_log.push(UndoEntry::TableRow {
@@ -898,6 +1280,23 @@ impl ElephantDbTx<'_> {
             id,
             previous: Some(previous),
         });
+        if let Some(old_space) = previous_space
+            .as_ref()
+            .filter(|space| *space != &record.base().space_id)
+        {
+            self.advance_reference_guard_revision(old_space)?;
+        }
+        if canonical_changed {
+            if let Some(previous_space) =
+                previous_space.filter(|space| space != &record.base().space_id)
+            {
+                self.advance_canonical_epoch(&previous_space)?;
+                self.bump_index_generation(T::TABLE, &previous_space)?;
+            }
+            self.advance_canonical_epoch(&record.base().space_id)?;
+        }
+        self.bump_index_generation(T::TABLE, &record.base().space_id)?;
+        self.advance_reference_guard_revision(&record.base().space_id)?;
         Ok(record)
     }
 
@@ -927,6 +1326,50 @@ impl ElephantDbTx<'_> {
         self.state.scan_table::<T>()
     }
 
+    /// Scans physical typed rows for coordinated erasure, including deleted rows.
+    pub fn scan_raw_rows(&self, table: TableName) -> Result<Vec<(RecordId, serde_json::Value)>> {
+        let mut rows = self.state.tables.get(&table).map_or_else(Vec::new, |rows| {
+            rows.iter()
+                .map(|(id, row)| (id.clone(), row.clone()))
+                .collect::<Vec<_>>()
+        });
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows)
+    }
+
+    /// Deletes a physical typed row with the same rollback/index fences as typed deletion.
+    /// The table is explicit because an embedding can reuse its node's record ID.
+    pub fn hard_delete_raw_row(
+        &mut self,
+        table: TableName,
+        space: &str,
+        id: &RecordId,
+    ) -> Result<()> {
+        let rows = self.state.tables.entry(table).or_default();
+        let previous = rows
+            .get(id)
+            .ok_or_else(|| ElephantDbError::NotFound(id.to_string()))?;
+        if previous.get("space_id").and_then(serde_json::Value::as_str) != Some(space) {
+            return Err(ElephantDbError::NotFound(id.to_string()));
+        }
+        let previous = rows
+            .remove(id)
+            .ok_or_else(|| ElephantDbError::NotFound(id.to_string()))?;
+        let canonical_changed = fences_canonical_row(table, &previous);
+        self.dirty_tables.insert(table);
+        self.undo_log.push(UndoEntry::TableRow {
+            table,
+            id: id.clone(),
+            previous: Some(previous),
+        });
+        if canonical_changed {
+            self.advance_canonical_epoch(space)?;
+        }
+        self.bump_index_generation(table, space)?;
+        self.advance_reference_guard_revision(space)?;
+        Ok(())
+    }
+
     /// Hard deletes a record inside the transaction.
     pub fn hard_delete<T>(&mut self, space_id: &str, id: &RecordId) -> Result<()>
     where
@@ -941,12 +1384,18 @@ impl ElephantDbTx<'_> {
             let _ = table.insert(id.clone(), previous);
             return Err(ElephantDbError::NotFound(id.to_string()));
         }
+        let canonical_changed = fences_canonical_row(T::TABLE, &previous);
         let _ = self.dirty_tables.insert(T::TABLE);
         self.undo_log.push(UndoEntry::TableRow {
             table: T::TABLE,
             id: id.clone(),
             previous: Some(previous),
         });
+        if canonical_changed {
+            self.advance_canonical_epoch(space_id)?;
+        }
+        self.bump_index_generation(T::TABLE, space_id)?;
+        self.advance_reference_guard_revision(space_id)?;
         Ok(())
     }
 
@@ -977,17 +1426,72 @@ impl ElephantDbTx<'_> {
     ) -> Result<String> {
         let table_name = table_name.into();
         let row_key = extension_row_key_from_value(&table_name, &row)?;
+        let space = row
+            .get("space_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ElephantDbError::DataIntegrity("extension row missing space".into()))?
+            .to_owned();
+        let fenced = fences_canonical_extension_change(
+            &table_name,
+            self.state
+                .extension_tables
+                .get(&table_name)
+                .and_then(|rows| rows.get(&row_key)),
+            Some(&row),
+        );
+        let reference_fenced = checks_extension_erasure_refs(table_name.as_ref());
+        if reference_fenced {
+            let guarded = erasure_guard::check_serialized_references(
+                self.state,
+                &space,
+                table_name.as_ref(),
+                &row,
+                self.reference_permit.as_deref(),
+            );
+            self.record_erasure_result(guarded)?;
+        }
+        let visibility_changed = index_generation::control_visibility_changed(
+            &table_name,
+            self.state
+                .extension_tables
+                .get(&table_name)
+                .and_then(|rows| rows.get(&row_key)),
+            Some(&row),
+        );
         let previous = self
             .state
             .extension_tables
             .entry(table_name.clone())
             .or_default()
             .insert(row_key.clone(), row);
+        let old_space = previous
+            .as_ref()
+            .and_then(|row| row.get("space_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         self.undo_log.push(UndoEntry::ExtensionRow {
             table_name,
             row_key: row_key.clone(),
             previous,
         });
+        if fenced {
+            self.advance_canonical_epoch(&space)?;
+            if let Some(old_space) = old_space.as_ref().filter(|old_space| *old_space != &space) {
+                self.advance_canonical_epoch(old_space)?;
+            }
+        }
+        if visibility_changed {
+            self.bump_space_index_generation(&space)?;
+            if let Some(old_space) = old_space.as_ref().filter(|old_space| *old_space != &space) {
+                self.bump_space_index_generation(old_space)?;
+            }
+        }
+        if reference_fenced {
+            self.advance_reference_guard_revision(&space)?;
+            if let Some(old_space) = old_space.as_ref().filter(|old| *old != &space) {
+                self.advance_reference_guard_revision(old_space)?;
+            }
+        }
         Ok(row_key)
     }
 
@@ -998,6 +1502,21 @@ impl ElephantDbTx<'_> {
         row_key: &str,
         row: serde_json::Value,
     ) -> Result<()> {
+        let space = row
+            .get("space_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ElephantDbError::DataIntegrity("extension row missing space".into()))?
+            .to_owned();
+        if checks_extension_erasure_refs(table_name) {
+            let guarded = erasure_guard::check_serialized_references(
+                self.state,
+                &space,
+                table_name,
+                &row,
+                self.reference_permit.as_deref(),
+            );
+            self.record_erasure_result(guarded)?;
+        }
         let table = self
             .state
             .extension_tables
@@ -1012,12 +1531,110 @@ impl ElephantDbTx<'_> {
                 "extension row key mismatch: expected {row_key}, payload encodes {payload_key}"
             )));
         }
+        let visibility_changed = index_generation::control_visibility_changed(
+            table_name,
+            table.get(row_key),
+            Some(&row),
+        );
+        let fenced = fences_canonical_extension_change(table_name, table.get(row_key), Some(&row));
         let previous = table.insert(row_key.to_string(), row);
+        let old_space = previous
+            .as_ref()
+            .and_then(|row| row.get("space_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         self.undo_log.push(UndoEntry::ExtensionRow {
             table_name: table_name.to_string(),
             row_key: row_key.to_string(),
             previous,
         });
+        if fenced {
+            self.advance_canonical_epoch(&space)?;
+            if let Some(old_space) = old_space.as_ref().filter(|old_space| *old_space != &space) {
+                self.advance_canonical_epoch(old_space)?;
+            }
+        }
+        if visibility_changed {
+            self.bump_space_index_generation(&space)?;
+            if let Some(old_space) = old_space.as_ref().filter(|old_space| *old_space != &space) {
+                self.bump_space_index_generation(old_space)?;
+            }
+        }
+        if checks_extension_erasure_refs(table_name) {
+            self.advance_reference_guard_revision(&space)?;
+            if let Some(old_space) = old_space.as_ref().filter(|old| *old != &space) {
+                self.advance_reference_guard_revision(old_space)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Advances the private inventory revision with the same rollback as payload writes.
+    pub fn advance_reference_guard_revision(&mut self, space: &str) -> Result<()> {
+        let next =
+            erasure_guard::next_revision_row(self.state, space, self.reference_permit.as_deref());
+        if let Some(row) = self.record_erasure_result(next)? {
+            let written = self.upsert_extension_row("source_erasure_guard", row);
+            self.record_erasure_result(written)?;
+        }
+        Ok(())
+    }
+
+    fn record_erasure_result<T>(&mut self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            if self.erasure_failure.is_none() {
+                self.erasure_failure = Some(error.clone());
+            }
+        }
+        result
+    }
+
+    /// Advances the predicate fence within this transaction, including rollback.
+    pub fn advance_canonical_epoch(&mut self, space_id: &str) -> Result<String> {
+        let (_, row) = canonical_epoch_row(space_id);
+        let epoch = row["epoch"]
+            .as_str()
+            .ok_or_else(|| ElephantDbError::DataIntegrity("missing canonical epoch".to_owned()))?
+            .to_owned();
+        self.upsert_extension_row("canonical_epoch", row)?;
+        Ok(epoch)
+    }
+
+    /// Physically removes an extension row without leaving payload in a tombstone.
+    pub fn hard_delete_extension_row(
+        &mut self,
+        table_name: &str,
+        row_key: &str,
+        space_id: &str,
+    ) -> Result<()> {
+        let table = self
+            .state
+            .extension_tables
+            .get_mut(table_name)
+            .ok_or_else(|| ElephantDbError::NotFound(row_key.to_owned()))?;
+        let previous = table
+            .get(row_key)
+            .ok_or_else(|| ElephantDbError::NotFound(row_key.to_owned()))?;
+        if previous.get("space_id").and_then(serde_json::Value::as_str) != Some(space_id) {
+            return Err(ElephantDbError::NotFound(row_key.to_owned()));
+        }
+        let visibility_changed =
+            index_generation::control_visibility_changed(table_name, Some(previous), None);
+        let previous = table.remove(row_key);
+        self.undo_log.push(UndoEntry::ExtensionRow {
+            table_name: table_name.to_owned(),
+            row_key: row_key.to_owned(),
+            previous,
+        });
+        if fences_canonical_extension_reads(table_name) {
+            self.advance_canonical_epoch(space_id)?;
+        }
+        if visibility_changed {
+            self.bump_space_index_generation(space_id)?;
+        }
+        if checks_extension_erasure_refs(table_name) {
+            self.advance_reference_guard_revision(space_id)?;
+        }
         Ok(())
     }
 
@@ -1067,6 +1684,14 @@ impl ElephantDbTx<'_> {
 }
 
 impl ElephantDbState {
+    fn advance_canonical_epoch(&mut self, space_id: &str) {
+        let (key, row) = canonical_epoch_row(space_id);
+        self.extension_tables
+            .entry("canonical_epoch".to_owned())
+            .or_default()
+            .insert(key, row);
+    }
+
     fn table_names(&self) -> Vec<String> {
         let mut names = self.persisted_table_names();
         names.extend(self.indexes.vector_partitions.keys().cloned());
@@ -1196,18 +1821,23 @@ impl ElephantDbState {
         T: ElephantDbRecord,
     {
         let value = serialize_record("create", &record)?;
+        erasure_guard::check_erasure_guard(self, T::TABLE, &value, None)?;
         let id = record.base().id.clone();
         self.ensure_unique_constraints(T::TABLE, &id, &value)?;
         let table = self.tables.entry(T::TABLE).or_default();
         if table.contains_key(&id) {
             return Err(ElephantDbError::Conflict(id.to_string()));
         }
+        let canonical_changed = fences_canonical_row(T::TABLE, &value);
         table.insert(id.clone(), value.clone());
         if let Err(err) = self.index_created_record(T::TABLE, &id, &value) {
             let _ = self.tables.entry(T::TABLE).or_default().remove(&id);
             let dirty_tables = HashSet::from([T::TABLE]);
             self.rebuild_for_tables(&dirty_tables)?;
             return Err(err);
+        }
+        if canonical_changed {
+            self.advance_canonical_epoch(&record.base().space_id);
         }
         Ok(record)
     }
@@ -1217,12 +1847,16 @@ impl ElephantDbState {
         T: ElephantDbRecord,
     {
         let value = serialize_record("replace", &record)?;
+        erasure_guard::check_erasure_guard(self, T::TABLE, &value, None)?;
         let id = record.base().id.clone();
         self.ensure_unique_constraints(T::TABLE, &id, &value)?;
         let table = self.tables.entry(T::TABLE).or_default();
         let Some(previous) = table.get(&id).cloned() else {
             return Err(ElephantDbError::NotFound(id.to_string()));
         };
+        let previous_space = json_string_field(&previous, "space_id").map(str::to_owned);
+        let canonical_changed =
+            fences_canonical_row(T::TABLE, &previous) || fences_canonical_row(T::TABLE, &value);
         table.insert(id.clone(), value);
         let dirty_tables = HashSet::from([T::TABLE]);
         if let Err(err) = self.rebuild_for_tables(&dirty_tables) {
@@ -1233,6 +1867,14 @@ impl ElephantDbState {
                 .insert(id, previous);
             self.rebuild_for_tables(&dirty_tables)?;
             return Err(err);
+        }
+        if canonical_changed {
+            if let Some(previous_space) =
+                previous_space.filter(|space| space != &record.base().space_id)
+            {
+                self.advance_canonical_epoch(&previous_space);
+            }
+            self.advance_canonical_epoch(&record.base().space_id);
         }
         Ok(record)
     }
@@ -1822,6 +2464,9 @@ impl ElephantDbState {
             self.rebuild_for_tables(&dirty_tables)?;
             return Err(err);
         }
+        if fences_canonical_row(T::TABLE, &removed) {
+            self.advance_canonical_epoch(space_id);
+        }
         Ok(())
     }
 
@@ -2014,6 +2659,7 @@ impl ElephantDbState {
             tables: self.tables.clone(),
             extension_tables: self.extension_tables.clone(),
             indexes: IndexState::default(),
+            reference_guard: self.reference_guard.clone(),
         };
         state.rebuild_unique_indexes()?;
         Ok(())
@@ -2585,7 +3231,7 @@ fn extension_row_key_from_value(table_name: &str, value: &serde_json::Value) -> 
             if id.contains(':') {
                 Ok(id.clone())
             } else {
-                Ok(format!("{table_name}:{id}"))
+                Ok(format!("{table_name}:{}", extension_string_key(id)))
             }
         }
         serde_json::Value::Object(map) => {
@@ -2600,7 +3246,7 @@ fn extension_row_key_from_value(table_name: &str, value: &serde_json::Value) -> 
                 ))
             })?;
             let id = match raw_id {
-                serde_json::Value::String(id) => id.clone(),
+                serde_json::Value::String(id) => extension_string_key(id),
                 serde_json::Value::Number(id) => id.to_string(),
                 other => {
                     return Err(ElephantDbError::Snapshot(format!(
@@ -2614,6 +3260,20 @@ fn extension_row_key_from_value(table_name: &str, value: &serde_json::Value) -> 
         other => Err(ElephantDbError::Snapshot(format!(
             "unsupported extension row id shape for `{table_name}`: {other}"
         ))),
+    }
+}
+
+// Numeric JSON strings are native string keys, not native integer keys. Keep
+// older nonnumeric opaque key spelling; quoting numeric strings removes the
+// otherwise destructive collision across supported extension identity shapes.
+fn extension_string_key(id: &str) -> String {
+    if id.is_empty()
+        || id.parse::<i64>().is_ok()
+        || id.bytes().all(|byte| byte.is_ascii_digit() || byte == b'_')
+    {
+        format!("`{id}`")
+    } else {
+        id.to_owned()
     }
 }
 
@@ -4296,5 +4956,55 @@ mod tests {
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
             "wasm-benchmark:{report}"
         )));
+    }
+}
+
+#[cfg(test)]
+mod extension_page_tests {
+    use super::*;
+
+    #[test]
+    fn pages_are_tenant_scoped_stable_and_bounded() -> Result<()> {
+        let db = ElephantDb::default();
+        db.tx(|tx| {
+            for index in (0..105).rev() {
+                tx.upsert_extension_row(
+                    "inventory_fixture",
+                    serde_json::json!({
+                        "id":format!("inventory_fixture:{index:03}"),
+                        "space_id":"alpha", "payload":"opaque"
+                    }),
+                )?;
+            }
+            tx.upsert_extension_row(
+                "inventory_fixture",
+                serde_json::json!({
+                    "id":"inventory_fixture:000-foreign", "space_id":"beta", "payload":"private"
+                }),
+            )?;
+            Ok::<_, ElephantDbError>(())
+        })?;
+        let first = db.extension_rows_page("inventory_fixture", "alpha", None, 2)?;
+        assert_eq!(
+            first
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            ["inventory_fixture:000", "inventory_fixture:001"]
+        );
+        let second = db.extension_rows_page("inventory_fixture", "alpha", Some(&first[1].0), 2)?;
+        assert_eq!(second[0].0, "inventory_fixture:002");
+        assert_eq!(
+            db.extension_rows_page("inventory_fixture", "alpha", None, usize::MAX)?
+                .len(),
+            101
+        );
+        assert!(db
+            .extension_rows_page("inventory_fixture", "missing", None, 2)?
+            .is_empty());
+        assert!(db
+            .extension_rows_page("inventory_fixture", "alpha", None, 0)?
+            .is_empty());
+        Ok(())
     }
 }

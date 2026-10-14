@@ -1,0 +1,28 @@
+{
+  "format": "recall-darwin-native-expectations/v1",
+  "scope": "native Apple Silicon installed CLI, current classified-space authorization and acknowledged metadata durability; no model, provider, semantic, physical-erasure or deployment acceptance",
+  "shared_cases": "tests/recall_preview_semantics/installed_linux_cases.json",
+  "target": "aarch64-apple-darwin",
+  "platform_cases": ["actual_sandbox_controls", "shared_installed_cases_on_arm64"],
+  "limits": {
+    "minimum_free_bytes": 8589934592,
+    "run_bytes": 4294967296,
+    "archive_bytes": 2147483648,
+    "archive_expanded_bytes": 2147483648,
+    "resident_bytes": 4294967296,
+    "filesystem_entries": 100000,
+    "sample_seconds": 1,
+    "cpu_seconds_per_child": 180,
+    "tokio_threads": 2,
+    "rayon_threads": 2,
+    "probe_seconds": 10
+  },
+  "unmet_if_absent": [
+    "independent exact driver, shared helper and case review",
+    "explicit expiring root allocation and trusted prebuilt archive identity",
+    "actual receiving macOS arm64 and minimum OS compatibility evidence",
+    "native kqueue child custody and libproc resource observation",
+    "actual Seatbelt read/write/outbound denials and own-loopback bind positive",
+    "supported classified named-space CLI bootstrap and current service grants"
+  ]
+}

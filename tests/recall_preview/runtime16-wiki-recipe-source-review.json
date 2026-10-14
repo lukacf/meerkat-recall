@@ -1,0 +1,50 @@
+{
+  "format": "recall-independent-source-review/v1",
+  "authority": "qualification",
+  "scope": "selected Runtime16 original wiki stack failure/Event canonical read set and native semantic recipe fingerprint repair",
+  "verdict": "selected source ACK; runtime unresolved",
+  "execution_authorized": false,
+  "product_acceptance": false,
+  "files": {
+    "crates/pipeline/src/wiki_editorial.rs": {
+      "source": "c0f020c1f48967dde93ac953eab819db87cebfac",
+      "sha256": "bf4d8649b50a8a40a216573608597b5f4d35ebdaed83d2cfcab9d0c5bf4f8aed"
+    },
+    "docs/maintenance-atomic-commit.md": {
+      "source": "c0f020c1f48967dde93ac953eab819db87cebfac",
+      "sha256": "a9054baa88458a7dad1afa7bed4a23b078ecbfc433db4b0f61e486ba97b3c1d7"
+    },
+    "crates/pipeline/src/maintenance_commit.rs": {
+      "source": "134057ff1220cf1e59fd5c393b4e8a273d0ada74",
+      "sha256": "386103a07215fdc17133c577106f1b672a7f5bb7702e49eb8ea916ef6d71fd12"
+    },
+    "crates/pipeline/src/maintenance_commit_tests.rs": {
+      "source": "134057ff1220cf1e59fd5c393b4e8a273d0ada74",
+      "sha256": "5964f4836614a2d7851976bf63c3b74a114f77ec15b63c5f1d3606efa91f9d13"
+    }
+  },
+  "original_failure": {
+    "source": "a7e46c17fad0be72b2d483afafe8d1675356d65e",
+    "test": "elephant-pipeline maintenance_commit::tests::independent_wiki_definition_oracles::surreal_actual_planner_never_revives_deleted_definition_or_replaces_sibling",
+    "result": "SIGABRT stack overflow",
+    "seconds": 2.14,
+    "original_log_lines": [
+      3860,
+      3869
+    ]
+  },
+  "reviewed_properties": [
+    "Both D outer test and original planner calls were already boxed; M adds actual nested planner inventory/provider/compiler/context/catalog/publication heap boundaries, with same calls/order/awaits and retained publication concurrency. No stack-size override.",
+    "Event read eligibility already checks assertion support, but the later canonical read set lacked exact assertion rows and immutable evidence. New Event branch loads exact same-space assertion refs, refuses disappearance and recursively uses existing current classified dependency capture.",
+    "Existing Assertion dependency traversal brings immutable revision and parent Doc into the canonical transaction. New authored assertions check exact original assertion equality and actual revision/Doc membership, not only Event existence.",
+    "Named-space fixtures use established registered fixture. Classified catalog fixture first asserts original public context refusal, then explicitly supplies original classified partition; subject/security/source/evidence checks remain.",
+    "Generic request_fingerprint now recursively sorts JSON object keys before existing SHA256. Arrays/scalars/fields remain unchanged. Authored controls preserve nested object reordering equality while changed nested value, array order or scalar type changes hash.",
+    "Existing incompatible stored fingerprints are not rewritten or adopted; original receipt comparison remains authoritative. Native SourceIntent round-trip regression is separately B-owned."
+  ],
+  "limits": [
+    "No compiler, Rust test, storage runtime, provider or artifact execution by qualification.",
+    "Future-size source repair does not prove the original native stack failure resolved; centrally rerun the exact original test and coherent family.",
+    "Sorting changes fingerprints that depended on object insertion order; historical incompatible operations refuse, with no generic migration or read-time adoption.",
+    "Fixture/schema repairs and other Runtime16 failures retain their separate owners/evidence."
+  ]
+}

@@ -1,0 +1,9260 @@
+//! OpenAI API client - Responses API
+//!
+//! Implements the LlmClient trait for OpenAI's Responses API.
+//! This client uses the /v1/responses endpoint which supports reasoning items.
+
+use async_trait::async_trait;
+use futures::StreamExt;
+use meerkat_core::ToolChoice;
+use meerkat_core::lifecycle::run_primitive::{
+    OpenAiPromptCacheRetention, OpenAiProviderTag, ProviderTag,
+};
+use meerkat_core::schema::{CompiledSchema, SchemaError};
+use meerkat_core::{
+    AssistantBlock, BlockAssistantMessage, ContentBlock, ImageData, ImageGenerationIntent,
+    ImageGenerationWarning, ImageProviderErrorCode, ImageProviderTerminalObservation, Message,
+    OpenAiImageMetadata, OutputSchema, Provider, ProviderImageMetadata, ProviderMeta,
+    RevisedPromptDisposition, RevisedPromptSource, ServerToolKind, StopReason, SystemNoticeBlock,
+    SystemNoticeMessage, ToolResult, Usage, UserMessage,
+};
+use meerkat_llm_core::{
+    ImageGenerationExecutor, LlmClient, LlmDoneOutcome, LlmEvent, LlmRequest, LlmStream,
+    ProviderGeneratedImage, ProviderImageGenerationOutput, ProviderImageGenerationRequest,
+    dimensions_from_size_preference, media_type_from_format_preference,
+    normalize_base64_image_data,
+};
+use meerkat_llm_core::{LlmError, ToolChoiceRefusal};
+use meerkat_llm_core::{http, streaming};
+use serde::Deserialize;
+use serde_json::Value;
+use serde_json::value::RawValue;
+use std::collections::{HashMap, HashSet};
+
+use crate::image_generation::{
+    OpenAiImageGenerationProfile, OpenAiImageOutputOptions, OpenAiImageProviderParams,
+    OpenAiImagesApiEndpoint, OpenAiImagesApiPlan, OpenAiImagesApiRequestShape,
+    OpenAiResponsesImagePlan,
+};
+
+use meerkat_core::image_generation::ImageGenerationProviderProfile;
+
+/// Extract the typed OpenAI provider tag from a request.
+pub(crate) fn openai_tag(request: &LlmRequest) -> Option<&OpenAiProviderTag> {
+    match request.provider_params.as_ref()? {
+        ProviderTag::OpenAi(t) => Some(t),
+        _ => None,
+    }
+}
+
+/// Client for OpenAI Responses API
+pub struct OpenAiClient {
+    api_key: Option<String>,
+    base_url: String,
+    responses_path: String,
+    backend_wire: OpenAiBackendWire,
+    /// The provider HTTP client, or why it could not be built. A failed
+    /// build fails each request with that error instead of substituting a
+    /// default client, whose redirect policy would follow redirects.
+    http: Result<reqwest::Client, LlmError>,
+    /// Extra headers emitted on every request (e.g. `ChatGPT-Account-ID`,
+    /// `X-OpenAI-Fedramp`). Populated by provider runtimes when the
+    /// backend is the ChatGPT backend and the OAuth token's JWT carries
+    /// identity claims per Codex `bearer_auth_provider.rs:23-38`.
+    extra_headers: Vec<(String, String)>,
+    /// Dynamic authorizer — when set, replaces the `Authorization:
+    /// Bearer <api_key>` header path with `HttpAuthorizer::authorize`
+    /// invocation. Used for ExternalAuthorizer flows that produce a
+    /// DynamicAuthorizer envelope (host-managed OAuth refresh, etc.).
+    authorizer: Option<std::sync::Arc<dyn meerkat_core::HttpAuthorizer>>,
+    supports_image_input: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AzureOpenAiWireConfig {
+    pub image_generation_deployment: Option<String>,
+    pub image_generation_api_version: String,
+}
+
+impl Default for AzureOpenAiWireConfig {
+    fn default() -> Self {
+        Self {
+            image_generation_deployment: None,
+            image_generation_api_version: "preview".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenAiBackendWire {
+    PublicOpenAi,
+    ChatGptBackend,
+    AzureOpenAi(AzureOpenAiWireConfig),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemMessageMode {
+    IncludeInInput,
+    ExtractToInstructions,
+}
+
+/// Which lowered input items carry an explicit `prompt_cache_breakpoint`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesCacheBreakpoints {
+    /// OpenAI places breakpoints (implicit mode or the provider default).
+    None,
+    /// Explicit mode: every eligible input item, append-monotone, so the
+    /// last input before the previous run's output always carries one.
+    EveryInput,
+    /// Implicit mode on a model that also accepts explicit breakpoints: one
+    /// marker on the last input at or before the previous run's output
+    /// ([`meerkat_core::prior_run_cache_anchor`]), when there is one. The
+    /// implicit breakpoint writes only at the end of each request, so without
+    /// this marker a run that starts on a cold cache leaves no entry a
+    /// `fork_off` child cut at the previous turn end can read.
+    ///
+    /// Every input that can become the anchor is lowered as content parts
+    /// even when unmarked, so marking it later adds only the marker and
+    /// leaves the item's content bytes as the earlier requests sent them.
+    ///
+    /// Assumption: OpenAI keys cache entries on the prompt content and treats
+    /// `prompt_cache_breakpoint` as placement metadata, not prefix content.
+    /// The prompt-caching guide (developers.openai.com/api/docs/guides/
+    /// prompt-caching) describes implicit breakpoints moving to "the end of
+    /// the latest eligible message" on every request and explicit ones being
+    /// added "without turning off the implicit breakpoint", which only
+    /// works if markers are not hashed. If OpenAI did hash them, the anchor
+    /// item would change bytes as the anchor moves, and each run boundary
+    /// would re-bill from the previous anchor onward.
+    ///
+    /// This mode never authors cache-breakpoint evidence
+    /// ([`LlmClient::authored_cache_breakpoints`] only lowers explicit mode),
+    /// so it does not enter the per-request evidence path.
+    ImplicitWithTurnAnchor { anchor_message: Option<usize> },
+}
+
+impl ResponsesCacheBreakpoints {
+    fn authors(self, message_index: usize) -> bool {
+        match self {
+            Self::None => false,
+            Self::EveryInput => true,
+            Self::ImplicitWithTurnAnchor { anchor_message } => {
+                anchor_message == Some(message_index)
+            }
+        }
+    }
+
+    /// Whether unmarked inputs that could carry a breakpoint are lowered as
+    /// content parts rather than bare strings.
+    fn lowers_inputs_as_parts(self) -> bool {
+        matches!(self, Self::ImplicitWithTurnAnchor { .. })
+    }
+
+    /// The breakpoint placement `request` asks for.
+    fn for_request(request: &LlmRequest) -> Self {
+        use meerkat_core::model_profile::capabilities::OpenAiPromptCacheMode;
+        let Some(tag) = openai_tag(request).filter(|tag| tag.prompt_cache_enabled != Some(false))
+        else {
+            return Self::None;
+        };
+        match tag.prompt_cache_options.and_then(|options| options.mode) {
+            Some(OpenAiPromptCacheMode::Explicit) => Self::EveryInput,
+            Some(OpenAiPromptCacheMode::Implicit)
+                if crate::request_support::supports_prompt_cache_mode(
+                    &request.model,
+                    OpenAiPromptCacheMode::Explicit,
+                ) == Some(true) =>
+            {
+                Self::ImplicitWithTurnAnchor {
+                    anchor_message: Self::turn_anchor_input(&request.messages),
+                }
+            }
+            _ => Self::None,
+        }
+    }
+
+    /// The last input message at or before the previous run's output.
+    fn turn_anchor_input(messages: &[Message]) -> Option<usize> {
+        let anchor = meerkat_core::prior_run_cache_anchor(messages)?;
+        messages.get(..=anchor)?.iter().rposition(|message| {
+            matches!(
+                message,
+                Message::User(_) | Message::SystemNotice(_) | Message::ToolResults { .. }
+            )
+        })
+    }
+}
+
+// ChatGPT's Responses wire exposes one top-level instruction string. The
+// provider request builder therefore accepts at most one leading System row;
+// distinct canonical messages are never delimiter-joined into an ambiguous
+// string.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenAiContinuationPlan {
+    previous_response_id: String,
+    replay_from_message_index: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum OpenAiReplayProjectionMode {
+    Responses,
+    ChatCompletions,
+}
+
+fn invalid_replay(message: impl Into<String>) -> LlmError {
+    LlmError::InvalidRequest {
+        message: message.into(),
+    }
+}
+
+/// Return only message annotations that prove OpenAI web-search provenance.
+///
+/// The Responses API includes `annotations: []` on ordinary output text and
+/// can also carry annotation kinds unrelated to web search. Presence of the
+/// field is therefore not evidence that a server-side search ran.
+pub(crate) fn web_search_message_annotations(value: &Value) -> Option<Vec<Value>> {
+    let annotations = value.as_array()?;
+    let web_citations = annotations
+        .iter()
+        .filter(|annotation| annotation.get("type").and_then(Value::as_str) == Some("url_citation"))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!web_citations.is_empty()).then_some(web_citations)
+}
+
+fn project_openai_content_blocks(
+    replay_application: &mut meerkat_core::ReplayApplication<'_>,
+    message: meerkat_core::ReplayMessageIndex,
+    blocks: &[ContentBlock],
+) -> Result<Vec<ContentBlock>, LlmError> {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(block_index, block)| {
+            let subject = meerkat_core::ReplaySubject::UserContent {
+                message,
+                block: meerkat_core::ReplayUserContentIndex(block_index),
+            };
+            let projected = match replay_application
+                .next(subject)
+                .map_err(|error| invalid_replay(error.to_string()))?
+            {
+                meerkat_core::ReplayDisposition::Preserve => block.clone(),
+                meerkat_core::ReplayDisposition::LowerToText => ContentBlock::Text {
+                    text: block.text_projection().into_owned(),
+                },
+                disposition => {
+                    return Err(invalid_replay(format!(
+                        "OpenAI replay cannot apply user-content disposition {disposition:?}"
+                    )));
+                }
+            };
+            replay_application
+                .record_content(subject, block, &projected)
+                .map_err(|error| invalid_replay(error.to_string()))?;
+            Ok(projected)
+        })
+        .collect()
+}
+
+fn project_openai_tool_result(
+    replay_application: &mut meerkat_core::ReplayApplication<'_>,
+    message: meerkat_core::ReplayMessageIndex,
+    result_index: meerkat_core::ReplayToolResultIndex,
+    result: &ToolResult,
+) -> Result<ToolResult, LlmError> {
+    replay_application
+        .project_tool_result(message, result_index, result)
+        .map_err(|error| invalid_replay(error.to_string()))
+}
+
+fn openai_reasoning_replayable(
+    mode: OpenAiReplayProjectionMode,
+    meta: &Option<Box<ProviderMeta>>,
+) -> bool {
+    matches!(mode, OpenAiReplayProjectionMode::Responses)
+        && matches!(meta.as_deref(), Some(ProviderMeta::OpenAi { .. }))
+}
+
+fn openai_server_tool_content_replayable(
+    mode: OpenAiReplayProjectionMode,
+    content: &Value,
+) -> bool {
+    match mode {
+        OpenAiReplayProjectionMode::Responses => matches!(
+            content.get("type").and_then(Value::as_str),
+            Some(
+                "web_search_call"
+                    | "web_search_result"
+                    | "file_search_call"
+                    | "computer_call"
+                    | "code_interpreter_call"
+                    | "image_generation_call"
+                    | "mcp_call"
+                    | "mcp_list_tools"
+                    | "mcp_approval_request"
+            )
+        ),
+        OpenAiReplayProjectionMode::ChatCompletions => false,
+    }
+}
+
+fn openai_response_id_from_meta(meta: &Option<Box<ProviderMeta>>) -> Option<&str> {
+    match meta.as_deref() {
+        Some(
+            ProviderMeta::OpenAi {
+                response_id: Some(response_id),
+                ..
+            }
+            | ProviderMeta::OpenAiAssistantMessage {
+                response_id: Some(response_id),
+                ..
+            }
+            | ProviderMeta::OpenAiResponse { response_id },
+        ) => Some(response_id.as_str()),
+        _ => None,
+    }
+}
+
+fn openai_response_id_from_block(block: &AssistantBlock) -> Option<&str> {
+    match block {
+        AssistantBlock::Text { meta, .. }
+        | AssistantBlock::Reasoning { meta, .. }
+        | AssistantBlock::ToolUse { meta, .. }
+        | AssistantBlock::Transcript { meta, .. }
+        | AssistantBlock::ServerToolContent { meta, .. } => openai_response_id_from_meta(meta),
+        AssistantBlock::Image { .. } | _ => None,
+    }
+}
+
+pub(crate) fn openai_response_meta(response_id: Option<&str>) -> Option<Box<ProviderMeta>> {
+    response_id.map(|response_id| {
+        Box::new(ProviderMeta::OpenAiResponse {
+            response_id: response_id.to_string(),
+        })
+    })
+}
+
+fn openai_response_id_from_response(response: &Value) -> Option<String> {
+    response
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn openai_continuation_plan(request: &LlmRequest) -> Option<OpenAiContinuationPlan> {
+    let tag = openai_tag(request)?;
+    if tag.store != Some(true) {
+        return None;
+    }
+
+    request
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            let Message::BlockAssistant(assistant) = message else {
+                return None;
+            };
+            assistant
+                .blocks
+                .iter()
+                .rev()
+                .find_map(openai_response_id_from_block)
+                .map(|response_id| OpenAiContinuationPlan {
+                    previous_response_id: response_id.to_string(),
+                    replay_from_message_index: index + 1,
+                })
+        })
+        .filter(|plan| plan.replay_from_message_index < request.messages.len())
+}
+
+fn project_openai_assistant_blocks(
+    replay_application: &mut meerkat_core::ReplayApplication<'_>,
+    message: meerkat_core::ReplayMessageIndex,
+    mode: OpenAiReplayProjectionMode,
+    blocks: &[AssistantBlock],
+) -> Result<Vec<AssistantBlock>, LlmError> {
+    let mut projected = Vec::with_capacity(blocks.len());
+    let has_output_item = blocks.iter().any(|block| match block {
+        AssistantBlock::Text { text, meta } => {
+            !text.is_empty()
+                || matches!(
+                    meta.as_deref(),
+                    Some(ProviderMeta::OpenAiAssistantMessage { .. })
+                )
+        }
+        AssistantBlock::Transcript { text, .. } => !text.is_empty(),
+        AssistantBlock::ToolUse { .. } => true,
+        AssistantBlock::ServerToolContent { content, .. } => {
+            openai_server_tool_content_replayable(mode, content)
+        }
+        _ => false,
+    });
+    for (block_index, block) in blocks.iter().enumerate() {
+        let projected_block = match block {
+            AssistantBlock::Text { text, meta }
+                if text.is_empty()
+                    && !matches!(
+                        meta.as_deref(),
+                        Some(ProviderMeta::OpenAiAssistantMessage { .. })
+                    ) =>
+            {
+                None
+            }
+            AssistantBlock::Text { .. } | AssistantBlock::ToolUse { .. } => {
+                Some(meerkat_core::ReplayWireFamily::OpenAi.strip_foreign_metadata(block.clone()))
+            }
+            // Spoken transcripts replay back to the provider as plain text;
+            // OpenAI Responses API sees the assistant's visible output
+            // regardless of capture lane.
+            AssistantBlock::Transcript { text, .. } if text.is_empty() => None,
+            AssistantBlock::Transcript { text, source, .. } => Some(AssistantBlock::Text {
+                text: source.text_for_model(text).into_owned(),
+                meta: None,
+            }),
+            AssistantBlock::Reasoning { meta, .. }
+                if has_output_item && openai_reasoning_replayable(mode, meta) =>
+            {
+                Some(meerkat_core::ReplayWireFamily::OpenAi.strip_foreign_metadata(block.clone()))
+            }
+            AssistantBlock::ServerToolContent { content, .. }
+                if openai_server_tool_content_replayable(mode, content) =>
+            {
+                Some(meerkat_core::ReplayWireFamily::OpenAi.strip_foreign_metadata(block.clone()))
+            }
+            AssistantBlock::Reasoning { .. }
+            | AssistantBlock::ServerToolContent { .. }
+            | AssistantBlock::Image { .. } => None,
+            _ => {
+                return Err(invalid_replay(
+                    "OpenAI replay cannot project an unknown assistant block",
+                ));
+            }
+        };
+        replay_application
+            .record_assistant(
+                meerkat_core::ReplaySubject::AssistantBlock {
+                    message,
+                    block: meerkat_core::ReplayAssistantBlockIndex(block_index),
+                },
+                block,
+                projected_block.as_ref(),
+            )
+            .map_err(|error| invalid_replay(error.to_string()))?;
+        let source_meta = meerkat_core::replay_provider_metadata(block);
+        if let Some(meta) = source_meta {
+            replay_application
+                .record_provider_metadata(
+                    meerkat_core::ReplaySubject::ProviderMetadata {
+                        message,
+                        block: meerkat_core::ReplayAssistantBlockIndex(block_index),
+                    },
+                    meta,
+                    block,
+                    projected_block.as_ref(),
+                )
+                .map_err(|error| invalid_replay(error.to_string()))?;
+        }
+
+        if let Some(block) = projected_block {
+            projected.push(block);
+        }
+    }
+
+    Ok(projected)
+}
+
+#[cfg(test)]
+fn project_openai_replay_messages(
+    messages: &[Message],
+    mode: OpenAiReplayProjectionMode,
+) -> Result<Vec<Message>, LlmError> {
+    project_openai_replay_messages_for_capabilities(messages, mode, true, true)
+}
+
+pub(crate) fn project_openai_replay_messages_for_capabilities(
+    messages: &[Message],
+    mode: OpenAiReplayProjectionMode,
+    image_input: bool,
+    image_tool_results: bool,
+) -> Result<Vec<Message>, LlmError> {
+    project_openai_replay_messages_for_target(messages, mode, image_input, image_tool_results)
+}
+
+pub(crate) fn project_openai_replay_messages_for_target(
+    messages: &[Message],
+    mode: OpenAiReplayProjectionMode,
+    image_input: bool,
+    image_tool_results: bool,
+) -> Result<Vec<Message>, LlmError> {
+    let mut projected = Vec::with_capacity(messages.len());
+    // Responses can now accept image parts in `function_call_output.output`.
+    // This projection intentionally preserves inline tool-result images across
+    // the replayed history for capable models, matching Anthropic semantics.
+    // Callers that need cheaper historical replay should add an explicit
+    // fresh-vs-historical projection policy instead of changing this default.
+    let image_tool_results =
+        matches!(mode, OpenAiReplayProjectionMode::Responses) && image_tool_results;
+    let replay_plan = meerkat_core::ReplayPlan::build(
+        messages,
+        meerkat_core::ReplayTarget::new(
+            meerkat_core::ReplayWireFamily::OpenAi,
+            image_input,
+            false,
+            image_tool_results,
+            if image_tool_results {
+                meerkat_core::ReplayToolResultProjection::PreserveBlocks
+            } else {
+                meerkat_core::ReplayToolResultProjection::CollapseToText
+            },
+            match mode {
+                OpenAiReplayProjectionMode::Responses => {
+                    meerkat_core::ReplayReasoningProjection::ProviderNative
+                }
+                OpenAiReplayProjectionMode::ChatCompletions => {
+                    meerkat_core::ReplayReasoningProjection::Omit
+                }
+            },
+        ),
+    )
+    .map_err(|error| invalid_replay(error.to_string()))?;
+    let mut replay_application = replay_plan.application();
+
+    for (message_index, message) in messages.iter().enumerate() {
+        let message_index = meerkat_core::ReplayMessageIndex(message_index);
+        if let Message::SystemNotice(notice) = message {
+            let projected_notice = replay_application
+                .project_system_notice(message_index, notice)
+                .map_err(|error| invalid_replay(error.to_string()))?;
+            projected.push(Message::SystemNotice(projected_notice));
+            continue;
+        }
+        replay_application
+            .record_message(
+                meerkat_core::ReplaySubject::Message(message_index),
+                message,
+                match message {
+                    Message::System(_) => Some(message),
+                    _ => None,
+                },
+            )
+            .map_err(|error| invalid_replay(error.to_string()))?;
+        if let Message::ToolResults {
+            results,
+            created_at,
+        } = message
+        {
+            let results = results
+                .iter()
+                .enumerate()
+                .map(|(result_index, result)| {
+                    project_openai_tool_result(
+                        &mut replay_application,
+                        message_index,
+                        meerkat_core::ReplayToolResultIndex(result_index),
+                        result,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            projected.push(Message::ToolResults {
+                results,
+                created_at: *created_at,
+            });
+            continue;
+        }
+
+        let next_message = match message {
+            Message::System(_) => Some(message.clone()),
+            Message::SystemNotice(_) => unreachable!("handled above"),
+            Message::User(user) => Some(Message::User(UserMessage {
+                content: project_openai_content_blocks(
+                    &mut replay_application,
+                    message_index,
+                    &user.content,
+                )?,
+                render_metadata: user.render_metadata.clone(),
+                identity: user.identity.clone(),
+                transcript_role: user.transcript_role,
+                created_at: user.created_at,
+            })),
+            Message::BlockAssistant(assistant) => {
+                let blocks = project_openai_assistant_blocks(
+                    &mut replay_application,
+                    message_index,
+                    mode,
+                    &assistant.blocks,
+                )?;
+                if blocks.is_empty() {
+                    None
+                } else {
+                    Some(Message::BlockAssistant(BlockAssistantMessage {
+                        blocks,
+                        stop_reason: assistant.stop_reason,
+                        identity: assistant.identity.clone(),
+                        assistant_message_id: assistant.assistant_message_id,
+                        created_at: assistant.created_at,
+                    }))
+                }
+            }
+            Message::ToolResults { .. } => unreachable!("handled above"),
+        };
+
+        let Some(message) = next_message else {
+            continue;
+        };
+        projected.push(message);
+    }
+
+    replay_plan
+        .validate_projected(messages, &projected, replay_application)
+        .map_err(|error| invalid_replay(error.to_string()))?;
+    Ok(projected)
+}
+
+impl OpenAiClient {
+    /// The provider HTTP client; a failed build fails the request.
+    fn http(&self) -> Result<&reqwest::Client, LlmError> {
+        self.http.as_ref().map_err(Clone::clone)
+    }
+
+    fn model_supports_temperature(model: &str) -> bool {
+        crate::request_support::supports_temperature(model)
+    }
+
+    fn model_supports_reasoning_payload(model: &str) -> bool {
+        crate::request_support::supports_reasoning(model)
+    }
+
+    fn request_supports_temperature(request: &LlmRequest) -> bool {
+        openai_tag(request)
+            .and_then(|t| t.supports_temperature_override)
+            .unwrap_or_else(|| Self::model_supports_temperature(&request.model))
+    }
+
+    fn request_supports_reasoning_payload(request: &LlmRequest) -> bool {
+        openai_tag(request)
+            .and_then(|t| t.supports_reasoning_override)
+            .unwrap_or_else(|| Self::model_supports_reasoning_payload(&request.model))
+    }
+
+    /// Create a new OpenAI client with the given API key
+    pub fn new(api_key: String) -> Self {
+        Self::new_with_optional_api_key_and_base_url(
+            Some(api_key),
+            "https://api.openai.com".to_string(),
+        )
+    }
+
+    /// Create a new OpenAI client with an explicit base URL
+    pub fn new_with_base_url(api_key: String, base_url: String) -> Self {
+        Self::new_with_optional_api_key_and_base_url(Some(api_key), base_url)
+    }
+
+    /// Create a new OpenAI client with an optional API key and explicit base URL.
+    pub fn new_with_optional_api_key_and_base_url(
+        api_key: Option<String>,
+        base_url: String,
+    ) -> Self {
+        let http = http::build_http_client_for_base_url(reqwest::Client::builder(), &base_url);
+        Self {
+            api_key,
+            base_url,
+            responses_path: "v1/responses".to_string(),
+            backend_wire: OpenAiBackendWire::PublicOpenAi,
+            http,
+            extra_headers: Vec::new(),
+            authorizer: None,
+            supports_image_input: true,
+        }
+    }
+
+    /// Install a set of (name, value) headers to include on every request.
+    ///
+    /// ChatGPT-backend callers pass `ChatGPT-Account-ID` and optionally
+    /// `X-OpenAI-Fedramp` here.
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    /// Set the Responses endpoint path relative to `base_url`.
+    ///
+    /// Public OpenAI uses `/v1/responses`; the ChatGPT Codex backend
+    /// uses `/responses` under `https://chatgpt.com/backend-api/codex`.
+    pub fn with_responses_path(mut self, path: impl Into<String>) -> Self {
+        self.responses_path = path.into().trim_start_matches('/').to_string();
+        self
+    }
+
+    pub fn with_chatgpt_backend_wire(self) -> Self {
+        let mut client = self.with_responses_path("responses");
+        client.backend_wire = OpenAiBackendWire::ChatGptBackend;
+        client
+    }
+
+    pub fn with_azure_openai_wire(mut self, config: AzureOpenAiWireConfig) -> Self {
+        self.backend_wire = OpenAiBackendWire::AzureOpenAi(config);
+        self
+    }
+
+    /// Attach a dynamic authorizer. When set, overrides the
+    /// `Authorization: Bearer <api_key>` path on every request with
+    /// `HttpAuthorizer::authorize`. Extra headers (ChatGPT-Account-ID
+    /// etc.) still flow through unchanged.
+    pub fn with_authorizer(
+        mut self,
+        authorizer: std::sync::Arc<dyn meerkat_core::HttpAuthorizer>,
+    ) -> Self {
+        self.authorizer = Some(authorizer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_image_input_support(mut self, supports_image_input: bool) -> Self {
+        self.supports_image_input = supports_image_input;
+        self
+    }
+
+    pub fn extra_headers(&self) -> &[(String, String)] {
+        &self.extra_headers
+    }
+
+    fn is_chatgpt_backend_wire(&self) -> bool {
+        matches!(self.backend_wire, OpenAiBackendWire::ChatGptBackend)
+    }
+
+    fn azure_openai_wire_config(&self) -> Option<&AzureOpenAiWireConfig> {
+        match &self.backend_wire {
+            OpenAiBackendWire::AzureOpenAi(config) => Some(config),
+            OpenAiBackendWire::PublicOpenAi | OpenAiBackendWire::ChatGptBackend => None,
+        }
+    }
+
+    async fn apply_request_headers_with_receipt(
+        &self,
+        mut request_builder: reqwest::RequestBuilder,
+        endpoint: &str,
+        request_extra_headers: &[(String, String)],
+    ) -> Result<
+        (
+            reqwest::RequestBuilder,
+            meerkat_core::HttpAuthorizationReceipt,
+        ),
+        LlmError,
+    > {
+        let receipt = if let Some(authorizer) = &self.authorizer {
+            let mut extra: Vec<(String, String)> = Vec::new();
+            let mut auth_req = meerkat_core::HttpAuthorizationRequest {
+                method: "POST",
+                url: endpoint,
+                headers: &mut extra,
+            };
+            let receipt = authorizer
+                .authorize_with_receipt(&mut auth_req)
+                .await
+                .map_err(LlmError::from_authorizer)?;
+            for (name, value) in extra {
+                request_builder = request_builder.header(name, value);
+            }
+            receipt
+        } else if let Some(api_key) = &self.api_key {
+            if self.azure_openai_wire_config().is_some() {
+                request_builder = request_builder.header("api-key", api_key);
+            } else {
+                request_builder =
+                    request_builder.header("Authorization", format!("Bearer {api_key}"));
+            }
+            meerkat_core::HttpAuthorizationReceipt::untracked()
+        } else {
+            meerkat_core::HttpAuthorizationReceipt::untracked()
+        };
+        for (name, value) in &self.extra_headers {
+            request_builder = request_builder.header(name, value);
+        }
+        for (name, value) in request_extra_headers {
+            request_builder = request_builder.header(name, value);
+        }
+        Ok((request_builder, receipt))
+    }
+
+    async fn apply_request_headers(
+        &self,
+        request_builder: reqwest::RequestBuilder,
+        endpoint: &str,
+        request_extra_headers: &[(String, String)],
+    ) -> Result<reqwest::RequestBuilder, LlmError> {
+        self.apply_request_headers_with_receipt(request_builder, endpoint, request_extra_headers)
+            .await
+            .map(|(request, _)| request)
+    }
+
+    fn responses_endpoint(&self) -> String {
+        format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            self.responses_path.trim_start_matches('/'),
+        )
+    }
+
+    /// Set custom base URL
+    pub fn with_base_url(mut self, url: String) -> Self {
+        self.http = http::build_http_client_for_base_url(reqwest::Client::builder(), &url);
+        self.base_url = url;
+        self
+    }
+
+    /// Build request body for OpenAI Responses API.
+    ///
+    /// Public but hidden: the integration matrix in `meerkat-integration-tests`
+    /// runs every built-in tool definition through this exact builder to prove
+    /// the emitted `tools[].parameters` carry no root-level combinator. It is
+    /// not a supported host API.
+    #[doc(hidden)]
+    pub fn build_request_body(&self, request: &LlmRequest) -> Result<Value, LlmError> {
+        let cache_breakpoints = ResponsesCacheBreakpoints::for_request(request);
+        let (input, instructions, _) = if self.is_chatgpt_backend_wire() {
+            Self::validate_chatgpt_system_messages(&request.messages)?;
+            Self::convert_to_responses_input_with_system_mode(
+                &request.messages,
+                SystemMessageMode::ExtractToInstructions,
+                cache_breakpoints,
+            )?
+        } else {
+            Self::convert_to_responses_input_with_system_mode(
+                &request.messages,
+                SystemMessageMode::IncludeInInput,
+                cache_breakpoints,
+            )?
+        };
+        let reasoning_enabled = Self::request_supports_reasoning_payload(request);
+
+        if let Some(tag) = openai_tag(request) {
+            if reasoning_enabled
+                && let Some(effort) = tag.reasoning_effort
+                && crate::request_support::supports_reasoning_effort(&request.model, effort)
+                    == Some(false)
+            {
+                return Err(LlmError::InvalidRequest {
+                    message: format!(
+                        "OpenAI model '{}' does not support reasoning effort '{}'",
+                        request.model,
+                        effort.as_legacy_str()
+                    ),
+                });
+            }
+            if let Some(mode) = tag.reasoning_mode
+                && crate::request_support::supports_reasoning_mode(&request.model, mode)
+                    == Some(false)
+            {
+                return Err(LlmError::InvalidRequest {
+                    message: format!(
+                        "OpenAI model '{}' does not support reasoning mode '{}'",
+                        request.model,
+                        mode.as_wire_str()
+                    ),
+                });
+            }
+            if let Some(context) = tag.reasoning_context
+                && crate::request_support::supports_reasoning_context(&request.model, context)
+                    == Some(false)
+            {
+                return Err(LlmError::InvalidRequest {
+                    message: format!(
+                        "OpenAI model '{}' does not support reasoning context '{}'",
+                        request.model,
+                        context.as_wire_str()
+                    ),
+                });
+            }
+            if let Some(verbosity) = tag.text_verbosity
+                && crate::request_support::supports_text_verbosity(&request.model, verbosity)
+                    == Some(false)
+            {
+                return Err(LlmError::InvalidRequest {
+                    message: format!(
+                        "OpenAI model '{}' does not support text verbosity '{}'",
+                        request.model,
+                        verbosity.as_wire_str()
+                    ),
+                });
+            }
+            if (tag.seed.is_some()
+                || tag.frequency_penalty.is_some()
+                || tag.presence_penalty.is_some())
+                && crate::request_support::supports_legacy_penalties(&request.model) == Some(false)
+            {
+                return Err(LlmError::InvalidRequest {
+                    message: format!(
+                        "OpenAI model '{}' does not support seed, frequency_penalty, or presence_penalty on the Responses API",
+                        request.model
+                    ),
+                });
+            }
+            if let Some(enabled) = tag.prompt_cache_enabled {
+                let required_mode = if enabled {
+                    tag.prompt_cache_options
+                        .and_then(|options| options.mode)
+                        .unwrap_or(
+                        meerkat_core::model_profile::capabilities::OpenAiPromptCacheMode::Implicit,
+                    )
+                } else {
+                    meerkat_core::model_profile::capabilities::OpenAiPromptCacheMode::Explicit
+                };
+                if crate::request_support::supports_prompt_cache_mode(&request.model, required_mode)
+                    == Some(false)
+                {
+                    return Err(LlmError::InvalidRequest {
+                        message: format!(
+                            "OpenAI model '{}' does not support the '{}' mode required by prompt_cache_enabled={enabled}",
+                            request.model,
+                            required_mode.as_wire_str()
+                        ),
+                    });
+                }
+            }
+            if tag.prompt_cache_enabled != Some(false) {
+                if let Some(message) = tag.prompt_cache_retention.and_then(|retention| {
+                    crate::request_support::prompt_cache_retention_rejection(
+                        &request.model,
+                        retention,
+                    )
+                }) {
+                    return Err(LlmError::InvalidRequest { message });
+                }
+                if let Some(options) = tag.prompt_cache_options {
+                    if let Some(mode) = options.mode
+                        && crate::request_support::supports_prompt_cache_mode(&request.model, mode)
+                            == Some(false)
+                    {
+                        return Err(LlmError::InvalidRequest {
+                            message: format!(
+                                "OpenAI model '{}' does not support prompt cache mode '{}'",
+                                request.model,
+                                mode.as_wire_str()
+                            ),
+                        });
+                    }
+                    if let Some(ttl) = options.ttl
+                        && crate::request_support::supports_prompt_cache_ttl(&request.model, ttl)
+                            == Some(false)
+                    {
+                        return Err(LlmError::InvalidRequest {
+                            message: format!(
+                                "OpenAI model '{}' does not support prompt cache TTL '{}'",
+                                request.model,
+                                ttl.as_wire_str()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut body = serde_json::json!({
+            "model": request.model,
+            "input": input,
+            "max_output_tokens": request.max_tokens,
+            "stream": true,
+            "store": false,
+        });
+
+        if reasoning_enabled {
+            // Request encrypted_content for stateless replay.
+            body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+            // Enable reasoning with default effort.
+            body["reasoning"] = serde_json::json!({
+                "effort": "medium",
+                "summary": "auto"
+            });
+        }
+
+        if self.is_chatgpt_backend_wire() {
+            body["instructions"] = Value::String(
+                instructions.unwrap_or_else(|| "You are a helpful assistant.".to_string()),
+            );
+            body["tools"] = Value::Array(Vec::new());
+            body["tool_choice"] = Value::String("auto".to_string());
+            body["parallel_tool_calls"] = Value::Bool(false);
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("max_output_tokens");
+            }
+        }
+
+        if Self::request_supports_temperature(request)
+            && let Some(temp) = request.temperature
+            && let Some(num) = serde_json::Number::from_f64(temp as f64)
+        {
+            body["temperature"] = Value::Number(num);
+        }
+
+        if !request.tools.is_empty() {
+            // Responses API tool format: {"type": "function", "name": "...", "parameters": {...}}
+            let tools = request
+                .tools
+                .iter()
+                .map(|t| -> Result<Value, LlmError> {
+                    let parameters = crate::tool_schema::normalize_openai_tool_parameters_schema(
+                        &t.name,
+                        &t.input_schema,
+                    )?;
+                    // Responses may otherwise normalize optional parameters into
+                    // required fields. Preserve the authored ToolDef contract;
+                    // the dispatcher remains the argument-validation owner.
+                    Ok(serde_json::json!({
+                        "type": "function",
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": parameters,
+                        "strict": false
+                    }))
+                })
+                .collect::<Result<Vec<Value>, LlmError>>()?;
+            body["tools"] = Value::Array(tools);
+        }
+
+        // Inject provider-native web search tool from typed tag.
+        if let Some(web_search) = openai_tag(request).and_then(|t| t.web_search.as_ref()) {
+            let ws_value = web_search.as_value();
+            if ws_value.is_object() {
+                match body.get_mut("tools").and_then(|v| v.as_array_mut()) {
+                    Some(arr) => arr.push(ws_value),
+                    None => body["tools"] = Value::Array(vec![ws_value]),
+                }
+            }
+        }
+
+        self.apply_tool_choice(request, &mut body)?;
+
+        if let Some(tag) = openai_tag(request) {
+            if let Some(store) = tag.store {
+                body["store"] = Value::Bool(store);
+            }
+
+            if tag.prompt_cache_enabled == Some(false) {
+                // Durable Meerkat opt-out: explicit-only mode with no authored
+                // breakpoints performs no cache reads or writes. Keep this
+                // branch authoritative over explicit breakpoint authoring.
+                body["prompt_cache_options"] = serde_json::json!({"mode": "explicit"});
+            } else {
+                if let Some(prompt_cache_key) = tag.prompt_cache_key.as_ref() {
+                    body["prompt_cache_key"] = Value::String(prompt_cache_key.clone());
+                }
+
+                if let Some(retention) = tag.prompt_cache_retention {
+                    body["prompt_cache_retention"] = Value::String(
+                        match retention {
+                            OpenAiPromptCacheRetention::InMemory => "in_memory",
+                            OpenAiPromptCacheRetention::TwentyFourHours => "24h",
+                        }
+                        .to_string(),
+                    );
+                }
+
+                if let Some(options) = tag.prompt_cache_options {
+                    body["prompt_cache_options"] =
+                        serde_json::to_value(options).map_err(|error| {
+                            LlmError::InvalidRequest {
+                                message: format!("invalid prompt_cache_options: {error}"),
+                            }
+                        })?;
+                } else if tag.prompt_cache_enabled == Some(true) {
+                    body["prompt_cache_options"] = serde_json::json!({"mode": "implicit"});
+                }
+            }
+
+            if reasoning_enabled && let Some(effort) = tag.reasoning_effort {
+                let s = effort.as_legacy_str();
+                body["reasoning"]["effort"] = Value::String(s.to_string());
+            }
+            if reasoning_enabled && let Some(mode) = tag.reasoning_mode {
+                body["reasoning"]["mode"] = Value::String(mode.as_wire_str().to_string());
+            }
+            if reasoning_enabled && let Some(context) = tag.reasoning_context {
+                body["reasoning"]["context"] = Value::String(context.as_wire_str().to_string());
+            }
+            if let Some(verbosity) = tag.text_verbosity {
+                if !body["text"].is_object() {
+                    body["text"] = serde_json::json!({});
+                }
+                body["text"]["verbosity"] = Value::String(verbosity.as_wire_str().to_string());
+            }
+
+            if let Some(seed) = tag.seed {
+                body["seed"] = Value::Number(seed.into());
+            }
+
+            if let Some(fp) = tag.frequency_penalty
+                && let Some(n) = serde_json::Number::from_f64(fp as f64)
+            {
+                body["frequency_penalty"] = Value::Number(n);
+            }
+
+            if let Some(pp) = tag.presence_penalty
+                && let Some(n) = serde_json::Number::from_f64(pp as f64)
+            {
+                body["presence_penalty"] = Value::Number(n);
+            }
+
+            if let Some(output_schema) = tag.structured_output.as_ref() {
+                let compiled =
+                    self.compile_schema(output_schema)
+                        .map_err(|e| LlmError::InvalidRequest {
+                            message: e.to_string(),
+                        })?;
+                let name = output_schema.name.as_deref().unwrap_or("output");
+                let strict = output_schema.strict;
+
+                if !body["text"].is_object() {
+                    body["text"] = serde_json::json!({});
+                }
+                body["text"]["format"] = serde_json::json!({
+                    "type": "json_schema",
+                    "name": name,
+                    "schema": compiled.schema,
+                    "strict": strict
+                });
+            }
+        }
+
+        Ok(body)
+    }
+
+    fn validate_chatgpt_system_messages(messages: &[Message]) -> Result<(), LlmError> {
+        let mut leading_system_prefix = true;
+        let mut system_count = 0usize;
+        for (index, message) in messages.iter().enumerate() {
+            if matches!(message, Message::System(_)) {
+                if !leading_system_prefix || system_count != 0 {
+                    return Err(LlmError::InvalidInputShape {
+                        message: format!(
+                            "ChatGPT Responses cannot exactly represent System message at \
+                             transcript index {index}; its wire supports at most one leading \
+                             System message"
+                        ),
+                    });
+                }
+                system_count += 1;
+            } else {
+                leading_system_prefix = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lower the typed tool choice to the Responses `tool_choice` field.
+    /// `Auto` leaves the body as it always was (the ChatGPT backend's fixed
+    /// `"auto"` included); that backend fixes the choice, so it refuses others.
+    fn apply_tool_choice(&self, request: &LlmRequest, body: &mut Value) -> Result<(), LlmError> {
+        request.validate_tool_choice("openai")?;
+        let choice = match &request.tool_choice {
+            ToolChoice::Auto => return Ok(()),
+            _ if self.is_chatgpt_backend_wire() => {
+                return Err(LlmError::ToolChoiceUnsupported {
+                    provider: "openai".to_owned(),
+                    choice: request.tool_choice.clone(),
+                    reason: ToolChoiceRefusal::BackendFixesToolChoice,
+                });
+            }
+            ToolChoice::Required => Value::String("required".to_owned()),
+            ToolChoice::None => Value::String("none".to_owned()),
+            ToolChoice::Tool { name } => serde_json::json!({"type": "function", "name": name}),
+        };
+        body["tool_choice"] = choice;
+        Ok(())
+    }
+
+    fn build_request_body_with_continuation(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<(Value, Option<OpenAiContinuationPlan>), LlmError> {
+        let Some(plan) = openai_continuation_plan(request) else {
+            return self.build_request_body(request).map(|body| (body, None));
+        };
+
+        let mut continuation_request = request.clone();
+        continuation_request.messages = request.messages[plan.replay_from_message_index..].to_vec();
+        let mut body = self.build_request_body(&continuation_request)?;
+        if self.is_chatgpt_backend_wire() {
+            let full_body = self.build_request_body(request)?;
+            if let Some(instructions) = full_body.get("instructions").cloned() {
+                body["instructions"] = instructions;
+            }
+        }
+        body["previous_response_id"] = Value::String(plan.previous_response_id.clone());
+        Ok((body, Some(plan)))
+    }
+
+    fn previous_response_id_retriable_error(status_code: u16, text: &str) -> bool {
+        if !matches!(status_code, 400 | 404 | 409 | 422) {
+            return false;
+        }
+        let lowered = text.to_ascii_lowercase();
+        lowered.contains("previous_response_id")
+            || lowered.contains("previous response")
+            || lowered.contains("response id")
+    }
+
+    async fn send_responses_request(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        has_images: bool,
+    ) -> Result<(reqwest::Response, meerkat_core::HttpAuthorizationReceipt), LlmError> {
+        let mut request_builder = self
+            .http()?
+            .post(endpoint)
+            .header("Content-Type", "application/json");
+        if let Some(authorizer) = &self.authorizer {
+            let mut content_headers = Vec::new();
+            authorizer
+                .append_content_headers(
+                    meerkat_core::HttpAuthorizationContent { has_images },
+                    &mut content_headers,
+                )
+                .map_err(|error| LlmError::AuthenticationFailed {
+                    message: error.to_string(),
+                })?;
+            for (name, value) in content_headers {
+                request_builder = request_builder.header(name, value);
+            }
+        }
+        let (request_builder, receipt) = self
+            .apply_request_headers_with_receipt(request_builder, endpoint, &[])
+            .await?;
+        let response = request_builder.json(body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                LlmError::NetworkTimeout { duration_ms: 30000 }
+            } else {
+                #[cfg(not(target_arch = "wasm32"))]
+                if e.is_connect() {
+                    return LlmError::ConnectionReset;
+                }
+
+                LlmError::Unknown {
+                    message: e.to_string(),
+                }
+            }
+        })?;
+        Ok((response, receipt))
+    }
+
+    async fn responses_response_with_fallback(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        fallback_body: Option<Value>,
+        has_images: bool,
+    ) -> Result<reqwest::Response, LlmError> {
+        let mut current_body = body;
+        let mut used_fallback = false;
+        let mut refreshed_authorization = false;
+        loop {
+            let (response, receipt) = self
+                .send_responses_request(endpoint, current_body, has_images)
+                .await?;
+            let status = response.status().as_u16();
+            if (200..=299).contains(&status) {
+                return Ok(response);
+            }
+            let headers = response.headers().clone();
+            let text = response
+                .text()
+                .await
+                .map_err(|error| LlmError::StreamParseError {
+                    message: format!("cannot read Responses rejection body: {error}"),
+                })?;
+            let rejection = LlmError::from_http_response(status, text.clone(), &headers);
+            // A policy stop must reach the recovery owner before auth refresh
+            // or stateless continuation fallback can issue another request.
+            if matches!(rejection, LlmError::PolicyStop { .. }) {
+                return Err(rejection);
+            }
+            if let Some(authorizer) = &self.authorizer {
+                let action = authorizer
+                    .observe_response_with_receipt(
+                        receipt,
+                        &meerkat_core::HttpAuthorizationResponse {
+                            method: "POST",
+                            url: endpoint,
+                            status,
+                        },
+                    )
+                    .await
+                    .map_err(|error| LlmError::AuthenticationFailed {
+                        message: error.to_string(),
+                    })?;
+                if !refreshed_authorization
+                    && action == meerkat_core::HttpAuthorizationResponseAction::RetryWithFreshAuthorization
+                {
+                    refreshed_authorization = true;
+                    continue;
+                }
+            }
+            if !used_fallback
+                && let Some(fallback) = fallback_body.as_ref()
+                && Self::previous_response_id_retriable_error(status, &text)
+            {
+                used_fallback = true;
+                refreshed_authorization = false;
+                current_body = fallback;
+                continue;
+            }
+            return Err(rejection);
+        }
+    }
+
+    /// Convert messages to Responses API input format.
+    ///
+    /// OpenAI-hosted tool output items can depend on paired reasoning output
+    /// items. `project_openai_replay_messages` filters provider-specific
+    /// history before this point so Responses replay keeps OpenAI reasoning and
+    /// final hosted-tool items together, while provider switches and Chat
+    /// Completions mode do not receive OpenAI-private transcript state.
+    fn convert_to_responses_input(messages: &[Message]) -> Result<Vec<Value>, LlmError> {
+        Self::convert_to_responses_input_with_system_mode(
+            messages,
+            SystemMessageMode::IncludeInInput,
+            ResponsesCacheBreakpoints::None,
+        )
+        .map(|(input, _, _)| input)
+    }
+
+    fn content_block_to_responses_part(block: &ContentBlock) -> Value {
+        match block {
+            ContentBlock::Text { text } => serde_json::json!({
+                "type": "input_text",
+                "text": text
+            }),
+            ContentBlock::Image { media_type, data } => match data {
+                ImageData::Inline { data } => serde_json::json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{media_type};base64,{data}")
+                }),
+                ImageData::Blob { .. } => serde_json::json!({
+                    "type": "input_text",
+                    "text": block.text_projection()
+                }),
+            },
+            _ => serde_json::json!({
+                "type": "input_text",
+                "text": block.text_projection()
+            }),
+        }
+    }
+
+    /// Lower a non-empty bare-string input as one `input_text` part, the
+    /// form a breakpoint marker is authored on.
+    fn lower_responses_content_as_parts(content: &mut Value) {
+        if let Some(text) = content
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+        {
+            *content = serde_json::json!([{"type": "input_text", "text": text}]);
+        }
+    }
+
+    fn author_responses_content_breakpoint(content: &mut Value) -> bool {
+        if let Some(parts) = content.as_array_mut() {
+            for part in parts.iter_mut().rev() {
+                if matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("input_text" | "input_image" | "input_file")
+                ) {
+                    part["prompt_cache_breakpoint"] = serde_json::json!({"mode": "explicit"});
+                    return true;
+                }
+            }
+            return false;
+        }
+        if let Some(text) = content
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+        {
+            *content = serde_json::json!([{
+                "type": "input_text",
+                "text": text,
+                "prompt_cache_breakpoint": {"mode": "explicit"}
+            }]);
+            return true;
+        }
+        false
+    }
+
+    fn tool_result_responses_output(result: &ToolResult) -> Result<Value, LlmError> {
+        if result.has_video() {
+            return Err(LlmError::InvalidRequest {
+                message: "video blocks are not supported in OpenAI tool results".to_string(),
+            });
+        }
+
+        if result.has_images() {
+            Ok(Value::Array(
+                result
+                    .content
+                    .iter()
+                    .map(Self::content_block_to_responses_part)
+                    .collect(),
+            ))
+        } else {
+            Ok(Value::String(result.text_content()))
+        }
+    }
+
+    fn system_notice_responses_content(notice: &SystemNoticeMessage) -> Value {
+        let rendered = notice.model_projection_text();
+        let mut parts = Vec::new();
+        if !rendered.trim().is_empty() {
+            parts.push(serde_json::json!({
+                "type": "input_text",
+                "text": rendered
+            }));
+        }
+
+        for block in &notice.blocks {
+            match block {
+                SystemNoticeBlock::Comms { content, .. }
+                | SystemNoticeBlock::ExternalEvent { content, .. } => {
+                    for content_block in content {
+                        if !matches!(content_block, ContentBlock::Text { .. }) {
+                            parts.push(Self::content_block_to_responses_part(content_block));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match parts.as_slice() {
+            [] => Value::String(String::new()),
+            [only] if only.get("type").and_then(Value::as_str) == Some("input_text") => only
+                .get("text")
+                .cloned()
+                .unwrap_or_else(|| Value::String(String::new())),
+            _ => Value::Array(parts),
+        }
+    }
+
+    fn openai_reasoning_input_item(text: &str, meta: &ProviderMeta) -> Option<Value> {
+        let ProviderMeta::OpenAi {
+            id,
+            encrypted_content,
+            phase,
+            ..
+        } = meta
+        else {
+            return None;
+        };
+
+        let summary = if text.is_empty() {
+            Value::Array(Vec::new())
+        } else {
+            serde_json::json!([{
+                "type": "summary_text",
+                "text": text
+            }])
+        };
+        let mut item = serde_json::json!({
+            "type": "reasoning",
+            "id": id,
+            "summary": summary
+        });
+
+        if let Some(encrypted_content) = encrypted_content {
+            item["encrypted_content"] = Value::String(encrypted_content.clone());
+        }
+        if let Some(phase) = phase {
+            item["phase"] = Value::String(phase.clone());
+        }
+
+        Some(item)
+    }
+
+    fn convert_to_responses_input_with_system_mode(
+        messages: &[Message],
+        system_mode: SystemMessageMode,
+        cache_breakpoints: ResponsesCacheBreakpoints,
+    ) -> Result<
+        (
+            Vec<Value>,
+            Option<String>,
+            Vec<(meerkat_core::CacheBreakpointBoundary, usize)>,
+        ),
+        LlmError,
+    > {
+        let mut items = Vec::new();
+        let mut instructions = None;
+        let mut authored_boundaries = Vec::new();
+        let leading_system_count = messages
+            .iter()
+            .take_while(|message| matches!(message, Message::System(_)))
+            .count();
+
+        for (message_index, msg) in messages.iter().enumerate() {
+            match msg {
+                Message::System(s) => match system_mode {
+                    SystemMessageMode::IncludeInInput => {
+                        items.push(serde_json::json!({
+                            "type": "message",
+                            "role": "system",
+                            "content": s.content
+                        }));
+                        let lowered_item_count = items.len();
+                        if cache_breakpoints.authors(message_index)
+                            && message_index + 1 == leading_system_count
+                            && let Some(item) = items.last_mut()
+                            && Self::author_responses_content_breakpoint(&mut item["content"])
+                        {
+                            authored_boundaries.push((
+                                meerkat_core::CacheBreakpointBoundary::SystemProfilePrefix {
+                                    message_count: (message_index + 1) as u64,
+                                },
+                                lowered_item_count,
+                            ));
+                        }
+                    }
+                    SystemMessageMode::ExtractToInstructions => {
+                        if instructions.replace(s.content.clone()).is_some() {
+                            return Err(LlmError::InvalidInputShape {
+                                message: "a singular instructions field cannot represent multiple \
+                                          System messages"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                },
+                Message::SystemNotice(notice) => {
+                    items.push(serde_json::json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": Self::system_notice_responses_content(notice)
+                    }));
+                    if cache_breakpoints.lowers_inputs_as_parts()
+                        && let Some(item) = items.last_mut()
+                    {
+                        Self::lower_responses_content_as_parts(&mut item["content"]);
+                    }
+                    let lowered_item_count = items.len();
+                    if cache_breakpoints.authors(message_index)
+                        && let Some(item) = items.last_mut()
+                        && Self::author_responses_content_breakpoint(&mut item["content"])
+                    {
+                        authored_boundaries.push((
+                            meerkat_core::CacheBreakpointBoundary::TranscriptAfter {
+                                message_count: (message_index + 1) as u64,
+                            },
+                            lowered_item_count,
+                        ));
+                    }
+                }
+                Message::User(u) => {
+                    if meerkat_core::has_non_text_content(&u.content) {
+                        let content_array: Vec<Value> = u
+                            .content
+                            .iter()
+                            .map(Self::content_block_to_responses_part)
+                            .collect();
+                        items.push(serde_json::json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": content_array
+                        }));
+                    } else {
+                        items.push(serde_json::json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": u.text_content()
+                        }));
+                    }
+                    if cache_breakpoints.lowers_inputs_as_parts()
+                        && let Some(item) = items.last_mut()
+                    {
+                        Self::lower_responses_content_as_parts(&mut item["content"]);
+                    }
+                    let lowered_item_count = items.len();
+                    if cache_breakpoints.authors(message_index)
+                        && let Some(item) = items.last_mut()
+                        && Self::author_responses_content_breakpoint(&mut item["content"])
+                    {
+                        authored_boundaries.push((
+                            meerkat_core::CacheBreakpointBoundary::TranscriptAfter {
+                                message_count: (message_index + 1) as u64,
+                            },
+                            lowered_item_count,
+                        ));
+                    }
+                }
+                Message::BlockAssistant(a) => {
+                    // BlockAssistantMessage format - render blocks as items
+                    for block in &a.blocks {
+                        match block {
+                            AssistantBlock::Text { text, meta } => {
+                                if !text.is_empty()
+                                    || matches!(
+                                        meta.as_deref(),
+                                        Some(ProviderMeta::OpenAiAssistantMessage { .. })
+                                    )
+                                {
+                                    let mut item = serde_json::json!({
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": text
+                                    });
+                                    if let Some(ProviderMeta::OpenAiAssistantMessage {
+                                        id,
+                                        phase,
+                                        ..
+                                    }) = meta.as_deref()
+                                    {
+                                        item["id"] = Value::String(id.clone());
+                                        item["status"] = Value::String("completed".into());
+                                        item["content"] = serde_json::json!([{"type":"output_text","text":text,"annotations":[]}]);
+                                        if let Some(phase) = phase {
+                                            item["phase"] =
+                                                serde_json::to_value(phase).map_err(|error| {
+                                                    invalid_replay(error.to_string())
+                                                })?;
+                                        }
+                                    }
+                                    items.push(item);
+                                }
+                            }
+                            AssistantBlock::ToolUse { id, name, args, .. } => {
+                                items.push(serde_json::json!({
+                                    "type": "function_call",
+                                    "call_id": id,
+                                    "name": name,
+                                    "arguments": args.get()  // Already JSON string
+                                }));
+                            }
+                            AssistantBlock::Reasoning { text, meta } => {
+                                if let Some(item) = meta
+                                    .as_deref()
+                                    .and_then(|meta| Self::openai_reasoning_input_item(text, meta))
+                                {
+                                    items.push(item);
+                                }
+                            }
+                            AssistantBlock::ServerToolContent { content, .. } => {
+                                items.push(content.clone());
+                            }
+                            // Unknown future variants are omitted unless the
+                            // OpenAI projection explicitly admits them above.
+                            _ => {}
+                        }
+                    }
+                }
+                Message::ToolResults { results, .. } => {
+                    let first_result_item = items.len();
+                    for r in results {
+                        let output = Self::tool_result_responses_output(r)?;
+                        items.push(serde_json::json!({
+                            "type": "function_call_output",
+                            "call_id": r.tool_use_id,
+                            "output": output
+                        }));
+                    }
+                    let lowered_item_count = items.len();
+                    if cache_breakpoints.lowers_inputs_as_parts() {
+                        for item in &mut items[first_result_item..] {
+                            Self::lower_responses_content_as_parts(&mut item["output"]);
+                        }
+                    }
+                    if cache_breakpoints.authors(message_index) {
+                        for item in items[first_result_item..].iter_mut().rev() {
+                            if Self::author_responses_content_breakpoint(&mut item["output"]) {
+                                authored_boundaries.push((
+                                    meerkat_core::CacheBreakpointBoundary::TranscriptAfter {
+                                        message_count: (message_index + 1) as u64,
+                                    },
+                                    lowered_item_count,
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((items, instructions, authored_boundaries))
+    }
+
+    /// Parse an SSE event from the Responses API stream.
+    ///
+    /// Returns `Ok(None)` when the line is not a `data:` event or is the
+    /// `[DONE]` sentinel, and `Err(LlmError::StreamParseError)` when it IS a
+    /// real `data:` event whose JSON fails to parse — a malformed-but-present
+    /// event is a typed fault, not a silently skippable non-event.
+    fn parse_responses_sse_line(line: &str) -> Result<Option<ResponsesStreamEvent>, LlmError> {
+        let Some(data) = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))
+        else {
+            return Ok(None);
+        };
+        if data == "[DONE]" {
+            return Ok(None);
+        }
+        serde_json::from_str(data)
+            .map(Some)
+            .map_err(|error| LlmError::StreamParseError {
+                message: format!("invalid OpenAI Responses SSE data event JSON: {error}"),
+            })
+    }
+
+    fn image_prompt(request: &ProviderImageGenerationRequest) -> String {
+        match &request.generate_request.intent {
+            ImageGenerationIntent::Generate { prompt, .. } => prompt.content.clone(),
+            ImageGenerationIntent::Edit { instruction, .. } => instruction.content.clone(),
+        }
+    }
+
+    fn image_count_warning(
+        request: &ProviderImageGenerationRequest,
+        returned: usize,
+    ) -> Vec<ImageGenerationWarning> {
+        let requested = request.generate_request.count;
+        let Some(returned_count) = std::num::NonZeroU32::new(returned as u32) else {
+            return Vec::new();
+        };
+        if returned_count < requested {
+            vec![ImageGenerationWarning::ProviderReturnedFewerImages {
+                requested,
+                returned: returned_count,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn openai_error_observation(status_code: u16, text: &str) -> ImageProviderTerminalObservation {
+        let code = if let Ok(value) = serde_json::from_str::<Value>(text) {
+            Self::openai_structured_error_code(&value).unwrap_or(ImageProviderErrorCode::Unknown)
+        } else {
+            ImageProviderErrorCode::Unknown
+        };
+        ImageProviderTerminalObservation::ProviderHttpError {
+            status_code: Some(status_code),
+            code,
+        }
+    }
+
+    fn openai_structured_error_code(value: &Value) -> Option<ImageProviderErrorCode> {
+        let error = value.get("error").unwrap_or(value);
+        ["code", "type"].into_iter().find_map(|field| {
+            error
+                .get(field)
+                .and_then(Value::as_str)
+                .and_then(Self::openai_structured_error_code_observation)
+        })
+    }
+
+    fn openai_structured_error_code_observation(code: &str) -> Option<ImageProviderErrorCode> {
+        match code {
+            "content_filter"
+            | "content_filtered"
+            | "content_policy_violation"
+            | "moderation_blocked"
+            | "safety_violation" => Some(ImageProviderErrorCode::OpenAiContentFilter),
+            "model_refusal" | "refusal" | "refused_by_model" => {
+                Some(ImageProviderErrorCode::OpenAiModelRefusal)
+            }
+            _ => None,
+        }
+    }
+
+    fn openai_streamed_image_error_message(
+        event_type: &str,
+        error: Option<&Value>,
+        response: Option<&Value>,
+    ) -> String {
+        let error = error
+            .or_else(|| response.and_then(|value| value.get("error")))
+            .or_else(|| response.and_then(|value| value.get("last_error")));
+        let code = error
+            .and_then(|value| {
+                value
+                    .get("code")
+                    .or_else(|| value.get("type"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("unknown");
+        let message = error
+            .and_then(|value| value.get("message").and_then(Value::as_str))
+            .unwrap_or("unknown streaming error");
+        format!("OpenAI streamed image response {event_type}: {code}: {message}")
+    }
+
+    fn openai_streamed_image_failure_output(
+        request: ProviderImageGenerationRequest,
+        event_type: &str,
+        response: Option<Value>,
+        error: Option<Value>,
+    ) -> ProviderImageGenerationOutput {
+        let code = response
+            .as_ref()
+            .and_then(Self::openai_structured_error_code)
+            .or_else(|| error.as_ref().and_then(Self::openai_structured_error_code))
+            .unwrap_or(ImageProviderErrorCode::Unknown);
+        let response_id = response
+            .as_ref()
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let message = Self::openai_streamed_image_error_message(
+            event_type,
+            error.as_ref(),
+            response.as_ref(),
+        );
+
+        ProviderImageGenerationOutput {
+            operation_id: request.operation_id,
+            terminal_observation: ImageProviderTerminalObservation::ProviderNativeError { code },
+            images: Vec::new(),
+            provider_text: None,
+            revised_prompt: RevisedPromptDisposition::NotRequested,
+            native_metadata: ProviderImageMetadata::OpenAi(OpenAiImageMetadata {
+                target_model: request.model,
+                response_id,
+                image_generation_call_id: None,
+            }),
+            warnings: vec![ImageGenerationWarning::ProviderExecutionFailed { message }],
+        }
+    }
+
+    async fn post_json_to_openai(
+        &self,
+        endpoint: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response, LlmError> {
+        self.post_json_to_openai_with_headers(endpoint, body, &[])
+            .await
+    }
+
+    async fn post_json_to_openai_with_headers(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        request_extra_headers: &[(String, String)],
+    ) -> Result<reqwest::Response, LlmError> {
+        let mut request_builder = self
+            .http()?
+            .post(endpoint)
+            .header("Content-Type", "application/json");
+        request_builder = self
+            .apply_request_headers(request_builder, endpoint, request_extra_headers)
+            .await?;
+        request_builder.json(body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                LlmError::NetworkTimeout { duration_ms: 30000 }
+            } else {
+                #[cfg(not(target_arch = "wasm32"))]
+                if e.is_connect() {
+                    return LlmError::ConnectionReset;
+                }
+                LlmError::Unknown {
+                    message: e.to_string(),
+                }
+            }
+        })
+    }
+
+    async fn execute_hosted_responses_image(
+        &self,
+        request: ProviderImageGenerationRequest,
+        plan: OpenAiResponsesImagePlan,
+    ) -> Result<ProviderImageGenerationOutput, LlmError> {
+        let input = if request.projected_messages.is_empty() {
+            vec![serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": Self::image_prompt(&request)
+            })]
+        } else {
+            Self::convert_to_responses_input(&request.projected_messages)?
+        };
+        let mut tool = serde_json::Map::new();
+        tool.insert(
+            "type".to_string(),
+            serde_json::Value::String(plan.tool_name),
+        );
+        if self.azure_openai_wire_config().is_none() {
+            tool.insert(
+                "model".to_string(),
+                serde_json::Value::String(plan.model.to_string()),
+            );
+        }
+        Self::apply_image_output_options(&mut tool, &plan.output);
+        Self::apply_openai_image_provider_params(&mut tool, &plan.provider_params, true);
+        let mut tools = Vec::new();
+        if let Some(web_search_tool) = Self::openai_image_web_search_tool(&plan.provider_params) {
+            tools.push(web_search_tool);
+        }
+        tools.push(serde_json::Value::Object(tool));
+        let stream = self.is_chatgpt_backend_wire();
+        let body = serde_json::json!({
+            "model": request.model,
+            "input": input,
+            "instructions": "You are an image-generation agent. The user's input is always a request to produce one or more images. Call the image_generation tool to produce each image. Never reply in text instead of calling the tool. If the request cannot be fulfilled, refuse briefly and explicitly so the caller can see the reason.",
+            "tools": tools,
+            "tool_choice": "required",
+            "stream": stream,
+            "store": false,
+        });
+        let mut body = body;
+        if let Some(effort) = plan.provider_params.reasoning_effort {
+            body["reasoning"] = serde_json::json!({ "effort": effort.as_legacy_str() });
+        }
+        let mut extra_headers = Vec::new();
+        if let Some(config) = self.azure_openai_wire_config() {
+            let deployment = config
+                .image_generation_deployment
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| LlmError::InvalidConfig {
+                    message: "azure_openai image generation requires backend option `image_generation_deployment`".to_string(),
+                })?;
+            extra_headers.push((
+                "x-ms-oai-image-generation-deployment".to_string(),
+                deployment.to_string(),
+            ));
+            let api_version = config.image_generation_api_version.trim();
+            if api_version.is_empty() {
+                return Err(LlmError::InvalidConfig {
+                    message: "azure_openai image generation requires a non-empty `image_generation_api_version`".to_string(),
+                });
+            }
+            extra_headers.push(("api_version".to_string(), api_version.to_string()));
+        }
+        let endpoint = self.responses_endpoint();
+        let response = self
+            .post_json_to_openai_with_headers(&endpoint, &body, &extra_headers)
+            .await?;
+        if stream {
+            let status_code = response.status().as_u16();
+            if (200..=299).contains(&status_code) {
+                return self.normalize_openai_image_stream(request, response).await;
+            }
+        }
+        self.normalize_openai_image_response(request, response, true)
+            .await
+    }
+
+    async fn execute_images_api(
+        &self,
+        request: ProviderImageGenerationRequest,
+        model: String,
+        plan: OpenAiImagesApiPlan,
+    ) -> Result<ProviderImageGenerationOutput, LlmError> {
+        let endpoint_path = match plan.endpoint {
+            OpenAiImagesApiEndpoint::Generations => "/v1/images/generations",
+            OpenAiImagesApiEndpoint::Edits => "/v1/images/edits",
+        };
+        let mut body = serde_json::json!({
+            "model": model,
+            "prompt": Self::image_prompt(&request),
+            "n": request.generate_request.count.get(),
+        });
+        if let Some(obj) = body.as_object_mut() {
+            match plan.request_shape {
+                OpenAiImagesApiRequestShape::GptImage => {
+                    Self::apply_image_output_options(obj, &plan.output);
+                    Self::apply_openai_image_provider_params(obj, &plan.provider_params, false);
+                }
+                OpenAiImagesApiRequestShape::DallE => {
+                    obj.insert(
+                        "response_format".to_string(),
+                        serde_json::Value::String("b64_json".to_string()),
+                    );
+                }
+            }
+        }
+        let endpoint = format!("{}{}", self.base_url, endpoint_path);
+        let response = self.post_json_to_openai(&endpoint, &body).await?;
+        self.normalize_openai_image_response(request, response, false)
+            .await
+    }
+
+    fn apply_image_output_options(
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        output: &OpenAiImageOutputOptions,
+    ) {
+        obj.insert(
+            "size".to_string(),
+            serde_json::Value::String(output.size.as_wire_value()),
+        );
+        obj.insert(
+            "quality".to_string(),
+            serde_json::Value::String(output.quality.as_wire_value().to_string()),
+        );
+        obj.insert(
+            "output_format".to_string(),
+            serde_json::Value::String(output.output_format.as_wire_value().to_string()),
+        );
+    }
+
+    fn apply_openai_image_provider_params(
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        params: &OpenAiImageProviderParams,
+        allow_action: bool,
+    ) {
+        if let Some(background) = params.background {
+            obj.insert(
+                "background".to_string(),
+                serde_json::Value::String(background.as_wire_value().to_string()),
+            );
+        }
+        if let Some(output_compression) = params.output_compression {
+            obj.insert(
+                "output_compression".to_string(),
+                serde_json::Value::Number(output_compression.into()),
+            );
+        }
+        if let Some(moderation) = params.moderation {
+            obj.insert(
+                "moderation".to_string(),
+                serde_json::Value::String(moderation.as_wire_value().to_string()),
+            );
+        }
+        if allow_action && let Some(action) = params.action {
+            obj.insert(
+                "action".to_string(),
+                serde_json::Value::String(action.as_wire_value().to_string()),
+            );
+        }
+    }
+
+    fn openai_image_web_search_tool(
+        params: &OpenAiImageProviderParams,
+    ) -> Option<serde_json::Value> {
+        let value = params.web_search.as_ref()?;
+        match value {
+            Value::Bool(false) | Value::Null => None,
+            Value::Bool(true) => Some(serde_json::json!({"type": "web_search"})),
+            Value::Object(map) => {
+                let mut tool = map.clone();
+                tool.insert("type".to_string(), Value::String("web_search".to_string()));
+                Some(Value::Object(tool))
+            }
+            _ => None,
+        }
+    }
+
+    fn normalize_openai_image_response_value(
+        &self,
+        request: ProviderImageGenerationRequest,
+        value: Value,
+        hosted_responses: bool,
+    ) -> Result<ProviderImageGenerationOutput, LlmError> {
+        let (width, height) = dimensions_from_size_preference(&request.generate_request.size);
+        let media_type = media_type_from_format_preference(request.generate_request.format);
+        let mut images = Vec::new();
+        let mut revised_prompt = RevisedPromptDisposition::NotRequested;
+        let mut provider_text = Vec::new();
+        let mut image_generation_call_id = None;
+
+        if hosted_responses {
+            if let Some(output) = value.get("output").and_then(Value::as_array) {
+                for item in output {
+                    match item.get("type").and_then(Value::as_str) {
+                        Some("image_generation_call") => {
+                            if image_generation_call_id.is_none() {
+                                image_generation_call_id =
+                                    item.get("id").and_then(Value::as_str).map(str::to_string);
+                            }
+                            if let Some(data) = item
+                                .get("result")
+                                .or_else(|| item.get("b64_json"))
+                                .or_else(|| item.get("image_data"))
+                                .and_then(Value::as_str)
+                            {
+                                images.push(ProviderGeneratedImage {
+                                    media_type: media_type.clone(),
+                                    base64_data: normalize_base64_image_data(data),
+                                    width,
+                                    height,
+                                });
+                            }
+                            if let Some(text) = item.get("revised_prompt").and_then(Value::as_str)
+                                && let Ok(prompt) = meerkat_core::PromptText::new(text.to_string())
+                            {
+                                revised_prompt = RevisedPromptDisposition::Revised {
+                                    text: prompt,
+                                    source: RevisedPromptSource::Provider,
+                                };
+                            }
+                        }
+                        Some("message") => {
+                            if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                                for part in parts {
+                                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                        provider_text.push(text.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else if let Some(data) = value.get("data").and_then(Value::as_array) {
+            for item in data {
+                if let Some(data) = item.get("b64_json").and_then(Value::as_str) {
+                    images.push(ProviderGeneratedImage {
+                        media_type: media_type.clone(),
+                        base64_data: normalize_base64_image_data(data),
+                        width,
+                        height,
+                    });
+                }
+                if let Some(text) = item.get("revised_prompt").and_then(Value::as_str)
+                    && let Ok(prompt) = meerkat_core::PromptText::new(text.to_string())
+                {
+                    revised_prompt = RevisedPromptDisposition::Revised {
+                        text: prompt,
+                        source: RevisedPromptSource::Provider,
+                    };
+                }
+            }
+        }
+
+        let terminal_observation = if images.is_empty() {
+            ImageProviderTerminalObservation::EmptyResult
+        } else {
+            ImageProviderTerminalObservation::Generated
+        };
+        let warnings = Self::image_count_warning(&request, images.len());
+        Ok(ProviderImageGenerationOutput {
+            operation_id: request.operation_id,
+            terminal_observation,
+            images,
+            provider_text: if provider_text.is_empty() {
+                None
+            } else {
+                Some(provider_text.join("\n"))
+            },
+            revised_prompt,
+            native_metadata: ProviderImageMetadata::OpenAi(OpenAiImageMetadata {
+                target_model: request.model,
+                response_id: value.get("id").and_then(Value::as_str).map(str::to_string),
+                image_generation_call_id,
+            }),
+            warnings,
+        })
+    }
+
+    async fn normalize_openai_image_stream(
+        &self,
+        request: ProviderImageGenerationRequest,
+        response: reqwest::Response,
+    ) -> Result<ProviderImageGenerationOutput, LlmError> {
+        let mut stream = Box::pin(response.bytes_stream());
+        let mut buffer = String::with_capacity(512);
+        let mut streamed_output_items: Vec<Value> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| LlmError::ConnectionReset)?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(newline_pos) = buffer.find('\n') {
+                let line = buffer[..newline_pos].trim();
+                let should_process = !line.is_empty() && !line.starts_with(':');
+                let parsed_event = if should_process {
+                    Self::parse_responses_sse_line(line)?
+                } else {
+                    None
+                };
+                buffer.drain(..=newline_pos);
+
+                let Some(event) = parsed_event else {
+                    continue;
+                };
+                if matches!(event.event_type.as_str(), "error" | "response.error") {
+                    return Ok(Self::openai_streamed_image_failure_output(
+                        request,
+                        &event.event_type,
+                        event.response,
+                        event.error,
+                    ));
+                }
+                if matches!(
+                    event.event_type.as_str(),
+                    "response.output_item.added" | "response.output_item.done"
+                ) && let Some(item) = event.item.as_ref()
+                    && item
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind == "image_generation_call")
+                {
+                    if let Some(id) = item.get("id").and_then(Value::as_str) {
+                        if let Some(existing) = streamed_output_items
+                            .iter_mut()
+                            .find(|existing| existing.get("id").and_then(Value::as_str) == Some(id))
+                        {
+                            *existing = item.clone();
+                        } else {
+                            streamed_output_items.push(item.clone());
+                        }
+                    } else {
+                        streamed_output_items.push(item.clone());
+                    }
+                }
+                if event.event_type == "response.failed" {
+                    return Ok(Self::openai_streamed_image_failure_output(
+                        request,
+                        &event.event_type,
+                        event.response,
+                        event.error,
+                    ));
+                }
+                if event.event_type == "response.completed" {
+                    let mut value = event.response.ok_or_else(|| LlmError::StreamParseError {
+                        message: "OpenAI streamed image response.completed missing response"
+                            .to_string(),
+                    })?;
+                    if !streamed_output_items.is_empty()
+                        && !value
+                            .get("output")
+                            .and_then(Value::as_array)
+                            .is_some_and(|items| {
+                                items.iter().any(|item| {
+                                    item.get("type").and_then(Value::as_str)
+                                        == Some("image_generation_call")
+                                })
+                            })
+                        && let Some(obj) = value.as_object_mut()
+                    {
+                        obj.insert(
+                            "output".to_string(),
+                            Value::Array(streamed_output_items.clone()),
+                        );
+                    }
+                    return self.normalize_openai_image_response_value(request, value, true);
+                }
+            }
+        }
+
+        Err(LlmError::IncompleteResponse {
+            message: "OpenAI streamed image response ended before response.completed".to_string(),
+        })
+    }
+
+    async fn normalize_openai_image_response(
+        &self,
+        request: ProviderImageGenerationRequest,
+        response: reqwest::Response,
+        hosted_responses: bool,
+    ) -> Result<ProviderImageGenerationOutput, LlmError> {
+        let status_code = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        if !(200..=299).contains(&status_code) {
+            let warning_text = if text.trim().is_empty() {
+                format!("OpenAI image request failed with HTTP {status_code}")
+            } else {
+                format!("OpenAI image request failed with HTTP {status_code}: {text}")
+            };
+            return Ok(ProviderImageGenerationOutput {
+                operation_id: request.operation_id,
+                terminal_observation: Self::openai_error_observation(status_code, &text),
+                images: Vec::new(),
+                provider_text: None,
+                revised_prompt: RevisedPromptDisposition::NotRequested,
+                native_metadata: ProviderImageMetadata::OpenAi(OpenAiImageMetadata {
+                    target_model: request.model,
+                    response_id: None,
+                    image_generation_call_id: None,
+                }),
+                warnings: vec![ImageGenerationWarning::ProviderExecutionFailed {
+                    message: warning_text,
+                }],
+            });
+        }
+
+        let value: Value = serde_json::from_str(&text).map_err(|e| LlmError::StreamParseError {
+            message: format!("invalid OpenAI image response JSON: {e}"),
+        })?;
+        self.normalize_openai_image_response_value(request, value, hosted_responses)
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl ImageGenerationExecutor for OpenAiClient {
+    async fn execute_image_generation(
+        &self,
+        request: ProviderImageGenerationRequest,
+    ) -> Result<ProviderImageGenerationOutput, LlmError> {
+        match request.execution_plan.clone() {
+            plan if OpenAiImageGenerationProfile.matches_provider_id(&plan.provider.0) => {
+                match plan.backend {
+                    meerkat_core::ImageGenerationBackendKind::HostedTool => {
+                        let provider_plan: OpenAiResponsesImagePlan =
+                            serde_json::from_value(plan.provider_plan).map_err(|err| {
+                                LlmError::InvalidRequest {
+                                    message: format!("invalid OpenAI hosted image plan: {err}"),
+                                }
+                            })?;
+                        self.execute_hosted_responses_image(request, provider_plan)
+                            .await
+                    }
+                    meerkat_core::ImageGenerationBackendKind::ProviderApi => {
+                        let provider_plan: OpenAiImagesApiPlan =
+                            serde_json::from_value(plan.provider_plan).map_err(|err| {
+                                LlmError::InvalidRequest {
+                                    message: format!("invalid OpenAI Images API plan: {err}"),
+                                }
+                            })?;
+                        let model = request.model.clone();
+                        self.execute_images_api(request, model, provider_plan).await
+                    }
+                    other => Err(LlmError::InvalidRequest {
+                        message: format!("OpenAI image executor cannot run backend {other:?}"),
+                    }),
+                }
+            }
+            other => Err(LlmError::InvalidRequest {
+                message: format!("OpenAI image executor cannot run plan {other:?}"),
+            }),
+        }
+    }
+}
+
+/// OpenAI strict JSON schema mode requires `additionalProperties: false` on
+/// object schemas. We preserve explicit caller values and only inject when
+/// missing.
+fn ensure_additional_properties_false(value: &mut Value) {
+    match value {
+        Value::Object(obj) => {
+            let is_object_type = match obj.get("type") {
+                Some(Value::String(t)) => t == "object",
+                Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("object")),
+                _ => obj.contains_key("properties") || obj.contains_key("required"),
+            };
+
+            if is_object_type && !obj.contains_key("additionalProperties") {
+                obj.insert("additionalProperties".to_string(), Value::Bool(false));
+            }
+
+            for child in obj.values_mut() {
+                ensure_additional_properties_false(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                ensure_additional_properties_false(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl LlmClient for OpenAiClient {
+    fn project_replay_messages(&self, messages: &[Message]) -> Result<Vec<Message>, LlmError> {
+        project_openai_replay_messages_for_capabilities(
+            messages,
+            OpenAiReplayProjectionMode::Responses,
+            self.supports_image_input,
+            true,
+        )
+    }
+
+    fn request_pressure(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<meerkat_core::ProviderRequestPressure>, LlmError> {
+        let mut projected_request = request.clone();
+        projected_request.messages = self.project_replay_messages(&request.messages)?;
+        let (body, continuation_plan) =
+            self.build_request_body_with_continuation(&projected_request)?;
+        let mut encoded_body =
+            serde_json::to_vec(&body).map_err(|error| LlmError::InvalidRequest {
+                message: format!("failed to serialize OpenAI request body: {error}"),
+            })?;
+        // A rejected continuation is retried as a full replay. The pressure
+        // witness must cover the largest body this one invocation may send.
+        if continuation_plan.is_some() {
+            let fallback_body = self.build_request_body(&projected_request)?;
+            let fallback_encoded =
+                serde_json::to_vec(&fallback_body).map_err(|error| LlmError::InvalidRequest {
+                    message: format!("failed to serialize OpenAI fallback request body: {error}"),
+                })?;
+            if fallback_encoded.len() > encoded_body.len() {
+                encoded_body = fallback_encoded;
+            }
+        }
+        Ok(Some(
+            meerkat_core::ProviderRequestPressure::new(
+                encoded_body.len() as u64,
+                meerkat_models::approximate_request_byte_cap(self.provider()),
+            )
+            .with_lowered_request_provenance(
+                meerkat_core::LoweredRequestProvenance::from_body(
+                    Provider::OpenAI,
+                    meerkat_core::LoweredRequestEncoding::OpenAiResponsesJson,
+                    &encoded_body,
+                ),
+            ),
+        ))
+    }
+
+    fn authored_cache_breakpoints(
+        &self,
+        request: &LlmRequest,
+        canonical_messages: &[Message],
+    ) -> Result<Vec<meerkat_core::ProviderCacheBreakpointClaim>, LlmError> {
+        let Some(tag) = openai_tag(request) else {
+            return Ok(Vec::new());
+        };
+        let explicit = tag.prompt_cache_enabled != Some(false)
+            && tag.prompt_cache_options.is_some_and(|options| {
+                options.mode
+                    == Some(
+                        meerkat_core::model_profile::capabilities::OpenAiPromptCacheMode::Explicit,
+                    )
+            });
+        if !explicit || request.messages.len() != canonical_messages.len() {
+            return Ok(Vec::new());
+        }
+        // A previous_response_id request lowers only a replay suffix and may
+        // fall back to full replay after provider rejection. It has no single
+        // authored rendered prefix, so cache inheritance is unavailable.
+        if openai_continuation_plan(request).is_some() {
+            return Ok(Vec::new());
+        }
+
+        // Validate the exact full lowering first. Boundary evidence is minted
+        // only if the same renderer successfully authored the body.
+        let body = self.build_request_body(request)?;
+        let encoded_body = serde_json::to_vec(&body).map_err(|error| LlmError::InvalidRequest {
+            message: format!("failed to serialize OpenAI cache evidence body: {error}"),
+        })?;
+        let system_mode = if self.is_chatgpt_backend_wire() {
+            Self::validate_chatgpt_system_messages(&request.messages)?;
+            SystemMessageMode::ExtractToInstructions
+        } else {
+            SystemMessageMode::IncludeInInput
+        };
+        let (_, _, boundaries) = Self::convert_to_responses_input_with_system_mode(
+            &request.messages,
+            system_mode,
+            ResponsesCacheBreakpoints::EveryInput,
+        )?;
+        let ttl = if tag
+            .prompt_cache_options
+            .and_then(|options| options.ttl)
+            .is_some()
+        {
+            meerkat_core::ProviderCacheTtl::ThirtyMinutes
+        } else if matches!(
+            tag.prompt_cache_retention,
+            Some(OpenAiPromptCacheRetention::TwentyFourHours)
+        ) {
+            meerkat_core::ProviderCacheTtl::TwentyFourHours
+        } else {
+            meerkat_core::ProviderCacheTtl::ProviderDefault
+        };
+        boundaries
+            .into_iter()
+            .map(|(boundary, input_item_count)| {
+                let input = body
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.get(..input_item_count))
+                    .ok_or_else(|| LlmError::InvalidRequest {
+                        message: "OpenAI cache breakpoint did not map to lowered input items"
+                            .to_string(),
+                    })?;
+                let rendered_prefix = serde_json::to_vec(&serde_json::json!({
+                    "renderer_mode": match system_mode {
+                        SystemMessageMode::IncludeInInput => "responses_full_replay_input_system_v1",
+                        SystemMessageMode::ExtractToInstructions => "responses_full_replay_instructions_v1",
+                    },
+                    "model": body.get("model"),
+                    "instructions": body.get("instructions"),
+                    "tools": body.get("tools"),
+                    "tool_choice": body.get("tool_choice"),
+                    "parallel_tool_calls": body.get("parallel_tool_calls"),
+                    "prompt_cache_key": body.get("prompt_cache_key"),
+                    "prompt_cache_retention": body.get("prompt_cache_retention"),
+                    "prompt_cache_options": body.get("prompt_cache_options"),
+                    "input": input,
+                }))
+                .map_err(|error| LlmError::InvalidRequest {
+                    message: format!("failed to serialize OpenAI rendered cache prefix: {error}"),
+                })?;
+                meerkat_core::provider_cache_breakpoint_claim(
+                    meerkat_core::ProviderCacheBreakpointClaimRequest {
+                        provider: Provider::OpenAI,
+                        model: &request.model,
+                        messages: canonical_messages,
+                        boundary,
+                        ttl,
+                        rendered_prefix: &rendered_prefix,
+                        lowered_request_encoding:
+                            meerkat_core::LoweredRequestEncoding::OpenAiResponsesJson,
+                        lowered_request_body: &encoded_body,
+                    },
+                )
+                .map_err(|error| LlmError::InvalidRequest {
+                    message: format!("invalid OpenAI cache-breakpoint evidence: {error}"),
+                })
+            })
+            .collect()
+    }
+
+    fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
+        let inner: LlmStream<'a> = Box::pin(async_stream::try_stream! {
+            let mut projected_request = request.clone();
+            projected_request.messages = self.project_replay_messages(&request.messages)?;
+            let request = &projected_request;
+            let (body, continuation_plan) = self.build_request_body_with_continuation(request)?;
+            let fallback_body = if continuation_plan.is_some() {
+                Some(self.build_request_body(request)?)
+            } else {
+                None
+            };
+
+            let endpoint = self.responses_endpoint();
+            let response = self
+                .responses_response_with_fallback(
+                    &endpoint,
+                    &body,
+                    fallback_body,
+                    request.has_images(),
+                )
+                .await?;
+            let mut stream = response.bytes_stream();
+            let mut buffer = String::with_capacity(512);
+            let mut usage = Usage::default();
+            let mut active_response_id: Option<String> = None;
+            let mut saw_stream_text_delta = false;
+            let mut streamed_text_items: HashSet<String> = HashSet::new();
+            let mut assistant_items: HashMap<String, Value> = HashMap::new();
+            let mut completed_items: std::collections::BTreeMap<ResponsesOutputIndex, Value> = std::collections::BTreeMap::new();
+            let mut streamed_tool_ids: HashSet<String> = HashSet::with_capacity(4);
+            let mut response_item_tool_calls: HashMap<String, (String, String)> =
+                HashMap::with_capacity(4);
+            let mut streamed_reasoning_ids: HashSet<String> = HashSet::with_capacity(2);
+            let mut streamed_web_search_ids: HashSet<String> = HashSet::new();
+            let mut done_emitted = false;
+            let mut saw_terminal_fallback_output = false;
+
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| LlmError::ConnectionReset)?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                let chunk_yielded = std::cell::Cell::new(false);
+                let mut chunk_consumed_line = false;
+                while let Some(newline_pos) = buffer.find('\n') {
+                    chunk_consumed_line = true;
+                    let line = buffer[..newline_pos].trim();
+                    if line == "data: [DONE]" {
+                        buffer.drain(..=newline_pos);
+                        if !done_emitted && saw_terminal_fallback_output {
+                            if !completed_items.is_empty() {
+                                let blocks = crate::responses_output::lower_items(completed_items.values(), active_response_id.as_deref())?;
+                                crate::responses_output::validate_coverage(
+                                    &blocks, &streamed_tool_ids, &streamed_reasoning_ids, &streamed_text_items, &streamed_web_search_ids,
+                                )?;
+                                yield LlmEvent::AssistantOutput { blocks };
+                            }
+                            done_emitted = true;
+                            let stop_reason = if streamed_tool_ids.is_empty() {
+                                StopReason::EndTurn
+                            } else {
+                                StopReason::ToolUse
+                            };
+                            chunk_yielded.set(true);
+                            yield LlmEvent::Done {
+                                outcome: LlmDoneOutcome::Success { stop_reason },
+                            };
+                        }
+                        continue;
+                    }
+                    let should_process = !line.is_empty() && !line.starts_with(':');
+                    let parsed_event = if should_process {
+                        Self::parse_responses_sse_line(line)?
+                    } else {
+                        None
+                    };
+
+                    buffer.drain(..=newline_pos);
+
+                    if let Some(event) = parsed_event {
+                        if let Some(response_id) = event
+                            .response
+                            .as_ref()
+                            .and_then(openai_response_id_from_response)
+                        {
+                            active_response_id = Some(response_id);
+                        }
+                        // Responses API terminal events carry the same full response
+                        // object. `response.incomplete` is terminal too (for example,
+                        // when max_output_tokens is exhausted), so it must take the
+                        // same output/usage projection path as `response.completed`.
+                        if event.event_type == "response.completed"
+                            || event.event_type == "response.incomplete"
+                            || event.event_type == "response.done"
+                        {
+                            if done_emitted {
+                                // Already processed a terminal event, skip
+                                continue;
+                            }
+                            if event.response.is_none() {
+                                done_emitted = true;
+                                chunk_yielded.set(true);
+                                yield LlmEvent::Done {
+                                    outcome: missing_terminal_response_outcome(&event.event_type),
+                                };
+                                continue;
+                            }
+                            if let Some(response_obj) = &event.response {
+                                if let Err(error) = validate_responses_terminal_status(
+                                    &event.event_type,
+                                    response_obj,
+                                ) {
+                                    done_emitted = true;
+                                    chunk_yielded.set(true);
+                                    yield LlmEvent::Done {
+                                        outcome: LlmDoneOutcome::Error { error },
+                                    };
+                                    continue;
+                                }
+                                let final_blocks = match response_obj.get("output") {
+                                    Some(Value::Array(output)) if !output.is_empty() => {
+                                        crate::responses_output::validate_completed_coverage(output, completed_items.values())?;
+                                        Some(crate::responses_output::lower_items(output, active_response_id.as_deref())?)
+                                    },
+                                    Some(Value::Array(_)) | None if !completed_items.is_empty() => Some(
+                                        crate::responses_output::lower_items(completed_items.values(), active_response_id.as_deref())?
+                                    ),
+                                    Some(Value::Array(_)) | None => None,
+                                    Some(_) => Err(LlmError::StreamParseError { message: "Responses output must be an array".into() })?,
+                                };
+                                if let Some(blocks) = final_blocks.as_ref() {
+                                    crate::responses_output::validate_coverage(
+                                        blocks, &streamed_tool_ids, &streamed_reasoning_ids, &streamed_text_items, &streamed_web_search_ids,
+                                    )?;
+                                }
+                                // Process output items
+                                if let Some(output) = response_obj.get("output").and_then(|o| o.as_array()) {
+                                    for item in output {
+                                        if let Some(item_type) = item.get("type").and_then(|t| t.as_str()) {
+                                            match item_type {
+                                                "message" => {
+                                                    // content is an array: [{"type": "output_text", "text": "..."}, ...]
+                                                    if let Some(content_parts) = item.get("content").and_then(|c| c.as_array()) {
+                                                        for part in content_parts {
+                                                            if let Some(part_type) = part.get("type").and_then(|t| t.as_str()) {
+                                                                match part_type {
+                                                                    "output_text" => {
+                                                                        if let Some(annotations) = part
+                                                                            .get("annotations")
+                                                                            .and_then(web_search_message_annotations)
+                                                                        {
+                                                                            chunk_yielded.set(true);
+                                                                            yield LlmEvent::ServerToolContent {
+                                                                                id: item.get("id")
+                                                                                    .and_then(|v| v.as_str())
+                                                                                    .map(std::string::ToString::to_string),
+                                                                                kind: ServerToolKind::WebSearch,
+                                                                                content: serde_json::json!({
+                                                                                    "type": "message_annotations",
+                                                                                    "annotations": annotations
+                                                                                }),
+                                                                                meta: openai_response_meta(active_response_id.as_deref()),
+                                                                            };
+                                                                        }
+                                                                        if let Some(text) = part.get("text").and_then(|t| t.as_str())
+                                                                            && !saw_stream_text_delta
+                                                                            && !item.get("id").and_then(Value::as_str).is_some_and(|id| streamed_text_items.contains(id))
+                                                                        {
+                                                                            let meta = crate::responses_output::assistant_meta(item, active_response_id.as_deref())?;
+                                                                            saw_terminal_fallback_output = true;
+                                                                            chunk_yielded.set(true);
+                                                                            yield LlmEvent::TextDelta { delta: text.to_string(), meta };
+                                                                        }
+                                                                    }
+                                                                    "refusal" => {
+                                                                        if let Some(refusal) = part.get("refusal").and_then(|r| r.as_str())
+                                                                            && !saw_stream_text_delta
+                                                                            && !item.get("id").and_then(Value::as_str).is_some_and(|id| streamed_text_items.contains(id))
+                                                                        {
+                                                                            let meta = crate::responses_output::assistant_meta(item, active_response_id.as_deref())?;
+                                                                            saw_terminal_fallback_output = true;
+                                                                            chunk_yielded.set(true);
+                                                                            yield LlmEvent::TextDelta { delta: refusal.to_string(), meta };
+                                                                        }
+                                                                    }
+                                                                    _ => {}
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                "reasoning" => {
+                                                    // Required: reasoning item ID for replay
+                                                    let Some(reasoning_id) = item.get("id").and_then(|i| i.as_str()) else {
+                                                        tracing::warn!("reasoning item missing id, skipping");
+                                                        continue;
+                                                    };
+
+                                                    // Skip if already emitted via streaming
+                                                    if streamed_reasoning_ids.contains(reasoning_id) {
+                                                        continue;
+                                                    }
+
+                                                    // Extract summary text
+                                                    let mut summary_text = String::new();
+                                                    if let Some(summaries) = item.get("summary").and_then(|s| s.as_array()) {
+                                                        for summary in summaries {
+                                                            if let Some(text) = summary.get("text").and_then(|t| t.as_str()) {
+                                                                if !summary_text.is_empty() {
+                                                                    summary_text.push('\n');
+                                                                }
+                                                                summary_text.push_str(text);
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // encrypted_content is optional
+                                                    let encrypted = item.get("encrypted_content")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(std::string::ToString::to_string);
+                                                    let phase = item.get("phase")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(std::string::ToString::to_string);
+
+                                                    let meta = Some(Box::new(ProviderMeta::OpenAi {
+                                                        id: reasoning_id.to_string(),
+                                                        encrypted_content: encrypted,
+                                                        phase,
+                                                        response_id: active_response_id.clone(),
+                                                    }));
+
+                                                    if !summary_text.is_empty() {
+                                                        saw_terminal_fallback_output = true;
+                                                    }
+
+                                                    chunk_yielded.set(true);
+                                                    yield LlmEvent::ReasoningComplete {
+                                                        text: summary_text,
+                                                        meta,
+                                                    };
+                                                }
+                                                "function_call" => {
+                                                    // Extract required fields
+                                                    let Some(call_id) = item.get("call_id").and_then(|c| c.as_str()) else {
+                                                        tracing::warn!("function_call missing call_id");
+                                                        continue;
+                                                    };
+
+                                                    // Skip if already emitted via streaming
+                                                    if streamed_tool_ids.contains(call_id) {
+                                                        continue;
+                                                    }
+                                                    let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
+                                                        tracing::warn!(call_id, "function_call missing name");
+                                                        continue;
+                                                    };
+                                                    // arguments is a JSON string. Missing arguments
+                                                    // represent a no-arg tool; malformed or non-object
+                                                    // JSON fails closed before projection.
+                                                    let (_, args_value) = match item.get("arguments").and_then(|a| a.as_str()) {
+                                                        Some(args_str) => parse_tool_call_arguments(args_str, call_id)?,
+                                                        None => {
+                                                            // Empty args - treat as empty object
+                                                            (empty_tool_args_raw_value(), serde_json::json!({}))
+                                                        }
+                                                    };
+
+                                                    chunk_yielded.set(true);
+                                                    yield LlmEvent::ToolCallComplete {
+                                                        id: call_id.to_string(),
+                                                        name: name.into(),
+                                                        args: args_value,
+                                                        meta: openai_response_meta(active_response_id.as_deref()),
+                                                    };
+                                                    saw_terminal_fallback_output = true;
+                                                }
+                                                "web_search_call" | "web_search_result" => {
+                                                    let id = item.get("id")
+                                                        .or_else(|| item.get("call_id"))
+                                                        .and_then(|v| v.as_str())
+                                                        .map(std::string::ToString::to_string);
+                                                    // Sub-event discriminator (`web_search_call`
+                                                    // vs `web_search_result`) is preserved in
+                                                    // `content["type"]`; the semantic kind is web search.
+                                                    chunk_yielded.set(true);
+                                                    yield LlmEvent::ServerToolContent {
+                                                        id,
+                                                        kind: ServerToolKind::WebSearch,
+                                                        content: item.clone(),
+                                                        meta: openai_response_meta(active_response_id.as_deref()),
+                                                    };
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some(blocks) = final_blocks {
+                                    // Last content event: usage and terminal fate follow.
+                                    chunk_yielded.set(true);
+                                    yield LlmEvent::AssistantOutput { blocks };
+                                }
+                                // Extract usage
+                                if let Some(usage_obj) = response_obj.get("usage") {
+                                    apply_responses_usage(&mut usage, usage_obj, &request.model);
+                                    chunk_yielded.set(true);
+                                    yield LlmEvent::UsageUpdate {
+                                        usage: meerkat_core::TurnUsage::try_from_usage(usage.clone())
+                                            .map_err(|error| LlmError::Unknown {
+                                                message: error.to_string(),
+                                            })?,
+                                    };
+                                }
+
+                                done_emitted = true;
+                                chunk_yielded.set(true);
+                                yield LlmEvent::Done {
+                                    outcome: responses_terminal_outcome(
+                                        &event.event_type,
+                                        response_obj,
+                                    ),
+                                };
+                            }
+                        }
+                        // Handle streaming delta events
+                        else if event.event_type == "response.output_item.added" {
+                            if let Some(item) = &event.item {
+                                crate::responses_output::validate_item(item)?;
+                                if item.get("type").and_then(Value::as_str) == Some("message")
+                                    && let Some(id) = item.get("id").and_then(Value::as_str)
+                                {
+                                    assistant_items.insert(id.to_owned(), item.clone());
+                                }
+                            }
+                            if let Some(item) = &event.item
+                                && item.get("type").and_then(Value::as_str) == Some("function_call")
+                                && let (Some(item_id), Some(call_id), Some(name)) = (
+                                    item.get("id").and_then(Value::as_str),
+                                    item.get("call_id").and_then(Value::as_str),
+                                    item.get("name").and_then(Value::as_str),
+                                )
+                            {
+                                response_item_tool_calls.insert(
+                                    item_id.to_string(),
+                                    (call_id.to_string(), name.to_string()),
+                                );
+                            }
+                        }
+                        else if event.event_type == "response.output_text.delta" {
+                            if let Some(delta) = &event.delta {
+                                if let Some(id) = &event.item_id {
+                                    streamed_text_items.insert(id.clone());
+                                } else {
+                                    saw_stream_text_delta = true;
+                                }
+                                saw_terminal_fallback_output = true;
+                                let meta = match event.item_id.as_ref().and_then(|id| assistant_items.get(id)) {
+                                    Some(item) => crate::responses_output::assistant_meta(item, active_response_id.as_deref())?,
+                                    None => openai_response_meta(active_response_id.as_deref()),
+                                };
+                                chunk_yielded.set(true);
+                                yield LlmEvent::TextDelta { delta: delta.clone(), meta };
+                            }
+                        }
+                        else if event.event_type == "response.reasoning_summary_text.delta" {
+                            if let Some(delta) = &event.delta {
+                                if !delta.trim().is_empty() {
+                                    saw_terminal_fallback_output = true;
+                                }
+                                chunk_yielded.set(true);
+                                yield LlmEvent::ReasoningDelta { delta: delta.clone() };
+                            }
+                        }
+                        else if event.event_type == "response.function_call_arguments.delta" {
+                            if let Some(delta) = &event.delta {
+                                let item_lookup = event
+                                    .item_id
+                                    .as_ref()
+                                    .and_then(|item_id| response_item_tool_calls.get(item_id));
+                                let call_id = event
+                                    .call_id
+                                    .as_ref()
+                                    .or_else(|| item_lookup.map(|(call_id, _)| call_id));
+                                let Some(call_id) = call_id else {
+                                    continue;
+                                };
+                                let name = event
+                                    .name
+                                    .clone()
+                                    .or_else(|| item_lookup.map(|(_, name)| name.clone()));
+                                chunk_yielded.set(true);
+                                yield LlmEvent::ToolCallDelta {
+                                    id: call_id.clone(),
+                                    name,
+                                    args_delta: delta.clone(),
+                                };
+                            }
+                        }
+                        else if event.event_type == "response.function_call_arguments.done" {
+                            if let Some(arguments) = &event.arguments {
+                                let item_lookup = event
+                                    .item_id
+                                    .as_ref()
+                                    .and_then(|item_id| response_item_tool_calls.get(item_id));
+                                let call_id = event
+                                    .call_id
+                                    .as_ref()
+                                    .or_else(|| item_lookup.map(|(call_id, _)| call_id));
+                                let Some(call_id) = call_id else {
+                                    continue;
+                                };
+                                let name = event
+                                    .name
+                                    .clone()
+                                    .or_else(|| item_lookup.map(|(_, name)| name.clone()))
+                                    .unwrap_or_default();
+                                let (_, args_value) =
+                                    parse_tool_call_arguments(arguments, call_id)?;
+
+                                streamed_tool_ids.insert(call_id.clone());
+                                saw_terminal_fallback_output = true;
+                                chunk_yielded.set(true);
+                                yield LlmEvent::ToolCallComplete {
+                                    id: call_id.clone(),
+                                    name,
+                                    args: args_value,
+                                    meta: openai_response_meta(active_response_id.as_deref()),
+                                };
+                            }
+                        }
+                        else if event.event_type == "response.output_item.done" {
+                            if let Some(item) = &event.item {
+                                crate::responses_output::validate_item(item)?;
+                                if let Some(index) = event.output_index {
+                                    completed_items.insert(ResponsesOutputIndex(index), item.clone());
+                                }
+                            }
+                            if let Some(item) = &event.item
+                                && item.get("type").and_then(Value::as_str) == Some("function_call")
+                            {
+                                let Some(call_id) = item.get("call_id").and_then(Value::as_str)
+                                else {
+                                    tracing::warn!("function_call output item missing call_id");
+                                    continue;
+                                };
+                                if streamed_tool_ids.contains(call_id) {
+                                    continue;
+                                }
+                                let Some(name) = item.get("name").and_then(Value::as_str) else {
+                                    tracing::warn!(call_id, "function_call output item missing name");
+                                    continue;
+                                };
+                                let (_, args_value) = match item
+                                    .get("arguments")
+                                    .and_then(Value::as_str)
+                                {
+                                    Some(arguments) => {
+                                        parse_tool_call_arguments(arguments, call_id)?
+                                    }
+                                    None => (empty_tool_args_raw_value(), serde_json::json!({})),
+                                };
+
+                                streamed_tool_ids.insert(call_id.to_string());
+                                saw_terminal_fallback_output = true;
+                                chunk_yielded.set(true);
+                                yield LlmEvent::ToolCallComplete {
+                                    id: call_id.to_string(),
+                                    name: name.to_string(),
+                                    args: args_value,
+                                    meta: openai_response_meta(active_response_id.as_deref()),
+                                };
+                            }
+                        }
+                        else if event.event_type == "response.reasoning_summary.done" || event.event_type == "response.reasoning.done" {
+                            // Extract reasoning item details from the item field
+                            if let Some(item) = &event.item {
+                                let Some(reasoning_id) = item.get("id")
+                                    .and_then(|i| i.as_str()) else {
+                                    tracing::warn!("reasoning item missing id, skipping");
+                                    continue;
+                                };
+
+                                let mut summary_text = String::new();
+                                if let Some(summaries) = item.get("summary").and_then(|s| s.as_array()) {
+                                    for summary in summaries {
+                                        if let Some(text) = summary.get("text").and_then(|t| t.as_str()) {
+                                            if !summary_text.is_empty() {
+                                                summary_text.push('\n');
+                                            }
+                                            summary_text.push_str(text);
+                                        }
+                                    }
+                                }
+
+                                let encrypted = item.get("encrypted_content")
+                                    .and_then(|v| v.as_str())
+                                    .map(std::string::ToString::to_string);
+                                let phase = item.get("phase")
+                                    .and_then(|v| v.as_str())
+                                    .map(std::string::ToString::to_string);
+
+                                let meta = Some(Box::new(ProviderMeta::OpenAi {
+                                    id: reasoning_id.to_string(),
+                                    encrypted_content: encrypted,
+                                    phase,
+                                    response_id: active_response_id.clone(),
+                                }));
+
+                                if !summary_text.is_empty() {
+                                    saw_terminal_fallback_output = true;
+                                }
+
+                                streamed_reasoning_ids.insert(reasoning_id.to_string());
+                                if !summary_text.trim().is_empty() || meta.is_some() {
+                                    saw_terminal_fallback_output = true;
+                                }
+                                chunk_yielded.set(true);
+                                yield LlmEvent::ReasoningComplete {
+                                    text: summary_text,
+                                    meta,
+                                };
+                            }
+                        }
+                        else if event.event_type.starts_with("response.web_search_call.") {
+                            if let Some(id) = &event.item_id {
+                                streamed_web_search_ids.insert(id.clone());
+                            }
+                            let mut content = serde_json::Map::new();
+                            content.insert("type".to_string(), Value::String(event.event_type.clone()));
+                            if let Some(item_id) = &event.item_id {
+                                content.insert("item_id".to_string(), Value::String(item_id.clone()));
+                            }
+                            if let Some(output_index) = event.output_index {
+                                content.insert("output_index".to_string(), Value::from(output_index));
+                            }
+                            if let Some(sequence_number) = event.sequence_number {
+                                content.insert("sequence_number".to_string(), Value::from(sequence_number));
+                            }
+                            chunk_yielded.set(true);
+                            yield LlmEvent::ServerToolContent {
+                                id: event.item_id.clone(),
+                                kind: ServerToolKind::WebSearch,
+                                content: Value::Object(content),
+                                meta: openai_response_meta(active_response_id.as_deref()),
+                            };
+                        }
+                        else if event.event_type == "response.failed" {
+                            let error_msg = event.response
+                                .as_ref()
+                                .and_then(responses_error_object)
+                                .and_then(|e| e.get("message"))
+                                .and_then(|m| m.as_str())
+                                .or_else(|| event.response
+                                    .as_ref()
+                                    .and_then(|r| r.get("status_details"))
+                                    .and_then(|d| d.get("error"))
+                                    .and_then(|e| e.get("message"))
+                                    .and_then(|m| m.as_str()))
+                                .unwrap_or("response failed");
+                            let error_code = event.response
+                                .as_ref()
+                                .and_then(responses_error_object)
+                                .and_then(|e| e.get("code"))
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("server_error");
+
+                            tracing::error!(
+                                code = error_code,
+                                message = error_msg,
+                                "OpenAI response failed"
+                            );
+
+                            let error = map_responses_stream_error(error_code, error_msg);
+
+                            done_emitted = true;
+                            chunk_yielded.set(true);
+                            yield LlmEvent::Done {
+                                outcome: LlmDoneOutcome::Error { error },
+                            };
+                        }
+                        else if event.event_type == "error" {
+                            // Streaming error event from OpenAI
+                            let error_msg = event.error
+                                .as_ref()
+                                .and_then(|e| e.get("message"))
+                                .and_then(|m| m.as_str())
+                                .or(event.message.as_deref())
+                                .unwrap_or("unknown streaming error");
+                            let error_code = event.error
+                                .as_ref()
+                                .and_then(|e| e.get("code"))
+                                .and_then(|c| c.as_str())
+                                .or(event.code.as_deref())
+                                .unwrap_or("unknown");
+
+                            tracing::error!(
+                                code = error_code,
+                                message = error_msg,
+                                "OpenAI streaming error"
+                            );
+
+                            let error = map_responses_stream_error(error_code, error_msg);
+
+                            done_emitted = true;
+                            chunk_yielded.set(true);
+                            yield LlmEvent::Done {
+                                outcome: LlmDoneOutcome::Error { error },
+                            };
+                        }
+                    }
+                }
+                // A chunk whose lines produced no semantic event is still wire
+                // liveness (keepalive comments, lifecycle bookkeeping); surface
+                // it so the stream-inactivity watchdog re-arms. Bytes that never
+                // complete a line intentionally do not count.
+                if chunk_consumed_line && !chunk_yielded.get() {
+                    yield LlmEvent::WireLiveness;
+                }
+            }
+        });
+
+        streaming::ensure_terminal_done(inner)
+    }
+
+    fn provider(&self) -> meerkat_core::Provider {
+        meerkat_core::Provider::OpenAI
+    }
+
+    async fn health_check(&self) -> Result<(), LlmError> {
+        Ok(())
+    }
+
+    fn compile_schema(&self, output_schema: &OutputSchema) -> Result<CompiledSchema, SchemaError> {
+        let mut schema = output_schema.schema.as_value().clone();
+        // OpenAI `strict` controls constrained decoding behavior for structured
+        // output. `compat` is only used for provider-lowering policies where
+        // warnings/errors may be emitted (e.g. Gemini keyword compatibility).
+        if output_schema.strict {
+            ensure_additional_properties_false(&mut schema);
+        }
+
+        Ok(CompiledSchema {
+            schema,
+            warnings: Vec::new(),
+        })
+    }
+}
+
+/// SSE event from OpenAI Responses API streaming
+#[derive(Debug, Deserialize)]
+struct ResponsesStreamEvent {
+    /// Event type (e.g., "response.output_text.delta", "response.done")
+    #[serde(rename = "type")]
+    event_type: String,
+    /// Text delta for streaming events
+    delta: Option<String>,
+    /// Call ID for function call events
+    call_id: Option<String>,
+    /// Function name for function call events
+    name: Option<String>,
+    /// Complete arguments for function_call_arguments.done
+    arguments: Option<String>,
+    /// Item object for reasoning/function done events
+    item: Option<Value>,
+    /// Full response object for response.done and response.completed
+    response: Option<Value>,
+    /// Error object for streaming error events
+    error: Option<Value>,
+    /// Official Responses `error` events carry these at the top level;
+    /// compatible endpoints may wrap them in `error` instead.
+    code: Option<String>,
+    message: Option<String>,
+    /// Output item ID for built-in tool streaming events.
+    item_id: Option<String>,
+    /// Output index for built-in tool streaming events.
+    output_index: Option<u64>,
+    /// Sequence number for built-in tool streaming events.
+    sequence_number: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ResponsesOutputIndex(u64);
+
+fn map_responses_stream_error(error_code: &str, error_message: &str) -> LlmError {
+    match error_code {
+        "misalignment_policy_violation" => LlmError::PolicyStop {
+            code: error_code.to_owned(),
+            message: error_message.to_owned(),
+        },
+        "rate_limit_exceeded" => LlmError::RateLimited {
+            retry_after_ms: None,
+        },
+        // Exhausted quota, credit, or spend limit shares the 429 family but
+        // no retry clears it; see `LlmError::QuotaExhausted`.
+        code if LlmError::code_signals_quota_exhausted(code) => LlmError::QuotaExhausted {
+            message: format!("{error_code}: {error_message}"),
+        },
+        "server_error" => LlmError::ServerError {
+            status: 500,
+            message: error_message.to_string(),
+        },
+        "server_is_overloaded" => LlmError::ServerOverloaded,
+        "context_length_exceeded" | "context_window_exceeded" => LlmError::ContextLengthExceeded {
+            max: 0,
+            requested: 1,
+        },
+        "invalid_request_error" => LlmError::from_http_status(400, error_message.to_string(), None),
+        _ => LlmError::Unknown {
+            message: format!("{error_code}: {error_message}"),
+        },
+    }
+}
+
+fn responses_error_object(response: &Value) -> Option<&Value> {
+    response
+        .get("error")
+        .filter(|error| !error.is_null())
+        .or_else(|| {
+            response
+                .get("status_details")
+                .and_then(|details| details.get("error"))
+        })
+}
+
+fn validate_responses_terminal_status(event_type: &str, response: &Value) -> Result<(), LlmError> {
+    if let Some(error) = responses_error_object(response)
+        && error.get("code").and_then(Value::as_str) == Some("misalignment_policy_violation")
+    {
+        return Err(map_responses_stream_error(
+            "misalignment_policy_violation",
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("provider policy stop"),
+        ));
+    }
+    let status = response.get("status").and_then(Value::as_str);
+    let status_is_valid_for_event = match event_type {
+        "response.completed" => status == Some("completed"),
+        "response.incomplete" => status == Some("incomplete"),
+        // Retained for compatible Responses endpoints that emit the
+        // Realtime-style terminal event used by existing integrations.
+        "response.done" => matches!(status, Some("completed" | "incomplete" | "cancelled")),
+        _ => false,
+    };
+    if !status_is_valid_for_event {
+        return Err(LlmError::StreamParseError {
+            message: format!(
+                "OpenAI {event_type} carried incompatible status {}",
+                status.unwrap_or("<missing>")
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn responses_terminal_outcome(event_type: &str, response: &Value) -> LlmDoneOutcome {
+    if let Err(error) = validate_responses_terminal_status(event_type, response) {
+        return LlmDoneOutcome::Error { error };
+    }
+
+    let status = response.get("status").and_then(Value::as_str);
+
+    let stop_reason = match status {
+        Some("completed") => {
+            let has_tool_calls = response
+                .get("output")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("function_call")
+                    })
+                });
+            if has_tool_calls {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            }
+        }
+        Some("incomplete") => {
+            let reason = response
+                .get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str);
+            match reason {
+                // Accept the documented/generated-schema spellings used by
+                // OpenAI and compatible Responses endpoints.
+                Some("max_tokens" | "max_output_tokens") => StopReason::MaxTokens,
+                Some("content_filter") => StopReason::ContentFilter,
+                Some(reason) => {
+                    return LlmDoneOutcome::Error {
+                        error: LlmError::IncompleteResponse {
+                            message: format!(
+                                "OpenAI response was incomplete for unsupported reason '{reason}'"
+                            ),
+                        },
+                    };
+                }
+                None => {
+                    return LlmDoneOutcome::Error {
+                        error: LlmError::IncompleteResponse {
+                            message: "OpenAI response was incomplete without a reason".to_string(),
+                        },
+                    };
+                }
+            }
+        }
+        Some("cancelled") => StopReason::Cancelled,
+        other => {
+            return LlmDoneOutcome::Error {
+                error: LlmError::StreamParseError {
+                    message: format!(
+                        "OpenAI {event_type} carried unsupported terminal status {}",
+                        other.unwrap_or("<missing>")
+                    ),
+                },
+            };
+        }
+    };
+
+    LlmDoneOutcome::Success { stop_reason }
+}
+
+fn missing_terminal_response_outcome(event_type: &str) -> LlmDoneOutcome {
+    LlmDoneOutcome::Error {
+        error: LlmError::StreamParseError {
+            message: format!("OpenAI {event_type} event missing response object"),
+        },
+    }
+}
+
+fn apply_responses_usage(target: &mut Usage, usage: &Value, model: &str) {
+    target.input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    target.output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let cached_tokens = usage
+        .get("input_tokens_details")
+        .or_else(|| usage.get("prompt_tokens_details"))
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64);
+    if let Some(cached_tokens) = cached_tokens {
+        target.cache_read_tokens = Some(cached_tokens);
+    }
+    let cache_write_tokens = usage
+        .get("input_tokens_details")
+        .or_else(|| usage.get("prompt_tokens_details"))
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64);
+    if let Some(cache_write_tokens) = cache_write_tokens {
+        target.cache_creation_tokens = Some(cache_write_tokens);
+    }
+    let reasoning_tokens = usage
+        .get("output_tokens_details")
+        .or_else(|| usage.get("completion_tokens_details"))
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(Value::as_u64);
+    if let Some(reasoning_tokens) = reasoning_tokens {
+        target.reasoning_tokens = Some(reasoning_tokens);
+    }
+    target.provider_accounting = Some(meerkat_core::ProviderTokenAccounting::openai(
+        model,
+        target.input_tokens,
+    ));
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn empty_tool_args_raw_value() -> Box<RawValue> {
+    RawValue::from_string("{}".to_string()).expect("static JSON is valid")
+}
+
+pub(crate) fn parse_tool_call_arguments(
+    arguments: &str,
+    call_id: &str,
+) -> Result<(Box<RawValue>, Value), LlmError> {
+    let raw = RawValue::from_string(arguments.to_string()).map_err(|error| {
+        LlmError::StreamParseError {
+            message: format!("invalid OpenAI tool call arguments JSON for {call_id}: {error}"),
+        }
+    })?;
+    let value: Value =
+        serde_json::from_str(raw.get()).map_err(|error| LlmError::StreamParseError {
+            message: format!("invalid OpenAI tool call arguments JSON for {call_id}: {error}"),
+        })?;
+    if value.is_object() {
+        Ok((raw, value))
+    } else {
+        Err(LlmError::StreamParseError {
+            message: format!("OpenAI tool call arguments for {call_id} must be a JSON object"),
+        })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// Exercise the actual stream path with a real failed reqwest builder.
+    /// No provider, credential or external endpoint is used.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn failed_http_build_never_substitutes_a_default_transport() {
+        use futures::StreamExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let mut client = OpenAiClient::new_with_base_url("fixture-key".into(), endpoint.clone());
+        client.http = http::build_http_client_for_base_url(
+            reqwest::Client::builder().user_agent("invalid\nheader"),
+            &endpoint,
+        );
+        let expected = client
+            .http
+            .as_ref()
+            .expect_err("invalid builder must fail")
+            .to_string();
+        let request = LlmRequest::new(
+            "gpt-5.6-sol",
+            vec![Message::User(UserMessage::text("fixture"))],
+        );
+        let events = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            client.stream(&request).collect::<Vec<_>>().await
+        })
+        .await
+        .expect("builder failure returns promptly");
+        let propagated = events
+            .into_iter()
+            .find_map(|event| match event {
+                Err(error)
+                | Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Error { error },
+                }) => Some(error),
+                _ => None,
+            })
+            .expect("stored build error propagates to caller");
+        assert_eq!(propagated.to_string(), expected);
+        assert!(!propagated.is_retryable());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(40), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+        routing::post,
+    };
+    use meerkat_core::lifecycle::run_primitive::OpenAiPromptCacheOptions;
+    use meerkat_core::model_profile::capabilities::{
+        OpenAiPromptCacheMode, OpenAiPromptCacheTtl, OpenAiReasoningContext, OpenAiReasoningMode,
+        OpenAiTextVerbosity,
+    };
+    use meerkat_core::{
+        AssistantImageId, BlobId, BlobRef, BlockAssistantMessage, MediaType, ProviderImageMetadata,
+        RevisedPromptDisposition, ToolResult, UserMessage, VideoData,
+    };
+    use meerkat_llm_core::{ImageGenerationExecutor, LlmClientAdapter};
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    /// The transcript a durable in-turn Steer produces: the running turn's
+    /// tool results, then the durable system notice written at the next
+    /// model boundary, then the model's next assistant message.
+    fn durable_in_turn_notice_transcript() -> Vec<Message> {
+        vec![
+            Message::User(UserMessage::text("start the job")),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![ToolResult::new(
+                "call_1".to_string(),
+                "lookup result".to_string(),
+                false,
+            )]),
+            Message::SystemNotice(meerkat_core::SystemNoticeMessage::new(
+                meerkat_core::SystemNoticeKind::Generic,
+                "background job finished",
+            )),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::Text {
+                    text: "noted".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+            )),
+        ]
+    }
+
+    #[test]
+    fn durable_in_turn_notice_after_tool_results_builds_a_valid_openai_body() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new("gpt-5.2", durable_in_turn_notice_transcript());
+        let body = client.build_request_body(&request).unwrap();
+        let input = body["input"].as_array().expect("responses input array");
+        let call_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call")
+            .expect("function_call item");
+        let output_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call_output")
+            .expect("function_call_output item");
+        assert_eq!(input[call_index]["call_id"], "call_1");
+        assert_eq!(input[output_index]["call_id"], "call_1");
+        assert!(
+            output_index > call_index,
+            "the tool output follows its call"
+        );
+        let notice_index = input
+            .iter()
+            .position(|item| item.to_string().contains("background job finished"))
+            .expect("notice item");
+        assert!(
+            notice_index > output_index,
+            "the notice lands after the tool output"
+        );
+        assert_eq!(input[notice_index]["role"], "user");
+        assert!(
+            input
+                .iter()
+                .all(|item| item["role"] != "system" && item["role"] != "developer"),
+            "a mid-conversation notice never becomes a system/developer row"
+        );
+    }
+
+    fn assistant_image_block() -> AssistantBlock {
+        AssistantBlock::Image {
+            image_id: AssistantImageId::new(meerkat_core::time_compat::new_uuid_v7()),
+            blob_ref: BlobRef {
+                blob_id: BlobId::from("openai-image"),
+                media_type: "image/png".to_string(),
+            },
+            media_type: MediaType::new("image/png"),
+            width: 128,
+            height: 128,
+            revised_prompt: RevisedPromptDisposition::NotRequested,
+            meta: ProviderImageMetadata::NotEmitted,
+        }
+    }
+
+    fn build_projected_request_body(client: &OpenAiClient, request: &LlmRequest) -> Value {
+        let mut projected = request.clone();
+        projected.messages = client
+            .project_replay_messages(&request.messages)
+            .expect("project replay messages");
+        client
+            .build_request_body(&projected)
+            .expect("build request")
+    }
+
+    /// The conversation a detached fork_off leaves behind: the forker's
+    /// finished turn, the job's durable completion record (a persisted
+    /// `BackgroundJob` notice), the wake turn it caused, then `later` user
+    /// turns separated by assistant replies.
+    fn detached_completion_transcript(
+        later: usize,
+    ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+        let assistant_text = |text: &str| {
+            Message::BlockAssistant(meerkat_core::BlockAssistantMessage::new(
+                vec![meerkat_core::AssistantBlock::Text {
+                    text: text.to_string(),
+                    meta: None,
+                }],
+                meerkat_core::StopReason::EndTurn,
+            ))
+        };
+        let mut messages = vec![
+            Message::System(meerkat_core::SystemMessage::new("You are the forker.")),
+            Message::User(meerkat_core::UserMessage::text(
+                "fork a child for the token",
+            )),
+            Message::BlockAssistant(meerkat_core::BlockAssistantMessage::new(
+                vec![meerkat_core::AssistantBlock::ToolUse {
+                    id: "toolu_fork_off".to_string(),
+                    name: "fork_off".to_string(),
+                    args: serde_json::value::RawValue::from_string(
+                        r#"{"member_id":"child","task":"reply with the token"}"#.to_string(),
+                    )?,
+                    meta: None,
+                }],
+                meerkat_core::StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![meerkat_core::ToolResult::new(
+                "toolu_fork_off".to_string(),
+                r#"{"status":"running","job_id":"job-7"}"#.to_string(),
+                false,
+            )]),
+            assistant_text("FORK_DONE"),
+            Message::SystemNotice(meerkat_core::SystemNoticeMessage::persisted_background_job(
+                "fork_off",
+                "job-7",
+                meerkat_core::event::BackgroundJobTerminalStatus::Completed,
+                r#"{"text":"CHILD-TOKEN-4K"}"#.to_string(),
+            )),
+            assistant_text("WAKE-ACK"),
+        ];
+        for turn in 1..=later {
+            if turn > 1 {
+                messages.push(assistant_text(&format!("ACK-{}", turn - 1)));
+            }
+            messages.push(Message::User(meerkat_core::UserMessage::text(format!(
+                "LATER-TURN-{turn}"
+            ))));
+        }
+        Ok(messages)
+    }
+
+    /// A detached job's durable completion record sits mid-conversation.
+    /// The request builder accepts it on each of the next two turns, as a
+    /// user-channel entry between the turn it followed and the wake turn,
+    /// for every model listed.
+    #[test]
+    fn persisted_background_job_notice_is_accepted_mid_conversation_on_later_turns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = OpenAiClient::new("test-key".to_string());
+        for model in ["gpt-5.5", "gpt-5.4"] {
+            for later in 1..=2 {
+                let messages = detached_completion_transcript(later)?;
+                let request = LlmRequest::new(model, client.project_replay_messages(&messages)?);
+                let body = client.build_request_body(&request)?;
+                let wire = body["input"]
+                    .as_array()
+                    .ok_or_else(|| format!("{model}: no {} in {body}", "input"))?;
+                let rendered: Vec<String> = wire.iter().map(Value::to_string).collect();
+                let position = |needle: &str| {
+                    rendered
+                        .iter()
+                        .position(|entry| entry.contains(needle))
+                        .ok_or_else(|| {
+                            format!("{model} turn {later}: {needle} missing from {body}")
+                        })
+                };
+                let notice_at = position("Background fork_off job job-7 finished (completed)")?;
+                assert_eq!(
+                    wire[notice_at]["role"], "user",
+                    "{model}: {}",
+                    rendered[notice_at]
+                );
+                assert_eq!(
+                    rendered[notice_at].matches("CHILD-TOKEN-4K").count(),
+                    1,
+                    "{model}: the record carries the outcome once: {}",
+                    rendered[notice_at]
+                );
+                assert!(
+                    position("FORK_DONE")? < notice_at && notice_at < position("WAKE-ACK")?,
+                    "{model} turn {later}: the record keeps its place: {body}"
+                );
+                assert_eq!(
+                    rendered
+                        .iter()
+                        .filter(|entry| entry.contains("job-7 finished"))
+                        .count(),
+                    1,
+                    "{model} turn {later}: the record is sent once: {body}"
+                );
+                assert!(
+                    rendered
+                        .last()
+                        .is_some_and(|entry| entry.contains(&format!("LATER-TURN-{later}"))),
+                    "{model} turn {later}: the new turn comes last: {body}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn text_followup_keeps_unmeasured_voice_provenance_in_provider_request() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.5",
+            vec![
+                Message::User(UserMessage::text("listen")),
+                Message::BlockAssistant(BlockAssistantMessage::snapshot(vec![
+                    AssistantBlock::Transcript {
+                        text: "ordinary speech".into(),
+                        source: meerkat_core::TranscriptSource::Spoken,
+                        meta: None,
+                    },
+                    AssistantBlock::Transcript {
+                        text: "voice-only discussion".into(),
+                        source: meerkat_core::TranscriptSource::SpokenUnmeasured,
+                        meta: None,
+                    },
+                ])),
+                Message::User(UserMessage::text("follow up on what we discussed")),
+            ],
+        );
+        let body = build_projected_request_body(&client, &request);
+        let assistant = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .collect::<Vec<_>>();
+        assert_eq!(assistant[0]["content"], "ordinary speech");
+        let observed = assistant[1]["content"].as_str().unwrap();
+        assert!(observed.contains("voice-only discussion") && observed.contains("UNMEASURED"));
+        assert!(observed.contains("Not proof"));
+        assert!(body.to_string().contains("follow up on what we discussed"));
+    }
+
+    async fn responses_sse(State(payload): State<String>) -> impl IntoResponse {
+        ([("content-type", "text/event-stream")], payload)
+    }
+
+    #[test]
+    fn replay_projection_policy_handles_openai_history_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = OpenAiClient::new("test-key".to_string());
+        let tool_args = RawValue::from_string(r#"{"query":"m"}"#.to_string())?;
+        let messages = vec![
+            Message::User(UserMessage::with_blocks(vec![
+                ContentBlock::Text {
+                    text: "look at this".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: ImageData::Inline {
+                        data: "AAAA".to_string(),
+                    },
+                },
+                ContentBlock::Video {
+                    media_type: "video/mp4".to_string(),
+                    duration_ms: 1_000,
+                    data: VideoData::Inline {
+                        data: "BBBB".to_string(),
+                    },
+                },
+            ])),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![
+                    AssistantBlock::Reasoning {
+                        text: "encrypted reasoning".to_string(),
+                        meta: Some(Box::new(ProviderMeta::OpenAi {
+                            id: "rs_1".to_string(),
+                            encrypted_content: Some("ciphertext".to_string()),
+                            phase: Some("reasoning".to_string()),
+                            response_id: None,
+                        })),
+                    },
+                    AssistantBlock::Reasoning {
+                        text: "foreign reasoning".to_string(),
+                        meta: Some(Box::new(ProviderMeta::Anthropic {
+                            signature: "signature".to_string(),
+                        })),
+                    },
+                    AssistantBlock::ServerToolContent {
+                        id: Some("ws_status".to_string()),
+                        kind: ServerToolKind::WebSearch,
+                        content: serde_json::json!({
+                            "type": "response.web_search_call.searching",
+                            "item_id": "ws_status"
+                        }),
+                        meta: None,
+                    },
+                    AssistantBlock::ServerToolContent {
+                        id: Some("ws_1".to_string()),
+                        kind: ServerToolKind::WebSearch,
+                        content: serde_json::json!({
+                            "type": "web_search_call",
+                            "id": "ws_1",
+                            "status": "completed"
+                        }),
+                        meta: None,
+                    },
+                    AssistantBlock::ServerToolContent {
+                        id: None,
+                        kind: ServerToolKind::WebSearch,
+                        content: serde_json::json!({
+                            "type": "message_annotations",
+                            "annotations": []
+                        }),
+                        meta: None,
+                    },
+                    assistant_image_block(),
+                    AssistantBlock::Text {
+                        text: "answer".to_string(),
+                        meta: None,
+                    },
+                    AssistantBlock::ToolUse {
+                        id: "tool_1".to_string(),
+                        name: "lookup".to_string(),
+                        args: tool_args,
+                        meta: None,
+                    },
+                ],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![ToolResult::with_blocks(
+                "tool_1".to_string(),
+                vec![
+                    ContentBlock::Text {
+                        text: "tool text".to_string(),
+                    },
+                    ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: ImageData::Inline {
+                            data: "CCCC".to_string(),
+                        },
+                    },
+                ],
+                false,
+            )]),
+            Message::SystemNotice(SystemNoticeMessage::new(
+                meerkat_core::SystemNoticeKind::Generic,
+                "control intent",
+            )),
+        ];
+
+        let projected = client.project_replay_messages(&messages)?;
+
+        let Message::User(user) = &projected[0] else {
+            panic!("expected user message");
+        };
+        assert!(
+            user.content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. })),
+            "OpenAI should retain inline user images"
+        );
+        assert!(
+            user.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Text { text } if text == "[video: video/mp4]"
+            )),
+            "OpenAI should degrade user video to text"
+        );
+
+        let Message::BlockAssistant(assistant) = &projected[1] else {
+            panic!("expected assistant message");
+        };
+        assert!(
+            assistant
+                .blocks
+                .iter()
+                .any(|block| matches!(block, AssistantBlock::Reasoning { .. })),
+            "OpenAI Responses replay projection should keep OpenAI reasoning blocks"
+        );
+        assert!(!assistant.blocks.iter().any(|block| matches!(
+            block,
+            AssistantBlock::Reasoning { text, .. } if text == "foreign reasoning"
+        )));
+        assert!(assistant.blocks.iter().any(|block| matches!(
+            block,
+            AssistantBlock::ServerToolContent { content, .. }
+                if content.get("type").and_then(Value::as_str) == Some("web_search_call")
+        )));
+        assert!(!assistant.blocks.iter().any(|block| matches!(
+            block,
+            AssistantBlock::ServerToolContent { content, .. }
+                if content.get("type").and_then(Value::as_str)
+                    == Some("response.web_search_call.searching")
+        )));
+        assert!(!assistant.blocks.iter().any(|block| matches!(
+            block,
+            AssistantBlock::ServerToolContent { content, .. }
+                if content.get("type").and_then(Value::as_str) == Some("message_annotations")
+        )));
+        assert!(
+            !assistant
+                .blocks
+                .iter()
+                .any(|block| matches!(block, AssistantBlock::Image { .. })),
+            "assistant images must be removed from OpenAI replay"
+        );
+        let body = client.build_request_body(&LlmRequest::new("gpt-5.4", projected.clone()))?;
+        let input = body["input"].as_array().expect("input array");
+        assert!(input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("reasoning")
+                && item.get("id").and_then(Value::as_str) == Some("rs_1")
+                && item.get("encrypted_content").and_then(Value::as_str) == Some("ciphertext")
+                && item.get("phase").and_then(Value::as_str) == Some("reasoning")
+        }));
+        assert!(input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("web_search_call")
+                && item.get("id").and_then(Value::as_str) == Some("ws_1")
+        }));
+        let reasoning_pos = input
+            .iter()
+            .position(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .expect("reasoning item");
+        let web_search_pos = input
+            .iter()
+            .position(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
+            .expect("web search item");
+        assert!(
+            reasoning_pos < web_search_pos,
+            "reasoning must replay before dependent hosted-tool item"
+        );
+
+        let Message::ToolResults { results, .. } = &projected[2] else {
+            panic!("expected tool results");
+        };
+        assert!(
+            results[0].has_images(),
+            "OpenAI Responses replay intentionally retains historical inline image tool results"
+        );
+        assert!(results[0].text_content().contains("[image: image/png]"));
+        let tool_output = input
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .expect("function_call_output item");
+        let output = tool_output["output"].as_array().expect("output array");
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[0]["text"], "tool text");
+        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(output[1]["image_url"], "data:image/png;base64,CCCC");
+        assert!(matches!(projected[3], Message::SystemNotice(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn non_vision_openai_replay_lowers_inline_images_to_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = OpenAiClient::new("test-key".to_string()).with_image_input_support(false);
+        let messages = vec![Message::User(UserMessage::with_blocks(vec![
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: ImageData::Inline {
+                    data: "AAAA".to_string(),
+                },
+            },
+        ]))];
+
+        let projected = client.project_replay_messages(&messages)?;
+        let Message::User(user) = &projected[0] else {
+            return Err("expected projected user message".into());
+        };
+        assert!(matches!(
+            user.content.as_slice(),
+            [ContentBlock::Text { .. }]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_projection_rejects_openai_orphan_tool_results() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let err = client
+            .project_replay_messages(&[Message::tool_results(vec![ToolResult::new(
+                "tool_1".to_string(),
+                "orphaned".to_string(),
+                false,
+            )])])
+            .expect_err("orphan tool results must be rejected");
+        assert!(matches!(err, LlmError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn replay_projection_drops_openai_provider_items_for_chat_completions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let messages = vec![Message::BlockAssistant(BlockAssistantMessage::new(
+            vec![
+                AssistantBlock::Reasoning {
+                    text: "private".to_string(),
+                    meta: Some(Box::new(ProviderMeta::OpenAi {
+                        id: "rs_1".to_string(),
+                        encrypted_content: Some("enc".to_string()),
+                        phase: Some("reasoning".to_string()),
+                        response_id: None,
+                    })),
+                },
+                AssistantBlock::ServerToolContent {
+                    id: Some("ws_1".to_string()),
+                    kind: ServerToolKind::WebSearch,
+                    content: serde_json::json!({
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "status": "completed"
+                    }),
+                    meta: None,
+                },
+                AssistantBlock::Text {
+                    text: "visible".to_string(),
+                    meta: None,
+                },
+            ],
+            StopReason::EndTurn,
+        ))];
+
+        let projected =
+            project_openai_replay_messages(&messages, OpenAiReplayProjectionMode::ChatCompletions)?;
+
+        let Message::BlockAssistant(assistant) = &projected[0] else {
+            panic!("expected assistant");
+        };
+        assert_eq!(assistant.blocks.len(), 1);
+        assert!(matches!(
+            &assistant.blocks[0],
+            AssistantBlock::Text { text, .. } if text == "visible"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_projection_allows_dropped_image_between_tool_use_and_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = OpenAiClient::new("test-key".to_string());
+        let tool_args = RawValue::from_string(r#"{"path":"out.png"}"#.to_string())?;
+        let messages = vec![
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "blob_save_file".to_string(),
+                    args: tool_args,
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![assistant_image_block()],
+                StopReason::EndTurn,
+            )),
+            Message::tool_results(vec![ToolResult::new(
+                "tool_1".to_string(),
+                r#"{"path":"out.png"}"#.to_string(),
+                false,
+            )]),
+        ];
+
+        let projected = client.project_replay_messages(&messages)?;
+
+        assert_eq!(projected.len(), 2);
+        let Message::BlockAssistant(assistant) = &projected[0] else {
+            panic!("expected assistant tool use");
+        };
+        assert!(assistant.blocks.iter().any(|block| {
+            matches!(
+                block,
+                AssistantBlock::ToolUse { name, .. } if name == "blob_save_file"
+            )
+        }));
+        assert!(matches!(projected[1], Message::ToolResults { .. }));
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct StreamStubState {
+        payload: String,
+        seen: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn responses_sse_with_body(
+        State(state): State<StreamStubState>,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        state.seen.lock().expect("seen mutex").push(body);
+        ([("content-type", "text/event-stream")], state.payload)
+    }
+
+    #[derive(Clone)]
+    struct FallbackStreamStubState {
+        payload: String,
+        seen: Arc<Mutex<Vec<Value>>>,
+        calls: Arc<Mutex<usize>>,
+        unauthorized_fallback_once: bool,
+    }
+
+    async fn responses_sse_with_previous_response_fallback(
+        State(state): State<FallbackStreamStubState>,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        state.seen.lock().expect("seen mutex").push(body.clone());
+        let mut calls = state.calls.lock().expect("calls mutex");
+        *calls += 1;
+        if *calls == 1 && body.get("previous_response_id").is_some() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": "previous_response_id was not found"
+                    }
+                })),
+            )
+                .into_response();
+        }
+        if *calls == 2 && state.unauthorized_fallback_once {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        ([("content-type", "text/event-stream")], state.payload).into_response()
+    }
+
+    #[derive(Clone)]
+    struct HeaderStreamStubState {
+        payload: String,
+        seen: Arc<Mutex<Vec<Value>>>,
+        seen_headers: Arc<Mutex<Vec<HeaderMap>>>,
+    }
+
+    async fn responses_sse_with_body_and_headers(
+        State(state): State<HeaderStreamStubState>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        state.seen.lock().expect("seen mutex").push(body);
+        state
+            .seen_headers
+            .lock()
+            .expect("seen headers mutex")
+            .push(headers);
+        ([("content-type", "text/event-stream")], state.payload)
+    }
+
+    #[derive(Clone)]
+    struct ImageStubState {
+        response: Value,
+        seen: Arc<Mutex<Vec<Value>>>,
+        seen_headers: Arc<Mutex<Vec<HeaderMap>>>,
+    }
+
+    async fn openai_image_stub(
+        State(state): State<ImageStubState>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        state.seen.lock().expect("seen mutex").push(body);
+        state
+            .seen_headers
+            .lock()
+            .expect("seen headers mutex")
+            .push(headers);
+        Json(state.response)
+    }
+
+    async fn spawn_openai_stub_server(payload: String) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/v1/responses", post(responses_sse))
+            .with_state(payload);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[derive(Clone)]
+    struct AuthRetryStubState {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        always_unauthorized: bool,
+    }
+
+    async fn auth_retry_responses(State(state): State<AuthRetryStubState>) -> impl IntoResponse {
+        let call = state
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 0 || state.always_unauthorized {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        ([("content-type", "text/event-stream")], "data: [DONE]\n\n").into_response()
+    }
+
+    struct RetryAuthorizer {
+        authorizations: std::sync::atomic::AtomicUsize,
+        observations: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::HttpAuthorizer for RetryAuthorizer {
+        async fn authorize(
+            &self,
+            request: &mut meerkat_core::HttpAuthorizationRequest<'_>,
+        ) -> Result<(), meerkat_core::AuthError> {
+            let generation = self
+                .authorizations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            request.headers.push((
+                "Authorization".to_string(),
+                format!("Bearer token-{generation}"),
+            ));
+            Ok(())
+        }
+
+        async fn observe_response(
+            &self,
+            response: &meerkat_core::HttpAuthorizationResponse<'_>,
+        ) -> Result<meerkat_core::HttpAuthorizationResponseAction, meerkat_core::AuthError>
+        {
+            self.observations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if response.status == 401 {
+                meerkat_core::HttpAuthorizationResponseAction::RetryWithFreshAuthorization
+            } else {
+                meerkat_core::HttpAuthorizationResponseAction::Propagate
+            })
+        }
+
+        fn label(&self) -> &'static str {
+            "retry-test"
+        }
+    }
+
+    async fn spawn_auth_retry_server(
+        always_unauthorized: bool,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/responses", post(auth_retry_responses))
+            .with_state(AuthRetryStubState {
+                calls: Arc::clone(&calls),
+                always_unauthorized,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), calls, handle)
+    }
+
+    #[tokio::test]
+    async fn responses_reauthorizes_once_before_streaming() {
+        let (base_url, calls, server) = spawn_auth_retry_server(false).await;
+        let authorizer = Arc::new(RetryAuthorizer {
+            authorizations: std::sync::atomic::AtomicUsize::new(0),
+            observations: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client = OpenAiClient::new_with_base_url("unused".to_string(), base_url)
+            .with_authorizer(authorizer.clone());
+        let endpoint = client.responses_endpoint();
+        let response = client
+            .responses_response_with_fallback(
+                &endpoint,
+                &serde_json::json!({"stream": true}),
+                None,
+                false,
+            )
+            .await
+            .expect("second authorization succeeds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            authorizer
+                .authorizations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_never_retries_unauthorized_more_than_once() {
+        let (base_url, calls, server) = spawn_auth_retry_server(true).await;
+        let authorizer = Arc::new(RetryAuthorizer {
+            authorizations: std::sync::atomic::AtomicUsize::new(0),
+            observations: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client = OpenAiClient::new_with_base_url("unused".to_string(), base_url)
+            .with_authorizer(authorizer.clone());
+        let endpoint = client.responses_endpoint();
+        client
+            .responses_response_with_fallback(
+                &endpoint,
+                &serde_json::json!({"stream": true}),
+                None,
+                false,
+            )
+            .await
+            .expect_err("second unauthorized response propagates");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            authorizer
+                .observations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn policy_stop_precedes_authorizer_and_continuation_fallback() {
+        for status in [StatusCode::FORBIDDEN, StatusCode::BAD_REQUEST] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = Arc::clone(&calls);
+            let app = Router::new().route(
+                "/v1/responses",
+                post(move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            status,
+                            Json(serde_json::json!({"error":{
+                                "type":"invalid_request_error",
+                                "code":"misalignment_policy_violation",
+                                "message":"previous_response_id is blocked"
+                            }})),
+                        )
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let authorizer = Arc::new(RetryAuthorizer {
+                authorizations: std::sync::atomic::AtomicUsize::new(0),
+                observations: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let client = OpenAiClient::new_with_base_url("unused".into(), base_url)
+                .with_authorizer(authorizer.clone());
+            let error = client
+                .responses_response_with_fallback(
+                    &client.responses_endpoint(),
+                    &serde_json::json!({"previous_response_id":"resp_blocked"}),
+                    Some(serde_json::json!({"input":[]})),
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, LlmError::PolicyStop { .. }));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                authorizer
+                    .observations
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert_eq!(
+                authorizer
+                    .authorizations
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            server.abort();
+        }
+    }
+
+    /// Serves each element of `chunks` as a separate paced HTTP body chunk so
+    /// tests can pin per-chunk wire behavior (lifecycle-only chunks etc.).
+    async fn paced_responses_sse(State(chunks): State<Vec<String>>) -> impl IntoResponse {
+        let body_stream = async_stream::stream! {
+            for chunk in chunks {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(chunk));
+            }
+        };
+        (
+            [("content-type", "text/event-stream")],
+            axum::body::Body::from_stream(body_stream),
+        )
+    }
+
+    async fn spawn_openai_paced_sse_server(
+        chunks: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/v1/responses", post(paced_responses_sse))
+            .with_state(chunks);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn spawn_openai_stub_server_with_body(
+        payload: String,
+        seen: Arc<Mutex<Vec<Value>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/v1/responses", post(responses_sse_with_body))
+            .with_state(StreamStubState { payload, seen });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn spawn_openai_fallback_stub_server(
+        payload: String,
+        seen: Arc<Mutex<Vec<Value>>>,
+        unauthorized_fallback_once: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route(
+                "/v1/responses",
+                post(responses_sse_with_previous_response_fallback),
+            )
+            .with_state(FallbackStreamStubState {
+                payload,
+                seen,
+                calls: Arc::new(Mutex::new(0)),
+                unauthorized_fallback_once,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn spawn_chatgpt_stub_server(
+        payload: String,
+        seen: Arc<Mutex<Vec<Value>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/responses", post(responses_sse_with_body))
+            .with_state(StreamStubState { payload, seen });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn spawn_azure_responses_stub_server(
+        payload: String,
+        seen: Arc<Mutex<Vec<Value>>>,
+        seen_headers: Arc<Mutex<Vec<HeaderMap>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route(
+                "/openai/v1/responses",
+                post(responses_sse_with_body_and_headers),
+            )
+            .with_state(HeaderStreamStubState {
+                payload,
+                seen,
+                seen_headers,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn spawn_openai_image_stub(
+        response: Value,
+        seen: Arc<Mutex<Vec<Value>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let seen_headers = Arc::new(Mutex::new(Vec::new()));
+        spawn_openai_image_stub_with_headers(response, seen, seen_headers).await
+    }
+
+    async fn spawn_openai_image_stub_with_headers(
+        response: Value,
+        seen: Arc<Mutex<Vec<Value>>>,
+        seen_headers: Arc<Mutex<Vec<HeaderMap>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/v1/responses", post(openai_image_stub))
+            .route("/openai/v1/responses", post(openai_image_stub))
+            .route("/responses", post(openai_image_stub))
+            .route("/v1/images/generations", post(openai_image_stub))
+            .with_state(ImageStubState {
+                response,
+                seen,
+                seen_headers,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn image_executor_request_json(plan: Value) -> ProviderImageGenerationRequest {
+        serde_json::from_value(serde_json::json!({
+            "operation_id": "00000000-0000-0000-0000-000000000101",
+            "model": "gpt-4.1-mini",
+            "generate_request": {
+                "intent": {
+                    "intent": "generate",
+                    "prompt": {"content": "draw a small red kite"},
+                    "prompt_source": {
+                        "source": "user_provided",
+                        "message_id": "00000000-0000-0000-0000-000000000102"
+                    },
+                    "reference_images": []
+                },
+                "target": {"target": "auto"},
+                "size": {"size": "landscape1536x1024"},
+                "quality": "low",
+                "format": "png",
+                "count": 2
+            },
+            "execution_plan": plan,
+            "projected_messages": []
+        }))
+        .expect("image executor request")
+    }
+
+    fn hosted_openai_plan_json() -> Value {
+        serde_json::json!({
+            "provider": "openai",
+            "backend": "hosted_tool",
+            "max_count": 4,
+            "capabilities": {
+                "hosted_image_generation_tool": true,
+                "native_image_output": false,
+                "custom_tools": true,
+                "image_search_grounding": false,
+                "image_continuity_tokens": "unsupported"
+            },
+            "requires_scoped_override": false,
+            "provider_plan": {
+                "tool_name": "image_generation",
+                "model": "gpt-image-2",
+                "output": {
+                    "size": "landscape1536x1024",
+                    "quality": "low",
+                    "output_format": "png"
+                }
+            }
+        })
+    }
+
+    fn images_api_openai_plan_json() -> Value {
+        serde_json::json!({
+            "provider": "openai",
+            "backend": "provider_api",
+            "max_count": 4,
+            "capabilities": {
+                "hosted_image_generation_tool": false,
+                "native_image_output": true,
+                "custom_tools": false,
+                "image_search_grounding": false,
+                "image_continuity_tokens": "unsupported"
+            },
+            "requires_scoped_override": false,
+            "provider_plan": {
+                "endpoint": "generations",
+                "request_shape": "gpt_image",
+                "output": {
+                    "size": "landscape1536x1024",
+                    "quality": "low",
+                    "output_format": "png"
+                }
+            }
+        })
+    }
+
+    // =========================================================================
+    // Responses API Request Format Tests
+    // =========================================================================
+
+    #[test]
+    fn openai_image_error_observation_uses_structured_error_codes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let safety = serde_json::json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "content_policy_violation",
+                "message": "Request rejected by policy."
+            }
+        });
+        assert_eq!(
+            OpenAiClient::openai_error_observation(400, &safety.to_string()),
+            ImageProviderTerminalObservation::ProviderHttpError {
+                status_code: Some(400),
+                code: ImageProviderErrorCode::OpenAiContentFilter,
+            }
+        );
+
+        let refusal = serde_json::json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "model_refusal",
+                "message": "The model declined the request."
+            }
+        });
+        assert_eq!(
+            OpenAiClient::openai_error_observation(400, &refusal.to_string()),
+            ImageProviderTerminalObservation::ProviderHttpError {
+                status_code: Some(400),
+                code: ImageProviderErrorCode::OpenAiModelRefusal,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_image_error_observation_does_not_parse_message_text() {
+        let message_only = serde_json::json!({
+            "error": {
+                "type": "invalid_request_error",
+                "message": "diagnostic text mentions safety, content_filter, refusal, and refused"
+            }
+        });
+
+        assert_eq!(
+            OpenAiClient::openai_error_observation(400, &message_only.to_string()),
+            ImageProviderTerminalObservation::ProviderHttpError {
+                status_code: Some(400),
+                code: ImageProviderErrorCode::Unknown,
+            }
+        );
+        assert_eq!(
+            OpenAiClient::openai_error_observation(
+                503,
+                "provider overloaded while checking safety filters"
+            ),
+            ImageProviderTerminalObservation::ProviderHttpError {
+                status_code: Some(503),
+                code: ImageProviderErrorCode::Unknown,
+            }
+        );
+    }
+
+    #[test]
+    fn openai_image_error_observation_keeps_transport_status() {
+        assert_eq!(
+            OpenAiClient::openai_error_observation(408, "request timed out"),
+            ImageProviderTerminalObservation::ProviderHttpError {
+                status_code: Some(408),
+                code: ImageProviderErrorCode::Unknown,
+            }
+        );
+        assert_eq!(
+            OpenAiClient::openai_error_observation(504, "gateway timeout"),
+            ImageProviderTerminalObservation::ProviderHttpError {
+                status_code: Some(504),
+                code: ImageProviderErrorCode::Unknown,
+            }
+        );
+        assert_eq!(
+            OpenAiClient::openai_error_observation(499, "client closed request"),
+            ImageProviderTerminalObservation::ProviderHttpError {
+                status_code: Some(499),
+                code: ImageProviderErrorCode::Unknown,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_hosted_image_executor_normalizes_fake_response()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let response = serde_json::json!({
+            "id": "resp_img_1",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Provider caption"}]
+                },
+                {
+                    "type": "image_generation_call",
+                    "id": "ig_1",
+                    "result": "data:image/png;base64,aGVsbG8=",
+                    "revised_prompt": "draw a small red kite in watercolor"
+                }
+            ]
+        });
+        let (base_url, handle) = spawn_openai_image_stub(response, seen.clone()).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+
+        let output = client
+            .execute_image_generation(image_executor_request_json(hosted_openai_plan_json()))
+            .await?;
+
+        assert!(matches!(
+            output.terminal_observation,
+            ImageProviderTerminalObservation::Generated
+        ));
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.images[0].base64_data, "aGVsbG8=");
+        assert_eq!(output.images[0].media_type.as_str(), "image/png");
+        assert_eq!(
+            (output.images[0].width, output.images[0].height),
+            (1536, 1024)
+        );
+        assert_eq!(output.provider_text.as_deref(), Some("Provider caption"));
+        assert!(matches!(
+            output.revised_prompt,
+            RevisedPromptDisposition::Revised { .. }
+        ));
+        assert!(matches!(
+            output.native_metadata,
+            ProviderImageMetadata::OpenAi(OpenAiImageMetadata {
+                response_id: Some(_),
+                image_generation_call_id: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            output.warnings.as_slice(),
+            [ImageGenerationWarning::ProviderReturnedFewerImages { .. }]
+        ));
+
+        let bodies = seen.lock().expect("seen mutex");
+        let body = bodies.first().expect("captured OpenAI image request");
+        assert_eq!(body["model"], "gpt-4.1-mini");
+        assert_eq!(body["tools"][0]["type"], "image_generation");
+        assert_eq!(body["tools"][0]["model"], "gpt-image-2");
+        assert_eq!(body["tools"][0]["size"], "1536x1024");
+        assert_eq!(body["tools"][0]["quality"], "low");
+        assert_eq!(body["tools"][0]["output_format"], "png");
+        assert_eq!(body["tool_choice"], "required");
+        assert!(
+            body["instructions"]
+                .as_str()
+                .is_some_and(|value| value.contains("Never reply in text"))
+        );
+        assert!(body.get("stream").and_then(Value::as_bool) == Some(false));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn azure_openai_hosted_image_uses_deployment_header_and_omits_tool_model()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_headers = Arc::new(Mutex::new(Vec::new()));
+        let response = serde_json::json!({
+            "id": "resp_img_azure",
+            "output": [{
+                "type": "image_generation_call",
+                "id": "ig_azure",
+                "result": "data:image/png;base64,aGVsbG8="
+            }]
+        });
+        let (base_url, handle) =
+            spawn_openai_image_stub_with_headers(response, seen.clone(), seen_headers.clone())
+                .await;
+        let client =
+            OpenAiClient::new_with_base_url("azure-key".to_string(), format!("{base_url}/openai"))
+                .with_azure_openai_wire(AzureOpenAiWireConfig {
+                    image_generation_deployment: Some("gpt-image-2".to_string()),
+                    image_generation_api_version: "preview".to_string(),
+                });
+        let mut request = image_executor_request_json(hosted_openai_plan_json());
+        request.model = "gpt-5.5".to_string();
+
+        let output = client.execute_image_generation(request).await?;
+
+        assert!(matches!(
+            output.terminal_observation,
+            ImageProviderTerminalObservation::Generated
+        ));
+        let headers = seen_headers.lock().expect("seen headers mutex");
+        let headers = headers.first().expect("captured Azure image headers");
+        assert_eq!(
+            headers.get("api-key").and_then(|v| v.to_str().ok()),
+            Some("azure-key")
+        );
+        assert!(headers.get("authorization").is_none());
+        assert_eq!(
+            headers
+                .get("x-ms-oai-image-generation-deployment")
+                .and_then(|v| v.to_str().ok()),
+            Some("gpt-image-2")
+        );
+        assert_eq!(
+            headers.get("api_version").and_then(|v| v.to_str().ok()),
+            Some("preview")
+        );
+        let bodies = seen.lock().expect("seen mutex");
+        let body = bodies.first().expect("captured Azure image request");
+        assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(body["tools"][0]["type"], "image_generation");
+        assert!(
+            !body["tools"][0]
+                .as_object()
+                .expect("tool object")
+                .contains_key("model"),
+            "Azure Responses image generation selects the image deployment via header"
+        );
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["store"], false);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn azure_openai_hosted_image_requires_image_generation_deployment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = OpenAiClient::new_with_base_url(
+            "azure-key".to_string(),
+            "http://127.0.0.1:1/openai".to_string(),
+        )
+        .with_azure_openai_wire(AzureOpenAiWireConfig::default());
+
+        let err = match client
+            .execute_image_generation(image_executor_request_json(hosted_openai_plan_json()))
+            .await
+        {
+            Ok(_) => panic!("missing Azure image deployment should fail before HTTP"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            LlmError::InvalidConfig { message }
+                if message.contains("image_generation_deployment")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chatgpt_backend_hosted_image_executor_sets_store_false()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let payload = [
+            r#"data: {"type":"response.output_item.added","item":{"id":"ig_1","type":"image_generation_call","status":"in_progress"}}"#,
+            r#"data: {"type":"response.output_item.done","item":{"id":"ig_1","type":"image_generation_call","status":"completed","result":"data:image/png;base64,aGVsbG8="}}"#,
+            r#"data: {"type":"response.completed","response":{"id":"resp_image","output":[]}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, handle) = spawn_chatgpt_stub_server(payload, seen.clone()).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url)
+            .with_chatgpt_backend_wire();
+
+        let output = client
+            .execute_image_generation(image_executor_request_json(hosted_openai_plan_json()))
+            .await?;
+
+        assert!(matches!(
+            output.terminal_observation,
+            ImageProviderTerminalObservation::Generated
+        ));
+        let bodies = seen.lock().expect("seen mutex");
+        let body = bodies.first().expect("captured ChatGPT image request");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tool_choice"], "required");
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chatgpt_backend_hosted_image_executor_surfaces_stream_error_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                "error event",
+                r#"data: {"type":"error","error":{"code":"rate_limit_exceeded","message":"too many images"}}"#,
+                None,
+                "rate_limit_exceeded",
+                "too many images",
+            ),
+            (
+                "response.error event",
+                r#"data: {"type":"response.error","response":{"id":"resp_error","error":{"code":"invalid_request_error","message":"bad image request"}}}"#,
+                Some("resp_error"),
+                "invalid_request_error",
+                "bad image request",
+            ),
+        ];
+
+        for (name, event, expected_response_id, expected_code, expected_message) in cases {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let payload = [event, "data: [DONE]", ""].join("\n");
+            let (base_url, handle) = spawn_chatgpt_stub_server(payload, seen).await;
+            let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url)
+                .with_chatgpt_backend_wire();
+
+            let output = client
+                .execute_image_generation(image_executor_request_json(hosted_openai_plan_json()))
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("{name} should return provider failure output: {err}")
+                });
+
+            assert!(matches!(
+                output.terminal_observation,
+                ImageProviderTerminalObservation::ProviderNativeError { .. }
+            ));
+            assert!(output.images.is_empty());
+            assert!(matches!(
+                output.native_metadata,
+                ProviderImageMetadata::OpenAi(OpenAiImageMetadata {
+                    response_id,
+                    ..
+                }) if response_id.as_deref() == expected_response_id
+            ));
+            assert!(matches!(
+                output.warnings.as_slice(),
+                [ImageGenerationWarning::ProviderExecutionFailed { message }]
+                    if message.contains(expected_code) && message.contains(expected_message)
+            ));
+
+            handle.abort();
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_images_api_executor_sends_output_options()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let response = serde_json::json!({
+            "created": 1713833628,
+            "data": [{"b64_json": "data:image/png;base64,aGVsbG8="}]
+        });
+        let (base_url, handle) = spawn_openai_image_stub(response, seen.clone()).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let mut request = image_executor_request_json(images_api_openai_plan_json());
+        request.model = "gpt-image-1".to_string();
+
+        let output = client.execute_image_generation(request).await?;
+
+        assert!(matches!(
+            output.terminal_observation,
+            ImageProviderTerminalObservation::Generated
+        ));
+        assert_eq!(
+            (output.images[0].width, output.images[0].height),
+            (1536, 1024)
+        );
+        let bodies = seen.lock().expect("seen mutex");
+        let body = bodies.first().expect("captured OpenAI image request");
+        assert_eq!(body["model"], "gpt-image-1");
+        assert_eq!(body["size"], "1536x1024");
+        assert_eq!(body["quality"], "low");
+        assert_eq!(body["output_format"], "png");
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_image_executor_sends_provider_params() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let response = serde_json::json!({
+            "id": "resp_img_1",
+            "output": [{"type": "image_generation_call", "id": "ig_1", "result": "aGVsbG8="}]
+        });
+        let (base_url, handle) = spawn_openai_image_stub(response, seen.clone()).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let mut plan = hosted_openai_plan_json();
+        plan["provider_plan"]["provider_params"] = serde_json::json!({
+            "background": "opaque",
+            "output_compression": 72,
+            "moderation": "low",
+            "action": "generate"
+        });
+
+        client
+            .execute_image_generation(image_executor_request_json(plan))
+            .await?;
+
+        let bodies = seen.lock().expect("seen mutex");
+        let body = bodies.first().expect("captured OpenAI image request");
+        assert_eq!(body["tools"][0]["background"], "opaque");
+        assert_eq!(body["tools"][0]["output_compression"], 72);
+        assert_eq!(body["tools"][0]["moderation"], "low");
+        assert_eq!(body["tools"][0]["action"], "generate");
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_hosted_image_executor_sends_web_search_and_reasoning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let response = serde_json::json!({
+            "id": "resp_img_1",
+            "output": [{"type": "image_generation_call", "id": "ig_1", "result": "aGVsbG8="}]
+        });
+        let (base_url, handle) = spawn_openai_image_stub(response, seen.clone()).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let mut plan = hosted_openai_plan_json();
+        plan["provider_plan"]["provider_params"] = serde_json::json!({
+            "reasoning_effort": "xhigh",
+            "web_search": {
+                "search_context_size": "low",
+                "external_web_access": false,
+                "filters": { "allowed_domains": ["example.com"] },
+                "return_token_budget": "default"
+            }
+        });
+
+        client
+            .execute_image_generation(image_executor_request_json(plan))
+            .await?;
+
+        let bodies = seen.lock().expect("seen mutex");
+        let body = bodies.first().expect("captured OpenAI image request");
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert_eq!(body["tools"][0]["search_context_size"], "low");
+        assert_eq!(body["tools"][0]["external_web_access"], false);
+        assert_eq!(
+            body["tools"][0]["filters"]["allowed_domains"][0],
+            "example.com"
+        );
+        assert_eq!(body["tools"][1]["type"], "image_generation");
+        assert_eq!(body["tools"][1]["model"], "gpt-image-2");
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_hosted_image_web_search_boolean_and_null_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (web_search, expect_search_tool) in [
+            (serde_json::json!(true), true),
+            (serde_json::json!({}), true),
+            (serde_json::json!(false), false),
+            (serde_json::Value::Null, false),
+        ] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let response = serde_json::json!({
+                "id": "resp_img_1",
+                "output": [{"type": "image_generation_call", "id": "ig_1", "result": "aGVsbG8="}]
+            });
+            let (base_url, handle) = spawn_openai_image_stub(response, seen.clone()).await;
+            let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+            let mut plan = hosted_openai_plan_json();
+            plan["provider_plan"]["provider_params"] = serde_json::json!({
+                "web_search": web_search
+            });
+
+            client
+                .execute_image_generation(image_executor_request_json(plan))
+                .await?;
+
+            let bodies = seen.lock().expect("seen mutex");
+            let body = bodies.first().expect("captured OpenAI image request");
+            let tools = body["tools"].as_array().expect("tools array");
+            if expect_search_tool {
+                assert_eq!(tools.len(), 2);
+                assert_eq!(tools[0]["type"], "web_search");
+                assert_eq!(tools[1]["type"], "image_generation");
+            } else {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0]["type"], "image_generation");
+            }
+            handle.abort();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_uses_responses_api_endpoint_format() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        // Should have "input" not "messages"
+        assert!(body.get("input").is_some(), "should have 'input' field");
+        assert!(
+            body.get("messages").is_none(),
+            "should NOT have 'messages' field"
+        );
+        assert_eq!(
+            body.get("store").and_then(Value::as_bool),
+            Some(false),
+            "Responses requests should not store provider-side copies by default"
+        );
+
+        // Should include reasoning.encrypted_content
+        let include = body.get("include").expect("should have include");
+        let include_arr = include.as_array().expect("include should be array");
+        assert!(
+            include_arr
+                .iter()
+                .any(|v| v.as_str() == Some("reasoning.encrypted_content")),
+            "should include reasoning.encrypted_content"
+        );
+    }
+
+    #[test]
+    fn openai_prompt_cache_knobs_are_explicit_and_store_defaults_false() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.store = Some(true);
+            t.prompt_cache_key = Some("tenant-a:stable-prefix".to_string());
+            t.prompt_cache_retention = Some(OpenAiPromptCacheRetention::TwentyFourHours);
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        assert_eq!(body["store"], true);
+        assert_eq!(body["prompt_cache_key"], "tenant-a:stable-prefix");
+        assert_eq!(body["prompt_cache_retention"], "24h");
+
+        let default_body = client
+            .build_request_body(&LlmRequest::new(
+                "gpt-5.4",
+                vec![Message::User(UserMessage::text("Hello".to_string()))],
+            ))
+            .expect("build default request");
+        assert_eq!(default_body["store"], false);
+        assert!(default_body.get("prompt_cache_key").is_none());
+        assert!(default_body.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn gpt_56_advanced_responses_params_lower_together() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.6-sol",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        )
+        .with_openai_tag_merge(|tag| {
+            tag.reasoning_effort =
+                Some(meerkat_core::lifecycle::run_primitive::ReasoningEffort::Max);
+            tag.reasoning_mode = Some(OpenAiReasoningMode::Pro);
+            tag.reasoning_context = Some(OpenAiReasoningContext::AllTurns);
+            tag.text_verbosity = Some(OpenAiTextVerbosity::High);
+            tag.prompt_cache_key = Some("meerkat:session:stable".to_string());
+            tag.prompt_cache_options = Some(OpenAiPromptCacheOptions {
+                mode: Some(OpenAiPromptCacheMode::Implicit),
+                ttl: Some(OpenAiPromptCacheTtl::ThirtyMinutes),
+            });
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["reasoning"]["mode"], "pro");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(body["text"]["verbosity"], "high");
+        assert_eq!(body["prompt_cache_key"], "meerkat:session:stable");
+        assert_eq!(
+            body["prompt_cache_options"],
+            serde_json::json!({"mode": "implicit", "ttl": "30m"})
+        );
+        assert!(
+            !body.to_string().contains("prompt_cache_breakpoint"),
+            "implicit mode must leave breakpoint placement to OpenAI"
+        );
+    }
+
+    #[test]
+    fn older_catalog_model_rejects_gpt_56_advanced_params() {
+        let client = OpenAiClient::new("test-key".to_string());
+
+        let pro = LlmRequest::new(
+            "gpt-5.5",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        )
+        .with_openai_tag_merge(|tag| tag.reasoning_mode = Some(OpenAiReasoningMode::Pro));
+        assert!(matches!(
+            client.build_request_body(&pro),
+            Err(LlmError::InvalidRequest { .. })
+        ));
+
+        let context = LlmRequest::new(
+            "gpt-5.5",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        )
+        .with_openai_tag_merge(|tag| {
+            tag.reasoning_context = Some(OpenAiReasoningContext::AllTurns);
+        });
+        assert!(matches!(
+            client.build_request_body(&context),
+            Err(LlmError::InvalidRequest { .. })
+        ));
+
+        let cache = LlmRequest::new(
+            "gpt-5.5",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        )
+        .with_openai_tag_merge(|tag| {
+            tag.prompt_cache_options = Some(OpenAiPromptCacheOptions {
+                mode: Some(OpenAiPromptCacheMode::Explicit),
+                ttl: None,
+            });
+        });
+        assert!(matches!(
+            client.build_request_body(&cache),
+            Err(LlmError::InvalidRequest { .. })
+        ));
+
+        let enabled = LlmRequest::new(
+            "gpt-5.5",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        )
+        .with_openai_tag_merge(|tag| {
+            tag.prompt_cache_enabled = Some(true);
+        });
+        assert!(matches!(
+            client.build_request_body(&enabled),
+            Err(LlmError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn explicit_cache_mode_authors_append_monotone_responses_breakpoints() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let first_request = LlmRequest::new(
+            "gpt-5.6-sol",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        )
+        .with_openai_tag_merge(|tag| {
+            tag.prompt_cache_retention = Some(OpenAiPromptCacheRetention::TwentyFourHours);
+            tag.prompt_cache_options = Some(OpenAiPromptCacheOptions {
+                mode: Some(OpenAiPromptCacheMode::Explicit),
+                ttl: None,
+            });
+        });
+        let first_body = client
+            .build_request_body(&first_request)
+            .expect("build first request");
+        let mut second_request = first_request;
+        second_request
+            .messages
+            .push(Message::User(UserMessage::text("Again".to_string())));
+        let second_body = client
+            .build_request_body(&second_request)
+            .expect("build growing request");
+
+        assert_eq!(first_body["prompt_cache_retention"], "24h");
+        assert_eq!(
+            first_body["prompt_cache_options"],
+            serde_json::json!({"mode": "explicit"})
+        );
+        assert_eq!(
+            first_body["input"][0]["content"][0]["prompt_cache_breakpoint"],
+            serde_json::json!({"mode": "explicit"})
+        );
+        assert_eq!(
+            first_body["input"][0], second_body["input"][0],
+            "growing a conversation must not mutate an earlier marked prefix"
+        );
+        assert_eq!(
+            second_body["input"][1]["content"][0]["prompt_cache_breakpoint"],
+            serde_json::json!({"mode": "explicit"})
+        );
+    }
+
+    #[test]
+    fn explicit_responses_marks_final_supported_multimodal_part() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.6-sol",
+            vec![Message::User(UserMessage::with_blocks(vec![
+                ContentBlock::Text {
+                    text: "describe this".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "iVBOR...".into(),
+                },
+            ]))],
+        )
+        .with_openai_tag_merge(|tag| {
+            tag.prompt_cache_options = Some(OpenAiPromptCacheOptions {
+                mode: Some(OpenAiPromptCacheMode::Explicit),
+                ttl: None,
+            });
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+        assert!(
+            body["input"][0]["content"][0]
+                .get("prompt_cache_breakpoint")
+                .is_none()
+        );
+        assert_eq!(
+            body["input"][0]["content"][1]["prompt_cache_breakpoint"],
+            serde_json::json!({"mode": "explicit"}),
+            "the marker belongs on the final supported multimodal part"
+        );
+    }
+
+    #[test]
+    fn explicit_responses_authors_system_prefix_and_handles_empty_tail_tool_results() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let explicit = |messages| {
+            LlmRequest::new("gpt-5.6-sol", messages).with_openai_tag_merge(|tag| {
+                tag.prompt_cache_options = Some(OpenAiPromptCacheOptions {
+                    mode: Some(OpenAiPromptCacheMode::Explicit),
+                    ttl: None,
+                });
+            })
+        };
+
+        let system_only = client
+            .build_request_body(&explicit(vec![Message::System(
+                meerkat_core::SystemMessage::new("system only"),
+            )]))
+            .expect("explicit system-prefix breakpoint is valid");
+        assert_eq!(
+            system_only["input"][0]["content"][0]["prompt_cache_breakpoint"],
+            serde_json::json!({"mode": "explicit"})
+        );
+
+        let tool_results = client
+            .build_request_body(&explicit(vec![
+                Message::User(UserMessage::text("run tools".to_string())),
+                Message::tool_results(vec![
+                    ToolResult::new(
+                        "call-1".to_string(),
+                        "large stable output".to_string(),
+                        false,
+                    ),
+                    ToolResult::new("call-2".to_string(), String::new(), false),
+                ]),
+            ]))
+            .expect("parallel tool results");
+        assert_eq!(
+            tool_results["input"][1]["output"][0]["prompt_cache_breakpoint"],
+            serde_json::json!({"mode":"explicit"}),
+            "an empty final result must fall back to the last cacheable result"
+        );
+        assert!(
+            tool_results["input"][2]["output"]
+                .to_string()
+                .find("prompt_cache_breakpoint")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn durable_cache_disable_overrides_conflicting_cache_fields() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.6-sol",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        )
+        .with_openai_tag_merge(|tag| {
+            tag.prompt_cache_enabled = Some(false);
+            tag.prompt_cache_key = Some("identity:must-not-leak".to_string());
+            tag.prompt_cache_retention = Some(OpenAiPromptCacheRetention::InMemory);
+            tag.prompt_cache_options = Some(OpenAiPromptCacheOptions {
+                mode: Some(OpenAiPromptCacheMode::Implicit),
+                ttl: Some(OpenAiPromptCacheTtl::ThirtyMinutes),
+            });
+        });
+
+        let body = client
+            .build_request_body(&request)
+            .expect("disable must ignore inactive conflicting cache fields");
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
+        assert_eq!(
+            body["prompt_cache_options"],
+            serde_json::json!({"mode":"explicit"})
+        );
+    }
+
+    #[test]
+    fn gpt_56_rejects_in_memory_legacy_cache_retention() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.6-sol",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        )
+        .with_openai_tag_merge(|tag| {
+            tag.prompt_cache_retention = Some(OpenAiPromptCacheRetention::InMemory);
+        });
+
+        assert!(matches!(
+            client.build_request_body(&request),
+            Err(LlmError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_prompt_cache_options_use_api_defaults() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.6-sol",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        )
+        .with_openai_tag_merge(|tag| {
+            tag.prompt_cache_options = Some(OpenAiPromptCacheOptions::default());
+        });
+        let body = client.build_request_body(&request).expect("build request");
+        assert_eq!(body["prompt_cache_options"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn gpt_56_rejects_legacy_responses_sampling_fields() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.6-luna",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        )
+        .with_openai_tag_merge(|tag| {
+            tag.seed = Some(42);
+            tag.frequency_penalty = Some(0.5);
+            tag.presence_penalty = Some(0.5);
+        });
+
+        assert!(matches!(
+            client.build_request_body(&request),
+            Err(LlmError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn openai_continuation_uses_previous_response_id_and_new_turn_only() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("old question".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage::new(
+                    vec![AssistantBlock::Text {
+                        text: "old answer".to_string(),
+                        meta: Some(Box::new(ProviderMeta::OpenAiResponse {
+                            response_id: "resp_previous".to_string(),
+                        })),
+                    }],
+                    StopReason::EndTurn,
+                )),
+                Message::User(UserMessage::text("new question".to_string())),
+            ],
+        )
+        .with_openai_tag_merge(|t| t.store = Some(true));
+
+        let (body, plan) = client
+            .build_request_body_with_continuation(&request)
+            .expect("build continuation request");
+
+        assert_eq!(
+            plan.expect("continuation plan").previous_response_id,
+            "resp_previous"
+        );
+        assert_eq!(body["store"], true);
+        assert_eq!(body["previous_response_id"], "resp_previous");
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "new question");
+    }
+
+    #[test]
+    fn chatgpt_backend_continuation_preserves_full_request_instructions() {
+        let client = OpenAiClient::new("test-key".to_string()).with_chatgpt_backend_wire();
+        let request = LlmRequest::new(
+            "gpt-5.5",
+            vec![
+                Message::System(meerkat_core::SystemMessage::new(
+                    "You are a careful assistant.".to_string(),
+                )),
+                Message::User(UserMessage::text("old question".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage::new(
+                    vec![AssistantBlock::Text {
+                        text: "old answer".to_string(),
+                        meta: Some(Box::new(ProviderMeta::OpenAiResponse {
+                            response_id: "resp_previous".to_string(),
+                        })),
+                    }],
+                    StopReason::EndTurn,
+                )),
+                Message::User(UserMessage::text("new question".to_string())),
+            ],
+        )
+        .with_openai_tag_merge(|t| t.store = Some(true));
+
+        let (body, plan) = client
+            .build_request_body_with_continuation(&request)
+            .expect("build continuation request");
+
+        assert_eq!(
+            plan.expect("continuation plan").previous_response_id,
+            "resp_previous"
+        );
+        assert_eq!(body["store"], true);
+        assert_eq!(body["previous_response_id"], "resp_previous");
+        assert_eq!(body["instructions"], "You are a careful assistant.");
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "new question");
+    }
+
+    #[test]
+    fn ordered_system_messages_remain_interleaved_on_standard_responses_wire() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let messages = vec![
+            Message::User(UserMessage::text("work")),
+            Message::System(meerkat_core::SystemMessage::new("")),
+            Message::User(UserMessage::text("continue")),
+            Message::System(meerkat_core::SystemMessage::new(" \t ")),
+            Message::System(meerkat_core::SystemMessage::new("duplicate")),
+            Message::System(meerkat_core::SystemMessage::new("duplicate")),
+        ];
+        let request = LlmRequest::new("gpt-5.6-sol", messages.clone());
+
+        let body = client.build_request_body(&request).expect("build request");
+        assert_eq!(request.messages, messages);
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 6);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "work");
+        assert_eq!(input[1]["role"], "system");
+        assert_eq!(input[1]["content"], "");
+        assert_eq!(input[2]["role"], "user");
+        assert_eq!(input[2]["content"], "continue");
+        assert_eq!(input[3]["role"], "system");
+        assert_eq!(input[3]["content"], " \t ");
+        assert_eq!(input[4]["role"], "system");
+        assert_eq!(input[4]["content"], "duplicate");
+        assert_eq!(input[5]["role"], "system");
+        assert_eq!(input[5]["content"], "duplicate");
+    }
+
+    #[test]
+    fn chatgpt_backend_rejects_unrepresentable_system_message_sequence() {
+        let client = OpenAiClient::new("test-key".to_string()).with_chatgpt_backend_wire();
+        let messages = vec![
+            Message::System(meerkat_core::SystemMessage::new("")),
+            Message::User(UserMessage::text("work")),
+            Message::System(meerkat_core::SystemMessage::new("late")),
+        ];
+        let request = LlmRequest::new("gpt-5.5", messages.clone());
+
+        assert!(matches!(
+            client.build_request_body(&request),
+            Err(LlmError::InvalidInputShape { .. })
+        ));
+        assert_eq!(request.messages, messages);
+    }
+
+    #[test]
+    fn chatgpt_backend_rejects_multiple_system_rows_without_aliasing_them() {
+        let client = OpenAiClient::new("test-key".to_string()).with_chatgpt_backend_wire();
+        let request = LlmRequest::new(
+            "gpt-5.5",
+            vec![
+                Message::System(meerkat_core::SystemMessage::new("a\n\nb")),
+                Message::System(meerkat_core::SystemMessage::new("a")),
+            ],
+        );
+
+        assert!(matches!(
+            client.build_request_body(&request),
+            Err(LlmError::InvalidInputShape { .. })
+        ));
+    }
+
+    #[test]
+    fn chatgpt_backend_distinguishes_absent_empty_and_whitespace_system_messages() {
+        let client = OpenAiClient::new("test-key".to_string()).with_chatgpt_backend_wire();
+
+        let absent = client
+            .build_request_body(&LlmRequest::new("gpt-5.5", Vec::new()))
+            .expect("build absent-System request");
+        assert_eq!(absent["instructions"], "You are a helpful assistant.");
+
+        let empty = client
+            .build_request_body(&LlmRequest::new(
+                "gpt-5.5",
+                vec![Message::System(meerkat_core::SystemMessage::new(""))],
+            ))
+            .expect("build empty-System request");
+        assert_eq!(empty["instructions"], "");
+
+        let whitespace = client
+            .build_request_body(&LlmRequest::new(
+                "gpt-5.5",
+                vec![Message::System(meerkat_core::SystemMessage::new(" \t "))],
+            ))
+            .expect("build whitespace-System request");
+        assert_eq!(whitespace["instructions"], " \t ");
+    }
+
+    #[test]
+    fn openai_store_false_keeps_full_replay_without_previous_response_id() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("old question".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage::new(
+                    vec![AssistantBlock::Text {
+                        text: "old answer".to_string(),
+                        meta: Some(Box::new(ProviderMeta::OpenAiResponse {
+                            response_id: "resp_previous".to_string(),
+                        })),
+                    }],
+                    StopReason::EndTurn,
+                )),
+                Message::User(UserMessage::text("new question".to_string())),
+            ],
+        );
+
+        let (body, plan) = client
+            .build_request_body_with_continuation(&request)
+            .expect("build request");
+
+        assert!(plan.is_none());
+        assert_eq!(body["store"], false);
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["input"].as_array().expect("input array").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn chatgpt_backend_wire_uses_codex_responses_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = [
+            r#"data: {"type":"response.output_text.delta","delta":"Hello from ChatGPT"}"#,
+            r#"data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":3}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) = spawn_chatgpt_stub_server(payload, seen.clone()).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url)
+            .with_chatgpt_backend_wire();
+        let request = LlmRequest::new(
+            "gpt-5.5",
+            vec![
+                Message::System(meerkat_core::SystemMessage::new(
+                    "You are a careful assistant.".to_string(),
+                )),
+                Message::User(UserMessage::text("hello".to_string())),
+            ],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut deltas = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event? {
+                LlmEvent::TextDelta { delta, .. } => deltas.push(delta),
+                LlmEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert_eq!(deltas, vec!["Hello from ChatGPT"]);
+        let bodies = seen.lock().expect("seen mutex");
+        let body = bodies.first().expect("captured ChatGPT backend request");
+        assert_eq!(body["instructions"], "You are a careful assistant.");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["tools"], serde_json::json!([]));
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert!(body.get("max_output_tokens").is_none());
+        let input = body["input"].as_array().expect("input should be array");
+        assert!(
+            input
+                .iter()
+                .all(|item| item.get("role").and_then(Value::as_str) != Some("system")),
+            "ChatGPT Codex backend rejects system messages in input; they must be lifted to instructions"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_previous_response_id_rejection_falls_back_to_full_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = [
+            r#"data: {"type":"response.created","response":{"id":"resp_retry"}}"#,
+            r#"data: {"type":"response.output_text.delta","delta":"Recovered"}"#,
+            r#"data: {"type":"response.done","response":{"id":"resp_retry","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":1}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) =
+            spawn_openai_fallback_stub_server(payload, seen.clone(), false).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("old question".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage::new(
+                    vec![AssistantBlock::Text {
+                        text: "old answer".to_string(),
+                        meta: Some(Box::new(ProviderMeta::OpenAiResponse {
+                            response_id: "resp_missing".to_string(),
+                        })),
+                    }],
+                    StopReason::EndTurn,
+                )),
+                Message::User(UserMessage::text("new question".to_string())),
+            ],
+        )
+        .with_openai_tag_merge(|t| t.store = Some(true));
+
+        let mut stream = client.stream(&request);
+        let mut deltas = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event? {
+                LlmEvent::TextDelta { delta, meta } => {
+                    deltas.push(delta);
+                    assert!(matches!(
+                        meta.as_deref(),
+                        Some(ProviderMeta::OpenAiResponse { response_id })
+                            if response_id == "resp_retry"
+                    ));
+                }
+                LlmEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert_eq!(deltas, vec!["Recovered"]);
+        let bodies = seen.lock().expect("seen mutex");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["previous_response_id"], "resp_missing");
+        assert_eq!(bodies[0]["input"].as_array().expect("input array").len(), 1);
+        assert!(bodies[1].get("previous_response_id").is_none());
+        assert_eq!(bodies[1]["input"].as_array().expect("input array").len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_fallback_reauthorizes_once_before_streaming()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = [
+            r#"data: {"type":"response.output_text.delta","delta":"Recovered"}"#,
+            r#"data: {"type":"response.done","response":{"id":"resp_retry","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":1}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) = spawn_openai_fallback_stub_server(payload, seen, true).await;
+        let authorizer = Arc::new(RetryAuthorizer {
+            authorizations: std::sync::atomic::AtomicUsize::new(0),
+            observations: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client = OpenAiClient::new_with_optional_api_key_and_base_url(None, base_url)
+            .with_authorizer(authorizer.clone());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("old question".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage::new(
+                    vec![AssistantBlock::Text {
+                        text: "old answer".to_string(),
+                        meta: Some(Box::new(ProviderMeta::OpenAiResponse {
+                            response_id: "resp_missing".to_string(),
+                        })),
+                    }],
+                    StopReason::EndTurn,
+                )),
+                Message::User(UserMessage::text("new question".to_string())),
+            ],
+        )
+        .with_openai_tag_merge(|tag| tag.store = Some(true));
+
+        let events = client.stream(&request).collect::<Vec<_>>().await;
+        server.abort();
+
+        assert!(events.iter().all(Result::is_ok));
+        assert_eq!(
+            authorizer
+                .authorizations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+        assert_eq!(
+            authorizer
+                .observations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn azure_openai_wire_uses_api_key_header_and_openai_responses_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = [
+            r#"data: {"type":"response.output_text.delta","delta":"Hello from Azure"}"#,
+            r#"data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":3}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_headers = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) =
+            spawn_azure_responses_stub_server(payload, seen.clone(), seen_headers.clone()).await;
+        let client =
+            OpenAiClient::new_with_base_url("azure-key".to_string(), format!("{base_url}/openai"))
+                .with_azure_openai_wire(AzureOpenAiWireConfig::default());
+        let request = LlmRequest::new(
+            "gpt-5.5",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut deltas = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event? {
+                LlmEvent::TextDelta { delta, .. } => deltas.push(delta),
+                LlmEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert_eq!(deltas, vec!["Hello from Azure"]);
+        let headers = seen_headers.lock().expect("seen headers mutex");
+        let headers = headers.first().expect("captured Azure headers");
+        assert_eq!(
+            headers.get("api-key").and_then(|v| v.to_str().ok()),
+            Some("azure-key")
+        );
+        assert!(headers.get("authorization").is_none());
+        let bodies = seen.lock().expect("seen mutex");
+        let body = bodies.first().expect("captured Azure request body");
+        assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert!(body.get("max_output_tokens").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn chatgpt_backend_wire_supplies_default_instructions_without_system_message() {
+        let client = OpenAiClient::new("test-key".to_string()).with_chatgpt_backend_wire();
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        assert_eq!(body["instructions"], "You are a helpful assistant.");
+        assert_eq!(body["store"], false);
+        assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn test_request_input_format_system_message() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::System(meerkat_core::SystemMessage::new(
+                    "You are helpful".to_string(),
+                )),
+                Message::User(UserMessage::text("Hello".to_string())),
+            ],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input should be array");
+
+        // System message should have type: "message"
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[0]["content"], "You are helpful");
+
+        // User message
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"], "Hello");
+    }
+
+    #[test]
+    fn test_request_input_format_degrades_video_user_content_to_text() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::with_blocks(vec![
+                ContentBlock::Video {
+                    media_type: "video/mp4".to_string(),
+                    duration_ms: 12_000,
+                    data: meerkat_core::VideoData::Inline {
+                        data: "AAAA".to_string(),
+                    },
+                },
+            ]))],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input should be array");
+        assert_eq!(input[0]["role"], "user");
+        let content = input[0]["content"]
+            .as_array()
+            .expect("content should be array");
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "[video: video/mp4]");
+    }
+
+    #[test]
+    fn test_request_input_rejects_video_tool_results() {
+        let err = OpenAiClient::convert_to_responses_input(&[Message::ToolResults {
+            results: vec![meerkat_core::ToolResult::with_blocks(
+                "tool_1".to_string(),
+                vec![ContentBlock::Video {
+                    media_type: "video/mp4".to_string(),
+                    duration_ms: 12_000,
+                    data: meerkat_core::VideoData::Inline {
+                        data: "AAAA".to_string(),
+                    },
+                }],
+                false,
+            )],
+            created_at: meerkat_core::types::message_timestamp_now(),
+        }])
+        .expect_err("video tool results should be rejected");
+
+        match err {
+            LlmError::InvalidRequest { message } => {
+                assert!(message.contains("video blocks are not supported"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_input_format_tool_call() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let tool_args = serde_json::json!({"location": "Tokyo"});
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Weather?".to_string())),
+                Message::BlockAssistant(meerkat_core::BlockAssistantMessage {
+                    blocks: vec![meerkat_core::AssistantBlock::ToolUse {
+                        id: "call_abc123".to_string(),
+                        name: "get_weather".to_string(),
+                        args: serde_json::value::RawValue::from_string(tool_args.to_string())
+                            .expect("valid args"),
+                        meta: None,
+                    }],
+                    stop_reason: Some(StopReason::ToolUse),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+            ],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input should be array");
+
+        // Tool call should be type: "function_call"
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_abc123");
+        assert_eq!(input[1]["name"], "get_weather");
+        // arguments should be JSON string
+        let args_str = input[1]["arguments"]
+            .as_str()
+            .expect("arguments should be string");
+        let parsed_args: Value = serde_json::from_str(args_str).expect("should be valid JSON");
+        assert_eq!(parsed_args["location"], "Tokyo");
+    }
+
+    #[test]
+    fn test_request_input_format_tool_result() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Weather?".to_string())),
+                Message::ToolResults {
+                    results: vec![meerkat_core::ToolResult::new(
+                        "call_abc123".to_string(),
+                        "Sunny, 25C".to_string(),
+                        false,
+                    )],
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                },
+            ],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input should be array");
+
+        // Tool result should be type: "function_call_output"
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_abc123");
+        assert_eq!(input[1]["output"], "Sunny, 25C");
+    }
+
+    #[test]
+    fn test_tool_definition_format() {
+        use meerkat_core::ToolDef;
+        use std::sync::Arc;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-4.1-mini",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_tools(vec![Arc::new(ToolDef {
+            name: "get_weather".into(),
+            description: "Get weather info".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"}
+                }
+            }),
+            provenance: None,
+        })]);
+
+        let body = client.build_request_body(&request).expect("build request");
+        let tools = body["tools"].as_array().expect("tools should be array");
+
+        // Responses API tool format: name at top level, not nested in "function"
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "get_weather");
+        assert_eq!(tools[0]["description"], "Get weather info");
+        assert!(tools[0]["parameters"].is_object());
+        // Should NOT have "function" wrapper
+        assert!(tools[0].get("function").is_none());
+    }
+
+    #[test]
+    fn test_tool_definition_preserves_optional_nonnullable_fields_without_strict_normalization() {
+        use meerkat_core::ToolDef;
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "due_at": {"type": "string", "format": "date-time"},
+                "not_before": {"type": "string", "format": "date-time"},
+                "labels": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["title"],
+            "additionalProperties": false
+        });
+        let tool = Arc::new(ToolDef {
+            name: "workgraph_create".into(),
+            description: "Create an item, optionally with a schedule.".to_string(),
+            input_schema: schema.clone(),
+            provenance: None,
+        });
+        let request = LlmRequest::new(
+            "gpt-5.5",
+            vec![Message::User(UserMessage::text(
+                "Create an unscheduled work item.".to_string(),
+            ))],
+        )
+        .with_tools(vec![Arc::clone(&tool)]);
+
+        for (backend, client) in [
+            ("public", OpenAiClient::new("test-key".to_string())),
+            (
+                "chatgpt",
+                OpenAiClient::new("test-key".to_string()).with_chatgpt_backend_wire(),
+            ),
+            (
+                "azure",
+                OpenAiClient::new("test-key".to_string())
+                    .with_azure_openai_wire(AzureOpenAiWireConfig::default()),
+            ),
+        ] {
+            let body = client.build_request_body(&request).expect("build request");
+            let emitted_tool = &body["tools"][0];
+
+            assert_eq!(
+                emitted_tool["strict"], false,
+                "{backend}: optional fields must not be made required by Responses"
+            );
+            assert_eq!(emitted_tool["parameters"], schema, "{backend}");
+            assert_eq!(
+                emitted_tool["parameters"]["required"],
+                serde_json::json!(["title"]),
+                "{backend}"
+            );
+            assert_eq!(
+                emitted_tool["parameters"]["properties"]["due_at"]["type"], "string",
+                "{backend}: optional does not imply nullable"
+            );
+            assert_eq!(
+                tool.input_schema, schema,
+                "{backend}: preserve the source schema"
+            );
+        }
+    }
+
+    /// Regression (A2): the `workgraph_claim` schema shipped from 0.8.22 to
+    /// 0.8.33 carried a root-level `not`, which OpenAI's function-parameter
+    /// validator rejects. The Responses tools array must carry the normalized
+    /// schema while nested keywords OpenAI accepts stay untouched.
+    #[test]
+    fn test_tool_definition_drops_root_level_not_from_pre_fix_workgraph_claim_shape() {
+        use meerkat_core::ToolDef;
+        use std::sync::Arc;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.5",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_tools(vec![Arc::new(ToolDef {
+            name: "workgraph_claim".into(),
+            description: "Claim a ready WorkGraph item with CAS revision checking.".to_string(),
+            input_schema: crate::tool_schema::test_fixtures::pre_fix_workgraph_claim_schema(),
+            provenance: None,
+        })]);
+
+        let body = client.build_request_body(&request).expect("build request");
+        let parameters = &body["tools"][0]["parameters"];
+
+        assert_eq!(body["tools"][0]["name"], "workgraph_claim");
+        assert!(
+            parameters.get("not").is_none(),
+            "root-level not must be dropped: {parameters}"
+        );
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["id", "expected_revision", "owner"])
+        );
+        assert_eq!(parameters["properties"]["lease_seconds"]["type"], "integer");
+        assert_eq!(
+            parameters["properties"]["owner"]["additionalProperties"],
+            serde_json::json!(false),
+            "nested keywords OpenAI accepts are left alone"
+        );
+    }
+
+    #[test]
+    fn test_request_includes_reasoning_config() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        // Should have reasoning config
+        let reasoning = body.get("reasoning").expect("should have reasoning");
+        assert_eq!(reasoning["effort"], "medium");
+        assert_eq!(reasoning["summary"], "auto");
+    }
+
+    #[test]
+    fn test_request_reasoning_effort_override() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.reasoning_effort =
+                Some(meerkat_core::lifecycle::run_primitive::ReasoningEffort::High);
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_request_reasoning_effort_none_override_for_catalog_reasoning_model() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.5",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.reasoning_effort =
+                Some(meerkat_core::lifecycle::run_primitive::ReasoningEffort::None);
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        assert_eq!(body["reasoning"]["effort"], "none");
+    }
+
+    #[test]
+    fn test_request_reasoning_effort_xhigh_override() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.reasoning_effort =
+                Some(meerkat_core::lifecycle::run_primitive::ReasoningEffort::XHigh);
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn test_gpt_56_request_reasoning_effort_max_override() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.6-sol",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.reasoning_effort = Some(meerkat_core::lifecycle::run_primitive::ReasoningEffort::Max);
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        assert_eq!(body["reasoning"]["effort"], "max");
+    }
+
+    #[test]
+    fn test_astra_request_validates_catalog_reasoning_efforts() {
+        use meerkat_core::lifecycle::run_primitive::ReasoningEffort;
+
+        let client = OpenAiClient::new("unused".to_string());
+        for effort in [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ] {
+            let request = LlmRequest::new("gpt-6-astra", vec![])
+                .with_openai_tag_merge(|tag| tag.reasoning_effort = Some(effort));
+            let body = client
+                .build_request_body(&request)
+                .expect("supported effort");
+            assert_eq!(body["reasoning"]["effort"], effort.as_legacy_str());
+            assert_eq!(body["store"], false);
+        }
+        let request = LlmRequest::new("gpt-6-astra", vec![])
+            .with_openai_tag_merge(|tag| tag.reasoning_effort = Some(ReasoningEffort::None));
+        assert!(matches!(
+            client.build_request_body(&request),
+            Err(LlmError::InvalidRequest { .. })
+        ));
+        assert!(serde_json::from_value::<ReasoningEffort>(serde_json::json!("minimal")).is_err());
+        for field in ["logprobs", "top_logprobs"] {
+            let payload = serde_json::json!({field: true});
+            assert!(serde_json::from_value::<meerkat_core::lifecycle::run_primitive::OpenAiProviderTag>(payload.clone()).is_err());
+            assert!(
+                serde_json::from_value::<
+                    meerkat_core::lifecycle::run_primitive::ProviderParamsOverride,
+                >(payload)
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_max_reasoning_effort_rejected_for_older_catalog_model() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.5",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.reasoning_effort = Some(meerkat_core::lifecycle::run_primitive::ReasoningEffort::Max);
+        });
+
+        let error = client
+            .build_request_body(&request)
+            .expect_err("gpt-5.5 must reject the GPT-5.6-only max effort");
+
+        assert!(matches!(error, LlmError::InvalidRequest { .. }));
+        assert!(error.to_string().contains("gpt-5.5"));
+        assert!(error.to_string().contains("max"));
+    }
+
+    #[test]
+    fn test_request_omits_reasoning_payload_for_non_gpt5_model() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-4.1-mini",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("include").is_none());
+    }
+
+    #[test]
+    fn test_reasoning_effort_ignored_for_non_gpt5_model() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-4.1-mini",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.reasoning_effort =
+                Some(meerkat_core::lifecycle::run_primitive::ReasoningEffort::High);
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_request_respects_internal_capability_overrides_for_self_hosted_aliases() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gemma4:e2b",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_temperature(0.3)
+        .with_openai_tag_merge(|t| t.supports_temperature_override = Some(true))
+        .with_openai_tag_merge(|t| t.supports_reasoning_override = Some(true))
+        .with_openai_tag_merge(|t| {
+            t.reasoning_effort =
+                Some(meerkat_core::lifecycle::run_primitive::ReasoningEffort::High);
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        let temperature = body["temperature"]
+            .as_f64()
+            .expect("temperature should be numeric");
+        assert!((temperature - 0.3).abs() < 1e-6);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    /// #46: the `supports_*_override` provider-tag fields are a typed,
+    /// fail-closed carve-out for off-catalog OpenAI-compatible endpoints.
+    /// When no override is present the capability MUST fall through to the
+    /// model catalog (the single typed owner), never default to a permissive
+    /// `true`. This is the fail-closed contract: an override only takes
+    /// effect when an off-catalog compatible client explicitly stamps it.
+    #[test]
+    fn request_capability_overrides_fall_back_to_catalog_when_absent() {
+        // A catalogued model with no override falls through to the catalog
+        // capability row — not to a hardcoded `true`.
+        let catalog_request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        );
+        assert_eq!(
+            OpenAiClient::request_supports_temperature(&catalog_request),
+            OpenAiClient::model_supports_temperature("gpt-5.4"),
+            "absent temperature override must fall through to the catalog row"
+        );
+        assert_eq!(
+            OpenAiClient::request_supports_reasoning_payload(&catalog_request),
+            OpenAiClient::model_supports_reasoning_payload("gpt-5.4"),
+            "absent reasoning override must fall through to the catalog row"
+        );
+
+        // An off-catalog compatible-endpoint alias has no catalog row, so the
+        // catalog says `false` (unknown -> false). With no override the
+        // capability stays fail-closed `false`.
+        let off_catalog_request = LlmRequest::new(
+            "gemma4:e2b",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        );
+        assert!(
+            !OpenAiClient::request_supports_temperature(&off_catalog_request),
+            "off-catalog alias with no override must fail closed to false"
+        );
+
+        // The off-catalog compatible endpoint opts in via the typed override
+        // (the only way the override is ever set — see
+        // `OpenAiCompatibleClient::request_with_remote_model`).
+        let with_override = off_catalog_request
+            .with_openai_tag_merge(|t| t.supports_temperature_override = Some(true));
+        assert!(
+            OpenAiClient::request_supports_temperature(&with_override),
+            "off-catalog endpoint sets the capability via the typed override"
+        );
+    }
+
+    // =========================================================================
+    // BlockAssistant Message Tests
+    // =========================================================================
+
+    #[test]
+    fn test_request_input_format_block_assistant_text() {
+        use meerkat_core::BlockAssistantMessage;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Hello".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![AssistantBlock::Text {
+                        text: "Hi there!".to_string(),
+                        meta: None,
+                    }],
+                    stop_reason: Some(StopReason::EndTurn),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+            ],
+        );
+
+        let body = build_projected_request_body(&client, &request);
+        let input = body["input"].as_array().expect("input should be array");
+
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"], "Hi there!");
+    }
+
+    #[test]
+    fn test_request_input_format_block_assistant_reasoning_with_output_replays_reasoning() {
+        use meerkat_core::BlockAssistantMessage;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Hello".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![
+                        AssistantBlock::Reasoning {
+                            text: "Let me think about this".to_string(),
+                            meta: Some(Box::new(ProviderMeta::OpenAi {
+                                id: "rs_abc123".to_string(),
+                                encrypted_content: Some("encrypted_data".to_string()),
+                                phase: None,
+                                response_id: None,
+                            })),
+                        },
+                        AssistantBlock::Text {
+                            text: "Here is my answer".to_string(),
+                            meta: None,
+                        },
+                    ],
+                    stop_reason: Some(StopReason::EndTurn),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+            ],
+        );
+
+        let body = build_projected_request_body(&client, &request);
+        let input = body["input"].as_array().expect("input should be array");
+
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["id"], "rs_abc123");
+        assert_eq!(input[1]["encrypted_content"], "encrypted_data");
+        assert_eq!(input[2]["type"], "message");
+        assert_eq!(input[2]["role"], "assistant");
+    }
+
+    #[test]
+    fn test_request_input_format_block_assistant_tool_use() {
+        use meerkat_core::BlockAssistantMessage;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let args = RawValue::from_string(r#"{"location":"Tokyo"}"#.to_string()).unwrap();
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Weather?".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![AssistantBlock::ToolUse {
+                        id: "call_xyz".to_string(),
+                        name: "get_weather".into(),
+                        args,
+                        meta: None,
+                    }],
+                    stop_reason: Some(StopReason::ToolUse),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+            ],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input should be array");
+
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_xyz");
+        assert_eq!(input[1]["name"], "get_weather");
+        // arguments should be the raw JSON string
+        let args_str = input[1]["arguments"]
+            .as_str()
+            .expect("arguments should be string");
+        assert_eq!(args_str, r#"{"location":"Tokyo"}"#);
+    }
+
+    // =========================================================================
+    // Provider Parameters Tests
+    // =========================================================================
+
+    #[test]
+    fn test_request_includes_seed_from_provider_params() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| t.seed = Some(12345));
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        assert_eq!(body["seed"], 12345);
+    }
+
+    #[test]
+    fn test_request_includes_frequency_penalty_from_provider_params() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| t.frequency_penalty = Some(0.5));
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        let fp = body["frequency_penalty"].as_f64().expect("fp numeric");
+        assert!((fp - 0.5).abs() < 1e-6, "fp drift: {fp}");
+    }
+
+    #[test]
+    fn test_request_includes_presence_penalty_from_provider_params() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| t.presence_penalty = Some(0.8));
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        let pp = body["presence_penalty"].as_f64().expect("pp numeric");
+        assert!((pp - 0.8).abs() < 1e-6, "pp drift: {pp}");
+    }
+
+    #[test]
+    fn test_request_omits_temperature_for_gpt5_family() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.2-codex",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_temperature(0.2);
+
+        let body = client.build_request_body(&request).expect("build request");
+        assert!(
+            body.get("temperature").is_none(),
+            "gpt-5/codex requests should not include temperature"
+        );
+    }
+
+    #[test]
+    fn test_astra_preserves_unsupported_sampling_omission() {
+        let client = OpenAiClient::new("unused".to_string());
+        let request = LlmRequest::new("gpt-6-astra", vec![]).with_temperature(0.2);
+        let body = client.build_request_body(&request).expect("build request");
+        for field in ["temperature", "top_p", "logprobs", "top_logprobs"] {
+            assert!(body.get(field).is_none(), "{field} must not reach Astra");
+        }
+        assert_eq!(request.temperature, Some(0.2));
+    }
+
+    #[test]
+    fn test_request_includes_temperature_for_supported_model() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-realtime-2",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_temperature(0.3);
+
+        let body = client.build_request_body(&request).expect("build request");
+        let temp = body["temperature"]
+            .as_f64()
+            .expect("temperature should be numeric");
+        assert!((temp - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_multiple_provider_params_combined() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.reasoning_effort =
+                Some(meerkat_core::lifecycle::run_primitive::ReasoningEffort::High);
+        })
+        .with_openai_tag_merge(|t| t.seed = Some(999))
+        .with_openai_tag_merge(|t| t.frequency_penalty = Some(0.3))
+        .with_openai_tag_merge(|t| t.presence_penalty = Some(0.4));
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["seed"], 999);
+        let fp = body["frequency_penalty"].as_f64().expect("fp numeric");
+        assert!((fp - 0.3).abs() < 1e-6, "fp drift: {fp}");
+        let pp = body["presence_penalty"].as_f64().expect("pp numeric");
+        assert!((pp - 0.4).abs() < 1e-6, "pp drift: {pp}");
+    }
+
+    #[test]
+    fn test_tool_args_serialization_no_double_encoding() -> Result<(), Box<dyn std::error::Error>> {
+        let client = OpenAiClient::new("test-key".to_string());
+
+        let tool_args = serde_json::json!({"city": "Tokyo", "units": "celsius"});
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("What's the weather?".to_string())),
+                Message::BlockAssistant(meerkat_core::BlockAssistantMessage {
+                    blocks: vec![meerkat_core::AssistantBlock::ToolUse {
+                        id: "call_123".to_string(),
+                        name: "get_weather".to_string(),
+                        args: serde_json::value::RawValue::from_string(tool_args.to_string())
+                            .expect("valid args"),
+                        meta: None,
+                    }],
+                    stop_reason: Some(StopReason::ToolUse),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+            ],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        let input = body["input"].as_array().ok_or("not array")?;
+        let tool_call = input
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .ok_or("no tool call")?;
+        let arguments = tool_call["arguments"].as_str().ok_or("not string")?;
+
+        let parsed: serde_json::Value = serde_json::from_str(arguments)?;
+
+        assert_eq!(parsed["city"], "Tokyo");
+        assert_eq!(parsed["units"], "celsius");
+
+        assert!(
+            !arguments.starts_with(r"{\"),
+            "arguments should not be double-encoded: {arguments}"
+        );
+        Ok(())
+    }
+
+    // =========================================================================
+    // Structured Output Tests
+    // =========================================================================
+
+    // =========================================================================
+    // Structured-output schema pins
+    //
+    // Anthropic lowers the schema it sends in its native structured-output
+    // slot. These pins hold this adapter's compiled schema and request slot
+    // byte-identical for schemas that carry keywords Anthropic's slot
+    // rejects (numeric bounds, array and object constraints, `oneOf`, `not`,
+    // unsupported string formats), so that lowering can never leak here.
+    // =========================================================================
+
+    /// The live-matrix review schema (numeric bounds on `number` and `integer`).
+    fn pinned_review_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "verdict": {"type": "string", "enum": ["approve", "request_changes", "comment"]},
+                "inline_comments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "line": {"type": "integer", "minimum": 1},
+                            "category": {"type": "string", "enum": ["bug", "security", "performance", "style", "docs"]},
+                            "message": {"type": "string"},
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+                        },
+                        "required": ["path", "line", "category", "message", "confidence"],
+                        "additionalProperties": false
+                    }
+                },
+                "general_comments": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["verdict", "inline_comments"],
+            "additionalProperties": false
+        })
+    }
+
+    /// Every keyword family Anthropic's slot lowering touches.
+    fn pinned_constraint_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "score": {"type": "number", "minimum": 0, "maximum": 1, "multipleOf": 0.01, "description": "Score."},
+                "count": {"type": ["integer", "null"], "format": "uint32", "minimum": 0, "exclusiveMaximum": 100},
+                "ids": {"type": "array", "items": {"type": "string", "format": "uuid"}, "minItems": 2, "maxItems": 5, "uniqueItems": true},
+                "choice": {"oneOf": [{"type": "string", "format": "int64"}, {"type": "integer", "minimum": 1}]},
+                "meta": {"type": "object", "properties": {"a": {"type": "string", "minLength": 1, "pattern": "^a"}}, "minProperties": 1, "propertyNames": {"pattern": "^a$"}},
+                "not_x": {"type": "string", "not": {"const": "x"}}
+            },
+            "required": ["score", "count", "ids", "choice", "meta", "not_x"]
+        })
+    }
+
+    const PINNED_OPENAI_RESPONSES: [(&str, bool, &str); 4] = [
+        (
+            "review",
+            false,
+            r#"{"name":"output","schema":{"additionalProperties":false,"properties":{"general_comments":{"items":{"type":"string"},"type":"array"},"inline_comments":{"items":{"additionalProperties":false,"properties":{"category":{"enum":["bug","security","performance","style","docs"],"type":"string"},"confidence":{"maximum":1,"minimum":0,"type":"number"},"line":{"minimum":1,"type":"integer"},"message":{"type":"string"},"path":{"type":"string"}},"required":["path","line","category","message","confidence"],"type":"object"},"type":"array"},"verdict":{"enum":["approve","request_changes","comment"],"type":"string"}},"required":["verdict","inline_comments"],"type":"object"},"strict":false,"type":"json_schema"}"#,
+        ),
+        (
+            "review",
+            true,
+            r#"{"name":"output","schema":{"additionalProperties":false,"properties":{"general_comments":{"items":{"type":"string"},"type":"array"},"inline_comments":{"items":{"additionalProperties":false,"properties":{"category":{"enum":["bug","security","performance","style","docs"],"type":"string"},"confidence":{"maximum":1,"minimum":0,"type":"number"},"line":{"minimum":1,"type":"integer"},"message":{"type":"string"},"path":{"type":"string"}},"required":["path","line","category","message","confidence"],"type":"object"},"type":"array"},"verdict":{"enum":["approve","request_changes","comment"],"type":"string"}},"required":["verdict","inline_comments"],"type":"object"},"strict":true,"type":"json_schema"}"#,
+        ),
+        (
+            "constraints",
+            false,
+            r#"{"name":"output","schema":{"properties":{"choice":{"oneOf":[{"format":"int64","type":"string"},{"minimum":1,"type":"integer"}]},"count":{"exclusiveMaximum":100,"format":"uint32","minimum":0,"type":["integer","null"]},"ids":{"items":{"format":"uuid","type":"string"},"maxItems":5,"minItems":2,"type":"array","uniqueItems":true},"meta":{"minProperties":1,"properties":{"a":{"minLength":1,"pattern":"^a","type":"string"}},"propertyNames":{"pattern":"^a$"},"required":[],"type":"object"},"not_x":{"not":{"const":"x"},"type":"string"},"score":{"description":"Score.","maximum":1,"minimum":0,"multipleOf":0.01,"type":"number"}},"required":["score","count","ids","choice","meta","not_x"],"type":"object"},"strict":false,"type":"json_schema"}"#,
+        ),
+        (
+            "constraints",
+            true,
+            r#"{"name":"output","schema":{"additionalProperties":false,"properties":{"choice":{"oneOf":[{"format":"int64","type":"string"},{"minimum":1,"type":"integer"}]},"count":{"exclusiveMaximum":100,"format":"uint32","minimum":0,"type":["integer","null"]},"ids":{"items":{"format":"uuid","type":"string"},"maxItems":5,"minItems":2,"type":"array","uniqueItems":true},"meta":{"additionalProperties":false,"minProperties":1,"properties":{"a":{"minLength":1,"pattern":"^a","type":"string"}},"propertyNames":{"pattern":"^a$"},"required":[],"type":"object"},"not_x":{"not":{"const":"x"},"type":"string"},"score":{"description":"Score.","maximum":1,"minimum":0,"multipleOf":0.01,"type":"number"}},"required":["score","count","ids","choice","meta","not_x"],"type":"object"},"strict":true,"type":"json_schema"}"#,
+        ),
+    ];
+
+    #[test]
+    fn structured_output_schema_pins_are_byte_identical() {
+        let client = OpenAiClient::new("test-key".to_string());
+        for (name, strict, expected) in PINNED_OPENAI_RESPONSES {
+            let raw = match name {
+                "review" => pinned_review_schema(),
+                _ => pinned_constraint_schema(),
+            };
+            let mut output_schema = OutputSchema::new(raw).expect("valid schema");
+            output_schema.strict = strict;
+            let compiled = client.compile_schema(&output_schema).expect("compile");
+            assert!(compiled.warnings.is_empty());
+            let request = LlmRequest::new(
+                "gpt-5.4",
+                vec![Message::User(UserMessage::text("extract".to_string()))],
+            )
+            .with_openai_tag_merge(|t| t.structured_output = Some(output_schema.clone()));
+            let body = client.build_request_body(&request).expect("build request");
+            let format = &body["text"]["format"];
+            assert_eq!(format["schema"], compiled.schema, "{name} strict={strict}");
+            assert_eq!(format.to_string(), expected, "{name} strict={strict}");
+        }
+    }
+
+    #[test]
+    fn test_build_request_body_with_structured_output() {
+        let client = OpenAiClient::new("test-key".to_string());
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"}
+            },
+            "required": ["name", "age"]
+        });
+
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.structured_output = serde_json::from_value::<OutputSchema>(serde_json::json!({
+                "schema": schema,
+                "name": "person",
+                "strict": true
+            }))
+            .ok();
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        // Responses API uses "text.format" for structured output
+        let text = body.get("text").expect("should have text");
+        let format = text.get("format").expect("should have format");
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["name"], "person");
+        assert_eq!(format["strict"], true);
+        assert!(format["schema"].is_object());
+    }
+
+    #[test]
+    fn gpt_56_text_verbosity_coexists_with_structured_output() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.6-terra",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|tag| {
+            tag.text_verbosity = Some(OpenAiTextVerbosity::Low);
+            tag.structured_output = serde_json::from_value::<OutputSchema>(serde_json::json!({
+                "schema": {"type": "object"},
+                "name": "answer",
+                "strict": true
+            }))
+            .ok();
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        assert_eq!(body["text"]["verbosity"], "low");
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["name"], "answer");
+    }
+
+    #[test]
+    fn test_build_request_body_with_structured_output_defaults() {
+        let client = OpenAiClient::new("test-key".to_string());
+
+        let schema = serde_json::json!({"type": "object"});
+
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.structured_output = serde_json::from_value::<OutputSchema>(serde_json::json!({
+                "schema": schema
+            }))
+            .ok();
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        let format = &body["text"]["format"];
+        assert_eq!(format["name"], "output"); // default name
+        assert_eq!(format["strict"], false); // default strict
+    }
+
+    #[test]
+    fn test_build_request_body_without_structured_output() {
+        let client = OpenAiClient::new("test-key".to_string());
+
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        // text field should not be present
+        assert!(
+            body.get("text").is_none(),
+            "text should not be present without structured_output"
+        );
+    }
+
+    #[test]
+    fn test_strict_structured_output_injects_additional_properties_recursively() {
+        let client = OpenAiClient::new("test-key".to_string());
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "profile": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"}
+                    }
+                },
+                "addresses": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "street": {"type": "string"}
+                        }
+                    }
+                },
+                "choice": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string"}
+                            }
+                        },
+                        {"type": "string"}
+                    ]
+                }
+            },
+            "required": ["name", "profile", "addresses"]
+        });
+
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.structured_output = serde_json::from_value::<OutputSchema>(serde_json::json!({
+                "schema": schema,
+                "name": "person",
+                "strict": true
+            }))
+            .ok();
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+        let compiled = &body["text"]["format"]["schema"];
+
+        assert_eq!(compiled["additionalProperties"], false);
+        assert_eq!(
+            compiled["properties"]["profile"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            compiled["properties"]["addresses"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            compiled["properties"]["choice"]["anyOf"][0]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn test_strict_structured_output_preserves_explicit_additional_properties() {
+        let client = OpenAiClient::new("test-key".to_string());
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "properties": {
+                        "x": {"type": "string"}
+                    }
+                },
+                "auto": {
+                    "type": "object",
+                    "properties": {
+                        "y": {"type": "integer"}
+                    }
+                }
+            }
+        });
+
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.structured_output = serde_json::from_value::<OutputSchema>(serde_json::json!({
+                "schema": schema,
+                "strict": true
+            }))
+            .ok();
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+        let compiled = &body["text"]["format"]["schema"];
+
+        assert_eq!(compiled["additionalProperties"], true);
+        assert_eq!(
+            compiled["properties"]["nested"]["additionalProperties"],
+            serde_json::json!({"type": "string"})
+        );
+        assert_eq!(
+            compiled["properties"]["auto"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn test_non_strict_structured_output_does_not_inject_additional_properties() {
+        let client = OpenAiClient::new("test-key".to_string());
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "string"}
+                    }
+                }
+            }
+        });
+
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.structured_output = serde_json::from_value::<OutputSchema>(serde_json::json!({
+                "schema": schema,
+                "strict": false
+            }))
+            .ok();
+        });
+
+        let body = client.build_request_body(&request).expect("build request");
+        let compiled = &body["text"]["format"]["schema"];
+
+        assert!(
+            compiled.get("additionalProperties").is_none(),
+            "root should not be modified in non-strict mode"
+        );
+        assert!(
+            compiled["properties"]["nested"]
+                .get("additionalProperties")
+                .is_none(),
+            "nested object should not be modified in non-strict mode"
+        );
+    }
+
+    #[test]
+    fn test_compile_schema_strict_handles_object_union_and_defs() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let schema = serde_json::json!({
+            "type": ["object", "null"],
+            "$defs": {
+                "Meta": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"}
+                    }
+                }
+            },
+            "properties": {
+                "meta": {"$ref": "#/$defs/Meta"},
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "value": {"type": "number"}
+                        }
+                    }
+                }
+            }
+        });
+        let output_schema = OutputSchema::new(schema).expect("valid schema").strict();
+        let compiled = client
+            .compile_schema(&output_schema)
+            .expect("compile should succeed");
+
+        assert!(compiled.warnings.is_empty());
+        assert_eq!(compiled.schema["additionalProperties"], false);
+        assert_eq!(
+            compiled.schema["$defs"]["Meta"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            compiled.schema["properties"]["items"]["items"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn test_compile_schema_strict_keeps_explicit_additional_properties_forms() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": {"type": "integer"},
+            "properties": {
+                "a": {"type": "string"},
+                "b": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "x": {"type": "string"}
+                    }
+                }
+            }
+        });
+        let output_schema = OutputSchema::new(schema).expect("valid schema").strict();
+        let compiled = client
+            .compile_schema(&output_schema)
+            .expect("compile should succeed");
+
+        assert!(compiled.warnings.is_empty());
+        assert_eq!(
+            compiled.schema["additionalProperties"],
+            serde_json::json!({"type": "integer"})
+        );
+        assert_eq!(
+            compiled.schema["properties"]["b"]["additionalProperties"],
+            true
+        );
+    }
+
+    // =========================================================================
+    // SSE Parsing Tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_responses_sse_line_text_delta() {
+        let line = r#"data: {"type":"response.output_text.delta","delta":"Hello"}"#;
+        let event = OpenAiClient::parse_responses_sse_line(line)
+            .expect("well-formed data event parses")
+            .expect("event present");
+        assert_eq!(event.event_type, "response.output_text.delta");
+        assert_eq!(event.delta, Some("Hello".to_string()));
+    }
+
+    #[test]
+    fn test_parse_responses_sse_line_reasoning_delta() {
+        let line =
+            r#"data: {"type":"response.reasoning_summary_text.delta","delta":"thinking..."}"#;
+        let event = OpenAiClient::parse_responses_sse_line(line)
+            .expect("well-formed data event parses")
+            .expect("event present");
+        assert_eq!(event.event_type, "response.reasoning_summary_text.delta");
+        assert_eq!(event.delta, Some("thinking...".to_string()));
+    }
+
+    #[test]
+    fn test_parse_responses_sse_line_function_call_done() {
+        let line = r#"data: {"type":"response.function_call_arguments.done","call_id":"call_123","name":"get_weather","arguments":"{\"location\":\"Tokyo\"}"}"#;
+        let event = OpenAiClient::parse_responses_sse_line(line)
+            .expect("well-formed data event parses")
+            .expect("event present");
+        assert_eq!(event.event_type, "response.function_call_arguments.done");
+        assert_eq!(event.call_id, Some("call_123".to_string()));
+        assert_eq!(event.name, Some("get_weather".to_string()));
+        assert_eq!(event.arguments, Some(r#"{"location":"Tokyo"}"#.to_string()));
+    }
+
+    #[test]
+    fn test_parse_responses_sse_line_response_done() {
+        let line = r#"data: {"type":"response.done","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Hi"}]}],"usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let event = OpenAiClient::parse_responses_sse_line(line)
+            .expect("well-formed data event parses")
+            .expect("event present");
+        assert_eq!(event.event_type, "response.done");
+        let response = event.response.expect("response present");
+        assert_eq!(response["status"], "completed");
+    }
+
+    #[test]
+    fn test_responses_usage_maps_cached_tokens() {
+        let usage_value = serde_json::json!({
+            "input_tokens": 100,
+            "output_tokens": 7,
+            "input_tokens_details": {
+                "cached_tokens": 64,
+                "cache_write_tokens": 32
+            }
+        });
+        let mut usage = Usage::default();
+
+        apply_responses_usage(&mut usage, &usage_value, "gpt-5.5");
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_read_tokens, Some(64));
+        assert_eq!(usage.cache_creation_tokens, Some(32));
+
+        let fallback = serde_json::json!({
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "prompt_tokens_details": {
+                "cached_tokens": 8,
+                "cache_write_tokens": 4
+            }
+        });
+        let mut fallback_usage = Usage::default();
+        apply_responses_usage(&mut fallback_usage, &fallback, "gpt-5.5");
+        assert_eq!(fallback_usage.cache_read_tokens, Some(8));
+        assert_eq!(fallback_usage.cache_creation_tokens, Some(4));
+    }
+
+    #[test]
+    fn test_responses_usage_maps_recorded_gpt56_reasoning_and_cache_counts() {
+        // Recorded verbatim from a live gpt-5.6-luna `response.completed`.
+        let usage_value = serde_json::json!({
+            "input_tokens": 37679,
+            "input_tokens_details": {"cache_write_tokens": 10710, "cached_tokens": 26966},
+            "output_tokens": 2722,
+            "output_tokens_details": {"reasoning_tokens": 2588},
+            "total_tokens": 40401
+        });
+        let mut usage = Usage::default();
+        apply_responses_usage(&mut usage, &usage_value, "gpt-5.6-luna");
+        assert_eq!(usage.input_tokens, 37679);
+        assert_eq!(usage.cache_read_tokens, Some(26966));
+        assert_eq!(usage.cache_creation_tokens, Some(10710));
+        assert_eq!(usage.output_tokens, 2722);
+        assert_eq!(usage.reasoning_tokens, Some(2588));
+
+        let chat_shape = serde_json::json!({
+            "input_tokens": 10,
+            "output_tokens": 6,
+            "completion_tokens_details": {"reasoning_tokens": 4}
+        });
+        let mut chat_usage = Usage::default();
+        apply_responses_usage(&mut chat_usage, &chat_shape, "gpt-5.6-luna");
+        assert_eq!(chat_usage.reasoning_tokens, Some(4));
+
+        let without = serde_json::json!({"input_tokens": 3, "output_tokens": 1});
+        let mut without_usage = Usage::default();
+        apply_responses_usage(&mut without_usage, &without, "gpt-5.6-luna");
+        assert_eq!(without_usage.reasoning_tokens, None);
+    }
+
+    #[test]
+    fn test_parse_responses_sse_line_done_marker() {
+        let line = "data: [DONE]";
+        let event = OpenAiClient::parse_responses_sse_line(line);
+        assert!(matches!(event, Ok(None)));
+    }
+
+    #[test]
+    fn test_parse_responses_sse_line_without_trailing_space() {
+        let line = r#"data:{"type":"response.output_text.delta","delta":"hello"}"#;
+        let event = OpenAiClient::parse_responses_sse_line(line);
+        assert!(matches!(event, Ok(Some(_))));
+    }
+
+    #[test]
+    fn test_parse_responses_sse_line_non_data_line() {
+        let line = "event: message";
+        let event = OpenAiClient::parse_responses_sse_line(line);
+        assert!(matches!(event, Ok(None)));
+    }
+
+    #[test]
+    fn test_parse_responses_sse_line_malformed_data_event_is_typed_error() {
+        // A real `data:` line whose JSON is truncated is a typed fault, not a
+        // silently-dropped non-event.
+        let line = r#"data: {"type":"response.output_text.delta""#;
+        let event = OpenAiClient::parse_responses_sse_line(line);
+        assert!(matches!(event, Err(LlmError::StreamParseError { .. })));
+    }
+
+    #[test]
+    fn test_parse_responses_sse_line_reasoning_item_with_encrypted() {
+        let line = r#"data: {"type":"response.reasoning.done","item":{"id":"rs_abc123","summary":[{"type":"summary_text","text":"I need to think"}],"encrypted_content":"enc_xyz"}}"#;
+        let event = OpenAiClient::parse_responses_sse_line(line)
+            .expect("well-formed data event parses")
+            .expect("event present");
+        assert_eq!(event.event_type, "response.reasoning.done");
+        let item = event.item.expect("should have item");
+        assert_eq!(item["id"], "rs_abc123");
+        assert_eq!(item["encrypted_content"], "enc_xyz");
+        let summary = item["summary"].as_array().expect("summary array");
+        assert_eq!(summary[0]["text"], "I need to think");
+    }
+
+    #[test]
+    fn test_response_incomplete_known_reason_vocabulary_is_typed() {
+        for (reason, expected) in [
+            ("max_tokens", StopReason::MaxTokens),
+            ("max_output_tokens", StopReason::MaxTokens),
+            ("content_filter", StopReason::ContentFilter),
+        ] {
+            let response = serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": { "reason": reason },
+                "output": []
+            });
+            assert!(matches!(
+                responses_terminal_outcome("response.incomplete", &response),
+                LlmDoneOutcome::Success { stop_reason } if stop_reason == expected
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_does_not_duplicate_text_when_completed_replays_output() {
+        let payload = [
+            r#"data: {"type":"response.output_text.delta","delta":"Hello"}"#,
+            r#"data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            r#"data: {"type":"response.done","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut deltas = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::TextDelta { delta, .. } => deltas.push(delta),
+                LlmEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert_eq!(deltas, vec!["Hello"]);
+    }
+
+    /// Watchdog liveness regression: Responses lifecycle events with no
+    /// yielding handler (response.created, response.in_progress,
+    /// response.output_item.added) plus SSE keepalive comments are real wire
+    /// traffic. A chunk made only of them must surface as `WireLiveness` so a
+    /// long reasoning-only stretch does not trip the inactivity watchdog.
+    #[tokio::test]
+    async fn stream_emits_wire_liveness_for_lifecycle_only_chunks() {
+        let chunks = vec![
+            concat!(
+                "data: {\"type\":\"response.created\",",
+                "\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+                "data: {\"type\":\"response.in_progress\",",
+                "\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
+                "\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
+                ": keepalive\n\n"
+            )
+            .to_string(),
+            concat!(
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+                "\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+        ];
+        let (base_url, server) = spawn_openai_paced_sse_server(chunks).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5.6-terra",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut liveness_before_done = 0usize;
+        let mut saw_done = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::WireLiveness => {
+                    if !saw_done {
+                        liveness_before_done += 1;
+                    }
+                }
+                LlmEvent::Done { .. } => saw_done = true,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert!(saw_done, "stream must still terminate with Done");
+        assert!(
+            liveness_before_done >= 1,
+            "a lifecycle-only chunk must surface wire liveness before the terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_maps_cached_tokens_from_completed_usage() {
+        let payload = [
+            r#"data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":5,"input_tokens_details":{"cached_tokens":40}}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut usage_updates = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let LlmEvent::UsageUpdate { usage } = event.expect("stream event") {
+                usage_updates.push(usage);
+            }
+        }
+        server.abort();
+
+        assert_eq!(usage_updates.len(), 1);
+        assert_eq!(usage_updates[0].input_tokens, 100);
+        assert_eq!(usage_updates[0].output_tokens, 5);
+        assert_eq!(usage_updates[0].cache_read_tokens, Some(40));
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_incomplete_at_4096_cap_preserves_partial_usage_and_done() {
+        let payload = [
+            r#"data: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"{\"ops\":["}]}],"usage":{"input_tokens":1200,"output_tokens":4096,"output_tokens_details":{"reasoning_tokens":3072}}}}"#,
+            r#"data: {"type":"response.completed","response":{"id":"resp_late","status":"completed","output":[],"usage":{"input_tokens":1200,"output_tokens":4096}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) =
+            spawn_openai_stub_server_with_body(payload, Arc::clone(&seen)).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5.6-terra",
+            vec![Message::User(UserMessage::text("return JSON".to_string()))],
+        )
+        .with_max_tokens(4096);
+
+        let mut stream = client.stream(&request);
+        let mut text = String::new();
+        let mut usage_updates = Vec::new();
+        let mut outcomes = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                LlmEvent::UsageUpdate { usage } => usage_updates.push(usage),
+                LlmEvent::Done { outcome } => outcomes.push(outcome),
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert_eq!(text, r#"{"ops":["#);
+        assert_eq!(usage_updates.len(), 1);
+        assert_eq!(usage_updates[0].input_tokens, 1200);
+        assert_eq!(usage_updates[0].output_tokens, 4096);
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "terminal event must yield exactly one Done"
+        );
+        assert!(matches!(
+            outcomes[0],
+            LlmDoneOutcome::Success {
+                stop_reason: StopReason::MaxTokens
+            }
+        ));
+        let bodies = seen.lock().expect("seen request bodies");
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0].get("model").and_then(Value::as_str),
+            Some("gpt-5.6-terra")
+        );
+        assert_eq!(
+            bodies[0].get("max_output_tokens").and_then(Value::as_u64),
+            Some(4096),
+            "the regression must exercise the same outbound cap as the steward failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_incomplete_unknown_reason_fails_closed_once() {
+        let payload = [
+            r#"data: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"provider_policy_changed"},"output":[],"usage":{"input_tokens":10,"output_tokens":2}}}"#,
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5.6-terra",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut outcomes = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let LlmEvent::Done { outcome } = event.expect("stream event") {
+                outcomes.push(outcome);
+            }
+        }
+        server.abort();
+
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "terminal event must yield exactly one Done"
+        );
+        assert!(matches!(
+            &outcomes[0],
+            LlmDoneOutcome::Error {
+                error: LlmError::IncompleteResponse { message }
+            } if message.contains("provider_policy_changed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_stream_terminal_event_missing_or_incompatible_response_fails_closed() {
+        let cases = [
+            r#"data: {"type":"response.completed"}"#,
+            r#"data: {"type":"response.completed","response":{"status":"incomplete","output":[{"type":"message","content":[{"type":"output_text","text":"must not project"}]}],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            r#"data: {"type":"response.incomplete","response":{"output":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            r#"data: {"type":"response.incomplete","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            r#"data: {"type":"response.done","response":{"status":"failed","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        ];
+
+        for terminal in cases {
+            let payload = [terminal, "data: [DONE]", ""].join("\n");
+            let (base_url, server) = spawn_openai_stub_server(payload).await;
+            let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+            let request = LlmRequest::new(
+                "gpt-5.6-terra",
+                vec![Message::User(UserMessage::text("hello".to_string()))],
+            );
+
+            let events = client
+                .stream(&request)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("terminal validation is represented by Done, not stream failure");
+            server.abort();
+
+            assert_eq!(
+                events.len(),
+                1,
+                "malformed terminal must not project output or usage: {terminal}"
+            );
+            assert!(matches!(
+                &events[0],
+                LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Error {
+                        error: LlmError::StreamParseError { .. }
+                    }
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_maps_cached_tokens_from_done_usage() {
+        let payload = [
+            r#"data: {"type":"response.done","response":{"status":"completed","output":[],"usage":{"input_tokens":101,"output_tokens":6,"input_tokens_details":{"cached_tokens":41}}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut usage_updates = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let LlmEvent::UsageUpdate { usage } = event.expect("stream event") {
+                usage_updates.push(usage);
+            }
+        }
+        server.abort();
+
+        assert_eq!(usage_updates.len(), 1);
+        assert_eq!(usage_updates[0].input_tokens, 101);
+        assert_eq!(usage_updates[0].output_tokens, 6);
+        assert_eq!(usage_updates[0].cache_read_tokens, Some(41));
+    }
+
+    #[tokio::test]
+    async fn test_stream_done_marker_after_delta_yields_success() {
+        let payload = [
+            r#"data: {"type":"response.output_text.delta","delta":"Hello"}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut deltas = Vec::new();
+        let mut saw_success_done = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::TextDelta { delta, .. } => deltas.push(delta),
+                LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Success { stop_reason },
+                } => {
+                    assert_eq!(stop_reason, StopReason::EndTurn);
+                    saw_success_done = true;
+                    break;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        server.abort();
+
+        assert_eq!(deltas, vec!["Hello"]);
+        assert!(
+            saw_success_done,
+            "[DONE] after streamed output should be accepted as a terminal fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_done_marker_after_reasoning_delta_yields_success() {
+        let payload = [
+            r#"data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut reasoning_deltas = Vec::new();
+        let mut saw_success_done = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::ReasoningDelta { delta } => reasoning_deltas.push(delta),
+                LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Success { stop_reason },
+                } => {
+                    assert_eq!(stop_reason, StopReason::EndTurn);
+                    saw_success_done = true;
+                    break;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        server.abort();
+
+        assert_eq!(reasoning_deltas, vec!["thinking"]);
+        assert!(
+            saw_success_done,
+            "[DONE] after streamed reasoning should be accepted as a terminal fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_done_marker_after_reasoning_meta_yields_success() {
+        let payload = [
+            r#"data: {"type":"response.reasoning.done","item":{"id":"rs_meta","summary":[],"encrypted_content":"enc_meta"}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut saw_reasoning_meta = false;
+        let mut saw_success_done = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::ReasoningComplete { text, meta } => {
+                    assert_eq!(text, "");
+                    assert!(matches!(
+                        meta.as_deref(),
+                        Some(ProviderMeta::OpenAi {
+                            id,
+                            encrypted_content: Some(encrypted),
+                            ..
+                        }) if id == "rs_meta" && encrypted == "enc_meta"
+                    ));
+                    saw_reasoning_meta = true;
+                }
+                LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Success { stop_reason },
+                } => {
+                    assert_eq!(stop_reason, StopReason::EndTurn);
+                    saw_success_done = true;
+                    break;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        server.abort();
+
+        assert!(saw_reasoning_meta);
+        assert!(
+            saw_success_done,
+            "[DONE] after reasoning metadata should be accepted as a terminal fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_done_marker_without_output_still_fails_incomplete() {
+        let payload = ["data: [DONE]", ""].join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut saw_incomplete_done = false;
+        while let Some(event) = stream.next().await {
+            if let LlmEvent::Done {
+                outcome: LlmDoneOutcome::Error { error },
+            } = event.expect("stream event")
+            {
+                assert!(matches!(error, LlmError::IncompleteResponse { .. }));
+                saw_incomplete_done = true;
+                break;
+            }
+        }
+        server.abort();
+
+        assert!(
+            saw_incomplete_done,
+            "empty [DONE] streams should remain fail-closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_web_search_call_blocks_are_emitted() {
+        let payload = [
+            r#"data: {"type":"response.web_search_call.searching","output_index":0,"item_id":"ws_123","sequence_number":1}"#,
+            r#"data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"web_search_call","id":"ws_123","status":"completed","action":{"type":"search","queries":["meerkat runtime"]}},{"type":"message","content":[{"type":"output_text","text":"done","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":4}]}]}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("search".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut server_blocks = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::ServerToolContent {
+                    id, kind, content, ..
+                } => {
+                    server_blocks.push((id, kind, content));
+                }
+                LlmEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert_eq!(server_blocks.len(), 3);
+        // All OpenAI web-search sub-events project to the typed WebSearch kind;
+        // the provider-native sub-event discriminator lives in `content["type"]`.
+        assert_eq!(server_blocks[0].0.as_deref(), Some("ws_123"));
+        assert_eq!(server_blocks[0].1, ServerToolKind::WebSearch);
+        assert_eq!(
+            server_blocks[0].2["type"],
+            "response.web_search_call.searching"
+        );
+        assert_eq!(server_blocks[1].0.as_deref(), Some("ws_123"));
+        assert_eq!(server_blocks[1].1, ServerToolKind::WebSearch);
+        assert_eq!(server_blocks[1].2["type"], "web_search_call");
+        assert_eq!(
+            server_blocks[1].2["action"]["queries"][0],
+            "meerkat runtime"
+        );
+        assert_eq!(server_blocks[2].1, ServerToolKind::WebSearch);
+        assert_eq!(server_blocks[2].2["type"], "message_annotations");
+        assert_eq!(
+            server_blocks[2].2["annotations"][0]["url"],
+            "https://example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_or_non_web_annotations_do_not_claim_web_search() {
+        let payload = [
+            r#"data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","id":"msg_123","content":[{"type":"output_text","text":"ordinary","annotations":[]},{"type":"output_text","text":" file","annotations":[{"type":"file_citation","file_id":"file_123"}]}]}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("answer".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut text = String::new();
+        let mut server_blocks = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                LlmEvent::ServerToolContent { kind, content, .. } => {
+                    server_blocks.push((kind, content));
+                }
+                LlmEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert_eq!(text, "ordinary file");
+        assert!(
+            server_blocks.is_empty(),
+            "annotation presence alone must not assert server-side web-search provenance: {server_blocks:?}"
+        );
+    }
+
+    // =========================================================================
+    // Response Parsing Tests
+    // =========================================================================
+
+    #[test]
+    fn test_response_completed_parses_message_content() {
+        // Test that response.completed event correctly parses message content array
+        let response_json = serde_json::json!({
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "Hello"},
+                        {"type": "output_text", "text": " World"}
+                    ]
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        // Verify structure matches what we expect to parse
+        let output = response_json["output"].as_array().expect("output array");
+        assert_eq!(output[0]["type"], "message");
+        let content = output[0]["content"].as_array().expect("content array");
+        assert_eq!(content[0]["type"], "output_text");
+        assert_eq!(content[0]["text"], "Hello");
+    }
+
+    #[test]
+    fn test_response_completed_parses_reasoning_item() {
+        let response_json = serde_json::json!({
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_abc123",
+                    "summary": [
+                        {"type": "summary_text", "text": "Let me think about this"}
+                    ],
+                    "encrypted_content": "encrypted_stuff_here"
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let output = response_json["output"].as_array().expect("output array");
+        let reasoning = &output[0];
+        assert_eq!(reasoning["type"], "reasoning");
+        assert_eq!(reasoning["id"], "rs_abc123");
+        assert_eq!(reasoning["encrypted_content"], "encrypted_stuff_here");
+        let summary = reasoning["summary"].as_array().expect("summary array");
+        assert_eq!(summary[0]["text"], "Let me think about this");
+    }
+
+    #[test]
+    fn test_response_completed_parses_function_call() {
+        let response_json = serde_json::json!({
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_xyz789",
+                    "name": "get_weather",
+                    "arguments": "{\"location\":\"Tokyo\"}"
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let output = response_json["output"].as_array().expect("output array");
+        let func_call = &output[0];
+        assert_eq!(func_call["type"], "function_call");
+        assert_eq!(func_call["call_id"], "call_xyz789");
+        assert_eq!(func_call["name"], "get_weather");
+        // arguments is a JSON STRING
+        let args_str = func_call["arguments"].as_str().expect("string");
+        let args: Value = serde_json::from_str(args_str).expect("valid json");
+        assert_eq!(args["location"], "Tokyo");
+    }
+
+    // =========================================================================
+    // Orphaned Reasoning Stripping Tests
+    // =========================================================================
+
+    #[test]
+    fn test_orphaned_reasoning_at_end_is_stripped() {
+        use meerkat_core::BlockAssistantMessage;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Hello".to_string())),
+                // Reasoning-only response (e.g., stream interrupted after reasoning)
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![AssistantBlock::Reasoning {
+                        text: "Let me think".to_string(),
+                        meta: Some(Box::new(ProviderMeta::OpenAi {
+                            id: "rs_orphan".to_string(),
+                            encrypted_content: None,
+                            phase: None,
+                            response_id: None,
+                        })),
+                    }],
+                    stop_reason: Some(StopReason::EndTurn),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+            ],
+        );
+
+        let body = build_projected_request_body(&client, &request);
+        let input = body["input"].as_array().expect("input should be array");
+
+        // Orphaned reasoning should be stripped, leaving only the user message
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+    }
+
+    #[test]
+    fn test_orphaned_reasoning_before_user_message_is_stripped() {
+        use meerkat_core::BlockAssistantMessage;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("First question".to_string())),
+                // Reasoning without output, followed by next user turn
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![AssistantBlock::Reasoning {
+                        text: "Thinking...".to_string(),
+                        meta: Some(Box::new(ProviderMeta::OpenAi {
+                            id: "rs_mid".to_string(),
+                            encrypted_content: None,
+                            phase: None,
+                            response_id: None,
+                        })),
+                    }],
+                    stop_reason: Some(StopReason::EndTurn),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+                Message::User(UserMessage::text("Second question".to_string())),
+            ],
+        );
+
+        let body = build_projected_request_body(&client, &request);
+        let input = body["input"].as_array().expect("input should be array");
+
+        // Reasoning followed by user message (not assistant output) should be stripped
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "First question");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"], "Second question");
+    }
+
+    #[test]
+    fn test_orphaned_reasoning_before_tool_result_is_stripped() {
+        use meerkat_core::BlockAssistantMessage;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let args = RawValue::from_string(r"{}".to_string()).unwrap();
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Hello".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![AssistantBlock::ToolUse {
+                        id: "call_123".to_string(),
+                        name: "lookup".to_string(),
+                        args,
+                        meta: None,
+                    }],
+                    stop_reason: Some(StopReason::ToolUse),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+                // Reasoning-only at end of one assistant message
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![AssistantBlock::Reasoning {
+                        text: "Thinking...".to_string(),
+                        meta: Some(Box::new(ProviderMeta::OpenAi {
+                            id: "rs_before_tool".to_string(),
+                            encrypted_content: None,
+                            phase: None,
+                            response_id: None,
+                        })),
+                    }],
+                    stop_reason: Some(StopReason::EndTurn),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+                // Next message is tool results; the reasoning-only message
+                // must be dropped without breaking tool-call adjacency.
+                Message::ToolResults {
+                    results: vec![meerkat_core::ToolResult::new(
+                        "call_123".to_string(),
+                        "result".to_string(),
+                        false,
+                    )],
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                },
+            ],
+        );
+
+        let body = build_projected_request_body(&client, &request);
+        let input = body["input"].as_array().expect("input should be array");
+
+        // Reasoning should be stripped; tool call/result adjacency remains.
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[2]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn test_reasoning_followed_by_function_call_replays_reasoning() {
+        use meerkat_core::BlockAssistantMessage;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let args = RawValue::from_string(r#"{"q":"test"}"#.to_string()).unwrap();
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Hello".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![
+                        AssistantBlock::Reasoning {
+                            text: "I should search".to_string(),
+                            meta: Some(Box::new(ProviderMeta::OpenAi {
+                                id: "rs_valid".to_string(),
+                                encrypted_content: Some("enc_valid".to_string()),
+                                phase: None,
+                                response_id: None,
+                            })),
+                        },
+                        AssistantBlock::ToolUse {
+                            id: "call_1".to_string(),
+                            name: "search".into(),
+                            args,
+                            meta: None,
+                        },
+                    ],
+                    stop_reason: Some(StopReason::ToolUse),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+            ],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input should be array");
+
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["id"], "rs_valid");
+        assert_eq!(input[1]["encrypted_content"], "enc_valid");
+        assert_eq!(input[2]["type"], "function_call");
+    }
+
+    #[test]
+    fn test_non_openai_reasoning_blocks_are_skipped() {
+        use meerkat_core::BlockAssistantMessage;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Hello".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![
+                        AssistantBlock::Reasoning {
+                            text: "Anthropic thinking".to_string(),
+                            meta: Some(Box::new(ProviderMeta::Anthropic {
+                                signature: "sig_abc".to_string(),
+                            })),
+                        },
+                        AssistantBlock::Text {
+                            text: "Answer".to_string(),
+                            meta: None,
+                        },
+                    ],
+                    stop_reason: Some(StopReason::EndTurn),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+            ],
+        );
+
+        let body = build_projected_request_body(&client, &request);
+        let input = body["input"].as_array().expect("input should be array");
+
+        // Non-OpenAI reasoning is not serialized at all, only text remains
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn test_consecutive_orphaned_reasoning_items_all_stripped() {
+        use meerkat_core::BlockAssistantMessage;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Hello".to_string())),
+                // Two consecutive reasoning-only messages (e.g., repeated interruptions)
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![AssistantBlock::Reasoning {
+                        text: "First thought".to_string(),
+                        meta: Some(Box::new(ProviderMeta::OpenAi {
+                            id: "rs_first".to_string(),
+                            encrypted_content: Some("enc_1".to_string()),
+                            phase: None,
+                            response_id: None,
+                        })),
+                    }],
+                    stop_reason: Some(StopReason::EndTurn),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![AssistantBlock::Reasoning {
+                        text: "Second thought".to_string(),
+                        meta: Some(Box::new(ProviderMeta::OpenAi {
+                            id: "rs_second".to_string(),
+                            encrypted_content: None,
+                            phase: None,
+                            response_id: None,
+                        })),
+                    }],
+                    stop_reason: Some(StopReason::EndTurn),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+                Message::User(UserMessage::text("Still here".to_string())),
+            ],
+        );
+
+        let body = build_projected_request_body(&client, &request);
+        let input = body["input"].as_array().expect("input should be array");
+
+        // Both orphaned reasoning items stripped, only user messages remain
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["content"], "Hello");
+        assert_eq!(input[1]["content"], "Still here");
+    }
+
+    // =========================================================================
+    // Response Status Tests
+    // =========================================================================
+
+    #[test]
+    fn test_stop_reason_from_response_status() {
+        // completed with tool calls -> ToolUse
+        let response_tool = serde_json::json!({
+            "status": "completed",
+            "output": [{"type": "function_call", "call_id": "1", "name": "x", "arguments": "{}"}]
+        });
+        let has_tools = response_tool["output"].as_array().is_some_and(|arr| {
+            arr.iter()
+                .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call"))
+        });
+        assert!(has_tools);
+
+        // completed without tool calls -> EndTurn
+        let response_text = serde_json::json!({
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "Hi"}]}]
+        });
+        let has_tools = response_text["output"].as_array().is_some_and(|arr| {
+            arr.iter()
+                .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call"))
+        });
+        assert!(!has_tools);
+    }
+
+    // =========================================================================
+    // Reasoning encrypted_content replay tests
+    // =========================================================================
+
+    #[test]
+    fn test_reasoning_without_encrypted_content_is_replayed_without_encrypted_content() {
+        use meerkat_core::BlockAssistantMessage;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let args = RawValue::from_string(r#"{"q":"test"}"#.to_string()).unwrap();
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Hello".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![
+                        AssistantBlock::Reasoning {
+                            text: "I should search".to_string(),
+                            meta: Some(Box::new(ProviderMeta::OpenAi {
+                                id: "rs_no_enc".to_string(),
+                                encrypted_content: None,
+                                phase: None,
+                                response_id: None,
+                            })),
+                        },
+                        AssistantBlock::ToolUse {
+                            id: "call_1".to_string(),
+                            name: "search".into(),
+                            args,
+                            meta: None,
+                        },
+                    ],
+                    stop_reason: Some(StopReason::ToolUse),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+            ],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input should be array");
+
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["id"], "rs_no_enc");
+        assert!(input[1].get("encrypted_content").is_none());
+        assert_eq!(input[2]["type"], "function_call");
+    }
+
+    #[test]
+    fn test_reasoning_with_encrypted_content_is_replayed() {
+        use meerkat_core::BlockAssistantMessage;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Hello".to_string())),
+                Message::BlockAssistant(BlockAssistantMessage {
+                    blocks: vec![
+                        AssistantBlock::Reasoning {
+                            text: "Let me think".to_string(),
+                            meta: Some(Box::new(ProviderMeta::OpenAi {
+                                id: "rs_enc".to_string(),
+                                encrypted_content: Some("enc_data_here".to_string()),
+                                phase: None,
+                                response_id: None,
+                            })),
+                        },
+                        AssistantBlock::Text {
+                            text: "Here is my answer".to_string(),
+                            meta: None,
+                        },
+                    ],
+                    stop_reason: Some(StopReason::EndTurn),
+                    identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                    assistant_message_id: None,
+                }),
+            ],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input should be array");
+
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["id"], "rs_enc");
+        assert_eq!(input[1]["encrypted_content"], "enc_data_here");
+        assert_eq!(input[2]["type"], "message");
+    }
+
+    // =========================================================================
+    // Stream deduplication tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_stream_does_not_duplicate_tool_calls_when_completed_replays() {
+        let payload = [
+            // Streaming tool call events
+            r#"data: {"type":"response.function_call_arguments.delta","call_id":"call_1","name":"get_weather","delta":"{\"loc"}"#,
+            r#"data: {"type":"response.function_call_arguments.delta","call_id":"call_1","delta":"ation\":\"Tokyo\"}"}"#,
+            r#"data: {"type":"response.function_call_arguments.done","call_id":"call_1","name":"get_weather","arguments":"{\"location\":\"Tokyo\"}"}"#,
+            // response.completed replays the same tool call
+            r#"data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"location\":\"Tokyo\"}"}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            r#"data: {"type":"response.done","response":{"status":"completed","output":[{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"location\":\"Tokyo\"}"}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("weather".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut tool_completes = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::ToolCallComplete { id, .. } => tool_completes.push(id),
+                LlmEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        // Should only get one ToolCallComplete, not duplicated from response.completed
+        assert_eq!(tool_completes.len(), 1);
+        assert_eq!(tool_completes[0], "call_1");
+    }
+
+    #[tokio::test]
+    async fn test_stream_function_call_arguments_can_reference_output_item_id() {
+        let payload = [
+            r#"data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","status":"in_progress","arguments":"","call_id":"call_1","name":"datetime"},"output_index":0,"sequence_number":1}"#,
+            r#"data: {"type":"response.function_call_arguments.delta","delta":"{}","item_id":"fc_1","output_index":0,"sequence_number":2}"#,
+            r#"data: {"type":"response.function_call_arguments.done","arguments":"{}","item_id":"fc_1","output_index":0,"sequence_number":3}"#,
+            r#"data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","status":"completed","arguments":"{}","call_id":"call_1","name":"datetime"},"output_index":0,"sequence_number":4}"#,
+            r#"data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("date".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut tool_completes = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::ToolCallComplete { id, name, args, .. } => {
+                    tool_completes.push((id, name, args));
+                }
+                LlmEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert_eq!(tool_completes.len(), 1);
+        assert_eq!(tool_completes[0].0, "call_1");
+        assert_eq!(tool_completes[0].1, "datetime");
+        assert_eq!(tool_completes[0].2, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn test_stream_malformed_function_call_arguments_done_fails_closed() {
+        let payload = [
+            r#"data: {"type":"response.function_call_arguments.done","call_id":"call_bad","name":"get_weather","arguments":"{\"location\":"}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("weather".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut tool_completes = 0;
+        let mut error_done = None;
+        while let Some(event) = stream.next().await {
+            match event.expect("stream wrapper should convert errors to Done") {
+                LlmEvent::ToolCallComplete { .. } => tool_completes += 1,
+                LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Error { error },
+                } => {
+                    error_done = Some(error);
+                    break;
+                }
+                LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Success { .. },
+                } => panic!("malformed tool args must not complete successfully"),
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert_eq!(tool_completes, 0);
+        let error = error_done.expect("expected terminal error for malformed args");
+        assert!(
+            matches!(error, LlmError::StreamParseError { .. }),
+            "expected StreamParseError, got: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("invalid OpenAI tool call arguments JSON"),
+            "error should name invalid OpenAI tool args: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_does_not_duplicate_reasoning_when_completed_replays() {
+        let payload = [
+            // Streaming reasoning events
+            r#"data: {"type":"response.reasoning_summary_text.delta","delta":"thinking..."}"#,
+            r#"data: {"type":"response.reasoning.done","item":{"id":"rs_1","summary":[{"type":"summary_text","text":"thinking..."}],"encrypted_content":"enc_xyz"}}"#,
+            // response.completed replays the same reasoning
+            r#"data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"thinking..."}],"encrypted_content":"enc_xyz"},{"type":"message","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            r#"data: {"type":"response.done","response":{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut reasoning_completes = 0;
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::ReasoningComplete { .. } => reasoning_completes += 1,
+                LlmEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        // Should only get one ReasoningComplete, not duplicated from response.completed
+        assert_eq!(reasoning_completes, 1);
+    }
+
+    #[tokio::test]
+    async fn test_agent_adapter_accepts_reasoning_only_completed_response() {
+        let payload = [
+            r#"data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","id":"rs_silent","summary":[],"encrypted_content":"enc_silent"}],"usage":{"input_tokens":10,"output_tokens":409770}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = Arc::new(OpenAiClient::new_with_base_url(
+            "test-key".to_string(),
+            base_url,
+        ));
+        let adapter = LlmClientAdapter::new(client, "gpt-5.5".to_string());
+
+        let result = meerkat_core::AgentLlmClient::stream_response(
+            &adapter,
+            &[Message::User(UserMessage::text("ack silently".to_string()))],
+            &[],
+            1024,
+            None,
+            None,
+        )
+        .await
+        .expect("reasoning-only OpenAI response should assemble successfully");
+        server.abort();
+
+        assert_eq!(result.usage().output_tokens, 409770);
+        assert!(matches!(
+            result.blocks(),
+            [AssistantBlock::Reasoning { text, meta }]
+                if text.is_empty() && meta.is_some()
+        ));
+        assert!(
+            result
+                .blocks()
+                .iter()
+                .any(|block| matches!(block, AssistantBlock::Reasoning { .. })),
+            "adapter should preserve the reasoning item for the core commit boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_adapter_preserves_reasoning_delta_when_completed_omits_reasoning_item() {
+        let payload = [
+            r#"data: {"type":"response.reasoning_summary_text.delta","delta":"thinking then silent"}"#,
+            r#"data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":409770}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = Arc::new(OpenAiClient::new_with_base_url(
+            "test-key".to_string(),
+            base_url,
+        ));
+        let adapter = LlmClientAdapter::new(client, "gpt-5.5".to_string());
+
+        let result = meerkat_core::AgentLlmClient::stream_response(
+            &adapter,
+            &[Message::User(UserMessage::text("ack silently".to_string()))],
+            &[],
+            1024,
+            None,
+            None,
+        )
+        .await
+        .expect("terminal OpenAI stream should preserve pending reasoning deltas");
+        server.abort();
+
+        assert_eq!(result.usage().output_tokens, 409770);
+        assert!(matches!(
+            result.blocks(),
+            [AssistantBlock::Reasoning { text, meta }]
+                if text == "thinking then silent" && meta.is_none()
+        ));
+        assert!(
+            meerkat_core::assistant_blocks_have_visible_or_actionable_output(result.blocks()),
+            "pending reasoning summary text should satisfy the core commit predicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_error_event_yields_done_with_error() {
+        let payload = [
+            r#"data: {"type":"error","error":{"code":"server_error","message":"Internal server error"}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut saw_error_done = false;
+        while let Some(event) = stream.next().await {
+            if let LlmEvent::Done {
+                outcome: LlmDoneOutcome::Error { error },
+            } = event.expect("stream event")
+            {
+                assert!(
+                    matches!(error, LlmError::ServerError { status: 500, .. }),
+                    "expected ServerError, got: {error:?}"
+                );
+                let msg = error.to_string();
+                assert!(
+                    msg.contains("Internal server error"),
+                    "error should contain message: {msg}"
+                );
+                saw_error_done = true;
+                break;
+            }
+        }
+        server.abort();
+
+        assert!(saw_error_done, "Expected Done with error outcome");
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_failed_yields_done_with_error() {
+        let payload = [
+            r#"data: {"type":"response.failed","response":{"id":"resp_fail","status":"failed","error":{"code":"server_error","message":"reasoning decryption failed"}}}"#,
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut saw_error_done = false;
+        while let Some(event) = stream.next().await {
+            if let LlmEvent::Done {
+                outcome: LlmDoneOutcome::Error { error },
+            } = event.expect("stream event")
+            {
+                assert!(
+                    matches!(error, LlmError::ServerError { status: 500, .. }),
+                    "expected ServerError, got: {error:?}"
+                );
+                let msg = error.to_string();
+                assert!(
+                    msg.contains("reasoning decryption failed"),
+                    "error should contain message: {msg}"
+                );
+                saw_error_done = true;
+                break;
+            }
+        }
+        server.abort();
+
+        assert!(
+            saw_error_done,
+            "Expected Done with error outcome from response.failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_failed_server_is_overloaded_is_typed_retryable() {
+        let payload = [
+            r#"data: {"type":"response.failed","response":{"id":"resp_overloaded","status":"failed","error":{"code":"server_is_overloaded","message":"The server is overloaded. Please retry later."}}}"#,
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut observed = None;
+        while let Some(event) = stream.next().await {
+            if let LlmEvent::Done {
+                outcome: LlmDoneOutcome::Error { error },
+            } = event.expect("stream event")
+            {
+                observed = Some(error);
+                break;
+            }
+        }
+        server.abort();
+
+        let error = observed.expect("response.failed must yield a terminal error event");
+        assert!(matches!(&error, LlmError::ServerOverloaded));
+        let meerkat_core::error::LlmFailureReason::ProviderError(provider_error) =
+            error.failure_reason()
+        else {
+            panic!("overload must retain a typed provider failure");
+        };
+        assert_eq!(
+            provider_error.kind,
+            meerkat_core::error::LlmProviderErrorKind::ServerOverloaded
+        );
+        assert!(provider_error.is_retryable());
+    }
+
+    #[test]
+    fn insufficient_quota_stream_error_terminalizes_instead_of_retrying() {
+        let error = map_responses_stream_error(
+            "insufficient_quota",
+            "You exceeded your current quota, please check your plan and billing details.",
+        );
+
+        assert!(
+            matches!(&error, LlmError::QuotaExhausted { .. }),
+            "insufficient_quota must classify as exhausted quota, got {error:?}"
+        );
+        assert!(!error.is_retryable());
+        let meerkat_core::error::LlmFailureReason::ProviderError(provider_error) =
+            error.failure_reason()
+        else {
+            panic!("exhausted quota must retain a typed provider carrier");
+        };
+        assert!(!provider_error.is_retryable());
+    }
+
+    #[test]
+    fn unrecognized_stream_error_code_defaults_to_retryable_unknown() {
+        let error = map_responses_stream_error(
+            "future_transient_provider_error",
+            "provider asks the caller to try again later",
+        );
+
+        assert!(matches!(&error, LlmError::Unknown { .. }));
+        assert!(error.is_retryable());
+        let meerkat_core::error::LlmFailureReason::ProviderError(provider_error) =
+            error.failure_reason()
+        else {
+            panic!("unknown provider failure must retain a typed provider carrier");
+        };
+        assert_eq!(
+            provider_error.kind,
+            meerkat_core::error::LlmProviderErrorKind::Unknown
+        );
+        assert!(provider_error.is_retryable());
+    }
+
+    // =========================================================================
+    // Multimodal content (ContentBlock::Image) serialization tests
+    // =========================================================================
+
+    #[test]
+    fn openai_user_message_with_image() {
+        use meerkat_core::ContentBlock;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::with_blocks(vec![
+                ContentBlock::Text {
+                    text: "describe this".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "iVBOR...".into(),
+                },
+            ]))],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input array");
+        let user_item = &input[0];
+
+        assert_eq!(user_item["type"], "message");
+        assert_eq!(user_item["role"], "user");
+
+        // Content should be an array with typed content parts
+        let content = user_item["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 2);
+
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "describe this");
+
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(
+            content[1]["image_url"], "data:image/png;base64,iVBOR...",
+            "should be a data URI"
+        );
+
+        // source_path must NOT leak
+        let body_str = serde_json::to_string(&body).unwrap();
+        assert!(
+            !body_str.contains("source_path"),
+            "source_path must never appear in provider payload"
+        );
+        assert!(
+            !body_str.contains("/tmp/img.png"),
+            "source_path value must never appear in provider payload"
+        );
+    }
+
+    #[test]
+    fn openai_system_notice_with_image_emits_typed_image_part() {
+        use meerkat_core::{
+            SystemNoticeDirection, SystemNoticeKind, SystemNoticeMessage, SystemNoticePeer,
+        };
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let mut request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::SystemNotice(SystemNoticeMessage::with_block(
+                SystemNoticeKind::Comms,
+                None,
+                SystemNoticeBlock::Comms {
+                    sender_taint: None,
+                    kind: meerkat_core::types::CommsNoticeKind::Message,
+                    direction: SystemNoticeDirection::Incoming,
+                    peer: Some(SystemNoticePeer {
+                        id: meerkat_core::comms::PeerId::new(),
+                        display_name: Some("operator".to_string()),
+                    }),
+                    request_id: None,
+                    intent: None,
+                    status: None,
+                    summary: None,
+                    payload: None,
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "describe this poster".to_string(),
+                        },
+                        ContentBlock::Image {
+                            media_type: "image/png".to_string(),
+                            data: ImageData::Inline {
+                                data: "iVBOR...".to_string(),
+                            },
+                        },
+                    ],
+                },
+            ))],
+        );
+        request.messages = client
+            .project_replay_messages(&request.messages)
+            .expect("project system notice");
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input array");
+        let notice_item = &input[0];
+
+        assert_eq!(notice_item["type"], "message");
+        assert_eq!(notice_item["role"], "user");
+        let content = notice_item["content"].as_array().expect("content array");
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,iVBOR...");
+    }
+
+    #[test]
+    fn openai_text_only_user_message_stays_string() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::User(UserMessage::text("just text"))],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input array");
+
+        // Text-only user message content should remain a plain string
+        assert!(
+            input[0]["content"].is_string(),
+            "text-only user message content should be a string"
+        );
+        assert_eq!(input[0]["content"], "just text");
+    }
+
+    #[test]
+    fn openai_tool_result_with_inline_image_emits_responses_parts_array() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Take a screenshot")),
+                Message::ToolResults {
+                    results: vec![meerkat_core::ToolResult::with_blocks(
+                        "call_1".to_string(),
+                        vec![
+                            ContentBlock::Text {
+                                text: "screenshot taken".to_string(),
+                            },
+                            ContentBlock::Image {
+                                media_type: "image/png".to_string(),
+                                data: "iVBOR...".into(),
+                            },
+                        ],
+                        false,
+                    )],
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                },
+            ],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input array");
+
+        // Tool result item
+        let tool_output = &input[1];
+        assert_eq!(tool_output["type"], "function_call_output");
+        assert_eq!(tool_output["call_id"], "call_1");
+
+        let output = tool_output["output"]
+            .as_array()
+            .expect("output should be an array when images are present");
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[0]["text"], "screenshot taken");
+        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(output[1]["image_url"], "data:image/png;base64,iVBOR...");
+    }
+
+    #[test]
+    fn openai_tool_result_with_blob_image_uses_text_projection_part() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![
+                Message::User(UserMessage::text("Take a screenshot")),
+                Message::ToolResults {
+                    results: vec![meerkat_core::ToolResult::with_blocks(
+                        "call_1".to_string(),
+                        vec![
+                            ContentBlock::Text {
+                                text: "screenshot stored".to_string(),
+                            },
+                            ContentBlock::Image {
+                                media_type: "image/png".to_string(),
+                                data: ImageData::Blob {
+                                    blob_id: "sha256:abc".into(),
+                                },
+                            },
+                        ],
+                        false,
+                    )],
+                    created_at: meerkat_core::types::message_timestamp_now(),
+                },
+            ],
+        );
+
+        let body = client.build_request_body(&request).expect("build request");
+        let input = body["input"].as_array().expect("input array");
+        let output = input[1]["output"].as_array().expect("output array");
+
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[0]["text"], "screenshot stored");
+        assert_eq!(output[1]["type"], "input_text");
+        assert_eq!(output[1]["text"], "[image: image/png]");
+    }
+
+    // =========================================================================
+    // Web search tool injection tests
+    // =========================================================================
+
+    #[test]
+    fn test_web_search_tool_appended_openai() {
+        use meerkat_core::ToolDef;
+        use std::sync::Arc;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-4.1-mini",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_tools(vec![Arc::new(ToolDef::new(
+            "my_tool",
+            "A test tool",
+            serde_json::json!({"type": "object"}),
+        ))])
+        .with_openai_tag_merge(|t| {
+            t.web_search = Some(
+                meerkat_core::lifecycle::run_primitive::OpaqueProviderBody::from_value(
+                    &serde_json::json!({"type": "web_search"}),
+                ),
+            );
+        });
+        let body = client.build_request_body(&request).expect("build request");
+        let tools = body["tools"].as_array().expect("tools should be array");
+        assert_eq!(tools.len(), 2, "should have regular tool + web_search");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[1]["type"], "web_search");
+    }
+
+    #[test]
+    fn test_web_search_only_openai() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-4.1-mini",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_openai_tag_merge(|t| {
+            t.web_search = Some(
+                meerkat_core::lifecycle::run_primitive::OpaqueProviderBody::from_value(
+                    &serde_json::json!({"type": "web_search"}),
+                ),
+            );
+        });
+        let body = client.build_request_body(&request).expect("build request");
+        let tools = body["tools"].as_array().expect("tools should be array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "web_search");
+    }
+
+    #[test]
+    fn test_no_web_search_when_absent_openai() {
+        use meerkat_core::ToolDef;
+        use std::sync::Arc;
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-4.1-mini",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_tools(vec![Arc::new(ToolDef::new(
+            "my_tool",
+            "A test tool",
+            serde_json::json!({"type": "object"}),
+        ))]);
+        let body = client.build_request_body(&request).expect("build request");
+        let tools = body["tools"].as_array().expect("tools should be array");
+        assert_eq!(tools.len(), 1, "should only have the regular tool");
+        assert_eq!(tools[0]["type"], "function");
+    }
+
+    #[tokio::test]
+    async fn stream_dispatch_applies_non_vision_replay_to_captured_request() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let payload = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            "data: {\"type\":\"response.done\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+        )
+        .to_string();
+        let (base_url, server) =
+            spawn_openai_stub_server_with_body(payload, Arc::clone(&seen)).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url)
+            .with_image_input_support(false);
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::SystemNotice(SystemNoticeMessage::with_block(
+                meerkat_core::SystemNoticeKind::ExternalEvent,
+                None,
+                SystemNoticeBlock::ExternalEvent {
+                    source: "console".to_string(),
+                    event_type: "operator_message".to_string(),
+                    summary: None,
+                    body: Some("inspect this".to_string()),
+                    payload: None,
+                    content: vec![ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: ImageData::Inline {
+                            data: "NESTED_IMAGE_BYTES".to_string(),
+                        },
+                    }],
+                },
+            ))],
+        );
+
+        let events = client.stream(&request).collect::<Vec<_>>().await;
+        assert!(events.iter().all(Result::is_ok));
+        let bodies = seen.lock().expect("request body capture lock");
+        assert_eq!(bodies.len(), 1);
+        let encoded = serde_json::to_string(&bodies[0]).expect("encode captured request");
+        assert!(!encoded.contains("NESTED_IMAGE_BYTES"));
+        assert!(!encoded.contains("input_image"));
+        assert!(encoded.contains("[image: image/png]"));
+        server.abort();
+    }
+
+    #[test]
+    fn replay_projection_rejects_duplicate_tool_use_ids() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let args = serde_json::value::RawValue::from_string("{}".to_string())
+            .unwrap_or_else(|error| panic!("test args: {error}"));
+        let messages = [
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![
+                    AssistantBlock::ToolUse {
+                        id: "duplicate".to_string(),
+                        name: "a".to_string(),
+                        args: args.clone(),
+                        meta: None,
+                    },
+                    AssistantBlock::ToolUse {
+                        id: "duplicate".to_string(),
+                        name: "b".to_string(),
+                        args,
+                        meta: None,
+                    },
+                ],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![ToolResult::new(
+                "duplicate".to_string(),
+                "result".to_string(),
+                false,
+            )]),
+        ];
+        assert!(matches!(
+            client.project_replay_messages(&messages),
+            Err(LlmError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_projection_rejects_duplicate_tool_result_ids() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let args = serde_json::value::RawValue::from_string("{}".to_string())
+            .unwrap_or_else(|error| panic!("test args: {error}"));
+        let messages = [
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "tool".to_string(),
+                    name: "a".to_string(),
+                    args,
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![
+                ToolResult::new("tool".to_string(), "first".to_string(), false),
+                ToolResult::new("tool".to_string(), "second".to_string(), false),
+            ]),
+        ];
+        assert!(matches!(
+            client.project_replay_messages(&messages),
+            Err(LlmError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_projection_rejects_mismatched_tool_result_id() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let args = serde_json::value::RawValue::from_string("{}".to_string())
+            .unwrap_or_else(|error| panic!("test args: {error}"));
+        let messages = [
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "tool".to_string(),
+                    name: "a".to_string(),
+                    args,
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![ToolResult::new(
+                "other".to_string(),
+                "result".to_string(),
+                false,
+            )]),
+        ];
+        assert!(matches!(
+            client.project_replay_messages(&messages),
+            Err(LlmError::InvalidRequest { .. })
+        ));
+    }
+
+    fn mcp_structured_payload() -> Value {
+        serde_json::json!({
+            "records": [{"name": "a\n\"b", "enabled": true, "missing": null,
+                         "numbers": [0, -7, 1.25], "children": [{"value": false}]}],
+            "empty": {}, "list": []
+        })
+    }
+
+    fn mcp_structured_request(model: &str, mixed: bool) -> LlmRequest {
+        let mut blocks = if mixed {
+            vec![
+                ContentBlock::Text {
+                    text: "before".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "cG5n".into(),
+                },
+                ContentBlock::Text {
+                    text: "after".into(),
+                },
+            ]
+        } else {
+            Vec::new()
+        };
+        blocks.push(ContentBlock::structured(&mcp_structured_payload()).expect("structured JSON"));
+        LlmRequest::new(
+            model,
+            vec![
+                Message::User(UserMessage::text("lookup")),
+                Message::BlockAssistant(BlockAssistantMessage::new(
+                    vec![AssistantBlock::ToolUse {
+                        id: "call-structured".into(),
+                        name: "lookup".into(),
+                        args: serde_json::value::to_raw_value(&serde_json::json!({})).unwrap(),
+                        meta: None,
+                    }],
+                    StopReason::ToolUse,
+                )),
+                Message::tool_results(vec![ToolResult::with_blocks(
+                    "call-structured".into(),
+                    blocks,
+                    false,
+                )]),
+            ],
+        )
+    }
+
+    #[test]
+    fn mcp_structured_openai_nested_result_reaches_request_body() {
+        let client = OpenAiClient::new("test-key".into());
+        let body = client
+            .build_request_body(&mcp_structured_request("gpt-5.4", false))
+            .unwrap();
+        let result = &body["input"][2];
+        assert_eq!(result["type"], "function_call_output");
+        assert_eq!(result["call_id"], "call-structured");
+        assert_eq!(
+            serde_json::from_str::<Value>(result["output"].as_str().unwrap()).unwrap(),
+            mcp_structured_payload()
+        );
+    }
+
+    #[test]
+    fn mcp_structured_openai_mixed_result_keeps_order_and_image() {
+        let client = OpenAiClient::new("test-key".into());
+        let body = client
+            .build_request_body(&mcp_structured_request("gpt-5.4", true))
+            .unwrap();
+        let result = &body["input"][2];
+        assert_eq!(result["type"], "function_call_output");
+        assert_eq!(result["call_id"], "call-structured");
+        let parts = result["output"].as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(
+            parts[0],
+            serde_json::json!({"type": "input_text", "text": "before"})
+        );
+        assert_eq!(
+            parts[1],
+            serde_json::json!({"type": "input_image", "image_url": "data:image/png;base64,cG5n"})
+        );
+        assert_eq!(
+            parts[2],
+            serde_json::json!({"type": "input_text", "text": "after"})
+        );
+        assert_eq!(parts[3]["type"], "input_text");
+        assert_eq!(
+            serde_json::from_str::<Value>(parts[3]["text"].as_str().unwrap()).unwrap(),
+            mcp_structured_payload()
+        );
+    }
+}

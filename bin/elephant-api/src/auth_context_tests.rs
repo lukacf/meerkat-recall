@@ -1,3 +1,5 @@
+use axum::http::StatusCode;
+
 #[tokio::test]
 async fn verified_http_context_is_retained_and_invalid_tokens_never_reach_body_sink() {
     use elephant_auth::{ExactId, IssuerMapping, PrincipalKind};

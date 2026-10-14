@@ -386,7 +386,7 @@ impl TruthSlotRepository {
     }
 
     /// Converts a TruthSlot to a SurrealDB value for insertion.
-    fn truth_slot_to_value(item: &TruthSlot) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn truth_slot_to_value(item: &TruthSlot) -> StorageResult<surrealdb::sql::Value> {
         use surrealdb::sql::Value;
 
         let mut obj = crate::surreal::base_fields_to_object(&item.base)?;
@@ -717,6 +717,39 @@ impl Repository<TruthSlot> for TruthSlotRepository {
     }
 }
 
+impl TruthSlotRepository {
+    /// Reads physical row state for atomic source lifecycle inverse preparation.
+    pub(crate) async fn get_including_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<TruthSlot>> {
+        if let Some(store) = self.client.embedded_store() {
+            return store.get::<TruthSlot>(space_id, id, true).await;
+        }
+
+        let mut response = self
+            .client
+            .query_bind(
+                &format!(
+                    "SELECT {TRUTH_SLOT_PROJECTION} FROM truth_slot WHERE id = $id AND space_id = $space_id"
+                ),
+                crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
+            )
+            .await?;
+
+        let items: Vec<TruthSlotDb> = response
+            .take(0)
+            .map_err(|e| StorageError::QueryError(format!("Failed to parse truth_slot: {e}")))?;
+
+        items
+            .into_iter()
+            .next()
+            .map(TruthSlot::try_from)
+            .transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -786,6 +819,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_truth_slot() {
         let repo = setup_test_repo().await;
         let item = create_test_truth_slot();
@@ -798,6 +835,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_truth_slot() {
         let repo = setup_test_repo().await;
         let item = create_test_truth_slot();
@@ -810,6 +851,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_truth_slot_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_truth_slot();
@@ -839,6 +884,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_truth_slot() {
         let repo = setup_test_repo().await;
         let item = create_test_truth_slot();
@@ -859,6 +908,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_truth_slot() {
         let repo = setup_test_repo().await;
         let item = create_test_truth_slot();
@@ -872,6 +925,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_create_rejects_duplicate_slot_key() {
         let repo = setup_embedded_test_repo().await;
         let first = create_test_truth_slot();
@@ -887,6 +944,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_upsert_rejects_duplicate_slot_key_for_other_id() {
         let repo = setup_embedded_test_repo().await;
         let first = create_test_truth_slot();

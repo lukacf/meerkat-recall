@@ -3,9 +3,11 @@
 
 services:
   surrealdb:
-    image: surrealdb/surrealdb:v2.4.1
+    # Build/load the reviewed paired server first; vanilla images lack its capability.
+    image: "${RECALL_SURREAL_IMAGE:?Set RECALL_SURREAL_IMAGE to the reviewed paired server image}"
+    pull_policy: never
     container_name: elephant-surrealdb-dev
-    user: "0:0"
+    user: "65532:65532"
     command:
       - start
       - --log=info
@@ -17,7 +19,7 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:
-      test: ["CMD", "/surreal", "is-ready"]
+      test: ["CMD", "/usr/local/bin/recall-surreal", "is-ready"]
       interval: 10s
       timeout: 5s
       retries: 5

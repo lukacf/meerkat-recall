@@ -1,0 +1,63 @@
+{
+  "format": "recall-independent-rendered-coordinate-edges/v1",
+  "authority": "qualification",
+  "execution_authorized": false,
+  "product_acceptance": false,
+  "renderer": {
+    "name": "elephant.renderer.text",
+    "version": "1.0.0",
+    "config_hash": null
+  },
+  "cases": [
+    {
+      "id": "empty_normalization_has_only_generated_LF",
+      "accepted_text": "",
+      "rendered_text": "\n",
+      "rendered_span": {
+        "start": 0,
+        "end": 1
+      },
+      "mapping_error": "GeneratedOnly",
+      "active_renderer_outcome": "failed: Document has no content to render; this is only the pure normalization edge",
+      "accepted_text_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "rendered_text_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "rendered_quote_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "id": "CRLF_only_span_maps_both_original_bytes",
+      "accepted_text": "A\r\n",
+      "rendered_text": "A\n",
+      "rendered_span": {
+        "start": 1,
+        "end": 2
+      },
+      "raw_span": {
+        "start": 1,
+        "end": 3
+      },
+      "quote": "\r\n",
+      "selected_rendered_quote": "\n",
+      "accepted_text_sha256": "26ffd5886253906a36a7ea0f6e26056fc36472626cb4894bcb100a34dc69d1db",
+      "rendered_text_sha256": "06f961b802bc46ee168555f066d28f4f0e9afdf3f88174c1ee6f9de004fc30a0",
+      "rendered_quote_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "id": "synthetic_terminal_LF_has_no_original_support",
+      "accepted_text": "A  ",
+      "rendered_text": "A\n",
+      "rendered_span": {
+        "start": 1,
+        "end": 2
+      },
+      "mapping_error": "GeneratedOnly",
+      "accepted_text_sha256": "62a4f64c2a8d94de035a2af0f523055741951efe05b7b4cded825aed76b85c2d",
+      "rendered_text_sha256": "06f961b802bc46ee168555f066d28f4f0e9afdf3f88174c1ee6f9de004fc30a0",
+      "rendered_quote_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    }
+  ],
+  "limits": [
+    "Independent literal expectations, not observed runtime responses.",
+    "Original7positive/8negative fixture remains byte-identical.",
+    "Pure empty normalization is not successful empty-document ingestion."
+  ]
+}

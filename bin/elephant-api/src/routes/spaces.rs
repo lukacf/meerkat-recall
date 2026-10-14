@@ -12,16 +12,15 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
+use elephant_pipeline::predicate::PredicateProposalData;
 use elephant_pipeline::predicate::PREDICATE_PROPOSAL_ARTIFACT_TYPE;
-use elephant_pipeline::predicate::{PredicateProposalData, PredicateProposalWorkflow};
-use elephant_pipeline::renderer::default::PassthroughRenderer;
-use elephant_pipeline::renderer::RendererRegistry;
-use elephant_pipeline::reprocess::WORK_KIND_EXECUTE_REPROCESS_JOB;
-use elephant_pipeline::scheduler::PLAN_EXTRACTION_KIND;
-use elephant_pipeline::scheduler::{execute_build_doc_tree, execute_render_doc, DocTreeConfig};
+use elephant_pipeline::public_predicate_proposal::{
+    PublicPredicateProposal, PublicProposalOptions,
+};
+use elephant_storage::public_mutation::PublicMutation;
 use elephant_storage::{
     AssertionRepository, AttributeRepository, CostLedgerDailyRepository, DocRepository,
     EntityIdentityKeyRepository, EntityRepository, PredicateAliasRepository,
@@ -32,16 +31,12 @@ use elephant_storage::{
 use elephant_types::ids::{RecordId, TableName};
 use elephant_types::records::assertion::Assertion;
 use elephant_types::records::base::{BaseFields, Provenance, Security, SubjectsState};
-use elephant_types::records::entity::{Entity, EntityType};
+use elephant_types::records::entity::Entity;
 use elephant_types::records::identity::{EntityIdentityKey, IdentityKeyStatus};
-use elephant_types::records::predicate::{PredicateAlias, PredicateRegistry, SemanticsStatus};
-use elephant_types::records::rel::Rel;
-use elephant_types::records::reprocess::{
-    ReprocessJob, ReprocessProgress, ReprocessStatus, ReprocessTargetStage, SelectionCriteria,
-};
+use elephant_types::records::predicate::PredicateAlias;
 use elephant_types::records::truth::{CurrentValue, TruthSlot};
 use elephant_types::records::work::{WorkItem, WorkItemStatus};
-use elephant_types::records::{Doc, Source, SpaceConfig};
+use elephant_types::records::{Doc, SpaceConfig};
 use elephant_types::Link;
 
 use crate::auth::Principal as AuthPrincipal;
@@ -168,6 +163,8 @@ struct WorkItemListResponse {
 struct SpaceDocIngestRequest {
     doc: Doc,
     #[serde(default)]
+    intake: elephant_storage::source_intake::IntakeControl,
+    #[serde(default)]
     source_type: Option<String>,
     #[serde(default)]
     classification: Option<String>,
@@ -177,8 +174,11 @@ struct SpaceDocIngestRequest {
 #[allow(clippy::struct_field_names)]
 struct SpaceDocIngestResponse {
     doc_id: String,
-    revision_id: String,
-    work_item_id: String,
+    source_id: String,
+    /// Physical rendered revision, absent until the accepted input is rendered.
+    revision_id: Option<String>,
+    work_item_id: Option<String>,
+    operation: elephant_types::publication::OperationReceipt,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,7 +266,7 @@ fn apply_classification(doc: &mut Doc, classification: Option<&String>) {
         _ => 0,
     };
 
-    doc.base.security.level = level;
+    doc.base.security.level = doc.base.security.level.max(level);
     ensure_policy_defaults(&mut doc.base.security);
 
     if let Some(classification) = class {
@@ -340,13 +340,19 @@ async fn list_work_items(
             })?
     };
 
+    let items = state
+        .authz
+        .filter_records(&principal, items, "read:work_item");
     Ok(Json(WorkItemListResponse {
         total: items.len(),
         results: items,
     }))
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::large_futures,
+    reason = "Retain the existing dispatch future layout and ownership across the original await"
+)]
 async fn create_document(
     State(state): State<Arc<SpaceApiState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -359,104 +365,606 @@ async fn create_document(
     doc.base.created_by.clone_from(&principal.subject);
     ensure_policy_defaults(&mut doc.base.security);
     apply_classification(&mut doc, req.classification.as_ref());
-
-    state
-        .authz
-        .authorize_record_write(&principal, &doc, "write:doc")
-        .map_err(|e| (StatusCode::FORBIDDEN, Json(ApiError::validation(e.message))))?;
-
-    let doc = match state.doc_repo.get(&space_id, &doc.base.id).await {
-        Ok(Some(existing)) => {
-            let mut updated = doc;
-            updated.base.created_at = existing.base.created_at;
-            updated.base.updated_at = chrono::Utc::now();
-            let update_id = updated.base.id.clone();
-            state
-                .doc_repo
-                .update(&space_id, &update_id, updated)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiError::internal(e.to_string())),
-                    )
-                })?
-        }
-        _ => state.doc_repo.create(doc).await.map_err(|e| {
+    if let Some(source_type) = req.source_type {
+        let metadata = doc.metadata.as_object_mut().ok_or_else(|| {
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?,
-    };
-
-    let mut registry = RendererRegistry::new();
-    registry.register(Box::new(PassthroughRenderer::new()));
-    let source_type = req.source_type.as_deref().unwrap_or("text/plain");
-
-    let render_result = execute_render_doc(&state.storage, &registry, &doc, Some(source_type))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::validation("document metadata must be an object")),
             )
         })?;
-
-    let config = DocTreeConfig::default();
-    let _ = execute_build_doc_tree(&state.storage, &render_result.revision_id, &config)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-
-    let payload = serde_json::json!({
-        "revision_id": render_result.revision_id.to_string(),
-        "policy_version": "default",
-        "extractor_id": "elephant.extractor.agentic",
-        "allow_raw_quotes": false,
-        "ingest_mode": "graph"
-    });
-
-    let mut base = BaseFields::new(
-        RecordId::new_v4(TableName::WorkItem),
-        space_id.clone(),
-        principal.subject.clone(),
-    );
-    base.security = doc.base.security.clone();
-    base.provenance = doc.base.provenance.clone();
-    let work_item = WorkItem {
-        base,
-        kind: PLAN_EXTRACTION_KIND.to_string(),
-        payload,
-        status: WorkItemStatus::Runnable,
-        priority: 50,
-        idempotency_key: format!("plan_extraction:{}", render_result.revision_id),
-        attempts: 0,
-        lease_expires_at: None,
-        leased_by: None,
-        run_after: None,
-        last_error: None,
-    };
-
-    let work_item = state.work_item_repo.create(work_item).await.map_err(|e| {
+        metadata.insert("source_type".into(), serde_json::Value::String(source_type));
+    }
+    let (source, _) = super::docs::build_manual_source_for_doc(&doc)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(error)))?;
+    let (accepted, work_item_id) = super::source_intake::accept_intake(
+        &state.storage,
+        &state.authz,
+        &principal,
+        source,
+        Some(&doc),
+        req.intake,
+        &[],
+    )
+    .await?;
+    let doc = accepted.document.ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
+            Json(ApiError::internal(
+                "accepted document has no immutable projection",
+            )),
         )
     })?;
-
+    let mapping =
+        elephant_storage::source_publication_manifest::SourcePublicationManifestRepository::new(
+            state.storage.clone(),
+        )
+        .source_revision_for_document(&space_id, &doc.base.id)
+        .await
+        .map_err(super::source_intake::storage_error)?;
     Ok((
-        StatusCode::CREATED,
+        StatusCode::ACCEPTED,
         Json(SpaceDocIngestResponse {
             doc_id: doc.base.id.to_string(),
-            revision_id: render_result.revision_id.to_string(),
-            work_item_id: work_item.base.id.to_string(),
+            source_id: accepted.source.base.id.to_string(),
+            revision_id: mapping.map(|mapping| mapping.doc_revision_id.to_string()),
+            work_item_id: work_item_id.map(|id| id.to_string()),
+            operation: accepted.operation,
         }),
     ))
+}
+
+#[cfg(test)]
+mod source_intake_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use super::*;
+    use elephant_policy::Clearance;
+    use elephant_types::records::entity::EntityType;
+    use elephant_types::records::{Source, SourceType};
+    use std::collections::HashSet;
+
+    async fn fixture() -> (Arc<SpaceApiState>, AuthPrincipal, Doc) {
+        let storage = StorageClient::new_embedded().await.unwrap();
+        SpaceConfigRepository::new(storage.clone())
+            .create(SpaceConfig {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    "household".into(),
+                    "test".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(SpaceApiState::new(
+            storage,
+            Arc::new(crate::authz::AuthzService::new()),
+        ));
+        let principal = AuthPrincipal {
+            subject: "tester".into(),
+            space_id: Some("household".into()),
+            spaces: None,
+            scopes: [
+                "read:doc:metadata",
+                "write:doc",
+                "read:source",
+                "write:source",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            security_level: 0,
+            security_labels: vec![],
+            clearances: vec![Clearance {
+                policy_id: "default".into(),
+                max_level: 0,
+                labels: HashSet::new(),
+                handling_allow: HashSet::new(),
+            }],
+            subject_allowlist: None,
+            purpose: vec![],
+            bypass_abac: false,
+        };
+        let doc = Doc {
+            base: BaseFields::new(
+                RecordId::new_v4(TableName::Doc),
+                "household".into(),
+                "test".into(),
+            ),
+            title: "Retained source input".into(),
+            text: "First version".into(),
+            sidecar_text: None,
+            source: None,
+            media_attachments: vec![],
+            rendition_key: "request".into(),
+            metadata: serde_json::json!({"extraction_purpose":"facts"}),
+        };
+        (state, principal, doc)
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::default_trait_access,
+        clippy::large_futures,
+        reason = "Retain the original inferred defaults in the source and work-run fixtures; Retain the original test dispatch future layout and await boundaries"
+    )]
+    async fn document_helper_accepts_original_fence_and_preserves_prior_revision() {
+        let (state, principal, doc) = fixture().await;
+        let request = SpaceDocIngestRequest {
+            doc: doc.clone(),
+            intake: Default::default(),
+            source_type: Some("text/plain".into()),
+            classification: None,
+        };
+        let (status, Json(first)) = create_document(
+            State(state.clone()),
+            axum::Extension(principal.clone()),
+            Path("household".into()),
+            Json(request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(
+            first.revision_id.is_none(),
+            "rendered revision must not be fabricated"
+        );
+        let work_id: RecordId = first.work_item_id.as_ref().unwrap().parse().unwrap();
+        let work = state
+            .work_item_repo
+            .get("household", &work_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            work.payload["_publication"]["operation_id"],
+            first.operation.operation_id
+        );
+        assert_eq!(
+            work.payload["_publication"]["generation"],
+            first.operation.source_generation
+        );
+        let old_id: RecordId = first.doc_id.parse().unwrap();
+        let mut next = doc;
+        next.text = "Second version".into();
+        let request = SpaceDocIngestRequest {
+            doc: next,
+            source_type: Some("text/plain".into()),
+            classification: None,
+            intake: elephant_storage::source_intake::IntakeControl {
+                revision_id: Some("second".into()),
+                idempotency_key: Some("second-key".into()),
+                expected_generation: Some(first.operation.source_generation),
+            },
+        };
+        let (_, Json(second)) = create_document(
+            State(state.clone()),
+            axum::Extension(principal),
+            Path("household".into()),
+            Json(request),
+        )
+        .await
+        .unwrap();
+        assert_ne!(second.doc_id, first.doc_id);
+        assert_eq!(
+            state
+                .doc_repo
+                .get("household", &old_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .text,
+            "First version"
+        );
+    }
+
+    fn contact_source() -> Source {
+        let mut source = Source::new(
+            BaseFields::new(
+                RecordId::new_v4(TableName::Source),
+                "household".into(),
+                "caller".into(),
+            ),
+            SourceType::Manual,
+            "Contact import".into(),
+        );
+        source.external_id = Some("address-book:alice".into());
+        source.uri = Some("private://address-book".into());
+        source.metadata = serde_json::json!({"contact":{
+            "name":"Alice", "email":"ALICE@example.invalid", "company":"Example Org", "job_title":"Engineer"
+        }});
+        source
+    }
+
+    fn contact_scopes(principal: &mut AuthPrincipal) {
+        principal.scopes.extend(
+            [
+                "read:entity",
+                "write:entity",
+                "read:relationship",
+                "write:relationship",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::default_trait_access,
+        clippy::large_futures,
+        reason = "Retain the original inferred defaults in the source and work-run fixtures; Retain the original test dispatch future layout and await boundaries"
+    )]
+    async fn contact_helper_seals_intent_and_queues_original_fence_without_graph_writes() {
+        let (state, mut principal, _) = fixture().await;
+        contact_scopes(&mut principal);
+        let source = contact_source();
+        let request = || super::super::sources::SourceWriteRequest {
+            source: source.clone(),
+            intake: Default::default(),
+        };
+        let (status, Json(first)) = create_source_in_space(
+            State(state.clone()),
+            axum::Extension(principal.clone()),
+            Path("household".into()),
+            Json(request()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(first["source"]["uri"].is_null());
+        assert!(first["source"]["metadata"].get("_manual_doc").is_none());
+        assert!(
+            first["operation"].get("source").is_none(),
+            "operation receipt contains no raw source"
+        );
+        let operation: elephant_types::publication::OperationReceipt =
+            serde_json::from_value(first["operation"].clone()).unwrap();
+        let work_id: RecordId = first["work_item_id"].as_str().unwrap().parse().unwrap();
+        let work = state
+            .work_item_repo
+            .get("household", &work_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            work.payload["_publication"]["operation_id"],
+            operation.operation_id
+        );
+        assert_eq!(
+            work.payload["_publication"]["generation"],
+            operation.source_generation
+        );
+        assert_eq!(
+            work.payload["_publication"]["revision_id"],
+            operation.desired_revision.as_ref().unwrap().as_str()
+        );
+        assert!(state
+            .entity_repo
+            .list("household", 100, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .identity_repo
+            .list("household", 100, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .rel_repo
+            .list("household", 100, None)
+            .await
+            .unwrap()
+            .is_empty());
+        let fence: elephant_types::publication::PublicationFence =
+            serde_json::from_value(work.payload["_publication"].clone()).unwrap();
+        let mut plan = elephant_storage::canonical_commit::CanonicalPlan::default();
+        elephant_storage::canonical_commit::CanonicalRepository::new(state.storage.clone())
+            .append_accepted_source_effects(&mut plan, "household", &fence)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.effects.len(),
+            4,
+            "person, key, company and relationship are sealed for whole-source finalization"
+        );
+        let (_, Json(retry)) = create_source_in_space(
+            State(state.clone()),
+            axum::Extension(principal),
+            Path("household".into()),
+            Json(request()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            retry["operation"]["operation_id"],
+            first["operation"]["operation_id"]
+        );
+        assert_eq!(
+            retry["operation"]["source_generation"],
+            first["operation"]["source_generation"]
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::default_trait_access,
+        clippy::large_futures,
+        reason = "Retain the original inferred defaults in the source and work-run fixtures; Retain the original test dispatch future layout and await boundaries"
+    )]
+    async fn contact_helper_denies_hidden_company_before_acceptance_or_partial_person() {
+        let (state, mut principal, _) = fixture().await;
+        contact_scopes(&mut principal);
+        let mut company = Entity::new(
+            BaseFields::new(
+                RecordId::new_v4(TableName::Entity),
+                "household".into(),
+                "fixture".into(),
+            ),
+            EntityType::new("org"),
+            "Example Org".into(),
+        );
+        company.base.security.level = 5;
+        let company = state.entity_repo.create(company).await.unwrap();
+        let error = create_source_in_space(
+            State(state.clone()),
+            axum::Extension(principal),
+            Path("household".into()),
+            Json(super::super::sources::SourceWriteRequest {
+                source: contact_source(),
+                intake: Default::default(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            state
+                .entity_repo
+                .list("household", 100, None)
+                .await
+                .unwrap(),
+            vec![company]
+        );
+        assert!(state
+            .source_repo
+            .list("household", 100, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .identity_repo
+            .list("household", 100, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .work_item_repo
+            .list("household", 100, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            elephant_storage::SourcePublicationRepository::new(state.storage.clone())
+                .external_head("household", SourceType::Manual, "address-book:alice")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::default_trait_access,
+        clippy::large_futures,
+        reason = "Retain the original inferred defaults in the source and work-run fixtures; Retain the original test dispatch future layout and await boundaries"
+    )]
+    async fn source_scopes_alone_do_not_grant_contact_mutation() {
+        let (state, principal, _) = fixture().await;
+        let error = create_source_in_space(
+            State(state.clone()),
+            axum::Extension(principal),
+            Path("household".into()),
+            Json(super::super::sources::SourceWriteRequest {
+                source: contact_source(),
+                intake: Default::default(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert!(state
+            .source_repo
+            .list("household", 100, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .work_item_repo
+            .list("household", 100, None)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_entity_and_identity_keys_share_one_canonical_commit() {
+        let (state, mut principal, _) = fixture().await;
+        principal
+            .scopes
+            .extend(["read:entity".to_owned(), "write:entity".to_owned()]);
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::Entity),
+            "household".into(),
+            "test".into(),
+        );
+        base.subjects_state = SubjectsState::Complete;
+        let mut entity = Entity::new(base, EntityType::new("person"), "Independent person".into());
+        entity.identity_keys = vec![
+            "email:person@example.invalid".into(),
+            "profile:person".into(),
+        ];
+        let (status, Json(created)) = create_entity(
+            State(state.clone()),
+            axum::Extension(principal),
+            Path("household".into()),
+            Json(entity),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        for key in &created.identity_keys {
+            let stored = state
+                .identity_repo
+                .find_by_key("household", key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.entity.id(), &created.base.id);
+            assert_eq!(stored.base.security, created.base.security);
+        }
+        let events = elephant_storage::SystemEventRepository::new(state.storage.clone())
+            .list("household", 100, None)
+            .await
+            .unwrap();
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|event| event.seq > 0));
+        assert!(
+            state
+                .source_repo
+                .list("household", 100, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "independent manual entity needs no manufactured source"
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_identity_key_denies_entity_creation_without_partial_records() {
+        let (state, mut principal, _) = fixture().await;
+        principal
+            .scopes
+            .extend(["read:entity".to_owned(), "write:entity".to_owned()]);
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::EntityIdentityKey),
+            "household".into(),
+            "test".into(),
+        );
+        base.security.level = 5;
+        let key = EntityIdentityKey {
+            base,
+            key: "private-key".into(),
+            entity: Link::new(RecordId::new_v4(TableName::Entity)),
+            confidence: 1.0,
+            first_seen: None,
+            last_seen: None,
+            evidence: vec![],
+            status: IdentityKeyStatus::Active,
+        };
+        state.identity_repo.create(key.clone()).await.unwrap();
+        let mut entity = Entity::new(
+            BaseFields::new(
+                RecordId::new_v4(TableName::Entity),
+                "household".into(),
+                "test".into(),
+            ),
+            EntityType::new("person"),
+            "Denied person".into(),
+        );
+        entity.identity_keys = vec!["fresh-key".into(), "private-key".into()];
+        let id = entity.base.id.clone();
+        let error = create_entity(
+            State(state.clone()),
+            axum::Extension(principal),
+            Path("household".into()),
+            Json(entity),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert!(state
+            .entity_repo
+            .get("household", &id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .identity_repo
+            .find_by_key("household", "fresh-key")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            state
+                .identity_repo
+                .find_by_key("household", "private-key")
+                .await
+                .unwrap()
+                .unwrap(),
+            key
+        );
+        assert!(
+            elephant_storage::SystemEventRepository::new(state.storage.clone())
+                .list("household", 100, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::default_trait_access,
+        clippy::large_futures,
+        reason = "Retain the original inferred defaults in the source and work-run fixtures; Retain the original test dispatch future layout and await boundaries"
+    )]
+    async fn document_helper_authorizes_old_doc_before_any_acceptance() {
+        let (state, principal, doc) = fixture().await;
+        let mut protected = doc.clone();
+        protected.base.security.level = 5;
+        state.doc_repo.create(protected.clone()).await.unwrap();
+        let error = create_document(
+            State(state.clone()),
+            axum::Extension(principal),
+            Path("household".into()),
+            Json(SpaceDocIngestRequest {
+                doc,
+                intake: Default::default(),
+                source_type: None,
+                classification: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            state
+                .doc_repo
+                .get("household", &protected.base.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            protected
+        );
+        assert!(state
+            .source_repo
+            .list("household", 10, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .work_item_repo
+            .list("household", 10, None)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 }
 
 async fn list_documents(
@@ -481,7 +989,12 @@ async fn list_documents(
 
     let filtered = state.authz.filter_records(&principal, docs, "read:doc");
 
-    Ok(Json(filtered))
+    Ok(Json(
+        filtered
+            .into_iter()
+            .map(|doc| crate::redact_doc(&principal, doc).data)
+            .collect(),
+    ))
 }
 
 async fn get_document(
@@ -503,7 +1016,7 @@ async fn get_document(
                 .authz
                 .authorize_record_read(&principal, &doc, "read:doc")
                 .map_err(|e| (StatusCode::FORBIDDEN, Json(ApiError::validation(e.message))))?;
-            Ok(Json(doc))
+            Ok(Json(crate::redact_doc(&principal, doc).data))
         }
         Ok(None) => Err((StatusCode::NOT_FOUND, Json(ApiError::not_found("Doc", &id)))),
         Err(e) => Err((
@@ -542,345 +1055,138 @@ async fn list_entities(
     Ok(Json(filtered))
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Retain guard, repository and runtime owners through the original response or state transition scope"
+)]
 async fn create_entity(
     State(state): State<Arc<SpaceApiState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(space): Path<String>,
     Json(mut entity): Json<Entity>,
 ) -> Result<(StatusCode, Json<Entity>), (StatusCode, Json<ApiError>)> {
+    use elephant_storage::canonical_commit::CanonicalRecord;
+    use elephant_storage::public_mutation::PublicMutation;
     let space_id = ensure_space(&principal, &space)?;
     entity.base.space_id.clone_from(&space_id);
     ensure_policy_defaults(&mut entity.base.security);
-
+    let mut mutation = PublicMutation::begin(state.storage.clone(), &space_id)
+        .await
+        .map_err(super::source_intake::storage_error)?;
+    let denied = |error: crate::authz::AuthzError| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(ApiError::validation(error.message)),
+        )
+    };
+    state
+        .authz
+        .authorize_record_read(&principal, &entity, "read:entity")
+        .map_err(denied)?;
     state
         .authz
         .authorize_record_write(&principal, &entity, "write:entity")
-        .map_err(|e| (StatusCode::FORBIDDEN, Json(ApiError::validation(e.message))))?;
-
-    let created = state.entity_repo.create(entity).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )
-    })?;
-
-    upsert_identity_keys(&state.identity_repo, &created, &created.identity_keys, None).await?;
-
+        .map_err(denied)?;
+    let mut keys = entity.identity_keys.clone();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        if let Some(existing) = state
+            .identity_repo
+            .find_by_key(&space_id, &key)
+            .await
+            .map_err(super::source_intake::storage_error)?
+        {
+            state
+                .authz
+                .authorize_record_read(&principal, &existing, "read:entity")
+                .map_err(denied)?;
+            state
+                .authz
+                .authorize_record_write(&principal, &existing, "write:entity")
+                .map_err(denied)?;
+            if existing.entity.id() != &entity.base.id || existing.base.deleted_at.is_some() {
+                return Err(super::source_intake::storage_error(
+                    elephant_storage::StorageError::Conflict(
+                        "identity key belongs to another identity; use explicit merge".into(),
+                    ),
+                ));
+            }
+            mutation.depend_on(CanonicalRecord::EntityIdentityKey(Box::new(existing)));
+            continue;
+        }
+        let bytes = serde_json::to_vec(&(&space_id, &key)).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::validation(error.to_string())),
+            )
+        })?;
+        let mut base = entity.base.clone();
+        base.id = RecordId::new(
+            TableName::EntityIdentityKey,
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, &bytes),
+        );
+        base.created_by.clone_from(&principal.subject);
+        let record = EntityIdentityKey {
+            base,
+            key,
+            entity: Link::new(entity.base.id.clone()),
+            confidence: 1.0,
+            first_seen: Some(entity.base.created_at),
+            last_seen: Some(entity.base.updated_at),
+            evidence: vec![],
+            status: IdentityKeyStatus::Active,
+        };
+        state
+            .authz
+            .authorize_record_read(&principal, &record, "read:entity")
+            .map_err(denied)?;
+        state
+            .authz
+            .authorize_record_write(&principal, &record, "write:entity")
+            .map_err(denied)?;
+        mutation
+            .stage_create(CanonicalRecord::EntityIdentityKey(Box::new(record)))
+            .map_err(super::source_intake::storage_error)?;
+    }
+    let created = mutation
+        .create(entity, &principal.subject)
+        .await
+        .map_err(super::source_intake::storage_error)?;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct ContactMeta {
-    name: Option<String>,
-    email: Option<String>,
-    company: Option<String>,
-    job_title: Option<String>,
-    profile: Option<String>,
-}
-
-fn extract_contact_meta(metadata: &serde_json::Value) -> Option<ContactMeta> {
-    let obj = metadata.get("contact")?.as_object()?;
-    Some(ContactMeta {
-        name: obj
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string),
-        email: obj
-            .get("email")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string),
-        company: obj
-            .get("company")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string),
-        job_title: obj
-            .get("job_title")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string),
-        profile: obj
-            .get("profile")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string),
-    })
-}
-
+#[expect(
+    clippy::large_futures,
+    reason = "Retain the existing dispatch future layout and ownership across the original await"
+)]
 async fn create_source_in_space(
     State(state): State<Arc<SpaceApiState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(space): Path<String>,
-    Json(mut source): Json<Source>,
-) -> Result<(StatusCode, Json<Source>), (StatusCode, Json<ApiError>)> {
-    let space_id = ensure_space(&principal, &space)?;
-    source.base.space_id.clone_from(&space_id);
+    Json(request): Json<super::sources::SourceWriteRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
+    let mut source = request.source;
+    source.base.space_id = ensure_space(&principal, &space)?;
+    source.base.created_by.clone_from(&principal.subject);
     ensure_policy_defaults(&mut source.base.security);
-
-    state
-        .authz
-        .authorize_record_write(&principal, &source, "write:source")
-        .map_err(|e| (StatusCode::FORBIDDEN, Json(ApiError::validation(e.message))))?;
-
-    let created = state.source_repo.create(source).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )
-    })?;
-
-    if let Some(contact) = extract_contact_meta(&created.metadata) {
-        let entity = upsert_contact_entity(&state, &space_id, &contact, &created).await?;
-        if let Some(company) = contact.company {
-            if let Some(job_title) = contact.job_title {
-                ensure_works_at_rel(&state, &entity, &company, &job_title).await?;
-            }
-        }
-    }
-
-    Ok((StatusCode::CREATED, Json(created)))
-}
-
-async fn upsert_contact_entity(
-    state: &SpaceApiState,
-    space_id: &str,
-    contact: &ContactMeta,
-    source: &Source,
-) -> Result<Entity, (StatusCode, Json<ApiError>)> {
-    let mut keys = Vec::new();
-    if let Some(email) = &contact.email {
-        keys.push(email.to_lowercase());
-    }
-    if let Some(profile) = &contact.profile {
-        keys.push(profile.clone());
-    }
-
-    let mut existing_entity = None;
-    for key in &keys {
-        if let Ok(Some(identity)) = state.identity_repo.find_by_key(space_id, key).await {
-            if let Ok(Some(entity)) = state.entity_repo.get(space_id, identity.entity.id()).await {
-                existing_entity = Some(entity);
-                break;
-            }
-        }
-    }
-
-    let entity = if let Some(mut existing) = existing_entity {
-        for key in &keys {
-            if !existing.identity_keys.contains(key) {
-                existing.identity_keys.push(key.clone());
-            }
-        }
-        if let Some(name) = &contact.name {
-            if existing.display_name != *name && !existing.aliases.contains(name) {
-                existing.aliases.push(name.clone());
-            }
-        }
-        let update_id = existing.base.id.clone();
-        state
-            .entity_repo
-            .update(space_id, &update_id, existing)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )
-            })?
-    } else {
-        let display_name = contact
-            .name
-            .clone()
-            .or_else(|| contact.email.clone())
-            .unwrap_or_else(|| "Unknown".to_string());
-        let mut base = BaseFields::new(
-            RecordId::new_v4(TableName::Entity),
-            space_id.to_string(),
-            "contact_ingest".to_string(),
-        );
-        base.security = Security {
-            policy_id: "default".to_string(),
-            level: 0,
-            labels: vec![],
-            handling: vec![],
-        };
-        base.provenance = Provenance::default();
-        base.subjects_state = SubjectsState::Complete;
-
-        let entity = Entity {
-            base,
-            entity_type: EntityType::new("person"),
-            display_name,
-            aliases: Vec::new(),
-            summary: None,
-            handles: Vec::new(),
-            identity_keys: keys.clone(),
-            risk_level: None,
-            trust_level: None,
-            known_safe: false,
-            first_seen: None,
-            last_seen: None,
-            status: elephant_types::records::entity::EntityStatus::Active,
-            redirect_to: None,
-            metadata: serde_json::json!({
-                "source_type": "contact_import"
-            }),
-        };
-        state.entity_repo.create(entity).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
-    };
-
-    upsert_identity_keys(&state.identity_repo, &entity, &keys, Some(source)).await?;
-
-    Ok(entity)
-}
-
-async fn upsert_identity_keys(
-    repo: &EntityIdentityKeyRepository,
-    entity: &Entity,
-    keys: &[String],
-    source: Option<&Source>,
-) -> Result<(), (StatusCode, Json<ApiError>)> {
-    for key in keys {
-        if let Ok(Some(existing)) = repo.find_by_key(&entity.base.space_id, key).await {
-            if existing.entity.id() == &entity.base.id {
-                continue;
-            }
-        }
-
-        let mut base = BaseFields::new(
-            RecordId::new_v4(TableName::EntityIdentityKey),
-            entity.base.space_id.clone(),
-            "identity_upsert".to_string(),
-        );
-        base.security = entity.base.security.clone();
-        base.provenance = entity.base.provenance.clone();
-        base.subjects_state = SubjectsState::Complete;
-
-        let evidence = source
-            .map(|s| vec![Link::new(s.base.id.clone())])
-            .unwrap_or_default();
-
-        let record = EntityIdentityKey {
-            base,
-            key: key.clone(),
-            entity: Link::new(entity.base.id.clone()),
-            confidence: 1.0,
-            first_seen: Some(Utc::now()),
-            last_seen: Some(Utc::now()),
-            evidence,
-            status: IdentityKeyStatus::Active,
-        };
-
-        repo.create(record).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-    }
-
-    Ok(())
-}
-
-async fn ensure_works_at_rel(
-    state: &SpaceApiState,
-    person: &Entity,
-    company: &str,
-    _job_title: &str,
-) -> Result<(), (StatusCode, Json<ApiError>)> {
-    let company_entity = if let Ok(Some(entity)) = state
-        .entity_repo
-        .find_by_display_name(&person.base.space_id, company)
-        .await
-    {
-        entity
-    } else {
-        let mut base = BaseFields::new(
-            RecordId::new_v4(TableName::Entity),
-            person.base.space_id.clone(),
-            "contact_ingest".to_string(),
-        );
-        base.security = person.base.security.clone();
-        base.provenance = person.base.provenance.clone();
-        base.subjects_state = SubjectsState::Complete;
-
-        let entity = Entity {
-            base,
-            entity_type: EntityType::new("org"),
-            display_name: company.to_string(),
-            aliases: Vec::new(),
-            summary: None,
-            handles: Vec::new(),
-            identity_keys: Vec::new(),
-            risk_level: None,
-            trust_level: None,
-            known_safe: false,
-            first_seen: None,
-            last_seen: None,
-            status: elephant_types::records::entity::EntityStatus::Active,
-            redirect_to: None,
-            metadata: serde_json::json!({}),
-        };
-
-        state.entity_repo.create(entity).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
-    };
-
-    if state
-        .rel_repo
-        .find_by_endpoints_with_deleted(
-            &person.base.space_id,
-            &person.base.id,
-            &company_entity.base.id,
-            "works_at",
-        )
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    let mut base = BaseFields::new(
-        RecordId::new_v4(TableName::Rel),
-        person.base.space_id.clone(),
-        "contact_ingest".to_string(),
-    );
-    base.security = person.base.security.clone();
-    base.provenance = person.base.provenance.clone();
-    base.subjects_state = SubjectsState::Complete;
-
-    let rel = Rel {
-        base,
-        subject: Link::new(person.base.id.clone()),
-        object: Link::new(company_entity.base.id.clone()),
-        rel_type: "works_at".to_string(),
-        status: elephant_types::records::rel::ClaimStatus::Approved,
-        confidence: 0.95,
-        validity_window: None,
-        evidence: Vec::new(),
-        temporal_audit: None,
-    };
-
-    state.rel_repo.create(rel).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )
-    })?;
-
-    Ok(())
+    source.set_requested_ingest_mode(elephant_types::records::ingest::IngestMode::Metadata);
+    let (accepted, work_item_id) = super::source_intake::accept_contact_intake(
+        &state.storage,
+        &state.authz,
+        &principal,
+        source,
+        request.intake,
+    )
+    .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "source": crate::redaction::redact_source(&principal, accepted.source).data,
+            "operation": accepted.operation,
+            "work_item_id": work_item_id,
+        })),
+    ))
 }
 
 async fn list_assertions(
@@ -1079,243 +1385,133 @@ async fn list_predicate_proposals(
     }))
 }
 
+#[expect(
+    clippy::large_futures,
+    clippy::significant_drop_tightening,
+    reason = "Retain the existing dispatch future layout and ownership across the original await; Retain guard, repository and runtime owners through the original response or state transition scope"
+)]
 async fn approve_predicate_proposal(
     State(state): State<Arc<SpaceApiState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(id): Path<String>,
 ) -> ApiResult<PredicateAlias> {
     let space_id = require_space_id(&principal)?;
-
+    state
+        .authz
+        .authorize_space_scope(&principal, &space_id, "write:predicate")
+        .map_err(predicate_proposal_auth_error)?;
     let artifact_id = elephant_storage::parse_id(&id, TableName::WorkArtifact).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(ApiError::validation(e.to_string())),
         )
     })?;
-
-    let workflow = PredicateProposalWorkflow::new(state.storage.clone());
+    let mutation = PublicMutation::begin(state.storage.clone(), &space_id)
+        .await
+        .map_err(|error| ApiError::storage(&error))?;
     let artifact = state
         .work_artifact_repo
         .get(&space_id, &artifact_id)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
+        .map_err(|error| ApiError::storage(&error))?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
                 Json(ApiError::not_found("WorkArtifact", &id)),
             )
         })?;
-
-    let proposal: PredicateProposalData =
-        serde_json::from_value(artifact.data.clone()).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiError::validation(e.to_string())),
-            )
-        })?;
-
-    ensure_predicate_registry_entry(
-        &state.predicate_repo,
-        &space_id,
-        &proposal.predicate_id,
-        &principal.subject,
-    )
-    .await?;
-
-    let _ = workflow
-        .validate_predicate_proposal(&space_id, &artifact_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-
-    let _ = workflow
-        .commit_predicate_proposal(&space_id, &artifact_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-
-    let alias = state
-        .alias_repo
-        .find_active_by_raw(&space_id, &proposal.proposed_aliases[0].alias)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ApiError::not_found(
-                    "PredicateAlias",
-                    &proposal.predicate_id,
-                )),
-            )
-        })?;
-
-    enqueue_reprocess_for_predicate(&state, &space_id, &proposal.predicate_id).await?;
-
-    Ok(Json(alias))
-}
-
-async fn ensure_predicate_registry_entry(
-    repo: &PredicateRegistryRepository,
-    space_id: &str,
-    predicate_id: &str,
-    actor: &str,
-) -> Result<(), (StatusCode, Json<ApiError>)> {
-    if repo
-        .find_by_predicate_id(space_id, predicate_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    let mut base = BaseFields::new(
-        RecordId::new_v4(TableName::PredicateRegistry),
-        space_id.to_string(),
-        actor.to_string(),
-    );
-    base.security = Security {
-        policy_id: "default".to_string(),
-        level: 0,
-        labels: vec![],
-        handling: vec![],
-    };
-    base.provenance = Provenance::default();
-    base.subjects_state = SubjectsState::Complete;
-
-    let record = PredicateRegistry {
-        base,
-        predicate_id: predicate_id.to_string(),
-        description: None,
-        status: "active".to_string(),
-        semantics: None,
-        semantics_status: SemanticsStatus::Default,
-        first_seen_at: None,
-        usage_count: 0,
-        last_used_at: None,
-    };
-
-    repo.create(record).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )
-    })?;
-
-    Ok(())
-}
-
-async fn enqueue_reprocess_for_predicate(
-    state: &SpaceApiState,
-    space_id: &str,
-    predicate_id: &str,
-) -> Result<(), (StatusCode, Json<ApiError>)> {
-    let has_assertions = state
-        .assertion_repo
-        .list(space_id, 500, None)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
-        .into_iter()
-        .filter(|a| a.predicate_raw == predicate_id)
-        .any(|_| true);
-
-    if !has_assertions {
-        return Ok(());
-    }
-
-    let reprocess_job = ReprocessJob {
-        base: BaseFields::new(
-            RecordId::new_v4(TableName::ReprocessJob),
-            space_id.to_string(),
-            "predicate_reprocess".to_string(),
-        ),
-        name: format!("predicate-reprocess-{predicate_id}"),
-        selection_criteria: SelectionCriteria {
-            predicate_ids: vec![predicate_id.to_string()],
-            ..SelectionCriteria::default()
+    authorize_predicate_proposal_record(&state, &principal, &artifact.base)?;
+    let observed = PublicPredicateProposal::load(
+        state.storage.clone(),
+        mutation,
+        artifact,
+        PublicProposalOptions {
+            allow_draft: true,
+            ensure_registry: true,
+            check_work_run_budget: true,
+            confidence: None,
         },
-        target_stages: vec![
-            ReprocessTargetStage::ReResolve,
-            ReprocessTargetStage::ReMaintain,
-        ],
-        status: ReprocessStatus::Pending,
-        progress: ReprocessProgress::default(),
-        priority: 50,
-        budget_limit_euros: None,
-        max_sources_per_day: None,
-        started_at: None,
-        completed_at: None,
-        error: None,
-        reason: Some(format!(
-            "Predicate alias approved; refresh claims for predicate {predicate_id}"
-        )),
-    };
-
-    let created_job = state
-        .reprocess_job_repo
-        .create(reprocess_job)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-
-    let work_item = WorkItem {
-        base: BaseFields::new(
-            RecordId::new_v4(TableName::WorkItem),
-            space_id.to_string(),
-            "predicate_reprocess".to_string(),
-        ),
-        kind: WORK_KIND_EXECUTE_REPROCESS_JOB.to_string(),
-        payload: serde_json::json!({ "job_id": created_job.base.id.to_string() }),
-        status: WorkItemStatus::Runnable,
-        priority: 50,
-        idempotency_key: format!("{WORK_KIND_EXECUTE_REPROCESS_JOB}:{}", created_job.base.id),
-        attempts: 0,
-        lease_expires_at: None,
-        leased_by: None,
-        run_after: None,
-        last_error: None,
-    };
-
-    state.work_item_repo.create(work_item).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
+    )
+    .await
+    .map_err(predicate_proposal_error)?;
+    if let Some(registry) = &observed.registry {
+        authorize_predicate_proposal_record(&state, &principal, registry)?;
+    }
+    for alias in &observed.aliases {
+        authorize_predicate_proposal_record(&state, &principal, alias)?;
+    }
+    if let Some(run) = &observed.work_run {
+        state
+            .authz
+            .authorize_record_read(&principal, &run.base, "read:predicate")
+            .map_err(predicate_proposal_auth_error)?;
+    }
+    let prepared = observed
+        .prepare(&principal.subject)
+        .map_err(predicate_proposal_error)?;
+    for base in std::iter::once(&prepared.artifact.base)
+        .chain(
+            prepared
+                .registry_create
+                .iter()
+                .map(|registry| &registry.base),
         )
-    })?;
+        .chain(prepared.aliases.iter().map(|alias| &alias.base))
+        .chain(std::iter::once(&prepared.reprocess_job.base))
+    {
+        state
+            .authz
+            .authorize_record_write(&principal, base, "write:predicate")
+            .map_err(predicate_proposal_auth_error)?;
+    }
+    prepared
+        .commit(&principal.subject)
+        .await
+        .map(Json)
+        .map_err(predicate_proposal_error)
+}
 
-    Ok(())
+#[expect(
+    clippy::result_large_err,
+    reason = "Retain the shared status and public JSON error representation at the route boundary"
+)]
+fn authorize_predicate_proposal_record(
+    state: &SpaceApiState,
+    principal: &AuthPrincipal,
+    record: &impl elephant_types::records::HasSecurity,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .authz
+        .authorize_record_read(principal, record, "read:predicate")
+        .map_err(predicate_proposal_auth_error)?;
+    state
+        .authz
+        .authorize_record_write(principal, record, "write:predicate")
+        .map_err(predicate_proposal_auth_error)
+}
+
+fn predicate_proposal_auth_error(error: crate::authz::AuthzError) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            code: error.code,
+            message: error.message,
+            details: None,
+        }),
+    )
+}
+
+fn predicate_proposal_error(
+    error: elephant_pipeline::PipelineError,
+) -> (StatusCode, Json<ApiError>) {
+    if let elephant_pipeline::PipelineError::StorageError(error) = error {
+        return ApiError::storage(&error);
+    }
+    let status = match error {
+        elephant_pipeline::PipelineError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(ApiError::internal(error.to_string())))
 }
 
 async fn list_predicate_aliases(
@@ -1379,9 +1575,15 @@ async fn get_budget_today(
 
 /// Request body for creating a space.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateSpaceRequest {
+    #[serde(default)]
+    processing: Option<elephant_types::provider_binding::SpaceProcessingConfig>,
     /// Space name / ID.
     name: String,
+    /// Initial administration envelope and default for new source envelopes.
+    #[serde(default)]
+    security: Option<Security>,
     /// Embedding provider (e.g. "fastembed", "openai", "fake").
     #[serde(default = "default_provider")]
     embedding_provider: String,
@@ -1413,8 +1615,11 @@ fn default_dims() -> i32 {
 
 /// Request body for updating a space.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_field_names)]
 struct UpdateSpaceRequest {
+    #[serde(default)]
+    processing: Option<elephant_types::provider_binding::SpaceProcessingConfig>,
     #[serde(default)]
     embedding_provider: Option<String>,
     #[serde(default)]
@@ -1430,38 +1635,79 @@ struct UpdateSpaceRequest {
 /// GET /v1/spaces - List all space configs.
 async fn list_spaces_v1(
     State(state): State<Arc<SpaceApiState>>,
-    axum::Extension(_principal): axum::Extension<AuthPrincipal>,
+    axum::Extension(principal): axum::Extension<AuthPrincipal>,
 ) -> ApiResult<Vec<SpaceConfig>> {
-    let configs = state
-        .space_config_repo
-        .list_all(100, None)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
+    let configs = if principal.bypass_abac {
+        state.space_config_repo.list_all(100, None).await
+    } else {
+        let space_id = require_space_id(&principal)?;
+        state
+            .authz
+            .authorize_space_scope(&principal, &space_id, "read:space_config")
+            .map_err(space_authorization_error)?;
+        state
+            .space_config_repo
+            .get_by_space_id(&space_id)
+            .await
+            .map(|config| config.into_iter().collect())
+    }
+    .map_err(crate::public_error::legacy_storage_failure)?;
+    Ok(Json(state.authz.filter_records(
+        &principal,
+        configs,
+        "read:space_config",
+    )))
+}
 
-    Ok(Json(configs))
+#[expect(
+    clippy::result_large_err,
+    reason = "Retain the shared status and public JSON error representation at the route boundary"
+)]
+fn require_provider_admin(principal: &AuthPrincipal) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if principal.bypass_abac
+        || principal
+            .scopes
+            .iter()
+            .any(|scope| scope == "manage:provider")
+    {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            code: "ACCESS_DENIED".into(),
+            message: "Processing changes require explicit manage:provider scope".into(),
+            details: None,
+        }),
+    ))
+}
+
+fn space_authorization_error(error: crate::authz::AuthzError) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            code: error.code,
+            message: error.message,
+            details: None,
+        }),
+    )
 }
 
 /// `GET /v1/spaces/{space_id}` - Get a space config by space ID.
 async fn get_space_v1(
     State(state): State<Arc<SpaceApiState>>,
-    axum::Extension(_principal): axum::Extension<AuthPrincipal>,
+    axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(space_id): Path<String>,
 ) -> ApiResult<SpaceConfig> {
+    state
+        .authz
+        .authorize_space_scope(&principal, &space_id, "read:space_config")
+        .map_err(space_authorization_error)?;
     let config = state
         .space_config_repo
         .get_by_space_id(&space_id)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
+        .map_err(crate::public_error::legacy_storage_failure)?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -1469,6 +1715,10 @@ async fn get_space_v1(
             )
         })?;
 
+    state
+        .authz
+        .authorize_record_read(&principal, &config, "read:space_config")
+        .map_err(space_authorization_error)?;
     Ok(Json(config))
 }
 
@@ -1478,40 +1728,40 @@ async fn create_space_v1(
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(req): Json<CreateSpaceRequest>,
 ) -> Result<(StatusCode, Json<SpaceConfig>), (StatusCode, Json<ApiError>)> {
-    // Check if space already exists
-    if state
-        .space_config_repo
-        .get_by_space_id(&req.name)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
-        .is_some()
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(ApiError {
-                code: "CONFLICT".to_string(),
-                message: format!("Space '{}' already exists", req.name),
-                details: None,
-            }),
-        ));
+    state
+        .authz
+        .authorize_space_scope(&principal, &req.name, "write:space_config")
+        .map_err(space_authorization_error)?;
+    state
+        .authz
+        .authorize_space_scope(&principal, &req.name, "read:space_config")
+        .map_err(space_authorization_error)?;
+    elephant_types::validation::validate_space_id(&req.name).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::validation(error.to_string())),
+        )
+    })?;
+    if req.processing.is_some() {
+        require_provider_admin(&principal)?;
     }
-
     let mut base = BaseFields::new(
         RecordId::new_v4(TableName::SpaceConfig),
         req.name.clone(),
         principal.subject.clone(),
     );
-    base.security = Security {
+    base.security = req.security.unwrap_or_else(|| Security {
         policy_id: "default".to_string(),
         level: 0,
         labels: vec![],
         handling: vec![],
-    };
+    });
+    elephant_types::validation::validate_security(&base.security).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::validation(error.to_string())),
+        )
+    })?;
     base.provenance = Provenance::default();
     base.subjects_state = SubjectsState::Complete;
 
@@ -1522,14 +1772,43 @@ async fn create_space_v1(
         embedding_dims: req.embedding_dims,
         purpose: req.purpose,
         skill: req.skill,
+        processing: req.processing,
     };
 
-    let created = state.space_config_repo.create(config).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )
-    })?;
+    state
+        .authz
+        .authorize_record_write(&principal, &config, "write:space_config")
+        .map_err(space_authorization_error)?;
+    state
+        .authz
+        .authorize_record_read(&principal, &config, "read:space_config")
+        .map_err(space_authorization_error)?;
+    // Both the proposed envelope and an existing record require read authority.
+    // An inaccessible existing space must not become an existence oracle.
+    if let Some(existing) = state
+        .space_config_repo
+        .get_by_space_id(&req.name)
+        .await
+        .map_err(crate::public_error::legacy_storage_failure)?
+    {
+        state
+            .authz
+            .authorize_record_read(&principal, &existing, "read:space_config")
+            .map_err(space_authorization_error)?;
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                code: "CONFLICT".into(),
+                message: format!("Space '{}' already exists", req.name),
+                details: None,
+            }),
+        ));
+    }
+    let created = state
+        .space_config_repo
+        .create(config)
+        .await
+        .map_err(crate::public_error::legacy_storage_failure)?;
 
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -1537,20 +1816,22 @@ async fn create_space_v1(
 /// `PUT /v1/spaces/{space_id}` - Update a space config.
 async fn update_space_v1(
     State(state): State<Arc<SpaceApiState>>,
-    axum::Extension(_principal): axum::Extension<AuthPrincipal>,
+    axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(space_id): Path<String>,
     Json(req): Json<UpdateSpaceRequest>,
 ) -> ApiResult<SpaceConfig> {
+    state
+        .authz
+        .authorize_space_scope(&principal, &space_id, "write:space_config")
+        .map_err(space_authorization_error)?;
+    if req.processing.is_some() {
+        require_provider_admin(&principal)?;
+    }
     let existing = state
         .space_config_repo
         .get_by_space_id(&space_id)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
+        .map_err(crate::public_error::legacy_storage_failure)?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -1558,6 +1839,14 @@ async fn update_space_v1(
             )
         })?;
 
+    state
+        .authz
+        .authorize_record_write(&principal, &existing, "write:space_config")
+        .map_err(space_authorization_error)?;
+    state
+        .authz
+        .authorize_record_read(&principal, &existing, "read:space_config")
+        .map_err(space_authorization_error)?;
     let updated = SpaceConfig {
         base: existing.base.clone(),
         embedding_provider: req
@@ -1569,18 +1858,18 @@ async fn update_space_v1(
         embedding_dims: req.embedding_dims.unwrap_or(existing.embedding_dims),
         purpose: req.purpose.or_else(|| existing.purpose.clone()),
         skill: req.skill.or_else(|| existing.skill.clone()),
+        processing: req.processing.or_else(|| existing.processing.clone()),
     };
 
     let result = state
         .space_config_repo
-        .update(&space_id, &existing.base.id, updated)
+        .replace_authorized(&existing, updated)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
+        .map_err(crate::public_error::legacy_storage_failure)?;
 
     Ok(Json(result))
 }
+
+#[cfg(test)]
+#[path = "spaces_predicate_tests.rs"]
+mod guarded_predicate_tests;

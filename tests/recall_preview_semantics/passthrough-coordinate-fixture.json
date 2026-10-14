@@ -1,0 +1,62 @@
+{
+  "format": "recall-passthrough-coordinate-fixture/v1",
+  "oracle": "Literal UTF-8 bytes and byte offsets fixed independently of Recall rendering or mapping; SHA-256 uses the standard digest over those exact bytes.",
+  "renderer": {
+    "name": "elephant.renderer.passthrough",
+    "version": "1.0.0",
+    "config_hash": null
+  },
+  "case": {
+    "id": "passthrough-utf8-crlf-without-generated-lf",
+    "accepted_text": "Aé\r\n猫🙂",
+    "accepted_text_utf8_hex": "41c3a90d0ae78cabf09f9982",
+    "accepted_text_bytes": 12,
+    "accepted_text_sha256": "889d1bc6b654b488647d34b19fb36fb9f485bc4c33a3f7ce5ec80cd273cd74af",
+    "rendered_text": "Aé\r\n猫🙂",
+    "rendered_text_utf8_hex": "41c3a90d0ae78cabf09f9982",
+    "rendered_text_bytes": 12,
+    "rendered_text_sha256": "889d1bc6b654b488647d34b19fb36fb9f485bc4c33a3f7ce5ec80cd273cd74af",
+    "raw_span": {
+      "start": 1,
+      "end": 12
+    },
+    "raw_quote": "é\r\n猫🙂",
+    "raw_quote_sha256": "232cc485c24e370d283a829a367b5ad2845120244a8f5fe2c248737426354444",
+    "rendered_span": {
+      "start": 1,
+      "end": 12
+    },
+    "rendered_quote": "é\r\n猫🙂",
+    "rendered_quote_sha256": "232cc485c24e370d283a829a367b5ad2845120244a8f5fe2c248737426354444"
+  },
+  "negative_controls": [
+    {
+      "id": "no-default-normalization",
+      "rendered_text": "Aé\n猫🙂\n",
+      "expected_mapping_error": "changed_output"
+    },
+    {
+      "id": "no-generated-terminal-lf",
+      "rendered_text": "Aé\r\n猫🙂\n",
+      "expected_mapping_error": "changed_output"
+    },
+    {
+      "id": "no-utf8-codepoint-split",
+      "rendered_span": {
+        "start": 2,
+        "end": 12
+      },
+      "expected_mapping_error": "invalid_span"
+    },
+    {
+      "id": "no-name-alias",
+      "renderer": {
+        "name": "passthrough",
+        "version": "1.0.0",
+        "config_hash": null
+      },
+      "expected_mapping_error": "unsupported_renderer"
+    }
+  ],
+  "scope": "Renderer byte identity and coordinate mapping only; no accepted source identity, current publication or policy authority is manufactured by this fixture."
+}

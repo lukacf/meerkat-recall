@@ -82,6 +82,10 @@ fn rct_contracts_provenance_omits_none_fields_in_json() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+)]
 async fn rct_contracts_provenance_omits_none_fields_after_db_round_trip() {
     let client = setup_client_and_schema().await;
     let repo = AssertionRepository::new(client);
@@ -187,6 +191,10 @@ fn make_assertion_with_object_literal(object_literal: Option<serde_json::Value>)
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+)]
 async fn rct_contracts_assertion_object_literal_round_trips_common_json_shapes() {
     let client = setup_client_and_schema().await;
     let repo = AssertionRepository::new(client);
@@ -208,6 +216,10 @@ async fn rct_contracts_assertion_object_literal_round_trips_common_json_shapes()
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+)]
 async fn rct_contracts_assertion_object_literal_rejects_reserved_wrapper_object_shape() {
     let client = setup_client_and_schema().await;
     let repo = AssertionRepository::new(client);
@@ -365,6 +377,10 @@ fn rct_contracts_link_deserializes_uuid_bytes_shape() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client in the original fixture scope through assertions and cleanup."
+)]
 async fn rct_contracts_record_id_json_db_json_round_trip_preserves_string_format() {
     #[derive(serde::Deserialize)]
     struct Row {

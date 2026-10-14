@@ -1,0 +1,91 @@
+{
+  "format": "recall-independent-search-budget-arithmetic/v1",
+  "review_status": "pending_qualification_owner",
+  "execution_authorized": false,
+  "source_recipes": [
+    {
+      "path": "container-response-budget-0.json",
+      "file_sha256": "5d84a9e4640ea6cfea18d03b7bde2859f31775b9efa4a812e3d799b0fc6ed667",
+      "canonical_sha256": "bbb0508a0adfa26276f25a404fddeebfa97d81ba8aa7e34cd8bea2ad112f7b6d"
+    },
+    {
+      "path": "container-response-budget-1.json",
+      "file_sha256": "40698c876b7d43e913858ee43f307102413712e60c7c59f1d2b6aafcaad3fda7",
+      "canonical_sha256": "b92aee9b1470b354e902120b602e90f5da3c7d089d5bcac51479523e621cfb2d"
+    }
+  ],
+  "source_count": 2,
+  "source_raw_bytes_each": 65018,
+  "source_rendered_bytes_each": 65019,
+  "paragraph_count_each": 10,
+  "paragraph_bytes": 6500,
+  "blank_separator_bytes": 2,
+  "control_u0001_bytes_per_quote": 3000,
+  "original_quote_json_string_bytes": 21502,
+  "default_extraction_window_max_bytes": 12000,
+  "two_adjacent_paragraph_span_bytes": 13002,
+  "query": "oversees",
+  "ranking_mode": "lexical",
+  "source_revision_constraints": {
+    "boundary/graph-response-budget-0": "boundary-response-r1",
+    "boundary/graph-response-budget-1": "boundary-response-r1"
+  },
+  "limit20": {
+    "required_selected_results": 20,
+    "minimum_selected_supported_claims": 18,
+    "maximum_selected_chunks": 2,
+    "expected_selected_entities": 0,
+    "quote_only_response_bytes_lower_bound": 387036,
+    "response_budget_bytes": 262144,
+    "required_http_status": 413,
+    "required_error_code": "payload_too_large"
+  },
+  "limit10": {
+    "required_actual_new_request_limit": 10,
+    "maximum_claim_result_encoded_bytes": 22116,
+    "maximum_chunk_result_encoded_bytes": 6709,
+    "full_response_bytes_upper_bound": 221584,
+    "response_budget_bytes": 262144,
+    "required_http_status": 200,
+    "required_complete_evidence": true,
+    "mcp_jsonrpc_bytes_upper_bound": 252277,
+    "mcp_streamed_capture_bytes_upper_bound": 256373,
+    "original_collector_response_bytes": 270336,
+    "mcp_tool_response_bytes_upper_bound": 221603
+  },
+  "selection_basis": [
+    "All20 independentlyexpectedclaims have predicate_raw oversees; no promotedEntitydisplay_name contains oversees.",
+    "Two constrained actuallypublishedDocs give at mosttwo current chunk results in ordinary lexicalassembly; no other matching published source in isolatedfixture.",
+    "Exact20selectionthereforecontains18through20completeclaimquotes; never count nonselectedcandidatebytes.",
+    "Forlimit10 every claim result is at most the fixed bound; each bounded512bytechunk text+quote is smaller; exacttwoSourcecoverage and32ASCIIbytes perfinitef64score are included. Requiredraw/renderedcoordinates, both64hexhashes, andtheexactparentDocUUIDidentifier are fullyencoded.",
+    "Publiccalls must capture actualHTTP/MCPoriginalframing and complete evidence; arithmeticalone cannotprove actualGraphpublication or responsebehavior.",
+    "MCP separately applies its262144bytebudget to the exactToolResponse success envelope {ok:true,data:SearchResponse}, then encodes that envelope as one JSON text content. Doubleescaping and20digitJSONRPCrequestID are counted, plus4096byte conservative stream-framing reserve. Actualoriginalcomplete framing remainsrequired."
+  ],
+  "unmet_prerequisites": [
+    "D approves literal facts and source arithmetic before use",
+    "Root/D revised contract frozen; old single262145 quote remainsunmet",
+    "Both actualGraphFixturescompletewith10exactassertionseachandimmutableSourceRevisions",
+    "Actuallexicalcandidatecount/ranking matches independentselection requirements; unexpectedresultsremainunmet",
+    "Actual dual-coordinate evidence fields anddoc_id exactly match frozen required field names/semantics; actual captured MIME/framing stays within originalcollectorcap."
+  ],
+  "wire_contract": {
+    "format": "recall-dual-coordinate-evidence/v1",
+    "required_additive_fields": [
+      "rendered_span",
+      "rendered_quote_sha256",
+      "rendered_text_sha256",
+      "doc_id"
+    ],
+    "hash_encoding": "64 lowercase hexadecimal ASCII bytes without prefix",
+    "original_span_and_quote": "exact supplied source UTF8 minimal contiguous cover",
+    "rendered_reference": "exact full immutable DocRevision text and selected span hashes; doc_id from the same authorized current Doc and internal_doc_revision_id from that full revision; no duplicated full rendered quote",
+    "span_coordinate_decimal_digits_upper_bound": 5,
+    "internal_revision_id_encoded_string_bytes": 51,
+    "doc_id_encoded_string_bytes": 42,
+    "doc_id_shape": "doc:<36-byte canonical UUID>; same original ReadEligibility document, not derived from external source or revision strings",
+    "finite_score_encoded_bytes_upper_bound": 32,
+    "mcp_jsonrpc_id_decimal_digits_upper_bound": 20,
+    "mcp_result_representation": "one content type=text containing compact ToolResponse {ok:true,data:SearchResponse} JSON, isError=false, no structuredContent or metadata",
+    "mcp_stream_framing_reserve_bytes": 4096
+  }
+}

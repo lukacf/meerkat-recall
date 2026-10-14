@@ -1,0 +1,26 @@
+{
+  "elapsed_seconds": 0.577,
+  "errors": 0,
+  "failures": 0,
+  "format": "recall-d-cohort-offline/v1",
+  "gateway_source_commit": "83060dcc6f05e602ae221061255cb71251138429",
+  "installed_artifact_qualified": false,
+  "live_spending_authorized": false,
+  "network_permitted": false,
+  "provider_billing_verified": false,
+  "scope": "offline SQLite and mocked transport only; no provider, launcher, product service or installed artifact",
+  "skipped": 0,
+  "source_sha256": {
+    "capture.py": "9184598ac790e6a06f3cb1a5cde2dcdaae45d0e15057efdb7eb5b5a8b298665f",
+    "cohort.py": "6e96af56c42031e4dcb0903f422a76359ee30404e3d579f52e5118c1716cebea",
+    "cohort_bridge.py": "74cb9469ea0c814014e877c591bfb0e9059d8c5a9962e35a01095f6def270d51",
+    "cohort_policy.py": "a91a6f9212b78fc4641303ac369fbe6dd55d76291838bcc4712a956fed0f94e2",
+    "ledger.py": "0b9df0c9117db9037fcb135534bd70a630ac04aae1610d0a9bab91bd44ecd8b2",
+    "policy.py": "4f8661d0b89b9b8366672c7e6f17cd11ac7115f5602f11d9e4a5f6e6e72b1534",
+    "transport.py": "3dfb990fca1d8086f6650eaccd690dc26a9e8334e968700107ae1c92b1c170e8",
+    "wire.py": "7bd2bbc1add5ff4e7efb30fc789ef083b080858635efcbd2ed1e65517120271d"
+  },
+  "source_stable_during_test": true,
+  "test_source_sha256": "9ef10a6f39f224f7207fb43d786afd4529def24db6d7bfa845c8fd9fa43962cd",
+  "tests_run": 12
+}

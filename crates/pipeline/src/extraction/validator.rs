@@ -1,6 +1,7 @@
 //! Assertion validation per spec §8.5
 
 use crate::extraction::RawAssertion;
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -20,10 +21,16 @@ pub struct ValidationError {
 pub enum ValidationErrorCode {
     /// Evidence span end exceeds revision text length.
     SpanOutOfBounds,
-    /// Evidence span start > end.
+    /// Evidence span is empty, reversed, or exceeds the configured maximum.
     SpanInvalid,
     /// Evidence span is missing a node reference.
     MissingEvidenceNode,
+    /// Confidence is not finite or is outside 0..=1.
+    InvalidConfidence,
+    /// Source quote hash is absent or not a SHA-256 digest.
+    InvalidQuoteHash,
+    /// Object has inconsistent entity/literal forms or a nonfinite value.
+    InvalidObject,
     /// Subject text is empty or missing.
     MissingSubject,
     /// Predicate text is empty or missing.
@@ -89,10 +96,16 @@ impl AssertionValidator {
                 code: ValidationErrorCode::SpanOutOfBounds,
             });
         }
-        if assertion.evidence_span.start > assertion.evidence_span.end {
+        if assertion.evidence_span.start >= assertion.evidence_span.end
+            || assertion
+                .evidence_span
+                .end
+                .saturating_sub(assertion.evidence_span.start)
+                > self.max_span_length
+        {
             errors.push(ValidationError {
                 field: "evidence_span".into(),
-                message: "start > end".into(),
+                message: "Evidence must be nonempty and within the span length limit".into(),
                 code: ValidationErrorCode::SpanInvalid,
             });
         }
@@ -101,6 +114,36 @@ impl AssertionValidator {
                 field: "evidence_span.node".into(),
                 message: "Required".into(),
                 code: ValidationErrorCode::MissingEvidenceNode,
+            });
+        }
+
+        if !assertion.confidence.is_finite() || !(0.0..=1.0).contains(&assertion.confidence) {
+            errors.push(ValidationError {
+                field: "confidence".into(),
+                message: "Confidence must be finite and between zero and one".into(),
+                code: ValidationErrorCode::InvalidConfidence,
+            });
+        }
+        if !Self::is_quote_hash(&assertion.evidence_span.quote_hash) {
+            errors.push(ValidationError {
+                field: "evidence_span.quote_hash".into(),
+                message: "An exact SHA-256 source quote hash is required".into(),
+                code: ValidationErrorCode::InvalidQuoteHash,
+            });
+        }
+
+        if (assertion.object_text.is_some() && assertion.object_literal.is_some())
+            || assertion
+                .object_text
+                .as_deref()
+                .is_some_and(|object| object.trim().is_empty())
+            || matches!(assertion.object_literal, Some(elephant_types::records::attribute::Literal::Float(value)) if !value.is_finite())
+        {
+            errors.push(ValidationError {
+                field: "object".into(),
+                message: "Object must have one consistent, nonempty entity or finite literal value"
+                    .into(),
+                code: ValidationErrorCode::InvalidObject,
             });
         }
 
@@ -114,14 +157,14 @@ impl AssertionValidator {
         }
 
         // Check required fields
-        if assertion.subject_text.is_empty() {
+        if assertion.subject_text.trim().is_empty() {
             errors.push(ValidationError {
                 field: "subject_text".into(),
                 message: "Required".into(),
                 code: ValidationErrorCode::MissingSubject,
             });
         }
-        if assertion.predicate_text.is_empty() {
+        if assertion.predicate_text.trim().is_empty() {
             errors.push(ValidationError {
                 field: "predicate_text".into(),
                 message: "Required".into(),
@@ -159,12 +202,42 @@ impl AssertionValidator {
         format!("assertion_{:x}", h.finish())
     }
 
-    /// Hashes a quote string for storage (avoids storing raw quotes).
+    /// Whether a value is a canonical lowercase SHA-256 quote digest.
+    #[must_use]
+    pub fn is_quote_hash(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    /// Validates the exact byte slice, UTF-8 boundaries, hash and optional quote.
+    /// This validates evidence identity; semantic support is checked separately.
+    pub fn validate_evidence(assertion: &RawAssertion, text: &str) -> Result<(), String> {
+        let span = &assertion.evidence_span;
+        if span.start >= span.end {
+            return Err("Evidence span must be nonempty".into());
+        }
+        let quote = text
+            .get(span.start as usize..span.end as usize)
+            .ok_or_else(|| "Evidence span is outside source text or splits UTF-8".to_string())?;
+        if quote.trim().is_empty() || span.quote_hash != Self::hash_quote(quote) {
+            return Err("Evidence quote hash does not match immutable source bytes".into());
+        }
+        if assertion
+            .quote
+            .as_deref()
+            .is_some_and(|provided| provided != quote)
+        {
+            return Err("Evidence quote does not match immutable source bytes".into());
+        }
+        Ok(())
+    }
+
+    /// Hashes exact UTF-8 quote bytes using SHA-256.
     #[must_use]
     pub fn hash_quote(quote: &str) -> String {
-        let mut h = DefaultHasher::new();
-        quote.hash(&mut h);
-        format!("{:x}", h.finish())
+        hex::encode(Sha256::digest(quote.as_bytes()))
     }
 }
 
@@ -189,6 +262,7 @@ mod tests {
         let revision_id = RecordId::new_v4(TableName::DocRevision);
         let node_id = RecordId::new_v4(TableName::DocNode);
         RawAssertion {
+            support_verification: None,
             subject_text: subject.into(),
             predicate_text: predicate.into(),
             object_text: None,
@@ -198,7 +272,7 @@ mod tests {
                 node: Some(Link::new(node_id)),
                 start,
                 end,
-                quote_hash: "test_hash".into(),
+                quote_hash: AssertionValidator::hash_quote("test quote"),
             },
             confidence: 0.9,
             quote: None,

@@ -33,8 +33,8 @@ impl DefaultTextRenderer {
     #[must_use]
     pub fn new() -> Self {
         let manifest = PluginManifest {
-            plugin_id: "elephant.renderer.text".to_string(),
-            version: "1.0.0".to_string(),
+            plugin_id: elephant_types::rendered_text::DEFAULT_TEXT_RENDERER_NAME.to_string(),
+            version: elephant_types::rendered_text::DEFAULT_TEXT_RENDERER_VERSION.to_string(),
             plugin_type: "renderer".to_string(),
             required_scopes: vec!["read:docs".to_string()],
             tool_access: vec![],
@@ -60,15 +60,9 @@ impl DefaultTextRenderer {
     ///
     /// - Normalizes line endings to LF
     /// - Trims trailing whitespace from lines
-    /// - Ensures single trailing newline
+    /// - Adds a trailing newline while preserving existing blank lines
     fn normalize_text(text: &str) -> String {
-        text.replace("\r\n", "\n")
-            .replace('\r', "\n")
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n"
+        elephant_types::rendered_text::normalize_default_text(text).into_text()
     }
 
     /// Returns the renderer metadata.
@@ -287,6 +281,64 @@ mod tests {
         assert_eq!(result.status, RevisionStatus::Active);
         // Passthrough doesn't normalize
         assert_eq!(result.text, "Hello\r\nWorld");
+    }
+
+    #[tokio::test]
+    async fn passthrough_renderer_matches_independent_utf8_coordinate_literal() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/recall_preview_semantics/passthrough-coordinate-fixture.json"
+        ))
+        .expect("fixed independent fixture");
+        let case = &fixture["case"];
+        let original = case["accepted_text"].as_str().expect("literal input");
+        let result = PassthroughRenderer::new()
+            .render(RenderContext {
+                doc: make_doc(original),
+                storage: None,
+                space_id: "default".into(),
+                config: None,
+            })
+            .await
+            .expect("actual passthrough renderer");
+        assert_eq!(result.status, RevisionStatus::Active);
+        assert_eq!(
+            result.text,
+            case["rendered_text"].as_str().expect("literal output")
+        );
+        assert_eq!(result.text.len(), 12);
+        assert!(!result.text.ends_with('\n'));
+        assert_eq!(
+            result.text_hash,
+            case["rendered_text_sha256"]
+                .as_str()
+                .expect("literal digest")
+        );
+        assert_eq!(
+            crate::extraction::AssertionValidator::hash_quote(original),
+            case["accepted_text_sha256"]
+                .as_str()
+                .expect("literal input digest")
+        );
+        assert_eq!(
+            serde_json::to_value(&result.renderer).expect("actual renderer identity"),
+            fixture["renderer"]
+        );
+        let quote = result.text.get(1..12).expect("literal UTF-8 quote bounds");
+        assert_eq!(
+            quote,
+            case["rendered_quote"].as_str().expect("literal quote")
+        );
+        let digest = crate::extraction::AssertionValidator::hash_quote(quote);
+        assert_eq!(
+            digest,
+            case["rendered_quote_sha256"]
+                .as_str()
+                .expect("rendered quote digest")
+        );
+        assert_eq!(
+            digest,
+            case["raw_quote_sha256"].as_str().expect("raw quote digest")
+        );
     }
 
     #[test]

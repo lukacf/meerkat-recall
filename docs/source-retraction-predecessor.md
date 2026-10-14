@@ -1,0 +1,11 @@
+# Exact acceptance before retraction
+
+Retraction replaces the head generation and operation with lifecycle identities while retaining the desired revision. Those new identities cannot identify the immutable accepted physical document or its contact capability. An immutable revision's first acceptance also cannot identify a later A → B → A admission.
+
+The private existing `StoredOperation.predecessor_publication` field stores the exact desired acceptance fence observed before retraction. Lifecycle captures it in the same transaction, guarded by the original head and full prior operation. Repeated retraction carries that original reference unchanged after verification. Ordinary acceptance and erasure initialize it to `None`. Missing historical proof remains unknown; no timeline search or implicit migration reconstructs it.
+
+`publication_before_retraction(space, original_retracted_head)` verifies the current exact retracted head, lifecycle receipt identity, original referenced acceptance operation and retained seal, and immutable revision existence. It returns an acceptance fence even if that input never completed publication. `prepared_restore_contact(request, original_retracted_head)` first preserves a matching original restore retry; a new intent requires explicit reactivation and the captured generation, and prepares fresh effects only if the real preceding acceptance admitted a contact seal. Original plain input stays plain regardless of editable metadata.
+
+Intake uses this reference with the original immutable revision/manifest to locate the actual document, authorizes all original/current/proposed envelopes, and keeps the retracted head in its document guards. No public DTO, duplicate head, raw document copy, or new durable table is introduced. Erasure still removes payload-bearing contact attachments and revisions.
+
+Both-backend source regression tests use real pending acceptance, two real retractions, exact predecessor lookup, explicit fresh contact restoration, historical sealed retry after head advance and ambiguous selectors, and stale new-intent refusal. E owns the transaction capture and adds actual ABA predecessor tests; F owns complete pipeline reactivation qualification. Source is authored; no local Cargo or Rust tests have run.

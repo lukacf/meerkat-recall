@@ -54,14 +54,22 @@ pub(crate) async fn create_item(
                 {
                     return Err(StorageError::Conflict(record.base.id.to_string()));
                 }
-                tx.create(record).map_err(Into::into)
+                tx.create(record.clone())?;
+                crate::work_producer_repository::initialize_direct_tx(tx, &record)?;
+                Ok(record)
             })
             .await;
     }
-    client.query_bind_checked(
-        "BEGIN TRANSACTION; LET $cold = SELECT VALUE id FROM ONLY $archive; IF $cold != NONE { THROW 'work_identity_already_archived'; }; CREATE $id CONTENT $record; COMMIT TRANSACTION;",
-        crate::bindings! { "id" => crate::surreal::thing_from_record_id(&record.base.id), "archive" => crate::surreal::thing_from_record_id(&archive_id(&record.base.id)), "record" => WorkItemRepository::work_item_to_value(&record)? }
-    ).await?;
+    let mut sql = "BEGIN TRANSACTION; LET $cold = SELECT VALUE id FROM ONLY $archive; IF $cold != NONE { THROW 'work_identity_already_archived'; }; CREATE $id CONTENT $record;\n".to_string();
+    let mut bindings = crate::bindings! { "id" => crate::surreal::thing_from_record_id(&record.base.id), "archive" => crate::surreal::thing_from_record_id(&archive_id(&record.base.id)), "record" => WorkItemRepository::work_item_to_value(&record)? };
+    crate::work_producer_repository::append_direct_sql(
+        &mut sql,
+        &mut bindings,
+        "new_work",
+        &record,
+    )?;
+    sql.push_str("COMMIT TRANSACTION;");
+    client.query_bind_checked(&sql, bindings).await?;
     Ok(record)
 }
 
@@ -92,19 +100,26 @@ pub(crate) async fn get_item(
     id: &RecordId,
 ) -> StorageResult<Option<WorkItem>> {
     if let Some(store) = client.embedded_store() {
-        return store
-            .mutate(|tx| {
-                if let Some(item) = tx.get::<WorkItem>(space, id, true)? {
-                    return Ok(item.base.deleted_at.is_none().then_some(item));
-                }
-                Ok(tx
-                    .get::<WorkItemArchive>(space, &archive_id(id), false)?
-                    .map(|v| v.record))
-            })
-            .await;
+        if let Some(item) = store.get::<WorkItem>(space, id, true).await? {
+            return Ok(item.base.deleted_at.is_none().then_some(item));
+        }
+        if let Some(cold) = store
+            .get::<WorkItemArchive>(space, &archive_id(id), false)
+            .await?
+        {
+            return Ok(Some(cold.record));
+        }
+        // A concurrent cold-to-hot promotion may cross the two read locks.
+        // Recheck hot once; the committing authority still uses atomic guards.
+        return store.get::<WorkItem>(space, id, false).await;
     }
-    let mut response = client.query_bind(
-        &format!("SELECT {WORK_ITEM_PROJECTION} FROM array::concat((SELECT * FROM work_item WHERE id = $id AND space_id = $space AND deleted_at IS NONE), (SELECT VALUE record FROM work_item_archive WHERE id = $archive AND space_id = $space AND deleted_at IS NONE)) LIMIT 1"),
+    // One statement retains a single read snapshot. The lazy array fallback
+    // reads cold history only when the exact eligible hot target is absent.
+    if id.table() != TableName::WorkItem {
+        return Ok(None);
+    }
+    let mut response = client.query_bind_checked(
+        &format!("SELECT {WORK_ITEM_PROJECTION} FROM ((SELECT * FROM $id WHERE space_id = $space AND deleted_at IS NONE) ?: (SELECT VALUE record FROM $archive WHERE space_id = $space AND deleted_at IS NONE)) LIMIT 1"),
         crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "archive" => crate::surreal::thing_from_record_id(&archive_id(id)), "space" => space }
     ).await?;
     let rows: Vec<WorkItemDb> = response
@@ -119,19 +134,25 @@ pub(crate) async fn get_run(
     id: &RecordId,
 ) -> StorageResult<Option<WorkRun>> {
     if let Some(store) = client.embedded_store() {
-        return store
-            .mutate(|tx| {
-                if let Some(run) = tx.get::<WorkRun>(space, id, true)? {
-                    return Ok(run.base.deleted_at.is_none().then_some(run));
-                }
-                Ok(tx
-                    .get::<WorkRunArchive>(space, &archive_id(id), false)?
-                    .map(|v| v.record))
-            })
-            .await;
+        if let Some(run) = store.get::<WorkRun>(space, id, true).await? {
+            return Ok(run.base.deleted_at.is_none().then_some(run));
+        }
+        if let Some(cold) = store
+            .get::<WorkRunArchive>(space, &archive_id(id), false)
+            .await?
+        {
+            return Ok(Some(cold.record));
+        }
+        // A concurrent cold-to-hot promotion may cross the two read locks.
+        // Recheck hot once; the committing authority still uses atomic guards.
+        return store.get::<WorkRun>(space, id, false).await;
     }
-    let mut response = client.query_bind(
-        &format!("SELECT {WORK_RUN_PROJECTION} FROM array::concat((SELECT * FROM work_run WHERE id = $id AND space_id = $space AND deleted_at IS NONE), (SELECT VALUE record FROM work_run_archive WHERE id = $archive AND space_id = $space AND deleted_at IS NONE)) LIMIT 1"),
+    // Same lazy, single-snapshot hot-first lookup as WorkItem history.
+    if id.table() != TableName::WorkRun {
+        return Ok(None);
+    }
+    let mut response = client.query_bind_checked(
+        &format!("SELECT {WORK_RUN_PROJECTION} FROM ((SELECT * FROM $id WHERE space_id = $space AND deleted_at IS NONE) ?: (SELECT VALUE record FROM $archive WHERE space_id = $space AND deleted_at IS NONE)) LIMIT 1"),
         crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "archive" => crate::surreal::thing_from_record_id(&archive_id(id)), "space" => space }
     ).await?;
     let rows: Vec<WorkRunDb> = response
@@ -153,9 +174,25 @@ pub(crate) async fn update_item(
     client: &StorageClient,
     space: &str,
     id: &RecordId,
-    mut record: WorkItem,
+    record: WorkItem,
     expected: Option<WorkItemStatus>,
 ) -> StorageResult<Option<WorkItem>> {
+    update_item_guarded(client, space, id, record, expected, None).await
+}
+
+pub(crate) async fn update_item_guarded(
+    client: &StorageClient,
+    space: &str,
+    id: &RecordId,
+    mut record: WorkItem,
+    expected: Option<WorkItemStatus>,
+    observed: Option<&WorkItem>,
+) -> StorageResult<Option<WorkItem>> {
+    if record.status == WorkItemStatus::Running {
+        return Err(StorageError::Conflict(
+            "work_attempt_required: claim or renew through the attempt repository".into(),
+        ));
+    }
     record.base.id = id.clone();
     record.base.space_id = space.to_string();
     record.base.updated_at = Utc::now();
@@ -170,8 +207,23 @@ pub(crate) async fn update_item(
                 };
                 if existing.base.deleted_at.is_some()
                     || expected.is_some_and(|status| existing.status != status)
+                    || observed.is_some_and(|old| {
+                        old.base.updated_at != existing.base.updated_at
+                            || !crate::lifecycle_guard::base_envelope_unchanged(
+                                &old.base,
+                                &existing.base,
+                            )
+                            || old.kind != existing.kind
+                            || old.payload != existing.payload
+                            || old.idempotency_key != existing.idempotency_key
+                    })
                 {
                     return Ok(None);
+                }
+                if existing.status == WorkItemStatus::Running {
+                    return Err(StorageError::Conflict(
+                        "work_attempt_required: transition the captured lease token".into(),
+                    ));
                 }
                 if hot.is_some() {
                     let _ = tx.replace(record.clone())?;
@@ -186,8 +238,8 @@ pub(crate) async fn update_item(
             .await;
     }
     let mut response = client.query_bind_checked(
-        &format!("BEGIN TRANSACTION; LET $hot = (SELECT * FROM ONLY $id WHERE space_id = $space); LET $cold = (SELECT * FROM ONLY $archive WHERE space_id = $space); LET $old = IF $hot != NONE {{ $hot }} ELSE {{ $cold.record }}; LET $changed = IF $old != NONE AND $old.deleted_at IS NONE AND ($expected = NONE OR $old.status = $expected) {{ UPSERT $id CONTENT $record; {RETIRE_ARCHIVE_SQL} RETURN true; }} ELSE {{ RETURN false; }}; RETURN $changed; COMMIT TRANSACTION;"),
-        crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "archive" => crate::surreal::thing_from_record_id(&archive_id(id)), "space" => space, "expected" => expected.map_or(surrealdb::sql::Value::None, |v| v.to_string().into()), "record" => WorkItemRepository::work_item_to_value(&record)? }
+        &format!("BEGIN TRANSACTION; LET $hot = (SELECT * FROM ONLY $id WHERE space_id = $space); LET $cold = (SELECT * FROM ONLY $archive WHERE space_id = $space); LET $old = IF $hot != NONE {{ $hot }} ELSE {{ $cold.record }}; LET $changed = IF $old != NONE AND $old.deleted_at IS NONE AND ($expected = NONE OR $old.status = $expected) AND ($observed = NONE OR ($old.updated_at = $observed.updated_at AND $old.security = $observed.security AND $old.subjects = $observed.subjects AND $old.subjects_state = $observed.subjects_state AND $old.kind = $observed.kind AND $old.payload = $observed.payload AND $old.idempotency_key = $observed.idempotency_key)) {{ IF $old.status = 'running' {{ THROW 'work_attempt_required'; }}; UPSERT $id CONTENT $record; {RETIRE_ARCHIVE_SQL} RETURN true; }} ELSE {{ RETURN false; }}; RETURN $changed; COMMIT TRANSACTION;"),
+        crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "archive" => crate::surreal::thing_from_record_id(&archive_id(id)), "space" => space, "expected" => expected.map_or(surrealdb::sql::Value::None, |v| v.to_string().into()), "record" => WorkItemRepository::work_item_to_value(&record)?, "observed" => observed.map(WorkItemRepository::work_item_to_value).transpose()?.unwrap_or(surrealdb::sql::Value::None) }
     ).await?;
     let changed: Option<bool> = response
         .take(response.num_statements() - 1)
@@ -325,7 +377,7 @@ async fn archive_surreal(
     // for every candidate. The NONE guard is for SurrealDB's planner, which
     // evaluates functions without a row and abandons indexes if meta::tb fails.
     // Actual records always have IDs and still check legacy string references.
-    let mut response = client.query_bind(
+    let mut response = client.query_bind_checked(
         &format!("LET $open_work = SELECT VALUE work_item FROM work_run WHERE completed_at IS NONE; SELECT {WORK_ITEM_PROJECTION} FROM work_item WITH INDEX work_item_updated WHERE status IN ['done','failed','cancelled'] AND updated_at < $cutoff AND deleted_at IS NONE AND leased_by IS NONE AND lease_expires_at IS NONE AND kind NOT IN ['managed_wiki_registration','managed_wiki_registration_lock'] AND array::all([id NOT IN $open_work, IF id IS NONE THEN true ELSE string::concat(meta::tb(id), ':', meta::id(id)) NOT IN $open_work END]) ORDER BY updated_at, id LIMIT {limit}"),
         crate::bindings! { "cutoff" => crate::surreal::datetime_from_chrono(cutoff) }
     ).await?;
@@ -344,7 +396,7 @@ async fn archive_surreal(
             .map_err(|e| StorageError::QueryError(format!("Archive result: {e}")))?;
         result.items_archived += usize::from(moved.unwrap_or(false));
     }
-    let mut response = client.query_bind(&format!("SELECT {WORK_RUN_PROJECTION} FROM array::union((SELECT * FROM work_run WHERE completed_at < $cutoff AND type::is::datetime(completed_at) AND deleted_at IS NONE ORDER BY completed_at, id LIMIT {limit}), (SELECT * FROM work_run WHERE completed_at < $cutoff_string AND type::is::string(completed_at) AND deleted_at IS NONE ORDER BY completed_at, id LIMIT {limit})) LIMIT {limit}"), crate::bindings! { "cutoff" => crate::surreal::datetime_from_chrono(cutoff), "cutoff_string" => cutoff.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true) }).await?;
+    let mut response = client.query_bind_checked(&format!("SELECT {WORK_RUN_PROJECTION} FROM array::union((SELECT * FROM work_run WHERE completed_at < $cutoff AND type::is::datetime(completed_at) AND deleted_at IS NONE ORDER BY completed_at, id LIMIT {limit}), (SELECT * FROM work_run WHERE completed_at < $cutoff_string AND type::is::string(completed_at) AND deleted_at IS NONE ORDER BY completed_at, id LIMIT {limit})) LIMIT {limit}"), crate::bindings! { "cutoff" => crate::surreal::datetime_from_chrono(cutoff), "cutoff_string" => cutoff.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true) }).await?;
     let rows: Vec<WorkRunDb> = response
         .take(0)
         .map_err(|e| StorageError::QueryError(format!("Retention run candidates: {e}")))?;
@@ -444,7 +496,7 @@ pub(crate) async fn list_items(
         ""
     };
     let query = format!("SELECT {WORK_ITEM_PROJECTION} FROM array::concat((SELECT * FROM work_item WHERE space_id = $space AND deleted_at IS NONE{cursor_clause} ORDER BY id LIMIT {limit}), (SELECT * FROM work_item_archive WHERE space_id = $space AND deleted_at IS NONE{cold_cursor} ORDER BY original_id LIMIT {limit}).record) ORDER BY id LIMIT {limit}");
-    let mut response = client.query_bind(&query, crate::bindings! { "space" => space, "cursor" => cursor.map_or(surrealdb::sql::Value::None, |v| crate::surreal::thing_from_record_id(v).into()) }).await?;
+    let mut response = client.query_bind_checked(&query, crate::bindings! { "space" => space, "cursor" => cursor.map_or(surrealdb::sql::Value::None, |v| crate::surreal::thing_from_record_id(v).into()) }).await?;
     let rows: Vec<WorkItemDb> = response
         .take(0)
         .map_err(|e| StorageError::QueryError(format!("Item history list: {e}")))?;
@@ -491,7 +543,7 @@ pub(crate) async fn list_runs(
         ""
     };
     let query = format!("SELECT {WORK_RUN_PROJECTION} FROM array::concat((SELECT * FROM work_run WHERE space_id = $space AND deleted_at IS NONE{cursor_clause} ORDER BY id LIMIT {limit}), (SELECT * FROM work_run_archive WHERE space_id = $space AND deleted_at IS NONE{cold_cursor} ORDER BY original_id LIMIT {limit}).record) ORDER BY id LIMIT {limit}");
-    let mut response = client.query_bind(&query, crate::bindings! { "space" => space, "cursor" => cursor.map_or(surrealdb::sql::Value::None, |v| crate::surreal::thing_from_record_id(v).into()) }).await?;
+    let mut response = client.query_bind_checked(&query, crate::bindings! { "space" => space, "cursor" => cursor.map_or(surrealdb::sql::Value::None, |v| crate::surreal::thing_from_record_id(v).into()) }).await?;
     let rows: Vec<WorkRunDb> = response
         .take(0)
         .map_err(|e| StorageError::QueryError(format!("Run history list: {e}")))?;
@@ -525,7 +577,7 @@ pub(crate) async fn find_item_key(
             })
             .await;
     }
-    let mut response = client.query_bind(&format!("SELECT {WORK_ITEM_PROJECTION} FROM array::concat((SELECT * FROM work_item WHERE space_id = $space AND idempotency_key = $key AND deleted_at IS NONE LIMIT 1), (SELECT VALUE record FROM work_item_archive WHERE space_id = $space AND record.idempotency_key = $key AND deleted_at IS NONE LIMIT 1)) LIMIT 1"), crate::bindings! { "space" => space, "key" => key }).await?;
+    let mut response = client.query_bind_checked(&format!("SELECT {WORK_ITEM_PROJECTION} FROM array::concat((SELECT * FROM work_item WHERE space_id = $space AND idempotency_key = $key AND deleted_at IS NONE LIMIT 1), (SELECT VALUE record FROM work_item_archive WHERE space_id = $space AND record.idempotency_key = $key AND deleted_at IS NONE LIMIT 1)) LIMIT 1"), crate::bindings! { "space" => space, "key" => key }).await?;
     let rows: Vec<WorkItemDb> = response
         .take(0)
         .map_err(|e| StorageError::QueryError(format!("Item history key: {e}")))?;
@@ -536,29 +588,29 @@ pub(crate) async fn runs_for_item(
     id: &RecordId,
 ) -> StorageResult<Vec<WorkRun>> {
     if let Some(store) = client.embedded_store() {
-        return store
-            .mutate(|tx| {
-                let mut rows: std::collections::BTreeMap<_, _> = tx
-                    .scan::<WorkRunArchive>()?
-                    .into_iter()
-                    .filter(|v| v.base.deleted_at.is_none() && v.record.work_item.id() == id)
-                    .map(|v| (v.original_id, v.record))
-                    .collect();
-                for row in tx.scan::<WorkRun>()? {
-                    if row.work_item.id() == id {
-                        rows.insert(row.base.id.clone(), row);
-                    }
-                }
-                let mut rows: Vec<_> = rows
-                    .into_values()
-                    .filter(|v| v.base.deleted_at.is_none())
-                    .collect();
-                rows.sort_by_key(|v| (v.attempt, v.started_at, v.base.id.clone()));
-                Ok(rows)
-            })
-            .await;
+        // Hot and archived records are read without opening a transaction that
+        // could checkpoint persistent storage. Final mutation guards still
+        // validate the exact captured run atomically against either location.
+        let mut rows: std::collections::BTreeMap<_, _> = store
+            .scan::<WorkRunArchive>()
+            .await?
+            .into_iter()
+            .filter(|v| v.base.deleted_at.is_none() && v.record.work_item.id() == id)
+            .map(|v| (v.original_id, v.record))
+            .collect();
+        for row in store.scan::<WorkRun>().await? {
+            if row.work_item.id() == id {
+                rows.insert(row.base.id.clone(), row);
+            }
+        }
+        let mut rows: Vec<_> = rows
+            .into_values()
+            .filter(|v| v.base.deleted_at.is_none())
+            .collect();
+        rows.sort_by_key(|v| (v.attempt, v.started_at, v.base.id.clone()));
+        return Ok(rows);
     }
-    let mut response = client.query_bind(&format!("SELECT {WORK_RUN_PROJECTION} FROM array::concat((SELECT * FROM work_run WHERE work_item = $id AND deleted_at IS NONE), (SELECT * FROM work_run WHERE work_item = $id_string AND deleted_at IS NONE), (SELECT VALUE record FROM work_run_archive WHERE record.work_item = $id AND deleted_at IS NONE), (SELECT VALUE record FROM work_run_archive WHERE record.work_item = $id_string AND deleted_at IS NONE)) ORDER BY attempt, started_at, id"), crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "id_string" => id.to_string() }).await?;
+    let mut response = client.query_bind_checked(&format!("SELECT {WORK_RUN_PROJECTION} FROM array::concat((SELECT * FROM work_run WHERE work_item = $id AND deleted_at IS NONE), (SELECT * FROM work_run WHERE work_item = $id_string AND deleted_at IS NONE), (SELECT VALUE record FROM work_run_archive WHERE record.work_item = $id AND deleted_at IS NONE), (SELECT VALUE record FROM work_run_archive WHERE record.work_item = $id_string AND deleted_at IS NONE)) ORDER BY attempt, started_at, id"), crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "id_string" => id.to_string() }).await?;
     let rows: Vec<WorkRunDb> = response
         .take(0)
         .map_err(|e| StorageError::QueryError(format!("Item run history: {e}")))?;
@@ -611,7 +663,7 @@ pub(crate) async fn terminal_items(
     let cold_kind = kind.map_or("", |_| " AND record.kind = $kind");
     let bound = limit.map_or_else(String::new, |v| format!(" LIMIT {v}"));
     let query = format!("SELECT {WORK_ITEM_PROJECTION} FROM array::concat((SELECT * FROM work_item WHERE space_id = $space AND status = $status AND deleted_at IS NONE{hot_kind} ORDER BY priority DESC, created_at ASC{bound}), (SELECT * FROM work_item_archive WHERE space_id = $space AND record.status = $status AND deleted_at IS NONE{cold_kind} ORDER BY record.priority DESC, record.created_at ASC{bound}).record) ORDER BY priority DESC, created_at ASC{bound}");
-    let mut response = client.query_bind(&query, crate::bindings! { "space" => space, "status" => status.to_string(), "kind" => kind.map_or(surrealdb::sql::Value::None, |v| v.to_string().into()) }).await?;
+    let mut response = client.query_bind_checked(&query, crate::bindings! { "space" => space, "status" => status.to_string(), "kind" => kind.map_or(surrealdb::sql::Value::None, |v| v.to_string().into()) }).await?;
     let rows: Vec<WorkItemDb> = response
         .take(0)
         .map_err(|e| StorageError::QueryError(format!("Terminal work history: {e}")))?;
@@ -663,6 +715,10 @@ mod tests {
                 .unwrap();
         }
     }
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep items, runs in the original fixture scope through assertions and cleanup."
+    )]
     async fn exercise(client: StorageClient) {
         indexes(&client).await;
         let items = WorkItemRepository::new(client.clone());
@@ -829,6 +885,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep items, runs in the original fixture scope through assertions and cleanup."
+    )]
     async fn batches(client: StorageClient) {
         indexes(&client).await;
         let items = WorkItemRepository::new(client.clone());
@@ -894,6 +954,10 @@ mod tests {
         batches(StorageClient::new_embedded().await.unwrap()).await;
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep items in the original fixture scope through assertions and cleanup."
+    )]
     async fn wiki_config(client: StorageClient) {
         indexes(&client).await;
         let items = WorkItemRepository::new(client.clone());
@@ -939,6 +1003,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, items, runs, restored in the original fixture scope through assertions and cleanup."
+    )]
     async fn retention_snapshot_and_migration_preserve_native_fields() {
         let client = StorageClient::new_embedded().await.unwrap();
         let items = WorkItemRepository::new(client.clone());
@@ -955,19 +1023,16 @@ mod tests {
         archive_terminal_work(&client, Utc::now() - chrono::Duration::days(30), 10)
             .await
             .unwrap();
-        let bytes = client
-            .embedded_store()
-            .unwrap()
-            .export_snapshot_bytes()
-            .await
-            .unwrap();
-        let restored = StorageClient::new_embedded().await.unwrap();
-        restored
-            .embedded_store()
-            .unwrap()
-            .import_snapshot_bytes(&bytes)
-            .await
-            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("retained.snapshot");
+        client.export_snapshot(&snapshot).await.unwrap();
+        let extra = item(WorkItemStatus::Runnable, "after_snapshot");
+        items.create(extra.clone()).await.unwrap();
+        // Restore through the runtime barrier with the same independent journal.
+        // The replacement must remove records created after the checkpoint.
+        client.import_snapshot(&snapshot).await.unwrap();
+        let restored = client.clone();
+        assert!(items.get("space", &extra.base.id).await.unwrap().is_none());
         assert_eq!(
             WorkItemRepository::new(restored.clone())
                 .get("space", &old.base.id)
@@ -1040,6 +1105,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep items in the original fixture scope through assertions and cleanup."
+    )]
     async fn retry_race(client: StorageClient) {
         indexes(&client).await;
         let items = WorkItemRepository::new(client.clone());
@@ -1086,6 +1155,10 @@ mod tests {
     async fn retention_retry_race_embedded() {
         retry_race(StorageClient::new_embedded().await.unwrap()).await;
     }
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep items, runs in the original fixture scope through assertions and cleanup."
+    )]
     async fn sibling_update_races(client: StorageClient) {
         indexes(&client).await;
         let items = WorkItemRepository::new(client.clone());
@@ -1170,6 +1243,10 @@ mod tests {
         sibling_update_races(StorageClient::new_embedded().await.unwrap()).await;
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep items, runs in the original fixture scope through assertions and cleanup."
+    )]
     async fn both_commit_orders(client: StorageClient) {
         indexes(&client).await;
         let items = WorkItemRepository::new(client.clone());
@@ -1251,6 +1328,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, items, runs, edges in the original fixture scope through assertions and cleanup."
+    )]
     async fn retention_legacy_string_runs_and_archived_done_dependencies() {
         let client = StorageClient::new_memory().await.unwrap();
         indexes(&client).await;
@@ -1349,5 +1430,58 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
+    async fn exercise_authorized_retry(client: StorageClient) {
+        indexes(&client).await;
+        let repo = WorkItemRepository::new(client.clone());
+        for archive in [false, true] {
+            let mut record = item(WorkItemStatus::Failed, "authorization_fixture");
+            record.base.security.level = 5;
+            let original = repo.create(record).await.unwrap();
+            if archive {
+                assert_eq!(
+                    archive_terminal_work(&client, Utc::now(), 100)
+                        .await
+                        .unwrap()
+                        .items_archived,
+                    1
+                );
+            }
+            let mut stale = original.clone();
+            stale.base.security.level = 0;
+            assert!(matches!(
+                repo.retry_authorized(&stale).await,
+                Err(StorageError::Conflict(_))
+            ));
+            assert_eq!(
+                repo.get("space", &original.base.id).await.unwrap().unwrap(),
+                original
+            );
+            let retried = repo.retry_authorized(&original).await.unwrap();
+            assert_eq!(retried.status, WorkItemStatus::Runnable);
+            assert_eq!(retried.base.security, original.base.security);
+            assert_eq!(
+                repo.get("space", &original.base.id).await.unwrap().unwrap(),
+                retried
+            );
+            assert!(matches!(
+                repo.retry_authorized(&original).await,
+                Err(StorageError::Conflict(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_retry_hot_and_cold_embedded() {
+        exercise_authorized_retry(StorageClient::new_embedded().await.unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn authorized_retry_hot_and_cold_surreal() {
+        exercise_authorized_retry(StorageClient::new_memory().await.unwrap()).await;
     }
 }

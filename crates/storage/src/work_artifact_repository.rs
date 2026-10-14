@@ -188,7 +188,9 @@ impl WorkArtifactRepository {
     }
 
     /// Converts a WorkArtifact to a SurrealDB value for insertion.
-    fn work_artifact_to_value(item: &WorkArtifact) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn work_artifact_to_value(
+        item: &WorkArtifact,
+    ) -> StorageResult<surrealdb::sql::Value> {
         use std::collections::BTreeMap;
         use surrealdb::sql::{Array, Object, Value};
 
@@ -214,7 +216,7 @@ impl WorkArtifactRepository {
         );
         obj.insert(
             "provenance".to_string(),
-            crate::surreal::json_to_surreal(serde_json::json!(item.base.provenance))?,
+            crate::surreal::provenance_to_value(&item.base.provenance)?,
         );
         obj.insert(
             "security".to_string(),
@@ -350,7 +352,7 @@ impl Repository<WorkArtifact> for WorkArtifactRepository {
             .client
             .query_bind_checked(
                 &format!(
-                    "UPDATE $id MERGE $record WHERE space_id = $space_id AND deleted_at IS NONE RETURN {WORK_ARTIFACT_PROJECTION};"
+                    "UPDATE $id CONTENT $record WHERE space_id = $space_id AND deleted_at IS NONE RETURN {WORK_ARTIFACT_PROJECTION};"
                 ),
                 crate::bindings! {
                     "id" => crate::surreal::thing_from_record_id(id),
@@ -549,8 +551,8 @@ impl WorkArtifactRepository {
 
         let mut response = self
             .client
-            .query_bind(
-                "UPDATE $id MERGE $record WHERE space_id = $space_id AND status = $status AND deleted_at IS NONE RETURN AFTER",
+            .query_bind_checked(
+                "UPDATE $id CONTENT $record WHERE space_id = $space_id AND status = $status AND deleted_at IS NONE RETURN AFTER",
                 crate::bindings! {
                     "id" => crate::surreal::thing_from_record_id(id),
                     "space_id" => space_id,
@@ -572,6 +574,39 @@ impl WorkArtifactRepository {
         })?;
 
         Ok(Some(WorkArtifact::try_from(item_db)?))
+    }
+}
+
+impl WorkArtifactRepository {
+    /// Reads physical row state for atomic source lifecycle inverse preparation.
+    pub(crate) async fn get_including_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<WorkArtifact>> {
+        if let Some(store) = self.client.embedded_store() {
+            return store.get::<WorkArtifact>(space_id, id, true).await;
+        }
+
+        let mut response = self
+            .client
+            .query_bind(
+                &format!(
+                    "SELECT {WORK_ARTIFACT_PROJECTION} FROM work_artifact WHERE id = $id AND space_id = $space_id"
+                ),
+                crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
+            )
+            .await?;
+
+        let items: Vec<WorkArtifactDb> = response
+            .take(0)
+            .map_err(|e| StorageError::QueryError(format!("Failed to parse work_artifact: {e}")))?;
+
+        items
+            .into_iter()
+            .next()
+            .map(WorkArtifact::try_from)
+            .transpose()
     }
 }
 
@@ -627,6 +662,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_work_artifact() {
         let repo = setup_test_repo().await;
         let item = create_test_work_artifact();
@@ -638,6 +677,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_work_artifact() {
         let repo = setup_test_repo().await;
         let item = create_test_work_artifact();
@@ -650,6 +693,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_work_artifact_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_work_artifact();
@@ -663,6 +710,131 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo, sources in the original fixture scope through assertions and cleanup."
+    )]
+    async fn native_source_provenance_survives_artifact_create_and_replacement() {
+        use elephant_types::records::base::{Extractor, ProvenanceStep};
+        use elephant_types::records::source::{Source, SourceType};
+
+        let client = StorageClient::new_memory().await.unwrap();
+        let repo = WorkArtifactRepository::new(client.clone());
+        let sources = crate::SourceRepository::new(client.clone());
+        let mut source_ids = Vec::new();
+        for name in ["first", "second"] {
+            let source = Source::new(
+                BaseFields::new(
+                    RecordId::new_v4(TableName::Source),
+                    "test_space".to_string(),
+                    "test_agent".to_string(),
+                ),
+                SourceType::Manual,
+                format!("source-{name}"),
+            );
+            source_ids.push(sources.create(source).await.unwrap().base.id);
+        }
+        let mut expected = create_test_work_artifact();
+        let id = expected.base.id.clone();
+        expected.base.provenance = Provenance {
+            sources: source_ids.clone(),
+            extractor: Some(Extractor {
+                name: Some("native-provenance-regression".to_string()),
+                version: Some("1".to_string()),
+                model: Some("deterministic".to_string()),
+            }),
+            work_run_id: Some(expected.work_run.id().clone()),
+            run_id: Some("original-run".to_string()),
+            prompt_id: Some("original-prompt".to_string()),
+            config_id: Some("original-config".to_string()),
+            chain: vec![ProvenanceStep {
+                step: "extraction".to_string(),
+                input: source_ids[0].to_string(),
+                output: id.to_string(),
+            }],
+        };
+        expected.base.security = Security {
+            policy_id: "default".to_string(),
+            level: 2,
+            labels: vec!["private".to_string()],
+            handling: vec!["restricted".to_string()],
+        };
+        expected.data = serde_json::json!({"assertions": [{"text": "source-backed output"}]});
+
+        assert_eq!(repo.create(expected.clone()).await.unwrap(), expected);
+        assert_eq!(
+            repo.get("test_space", &id).await.unwrap(),
+            Some(expected.clone())
+        );
+        assert_native_artifact_sources(&client, &id, &source_ids).await;
+
+        expected.base.provenance.sources.remove(0);
+        expected.base.provenance.chain.clear();
+        expected.base.provenance.prompt_id = None;
+        expected.data = serde_json::json!({"replacement": true});
+        assert_eq!(
+            repo.update("test_space", &id, expected.clone())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            repo.get("test_space", &id).await.unwrap(),
+            Some(expected.clone())
+        );
+        assert_native_artifact_sources(&client, &id, &source_ids[1..]).await;
+
+        expected.status = ArtifactStatus::Validated;
+        expected.validated_at = Some(Utc::now());
+        let conditional = repo
+            .update_if_status("test_space", &id, expected.clone(), ArtifactStatus::Draft)
+            .await
+            .unwrap()
+            .expect("the original draft is replaced");
+        expected.base.updated_at = conditional.base.updated_at;
+        assert_eq!(conditional, expected);
+        assert_native_artifact_sources(&client, &id, &source_ids[1..]).await;
+
+        let mut stale = expected.clone();
+        stale.base.provenance.sources.clear();
+        stale.data = serde_json::json!({"stale": true});
+        assert!(repo
+            .update_if_status("test_space", &id, stale, ArtifactStatus::Draft)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(repo.get("test_space", &id).await.unwrap(), Some(expected));
+        assert_native_artifact_sources(&client, &id, &source_ids[1..]).await;
+    }
+
+    async fn assert_native_artifact_sources(
+        client: &StorageClient,
+        id: &RecordId,
+        sources: &[RecordId],
+    ) {
+        let mut response = client
+            .query_bind_checked(
+                "SELECT VALUE provenance.sources FROM ONLY $id;",
+                crate::bindings! { "id" => crate::surreal::thing_from_record_id(id) },
+            )
+            .await
+            .unwrap();
+        let actual: Vec<surrealdb::sql::Thing> = response.take(0).unwrap();
+        let expected = sources
+            .iter()
+            .map(crate::surreal::thing_from_record_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual, expected,
+            "physical provenance must contain native records"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_work_artifact() {
         let repo = setup_test_repo().await;
         let item = create_test_work_artifact();
@@ -680,6 +852,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_work_artifact() {
         let repo = setup_test_repo().await;
         let item = create_test_work_artifact();
@@ -693,6 +869,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_if_status_matches() {
         let repo = setup_test_repo().await;
         let item = create_test_work_artifact();
@@ -715,6 +895,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_if_status_mismatch_returns_none() {
         let repo = setup_test_repo().await;
         let item = create_test_work_artifact();
@@ -740,6 +924,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_if_status_uses_target_id_not_payload_id() {
         let repo = setup_test_repo().await;
         let target = repo.create(create_test_work_artifact()).await.unwrap();
@@ -827,5 +1015,80 @@ mod tests {
 
         let result = WorkArtifact::try_from(db);
         assert!(result.is_err(), "Missing data should error");
+    }
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
+    async fn nested_replacement_contract(client: StorageClient) {
+        let repo = WorkArtifactRepository::new(client);
+        let mut original = create_test_work_artifact();
+        original.data = serde_json::json!({"coverage":{"required":["span-a"]},"nested":{"remove":true,"keep":1}});
+        original.validation_errors = Some(vec!["previous validation".into()]);
+        let original = repo.create(original).await.expect("original artifact");
+        let mut changed = original.clone();
+        changed.data = serde_json::json!({"nested":{"keep":2}});
+        changed.validation_errors = None;
+        repo.update("test_space", &original.base.id, changed.clone())
+            .await
+            .expect("full replacement");
+        let stored = repo
+            .get("test_space", &original.base.id)
+            .await
+            .expect("read actual storage")
+            .expect("present");
+        assert_eq!(stored.data, changed.data);
+        assert!(stored.data.get("coverage").is_none());
+        assert!(stored.validation_errors.is_none());
+        assert_eq!(stored.base.id, original.base.id);
+        assert_eq!(stored.base.created_at, original.base.created_at);
+        assert_eq!(stored.base.security, original.base.security);
+        let mut conditional = stored.clone();
+        conditional.data = serde_json::json!({});
+        conditional.status = ArtifactStatus::Validated;
+        repo.update_if_status(
+            "test_space",
+            &original.base.id,
+            conditional,
+            ArtifactStatus::Draft,
+        )
+        .await
+        .expect("conditional replacement")
+        .expect("expected status");
+        let actual = repo
+            .get("test_space", &original.base.id)
+            .await
+            .expect("read conditional")
+            .expect("present");
+        assert_eq!(actual.data, serde_json::json!({}));
+        assert_eq!(actual.status, ArtifactStatus::Validated);
+        let mut forbidden = actual.clone();
+        forbidden.data = serde_json::json!({"unexpected":true});
+        assert!(repo
+            .update_if_status(
+                "test_space",
+                &original.base.id,
+                forbidden,
+                ArtifactStatus::Draft
+            )
+            .await
+            .expect("status mismatch")
+            .is_none());
+        assert_eq!(
+            repo.get("test_space", &original.base.id)
+                .await
+                .expect("unchanged"),
+            Some(actual)
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_artifact_updates_replace_removed_nested_fields() {
+        nested_replacement_contract(StorageClient::new_embedded().await.expect("embedded")).await;
+    }
+    #[tokio::test]
+    async fn surreal_artifact_updates_replace_removed_nested_fields() {
+        nested_replacement_contract(StorageClient::new_memory().await.expect("native memory"))
+            .await;
     }
 }

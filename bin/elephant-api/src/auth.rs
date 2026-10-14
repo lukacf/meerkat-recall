@@ -10,11 +10,10 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Request, State},
-    http::{header, StatusCode},
+    extract::{FromRequestParts, Path, Request, State},
+    http::header,
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 pub use elephant_auth::Claims;
 use elephant_auth::{IssuerMappings, LegacyVerifier, VerifiedCallerContext};
@@ -49,13 +48,15 @@ impl From<elephant_auth::AuthError> for AuthError {
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
-        let status = match self.error.as_str() {
-            "missing_token" | "invalid_token" | "expired_token" => StatusCode::UNAUTHORIZED,
-            "insufficient_scope" => StatusCode::FORBIDDEN,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        use crate::public_error::{ApiFailure, ErrorCode};
+        let code = match self.error.as_str() {
+            "insufficient_scope" => ErrorCode::ForbiddenSpace,
+            "missing_token" | "invalid_token" | "expired_token" | "missing_principal" => {
+                ErrorCode::Unauthorized
+            }
+            _ => ErrorCode::Unavailable,
         };
-
-        (status, Json(self)).into_response()
+        ApiFailure::new(code, self.message).into_response()
     }
 }
 
@@ -67,6 +68,8 @@ pub struct Principal {
     pub subject: String,
     /// Space the principal has access to.
     pub space_id: Option<String>,
+    /// Signed grant ceiling, distinct from the space selected for this request.
+    pub spaces: Option<Vec<String>>,
     /// Granted scopes.
     pub scopes: Vec<String>,
     /// Security level.
@@ -88,6 +91,7 @@ impl From<Claims> for Principal {
         Self {
             subject: claims.sub,
             space_id: claims.space_id,
+            spaces: claims.spaces,
             scopes: claims.scopes,
             security_level: claims.security_level,
             security_labels: claims.security_labels,
@@ -96,6 +100,55 @@ impl From<Claims> for Principal {
             purpose: claims.purpose,
             bypass_abac: false,
         }
+    }
+}
+
+impl Principal {
+    /// Bind an explicitly selected space without widening the signed grant set.
+    pub(crate) fn bind_space(&mut self, selected: Option<&str>) -> Result<(), AuthError> {
+        let selected = selected.or(self.space_id.as_deref());
+        if selected
+            .is_some_and(|space| elephant_types::validation::validate_space_id(space).is_err())
+        {
+            return Err(AuthError {
+                error: "insufficient_scope".into(),
+                message: "Invalid selected space identifier".into(),
+            });
+        }
+        if self.bypass_abac {
+            self.space_id = selected.map(String::from);
+            return Ok(());
+        }
+        if let Some(spaces) = &self.spaces {
+            let Some(space) = selected.filter(|space| !space.trim().is_empty()) else {
+                return Err(AuthError {
+                    error: "insufficient_scope".into(),
+                    message: "Select a granted space with the route or X-Space-Id".into(),
+                });
+            };
+            if !spaces.iter().any(|granted| granted == space) {
+                return Err(AuthError {
+                    error: "insufficient_scope".into(),
+                    message: "The selected space is not granted".into(),
+                });
+            }
+        } else if let Some(space) = selected {
+            let global_grant_admin = self.space_id.is_none()
+                && self.scopes.iter().any(|scope| {
+                    matches!(
+                        scope.as_str(),
+                        "manage:grant" | "write:space_config" | "manage:provider"
+                    )
+                });
+            if self.space_id.as_deref() != Some(space) && !global_grant_admin {
+                return Err(AuthError {
+                    error: "insufficient_scope".into(),
+                    message: "The selected space is not granted".into(),
+                });
+            }
+        }
+        self.space_id = selected.map(String::from);
+        Ok(())
     }
 }
 
@@ -121,7 +174,12 @@ impl AuthConfig {
     ///
     /// Returns an error when an explicit JWT algorithm is unsupported.
     pub fn from_env() -> anyhow::Result<Self> {
-        let secret = std::env::var("JWT_SECRET").unwrap_or_default();
+        let secret = load_signing_secret(
+            std::env::var("JWT_SECRET").ok().as_deref(),
+            std::env::var_os("JWT_SECRET_FILE")
+                .as_deref()
+                .map(std::path::Path::new),
+        )?;
         let algorithm = Self::configured_algorithm(std::env::var("JWT_ALGORITHM").ok().as_deref())
             .map_err(anyhow::Error::msg)?;
         let audience = std::env::var("JWT_AUDIENCE").ok();
@@ -196,8 +254,44 @@ impl Default for AuthConfig {
     }
 }
 
+fn load_signing_secret(
+    secret: Option<&str>,
+    path: Option<&std::path::Path>,
+) -> anyhow::Result<String> {
+    let secret = secret.filter(|value| !value.trim().is_empty());
+    anyhow::ensure!(
+        secret.is_none() || path.is_none(),
+        "Configure only one of JWT_SECRET and JWT_SECRET_FILE"
+    );
+    if let Some(path) = path {
+        return elephant_auth::service_token::read_secret_file(path).map_err(anyhow::Error::from);
+    }
+    Ok(secret.unwrap_or_default().to_string())
+}
+
 /// Shared auth state.
 pub type AuthState = Arc<AuthConfig>;
+
+/// Parse an explicitly supplied space header without fallback or normalization.
+/// UTF-8 bytes are accepted; portable deployments should prefer ASCII identifiers.
+pub(crate) fn selected_space_header(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<&str>, AuthError> {
+    let invalid = || AuthError {
+        error: "insufficient_scope".into(),
+        message: "Invalid or ambiguous X-Space-Id".into(),
+    };
+    let mut values = headers.get_all("X-Space-Id").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(invalid());
+    }
+    let value = std::str::from_utf8(value.as_bytes()).map_err(|_| invalid())?;
+    elephant_types::validation::validate_space_id(value).map_err(|_| invalid())?;
+    Ok(Some(value))
+}
 
 /// JWT authentication middleware.
 ///
@@ -212,20 +306,36 @@ pub async fn jwt_auth(
     mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, AuthError> {
+    let (mut parts, body) = request.into_parts();
+    let params =
+        Path::<std::collections::HashMap<String, String>>::from_request_parts(&mut parts, &())
+            .await
+            .ok()
+            .map(|Path(params)| params)
+            .unwrap_or_default();
+    request = Request::from_parts(parts, body);
+    let path_space = params.get("space").or_else(|| params.get("space_id"));
+    let header_space = selected_space_header(request.headers())?;
+    if path_space.is_some_and(|path| header_space.is_some_and(|header| path != header)) {
+        return Err(AuthError {
+            error: "insufficient_scope".into(),
+            message: "Route space and X-Space-Id disagree".into(),
+        });
+    }
+    let selected_space = path_space
+        .map(String::as_str)
+        .or(header_space)
+        .map(String::from);
     // Skip auth if configured (development mode)
     if config.skip_auth {
         // Allow overriding the space via X-Space-Id header in dev mode
-        let space_id = request
-            .headers()
-            .get("X-Space-Id")
-            .and_then(|h| h.to_str().ok())
-            .filter(|s| !s.is_empty())
-            .map_or_else(|| "default".to_string(), String::from);
+        let space_id = selected_space;
 
         // Insert a default principal for development
         let principal = Principal {
             subject: "dev-user".to_string(),
-            space_id: Some(space_id),
+            space_id,
+            spaces: None,
             scopes: vec!["*".to_string()],
             security_level: 10,
             security_labels: vec![],
@@ -256,11 +366,67 @@ pub async fn jwt_auth(
 
     let mappings = request.extensions().get::<Arc<IssuerMappings>>();
     let verified = config.verify_token(token, mappings.map(AsRef::as_ref))?;
-    let principal = Principal::from(verified.claims().clone());
+    let mut principal = Principal::from(verified.claims().clone());
+    if principal.spaces.is_none() && principal.space_id.is_none() && selected_space.is_some() {
+        let management_path = request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(axum::extract::MatchedPath::as_str)
+            .is_some_and(|path| {
+                matches!(
+                    path,
+                    "/v1/spaces" | "/v1/spaces/{space_id}" | "/v1/spaces/{space}/grants/{subject}"
+                ) || path.starts_with("/v1/spaces/{space}/processing/")
+            });
+        if !management_path {
+            return Err(AuthError {
+                error: "insufficient_scope".into(),
+                message: "Global management tokens cannot select ordinary data spaces".into(),
+            });
+        }
+    }
+    principal.bind_space(selected_space.as_deref())?;
+    authorize_bootstrap_route(
+        verified.claims(),
+        request.method(),
+        request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(axum::extract::MatchedPath::as_str),
+        principal.space_id.as_deref(),
+    )?;
     request.extensions_mut().insert(principal);
     request.extensions_mut().insert(verified);
 
     Ok(next.run(request).await)
+}
+
+/// Route admission for a verified explicit bootstrap profile. This admits no
+/// ordinary data or work-producing route and does not replace record ABAC.
+pub(crate) fn authorize_bootstrap_route(
+    claims: &Claims,
+    method: &axum::http::Method,
+    matched_path: Option<&str>,
+    selected_space: Option<&str>,
+) -> Result<(), AuthError> {
+    let Some(space) = claims.bootstrap_space.as_deref() else {
+        return Ok(());
+    };
+    let admitted = match matched_path {
+        Some("/v1/spaces") => matches!(*method, axum::http::Method::GET | axum::http::Method::POST),
+        Some("/v1/spaces/{space_id}" | "/v1/spaces/{space}/grants/{subject}") => {
+            matches!(*method, axum::http::Method::GET | axum::http::Method::PUT)
+        }
+        _ => false,
+    };
+    if selected_space != Some(space) || !admitted {
+        return Err(AuthError {
+            error: "insufficient_scope".into(),
+            message: "Space bootstrap authority is restricted to its named HTTP management routes"
+                .into(),
+        });
+    }
+    Ok(())
 }
 
 /// Scope validation middleware factory.
@@ -390,6 +556,8 @@ mod tests {
             iss: Some("test-issuer".to_string()),
             aud: None,
             space_id: Some("space_a".to_string()),
+            spaces: None,
+            bootstrap_space: None,
             scopes: vec!["entities:read".to_string(), "entities:write".to_string()],
             security_level: 2,
             security_labels: vec!["confidential".to_string()],
@@ -544,7 +712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skip_auth_defaults_to_default() {
+    async fn test_skip_auth_does_not_invent_a_space() {
         let config = Arc::new(AuthConfig {
             skip_auth: true,
             ..AuthConfig::default()
@@ -569,11 +737,11 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "default");
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "");
     }
 
     #[tokio::test]
-    async fn test_skip_auth_ignores_empty_header() {
+    async fn test_skip_auth_rejects_explicit_empty_header() {
         let config = Arc::new(AuthConfig {
             skip_auth: true,
             ..AuthConfig::default()
@@ -601,10 +769,7 @@ mod tests {
             .await
             .unwrap();
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "default");
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
     }
 
     #[test]
@@ -624,3 +789,92 @@ mod tests {
 #[cfg(test)]
 #[path = "auth_test_support.rs"]
 pub(crate) mod test_support;
+
+#[cfg(test)]
+mod space_binding_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_space_headers_are_exact_utf8_and_never_fall_back(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use axum::http::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        assert!(selected_space_header(&headers)
+            .map_err(|_| "absent header")?
+            .is_none());
+        headers.insert("X-Space-Id", HeaderValue::from_bytes("研究".as_bytes())?);
+        assert_eq!(
+            selected_space_header(&headers).map_err(|_| "UTF-8 header")?,
+            Some("研究")
+        );
+        for malformed in [
+            b"".as_slice(),
+            b" alpha".as_slice(),
+            b"alpha ".as_slice(),
+            &[0xff],
+        ] {
+            headers.insert("X-Space-Id", HeaderValue::from_bytes(malformed)?);
+            assert!(selected_space_header(&headers).is_err());
+        }
+        headers.insert("X-Space-Id", HeaderValue::from_static("alpha"));
+        headers.append("X-Space-Id", HeaderValue::from_static("beta"));
+        assert!(selected_space_header(&headers).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn signing_secret_sources_cannot_silently_override_one_another() {
+        assert!(
+            load_signing_secret(Some("configured"), Some(std::path::Path::new("ignored"))).is_err()
+        );
+        assert_eq!(
+            load_signing_secret(Some("configured"), None)
+                .ok()
+                .as_deref(),
+            Some("configured")
+        );
+    }
+
+    #[test]
+    fn one_service_principal_selects_only_explicitly_granted_spaces() {
+        let original = Principal {
+            subject: "service".into(),
+            spaces: Some(vec!["alpha".into(), "beta".into()]),
+            ..Principal::default()
+        };
+        for space in ["alpha", "beta"] {
+            let mut principal = original.clone();
+            assert!(principal.bind_space(Some(space)).is_ok());
+            assert_eq!(principal.space_id.as_deref(), Some(space));
+        }
+        for selection in [None, Some(""), Some("gamma")] {
+            assert!(original.clone().bind_space(selection).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_empty_ceiling_cannot_fall_back_to_legacy_space() {
+        let mut principal = Principal {
+            space_id: Some("alpha".into()),
+            spaces: Some(vec![]),
+            ..Principal::default()
+        };
+        assert!(principal.bind_space(None).is_err());
+        assert!(principal.bind_space(Some("alpha")).is_err());
+    }
+
+    #[test]
+    fn legacy_single_space_is_preserved_and_cannot_be_overridden() {
+        let mut principal = Principal {
+            space_id: Some("alpha".into()),
+            ..Principal::default()
+        };
+        assert!(principal.bind_space(None).is_ok());
+        assert!(principal.bind_space(Some("beta")).is_err());
+        assert_eq!(principal.space_id.as_deref(), Some("alpha"));
+    }
+}
+
+#[cfg(test)]
+#[path = "bootstrap_tests.rs"]
+mod bootstrap_tests;

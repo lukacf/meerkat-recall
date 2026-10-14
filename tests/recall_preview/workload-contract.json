@@ -1,0 +1,30 @@
+{
+  "format": "recall-preview-workload/v2",
+  "consumer_workload_reference": "OB3 2026-10-06 23:52 report and 23:59 byte-bound ACK; root 23:59:35 schedule freeze",
+  "corpus_sha256": "2192437954109fc17ebbea5b3960eb6b398a2ee91a725ce70666b119e86179dc",
+  "request_count": 200,
+  "concurrent_callers": 50,
+  "requests_per_caller": 4,
+  "minimum_peak_in_flight": 1,
+  "sources_per_space": {
+    "qualification-household": 25,
+    "qualification-business": 25
+  },
+  "spaces": [
+    "qualification-household",
+    "qualification-business"
+  ],
+  "p95_ms": 2000,
+  "p99_ms": 5000,
+  "latency_comparison": "strict-less-than",
+  "request_timeout_ms": 8000,
+  "response_budget_bytes": 262144,
+  "duration_budget_ms": 120000,
+  "wire_limit": 50,
+  "metric_k": 3,
+  "ranking_mode": "semantic",
+  "schedule_sha256": "6008b37de82a9a5ea0e722a5dc28bd1fc171fa76a4fb8e3e7f77ebad94d53043",
+  "execution_authorized": false,
+  "provider_budget_status": "separate physical-attempt allocation required; original 432 semantic attempts not extended",
+  "backend_runs": "one separate 200-call cohort per supported backend"
+}

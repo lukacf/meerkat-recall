@@ -8,27 +8,29 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use elephant_extensions::{enabled_extension_names, load_runtime_reference_registry_from_env};
 use elephant_mcp::{
     authz::AuthzService as McpAuthzService, create_dispatcher_with_context, ToolContext,
 };
+use elephant_storage::public_mutation::PreparedAuditRevert;
+use elephant_storage::source_intake::{
+    prepare_source_audit_revert, IntakeControl, SourceAuditRevertOutcome,
+};
 use elephant_storage::{
-    parse_id, AuditLogRepository, DocRepository, EmbeddedRecord, EntityRepository,
-    IdentityCandidateRepository, RelRepository, Repository, SourceRepository, StorageBackendKind,
-    StorageClient, SystemEventRepository,
+    parse_id, AuditLogRepository, DocRepository, EntityRepository, IdentityCandidateRepository,
+    RelRepository, Repository, SourceRepository, StorageBackendKind, StorageClient,
+    SystemEventRepository,
 };
 use elephant_types::ids::TableName;
-use elephant_types::records::base::BaseFields;
 use elephant_types::records::{AuditLog, Doc, Entity, IdentityCandidate, Rel, Source, SystemEvent};
-use elephant_types::RecordId;
 
 use crate::routes::entities::ApiError;
 
@@ -40,6 +42,7 @@ use crate::authz::AuthzState;
 pub struct SystemState {
     /// Shared storage handle for backend-level admin operations.
     pub storage: Option<StorageClient>,
+    pub runtime: Option<Arc<crate::runtime::RuntimeManager>>,
     /// Audit log repository.
     pub audit_repo: Arc<dyn Repository<AuditLog> + Send + Sync>,
     /// Entity repository.
@@ -75,6 +78,15 @@ impl SystemState {
         )
     }
 
+    #[expect(
+        clippy::return_self_not_must_use,
+        reason = "Retain the existing constructor and builder annotation contract."
+    )]
+    pub fn with_runtime(mut self, runtime: Arc<crate::runtime::RuntimeManager>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
     /// Creates system state from pre-built repositories (used by fast tests).
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -91,6 +103,7 @@ impl SystemState {
     ) -> Self {
         Self {
             storage,
+            runtime: None,
             audit_repo,
             entity_repo,
             rel_repo,
@@ -132,6 +145,12 @@ pub struct CapabilitiesResponse {
 pub struct SnapshotRequest {
     /// Filesystem path on the Elephant host.
     pub path: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub retention_seconds: Option<u64>,
+    #[serde(default)]
+    pub quiesce_timeout_seconds: Option<u64>,
 }
 
 /// Snapshot import/export response.
@@ -145,6 +164,7 @@ pub struct SnapshotResponse {
     pub path: String,
     /// Human-friendly result message.
     pub message: String,
+    pub manifest: elephant_storage::snapshot::SnapshotManifest,
 }
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
@@ -174,10 +194,11 @@ fn authorize_global_system_scope(
         ));
     }
 
-    if principal
-        .space_id
-        .as_deref()
-        .is_some_and(|space_id| !space_id.is_empty())
+    if principal.spaces.is_some()
+        || principal
+            .space_id
+            .as_deref()
+            .is_some_and(|space_id| !space_id.is_empty())
     {
         return Err((
             StatusCode::FORBIDDEN,
@@ -203,15 +224,6 @@ fn snapshot_storage(state: &SystemState) -> Result<&StorageClient, (StatusCode, 
             )),
         ));
     };
-
-    if !storage.is_embedded() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiError::validation(
-                "Snapshot import/export is only supported with ELEPHANT_DB=elephant-db",
-            )),
-        ));
-    }
 
     Ok(storage)
 }
@@ -312,49 +324,6 @@ fn resolve_snapshot_host_path(
     Ok(resolved)
 }
 
-async fn apply_revert_record<T>(
-    storage: Option<&StorageClient>,
-    repo: &(dyn Repository<T> + Send + Sync),
-    action: elephant_types::records::AuditAction,
-    space_id: &str,
-    id: &RecordId,
-    record: T,
-    record_type: &str,
-) -> Result<(), (StatusCode, Json<ApiError>)>
-where
-    T: EmbeddedRecord + Serialize + DeserializeOwned + Send + Sync,
-{
-    if matches!(action, elephant_types::records::AuditAction::Delete) {
-        if let Some(store) = storage.and_then(StorageClient::embedded_store) {
-            store
-                .restore_and_replace_existing::<T>(space_id, id, record)
-                .await
-                .map(|_| ())
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiError::internal(format!(
-                            "Failed to revert deleted {record_type}: {e}"
-                        ))),
-                    )
-                })?;
-            return Ok(());
-        }
-    }
-
-    repo.update(space_id, id, record)
-        .await
-        .map(|_| ())
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(format!(
-                    "Failed to revert {record_type}: {e}"
-                ))),
-            )
-        })
-}
-
 const fn write_scope_for_table(table: TableName) -> Option<&'static str> {
     match table {
         TableName::Entity => Some("write:entity"),
@@ -409,356 +378,170 @@ const fn write_scope_for_table(table: TableName) -> Option<&'static str> {
 /// Returns an error if the audit entry is not found, if authorization fails,
 /// or if the revert operation fails.
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::large_futures,
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn revert_audit(
     State(state): State<Arc<SystemState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(audit_id): Path<String>,
+    Query(intake): Query<IntakeControl>,
 ) -> ApiResult<RevertResponse> {
-    let Some(space_id) = principal.space_id.clone() else {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ApiError {
-                code: "ACCESS_DENIED".to_string(),
-                message: "Access denied: missing space_id".to_string(),
-                details: None,
-            }),
-        ));
-    };
-    let rid = parse_id(&audit_id, TableName::AuditLog).map_err(|e| {
+    let space_id = crate::routes::require_space_id(&principal)?;
+    let storage = state.storage.clone().ok_or_else(|| {
         (
-            StatusCode::BAD_REQUEST,
-            Json(ApiError::validation(e.to_string())),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::internal("Canonical audit storage unavailable")),
         )
     })?;
-    // Get the audit log entry
-    match state.audit_repo.get(&space_id, &rid).await {
-        Ok(Some(audit_log)) => {
+    let rid = parse_id(&audit_id, TableName::AuditLog).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::validation(error.to_string())),
+        )
+    })?;
+    let audit = state
+        .audit_repo
+        .get(&space_id, &rid)
+        .await
+        .map_err(audit_storage_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::not_found("Audit log", &audit_id)),
+            )
+        })?;
+    state
+        .authz
+        .authorize_record_read(&principal, &audit, "read:audit")
+        .map_err(audit_authz_error)?;
+    let required_scope = write_scope_for_table(audit.record.table()).ok_or_else(|| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(ApiError::validation("Revert not supported for record type")),
+        )
+    })?;
+    let source_backed = match audit.record.table() {
+        TableName::Source => true,
+        TableName::Doc => DocRepository::new(storage.clone())
+            .get_with_deleted(&space_id, &audit.record)
+            .await
+            .map_err(audit_storage_error)?
+            .is_some_and(|doc| doc.source.is_some()),
+        _ => false,
+    };
+    if source_backed {
+        let prepared = prepare_source_audit_revert(&storage, &space_id, &audit, intake)
+            .await
+            .map_err(audit_storage_error)?;
+        for source in
+            std::iter::once(&prepared.current_source).chain(prepared.proposed_source.iter())
+        {
             state
                 .authz
-                .authorize_record_read(&principal, &audit_log, "read:audit")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-
-            let required_scope =
-                write_scope_for_table(audit_log.record.table()).ok_or_else(|| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError::validation("Revert not supported for record type")),
-                    )
-                })?;
-
-            let snapshot = match audit_log.action {
-                elephant_types::records::AuditAction::Create => audit_log.after.as_ref(),
-                elephant_types::records::AuditAction::Update
-                | elephant_types::records::AuditAction::Delete
-                | elephant_types::records::AuditAction::Restore => audit_log.before.as_ref(),
-                elephant_types::records::AuditAction::Promote
-                | elephant_types::records::AuditAction::Merge
-                | elephant_types::records::AuditAction::Purge => None,
+                .authorize_record_read(&principal, source, "read:source")
+                .map_err(audit_authz_error)?;
+            state
+                .authz
+                .authorize_record_write(&principal, source, "write:source")
+                .map_err(audit_authz_error)?;
+        }
+        for doc in prepared
+            .current_document
+            .iter()
+            .chain(prepared.proposed_document.iter())
+        {
+            state
+                .authz
+                .authorize_record_read(&principal, doc, "read:doc")
+                .map_err(audit_authz_error)?;
+            state
+                .authz
+                .authorize_record_write(&principal, doc, "write:doc")
+                .map_err(audit_authz_error)?;
+        }
+        for doc in &prepared.current_documents {
+            state
+                .authz
+                .authorize_record_read(&principal, doc, "read:doc:metadata")
+                .map_err(audit_authz_error)?;
+            state
+                .authz
+                .authorize_record_write(&principal, doc, "write:doc")
+                .map_err(audit_authz_error)?;
+        }
+        if let Some(contact) = &prepared.contact {
+            for row in contact.authorizations() {
+                state
+                    .authz
+                    .authorize_record_read(&principal, row, row.read_scope())
+                    .map_err(audit_authz_error)?;
+                state
+                    .authz
+                    .authorize_record_write(&principal, row, row.write_scope())
+                    .map_err(audit_authz_error)?;
             }
-            .ok_or_else(|| {
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(ApiError::validation(
-                        "Revert not supported for audit action",
-                    )),
-                )
-            })?;
-
-            let target_record_id = audit_log.record.clone();
-            let mut snapshot_value = snapshot.clone();
-            if let serde_json::Value::Object(ref mut map) = snapshot_value {
-                map.entry("id".to_string())
-                    .or_insert_with(|| serde_json::Value::String(target_record_id.to_string()));
+        }
+        if let SourceAuditRevertOutcome::Accepted(accepted) = prepared
+            .accept(&storage, &principal.subject)
+            .await
+            .map_err(audit_storage_error)?
+        {
+            if accepted.needs_processing() {
+                elephant_pipeline::source_queue::enqueue_accepted_source(&storage, &accepted.source, &accepted.publication, &principal.subject).await
+                    .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError::internal(format!("Audit inverse accepted as {}; queue handoff pending durable recovery: {error}", accepted.operation.operation_id)))))?;
             }
-
-            let base: BaseFields = serde_json::from_value(snapshot_value.clone()).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(format!(
-                        "Failed to parse audit snapshot for authorization: {e}"
-                    ))),
-                )
-            })?;
-
-            let record_attrs = elephant_policy::RecordAttributes {
+        }
+    } else {
+        let prepared = PreparedAuditRevert::prepare(storage, &space_id, &audit)
+            .await
+            .map_err(audit_storage_error)?;
+        for record in [&prepared.current, &prepared.proposed] {
+            let base = record.base();
+            let attributes = elephant_policy::RecordAttributes {
                 space_id: base.space_id.clone(),
-                security: base.security,
-                subjects: base.subjects,
+                security: base.security.clone(),
+                subjects: base.subjects.clone(),
                 subjects_state: base.subjects_state,
             };
             state
                 .authz
-                .evaluate(&principal, &record_attrs, required_scope)
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-
-            let target_space_id = base.space_id;
-
-            // Apply revert semantics (docs/spec.md §18.3).
-            match audit_log.action {
-                elephant_types::records::AuditAction::Update
-                | elephant_types::records::AuditAction::Delete
-                | elephant_types::records::AuditAction::Restore => match audit_log.record.table() {
-                    TableName::Entity => {
-                        let record: Entity = serde_json::from_value(snapshot_value.clone())
-                            .map_err(|e| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(ApiError::internal(format!(
-                                        "Failed to parse entity snapshot: {e}"
-                                    ))),
-                                )
-                            })?;
-                        apply_revert_record::<Entity>(
-                            state.storage.as_ref(),
-                            state.entity_repo.as_ref(),
-                            audit_log.action,
-                            &target_space_id,
-                            &target_record_id,
-                            record,
-                            "entity",
-                        )
-                        .await?;
-                    }
-                    TableName::Rel => {
-                        let record: Rel =
-                            serde_json::from_value(snapshot_value.clone()).map_err(|e| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(ApiError::internal(format!(
-                                        "Failed to parse relationship snapshot: {e}"
-                                    ))),
-                                )
-                            })?;
-                        apply_revert_record::<Rel>(
-                            state.storage.as_ref(),
-                            state.rel_repo.as_ref(),
-                            audit_log.action,
-                            &target_space_id,
-                            &target_record_id,
-                            record,
-                            "relationship",
-                        )
-                        .await?;
-                    }
-                    TableName::SystemEvent => {
-                        let record: SystemEvent = serde_json::from_value(snapshot_value.clone())
-                            .map_err(|e| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(ApiError::internal(format!(
-                                        "Failed to parse event snapshot: {e}"
-                                    ))),
-                                )
-                            })?;
-                        apply_revert_record::<SystemEvent>(
-                            state.storage.as_ref(),
-                            state.event_repo.as_ref(),
-                            audit_log.action,
-                            &target_space_id,
-                            &target_record_id,
-                            record,
-                            "event",
-                        )
-                        .await?;
-                    }
-                    TableName::Doc => {
-                        let record: Doc =
-                            serde_json::from_value(snapshot_value.clone()).map_err(|e| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(ApiError::internal(format!(
-                                        "Failed to parse doc snapshot: {e}"
-                                    ))),
-                                )
-                            })?;
-                        apply_revert_record::<Doc>(
-                            state.storage.as_ref(),
-                            state.doc_repo.as_ref(),
-                            audit_log.action,
-                            &target_space_id,
-                            &target_record_id,
-                            record,
-                            "doc",
-                        )
-                        .await?;
-                    }
-                    TableName::Source => {
-                        let record: Source = serde_json::from_value(snapshot_value.clone())
-                            .map_err(|e| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(ApiError::internal(format!(
-                                        "Failed to parse source snapshot: {e}"
-                                    ))),
-                                )
-                            })?;
-                        apply_revert_record::<Source>(
-                            state.storage.as_ref(),
-                            state.source_repo.as_ref(),
-                            audit_log.action,
-                            &target_space_id,
-                            &target_record_id,
-                            record,
-                            "source",
-                        )
-                        .await?;
-                    }
-                    TableName::IdentityCandidate => {
-                        let record: IdentityCandidate =
-                            serde_json::from_value(snapshot_value.clone()).map_err(|e| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(ApiError::internal(format!(
-                                        "Failed to parse identity_candidate snapshot: {e}"
-                                    ))),
-                                )
-                            })?;
-                        apply_revert_record::<IdentityCandidate>(
-                            state.storage.as_ref(),
-                            state.identity_candidate_repo.as_ref(),
-                            audit_log.action,
-                            &target_space_id,
-                            &target_record_id,
-                            record,
-                            "identity_candidate",
-                        )
-                        .await?;
-                    }
-                    _ => {
-                        return Err((
-                            StatusCode::FORBIDDEN,
-                            Json(ApiError::validation("Revert not supported for record type")),
-                        ))
-                    }
-                },
-                elephant_types::records::AuditAction::Create => match audit_log.record.table() {
-                    TableName::Entity => state
-                        .entity_repo
-                        .delete(&target_space_id, &target_record_id)
-                        .await
-                        .map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ApiError::internal(format!(
-                                    "Failed to revert create (entity delete): {e}"
-                                ))),
-                            )
-                        })?,
-                    TableName::Rel => state
-                        .rel_repo
-                        .delete(&target_space_id, &target_record_id)
-                        .await
-                        .map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ApiError::internal(format!(
-                                    "Failed to revert create (relationship delete): {e}"
-                                ))),
-                            )
-                        })?,
-                    TableName::SystemEvent => state
-                        .event_repo
-                        .delete(&target_space_id, &target_record_id)
-                        .await
-                        .map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ApiError::internal(format!(
-                                    "Failed to revert create (event delete): {e}"
-                                ))),
-                            )
-                        })?,
-                    TableName::Doc => state
-                        .doc_repo
-                        .delete(&target_space_id, &target_record_id)
-                        .await
-                        .map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ApiError::internal(format!(
-                                    "Failed to revert create (doc delete): {e}"
-                                ))),
-                            )
-                        })?,
-                    TableName::Source => state
-                        .source_repo
-                        .delete(&target_space_id, &target_record_id)
-                        .await
-                        .map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ApiError::internal(format!(
-                                    "Failed to revert create (source delete): {e}"
-                                ))),
-                            )
-                        })?,
-                    TableName::IdentityCandidate => state
-                        .identity_candidate_repo
-                        .delete(&target_space_id, &target_record_id)
-                        .await
-                        .map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ApiError::internal(format!(
-                                    "Failed to revert create (identity_candidate delete): {e}"
-                                ))),
-                            )
-                        })?,
-                    _ => {
-                        return Err((
-                            StatusCode::FORBIDDEN,
-                            Json(ApiError::validation("Revert not supported for record type")),
-                        ))
-                    }
-                },
-                elephant_types::records::AuditAction::Promote
-                | elephant_types::records::AuditAction::Merge
-                | elephant_types::records::AuditAction::Purge => {
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError::validation(
-                            "Revert not supported for audit action",
-                        )),
-                    ))
-                }
-            }
-
-            Ok(Json(RevertResponse {
-                success: true,
-                message: format!(
-                    "Revert requested for audit log {audit_id}. Action: {:?}, Record: {}",
-                    audit_log.action, audit_log.record
-                ),
-                audit_id,
-            }))
+                .evaluate(&principal, &attributes, required_scope)
+                .map_err(audit_authz_error)?;
         }
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError::not_found("Audit log", &audit_id)),
-        )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        prepared
+            .commit(&principal.subject)
+            .await
+            .map_err(audit_storage_error)?;
     }
+    Ok(Json(RevertResponse {
+        success: true,
+        message: format!(
+            "Reversed {:?} on {} with current authority",
+            audit.action, audit.record
+        ),
+        audit_id,
+    }))
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Retain the owned error adapter used by existing map_err callers."
+)]
+fn audit_storage_error(error: elephant_storage::StorageError) -> (StatusCode, Json<ApiError>) {
+    ApiError::storage(&error)
+}
+fn audit_authz_error(error: crate::authz::AuthzError) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            code: error.code,
+            message: error.message,
+            details: None,
+        }),
+    )
 }
 
 /// GET /v1/capabilities - Get server capabilities.
@@ -824,6 +607,10 @@ fn configured_extensions() -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn visible_capability_features(
     storage: &StorageClient,
     authz: &AuthzState,
@@ -873,63 +660,86 @@ async fn visible_capability_features(
     Ok(features)
 }
 
-/// POST `/v1/system/snapshot/export` - Export the live embedded snapshot.
+/// Online export drains admissions and workers before the storage consistency barrier.
 async fn export_snapshot(
     State(state): State<Arc<SystemState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(request): Json<SnapshotRequest>,
 ) -> ApiResult<SnapshotResponse> {
     authorize_global_system_scope(&principal, "read:system")?;
-    let resolved_path = resolve_snapshot_host_path(&request.path, false)?;
-    let storage = snapshot_storage(&state)?;
-    storage
-        .export_snapshot(resolved_path.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-
-    Ok(Json(SnapshotResponse {
-        success: true,
-        backend: storage.backend().as_str().to_string(),
-        path: resolved_path.display().to_string(),
-        message: format!("Exported embedded snapshot to {}", resolved_path.display()),
-    }))
+    run_snapshot(&state, request, false).await
 }
 
-/// POST `/v1/system/snapshot/import` - Replace the live embedded state from a snapshot.
+/// Restore remains reachable while a previous restore's durable marker blocks data access.
 async fn import_snapshot(
     State(state): State<Arc<SystemState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(request): Json<SnapshotRequest>,
 ) -> ApiResult<SnapshotResponse> {
     authorize_global_system_scope(&principal, "write:system")?;
-    let resolved_path = resolve_snapshot_host_path(&request.path, true)?;
-    let storage = snapshot_storage(&state)?;
-    storage
-        .import_snapshot(resolved_path.clone())
-        .await
-        .map_err(|e| match e {
-            elephant_storage::StorageError::Conflict(message) => {
-                (StatusCode::CONFLICT, Json(ApiError::validation(message)))
-            }
-            other => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(other.to_string())),
-            ),
-        })?;
+    run_snapshot(&state, request, true).await
+}
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
+async fn run_snapshot(
+    state: &SystemState,
+    request: SnapshotRequest,
+    restore: bool,
+) -> ApiResult<SnapshotResponse> {
+    let resolved_path = resolve_snapshot_host_path(&request.path, restore)?;
+    let storage = snapshot_storage(state)?;
+    let runtime = state.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::internal("Snapshot runtime control unavailable")),
+        )
+    })?;
+    let defaults = elephant_storage::snapshot::SnapshotRetention::default();
+    let retention = elephant_storage::snapshot::SnapshotRetention {
+        retention_seconds: request
+            .retention_seconds
+            .unwrap_or(defaults.retention_seconds),
+        quiesce_timeout_seconds: request
+            .quiesce_timeout_seconds
+            .unwrap_or(defaults.quiesce_timeout_seconds),
+    };
+    if !(1..=2_592_000).contains(&retention.retention_seconds)
+        || !(1..=60).contains(&retention.quiesce_timeout_seconds)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::validation(
+                "Retention must be 1..=2592000 seconds and quiesce timeout 1..=60 seconds",
+            )),
+        ));
+    }
+    let name = request.name.unwrap_or_else(|| "manual".into());
+    let manifest = runtime
+        .snapshot_operation(resolved_path.clone(), name, retention, restore)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, restore, "Snapshot operation failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::internal(
+                    "Snapshot operation unavailable; inspect readiness and operator logs",
+                )),
+            )
+        })?;
     Ok(Json(SnapshotResponse {
         success: true,
-        backend: storage.backend().as_str().to_string(),
+        backend: storage.backend().as_str().into(),
         path: resolved_path.display().to_string(),
-        message: format!(
-            "Imported embedded snapshot from {}",
-            resolved_path.display()
-        ),
+        message: if restore {
+            "Snapshot restored after erasure replay"
+        } else {
+            "Consistent snapshot exported with bounded retention"
+        }
+        .into(),
+        manifest,
     }))
 }
 
@@ -942,11 +752,16 @@ pub fn system_routes() -> Router<Arc<SystemState>> {
         .route("/v1/capabilities", get(get_capabilities))
         .route("/v1/system/snapshot/export", post(export_snapshot))
         .route("/v1/system/snapshot/import", post(import_snapshot))
+        .route("/v1/system/snapshot/restore", post(import_snapshot))
 }
 
 #[cfg(test)]
 #[path = "system_test.rs"]
 mod integration_tests;
+
+#[cfg(test)]
+#[path = "system_source_audit_tests.rs"]
+mod source_audit_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1088,6 +903,10 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_visible_capability_features_follow_principal_scopes() {
         let storage = StorageClient::new_embedded()
             .await

@@ -74,6 +74,7 @@ fn make_space_config(space_id: &str, provider: &str, model: &str, dims: i32) -> 
     base.subjects_state = SubjectsState::Complete;
 
     SpaceConfig {
+        processing: None,
         base,
         embedding_provider: provider.to_string(),
         embedding_model: model.to_string(),

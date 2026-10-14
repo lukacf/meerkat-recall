@@ -1,16 +1,16 @@
 pub mod api;
+#[cfg(test)]
+mod doc_revision_surface;
+pub mod grounded_source_fixture;
 pub mod pipeline_driver;
 pub mod scenarios;
 
 use elephant_migrations::apply_schema;
 use elephant_storage::{StorageClient, StorageConfig};
-use surrealdb::engine::any::Any;
-use surrealdb::Surreal;
 
 /// Shared test harness for E2E scenarios.
 pub struct Harness {
     pub client: StorageClient,
-    pub db: Surreal<Any>,
     pub ns: String,
     pub db_name: String,
 }
@@ -39,7 +39,6 @@ impl Harness {
 
         Ok(Self {
             client: client.clone(),
-            db: client.db().expect("surreal test harness db").clone(),
             ns,
             db_name,
         })

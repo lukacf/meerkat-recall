@@ -44,12 +44,13 @@ mod tests {
 
     use elephant_migrations::apply_schema;
     use elephant_storage::{
-        DocRepository, EntityRepository, Repository, StorageClient, StorageConfig,
+        DocRepository, EntityIdentityKeyRepository, EntityRepository, Repository, StorageClient,
+        StorageConfig,
     };
     use elephant_types::ids::TableName;
     use elephant_types::records::base::{BaseFields, Provenance, Security, SubjectsState};
     use elephant_types::records::entity::EntityType;
-    use elephant_types::records::{Doc, Entity};
+    use elephant_types::records::{Doc, Entity, EntityIdentityKey, IdentityKeyStatus};
     use elephant_types::{Link, RecordId};
     use serde::Deserialize;
 
@@ -87,6 +88,25 @@ mod tests {
         entity: String,
     }
 
+    async fn register_merge_space(storage: &StorageClient, space: &str) {
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: elephant_types::records::base::BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    space.into(),
+                    "fixture".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .unwrap();
+    }
+
     async fn setup_test_app() -> (Router, StorageClient) {
         let config = StorageConfig {
             database: format!(
@@ -100,6 +120,7 @@ mod tests {
         };
         let client = StorageClient::new(config).await.expect("create client");
         apply_schema(&client).await.expect("schema");
+        register_merge_space(&client, "test_space").await;
 
         let authz = Arc::new(AuthzService::new());
         let state = Arc::new(IdentityState::new(client.clone(), authz));
@@ -115,6 +136,7 @@ mod tests {
         let client = StorageClient::new_embedded()
             .await
             .expect("create embedded client");
+        register_merge_space(&client, "test_space").await;
 
         let authz = Arc::new(AuthzService::new());
         let state = Arc::new(IdentityState::new(client.clone(), authz));
@@ -135,6 +157,7 @@ mod tests {
                 "read:entity".to_string(),
                 "write:entity".to_string(),
                 "read:doc".to_string(),
+                "read:doc:metadata".to_string(),
                 "write:doc".to_string(),
                 "read:relationship".to_string(),
                 "write:relationship".to_string(),
@@ -267,37 +290,38 @@ mod tests {
             .await
             .expect("create b");
 
-        // Create an entity_identity_key row pointing at entity B (source of truth table).
+        // Use the original typed native record and link representation. Constructing
+        // type::thing from UUID text creates a distinct string-keyed physical row.
         let key = "email:b@example.com";
-        client
-            .query_bind(
-                r#"
-                CREATE entity_identity_key CONTENT {
-                    space_id: "test_space",
-                    created_at: time::now(),
-                    updated_at: time::now(),
-                    created_by: "test_agent",
-                    deleted_at: NONE,
-                    security: { policy_id: "default", level: 0, labels: [], handling: [] },
-                    provenance: { sources: [], extractor: NONE, run_id: NONE, chain: [] },
-                    subjects: NONE,
-                    subjects_state: "complete",
-                    key: $key,
-                    entity: type::thing("entity", $entity_id),
-                    confidence: 1.0,
-                    first_seen: NONE,
-                    last_seen: NONE,
-                    evidence: [],
-                    status: "active"
-                };
-                "#,
-                serde_json::json!({
-                    "key": key,
-                    "entity_id": entity_b.base.id.id().to_string(),
-                }),
-            )
+        let key_id = RecordId::new_v7(TableName::EntityIdentityKey);
+        let key_repo = EntityIdentityKeyRepository::new(client.clone());
+        let mut key_base = BaseFields::new(
+            key_id.clone(),
+            "test_space".to_string(),
+            "test_agent".to_string(),
+        );
+        key_base.security.clone_from(&entity_b.base.security);
+        key_base.subjects_state = SubjectsState::Complete;
+        key_repo
+            .create(EntityIdentityKey {
+                base: key_base,
+                key: key.to_string(),
+                entity: Link::new(entity_b.base.id.clone()),
+                confidence: 1.0,
+                first_seen: None,
+                last_seen: None,
+                evidence: vec![],
+                status: IdentityKeyStatus::Active,
+            })
             .await
             .expect("create entity_identity_key");
+        let original_key = key_repo
+            .get("test_space", &key_id)
+            .await
+            .expect("read original typed identity key")
+            .expect("original identity key exists");
+        assert_eq!(original_key.base.id, key_id);
+        assert_eq!(original_key.entity.id(), &entity_b.base.id);
 
         let req = serde_json::json!({
             "entity_a": entity_a.base.id.to_string(),
@@ -344,6 +368,16 @@ mod tests {
         let rows: Vec<IdentityKeyRow> = query_response.take(0).expect("rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity, entity_a.base.id.to_string());
+        let moved_key = key_repo
+            .get("test_space", &key_id)
+            .await
+            .expect("read original key after merge")
+            .expect("original key survives merge");
+        assert_eq!(moved_key.entity.id(), &entity_a.base.id);
+        assert_eq!(moved_key.base.security, original_key.base.security);
+        assert_eq!(moved_key.base.provenance, original_key.base.provenance);
+        assert_eq!(moved_key.key, original_key.key);
+        assert_eq!(moved_key.status, IdentityKeyStatus::Active);
     }
 
     #[tokio::test]
@@ -580,6 +614,9 @@ mod tests {
         let row = serde_json::json!({
             "id": "sampleapp_todo:todo-1",
             "space_id": "test_space",
+            "security": entity_b.base.security,
+            "subjects": entity_b.base.subjects,
+            "subjects_state": entity_b.base.subjects_state,
             "owner": entity_b.base.id.to_string(),
             "secondary": [
                 entity_b.base.id.to_string(),
@@ -641,6 +678,18 @@ mod tests {
         assert_eq!(
             row["secondary"],
             serde_json::json!([entity_a.base.id.to_string()])
+        );
+        assert_eq!(
+            row["security"],
+            serde_json::to_value(&entity_b.base.security).expect("security")
+        );
+        assert_eq!(
+            row["subjects"],
+            serde_json::to_value(&entity_b.base.subjects).expect("subjects")
+        );
+        assert_eq!(
+            row["subjects_state"],
+            serde_json::to_value(entity_b.base.subjects_state).expect("subjects state")
         );
         let _ = std::fs::remove_dir_all(manifest_dir);
     }

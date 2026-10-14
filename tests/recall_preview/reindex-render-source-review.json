@@ -1,0 +1,58 @@
+{
+  "format": "recall-reindex-render-source-review/v1",
+  "source_review_only": true,
+  "execution_authorized": false,
+  "executed_by_qualification": false,
+  "product_acceptance": false,
+  "reindex": {
+    "source_commit": "15f09cf759bb95bb5d90ac6b90c24e1167a1c050",
+    "test": "reindex::actual_claimed_reindex_uses_current_target_and_refuses_revoked_continuation",
+    "test_method_count": 1,
+    "both_backends": true,
+    "both_named_spaces": true,
+    "source_blockers_in_reviewed_scope": [],
+    "expectations": [
+      "Actual repository-returned claim; no synthetic attempt authority.",
+      "Distinct staged target requires ReindexEmbedding approval; staging/claiming produces zero physical requests.",
+      "Foreign claim, foreign original target, unregistered space and missing current approval refuse before dispatch or processing change.",
+      "Empty node phase makes zero requests; actual entity phase makes exactly one request to its own space transport.",
+      "Exact original input, target model, dimension and synthetic credential; persisted text hash independently derived from literal entity name.",
+      "Other space has no vector under this partition; staged vectors cannot load as active query vectors; original active profile unchanged.",
+      "Current binding revocation refuses continuation without another send or checkpoint advancement."
+    ],
+    "limits": [
+      "Controlled fixed vectors do not qualify semantic relevance.",
+      "Does not qualify target activation, worker replacement race, installed artifact or actual runtime result."
+    ],
+    "source_hashes": {
+      "tests/recall_preview_semantics/provider_reindex.rs": "284b68c06c351b6d6ba0616df3b5fd69e0ceacbc28e0d99095f66ba9fbc18ab3",
+      "tests/recall_preview_semantics/provider_spy.rs": "05352bc7d5b7f26c0ba18539f2559ac2cc191839baf708e07689c62c18c2eeb8",
+      "tests/scenarios/tests/recall_preview_providers.rs": "6ffcc734e8bdaea8d97afd07352b9149a4c728b192e4128f69f0c8ee843ca1ff",
+      "crates/pipeline/src/embedding_reindex.rs": "da6bbcb34f0932078f4f972a39bb1a4ad70b5f363ec0f2f0d8458243bf6a902c"
+    }
+  },
+  "render": {
+    "source_commit": "859458ebee9029a0dbfa3d3c338e89ad99ebfca3",
+    "test_methods": [
+      "render_proof_tests::embedded_actual_render_proof_preserves_original_pending_generation",
+      "render_proof_tests::native_actual_render_proof_preserves_original_pending_generation"
+    ],
+    "expectations": [
+      "Real source acceptance, default render, tree/extraction/staging and canonical completion using the existing controlled pipeline fixture.",
+      "Original accepted CRLF/trailing spaces differ from the exact actual normalized Doc and immutable DocRevision.",
+      "Completed current read succeeds; supplied clone text/hash, renderer version and Doc title tampering refuses.",
+      "Genuine unqueued R2 acceptance preserves original published R1 and hides pending Doc; actual later R2 processing retires R1 and exposes the exact new normalized revision."
+    ],
+    "remaining_required_case": "Mutate stored immutable SourceRevision and original completion/receipt proof after actual completion; require completed-read refusal, restore only original bytes, and require original positive. Existing E tests cover pre-completion check_ready corruption, not this completed-read case.",
+    "limits": [
+      "Shared current-read path, not installed HTTP/MCP artifact execution.",
+      "Controlled extractor and vectors do not qualify model or retrieval semantics.",
+      "No test execution inferred from source review."
+    ],
+    "source_hashes": {
+      "tests/e2e/src/grounded_source_fixture.rs": "2dbe3b61892ff31c7b3644b1f8aaa227580191b8927f54bda51752ff7518a5d4",
+      "tests/e2e/src/pipeline_driver.rs": "81d855040dbe8118b042c863cfe19dc01a15165984490ce9a4e8881774cf470e",
+      "docs/grounding-and-promotion.md": "4fe409036738a515062df84192c4152afe666d1926e884c468564ab738b6502d"
+    }
+  }
+}

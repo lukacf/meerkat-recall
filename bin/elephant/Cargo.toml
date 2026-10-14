@@ -13,6 +13,8 @@ name = "meerkat-recall"
 path = "src/main.rs"
 
 [dependencies]
+elephant-auth = { path = "../../crates/auth" }
+elephant-policy = { path = "../../crates/policy" }
 elephant = { path = "../../crates/elephant" }
 elephant-api = { path = "../elephant-api" }
 elephant-migrations = { path = "../../crates/migrations" }
@@ -38,6 +40,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+jsonwebtoken = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tempfile = "3"

@@ -1,6 +1,17 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/pdf-inspector", "vendor/surrealkv-0.9.3"]
+exclude = [
+    # Historical Recall 0.1 provider backports; 0.9 uses unmodified registry crates.
+    "vendor/meerkat-llm-core-0.8.51",
+    "vendor/meerkat-openai-0.8.51",
+    "vendor/meerkat-gemini-0.8.51",
+    "vendor/pdf-inspector",
+    "vendor/surrealkv-0.9.3",
+    "vendor/surrealdb-core-2.6.5",
+    "vendor/surrealdb-2.6.5",
+    "vendor/tokenizers-0.22.2",
+    "vendor/rav1e-0.8.1",
+]
 members = [
     "crates/types",
     "crates/elephant-db",
@@ -45,7 +56,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["Elephant Team"]
 license = "MIT OR Apache-2.0"
@@ -54,14 +65,14 @@ rust-version = "1.94.0"
 
 [workspace.dependencies]
 # Meerkat - keep the facade and direct family dependencies on one release.
-meerkat = { version = "=0.8.51", default-features = false, features = ["anthropic", "openai", "gemini", "memory-store", "mcp", "session-compaction", "comms"] }
-meerkat-core = { version = "=0.8.51" }
-meerkat-mcp = { version = "=0.8.51" }
-meerkat-runtime = { version = "=0.8.51" }
-meerkat-skills = { version = "=0.8.51", default-features = false }
+meerkat = { version = "=0.9.0", default-features = false, features = ["anthropic", "openai", "gemini", "memory-store", "mcp", "session-compaction", "comms"] }
+meerkat-core = { version = "=0.9.0" }
+meerkat-mcp = { version = "=0.9.0" }
+meerkat-runtime = { version = "=0.9.0" }
+meerkat-skills = { version = "=0.9.0", default-features = false }
 # Test-only: pins the model-catalog regression test (gpt-5.6-sol resolution),
 # the reason this port exists. Version-unified with the meerkat facade above.
-meerkat-models = { version = "=0.8.51" }
+meerkat-models = { version = "=0.9.0" }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
@@ -150,6 +161,16 @@ unimplemented = "warn"
 opt-level = 0
 debug = true
 
+# The ancestry boundary tests validate every predecessor through the native
+# query interpreter. Optimize that dependency without changing the test workload.
+[profile.test.package.surrealdb-core]
+opt-level = 1
+
+# The full-book embedded scenario retains its fixed elapsed deadline while
+# exercising the real document index builder with optimization enabled.
+[profile.test.package.elephant-db]
+opt-level = 1
+
 [profile.release]
 opt-level = 3
 lto = true
@@ -180,3 +201,12 @@ push = true
 [patch.crates-io]
 pdf-inspector = { path = "vendor/pdf-inspector" }
 surrealkv = { path = "vendor/surrealkv-0.9.3" }
+
+# Exact native erasure references and private query-context inheritance.
+surrealdb-core = { path = "vendor/surrealdb-core-2.6.5" }
+surrealdb = { path = "vendor/surrealdb-2.6.5" }
+
+# Retain tokenizer/image behavior while replacing abandoned paste (RUSTSEC-2024-0436).
+# Exact source/license provenance and manifest-only deltas live beside each copy.
+tokenizers = { path = "vendor/tokenizers-0.22.2" }
+rav1e = { path = "vendor/rav1e-0.8.1" }

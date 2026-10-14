@@ -215,10 +215,10 @@ default_profile_count="$(array_len DEFAULT_TOOLS)"
 agent_profile_count="$(array_len AGENT_TOOLS)"
 maintenance_profile_count="$(array_len MAINTENANCE_TOOLS)"
 
-[[ "$full_count" == "91" ]] || { echo "expected full dispatcher count 91, got $full_count"; exit 1; }
-[[ "$default_dispatcher_count" == "23" ]] || { echo "expected default dispatcher count 23, got $default_dispatcher_count"; exit 1; }
-[[ "$agent_dispatcher_count" == "24" ]] || { echo "expected agent dispatcher count 24, got $agent_dispatcher_count"; exit 1; }
-[[ "$maintenance_dispatcher_count" == "43" ]] || { echo "expected maintenance dispatcher count 43, got $maintenance_dispatcher_count"; exit 1; }
+[[ "$full_count" == "100" ]] || { echo "expected full dispatcher count 100, got $full_count"; exit 1; }
+[[ "$default_dispatcher_count" == "26" ]] || { echo "expected default dispatcher count 26, got $default_dispatcher_count"; exit 1; }
+[[ "$agent_dispatcher_count" == "27" ]] || { echo "expected agent dispatcher count 27, got $agent_dispatcher_count"; exit 1; }
+[[ "$maintenance_dispatcher_count" == "46" ]] || { echo "expected maintenance dispatcher count 46, got $maintenance_dispatcher_count"; exit 1; }
 
 [[ "$default_profile_count" == "$default_dispatcher_count" ]] || {
   echo "default profile count $default_profile_count != dispatcher count $default_dispatcher_count"

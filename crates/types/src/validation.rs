@@ -16,15 +16,20 @@ pub trait Validate {
     fn validate(&self) -> TypeResult<()>;
 }
 
-/// Validates that a `space_id` is non-empty.
+/// Validates an opaque named space (1..256 UTF-8 bytes, trimmed, no controls).
 ///
 /// # Errors
 ///
-/// Returns an error if `space_id` is empty or only whitespace.
+/// Returns an error for empty, oversized, untrimmed, or control-bearing names.
 pub fn validate_space_id(space_id: &str) -> TypeResult<()> {
-    if space_id.trim().is_empty() {
+    if space_id.is_empty()
+        || space_id.len() > 256
+        || space_id.trim() != space_id
+        || space_id.chars().any(char::is_control)
+    {
         return Err(TypeError::ValidationError(
-            "space_id cannot be empty".to_string(),
+            "space_id must contain 1..256 UTF-8 bytes without edge whitespace or controls"
+                .to_string(),
         ));
     }
     Ok(())
@@ -143,6 +148,14 @@ mod tests {
         assert!(validate_space_id("space_1").is_ok());
         assert!(validate_space_id("").is_err());
         assert!(validate_space_id("   ").is_err());
+        assert!(validate_space_id(&"a".repeat(200)).is_ok());
+        assert!(validate_space_id(&"é".repeat(128)).is_ok());
+        assert!(validate_space_id(&"é".repeat(129)).is_err());
+        assert!(validate_space_id(" space").is_err());
+        assert!(validate_space_id("space\n").is_err());
+        assert!(validate_space_id("space\0name").is_err());
+        // Opaque identifiers are not normalized or limited to the portable subset.
+        assert!(validate_space_id("household/research:東京").is_ok());
     }
 
     #[test]

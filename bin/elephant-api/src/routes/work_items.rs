@@ -150,7 +150,9 @@ async fn list_work_items(
         items
     };
 
-    let filtered = state.authz.filter_records(&principal, items, "read:entity");
+    let filtered = state
+        .authz
+        .filter_records(&principal, items, "read:work_item");
 
     Ok(Json(WorkItemListResponse {
         total: filtered.len(),
@@ -198,7 +200,7 @@ async fn get_work_item(
 
     state
         .authz
-        .authorize_record_read(&principal, &item, "read:entity")
+        .authorize_record_read(&principal, &item, "read:work_item")
         .map_err(|e| {
             (
                 StatusCode::FORBIDDEN,
@@ -250,6 +252,33 @@ async fn retry_work_item(
             )
         })?;
 
+    state
+        .authz
+        .authorize_record_read(&principal, &item, "read:work_item")
+        .map_err(|e| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError {
+                    code: e.code,
+                    message: e.message,
+                    details: None,
+                }),
+            )
+        })?;
+    state
+        .authz
+        .authorize_record_write(&principal, &item, "write:work_item")
+        .map_err(|e| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError {
+                    code: e.code,
+                    message: e.message,
+                    details: None,
+                }),
+            )
+        })?;
+
     if item.status != WorkItemStatus::Failed {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -260,36 +289,28 @@ async fn retry_work_item(
         ));
     }
 
-    state
-        .work_item_repo
-        .update_status(&space_id, &rid, WorkItemStatus::Runnable)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-
-    let updated = state
-        .work_item_repo
-        .get(&space_id, &rid)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(
-                    "Work item not found after retry".to_string(),
-                )),
-            )
-        })?;
-
+    let updated =
+        state
+            .work_item_repo
+            .retry_authorized(&item)
+            .await
+            .map_err(|error| match error {
+                error @ elephant_storage::StorageError::ErasureInProgress => {
+                    ApiError::storage(&error)
+                }
+                elephant_storage::StorageError::Conflict(message) => (
+                    StatusCode::CONFLICT,
+                    Json(ApiError {
+                        code: "CONFLICT".into(),
+                        message,
+                        details: None,
+                    }),
+                ),
+                error => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError::internal(error.to_string())),
+                ),
+            })?;
     Ok(Json(updated))
 }
 

@@ -46,6 +46,10 @@ fn make_rel(space_id: &str, subject: &RecordId, object: &RecordId, rel_type: &st
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep original repository and fixture ownership through the complete control assertions"
+)]
 async fn test_resolution_bm25_search_entities_returns_hits() {
     let storage = setup_storage().await;
     let entity_repo = EntityRepository::new(storage);
@@ -68,6 +72,10 @@ async fn test_resolution_bm25_search_entities_returns_hits() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep original repository and fixture ownership through the complete control assertions"
+)]
 async fn test_resolution_vector_search_entities_returns_hits() {
     let storage = setup_storage().await;
     let entity_repo = EntityRepository::new(storage.clone());
@@ -119,6 +127,10 @@ async fn test_resolution_vector_search_entities_returns_hits() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep original repository and fixture ownership through the complete control assertions"
+)]
 async fn test_resolution_get_entities_within_n_hops_traverses_both_directions() {
     let storage = setup_storage().await;
     let entity_repo = EntityRepository::new(storage.clone());

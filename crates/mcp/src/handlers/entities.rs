@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use elephant_embeddings::EmbeddingProviderCache;
+use elephant_storage::public_mutation::PublicMutation;
 use elephant_storage::{
     is_source_inventory_entity, parse_id, EntityRepository, EntityVectorCache, Repository,
     SearchCriteria, SearchRepository, SpaceConfigRepository, StorageClient,
@@ -31,7 +32,7 @@ use crate::error::{McpError, McpResult};
 use crate::tools::ToolResponse;
 
 use super::assertions::entity_passes_attribution;
-use super::docs::{build_embedding_provider, resolve_embedding_policy};
+use super::docs::resolve_query_embedding;
 use super::{merge_base_fields, ToolContext, ToolHandler};
 
 /// Minimum cosine similarity for a semantic hit to participate in ranking.
@@ -39,6 +40,26 @@ use super::{merge_base_fields, ToolContext, ToolHandler};
 /// are relevant; this floor keeps unrelated entities from being added to
 /// results just for being the least-distant strangers.
 const MIN_SEMANTIC_SCORE: f32 = 0.30;
+
+/// An approval change after binding resolution must remain an authorization
+/// error, even when no vector would otherwise contribute to lexical ranking.
+fn entity_vector_availability(
+    result: elephant_storage::StorageResult<Vec<(elephant_types::RecordId, Vec<f32>)>>,
+) -> McpResult<bool> {
+    match result {
+        Ok(rows) => Ok(!rows.is_empty()),
+        Err(error) if error.to_string().contains("provider_authorization") => Err(
+            McpError::Public(elephant_types::public_error::PublicError::new(
+                elephant_types::public_error::ErrorCode::ProviderUnapproved,
+                "Approved query embedding is unavailable",
+            )),
+        ),
+        Err(error) => {
+            warn!("Semantic entity ranking unavailable (vector availability): {error}");
+            Ok(false)
+        }
+    }
+}
 
 fn entity_payload_schema() -> Value {
     json!({
@@ -185,7 +206,7 @@ pub struct BatchError {
 pub struct SearchEntitiesHandler {
     repo: EntityRepository,
     space_config_repo: SpaceConfigRepository,
-    provider_cache: EmbeddingProviderCache,
+    _provider_cache: EmbeddingProviderCache,
     entity_vectors: EntityVectorCache,
 }
 
@@ -196,8 +217,8 @@ impl SearchEntitiesHandler {
         Self::with_provider_cache(storage, EmbeddingProviderCache::new())
     }
 
-    /// Creates a handler with a pre-seeded embedding provider cache (tests
-    /// inject controlled providers here).
+    /// Retained constructor compatibility. Query dispatch resolves the current
+    /// approved space binding; cached providers do not grant model authority.
     #[must_use]
     pub fn with_provider_cache(
         storage: StorageClient,
@@ -206,7 +227,7 @@ impl SearchEntitiesHandler {
         Self {
             repo: EntityRepository::new(storage.clone()),
             space_config_repo: SpaceConfigRepository::new(storage),
-            provider_cache,
+            _provider_cache: provider_cache,
             entity_vectors: EntityVectorCache::new(),
         }
     }
@@ -219,6 +240,10 @@ impl SearchEntitiesHandler {
     /// (provider unavailable or failing, no stored vectors, nothing above
     /// the similarity floor) so the caller falls back to today's lexical
     /// behavior unchanged.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the repository handle scope while retaining the existing vector reload and provider authorization order."
+    )]
     pub(crate) async fn semantic_entity_hits(
         &self,
         ctx: &ToolContext,
@@ -227,33 +252,47 @@ impl SearchEntitiesHandler {
         entity_type: Option<&EntityType>,
         attributed_to: Option<&str>,
         limit: usize,
-    ) -> Option<Vec<(Entity, f32)>> {
-        let policy = match resolve_embedding_policy(&self.space_config_repo, space_id).await {
-            Ok(policy) => policy,
-            Err(err) => {
-                warn!("Semantic entity ranking unavailable (policy): {err}");
-                return None;
-            }
-        };
-        let provider = self
-            .provider_cache
-            .get_or_create(policy, build_embedding_provider)
-            .await;
+    ) -> McpResult<Option<Vec<(Entity, f32)>>> {
+        let (policy, provider) = resolve_query_embedding(&self.space_config_repo, space_id).await?;
+
+        // A query vector cannot contribute when this exact approved profile has
+        // no live entity vectors. Check current storage before spending a
+        // provider call. Discard this read before awaiting inference: ranking
+        // below reloads current rows, retaining erasure/restore and input guards.
+        let entity_vectors = elephant_storage::entity_profile_embedding_repository::EntityProfileEmbeddingRepository::new(self.repo.storage_client().clone());
+        if !entity_vector_availability(
+            entity_vectors
+                .load(space_id, &policy.model, policy.dims)
+                .await,
+        )? {
+            return Ok(None);
+        }
 
         let vectors = match provider.embed(&[query.to_string()]).await {
             Ok(vectors) => vectors,
             Err(err) => {
+                if err.to_string().contains("provider_authorization") {
+                    return Err(McpError::Public(
+                        elephant_types::public_error::PublicError::new(
+                            elephant_types::public_error::ErrorCode::ProviderUnapproved,
+                            "Approved query embedding is unavailable",
+                        ),
+                    ));
+                }
                 warn!("Semantic entity ranking unavailable (embed): {err}");
-                return None;
+                return Ok(None);
             }
         };
-        let vector = vectors.into_iter().next()?;
+        let Some(vector) = vectors.into_iter().next() else {
+            return Ok(None);
+        };
 
         let hits = match self
             .repo
-            .vector_search_entities_cached(
+            .vector_search_entities_for_policy(
                 &self.entity_vectors,
                 space_id,
+                &policy,
                 &vector,
                 limit.saturating_mul(2).clamp(10, 50),
             )
@@ -262,7 +301,7 @@ impl SearchEntitiesHandler {
             Ok(hits) => hits,
             Err(err) => {
                 warn!("Semantic entity ranking unavailable (vector search): {err}");
-                return None;
+                return Ok(None);
             }
         };
 
@@ -296,7 +335,7 @@ impl SearchEntitiesHandler {
         }
 
         if scored.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Row-level authz, preserving scores.
@@ -305,9 +344,7 @@ impl SearchEntitiesHandler {
             .map(|(entity, score)| (entity.base.id.to_string(), *score))
             .collect();
         let entities: Vec<Entity> = scored.into_iter().map(|(entity, _)| entity).collect();
-        let visible = ctx
-            .authz
-            .filter_records(&ctx.principal, entities, "read:entity");
+        let visible = crate::current_read::filter(ctx, entities, "read:entity").await?;
         let visible: Vec<(Entity, f32)> = visible
             .into_iter()
             .filter_map(|entity| {
@@ -316,7 +353,7 @@ impl SearchEntitiesHandler {
             })
             .collect();
 
-        (!visible.is_empty()).then_some(visible)
+        Ok((!visible.is_empty()).then_some(visible))
     }
 }
 
@@ -370,6 +407,7 @@ impl ToolHandler for SearchEntitiesHandler {
             "type": "object",
             "required": [],
             "properties": {
+                "use_vector": { "type": "boolean", "default": true },
                 "query": {
                     "type": "string",
                     "description": "Free-text search query"
@@ -402,6 +440,10 @@ impl ToolHandler for SearchEntitiesHandler {
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
+        let use_vector = params
+            .get("use_vector")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let input: SearchEntitiesInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
 
@@ -486,9 +528,7 @@ impl ToolHandler for SearchEntitiesHandler {
                 break;
             }
 
-            let filtered = ctx
-                .authz
-                .filter_records(&ctx.principal, page.results, "read:entity");
+            let filtered = crate::current_read::filter(ctx, page.results, "read:entity").await?;
 
             for entity in filtered {
                 if collected.len() >= input.limit {
@@ -521,7 +561,7 @@ impl ToolHandler for SearchEntitiesHandler {
         // embeddings are absent or the provider is unavailable this is None
         // and the lexical results pass through untouched — identical to the
         // pre-embedding behavior.
-        let semantic = if first_page {
+        let semantic = if first_page && use_vector {
             match criteria.query.as_deref() {
                 Some(query) => {
                     self.semantic_entity_hits(
@@ -532,7 +572,7 @@ impl ToolHandler for SearchEntitiesHandler {
                         criteria.attributed_to.as_deref(),
                         input.limit,
                     )
-                    .await
+                    .await?
                 }
                 None => None,
             }
@@ -664,6 +704,7 @@ impl ToolHandler for GetEntityHandler {
                     return serde_json::to_value(response)
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
+                let entity = crate::current_read::require(ctx, entity, "read:entity").await?;
                 let response = ToolResponse::success(entity);
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
@@ -734,7 +775,7 @@ impl ToolHandler for GetEntityWithRelationsHandler {
         let rid = parse_id(&input.id, TableName::Entity)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
         match self.repo.get_with_relations(&space_id, &rid).await {
-            Ok(Some(entity)) => {
+            Ok(Some(mut entity)) => {
                 if let Err(reason) =
                     ctx.authz
                         .authorize_record_read(&ctx.principal, &entity.entity, "read:entity")
@@ -744,17 +785,21 @@ impl ToolHandler for GetEntityWithRelationsHandler {
                     return serde_json::to_value(response)
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
+                entity.entity =
+                    crate::current_read::require(ctx, entity.entity, "read:entity").await?;
 
-                let outgoing_relations = ctx.authz.filter_records(
-                    &ctx.principal,
+                let outgoing_relations = crate::current_read::filter(
+                    ctx,
                     entity.outgoing_relations,
                     "read:relationship",
-                );
-                let incoming_relations = ctx.authz.filter_records(
-                    &ctx.principal,
+                )
+                .await?;
+                let incoming_relations = crate::current_read::filter(
+                    ctx,
                     entity.incoming_relations,
                     "read:relationship",
-                );
+                )
+                .await?;
 
                 let entity = elephant_storage::EntityWithRelations {
                     entity: entity.entity,
@@ -773,6 +818,11 @@ impl ToolHandler for GetEntityWithRelationsHandler {
             Err(e) => Err(McpError::ExecutionError(e.to_string())),
         }
     }
+}
+
+fn mutation_actor(ctx: &ToolContext) -> &str {
+    ctx.verified_caller()
+        .map_or("trusted:mcp", |caller| caller.claims().sub.as_str())
 }
 
 /// Handler for `update_entity` tool.
@@ -835,6 +885,7 @@ impl ToolHandler for UpdateEntityHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
+        let mutation = PublicMutation::begin(ctx.storage.clone(), &space_id).await?;
         let rid = parse_id(&input.id, TableName::Entity)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
         // Get existing entity first
@@ -846,7 +897,7 @@ impl ToolHandler for UpdateEntityHandler {
                 return serde_json::to_value(response)
                     .map_err(|e| McpError::ExecutionError(e.to_string()));
             }
-            Err(e) => return Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => return Err(McpError::StorageError(e)),
         };
 
         if let Err(reason) =
@@ -919,9 +970,8 @@ impl ToolHandler for UpdateEntityHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        match self
-            .repo
-            .replace_authorized(&existing, updated, false)
+        match mutation
+            .replace(&existing, updated, false, mutation_actor(ctx))
             .await
         {
             Ok(entity) => {
@@ -937,7 +987,7 @@ impl ToolHandler for UpdateEntityHandler {
                 let response = ToolResponse::success(entity);
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
@@ -984,6 +1034,10 @@ impl ToolHandler for DeleteEntityHandler {
         })
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the mutation plan scope through authorization, commit and response construction."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
         let input: EntityIdInput = serde_json::from_value(params)
@@ -996,6 +1050,7 @@ impl ToolHandler for DeleteEntityHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
+        let mutation = PublicMutation::begin(ctx.storage.clone(), &space_id).await?;
         let rid = parse_id(&input.id, TableName::Entity)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
         // Check if entity exists
@@ -1010,10 +1065,10 @@ impl ToolHandler for DeleteEntityHandler {
                     return serde_json::to_value(response)
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
-                self.repo
-                    .delete(&space_id, &rid)
+                mutation
+                    .delete(&entity, mutation_actor(ctx))
                     .await
-                    .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+                    .map_err(McpError::StorageError)?;
 
                 let response = ToolResponse::success(json!({ "deleted": true, "id": input.id }));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
@@ -1023,7 +1078,7 @@ impl ToolHandler for DeleteEntityHandler {
                     ToolResponse::error(format!("Entity not found: {}", input.id));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
@@ -1070,6 +1125,10 @@ impl ToolHandler for RestoreEntityHandler {
         })
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the mutation plan scope through authorization, commit and response construction."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
         let input: EntityIdInput = serde_json::from_value(params)
@@ -1082,6 +1141,7 @@ impl ToolHandler for RestoreEntityHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
+        let mutation = PublicMutation::begin(ctx.storage.clone(), &space_id).await?;
         let rid = parse_id(&input.id, TableName::Entity)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
         match self.repo.get_with_deleted(&space_id, &rid).await {
@@ -1107,7 +1167,7 @@ impl ToolHandler for RestoreEntityHandler {
 
                 // Guarded: restores only the row authorized above. A row changed
                 // in between is a conflict, not acted on under the old decision.
-                let restored = match self.repo.restore_guarded(&space_id, &rid, &entity).await {
+                let restored = match mutation.restore(&entity, mutation_actor(ctx)).await {
                     Ok(restored) => restored,
                     Err(elephant_storage::StorageError::Conflict(_)) => {
                         let response: ToolResponse<()> = ToolResponse::error(
@@ -1116,7 +1176,7 @@ impl ToolHandler for RestoreEntityHandler {
                         return serde_json::to_value(response)
                             .map_err(|e| McpError::ExecutionError(e.to_string()));
                     }
-                    Err(e) => return Err(McpError::ExecutionError(e.to_string())),
+                    Err(e) => return Err(McpError::StorageError(e)),
                 };
 
                 if let Err(reason) =
@@ -1137,7 +1197,7 @@ impl ToolHandler for RestoreEntityHandler {
                     ToolResponse::error(format!("Entity not found: {}", input.id));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
@@ -1219,6 +1279,7 @@ impl ToolHandler for BatchEntitiesHandler {
         let mut failed = Vec::new();
 
         for (index, entity) in input.items.into_iter().enumerate() {
+            let mutation = PublicMutation::begin(ctx.storage.clone(), &space_id).await?;
             let rid = entity.base.id.clone();
 
             // Try to get existing entity
@@ -1285,7 +1346,9 @@ impl ToolHandler for BatchEntitiesHandler {
                     }
 
                     // Update existing
-                    self.repo.replace_authorized(&existing, entity, true).await
+                    mutation
+                        .replace(&existing, entity, true, mutation_actor(ctx))
+                        .await
                 }
                 Ok(None) => {
                     if let Err(reason) =
@@ -1309,7 +1372,7 @@ impl ToolHandler for BatchEntitiesHandler {
                         continue;
                     }
                     // Create new
-                    self.repo.create(entity).await
+                    mutation.create(entity, mutation_actor(ctx)).await
                 }
                 Err(e) => Err(e),
             };
@@ -1328,6 +1391,9 @@ impl ToolHandler for BatchEntitiesHandler {
                         succeeded.push(entity);
                     }
                 }
+                Err(error @ elephant_storage::StorageError::ErasureInProgress) => {
+                    return Err(McpError::StorageError(error));
+                }
                 Err(e) => failed.push(BatchError {
                     index,
                     error: e.to_string(),
@@ -1342,17 +1408,13 @@ impl ToolHandler for BatchEntitiesHandler {
 }
 
 /// Handler for `create_entity_simple` tool.
-pub struct CreateEntitySimpleHandler {
-    repo: EntityRepository,
-}
+pub struct CreateEntitySimpleHandler {}
 
 impl CreateEntitySimpleHandler {
     /// Creates a new handler.
     #[must_use]
-    pub const fn new(storage: StorageClient) -> Self {
-        Self {
-            repo: EntityRepository::new(storage),
-        }
+    pub fn new(_storage: StorageClient) -> Self {
+        Self {}
     }
 }
 
@@ -1394,6 +1456,7 @@ impl ToolHandler for CreateEntitySimpleHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
+        let mutation = PublicMutation::begin(ctx.storage.clone(), &space_id).await?;
         let entity_type = EntityType::new(&input.entity_type);
 
         let base = BaseFieldsBuilder::new(space_id)
@@ -1421,7 +1484,7 @@ impl ToolHandler for CreateEntitySimpleHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        match self.repo.create(entity).await {
+        match mutation.create(entity, mutation_actor(ctx)).await {
             Ok(entity) => {
                 if let Err(reason) =
                     ctx.authz
@@ -1435,7 +1498,7 @@ impl ToolHandler for CreateEntitySimpleHandler {
                 let response = ToolResponse::success(entity);
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
@@ -1482,6 +1545,25 @@ mod tests {
                 purpose: HashSet::new(),
             },
         )
+    }
+
+    async fn canonical_test_space(storage: &StorageClient, space: &str) {
+        if !storage.is_embedded() {
+            storage
+                .query_checked(include_str!(
+                    "../../../migrations/sql/031_source_publication.surql"
+                ))
+                .await
+                .expect("canonical schema");
+        }
+        let config: elephant_types::records::SpaceConfig = serde_json::from_value(json!({
+            "id":elephant_types::RecordId::new_v4(TableName::SpaceConfig),"space_id":space,"created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now(),"created_by":"test",
+            "security":{"policy_id":"default","level":0,"labels":[],"handling":[]},"provenance":{},"subjects":[],"subjects_state":"complete","embedding_provider":"fake","embedding_model":"test","embedding_dims":8
+        })).expect("space fixture");
+        SpaceConfigRepository::new(storage.clone())
+            .create(config)
+            .await
+            .expect("space");
     }
 
     fn security_test_entity() -> Entity {
@@ -1533,8 +1615,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_update_entity_cannot_change_security_with_clearance_for_both() {
         let storage = StorageClient::new_embedded().await.unwrap();
+        canonical_test_space(&storage, "test_space").await;
         let repo = EntityRepository::new(storage.clone());
         let existing = repo.create(security_test_entity()).await.unwrap();
         let ctx = security_test_context(storage.clone());
@@ -1574,8 +1661,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_update_entity_content_preserves_security() {
         let storage = StorageClient::new_embedded().await.unwrap();
+        canonical_test_space(&storage, "test_space").await;
         let repo = EntityRepository::new(storage.clone());
         let existing = repo.create(security_test_entity()).await.unwrap();
         let ctx = security_test_context(storage.clone());
@@ -1602,8 +1694,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_batch_entities_cannot_change_security_or_restore_deleted_rows() {
         let storage = StorageClient::new_embedded().await.unwrap();
+        canonical_test_space(&storage, "test_space").await;
         let repo = EntityRepository::new(storage.clone());
         let ctx = security_test_context(storage.clone());
         let handler = BatchEntitiesHandler::new(storage);
@@ -1661,8 +1758,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_batch_entities_preserves_security_on_content_update_and_restore() {
         let storage = StorageClient::new_embedded().await.unwrap();
+        canonical_test_space(&storage, "test_space").await;
         let repo = EntityRepository::new(storage.clone());
         let ctx = security_test_context(storage.clone());
         let handler = BatchEntitiesHandler::new(storage);
@@ -1724,6 +1826,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_search_entities_applies_entity_type_filter() {
         use std::collections::HashSet;
         use std::sync::Arc;
@@ -1784,7 +1890,7 @@ mod tests {
             .execute(
                 &ctx,
                 serde_json::json!({
-                    "query": "*",
+                    "use_vector": false, "query": "*",
                     "filters": {"entity_type": "person"},
                     "limit": 10
                 }),
@@ -1801,6 +1907,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_search_entities_hides_merged_redirects_by_default() {
         use std::collections::HashSet;
         use std::sync::Arc;
@@ -1865,7 +1975,7 @@ mod tests {
             .execute(
                 &ctx,
                 serde_json::json!({
-                    "query": "Riley",
+                    "use_vector": false, "query": "Riley",
                     "limit": 10
                 }),
             )
@@ -1880,6 +1990,10 @@ mod tests {
         assert_eq!(output.items[0].status, EntityStatus::Active);
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture storage ownership and cleanup timing through construction of the ordinary-update context."
+    )]
     async fn ordinary_update_fixture(embedded: bool) -> (ToolContext, EntityRepository, Entity) {
         use elephant_policy::{Clearance, Principal};
         use elephant_storage::Repository;
@@ -1893,6 +2007,7 @@ mod tests {
             StorageClient::new_memory().await
         }
         .expect("storage");
+        canonical_test_space(&storage, "test_space").await;
         if !embedded {
             storage
                 .query("DEFINE TABLE entity SCHEMALESS;")
@@ -1937,6 +2052,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn ordinary_update_refuses_relabel_on_both_storage_backends() {
         use elephant_storage::Repository;
         for embedded in [false, true] {
@@ -1996,6 +2115,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn ordinary_batch_refuses_relabel_before_restoring_deleted_entity() {
         use elephant_storage::Repository;
         for embedded in [false, true] {
@@ -2083,56 +2206,14 @@ mod tests {
         }
     }
 
-    /// Deterministic provider for semantic ranking tests: known texts map to
-    /// fixed vectors, everything else embeds to a zero vector.
-    struct ControlledProvider {
-        entries: std::collections::HashMap<String, Vec<f32>>,
-        dims: usize,
-    }
-
-    impl ControlledProvider {
-        fn new(entries: Vec<(&str, Vec<f32>)>) -> Self {
-            let dims = entries.first().map_or(3, |(_, vector)| vector.len());
-            Self {
-                entries: entries
-                    .into_iter()
-                    .map(|(text, vector)| (text.to_string(), vector))
-                    .collect(),
-                dims,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl elephant_embeddings::EmbeddingProvider for ControlledProvider {
-        #[allow(clippy::unnecessary_literal_bound)]
-        fn model(&self) -> &str {
-            "controlled-entities-test"
-        }
-
-        fn dimensions(&self) -> usize {
-            self.dims
-        }
-
-        async fn embed(
-            &self,
-            texts: &[String],
-        ) -> elephant_embeddings::EmbeddingResult<Vec<Vec<f32>>> {
-            Ok(texts
-                .iter()
-                .map(|text| {
-                    self.entries
-                        .get(text)
-                        .cloned()
-                        .unwrap_or_else(|| vec![0.0; self.dims])
-                })
-                .collect())
-        }
-    }
-
     async fn semantic_test_setup(
         provider_entries: Vec<(&str, Vec<f32>)>,
-    ) -> (StorageClient, EntityRepository, SearchEntitiesHandler) {
+    ) -> (
+        StorageClient,
+        EntityRepository,
+        SearchEntitiesHandler,
+        crate::retrieval_test_support::QueryFixture,
+    ) {
         use std::sync::Arc;
 
         let storage = StorageClient::new_memory().await.expect("storage");
@@ -2141,12 +2222,14 @@ mod tests {
             .await
             .expect("schema");
         let repo = EntityRepository::new(storage.clone());
-        let cache = elephant_embeddings::EmbeddingProviderCache::with_provider(
-            elephant_embeddings::EmbeddingPolicy::from_env(),
-            Arc::new(ControlledProvider::new(provider_entries)),
-        );
-        let handler = SearchEntitiesHandler::with_provider_cache(storage.clone(), cache);
-        (storage, repo, handler)
+        let fixture = crate::retrieval_test_support::QueryFixture::install(
+            &storage,
+            "test_space",
+            provider_entries,
+        )
+        .await;
+        let handler = SearchEntitiesHandler::new(storage.clone());
+        (storage, repo, handler, fixture)
     }
 
     fn semantic_test_ctx(storage: StorageClient) -> ToolContext {
@@ -2189,9 +2272,10 @@ mod tests {
         handler: &SearchEntitiesHandler,
         ctx: &ToolContext,
         query: &str,
+        fixture: &crate::retrieval_test_support::QueryFixture,
     ) -> SearchEntitiesOutput {
-        let value = handler
-            .execute(ctx, serde_json::json!({ "query": query, "limit": 10 }))
+        let value = fixture
+            .run(handler.execute(ctx, serde_json::json!({ "query": query, "limit": 10 })))
             .await
             .expect("search");
         let response: ToolResponse<SearchEntitiesOutput> =
@@ -2203,27 +2287,29 @@ mod tests {
     async fn test_search_entities_semantic_match_beats_substring_miss() {
         use elephant_storage::Repository;
 
-        let (storage, repo, handler) =
+        let (storage, repo, handler, fixture) =
             semantic_test_setup(vec![("machine learning", vec![1.0, 0.0, 0.0])]).await;
 
         // "neural networks researcher" shares no substring with the query —
         // today's lexical search cannot find this entity.
         let researcher = semantic_test_entity("Riley Kim", Some("neural networks researcher"));
         let researcher_id = researcher.base.id.clone();
+        let researcher_hash =
+            elephant_storage::entity_profile_embedding_repository::entity_input_hash(&researcher);
         repo.create(researcher).await.expect("create researcher");
         // Pipeline-written embedding, close to the query vector.
         repo.set_name_embedding(
             "test_space",
             &researcher_id,
             &[0.95, 0.05, 0.0],
-            "controlled-entities-test",
-            "hash-researcher",
+            &fixture.policy.model,
+            &researcher_hash,
         )
         .await
         .expect("store embedding");
 
         let ctx = semantic_test_ctx(storage);
-        let output = run_search(&handler, &ctx, "machine learning").await;
+        let output = run_search(&handler, &ctx, "machine learning", &fixture).await;
 
         assert!(
             output
@@ -2243,18 +2329,20 @@ mod tests {
     async fn test_search_entities_exact_name_still_wins_over_semantic() {
         use elephant_storage::Repository;
 
-        let (storage, repo, handler) =
+        let (storage, repo, handler, fixture) =
             semantic_test_setup(vec![("machine learning", vec![1.0, 0.0, 0.0])]).await;
 
         let researcher = semantic_test_entity("Riley Kim", Some("neural networks researcher"));
         let researcher_id = researcher.base.id.clone();
+        let researcher_hash =
+            elephant_storage::entity_profile_embedding_repository::entity_input_hash(&researcher);
         repo.create(researcher).await.expect("create researcher");
         repo.set_name_embedding(
             "test_space",
             &researcher_id,
             &[1.0, 0.0, 0.0],
-            "controlled-entities-test",
-            "hash-researcher",
+            &fixture.policy.model,
+            &researcher_hash,
         )
         .await
         .expect("store embedding");
@@ -2265,7 +2353,7 @@ mod tests {
         repo.create(exact).await.expect("create exact");
 
         let ctx = semantic_test_ctx(storage);
-        let output = run_search(&handler, &ctx, "machine learning").await;
+        let output = run_search(&handler, &ctx, "machine learning", &fixture).await;
 
         assert_eq!(
             output
@@ -2287,13 +2375,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_search_entities_without_embeddings_matches_plain_handler() {
         use elephant_storage::Repository;
 
         // Provider present, but NO entity embeddings stored anywhere: the
         // provider-equipped handler must return byte-identical results to
         // the plain handler (today's behavior).
-        let (storage, repo, handler) =
+        let (storage, repo, handler, fixture) =
             semantic_test_setup(vec![("Riley", vec![1.0, 0.0, 0.0])]).await;
 
         repo.create(semantic_test_entity(
@@ -2313,12 +2405,15 @@ mod tests {
         let plain_handler = SearchEntitiesHandler::new(storage);
 
         let params = serde_json::json!({ "query": "Riley", "limit": 10 });
-        let blended = handler
-            .execute(&ctx, params.clone())
+        let blended = fixture
+            .run(handler.execute(&ctx, params.clone()))
             .await
             .expect("blended search");
         let plain = plain_handler
-            .execute(&ctx, params)
+            .execute(
+                &ctx,
+                serde_json::json!({"query":"Riley", "limit":10, "use_vector":false}),
+            )
             .await
             .expect("plain search");
 
@@ -2326,5 +2421,183 @@ mod tests {
             blended, plain,
             "absent embeddings: fallback must be identical to today's output"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_entity_vectors_skip_dispatch_until_live_vectors_exist_and_after_erasure() {
+        let (storage, repo, handler, fixture) =
+            semantic_test_setup(vec![("related subject", vec![1.0, 0.0, 0.0])]).await;
+        let entity = semantic_test_entity("Riley Kim", Some("A research subject"));
+        let id = entity.base.id.clone();
+        let hash =
+            elephant_storage::entity_profile_embedding_repository::entity_input_hash(&entity);
+        repo.create(entity).await.expect("entity");
+        let ctx = semantic_test_ctx(storage);
+        let empty = run_search(&handler, &ctx, "related subject", &fixture).await;
+        assert!(empty.items.is_empty());
+        assert_eq!(fixture.physical_requests(), 0);
+
+        repo.set_name_embedding(
+            "test_space",
+            &id,
+            &[1.0, 0.0, 0.0],
+            &fixture.policy.model,
+            &hash,
+        )
+        .await
+        .expect("publish current vector");
+        let ranked = run_search(&handler, &ctx, "related subject", &fixture).await;
+        assert!(ranked.items.iter().any(|row| row.base.id == id));
+        assert_eq!(fixture.physical_requests(), 1);
+
+        repo.hard_delete("test_space", &id)
+            .await
+            .expect("erase entity");
+        let erased = run_search(&handler, &ctx, "related subject", &fixture).await;
+        assert!(erased.items.is_empty());
+        assert_eq!(
+            fixture.physical_requests(),
+            1,
+            "erased vectors must not trigger inference"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_entity_vector_skips_dispatch_without_losing_lexical_results() {
+        use elephant_storage::entity_profile_embedding_repository::{
+            entity_input_hash, EntityProfileEmbeddingRepository,
+        };
+
+        for embedded in [false, true] {
+            let entries = vec![
+                ("Riley", vec![1.0, 0.0, 0.0]),
+                ("related subject", vec![1.0, 0.0, 0.0]),
+            ];
+            let (storage, repo, handler, fixture) = if embedded {
+                let storage = StorageClient::new_embedded()
+                    .await
+                    .expect("embedded storage");
+                let repo = EntityRepository::new(storage.clone());
+                let fixture = crate::retrieval_test_support::QueryFixture::install(
+                    &storage,
+                    "test_space",
+                    entries,
+                )
+                .await;
+                let handler = SearchEntitiesHandler::new(storage.clone());
+                (storage, repo, handler, fixture)
+            } else {
+                semantic_test_setup(entries).await
+            };
+            let entity = semantic_test_entity("Riley Kim", Some("Old description"));
+            let id = entity.base.id.clone();
+            let hash = entity_input_hash(&entity);
+            let mut entity = repo.create(entity).await.expect("entity");
+            let original_version = entity.base.updated_at;
+            repo.set_name_embedding(
+                "test_space",
+                &id,
+                &[1.0, 0.0, 0.0],
+                &fixture.policy.model,
+                &hash,
+            )
+            .await
+            .expect("publish vector");
+            entity.summary = Some("Changed description invalidates the stored vector".into());
+            let current = repo
+                .update("test_space", &id, entity)
+                .await
+                .expect("change entity input");
+            let current_hash = entity_input_hash(&current);
+            assert_ne!(current_hash, hash, "the stored preimage really changed");
+            if !embedded {
+                assert_eq!(
+                    current.base.updated_at, original_version,
+                    "Surreal trusted update retains the supplied timestamp"
+                );
+            }
+            assert!(EntityProfileEmbeddingRepository::new(storage.clone())
+                .load("test_space", &fixture.policy.model, fixture.policy.dims)
+                .await
+                .expect("current vector read")
+                .is_empty());
+            let ctx = semantic_test_ctx(storage);
+            let output = run_search(&handler, &ctx, "Riley", &fixture).await;
+            assert!(output.items.iter().any(|row| row.base.id == id));
+            assert_eq!(fixture.physical_requests(), 0);
+            let stale_semantic = run_search(&handler, &ctx, "related subject", &fixture).await;
+            assert!(stale_semantic.items.is_empty());
+            assert_eq!(fixture.physical_requests(), 0);
+
+            repo.set_name_embedding(
+                "test_space",
+                &id,
+                &[1.0, 0.0, 0.0],
+                &fixture.policy.model,
+                &current_hash,
+            )
+            .await
+            .expect("publish vector for current exact text");
+            let refreshed = run_search(&handler, &ctx, "related subject", &fixture).await;
+            assert!(refreshed.items.iter().any(|row| row.base.id == id));
+            assert_eq!(fixture.physical_requests(), 1);
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
+    async fn empty_entity_vectors_do_not_bypass_revoked_query_approval() {
+        use elephant_types::provider_binding::ModelOperation;
+        let (storage, _, handler, fixture) = semantic_test_setup(vec![]).await;
+        let configs = SpaceConfigRepository::new(storage.clone());
+        let before = configs
+            .get_by_space_id("test_space")
+            .await
+            .expect("read config")
+            .expect("config");
+        let mut revoked = before.clone();
+        let processing = revoked.processing.as_mut().expect("processing");
+        processing.generation += 1;
+        processing
+            .bindings
+            .get_mut(&ModelOperation::QueryEmbedding)
+            .expect("binding")
+            .revoked = true;
+        configs
+            .replace_authorized(&before, revoked)
+            .await
+            .expect("revoke binding");
+        let ctx = semantic_test_ctx(storage);
+        let result = fixture
+            .run(handler.execute(&ctx, serde_json::json!({"query":"Riley", "limit":10})))
+            .await;
+        assert!(matches!(result, Err(McpError::Public(_))));
+        assert_eq!(fixture.physical_requests(), 0);
+    }
+
+    #[test]
+    fn entity_vector_availability_preserves_late_authorization_failures() {
+        use elephant_storage::StorageError;
+        use elephant_types::public_error::ErrorCode;
+        for cause in [
+            "provider_authorization: query approval changed",
+            "provider_authorization: entity query approval missing",
+            "provider_authorization: stale query profile",
+            "provider_authorization: binding revoked",
+        ] {
+            let error = entity_vector_availability(Err(StorageError::Conflict(cause.into())))
+                .expect_err("late authorization change must not fall back");
+            assert!(
+                matches!(error, McpError::Public(error) if error.error_code == ErrorCode::ProviderUnapproved)
+            );
+        }
+        assert!(!entity_vector_availability(Ok(vec![])).expect("empty index"));
+        assert!(!entity_vector_availability(Err(StorageError::QueryError(
+            "storage unavailable".into()
+        )))
+        .expect("existing ordinary storage fallback"));
     }
 }

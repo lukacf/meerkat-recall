@@ -1,0 +1,52 @@
+{
+  "format": "recall-darwin-build-allocation/v1",
+  "execution_authorized": false,
+  "target": "aarch64-apple-darwin",
+  "cargo_jobs": 4,
+  "maximum_seconds": 43200,
+  "minimum_free_bytes": 268435456000,
+  "allocation_bytes": 161061273600,
+  "maximum_group_resident_bytes": 103079215104,
+  "started_at": "2099-01-01T00:00:00Z",
+  "expires_at": "2099-01-01T12:00:00Z",
+  "lane": {
+    "coordinator": "codex-security-adr-mac",
+    "state": "START",
+    "grant_id": "REPLACE_WITH_ORIGINAL_CONFIRMED_GRANT"
+  },
+  "source_identity": {
+    "source_commit": "0000000000000000000000000000000000000000",
+    "source_tree": "0000000000000000000000000000000000000000",
+    "source_tar_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "cargo_lock_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "task_directory": "/absolute/recall-task",
+  "source_directory": "/absolute/recall-task/source",
+  "cargo_home": "/Users/BUILDER/Library/Caches/rust-workspaces/ACTUAL_REPO_KEY/cargo-home",
+  "cargo_target": "/Users/BUILDER/Library/Caches/rust-workspaces/ACTUAL_REPO_KEY/targets/recall-darwin-000000000000",
+  "ort_cache": "/absolute/recall-task/ort-cache",
+  "rustup_home": "/absolute/recall-task/rustup",
+  "tmp_directory": "/absolute/recall-task/tmp",
+  "output_directory": "/absolute/recall-task/output",
+  "receipt_directory": "/absolute/recall-task/attempt-1",
+  "developer_directory": "/Library/Developer/CommandLineTools",
+  "sdk_root": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+  "libclang_directory": "/Library/Developer/CommandLineTools/usr/lib",
+  "clang": "/Library/Developer/CommandLineTools/usr/bin/clang",
+  "clangxx": "/Library/Developer/CommandLineTools/usr/bin/clang++",
+  "python": "/absolute/recall-task/tools/python/PINNED_3_12_12/bin/python3.12",
+  "python_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "tool_sha256": {
+    "rustc": "0000000000000000000000000000000000000000000000000000000000000000",
+    "cargo": "0000000000000000000000000000000000000000000000000000000000000000",
+    "clang": "0000000000000000000000000000000000000000000000000000000000000000",
+    "clang++": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "budget_receipt": "/absolute/original-shared-mac-budget.json",
+  "lane_lock": "/absolute/original-shared-mac-lane.lock",
+  "monitored_paths": [
+    "/absolute/recall-task",
+    "/Users/BUILDER/Library/Caches/rust-workspaces/ACTUAL_REPO_KEY",
+    "/Library/Developer/CommandLineTools"
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "format": "meerkat-recall-container-inputs/v1",
+  "resolved_at": "2026-10-06T23:31:24.235658+00:00",
+  "registry": "https://registry-1.docker.io/v2/",
+  "platform": "linux/amd64",
+  "builder": {
+    "repository": "library/rust",
+    "tag": "1.94.0-bookworm",
+    "index_digest": "sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f",
+    "manifest_digest": "sha256:4673f78db88b71f09d5451bbc404734807918161241215ba0a50bbbe9b448117",
+    "image": "library/rust@sha256:4673f78db88b71f09d5451bbc404734807918161241215ba0a50bbbe9b448117",
+    "config_digest": "sha256:fb7a58d0482a24e269ba85636ce46cb06aaaef3aea0e868154ed0ae7c18fa379",
+    "os": "linux",
+    "architecture": "amd64",
+    "layer_bytes": 561475152
+  },
+  "runtime": {
+    "repository": "library/debian",
+    "tag": "bookworm-slim",
+    "index_digest": "sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
+    "manifest_digest": "sha256:a4672c0cb26fbdde88e38fa2dfb6c681942306680e41e4378b28770b6e79ee91",
+    "image": "library/debian@sha256:a4672c0cb26fbdde88e38fa2dfb6c681942306680e41e4378b28770b6e79ee91",
+    "config_digest": "sha256:d4c45f66efc59f89b0597d343a9bd72808493c0eacecde5285961743252cee23",
+    "os": "linux",
+    "architecture": "amd64",
+    "layer_bytes": 28249323
+  },
+  "frontend": {
+    "repository": "docker/dockerfile",
+    "tag": "1",
+    "index_digest": "sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e",
+    "manifest_digest": "sha256:7b32114e84ca21aeb2d6f871a0b62b3a0762193f75d9afd048ee4cbe889f3148",
+    "image": "docker/dockerfile@sha256:7b32114e84ca21aeb2d6f871a0b62b3a0762193f75d9afd048ee4cbe889f3148",
+    "config_digest": "sha256:528c92d70d7e39dbb3dd1c6681f6750c565c7e45b70527cda47c1a61495c1b6a",
+    "os": "linux",
+    "architecture": "amd64",
+    "layer_bytes": 14277824
+  },
+  "package_resolution": "Debian Bookworm repositories at build time; complete installed package versions recorded, no bit-for-bit OS package reproducibility claim"
+}

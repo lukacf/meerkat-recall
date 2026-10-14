@@ -1,0 +1,37 @@
+{
+  "format": "recall-immutable-revision-source-review/v1",
+  "source_commit": "25a7bb044b9e1850bcaeba2aa8db5a4471da0ccf",
+  "source_review_only": true,
+  "execution_authorized": false,
+  "executed_by_qualification": false,
+  "product_acceptance": false,
+  "source_blockers_in_reviewed_scope": [],
+  "required_dependency": {
+    "read_eligibility_source_sha256": "4343d2e8300231c5bd1731f40df7198825f792a284e42a09b1f3e64714397825",
+    "note": "Requires current completed-render proof dependency and actual GroundedSourceFixture helpers in the composed graph; thin owner baseline alone is insufficient."
+  },
+  "route": "GET /v1/docs/{id}/revisions/{revision_id}",
+  "reviewed_properties": [
+    "Typed record identities, selected registered named space, exact Doc-to-Revision mapping, both read:doc and read:doc:raw on both original record envelopes.",
+    "One original ReadEligibility verifies current ancestors and original completed render proof; no raw-source-equals-rendered comparison. Exact Doc and Revision reread and final same-reader verify_current occur after lossless serialization.",
+    "A changed read returns retryable503 not_ready, consistent with existing reader-fence semantics. This explicitly supersedes the earlier proposed mutation-style409 for this new read.",
+    "A bounded writer rejects an entire encoded DTO above12065536 bytes; the full untruncated flat existing DocRevision DTO includes original renderer, mapping, status, metadata and text. Search262144 cap remains separate.",
+    "Six authored test entrypoints: typed-ID and full escaped2MB/envelope controls; both-backend intrinsic policy/subject/hash/parent checks; both-backend actual normalized completedR1, desired-pendingR2, actual-completedR2 supersession, stored render/policy tamper, current ancestor restriction, retract and erase through mounted HTTP route.",
+    "Actual-publication fixture compares full returned DTO to original persisted revision and restores original tampered bytes between cases, then requires the positive again."
+  ],
+  "evidence_limits": [
+    "New route tests inject Principal into mounted router, so they establish route/publication behavior only; signed middleware authentication, live grant revocation, installed artifact and process custody remain separate required gates.",
+    "Metadata-only raw-scope refusal is explicit; controlled extractor and local transport do not qualify semantic model behavior.",
+    "2MB serializer control is an intrinsic DTO test, not measured full2MB Graph publication/render-envelope capacity.",
+    "No deterministic concurrent reader-change test or actual runtime result is inferred from selected source review."
+  ],
+  "source_hashes": {
+    "bin/elephant-api/src/routes/doc_revisions.rs": "9994c692b389fa441e607ee57bc8f92f55898041945ee41d70b5c0bbaea732e9",
+    "bin/elephant-api/src/routes/doc_revisions_tests.rs": "fa2f349bd8b3030600542717c1fc3c3a9185918b97a999e72052597e6a9f68d9",
+    "bin/elephant-api/src/routes/docs.rs": "c4c95df4792f6b122e3817e71eaf9d7d570d8ad07d63515990f71eeb0efe3aab",
+    "bin/elephant-api/src/routes/mod.rs": "94844504155c7bc6292421f39adc09124c127d8aaa7991da53536c647720d7b0",
+    "tests/e2e/src/doc_revision_surface.rs": "f1ebb0d80f29d3deb4048aa5534dbc3342e22a6dcdd4e03f057d0a42d09bc3fc",
+    "tests/e2e/src/lib.rs": "0da95519b7f02089ce604e06e52c4a561ddc9bee98039eb0a0761969f69167e9",
+    "docs/internal/recall-preview-contract/immutable-revision-read.md": "7c49ed2712d8b2b4616cac2a549d03da6b7ba8f0182d76b629b56d419d638405"
+  }
+}

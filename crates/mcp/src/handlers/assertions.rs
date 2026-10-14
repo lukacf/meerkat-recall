@@ -185,9 +185,7 @@ impl ToolHandler for ListAssertionsHandler {
 
             let batch_len = items.len();
             scan_cursor = items.last().map(|a| a.base.id.clone());
-            let items = ctx
-                .authz
-                .filter_records(&ctx.principal, items, "read:assertion");
+            let items = crate::current_read::filter(ctx, items, "read:assertion").await?;
 
             for assertion in items {
                 if !assertion_matches_list_filter(&assertion, &input) {
@@ -343,6 +341,8 @@ impl ToolHandler for GetAssertionHandler {
                     return serde_json::to_value(response)
                         .map_err(|e| McpError::ExecutionError(e.to_string()));
                 }
+                let assertion =
+                    crate::current_read::require(ctx, assertion, "read:assertion").await?;
                 let response = ToolResponse::success(assertion);
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
@@ -408,7 +408,7 @@ pub struct SearchAssertionsHandler {
     repo: AssertionRepository,
     entity_repo: EntityRepository,
     space_config_repo: SpaceConfigRepository,
-    provider_cache: EmbeddingProviderCache,
+    _provider_cache: EmbeddingProviderCache,
     entity_vectors: EntityVectorCache,
     /// Rows the fallback table scan reads at most.
     scan_window: usize,
@@ -427,8 +427,8 @@ impl SearchAssertionsHandler {
         Self::with_provider_cache(storage, EmbeddingProviderCache::new())
     }
 
-    /// Creates a handler with a pre-seeded embedding provider cache (tests
-    /// inject controlled providers here).
+    /// Retained constructor compatibility. Query dispatch resolves the current
+    /// approved space binding; cached providers do not grant model authority.
     #[must_use]
     pub fn with_provider_cache(
         storage: StorageClient,
@@ -438,7 +438,7 @@ impl SearchAssertionsHandler {
             repo: AssertionRepository::new(storage.clone()),
             entity_repo: EntityRepository::new(storage.clone()),
             space_config_repo: SpaceConfigRepository::new(storage),
-            provider_cache,
+            _provider_cache: provider_cache,
             entity_vectors: EntityVectorCache::new(),
             scan_window: DEFAULT_SCAN_WINDOW,
         }
@@ -461,32 +461,33 @@ impl SearchAssertionsHandler {
         &self,
         space_id: &str,
         query: &str,
-    ) -> Option<Vec<(RecordId, f32)>> {
-        let policy =
-            match super::docs::resolve_embedding_policy(&self.space_config_repo, space_id).await {
-                Ok(policy) => policy,
-                Err(err) => {
-                    warn!("Semantic assertion recall unavailable (policy): {err}");
-                    return None;
-                }
-            };
-        let provider = self
-            .provider_cache
-            .get_or_create(policy, super::docs::build_embedding_provider)
-            .await;
+    ) -> McpResult<Option<Vec<(RecordId, f32)>>> {
+        let (policy, provider) =
+            super::docs::resolve_query_embedding(&self.space_config_repo, space_id).await?;
         let vectors = match provider.embed(&[query.to_string()]).await {
             Ok(vectors) => vectors,
             Err(err) => {
+                if err.to_string().contains("provider_authorization") {
+                    return Err(McpError::Public(
+                        elephant_types::public_error::PublicError::new(
+                            elephant_types::public_error::ErrorCode::ProviderUnapproved,
+                            "Approved query embedding is unavailable",
+                        ),
+                    ));
+                }
                 warn!("Semantic assertion recall unavailable (embed): {err}");
-                return None;
+                return Ok(None);
             }
         };
-        let vector = vectors.into_iter().next()?;
+        let Some(vector) = vectors.into_iter().next() else {
+            return Ok(None);
+        };
         let hits = match self
             .entity_repo
-            .vector_search_entities_cached(
+            .vector_search_entities_for_policy(
                 &self.entity_vectors,
                 space_id,
+                &policy,
                 &vector,
                 SEMANTIC_ANCHOR_ENTITIES,
             )
@@ -495,7 +496,7 @@ impl SearchAssertionsHandler {
             Ok(hits) => hits,
             Err(err) => {
                 warn!("Semantic assertion recall unavailable (vector search): {err}");
-                return None;
+                return Ok(None);
             }
         };
         let anchors: Vec<(RecordId, f32)> = hits
@@ -503,7 +504,7 @@ impl SearchAssertionsHandler {
             .filter(|hit| hit.score >= MIN_SEMANTIC_ANCHOR_SCORE)
             .map(|hit| (hit.entity_id, hit.score))
             .collect();
-        (!anchors.is_empty()).then_some(anchors)
+        Ok((!anchors.is_empty()).then_some(anchors))
     }
 }
 
@@ -556,6 +557,7 @@ impl ToolHandler for SearchAssertionsHandler {
             "type": "object",
             "required": [],
             "properties": {
+                "use_vector": { "type": "boolean", "default": true },
                 "query": {
                     "type": "string",
                     "description": "Free-text search query (optional when entity_id is given)"
@@ -590,6 +592,10 @@ impl ToolHandler for SearchAssertionsHandler {
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
+        let use_vector = params
+            .get("use_vector")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let input: SearchAssertionsInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
 
@@ -633,9 +639,7 @@ impl ToolHandler for SearchAssertionsHandler {
                 .find_by_resolved_entity(&space_id, &entity_id, fetch_limit)
                 .await
                 .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-            let assertions = ctx
-                .authz
-                .filter_records(&ctx.principal, assertions, "read:assertion");
+            let assertions = crate::current_read::filter(ctx, assertions, "read:assertion").await?;
             let mut entity_link_cache: HashMap<RecordId, CachedEntityLink> = HashMap::new();
             let mut items = Vec::new();
             for assertion in assertions {
@@ -695,8 +699,7 @@ impl ToolHandler for SearchAssertionsHandler {
         let index_failed = match self.repo.search(&criteria).await {
             Ok(page) => {
                 let items =
-                    ctx.authz
-                        .filter_records(&ctx.principal, page.results, "read:assertion");
+                    crate::current_read::filter(ctx, page.results, "read:assertion").await?;
                 // Text score and status first: they need no reads. Then load
                 // every linked entity the survivors need in one batch.
                 let mut matched: Vec<(usize, Assertion)> = Vec::new();
@@ -764,9 +767,7 @@ impl ToolHandler for SearchAssertionsHandler {
                 let batch_len = page.len();
                 scanned = scanned.saturating_add(batch_len);
                 scan_cursor = page.last().map(|assertion| assertion.base.id.clone());
-                let items = ctx
-                    .authz
-                    .filter_records(&ctx.principal, page, "read:assertion");
+                let items = crate::current_read::filter(ctx, page, "read:assertion").await?;
 
                 for assertion in items {
                     if !considered.insert(assertion.base.id.to_string()) {
@@ -820,8 +821,8 @@ impl ToolHandler for SearchAssertionsHandler {
         // entity similarity. With no stored embeddings (or provider down)
         // `semantic_entity_anchors` is None and this block is a no-op,
         // leaving today's behavior untouched.
-        if items.len() < output_limit {
-            if let Some(anchors) = self.semantic_entity_anchors(&space_id, query).await {
+        if use_vector && items.len() < output_limit {
+            if let Some(anchors) = self.semantic_entity_anchors(&space_id, query).await? {
                 let mut present: HashSet<String> = items
                     .iter()
                     .map(|assertion| assertion.base.id.to_string())
@@ -838,9 +839,7 @@ impl ToolHandler for SearchAssertionsHandler {
                             continue;
                         }
                     };
-                    let linked = ctx
-                        .authz
-                        .filter_records(&ctx.principal, linked, "read:assertion");
+                    let linked = crate::current_read::filter(ctx, linked, "read:assertion").await?;
                     for assertion in linked {
                         if !present.insert(assertion.base.id.to_string()) {
                             continue;
@@ -1335,6 +1334,7 @@ mod tests {
         clippy::cognitive_complexity
     )]
     use super::*;
+    use crate::retrieval_test_support::FixtureAssertions;
     use chrono::Utc;
     use elephant_types::records::assertion::{AssertionRetryState, EvidenceSpan};
     use elephant_types::records::base::{BaseFields, Provenance, Security, SubjectsState};
@@ -1352,7 +1352,8 @@ mod tests {
 
     #[test]
     fn test_search_assertions_input_defaults() {
-        let input: SearchAssertionsInput = serde_json::from_str(r#"{"query": "test"}"#).unwrap();
+        let input: SearchAssertionsInput =
+            serde_json::from_str(r#"{"use_vector": false, "query": "test"}"#).unwrap();
         assert_eq!(input.limit, 50);
         assert!(input.status.is_none());
         assert!(input.entity_id.is_none());
@@ -1398,7 +1399,7 @@ mod tests {
     }
 
     async fn create_test_assertion(
-        repo: &AssertionRepository,
+        repo: &FixtureAssertions,
         id: &str,
         subject: &str,
         predicate: &str,
@@ -1504,6 +1505,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_list_assertions_requires_read_assertion_scope() {
         let storage = StorageClient::new_memory().await.expect("storage");
         let handler = ListAssertionsHandler::new(storage.clone());
@@ -1534,13 +1539,17 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::items_after_statements)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_list_assertions_filter_scans_past_first_page() {
         let storage = StorageClient::new_memory().await.expect("storage");
         let handler = ListAssertionsHandler::new(storage.clone());
-        let repo = AssertionRepository::new(storage.clone());
+        let repo = FixtureAssertions::new(storage.clone());
 
         async fn create_assertion(
-            repo: &AssertionRepository,
+            repo: &FixtureAssertions,
             id: &str,
             predicate: &str,
         ) -> Assertion {
@@ -1633,10 +1642,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_search_assertions_preserves_total_beyond_page_size() {
         let storage = indexed_memory_storage().await;
         let handler = SearchAssertionsHandler::new(storage.clone());
-        let repo = AssertionRepository::new(storage.clone());
+        let repo = FixtureAssertions::new(storage.clone());
 
         for subject in ["Alice", "Bob"] {
             let id = RecordId::new_v4(TableName::Assertion);
@@ -1696,7 +1709,7 @@ mod tests {
             .execute(
                 &ctx,
                 serde_json::json!({
-                    "query": "knows",
+                    "use_vector": false, "query": "knows",
                     "limit": 1
                 }),
             )
@@ -1712,12 +1725,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_search_assertions_scans_past_first_repository_page() {
         // No search indexes here: the index query fails and the bounded scan
         // still serves the query.
         let storage = StorageClient::new_memory().await.expect("storage");
         let handler = SearchAssertionsHandler::new(storage.clone());
-        let repo = AssertionRepository::new(storage.clone());
+        let repo = FixtureAssertions::new(storage.clone());
 
         for index in 0..1000 {
             create_test_assertion(
@@ -1758,7 +1775,7 @@ mod tests {
             .execute(
                 &ctx,
                 serde_json::json!({
-                    "query": "Needle Folder",
+                    "use_vector": false, "query": "Needle Folder",
                     "status": "resolved",
                     "limit": 10
                 }),
@@ -1776,12 +1793,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_search_assertions_finds_matches_past_the_scan_window() {
         let storage = indexed_memory_storage().await;
         // More rows than the scan window ahead of the only match: recall
         // must come from the index, not the id-order scan.
         let handler = SearchAssertionsHandler::new(storage.clone()).with_scan_window(10);
-        let repo = AssertionRepository::new(storage.clone());
+        let repo = FixtureAssertions::new(storage.clone());
 
         for index in 0..30 {
             create_test_assertion(
@@ -1822,7 +1843,7 @@ mod tests {
             .execute(
                 &ctx,
                 serde_json::json!({
-                    "query": "Needle Folder",
+                    "use_vector": false, "query": "Needle Folder",
                     "limit": 10
                 }),
             )
@@ -1838,10 +1859,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_search_assertions_matches_terms_across_subject_predicate_and_literal() {
         let storage = indexed_memory_storage().await;
         let handler = SearchAssertionsHandler::new(storage.clone());
-        let repo = AssertionRepository::new(storage.clone());
+        let repo = FixtureAssertions::new(storage.clone());
 
         let id = RecordId::new_v4(TableName::Assertion);
         let mut base = BaseFields::new(id, "default".to_string(), "tester".to_string());
@@ -1899,7 +1924,7 @@ mod tests {
             .execute(
                 &ctx,
                 serde_json::json!({
-                    "query": "Ada reading homework kapitel",
+                    "use_vector": false, "query": "Ada reading homework kapitel",
                     "status": "resolved",
                     "limit": 10
                 }),
@@ -1916,10 +1941,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_search_assertions_literal_lookup_survives_unrelated_index_hits() {
         let storage = indexed_memory_storage().await;
         let handler = SearchAssertionsHandler::new(storage.clone());
-        let repo = AssertionRepository::new(storage.clone());
+        let repo = FixtureAssertions::new(storage.clone());
 
         // An unrelated row whose text carries the number: the index returns
         // it, so before the literal-shaped scan the literal-only row was lost.
@@ -1988,7 +2017,7 @@ mod tests {
             .execute(
                 &ctx,
                 serde_json::json!({
-                    "query": "152",
+                    "use_vector": false, "query": "152",
                     "status": "resolved",
                     "limit": 10
                 }),
@@ -2005,10 +2034,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_search_assertions_matches_partial_agent_query_terms() {
         let storage = indexed_memory_storage().await;
         let handler = SearchAssertionsHandler::new(storage.clone());
-        let repo = AssertionRepository::new(storage.clone());
+        let repo = FixtureAssertions::new(storage.clone());
 
         let id = RecordId::new_v4(TableName::Assertion);
         let mut base = BaseFields::new(id, "default".to_string(), "tester".to_string());
@@ -2066,7 +2099,7 @@ mod tests {
             .execute(
                 &ctx,
                 serde_json::json!({
-                    "query": "Example Organization group member",
+                    "use_vector": false, "query": "Example Organization group member",
                     "status": "resolved",
                     "limit": 10
                 }),
@@ -2083,10 +2116,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_search_assertions_does_not_drop_broad_discovery_queries() {
         let storage = indexed_memory_storage().await;
         let handler = SearchAssertionsHandler::new(storage.clone());
-        let repo = AssertionRepository::new(storage.clone());
+        let repo = FixtureAssertions::new(storage.clone());
 
         create_test_assertion(
             &repo,
@@ -2133,7 +2170,7 @@ mod tests {
             .execute(
                 &ctx,
                 serde_json::json!({
-                    "query": "Service Platform Worker Queue depends uses durable discovery context",
+                    "use_vector": false, "query": "Service Platform Worker Queue depends uses durable discovery context",
                     "status": "resolved",
                     "limit": 10
                 }),
@@ -2156,10 +2193,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_search_assertions_canonicalizes_merged_entity_links_before_dedup() {
         let storage = indexed_memory_storage().await;
         let handler = SearchAssertionsHandler::new(storage.clone());
-        let repo = AssertionRepository::new(storage.clone());
+        let repo = FixtureAssertions::new(storage.clone());
         let entity_repo = EntityRepository::new(storage.clone());
 
         let canonical_platform_id =
@@ -2230,7 +2271,7 @@ mod tests {
             .execute(
                 &ctx,
                 serde_json::json!({
-                    "query": "Service Platform depends",
+                    "use_vector": false, "query": "Service Platform depends",
                     "status": "resolved",
                     "limit": 10
                 }),
@@ -2275,9 +2316,13 @@ mod tests {
     /// riley → "member of club" → club, riley → "feeds beta" → beta,
     /// and "likes chess" with no entity links at all.
     /// Returns (storage, riley's entity id).
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn setup_attribution_fixture() -> (StorageClient, RecordId) {
         let storage = indexed_memory_storage().await;
-        let repo = AssertionRepository::new(storage.clone());
+        let repo = FixtureAssertions::new(storage.clone());
         let entity_repo = EntityRepository::new(storage.clone());
 
         let riley_id = RecordId::from_str("entity:00000000-0000-0000-0000-000000000401")
@@ -2366,6 +2411,10 @@ mod tests {
         predicates
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn search_with_params(storage: StorageClient, params: Value) -> SearchAssertionsOutput {
         let handler = SearchAssertionsHandler::new(storage.clone());
         let ctx = read_assertion_ctx(storage);
@@ -2438,7 +2487,7 @@ mod tests {
             let output = search_with_params(
                 storage.clone(),
                 serde_json::json!({
-                    "query": "attribution fixture",
+                    "use_vector": false, "query": "attribution fixture",
                     "filters": { "attributed_to": scope },
                     "limit": 10
                 }),
@@ -2459,7 +2508,7 @@ mod tests {
         let output = search_with_params(
             storage,
             serde_json::json!({
-                "query": "attribution fixture",
+                "use_vector": false, "query": "attribution fixture",
                 "filters": { "attributed_to": "child-a" },
                 "limit": 10
             }),
@@ -2485,10 +2534,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_get_assertion_enforces_record_security() {
         let storage = StorageClient::new_memory().await.expect("storage");
         let handler = GetAssertionHandler::new(storage.clone());
-        let repo = AssertionRepository::new(storage.clone());
+        let repo = FixtureAssertions::new(storage.clone());
 
         let id = RecordId::new_v4(TableName::Assertion);
         let mut base = BaseFields::new(id.clone(), "default".to_string(), "tester".to_string());
@@ -2557,59 +2610,22 @@ mod tests {
         assert!(decoded.error.is_some());
     }
 
-    /// Deterministic provider for semantic recall tests: known texts map to
-    /// fixed vectors, everything else embeds to a zero vector.
-    struct ControlledProvider {
-        entries: HashMap<String, Vec<f32>>,
-        dims: usize,
-    }
-
-    impl ControlledProvider {
-        fn new(entries: Vec<(&str, Vec<f32>)>) -> Self {
-            let dims = entries.first().map_or(3, |(_, vector)| vector.len());
-            Self {
-                entries: entries
-                    .into_iter()
-                    .map(|(text, vector)| (text.to_string(), vector))
-                    .collect(),
-                dims,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl elephant_embeddings::EmbeddingProvider for ControlledProvider {
-        #[allow(clippy::unnecessary_literal_bound)]
-        fn model(&self) -> &str {
-            "controlled-assertions-test"
-        }
-
-        fn dimensions(&self) -> usize {
-            self.dims
-        }
-
-        async fn embed(
-            &self,
-            texts: &[String],
-        ) -> elephant_embeddings::EmbeddingResult<Vec<Vec<f32>>> {
-            Ok(texts
-                .iter()
-                .map(|text| {
-                    self.entries
-                        .get(text)
-                        .cloned()
-                        .unwrap_or_else(|| vec![0.0; self.dims])
-                })
-                .collect())
-        }
-    }
-
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_search_assertions_semantic_entity_recall_without_text_match() {
         use std::sync::Arc;
 
         let storage = indexed_memory_storage().await;
-        let repo = AssertionRepository::new(storage.clone());
+        let fixture = crate::retrieval_test_support::QueryFixture::install(
+            &storage,
+            "default",
+            vec![("machine learning", vec![1.0, 0.0, 0.0])],
+        )
+        .await;
+        let repo = FixtureAssertions::new(storage.clone());
         let entity_repo = EntityRepository::new(storage.clone());
 
         // Riley's summary is semantically related to the query but shares no
@@ -2618,14 +2634,16 @@ mod tests {
             .expect("valid riley id");
         let mut riley = create_test_entity(&riley_id.to_string(), "Riley Kim");
         riley.summary = Some("neural networks researcher".to_string());
+        let riley_hash =
+            elephant_storage::entity_profile_embedding_repository::entity_input_hash(&riley);
         entity_repo.create(riley).await.expect("create riley");
         entity_repo
             .set_name_embedding(
                 "default",
                 &riley_id,
                 &[0.95, 0.05, 0.0],
-                "controlled-assertions-test",
-                "hash-riley",
+                &fixture.policy.model,
+                &riley_hash,
             )
             .await
             .expect("store embedding");
@@ -2644,21 +2662,14 @@ mod tests {
             .await
             .expect("link assertion");
 
-        let cache = elephant_embeddings::EmbeddingProviderCache::with_provider(
-            elephant_embeddings::EmbeddingPolicy::from_env(),
-            Arc::new(ControlledProvider::new(vec![(
-                "machine learning",
-                vec![1.0, 0.0, 0.0],
-            )])),
-        );
-        let handler = SearchAssertionsHandler::with_provider_cache(storage.clone(), cache);
+        let handler = SearchAssertionsHandler::new(storage.clone());
         let ctx = read_assertion_ctx(storage);
 
-        let response = handler
-            .execute(
+        let response = fixture
+            .run(handler.execute(
                 &ctx,
                 serde_json::json!({ "query": "machine learning", "limit": 10 }),
-            )
+            ))
             .await
             .expect("tool response");
         let response: ToolResponse<SearchAssertionsOutput> =
@@ -2676,11 +2687,21 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_search_assertions_without_embeddings_matches_plain_handler() {
         use std::sync::Arc;
 
         let storage = indexed_memory_storage().await;
-        let repo = AssertionRepository::new(storage.clone());
+        let fixture = crate::retrieval_test_support::QueryFixture::install(
+            &storage,
+            "default",
+            vec![("owns", vec![1.0, 0.0, 0.0])],
+        )
+        .await;
+        let repo = FixtureAssertions::new(storage.clone());
         create_test_assertion(
             &repo,
             "assertion:00000000-0000-0000-0000-000000000701",
@@ -2692,21 +2713,20 @@ mod tests {
 
         // Provider present, but no entity embeddings stored anywhere: output
         // must be byte-identical to the plain handler (today's behavior).
-        let cache = elephant_embeddings::EmbeddingProviderCache::with_provider(
-            elephant_embeddings::EmbeddingPolicy::from_env(),
-            Arc::new(ControlledProvider::new(vec![("owns", vec![1.0, 0.0, 0.0])])),
-        );
-        let blended_handler = SearchAssertionsHandler::with_provider_cache(storage.clone(), cache);
+        let blended_handler = SearchAssertionsHandler::new(storage.clone());
         let plain_handler = SearchAssertionsHandler::new(storage.clone());
         let ctx = read_assertion_ctx(storage);
 
         let params = serde_json::json!({ "query": "owns", "limit": 10 });
-        let blended = blended_handler
-            .execute(&ctx, params.clone())
+        let blended = fixture
+            .run(blended_handler.execute(&ctx, params.clone()))
             .await
             .expect("blended search");
         let plain = plain_handler
-            .execute(&ctx, params)
+            .execute(
+                &ctx,
+                serde_json::json!({"query":"owns", "limit":10, "use_vector":false}),
+            )
             .await
             .expect("plain search");
 
@@ -2723,25 +2743,37 @@ mod tests {
     /// assertion despite zero lexical overlap, which is how a nonsense query
     /// came back with four confident-looking hits on the live household space.
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_search_assertions_rejects_weak_semantic_anchor() {
         use std::sync::Arc;
 
         let storage = indexed_memory_storage().await;
-        let repo = AssertionRepository::new(storage.clone());
+        let fixture = crate::retrieval_test_support::QueryFixture::install(
+            &storage,
+            "default",
+            vec![("zzzqqqxyzzyplugh", vec![1.0, 0.0, 0.0])],
+        )
+        .await;
+        let repo = FixtureAssertions::new(storage.clone());
         let entity_repo = EntityRepository::new(storage.clone());
 
         let weak_id = RecordId::from_str("entity:00000000-0000-0000-0000-000000000901")
             .expect("valid weak id");
         let mut weak = create_test_entity(&weak_id.to_string(), "Unrelated Topic");
         weak.summary = Some("nothing to do with the query".to_string());
+        let weak_hash =
+            elephant_storage::entity_profile_embedding_repository::entity_input_hash(&weak);
         entity_repo.create(weak).await.expect("create weak entity");
         entity_repo
             .set_name_embedding(
                 "default",
                 &weak_id,
                 &[0.5, 0.866, 0.0],
-                "controlled-assertions-test",
-                "hash-weak",
+                &fixture.policy.model,
+                &weak_hash,
             )
             .await
             .expect("store embedding");
@@ -2760,21 +2792,14 @@ mod tests {
             .await
             .expect("link assertion");
 
-        let cache = elephant_embeddings::EmbeddingProviderCache::with_provider(
-            elephant_embeddings::EmbeddingPolicy::from_env(),
-            Arc::new(ControlledProvider::new(vec![(
-                "zzzqqqxyzzyplugh",
-                vec![1.0, 0.0, 0.0],
-            )])),
-        );
-        let handler = SearchAssertionsHandler::with_provider_cache(storage.clone(), cache);
+        let handler = SearchAssertionsHandler::new(storage.clone());
         let ctx = read_assertion_ctx(storage);
 
-        let response = handler
-            .execute(
+        let response = fixture
+            .run(handler.execute(
                 &ctx,
                 serde_json::json!({ "query": "zzzqqqxyzzyplugh", "limit": 10 }),
-            )
+            ))
             .await
             .expect("tool response");
         let response: ToolResponse<SearchAssertionsOutput> =

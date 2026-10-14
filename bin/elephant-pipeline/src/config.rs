@@ -1,5 +1,6 @@
 //! Pipeline worker configuration.
 
+use elephant_pipeline::scheduler::DocTreeConfig;
 use elephant_storage::StorageBackendKind;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -330,6 +331,10 @@ impl RetentionWorkerConfig {
 /// Work queue worker configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkQueueWorkerConfig {
+    /// Exact tree recipe retained by this worker and used by each render dispatch.
+    /// Capture this instance for diagnostics instead of reconstructing defaults.
+    #[serde(default)]
+    pub doc_tree: DocTreeConfig,
     /// Whether the worker is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -392,6 +397,7 @@ pub struct WorkQueueWorkerConfig {
 impl Default for WorkQueueWorkerConfig {
     fn default() -> Self {
         Self {
+            doc_tree: DocTreeConfig::default(),
             enabled: default_true(),
             poll_interval_secs: default_poll_interval(),
             lease_duration_secs: default_lease_duration_secs(),
@@ -415,10 +421,17 @@ impl Default for WorkQueueWorkerConfig {
 }
 
 impl WorkQueueWorkerConfig {
-    /// Load from environment.
+    /// Load from environment once, including the exact tree recipe.
     #[must_use]
     pub fn from_env() -> Self {
+        let mut doc_tree = DocTreeConfig::default();
+        if let Ok(model) = env::var("PIPELINE_SUMMARIZER_MODEL") {
+            if !model.trim().is_empty() {
+                doc_tree.summarizer_model = model;
+            }
+        }
         Self {
+            doc_tree,
             enabled: env::var("PIPELINE_WORK_QUEUE_ENABLED")
                 .map(|s| s == "true" || s == "1")
                 .unwrap_or(true),
@@ -942,6 +955,22 @@ mod tests {
         assert_eq!(decoded.work_queue.transient_retry_max_attempts, 3);
         assert_eq!(decoded.work_queue.transient_retry_base_delay_secs, 10);
         assert_eq!(decoded.work_queue.transient_retry_max_delay_secs, 120);
+    }
+
+    #[test]
+    fn retained_tree_recipe_roundtrips_without_reconstructing_defaults() {
+        let old: WorkQueueWorkerConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(old.doc_tree.max_chunk_size, 512);
+        assert!(!old.doc_tree.create_summaries);
+        let mut selected = old;
+        selected.doc_tree.max_chunk_size = 1024;
+        selected.doc_tree.create_paragraphs = false;
+        selected.doc_tree.summarizer_model = "explicit-retained-model".into();
+        let captured = serde_json::to_value(&selected).unwrap();
+        assert_eq!(captured["doc_tree"]["max_chunk_size"], 1024);
+        assert_eq!(captured["doc_tree"]["create_paragraphs"], false);
+        let restored: WorkQueueWorkerConfig = serde_json::from_value(captured.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), captured);
     }
 
     #[test]

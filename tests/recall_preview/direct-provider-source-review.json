@@ -1,0 +1,41 @@
+{
+  "format": "recall-direct-provider-source-review/v1",
+  "source_commit": "892c9e502ad4296f893b2abb427f34a10cb9ba91",
+  "source_review_only": true,
+  "execution_authorized": false,
+  "executed_by_qualification": false,
+  "product_acceptance": false,
+  "target": {
+    "package": "elephant-scenarios",
+    "name": "recall_preview_providers",
+    "additional_test_methods": [
+      "direct::actual_agentic_triage_checks_input_space_and_current_approval",
+      "direct::actual_default_extractor_checks_storage_space_and_current_approval",
+      "direct::actual_default_extractor_rotation_preserves_profile_and_uses_current_credential",
+      "media::actual_media_renderer_checks_document_space_and_current_approval"
+    ]
+  },
+  "reviewed_properties": [
+    "Actual dependency-built AgenticTriage, DefaultExtractor and live MultimodalRenderer adapters, without pipeline cfg(test) substitutions.",
+    "Both storage backends and two named spaces with distinct model/provider/credential configurations.",
+    "Wrong-space and absent approval must refuse before any physical request; each approved positive must reach its exact transport once before a controlled HTTP refusal.",
+    "Triage rule fallback is accepted only after the actual approved failed dispatch; no fallback qualifies generated semantic output.",
+    "Media input is a persisted managed asset; a document-space mismatch is tested even when the referenced asset exists in the selected space.",
+    "Media request preserves original PNG bytes, title and sidecar; unapproved caller model is replaced with the current governed model and exact synthetic credential.",
+    "Revocation after the positive must add zero physical requests.",
+    "Generation credential rotation preserves profile, binding, provider, endpoint and account; the next actual request has the new exact credential and original model/input.",
+    "The shared spy records physical HTTP before method/path/body validation and reports malformed or misdirected attempts as failure."
+  ],
+  "evidence_limits": [
+    "Controlled transport refusal and dispatch governance only; no generated claims, rendered interpretation, retrieval relevance or paid provider acceptance.",
+    "No runtime or source-format result is asserted by this review. Later phase-boxing/product changes require exact source-delta review.",
+    "Fixture Security::default does not substitute for the separate classified policy 3/7 bootstrap and public authorization gates."
+  ],
+  "source_hashes": {
+    "tests/recall_preview_semantics/provider_direct.rs": "3aa2a6b3bf0ddf8a00745758242aa041ad2e601a9bc586dbe4edec35a8727d7f",
+    "tests/recall_preview_semantics/provider_media.rs": "df40884e72cfcbfb423ac2b351ccb1d32ee03c0307dd40bd977b407206e8137c",
+    "tests/recall_preview_semantics/provider_spy.rs": "05352bc7d5b7f26c0ba18539f2559ac2cc191839baf708e07689c62c18c2eeb8",
+    "tests/scenarios/tests/recall_preview_providers.rs": "7edc37898756d01654077208a493021495d5e21ea64e6e079f705749241279c1",
+    "crates/pipeline/src/renderer/multimodal.rs": "2cdde851a3b681c268bb822b23f80798ff4a30da71b49f3e4b65e0a0fcdc5244"
+  }
+}

@@ -1,12 +1,11 @@
 //! LLM helper utilities for single-shot prompts.
 
 use futures::StreamExt;
-use serde_json::Value;
 
 use crate::error::PipelineError;
 use meerkat::{
-    AnthropicClient, LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, Message,
-    SystemMessage, Usage, UserMessage,
+    LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, Message, SystemMessage, Usage,
+    UserMessage,
 };
 
 /// Result from a single-shot LLM call.
@@ -18,18 +17,14 @@ pub struct LlmRunResult {
     pub usage: Usage,
 }
 
-/// Run a single-shot prompt against Anthropic and collect the full response.
-pub async fn run_anthropic_prompt(
-    api_key: String,
+/// Run a single prompt using the injected, governed provider client.
+pub async fn run_model_prompt(
+    client: std::sync::Arc<dyn LlmClient>,
     model: String,
     system_prompt: Option<&str>,
     prompt: String,
     max_tokens: u32,
-    _provider_params: Option<Value>,
 ) -> Result<LlmRunResult, PipelineError> {
-    let client =
-        AnthropicClient::new(api_key).map_err(|e| PipelineError::ExtractionError(e.to_string()))?;
-
     let mut messages = Vec::new();
     if let Some(system_prompt) = system_prompt {
         messages.push(Message::System(SystemMessage::new(system_prompt)));

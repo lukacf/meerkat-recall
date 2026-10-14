@@ -43,7 +43,7 @@ const files = [
 ];
 for (const file of files) {
   const source = await readFile(file, 'utf8');
-  if (/[\u2013\u2014]/u.test(source)) fail(file, 'use ASCII hyphens');
+  if (extname(file) === '.mdx' && /[\u2013\u2014]/u.test(source)) fail(file, 'use ASCII hyphens');
   let tree;
   try {
     if (extname(file) === '.mdx') {

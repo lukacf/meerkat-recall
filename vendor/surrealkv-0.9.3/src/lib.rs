@@ -1,3 +1,4 @@
+mod checkpoint;
 mod compaction;
 mod entry;
 mod error;
@@ -17,6 +18,7 @@ mod transaction;
 mod util;
 
 pub use {
+    checkpoint::{CheckpointDecision, CheckpointRecord, CheckpointSummary},
     entry::Record,
     error::{Error, Result},
     option::{IsolationLevel, Options},

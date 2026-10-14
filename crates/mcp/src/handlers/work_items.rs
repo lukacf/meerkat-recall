@@ -71,6 +71,31 @@ fn authorize_work_item_scope(ctx: &ToolContext, required_scope: &str) -> Result<
         .map_err(|reason| format!("Access denied: {reason}"))
 }
 
+fn work_attempt_conflict() -> McpError {
+    elephant_types::public_error::PublicError::new(
+        elephant_types::public_error::ErrorCode::ConflictGeneration,
+        "Work item authority or original lease changed; reconcile before retrying.",
+    )
+    .into()
+}
+
+fn authorize_work_attempt(ctx: &ToolContext, item: &WorkItem) -> McpResult<()> {
+    for decision in [
+        ctx.authz
+            .authorize_record_read(&ctx.principal, item, "read:work_item"),
+        ctx.authz
+            .authorize_record_write(&ctx.principal, item, "write:work_item"),
+    ] {
+        decision.map_err(|_| {
+            McpError::from(elephant_types::public_error::PublicError::new(
+                elephant_types::public_error::ErrorCode::ForbiddenSpace,
+                "Access denied for this work item.",
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Output for `list_work_items` tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListWorkItemsOutput {
@@ -457,8 +482,22 @@ impl ToolHandler for RetryWorkItemHandler {
                 return serde_json::to_value(response)
                     .map_err(|e| McpError::ExecutionError(e.to_string()));
             }
-            Err(e) => return Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => return Err(McpError::StorageError(e)),
         };
+
+        for decision in [
+            ctx.authz
+                .authorize_record_read(&ctx.principal, &item, "read:work_item"),
+            ctx.authz
+                .authorize_record_write(&ctx.principal, &item, "write:work_item"),
+        ] {
+            if let Err(reason) = decision {
+                return serde_json::to_value(ToolResponse::<()>::error(format!(
+                    "Access denied: {reason}"
+                )))
+                .map_err(|error| McpError::ExecutionError(error.to_string()));
+            }
+        }
 
         // Only allow retrying failed items
         if item.status != WorkItemStatus::Failed {
@@ -470,15 +509,9 @@ impl ToolHandler for RetryWorkItemHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        // Update the work item - reset to runnable status so work queue picks it up
-        let mut updated = item;
-        updated.status = WorkItemStatus::Runnable;
-        updated.attempts = 0;
-        updated.last_error = None;
-        updated.lease_expires_at = None;
-        updated.leased_by = None;
-
-        match self.repo.update(&space_id, &rid, updated).await {
+        // Match the REST retry boundary: preserve attempt history and compare
+        // the complete authorized failed pre-state in the reactivation write.
+        match self.repo.retry_authorized(&item).await {
             Ok(result) => {
                 let response = ToolResponse::success(json!({
                     "id": result.base.id.to_string(),
@@ -487,7 +520,7 @@ impl ToolHandler for RetryWorkItemHandler {
                 }));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
@@ -564,6 +597,8 @@ const fn default_lease_duration() -> u64 {
 pub struct CompleteWorkItemInput {
     /// Work item ID.
     pub id: String,
+    /// Opaque original lease token returned by `claim_work_item`.
+    pub lease_token: String,
     /// Whether the work item succeeded.
     #[serde(default = "default_success")]
     pub success: bool,
@@ -632,49 +667,74 @@ impl ToolHandler for ClaimWorkItemHandler {
         let input: ClaimWorkItemInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
 
-        if let Err(message) = authorize_work_item_scope(ctx, "write:work_item") {
-            let response: ToolResponse<()> = ToolResponse::error(message);
-            return serde_json::to_value(response)
-                .map_err(|e| McpError::ExecutionError(e.to_string()));
+        for scope in ["read:work_item", "write:work_item"] {
+            authorize_work_item_scope(ctx, scope).map_err(|_| {
+                McpError::from(elephant_types::public_error::PublicError::new(
+                    elephant_types::public_error::ErrorCode::ForbiddenSpace,
+                    "Access denied for work item operations.",
+                ))
+            })?;
         }
         let space_id = ctx.principal.space_id.clone();
 
         let rid = parse_id(&input.id, TableName::WorkItem)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
 
+        let authorized = self
+            .repo
+            .get(&space_id, &rid)
+            .await?
+            .ok_or_else(work_attempt_conflict)?;
+        authorize_work_attempt(ctx, &authorized)?;
         let lease_duration = parse_lease_duration_secs(input.lease_duration_secs)?;
 
         // Calculate lease expiration
-        let lease_expires = chrono::Utc::now() + lease_duration;
+        let lease_expires = chrono::Utc::now()
+            .checked_add_signed(lease_duration)
+            .ok_or_else(|| {
+                McpError::InvalidParameters(
+                    "lease_duration_secs exceeds the supported timestamp range".into(),
+                )
+            })?;
 
         // Try to claim the work item atomically
         match self
             .repo
-            .claim_with_lease(&space_id, &rid, &input.worker_id, lease_expires)
+            .claim_authorized(&authorized, &input.worker_id, lease_expires)
             .await
         {
             Ok(Some(claimed)) => {
+                let lease_token = claimed
+                    .leased_by
+                    .as_deref()
+                    .filter(|token| !token.is_empty())
+                    .ok_or_else(|| {
+                        McpError::StorageError(elephant_storage::StorageError::DataIntegrityError(
+                            "Committed claim lacks original lease token".into(),
+                        ))
+                    })?;
                 let response = ToolResponse::success(json!({
                     "id": claimed.base.id.to_string(),
                     "status": claimed.status,
                     "claimed": true,
                     "worker_id": input.worker_id,
-                    "lease_expires_at": lease_expires.to_rfc3339()
+                    "lease_token": lease_token,
+                    "lease_expires_at": claimed.lease_expires_at.map(|expires| expires.to_rfc3339())
                 }));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Ok(None) => {
-                let response: ToolResponse<WorkItem> = ToolResponse::error(
-                    "Work item could not be claimed (not found, not runnable, or already claimed)",
-                );
-                serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
-            }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Ok(None) => Err(work_attempt_conflict()),
+            Err(e) => Err(McpError::from(e)),
         }
     }
 }
 
 fn parse_lease_duration_secs(lease_duration_secs: u64) -> McpResult<chrono::Duration> {
+    if lease_duration_secs == 0 {
+        return Err(McpError::InvalidParameters(
+            "lease_duration_secs must be positive".into(),
+        ));
+    }
     let secs = i64::try_from(lease_duration_secs)
         .map_err(|_| McpError::InvalidParameters("lease_duration_secs out of range".to_string()))?;
     chrono::Duration::try_seconds(secs)
@@ -706,20 +766,24 @@ impl ToolHandler for CompleteWorkItemHandler {
 
     fn description(&self) -> &'static str {
         concat!(
-            "Mark a work item as completed (success or failure).\n\n",
+            "Complete the original claimed work attempt with its returned lease token.\n\n",
             "Example:\n",
-            r#"{ "id": "work_item:550e8400-e29b-41d4-a716-446655440000", "success": true }"#,
+            r#"{ "id": "work_item:550e8400-e29b-41d4-a716-446655440000", "lease_token": "token returned by claim_work_item", "success": true }"#,
         )
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
-            "required": ["id"],
+            "required": ["id", "lease_token"],
             "properties": {
                 "id": {
                     "type": "string",
                     "description": "Work item ID"
+                },
+                "lease_token": {
+                    "type": "string", "minLength": 1,
+                    "description": "Exact opaque lease token returned by the original claim"
                 },
                 "success": {
                     "type": "boolean",
@@ -734,68 +798,59 @@ impl ToolHandler for CompleteWorkItemHandler {
         })
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the work queue scope through lease-token completion and response construction."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
         let input: CompleteWorkItemInput = serde_json::from_value(params)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
+        if input.lease_token.trim().is_empty() {
+            return Err(McpError::InvalidParameters(
+                "lease_token must be the original nonempty claim token".into(),
+            ));
+        }
 
-        if let Err(message) = authorize_work_item_scope(ctx, "write:work_item") {
-            let response: ToolResponse<()> = ToolResponse::error(message);
-            return serde_json::to_value(response)
-                .map_err(|e| McpError::ExecutionError(e.to_string()));
+        for scope in ["read:work_item", "write:work_item"] {
+            authorize_work_item_scope(ctx, scope).map_err(|_| {
+                McpError::from(elephant_types::public_error::PublicError::new(
+                    elephant_types::public_error::ErrorCode::ForbiddenSpace,
+                    "Access denied for work item operations.",
+                ))
+            })?;
         }
         let space_id = ctx.principal.space_id.clone();
 
         let rid = parse_id(&input.id, TableName::WorkItem)
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
 
-        // Get the work item
-        let item = match self.repo.get(&space_id, &rid).await {
-            Ok(Some(i)) => i,
-            Ok(None) => {
-                let response: ToolResponse<WorkItem> =
-                    ToolResponse::error(format!("Work item not found: {}", input.id));
-                return serde_json::to_value(response)
-                    .map_err(|e| McpError::ExecutionError(e.to_string()));
-            }
-            Err(e) => return Err(McpError::ExecutionError(e.to_string())),
-        };
+        let item = self
+            .repo
+            .get(&space_id, &rid)
+            .await?
+            .ok_or_else(work_attempt_conflict)?;
 
-        // Only allow completing items that are running
-        if item.status != WorkItemStatus::Running {
-            let response: ToolResponse<WorkItem> = ToolResponse::error(format!(
-                "Work item is not in running status (current: {:?})",
-                item.status
-            ));
-            return serde_json::to_value(response)
-                .map_err(|e| McpError::ExecutionError(e.to_string()));
+        authorize_work_attempt(ctx, &item)?;
+        if item.status != WorkItemStatus::Running
+            || item.leased_by.as_deref() != Some(input.lease_token.as_str())
+        {
+            return Err(work_attempt_conflict());
         }
-
-        let worker_id = match item.leased_by.as_ref() {
-            Some(worker) if !worker.is_empty() => worker,
-            _ => {
-                let response: ToolResponse<WorkItem> =
-                    ToolResponse::error("Work item missing lease owner".to_string());
-                return serde_json::to_value(response)
-                    .map_err(|e| McpError::ExecutionError(e.to_string()));
-            }
-        };
-
         let config = WorkQueueConfig {
-            worker_id: worker_id.clone(),
+            worker_id: input.lease_token.clone(),
             ..WorkQueueConfig::default()
         };
         let work_queue = WorkQueue::new(self.storage.clone(), config);
-
-        let result = if input.success {
-            work_queue.complete(&space_id, &rid).await
-        } else {
-            let error = input
+        let error = (!input.success).then(|| {
+            input
                 .error
                 .clone()
-                .unwrap_or_else(|| "Work item failed".to_string());
-            work_queue.fail(&space_id, &rid, error).await
-        };
+                .unwrap_or_else(|| "Work item failed".into())
+        });
+        let result = work_queue
+            .finish_authorized(&item, input.success, error)
+            .await;
 
         match result {
             Ok(result) => {
@@ -806,13 +861,8 @@ impl ToolHandler for CompleteWorkItemHandler {
                 }));
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(PipelineError::LeaseConflict(_)) => {
-                let response: ToolResponse<WorkItem> = ToolResponse::error(
-                    "Work item could not be completed (not running or lease owner mismatch)",
-                );
-                serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
-            }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(PipelineError::LeaseConflict(_)) => Err(work_attempt_conflict()),
+            Err(e) => Err(McpError::from(e)),
         }
     }
 }
@@ -985,6 +1035,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn stop_managed_wiki_requires_explicit_space_service_authority() {
         let storage = StorageClient::new_embedded().await.expect("storage");
         let repo = WorkItemRepository::new(storage.clone());
@@ -1025,6 +1079,8 @@ mod tests {
             .unwrap());
     }
 
+    include!("work_attempt_tests.rs");
+
     #[test]
     fn test_list_work_items_input_defaults() {
         let input: ListWorkItemsInput = serde_json::from_str("{}").unwrap();
@@ -1043,7 +1099,9 @@ mod tests {
     #[test]
     fn test_complete_work_item_input_defaults() {
         let input: CompleteWorkItemInput =
-            serde_json::from_str(r#"{"id": "work_item:123"}"#).unwrap();
+            serde_json::from_str(r#"{"id": "work_item:123", "lease_token":"original-token"}"#)
+                .unwrap();
+        assert_eq!(input.lease_token, "original-token");
         assert!(input.success);
         assert!(input.error.is_none());
     }
@@ -1068,6 +1126,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_list_work_items_requires_read_work_item_scope() {
         let storage = StorageClient::new_embedded().await.expect("storage");
         let handler = ListWorkItemsHandler::new(storage.clone());
@@ -1088,6 +1150,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_list_work_items_status_filter_uses_limited_status_path() {
         let storage = StorageClient::new_embedded().await.expect("storage");
         let repo = WorkItemRepository::new(storage.clone());
@@ -1154,6 +1220,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_retry_work_item_requires_write_work_item_scope() {
         let storage = StorageClient::new_embedded().await.expect("storage");
         let repo = WorkItemRepository::new(storage.clone());
@@ -1192,5 +1262,78 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("Access denied"));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
+    async fn retry_authorizes_the_actual_row_and_preserves_attempt_history() {
+        for embedded in [true, false] {
+            let storage = if embedded {
+                StorageClient::new_embedded().await
+            } else {
+                StorageClient::new_memory().await
+            }
+            .expect("storage");
+            let repo = WorkItemRepository::new(storage.clone());
+            let mut base = BaseFields::new(
+                RecordId::new_v4(TableName::WorkItem),
+                "default".into(),
+                "tester".into(),
+            );
+            base.security.level = 2;
+            let item = repo
+                .create(WorkItem {
+                    base,
+                    kind: "embed".into(),
+                    payload: serde_json::json!({"private_input":"retained"}),
+                    status: WorkItemStatus::Failed,
+                    priority: 0,
+                    idempotency_key: "retry-classified".into(),
+                    attempts: 4,
+                    lease_expires_at: None,
+                    leased_by: None,
+                    run_after: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                    last_error: Some("previous failure".into()),
+                })
+                .await
+                .expect("failed item");
+            let handler = RetryWorkItemHandler::new(storage.clone());
+            let principal = make_test_principal("default", &["read:work_item", "write:work_item"]);
+            let context = ToolContext::new(storage.clone(), principal.clone());
+            let request = serde_json::json!({"id":item.base.id.to_string()});
+            let denied: ToolResponse<serde_json::Value> = serde_json::from_value(
+                handler
+                    .execute(&context, request.clone())
+                    .await
+                    .expect("denial"),
+            )
+            .expect("response");
+            assert!(!denied.ok);
+            assert_eq!(
+                repo.get("default", &item.base.id).await.expect("row"),
+                Some(item.clone())
+            );
+            let mut cleared = principal;
+            cleared.clearances[0].max_level = 2;
+            let context = ToolContext::new(storage.clone(), cleared);
+            let allowed: ToolResponse<serde_json::Value> =
+                serde_json::from_value(handler.execute(&context, request).await.expect("retry"))
+                    .expect("response");
+            assert!(allowed.ok);
+            let retried = repo
+                .get("default", &item.base.id)
+                .await
+                .expect("row")
+                .expect("retained item");
+            assert_eq!(retried.status, WorkItemStatus::Runnable);
+            assert_eq!(retried.attempts, item.attempts);
+            assert_eq!(retried.last_error, item.last_error);
+            assert_eq!(retried.base.security, item.base.security);
+            assert_eq!(retried.payload, item.payload);
+            assert!(retried.run_after.is_none());
+        }
     }
 }

@@ -1,0 +1,71 @@
+{
+  "format": "recall-full-context-alternatives/v1",
+  "status": "proposal-not-authorized",
+  "execution_authorized": false,
+  "base_proposal_file": "primary-provider-proposal.json",
+  "base_proposal_sha256": "2745c63cd9826ddcb702565d1c0d97cac86056fda465525f2f07a12da879cc12",
+  "catalog_file": "provider-full-context-facts.json",
+  "catalog_file_sha256": "84e94bc7aa09a48ed73829ac033de7105fa9838f0f1819b72119aa07cfcd3aa5",
+  "corpus_canonical_sha256": "fa6a84149483d3511fd559ac9a13e89d6c1c041ae97d6f15084b52b7d7f21c1b",
+  "model": "gpt-6.1-sol",
+  "reasoning_effort": "medium",
+  "generation_dispatches": 280,
+  "embedding_dispatches": 152,
+  "count_endpoint_dispatches": 0,
+  "input_reservation_tokens_per_generation": 1050000,
+  "input_admission_basis": "provider-documented-full-context-limit",
+  "refund_policy": "never-refund-any-physical-attempt-or-unknown-usage",
+  "retries_consume_original_role_and_global_quotas": true,
+  "options": [
+    {
+      "id": "keep-reviewed-16384-transform",
+      "output_reservation_tokens": 16384,
+      "output_mode": "explicit-cap-at-16384",
+      "proposed_usd_stop_cap": "1540.00",
+      "maximum_reserved_usd": "1538.97467392"
+    },
+    {
+      "id": "preserve-requested-output-through-64000",
+      "output_reservation_tokens": 64000,
+      "output_mode": "preserve-or-reject",
+      "proposed_usd_stop_cap": "1740.00",
+      "maximum_reserved_usd": "1738.96187392"
+    },
+    {
+      "id": "preserve-requested-output-through-model-maximum",
+      "output_reservation_tokens": 128000,
+      "output_mode": "preserve-or-reject",
+      "proposed_usd_stop_cap": "2010.00",
+      "maximum_reserved_usd": "2007.76187392"
+    }
+  ],
+  "selected_option": null,
+  "unchanged_limits": {
+    "physical_dispatches": 432,
+    "wall_time_seconds": 5400,
+    "max_concurrent_dispatches": 2,
+    "model_deadline_seconds": 120,
+    "embedding_total_input_tokens_per_dispatch": 8192,
+    "public_search_response_bytes": 262144
+  },
+  "gateway_requirements": [
+    "One durable full reservation before each physical send, including every retry/continuation; unknown spend never refunded.",
+    "Full inline default-SDK history with exact same-scope completed encrypted-reasoning provenance; no arbitrary remote references, tools, compaction or media.",
+    "No input truncation or ciphertext-size token inference; provider context rejection is a failed case.",
+    "Preserve original and forwarded bounded request/response bytes and exact transform/config/artifact/scope evidence.",
+    "Current approval, credential generation, role/global ceilings and original deadline rechecked before physical send; crash ambiguity halts.",
+    "Reverify provider documented limits and long-context pricing before a separately approved run; source-only arithmetic does not clear installed-gateway or semantic prerequisites."
+  ],
+  "count_option": {
+    "status": "less-conservative-separate-unpriced-proposal",
+    "physical_dispatches_if_one_count_per_generation": 712,
+    "count_billing_bound_usd": null,
+    "execution_authorized": false
+  },
+  "provider_contract_assumptions": [
+    "Accepted generation input including model framing and inline encrypted context is bounded by documented model context.",
+    "Requested max_output_tokens bounds all billable visible and reasoning output.",
+    "Published standard nonregional long-context token rates bound applicable generation charges; no hosted billable tools or other service tier.",
+    "Provider defects, unpublished pricing changes, taxes or unrelated account charges are outside this token reservation claim."
+  ]
+}

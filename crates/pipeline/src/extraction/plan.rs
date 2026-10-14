@@ -41,7 +41,7 @@ pub struct StopConditions {
     pub coverage_threshold: f64,
     /// Maximum budget in euros.
     pub budget_cap_euros: f64,
-    /// Maximum number of nodes to process.
+    /// Maximum number of extraction windows (work items) to process.
     pub max_nodes: u32,
     /// Maximum total tokens to process.
     pub max_tokens: u32,
@@ -53,9 +53,25 @@ impl Default for StopConditions {
             coverage_threshold: 0.95,
             budget_cap_euros: 10.0,
             max_nodes: 1000,
-            max_tokens: 500_000,
+            max_tokens: 1_000_000,
         }
     }
+}
+
+/// Exact rendered coverage recorded by the planner. Publication independently
+/// checks the selections against the immutable text; this is not an authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionCoverage {
+    /// Exact SHA-256 of the rendered text inspected while planning.
+    pub revision_text_hash: String,
+    /// UTF-8 byte length of that text.
+    pub revision_text_len: u32,
+    /// Size of the union of selected byte ranges, not their possibly overlapping sum.
+    pub selected_byte_count: u32,
+    /// Every non-whitespace character is inside at least one selected range.
+    pub complete: bool,
+    /// Empty selection is permitted only for an empty or whitespace-only revision.
+    pub empty_reason: Option<String>,
 }
 
 /// An extraction plan produced by the planning stage.
@@ -75,6 +91,9 @@ pub struct ExtractionPlan {
     pub stop_conditions: StopConditions,
     /// Estimated total cost in euros.
     pub estimated_cost_euros: f64,
+    /// Missing on older artifacts; absence cannot prove complete source coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<ExtractionCoverage>,
 }
 
 impl ExtractionPlan {
@@ -87,6 +106,7 @@ impl ExtractionPlan {
             node_selections: Vec::new(),
             stop_conditions: StopConditions::default(),
             estimated_cost_euros: 0.0,
+            coverage: None,
         }
     }
 
@@ -143,7 +163,7 @@ mod tests {
         assert_eq!(conditions.coverage_threshold, 0.95);
         assert_eq!(conditions.budget_cap_euros, 10.0);
         assert_eq!(conditions.max_nodes, 1000);
-        assert_eq!(conditions.max_tokens, 500_000);
+        assert_eq!(conditions.max_tokens, 1_000_000);
     }
 
     #[test]

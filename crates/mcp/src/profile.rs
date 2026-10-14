@@ -2,8 +2,8 @@
 //!
 //! Profiles restrict which MCP tools are available to different types of callers:
 //! - `Full` - All tools (operators, admin)
-//! - `Agent` - Read-only tools for extraction agents (~17 tools)
-//! - `Maintenance` - Agent read tools plus identity/predicate/entity write tools (~24 tools)
+//! - `Agent` - Read-only tools for extraction agents (read and metadata tools)
+//! - `Maintenance` - Agent read tools plus identity/predicate/entity write tools (including guarded maintenance)
 //! - `Pipeline` - Write tools for internal pipeline workers
 
 /// Tool profile for MCP access control.
@@ -82,6 +82,8 @@ pub const AGENT_TOOLS: &[&str] = &[
     "get_doc_chunk",
     // Source tools (read-only)
     "get_source",
+    "get_source_head",
+    "get_source_operation",
     // Assertion tools (read-only)
     "list_assertions",
     "get_assertion",
@@ -95,6 +97,7 @@ pub const AGENT_TOOLS: &[&str] = &[
     "list_upcoming_events",
     // Unified search
     "search_all",
+    "search_scoped",
     // System tools (read-only)
     "get_health",
     "get_capabilities",
@@ -129,6 +132,8 @@ pub const MAINTENANCE_TOOLS: &[&str] = &[
     "list_doc_chunks",
     "get_doc_chunk",
     "get_source",
+    "get_source_head",
+    "get_source_operation",
     "list_assertions",
     "get_assertion",
     "search_assertions",
@@ -139,6 +144,7 @@ pub const MAINTENANCE_TOOLS: &[&str] = &[
     "list_recent_events",
     "list_upcoming_events",
     "search_all",
+    "search_scoped",
     "get_health",
     "get_capabilities",
     "extract_doc",
@@ -175,6 +181,7 @@ pub const DEFAULT_TOOLS: &[&str] = &[
     "batch_ingest_sources",
     // Discover
     "search_all",
+    "search_scoped",
     // Navigate
     "get_entity",
     "get_entity_context_bundle",
@@ -185,6 +192,8 @@ pub const DEFAULT_TOOLS: &[&str] = &[
     "search_entities",
     "add_timeline_event",
     "search_events",
+    "get_source_head",
+    "get_source_operation",
     // Inspect (provenance)
     "get_provenance",
     "get_event",
@@ -314,17 +323,14 @@ mod tests {
 
     #[test]
     fn test_agent_profile_tool_count() {
-        // Per spec, agent profile should have ~15-20 tools
-        assert!(
-            AGENT_TOOLS.len() >= 15,
-            "Agent profile should have at least 15 tools, found {}",
-            AGENT_TOOLS.len()
+        let unique: std::collections::HashSet<_> = AGENT_TOOLS.iter().collect();
+        assert_eq!(
+            unique.len(),
+            AGENT_TOOLS.len(),
+            "agent tool names must be unique"
         );
-        assert!(
-            AGENT_TOOLS.len() <= 25,
-            "Agent profile should have at most 25 tools, found {}",
-            AGENT_TOOLS.len()
-        );
+        // 24 retained reads + scoped search + source head and operation metadata.
+        assert_eq!(AGENT_TOOLS.len(), 27);
     }
 
     #[test]
@@ -374,8 +380,8 @@ mod tests {
     fn test_default_tools_count() {
         assert_eq!(
             DEFAULT_TOOLS.len(),
-            23,
-            "Default profile should have exactly 23 tools, found {}",
+            26,
+            "Default profile should have exactly 26 tools, found {}",
             DEFAULT_TOOLS.len()
         );
     }
@@ -392,6 +398,9 @@ mod tests {
             "ingest_file is handled by elephant-local-helper"
         );
         assert!(is_default_tool("search_all"));
+        assert!(is_default_tool("search_scoped"));
+        assert!(is_default_tool("get_source_head"));
+        assert!(is_default_tool("get_source_operation"));
         assert!(is_default_tool("get_entity"));
         assert!(is_default_tool("get_entity_context_bundle"));
         assert!(is_default_tool("get_knowledge_view"));
@@ -426,8 +435,8 @@ mod tests {
         // Maintenance has all agent reads plus admin/write/helper tools.
         assert_eq!(
             MAINTENANCE_TOOLS.len(),
-            43,
-            "Maintenance profile should have exactly 43 tools, found {}",
+            46,
+            "Maintenance profile should have exactly 46 tools, found {}",
             MAINTENANCE_TOOLS.len()
         );
     }

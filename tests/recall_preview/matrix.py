@@ -1,0 +1,192 @@
+"""D-owned gate inventory. Status records fixture authorship, never a product pass."""
+
+BACKENDS = ("surreal-db", "elephant-db")
+ARTIFACTS = ("native-darwin-arm64", "container-pv")
+
+# id, owner, observation/oracle, required evidence, concrete expected behavior.
+CASES = (
+    ("D01", "grounding", "grounding.rs", "source-test", "Exact UTF-8 revision bytes, span and SHA256; full Security/subjects on new entities and claims."),
+    ("D02", "grounding", "grounding.rs", "source-test", "Empty/wrong/derived hash, wrong quote, split UTF8, foreign lineage: no canonical effect or approved high-confidence event."),
+    ("D03", "grounding", "support-verification", "source-test", "Valid quote but unsupported claim rejected; changed semantic fields invalidate support receipt."),
+    ("D04", "integrity", "publication", "source-test", "Every interrupted write group exposes either zero or complete effects/outbox/receipt; retry reconciles all effects once."),
+    ("D05", "integrity", "source_cas", "source-test", "CAS compares desired head at acceptance and commit; identical retry keeps receipt; changed same-key payload conflicts."),
+    ("D06", "integrity", "publication", "source-test", "Same-worker stale attempt cannot publish or complete after claim generation changed."),
+    ("D07", "recovery", "recovery.rs", "source-test", "Two quiet named spaces containing only expired Running work recover through all active claim selectors."),
+    ("D08", "recovery", "checkpoint", "source-test", "Failed consumers cannot advance durable cursors; restart retries same event; duplicate delivery makes no duplicate effect."),
+    ("D09", "integrity", "retract", "source-test", "Immediate visibility fence and delayed-work conflict; independent support remains; same external key in another space untouched."),
+    ("D10", "integrity/durability", "erase", "source-test", "Physical source/derived/work/archive/view payload deletion, finite enforced backup retention and explicit processor boundary."),
+    ("D11", "durability", "restore_replay", "source-test", "Independent payload-free journal survives old snapshot; no read/readiness until replay removes erased payload."),
+    ("D12", "surface", "authorization", "source-test", "Auth enabled; distinct principals/space grants; every provenance record and current lineage obey Security and subjects."),
+    ("D13", "providers", "provider_dispatch", "source-test", "All model operations use approved space/account/endpoint/model/profile; revoked pinned retries make zero outbound calls."),
+    ("D14", "providers", "profile-activation", "source-test", "Profile changes cannot mix old/new embedding partitions; activation waits for explicit reindex coverage; credential rotation independent."),
+    ("D15", "surface", "public_errors", "installed-artifact", "HTTP/MCP distinguish denial, disabled, stale, pending, unavailable, malformed, missing and genuine zero matches; bounded bytes/time."),
+    ("D16", "surface", "source-size", "source-test", "2,000,000 UTF-8 bytes accepted; limit+1 refused without accepted head/work; JSON overhead bounded separately."),
+    ("D17", "surface/providers", "legacy-parity", "source-test", "Existing ingest_doc/direct dispatch/maintenance/wiki and automatic replay share publication/provider/capability fences."),
+    ("D18", "qualification", "retrieval", "real-provider", "Original known-answer queries, exact source revisions/spans, fixed cutoff relevance, negative controls, no fallback judge context."),
+    ("D19", "qualification", "semantic_provider", "real-provider", "Provider request provenance and relevance, fake-vector control rejected; dimension/variance alone cannot pass."),
+    ("D20", "packaging", "artifact", "installed-artifact", "Final native Darwin ARM64 exact hash clean install/auth/HTTP/MCP/named-space persistence/restore/drain/standalone use."),
+    ("D21", "packaging", "artifact", "installed-artifact", "Final container image digest with reused PV, independent journal volume, exclusive writer and interrupted restore readiness."),
+    ("D22", "durability", "snapshot", "source-test", "Disk-full/interrupted save preserves previous good generation; runtime config is sole save/load authority; digest/schema errors explicit."),
+    ("D23", "durability", "initialization", "installed-artifact", "Fresh schema statement failure never reported initialized; retained transfer/export refuses unsupported state honestly."),
+    ("D24", "recovery", "usage", "source-test", "Pre-provider failure does not become measured tokens/currency; reservations/unknown/estimated/measured remain distinct."),
+    ("D25", "recovery", "retry", "source-test", "Timeout/stale span/retryable provider failure carry typed policy; exhausted attempts terminate with reason, never fake completion."),
+    ("D26", "grounding", "temporal", "real-provider", "Role change, independent corroboration, incompatible policies and changed decision fingerprints preserve grounded current truth."),
+    ("D27", "grounding", "wiki", "real-provider", "Retained wiki claims cite exact immutable evidence, respect subjects and current source visibility; writer/verifier remain separately approved."),
+    ("D28", "qualification/OB3", "workload", "measured-workload", "Frozen prequalification: 50 total sources (25 per named space), 50 callers x4 sequential requests=200 per backend; exact evidence, measured actual overlap, 8s request/120s cohort and strict p95<2s/p99<5s. Separate provider allocation. No-op/large/shared input, negatives, outage and consumer retry phases need separate inventories; larger consumer workload remains unexecuted. Reported 140 OB3 analyses over51min does not establish140 concurrent Recall requests."),
+    ("D29", "OB3", "consumer-fallback", "consumer-acceptance", "Outage review batch completes on existing authorized source path with degradation counted; permission failure is not retract."),
+    ("D30", "HomeCore", "consumer-optional", "consumer-acceptance", "Optional startup, bounded MCP and preserved source-less authoritative knowledge; transition/delta/rollback independently owned."),
+    ("D31", "HomeCore", "field-observation", "field-observation", "Explicitly agreed consecutive-day count and known-answer rerun after separately authorized cutover; no integrity/lost-ingest failures."),
+    ("D32", "integrity", "planning-read-set", "source-test", "Concurrent new identity/slot member or changed read-only referenced record invalidates detached planning snapshot on both backends."),
+    ("D33", "surface", "revision-coverage", "installed-artifact", "Per-space ready and queue Done never imply exact requested revision indexed; pending replacement identifies old publication without mixing."),
+    ("D34", "packaging/grounding", "pdf", "installed-artifact", "Exact patched parser and notices; multilingual/page/form/existing OCR layers, image-only and malformed/oversized refusal with revision-bound offsets."),
+    ("D35", "integrity/maintenance", "inverse-source-decision", "source-test", "A superseded by B becomes eligible after erase B; later independent field edits survive; dependent decisions invalidate in reverse order and replay is idempotent."),
+    ("D36", "surface", "source-inventory", "source-test", "Paginated inventory applies current ABAC and tombstones without count leaks; opaque cursors bind space and query; consistency/concurrent-change behavior explicit."),
+    ("D37", "integrity/recovery/durability", "process-kill", "persistent-process-test", "Actual owned-child SIGKILL immediately after acceptance, claim and whole-source finalization acknowledgment; same persistent destination reopens with exact accepted input/attempt/effects/outbox/receipt."),
+    ("D38", "durability/erasure", "wal-restore-generation", "persistent-process-test", "Every Erasing boundary recovers before readiness; completed physical erase removes live WAL/checkpoint/temp payload; restore reset prevents pre-restore WAL replay after SIGKILL."),
+    ("D39", "grounding/erasure", "retained-wiki-fence", "source-test", "Replace/retract after model start prevents stale view publication; zero spans/wrong hashes and mixed-security downgrade refused; source-less authority retained."),
+)
+
+# Concrete authored active-path targets. Absence is a visible source gap, not a
+# passed gate. Each target still needs coherent compilation and executed evidence.
+ACTIVE_TEST_SOURCE = {
+    "D01": ["recall_preview_grounding.rs::exact_grounded_plan_preserves_classified_lineage_without_live_publication", "recall_preview_graph.rs::complete_graph_and_receipt_wait_for_real_index_rows_and_embedding_work"],
+    "D02": ["recall_preview_grounding.rs::unsupported_high_confidence_output_never_creates_canonical_knowledge"],
+    "D03": ["recall_preview_graph.rs::public_claim_evidence_keeps_support_beyond_an_unrelated_quote_prefix", "recall_preview_corrections.rs::public_annotation_survives_but_changed_relationship_cannot_reuse_unchanged_assertion_proof", "recall_preview_graph.rs::mutually_consistent_tampered_staging_cannot_invent_a_support_verdict"],
+    "D04": ["recall_preview_publication.rs::actual_canonical_faults_roll_back_every_effect_outbox_and_receipt_then_retry"],
+    "D05": ["recall_preview_publication.rs::historical_revision_reacceptance_requires_fresh_key_and_current_cas_without_rebinding_input", "recall_preview_source_http.rs::source_http_observation_retry_keeps_operation_and_queue_identity_but_changed_input_conflicts", "recall_preview_publication.rs::source_acceptance_is_revision_exact_idempotent_and_desired_head_fenced", "recall_preview_publication.rs::concurrent_source_replacements_have_one_acceptance_winner", "recall_preview_publication.rs::newer_desired_revision_fences_prior_publication_even_before_it_publishes"],
+    "D06": ["recall_preview_attempt_mcp.rs::mcp_completion_cannot_adopt_successor_or_other_work_lease", "recall_preview_publication.rs::same_worker_reclaim_fences_old_publication_completion_and_renewal"],
+    "D07": ["recall_preview_recovery.rs::quiet_named_spaces_recover_without_default_or_unrelated_runnable_work", "recall_preview_finalization.rs::quiet_named_spaces_remain_discoverable_when_all_queue_items_are_done"],
+    "D08": ["recall_preview_outbox.rs::callback_failure_after_durable_effect_keeps_checkpoint_and_replays_without_duplicate_work", "recall_preview_outbox.rs::restore_cannot_split_consumer_effect_from_its_checkpoint_acknowledgment", "recall_preview_crash.rs::failed_and_successful_outbox_acknowledgments_recover_truthfully_after_sigkill"],
+    "D09": ["recall_preview_erasure.rs::retract_hides_published_graph_and_old_finalization_cannot_reactivate_it", "recall_preview_erasure.rs::erasing_published_b_reopens_a_hidden_by_cross_source_decision"],
+    "D10": ["recall_preview_erasure_closure.rs::trusted_shared_media_preserves_exact_surviving_owner_and_bytes_until_last_owner_erased", "recall_preview_erasure_closure.rs::erased_evidence_removes_source_and_mixed_view_history_but_preserves_independent_projection", "recall_preview_erasure_closure.rs::erasure_physically_removes_populated_hot_and_cold_history_without_changing_independent_rows", "recall_preview_erasure.rs::native_erasure_preserves_key_types_and_independent_neighbors_but_fences_exact_late_references_after_restore", "recall_preview_durability.rs::expired_registered_backup_is_physically_deleted_and_cannot_restore", "recall_preview_crash.rs::every_erasure_boundary_recovers_before_ready_after_real_sigkill", "recall_preview_erasure.rs::active_graph_erasure_and_old_backup_restore_preserve_other_space_and_source_less_authority"],
+    "D11": ["recall_preview_erasure.rs::restoring_backup_predating_source_keeps_erased_descendant_and_native_membership_fences", "recall_preview_erasure.rs::native_erasure_preserves_key_types_and_independent_neighbors_but_fences_exact_late_references_after_restore", "recall_preview_durability.rs::backup_cannot_be_restored_with_unrelated_empty_erasure_journal", "recall_preview_crash.rs::every_erasure_boundary_recovers_before_ready_after_real_sigkill", "recall_preview_erasure.rs::active_graph_erasure_and_old_backup_restore_preserve_other_space_and_source_less_authority"],
+    "D12": ["recall_preview_attempt_mcp.rs::mcp_claim_and_complete_require_current_record_scope_space_and_clearance", "recall_preview_auth.rs::retained_source_contact_route_uses_signed_admission_atomic_preflight_and_raw_projection", "recall_preview_auth.rs::scoped_http_checks_signed_authority_and_next_request_live_grants", "recall_preview_auth.rs::mcp_http_rechecks_live_grants_and_scope_attenuation_for_each_signed_request", "recall_preview_publication.rs::changed_policy_after_authorization_cannot_accept_replacement", "recall_preview_surface.rs::route_space_and_raw_scope_are_checked_before_lookup"],
+    "D15": ["recall_preview_auth.rs::signed_mcp_runtime_gates_mutations_without_disabling_read_only_reads", "recall_preview_search_window.rs::ineligible_partition_prefix_cannot_become_complete_empty_semantic_search", "recall_preview_surface.rs::http_and_mcp_enforce_same_search_input_bounds_before_storage_or_models"],
+    "D16": ["recall_preview_source_http.rs::source_http_distinguishes_decoded_utf8_and_encoded_body_limits_without_partial_acceptance", "recall_preview_publication.rs::source_byte_limit_has_no_partial_acceptance_on_oversize"],
+    "D17": ["recall_preview_auth.rs::retained_source_contact_route_uses_signed_admission_atomic_preflight_and_raw_projection"],
+    "D22": ["recall_preview_durability.rs::corrupted_backup_is_refused_before_live_dataset_changes", "recall_preview_durability.rs::existing_named_backup_generation_cannot_be_overwritten"],
+    "D32": ["recall_preview_publication.rs::concurrent_new_identity_invalidates_a_plan_even_without_changed_dependencies"],
+    "D33": ["recall_preview_graph.rs::public_lexical_read_returns_exact_published_bytes_and_never_substitutes_pending_revision", "recall_preview_finalization.rs::complete_metadata_requires_every_declared_bundle_then_replays_one_receipt"],
+    "D35": ["recall_preview_erasure.rs::erasing_published_b_reopens_a_hidden_by_cross_source_decision", "recall_preview_erasure.rs::erase_reverses_nested_decision_fields_while_preserving_independent_later_metadata"],
+    "D36": ["recall_preview_inventory.rs::wholly_unauthorized_inventory_is_empty_without_hidden_count_continuations", "recall_preview_inventory.rs::authorized_inventory_keeps_tombstones_and_binds_cursor_to_current_caller_and_space"],
+    "D37": ["recall_preview_crash.rs::acknowledged_source_acceptance_survives_sigkill_without_snapshot", "recall_preview_crash.rs::acknowledged_queue_claim_survives_sigkill_and_reclaim_advances_attempt", "recall_preview_crash.rs::acknowledged_whole_source_publication_survives_sigkill_with_exact_effects_and_outbox"],
+    "D38": ["recall_preview_crash.rs::every_erasure_boundary_recovers_before_ready_after_real_sigkill", "recall_preview_crash.rs::restored_generation_cannot_replay_pre_restore_wal_after_sigkill"],
+    "D39": ["recall_preview_wiki.rs::classified_editorial_article_and_cached_read_keep_exact_original_evidence", "recall_preview_wiki.rs::source_retract_or_replacement_after_writer_start_prevents_stale_wiki_publication", "recall_preview_wiki.rs::view_publication_refuses_zero_span_stale_hash_and_consistent_policy_downgrade"],
+}
+
+# Separately authored source reviewed by D. These references expose useful peer
+# coverage without claiming D authored it, that it has executed, or that owner
+# tests independently qualify their own implementation. The exact source group
+# and its dependencies still need central execution and D outcome review.
+RELATED_OWNER_TEST_SOURCE = {
+    "D10": {"owner": "integrity/erasure", "targets": [
+        "crates/elephant-db/src/erasure_guard_tests.rs::caught_guard_error_cannot_commit_any_payload_epoch_or_index_change",
+        "crates/elephant-db/src/erasure_guard_tests.rs::original_journal_permit_is_captured_once_per_transaction",
+        "crates/storage/src/source_lifecycle_tests.rs::surreal_reserved_inventory_refuses_independent_task_payload_and_owner_changes",
+    ], "source_checkpoints": ["b4ffdeccbf3532b0bca4264fa99320e20e9d1f39", "51eb5f97525311dc681d43f7eda9fa4556f8b63b"]},
+    "D11": {"owner": "erasure", "targets": [
+        "crates/storage/src/source_lifecycle_tests.rs::embedded_reserved_backup_replays_prior_membership_before_inverse",
+        "crates/storage/src/source_lifecycle_tests.rs::surreal_reserved_backup_replays_prior_membership_before_inverse",
+    ], "source_checkpoints": ["1a91ba9d5ef726c51c598225c99a11f345c7fc69"]},
+    "D13": {"owner": "semantics", "targets": [
+        "tests/scenarios/tests/recall_preview_providers.rs::every_governed_operation_uses_its_current_space_transport",
+        "tests/scenarios/tests/recall_preview_providers.rs::missing_and_wrong_space_approvals_emit_zero_outbound_requests",
+        "tests/scenarios/tests/recall_preview_providers.rs::revoked_pinned_clients_and_agent_continuations_never_dispatch",
+        "tests/scenarios/tests/recall_preview_providers.rs::actual_embedding_http_retry_rechecks_committed_revocation",
+        "tests/recall_preview_semantics/provider_cache.rs::actual_entity_search_handler_preserves_space_and_rechecks_warm_approval",
+    ], "source_checkpoints": ["1d18cf5504840aebfb73df74939a797154a1f1ab"]},
+    "D14": {"owner": "semantics", "targets": [
+        "tests/scenarios/tests/recall_preview_providers.rs::credential_rotation_changes_transport_without_changing_vector_identity",
+        "tests/scenarios/tests/recall_preview_providers.rs::immutable_partition_changes_are_refused_while_rotation_is_distinct",
+        "tests/recall_preview_semantics/provider_cache.rs::warm_entity_handle_does_not_cross_same_dimension_spaces_or_profile_identity",
+        "tests/recall_preview_semantics/provider_cache.rs::supported_embedded_snapshot_restore_cannot_reuse_pre_restore_vector_payload",
+    ], "source_checkpoints": ["1d18cf5504840aebfb73df74939a797154a1f1ab"]},
+    "D17": {"owner": "semantics", "targets": [
+        "tests/recall_preview_semantics/provider_adapters.rs::actual_identity_resolution_uses_assertion_space_and_current_approval",
+        "tests/recall_preview_semantics/provider_adapters.rs::active_long_summary_dispatch_and_revocation_are_governed",
+        "tests/recall_preview_semantics/provider_adapters.rs::actual_wiki_planner_organizer_writer_and_verifier_check_current_approval",
+        "tests/recall_preview_semantics/provider_adapters.rs::actual_tm_adapter_refuses_wrong_space_and_revoked_retry",
+        "tests/recall_preview_semantics/provider_extraction.rs::actual_extractor_and_independent_support_use_current_distinct_approvals",
+    ], "source_checkpoints": ["1d18cf5504840aebfb73df74939a797154a1f1ab"]},
+    "D19": {"owner": "semantics", "targets": [
+        "tests/recall_preview_semantics/scoped_index.rs::indexed_random_vectors_fail_frozen_semantic_expectations_on_both_backends",
+    ], "source_checkpoints": ["1d18cf5504840aebfb73df74939a797154a1f1ab"]},
+    "D22": {"owner": "lifecycle/surface", "targets": [
+        "crates/storage/src/durability_io_tests.rs::configuration_failures_before_publication_preserve_the_old_bytes",
+        "crates/storage/src/durability_io_tests.rs::directory_sync_failure_reports_replacement_without_claiming_rollback",
+        "crates/storage/src/durability_io_tests.rs::configuration_files_and_new_directories_are_private_without_chmod_existing_parents",
+        "crates/storage/src/durability_io_tests.rs::configuration_rejects_symlink_destination_and_parent_without_touching_the_target",
+        "crates/storage/src/durability_io_tests.rs::configuration_rejects_nonfile_and_parent_traversal_destinations",
+        "crates/storage/src/durability_io_tests.rs::shared_writer_does_not_delete_a_temporary_file_it_did_not_create",
+        "crates/storage/src/durability_io_tests.rs::shared_writer_keeps_existing_cross_directory_temporary_path_support",
+        "crates/storage/src/durability_io_tests.rs::fault_guard_is_one_shot_and_scoped_to_the_exact_configuration_path",
+        "bin/elephant-api/src/runtime_config_save_tests.rs::failed_config_publication_preserves_parseable_previous_configuration",
+        "bin/elephant-api/src/runtime_config_save_tests.rs::renamed_config_with_failed_directory_sync_retains_typed_uncertain_outcome",
+        "bin/elephant-api/src/runtime_config_save_tests.rs::failed_first_config_write_does_not_publish_partial_initialization",
+        "bin/elephant-api/src/runtime_configuration_failure_tests.rs::prepublication_failures_preserve_config_bytes_and_active_runtime",
+        "bin/elephant-api/src/runtime_configuration_failure_tests.rs::uncertain_publication_stops_workers_and_requires_restart_without_rollback_claim",
+        "bin/elephant-api/src/runtime_configuration_failure_tests.rs::saved_configuration_with_failed_old_worker_stop_remains_non_ready",
+        "bin/elephant-api/src/runtime_configuration_failure_tests.rs::bootstrap_publication_failure_never_activates_new_configuration",
+    ], "source_checkpoints": ["05af7b6c58fbca6507aaedf94cf55220cd4ef172", "bdfbf0ba5e9cbdc62e3ce368a6fdd490148f5eee"]},
+    "D24": {"owner": "recovery", "targets": [
+        "crates/pipeline/src/provider_usage.rs::embedded_receipts_preserve_unknown_and_count_once",
+        "crates/pipeline/src/provider_usage.rs::surreal_receipts_preserve_unknown_and_count_once",
+        "crates/pipeline/src/provider_dispatch_gateway_tests.rs::embedded_physical_stream_usage_requires_terminal_success",
+        "crates/pipeline/src/provider_dispatch_gateway_tests.rs::surreal_physical_stream_usage_requires_terminal_success",
+        "crates/embeddings/src/governed_usage_tests.rs::physical_embedding_completion_requires_decoded_response",
+    ], "source_checkpoints": ["eeed79fc04513f5e6c04b97d742d50b6da72a7dd"]},
+    "D25": {"owner": "recovery", "targets": [
+        "crates/pipeline/src/scheduler/preflight_failure.rs::embedded_preflight_failures_are_typed_bounded_and_fenced",
+        "crates/pipeline/src/scheduler/preflight_failure.rs::surreal_preflight_failures_are_typed_bounded_and_fenced",
+    ], "source_checkpoints": ["b20c49af568ad99c9eb862c1e7958f33e44e8011", "27d4937a9d1a07d90b2306bde1b94ac2c863f00a"]},
+    "D34": {"owner": "grounding (independent parser fixtures)", "targets": [
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_winansi",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_multilingual_tounicode",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_page_order_and_literal_markup",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_nested_and_repeated_forms",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_inherited_form_resources",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_acroform_field_values",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_existing_invisible_ocr_layer",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_image_only_is_empty",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_crop_visibility",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_blank_page_is_empty",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_missing_header_is_error",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_unfinished_catalog_is_error",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_corrupt_later_page_is_total_error",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_corpus_has_exactly_the_frozen_members",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_active_intake_retains_exact_immutable_text_without_publication",
+        "crates/mcp/tests/recall_preview_pdf.rs::pdf_parse_failures_create_no_source_document_operation_or_work",
+    ], "source_checkpoints": ["50caf22aa76661a8152cb0d19ba60482cb837c1a", "1f1437001c965b041ec3080fb14083e074fa11d5"]},
+}
+
+SOURCE_LIMITS = {
+    "D07": "Claim/discovery only; automatic re-enqueue and complete runner restart still need execution.",
+    "D08": "Actual shared production batch helper with real durable queue effects; callback is deterministic. Full wiki/TM downstream decision semantics remain separate.",
+    "D10": "Active graph/native-reference erase, populated production hot/cold archives and shared-reservation peer tests are authored. SIGKILL is persistent ElephantDB only. Trusted shared-media and actual MCP-compiled source/mixed view history now have independent both-backend source oracles. Actual two-process paired server and installed-artifact execution remain separate; same-client erasure globally drains runtime admission.",
+    "D11": "Both-backend post-source/pre-source backup replay and reserved replay of all original membership are authored. Durable opaque membership, key custody and installed journal-volume recovery remain unqualified until execution.",
+    "D12": "Real signed HTTP/MCP admission and live grant changes, plus independent record-envelope prestate race. An already admitted request may finish after grant revocation; later operations must reauthorize. Installed transport and persistent-session variants remain separate.",
+    "D13": "Actual configured transport/adapters with deterministic loopback spies and synthetic credentials; no provider relevance, real account entitlement or installed credential custody claim.",
+    "D14": "Peer rotation/immutable-partition/warm-cache source is reviewed. Full active reindex completion, profile activation and installed persistence still need their own executed evidence.",
+    "D15": "Source adapter bounds only; installed transport time/response bounds and full error taxonomy separate.",
+    "D16": "Repository and actual HTTP decoded/encoded byte boundaries plus absence of rejected heads/work are authored. Accepted input/queue never implies full 2MB extraction/index publication; that remains a separate measured gate.",
+    "D17": "Signed retained contact acceptance and active adapter provider spies are authored. Actual contact+Graph finalization, full retained lifecycle catalog and automatic replay remain distinct owner joins/execution gates.",
+    "D19": "The installed-index random-vector negative control is authored on both backends. Passing a negative control cannot qualify any real embedding provider or replace the frozen live semantic corpus.",
+    "D22": "Corruption/overwrite and actual runtime configuration atomic-publication/activation faults covered in source;15 owner test definitions independently reviewed, unexecuted. Installed OS-full and interrupted checkpoint evidence remains separate. See CONFIG_PUBLICATION_REVIEW.md.",
+    "D24": "Owner tests preserve incomplete/partial/unknown receipts, terminal usage and physical deletion; observer/SSE fixtures do not establish actual provider charges. Abstract budget units are not priced currency.",
+    "D28": "Separate50-total-source workload corpus/200-call schedule and all-hit exact-evidence/top3 metric are frozen. Twelve evaluator tests pass offline; actual load, artifact and separate provider accounting remain unexecuted. Consumer default20/one size-error retry10/fallback is a separately counted phase.",
+    "D25": "Owner preflight source covers original-claim retry exhaustion, prerequisite blockage and stale owners. ErasureInProgress typed transient successor27d4937 is joined; independent outcome review remains required.",
+    "D32": "Space-wide identity epoch phantom; all mutation surfaces and native Surreal event coverage remain separate.",
+    "D34": "Thirteen byte-pinned original synthetic PDFs and16 peer-authored parser/intake tests, independently frozen before parser execution. Intake wrapper is embedded only; installed binary, parser resource limits and broader layout/OCR claims remain separate. See PDF_FREEZE_REVIEW.md.",
+    "D36": "Actual HTTP inventory with non-bypass fixed readers; authorized pagination, real retract/physical-erase tombstones and between-page reclassification. No cross-request snapshot promise; mid-response races and scan-budget timing remain separate.",
+    "D37": "Persistent ElephantDB owned subprocess only; external Surreal server process and installed native/container restarts remain separate.",
+    "D38": "Live-file text canary plus decoded physical inventory; registered backup expiry is independently tested and never exempted indefinitely.",
+    "D39": "Actual retained compiler and publication path with independently fixed writer/verifier output; real-model editorial usefulness and broader multilingual corpus remain separate.",
+}
+
+
+def inventory() -> list[dict]:
+    return [dict(zip(("id", "owner", "oracle", "evidence_required", "expectation"), case),
+                 active_test_source=ACTIVE_TEST_SOURCE.get(case[0], []),
+                 related_owner_test_source=RELATED_OWNER_TEST_SOURCE.get(case[0]),
+                 source_limit=SOURCE_LIMITS.get(case[0], "Execution and required evidence class remain unqualified."),
+                 verdict="unexecuted") for case in CASES]

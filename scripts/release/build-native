@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Build only after source review and host qualification resources are allocated.
+set -euo pipefail
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$root"
+if [[ $# != 2 ]]; then
+  echo 'usage: scripts/release/build-native TARGET OUTPUT_DIRECTORY' >&2
+  exit 2
+fi
+target="$1"
+output="$2"
+case "$target" in x86_64-unknown-linux-gnu|aarch64-apple-darwin) ;; *) echo 'unsupported target' >&2; exit 2 ;; esac
+host_target="$(rustc -vV | sed -n 's/^host: //p')"
+[[ "$host_target" = "$target" ]] || { echo 'build on the native target host' >&2; exit 1; }
+default_jobs=8
+[[ "$target" != aarch64-apple-darwin ]] || default_jobs=4
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$default_jobs}"
+# Refuse ambient native-library overrides; the release recipe selects a pinned static runtime.
+for setting in ORT_LIB_PATH ORT_LIB_LOCATION ORT_PREFER_DYNAMIC_LINK ORT_IOS_XCFWK_PATH ORT_IOS_XCFWK_LOCATION; do
+  [[ -z "${!setting:-}" ]] || { echo "release recipe refuses ambient $setting" >&2; exit 1; }
+done
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 BINARYEN_CORES=8 TLC_WORKERS=8 LZMA_API_STATIC=1
+(( CARGO_BUILD_JOBS > 0 && CARGO_BUILD_JOBS <= 16 )) || { echo 'CARGO_BUILD_JOBS must be 1-16' >&2; exit 1; }
+python3 - "$root" "${RECALL_BUILD_MIN_FREE_GIB:-32}" <<'PY'
+import shutil, sys
+minimum = int(sys.argv[2])
+if minimum <= 0 or shutil.disk_usage(sys.argv[1]).free < minimum * 1024**3:
+    raise SystemExit(f'native build refused: requires {minimum} GiB free on this builder')
+PY
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/recall-native.XXXXXXXX")"
+trap 'rm -rf -- "$scratch"' EXIT
+python3 vendor/verify_recall_surrealdb.py
+python3 scripts/release/artifact.py reference-source-receipt > "$scratch/reference-source.json"
+python3 scripts/release/artifact.py source-identity > "$scratch/source-before.json"
+./scripts/repo-cargo --print-env > "$scratch/cargo-env"
+build_target_dir="$(sed -n 's/^CARGO_TARGET_DIR=//p' "$scratch/cargo-env")"
+[[ -n "$build_target_dir" ]] || { echo 'repository target directory missing' >&2; exit 1; }
+if [[ "$(uname -s)" = Linux ]]; then
+  ORT_LIB_PATH="$(python3 scripts/release/linux_static_ort.py --cargo-env "$scratch/cargo-env")"
+  export ORT_LIB_PATH ORT_PREFER_DYNAMIC_LINK=0
+  chrt --idle 0 ionice -c3 ./scripts/repo-cargo build --locked --profile deploy -p meerkat-recall-bin --features rocksdb,fastembed
+else
+  nice -n 20 ./scripts/repo-cargo build --locked --profile deploy -p meerkat-recall-bin --features rocksdb,fastembed
+fi
+python3 scripts/release/artifact.py source-identity > "$scratch/source-after.json"
+cmp "$scratch/source-before.json" "$scratch/source-after.json"
+binary="$build_target_dir/deploy/meerkat-recall"
+python3 scripts/release/static_ort_receipt.py --cargo-env "$scratch/cargo-env" --target "$target" --output "$scratch/static-ort.json"
+python3 scripts/release/artifact.py runtime-dependencies --binary "$binary" --target "$target" > "$scratch/runtime-dependencies.json"
+"$binary" --help > "$scratch/help.txt"
+"$binary" --version > "$scratch/version.txt"
+python3 - "$scratch" "$binary" "$target" <<'PY'
+import hashlib, json, pathlib, subprocess, sys
+scratch, binary, target = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+receipt = json.loads((scratch / 'source-before.json').read_text())
+with binary.open('rb') as stream:
+    receipt['binary_sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
+receipt.update(target=target, build_command='./scripts/repo-cargo build --locked --profile deploy -p meerkat-recall-bin --features rocksdb,fastembed',
+               build_profile='deploy', features=['rocksdb', 'fastembed'], default_features=True,
+               rustc=subprocess.check_output(['rustc', '--version'], text=True).strip(),
+               version_output=(scratch / 'version.txt').read_text().strip(),
+               runtime_dependencies=json.loads((scratch / 'runtime-dependencies.json').read_text()),
+               static_onnxruntime=json.loads((scratch / 'static-ort.json').read_text()),
+               model_assets='separate persistent cache; not included in this archive',
+               native_reference_capability=json.loads((scratch / 'reference-source.json').read_text()))
+(scratch / 'build-receipt.json').write_text(json.dumps(receipt, sort_keys=True) + '\n')
+PY
+python3 scripts/release/artifact.py package --binary "$binary" --target "$target" --output-dir "$output" --build-receipt "$scratch/build-receipt.json"

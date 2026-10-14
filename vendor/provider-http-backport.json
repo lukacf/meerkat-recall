@@ -1,0 +1,17 @@
+{
+  "upstream_defensive_commit": "a34b9fc7bbadd95e9284bcf1182d6d10bcc072be",
+  "released_source_commit": "1d5d844c8a75a70cbe90e62673dca5cd3621744e",
+  "registry_archives": {
+    "meerkat-gemini-0.8.51": "528fae31a25fda3af5d9c4a01b65a6c439718068b4a380b34184437c1bb9cd89",
+    "meerkat-llm-core-0.8.51": "3e79b75220cf9c0cd79bd229bfe8044f73776bfe885fd20dc7abf6d36714a944",
+    "meerkat-openai-0.8.51": "d2100adbbdade7c5b2bdc15a57fedd986fc769e0297d21c4320c7ffa9ea46f73"
+  },
+  "patched_files_sha256": {
+    "vendor/meerkat-llm-core-0.8.51/src/http.rs": "ae563126d83173fbbc0f5dc25a0d1a049ac5686e7b6528254dc3333eea172a5d",
+    "vendor/meerkat-llm-core-0.8.51/src/error.rs": "24551115955b5903324cf1d41d1d6025d74f625daa32752618e00ecbeb35e3a4",
+    "vendor/meerkat-openai-0.8.51/src/client.rs": "105229842f1a221277513653d5396c8e36a116384dde406182f2e173cdd0f8c3",
+    "vendor/meerkat-openai-0.8.51/src/client_compatible.rs": "816e4e7d0206867fc01eccb3009db73c327555a114fd29b570af63441ac93760",
+    "vendor/meerkat-gemini-0.8.51/src/client.rs": "6ad90ae921313b2a325e72a5505830ffcbeff86e45dd06f76c3bb97578537910"
+  },
+  "validation": "Source-only: registry archive checksums, direct rustfmt, TOML parse, whitespace checks. No Cargo/test/model probes."
+}

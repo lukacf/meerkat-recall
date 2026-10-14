@@ -11,8 +11,9 @@
 //!
 //! Re-deriving does NOT fix this. Promotion is idempotent on `assertion_key`:
 //! an existing assertion short-circuits into the entity-enrichment path and its
-//! security is never revisited. So the repair has to be a direct pass, which is
-//! also far cheaper than re-running extraction.
+//! security is never revisited. This opt-in repair prepares exact document
+//! dependencies and classification changes in the sweep's canonical transaction;
+//! it does not re-run extraction or publish another source generation.
 //!
 //! Reaching the source document differs per record type:
 //! - assertion: `evidence.revision` -> revision's doc
@@ -30,34 +31,28 @@ use elephant_storage::{
     AssertionRepository, AttributeRepository, DocRepository, DocRevisionRepository,
     EventRepository, RelRepository, Repository, StorageClient,
 };
-use elephant_types::records::base::Security;
+use elephant_types::records::base::{BaseFields, Security, SubjectsState};
+use elephant_types::records::Doc;
 use elephant_types::RecordId;
 use tracing::{info, warn};
 
-use crate::error::PipelineError;
+use crate::error::PipelineResult;
+use crate::maintenance_commit::{PlanRecord, PlanningTruthMaintenanceStorage};
 use crate::scheduler::inline_promotion::escalate_security;
 
-/// How many records of each kind a single pass will read before stopping.
-///
-/// The pass is bounded so it cannot starve the sweeps that run after it. Hitting
-/// the cap is logged rather than passed over in silence — a truncated repair that
-/// reports success reads as "everything is classified" when it is not.
 const DEFAULT_SCAN_CAP: usize = 20_000;
-
-/// Page size for walking a table.
 const PAGE_SIZE: usize = 200;
 
-/// Outcome of one backfill pass.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Outcome of one bounded classification repair.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClassificationBackfillStats {
-    /// Records read across all four kinds.
+    /// Records examined across all four kinds, including already classified rows.
     pub scanned: usize,
-    /// Records whose envelope was rewritten.
+    /// Records whose full inherited envelope was prepared for replacement.
     pub updated: usize,
-    /// Records still on the baseline whose source classification could not be
-    /// resolved, or whose source is itself unclassified. Left untouched.
+    /// Baseline records with missing or incompatible document authority.
     pub unresolved: usize,
-    /// True if any kind stopped at the scan cap with rows left to read.
+    /// At least one table exceeded the explicit scan bound.
     pub capped: bool,
 }
 
@@ -70,10 +65,6 @@ impl ClassificationBackfillStats {
     }
 }
 
-/// True when a record still carries the untouched `BaseFields::new` envelope.
-///
-/// Anything else has been classified deliberately and must not be overwritten —
-/// this pass only repairs records that never received an envelope at all.
 fn is_baseline(security: &Security) -> bool {
     security.policy_id == "default"
         && security.level == 0
@@ -81,387 +72,381 @@ fn is_baseline(security: &Security) -> bool {
         && security.handling.is_empty()
 }
 
-/// Resolves and caches the classification of the document behind a revision.
-///
-/// Backfilling a whole graph re-visits the same handful of documents constantly,
-/// so revisions are cached including their misses.
-struct DocSecurityResolver {
+/// Every actual revision and document joins the original read set, including
+/// missing-reference decisions protected by the outer predicate epoch.
+struct DocAuthorityResolver<'a> {
+    planning: &'a PlanningTruthMaintenanceStorage,
     revision_repo: DocRevisionRepository,
     doc_repo: DocRepository,
     space_id: String,
-    cache: HashMap<String, Option<Security>>,
+    cache: HashMap<RecordId, Option<Doc>>,
 }
 
-impl DocSecurityResolver {
-    fn new(storage: &StorageClient, space_id: &str) -> Self {
+impl<'a> DocAuthorityResolver<'a> {
+    fn new(
+        planning: &'a PlanningTruthMaintenanceStorage,
+        storage: &StorageClient,
+        space: &str,
+    ) -> Self {
         Self {
+            planning,
             revision_repo: DocRevisionRepository::new(storage.clone()),
             doc_repo: DocRepository::new(storage.clone()),
-            space_id: space_id.to_string(),
+            space_id: space.into(),
             cache: HashMap::new(),
         }
     }
 
-    /// Returns the source doc's envelope, or `None` when it cannot be resolved
-    /// or is itself the baseline (nothing worth propagating).
-    async fn security_for_revision(
-        &mut self,
-        revision_id: &RecordId,
-    ) -> Result<Option<Security>, PipelineError> {
-        let key = revision_id.to_string();
-        if let Some(hit) = self.cache.get(&key) {
-            return Ok(hit.clone());
+    async fn document(&mut self, revision_id: &RecordId) -> PipelineResult<Option<Doc>> {
+        if let Some(cached) = self.cache.get(revision_id) {
+            return Ok(cached.clone());
         }
-
-        let resolved = self.load_security(revision_id).await?;
-        self.cache.insert(key, resolved.clone());
-        Ok(resolved)
+        let revision = self.revision_repo.get(&self.space_id, revision_id).await?;
+        let revision = self.planning.current_row(revision, revision_id, false)?;
+        let doc = if let Some(revision) = revision {
+            let live = self.doc_repo.get(&self.space_id, revision.doc.id()).await?;
+            self.planning.current_row(live, revision.doc.id(), false)?
+        } else {
+            None
+        };
+        self.cache.insert(revision_id.clone(), doc.clone());
+        Ok(doc)
     }
 
-    async fn load_security(
-        &self,
-        revision_id: &RecordId,
-    ) -> Result<Option<Security>, PipelineError> {
-        let Some(revision) = self
-            .revision_repo
-            .get_by_id(revision_id)
-            .await
-            .map_err(PipelineError::StorageError)?
-        else {
-            return Ok(None);
-        };
-
-        let Some(doc) = self
-            .doc_repo
-            .get(&self.space_id, revision.doc.id())
-            .await
-            .map_err(PipelineError::StorageError)?
-        else {
-            return Ok(None);
-        };
-
-        if is_baseline(&doc.base.security) {
+    async fn documents(&mut self, revisions: &[RecordId]) -> PipelineResult<Option<Vec<Doc>>> {
+        if revisions.is_empty() {
             return Ok(None);
         }
-        Ok(Some(doc.base.security.clone()))
+        let mut docs = Vec::new();
+        for revision in revisions {
+            let Some(doc) = self.document(revision).await? else {
+                return Ok(None);
+            };
+            if !docs
+                .iter()
+                .any(|existing: &Doc| existing.base.id == doc.base.id)
+            {
+                docs.push(doc);
+            }
+        }
+        Ok(Some(docs))
     }
 }
 
-/// Folds every contributing document's classification into one envelope.
-///
-/// Returns `None` when no contributing document had anything to propagate, so
-/// callers can leave the record alone rather than writing back a no-op.
-fn combine(sources: &[Security]) -> Option<Security> {
-    let mut combined: Option<Security> = None;
-    for source in sources {
-        match combined.as_mut() {
-            None => combined = Some(source.clone()),
-            Some(existing) => escalate_security(existing, Some(source)),
-        }
+/// Opaque policy identifiers cannot be compared or silently substituted.
+fn combine(sources: &[Security]) -> PipelineResult<Option<Security>> {
+    let Some(first) = sources.first() else {
+        return Ok(None);
+    };
+    let mut combined = first.clone();
+    for source in &sources[1..] {
+        escalate_security(&mut combined, Some(source))?;
     }
-    combined
+    combined.labels.sort();
+    combined.labels.dedup();
+    combined.handling.sort();
+    combined.handling.dedup();
+    Ok(Some(combined))
 }
 
-/// Repairs derived records that never received their source's classification.
-///
-/// Only records still on the baseline envelope are considered, and a record is
-/// written only when the resolved envelope actually differs, so a pass over an
-/// already-repaired graph performs reads and no writes.
+fn inherit_documents(base: &mut BaseFields, docs: &[Doc]) -> PipelineResult<bool> {
+    let Some(security) = combine(
+        &docs
+            .iter()
+            .map(|doc| doc.base.security.clone())
+            .collect::<Vec<_>>(),
+    )?
+    else {
+        return Ok(false);
+    };
+    if is_baseline(&security) {
+        return Ok(false);
+    }
+    base.security = security;
+    for doc in docs {
+        base.subjects.extend(doc.base.subjects.iter().cloned());
+        base.subjects_state = match (base.subjects_state, doc.base.subjects_state) {
+            (SubjectsState::Unknown, _) | (_, SubjectsState::Unknown) => SubjectsState::Unknown,
+            (SubjectsState::Partial, _) | (_, SubjectsState::Partial) => SubjectsState::Partial,
+            _ => SubjectsState::Complete,
+        };
+    }
+    base.subjects.sort_by(|a, b| a.id().cmp(b.id()));
+    base.subjects.dedup();
+    base.updated_at = chrono::Utc::now();
+    Ok(true)
+}
+
+/// Repair baseline historical derived rows in one canonical transaction.
+/// Opt-in scheduling remains the maintenance wrapper's responsibility.
 ///
 /// # Errors
-///
-/// Returns an error if a table cannot be read or a record cannot be written.
+/// Returns an error for unavailable storage, stale dependencies, or invalid
+/// source/attempt authority. A failure commits no partial classifications.
 pub async fn run_classification_backfill_sweep(
     storage: &StorageClient,
     space_id: &str,
-) -> Result<ClassificationBackfillStats, PipelineError> {
+) -> PipelineResult<ClassificationBackfillStats> {
     run_classification_backfill_sweep_with_cap(storage, space_id, DEFAULT_SCAN_CAP).await
 }
 
-/// As [`run_classification_backfill_sweep`], with an explicit scan cap for tests.
+/// Run the same atomic repair with an explicit per-table scan bound.
 ///
 /// # Errors
-///
-/// Returns an error if a table cannot be read or a record cannot be written.
+/// Returns an error if preparation or the canonical commit is rejected.
 pub async fn run_classification_backfill_sweep_with_cap(
     storage: &StorageClient,
     space_id: &str,
     scan_cap: usize,
-) -> Result<ClassificationBackfillStats, PipelineError> {
-    let mut resolver = DocSecurityResolver::new(storage, space_id);
+) -> PipelineResult<ClassificationBackfillStats> {
+    let planning = PlanningTruthMaintenanceStorage::new(storage.clone(), space_id, None).await?;
+    let result = prepare_with_cap(&planning, storage, space_id, scan_cap).await?;
+    planning
+        .commit(
+            "classification_backfill",
+            space_id,
+            &serde_json::json!({"scan_cap":scan_cap}),
+            &result,
+        )
+        .await?;
+    Ok(result)
+}
+
+/// Prepare the opt-in repair into the caller's original sweep/attempt plan.
+pub(crate) async fn prepare_classification_backfill_sweep(
+    planning: &PlanningTruthMaintenanceStorage,
+    storage: &StorageClient,
+    space_id: &str,
+) -> PipelineResult<ClassificationBackfillStats> {
+    prepare_with_cap(planning, storage, space_id, DEFAULT_SCAN_CAP).await
+}
+
+async fn prepare_with_cap(
+    planning: &PlanningTruthMaintenanceStorage,
+    storage: &StorageClient,
+    space_id: &str,
+    scan_cap: usize,
+) -> PipelineResult<ClassificationBackfillStats> {
+    let mut resolver = DocAuthorityResolver::new(planning, storage, space_id);
     let mut stats = ClassificationBackfillStats::default();
-
-    let assertions = backfill_assertions(storage, space_id, &mut resolver, scan_cap).await?;
-    stats.merge(&assertions);
-
-    let attributes = backfill_attributes(storage, space_id, &mut resolver, scan_cap).await?;
-    stats.merge(&attributes);
-
-    let rels = backfill_rels(storage, space_id, &mut resolver, scan_cap).await?;
-    stats.merge(&rels);
-
-    let events = backfill_events(storage, space_id, &mut resolver, scan_cap).await?;
-    stats.merge(&events);
-
+    stats.merge(&backfill_assertions(planning, storage, space_id, &mut resolver, scan_cap).await?);
+    stats.merge(&backfill_attributes(planning, storage, space_id, &mut resolver, scan_cap).await?);
+    stats.merge(&backfill_rels(planning, storage, space_id, &mut resolver, scan_cap).await?);
+    stats.merge(&backfill_events(planning, storage, space_id, &mut resolver, scan_cap).await?);
     if stats.capped {
         warn!(
-            "Classification backfill stopped at the {scan_cap}-record scan cap; \
-             records remain unclassified and the next sweep will continue"
+            scan_cap,
+            "Classification repair remains incomplete at the configured scan bound"
         );
     }
     if stats.updated > 0 || stats.unresolved > 0 {
         info!(
-            "Classification backfill: {} scanned, {} reclassified, {} unresolved",
-            stats.scanned, stats.updated, stats.unresolved
+            scanned = stats.scanned,
+            prepared = stats.updated,
+            unresolved = stats.unresolved,
+            "Prepared classification repair"
         );
     }
-
     Ok(stats)
 }
 
-async fn backfill_assertions(
-    storage: &StorageClient,
-    space_id: &str,
-    resolver: &mut DocSecurityResolver,
-    scan_cap: usize,
-) -> Result<ClassificationBackfillStats, PipelineError> {
-    let repo = AssertionRepository::new(storage.clone());
-    let mut stats = ClassificationBackfillStats::default();
-    let mut cursor: Option<RecordId> = None;
-
-    loop {
-        let page = repo
-            .list(space_id, PAGE_SIZE, cursor.as_ref())
-            .await
-            .map_err(PipelineError::StorageError)?;
-        if page.is_empty() {
+async fn rows<T, R>(
+    planning: &PlanningTruthMaintenanceStorage,
+    repo: &R,
+    space: &str,
+    cap: usize,
+) -> PipelineResult<(Vec<T>, bool)>
+where
+    T: PlanRecord + serde::de::DeserializeOwned,
+    R: Repository<T> + Sync,
+{
+    let mut live = Vec::new();
+    let mut cursor = None;
+    let bound = cap.saturating_add(1);
+    while live.len() < bound {
+        let limit = PAGE_SIZE.min(bound - live.len());
+        let page = repo.list(space, limit, cursor.as_ref()).await?;
+        let count = page.len();
+        if let Some(last) = page.last() {
+            cursor = Some(last.base().id.clone());
+        }
+        live.extend(page);
+        if count < limit {
             break;
         }
-
-        for mut assertion in page.clone() {
-            stats.scanned += 1;
-            if !is_baseline(&assertion.base.security) {
-                continue;
-            }
-
-            let source = resolver
-                .security_for_revision(assertion.evidence.revision.id())
-                .await?;
-            let Some(security) = source else {
-                stats.unresolved += 1;
-                continue;
-            };
-
-            assertion.base.security = security;
-            let id = assertion.base.id.clone();
-            repo.update(space_id, &id, assertion)
-                .await
-                .map_err(PipelineError::StorageError)?;
-            stats.updated += 1;
-        }
-
-        if page.len() < PAGE_SIZE {
-            break;
-        }
-        if stats.scanned >= scan_cap {
-            stats.capped = true;
-            break;
-        }
-        cursor = page.last().map(|last| last.base.id.clone());
     }
+    let mut rows = planning.current_rows(live, |_| true)?;
+    let capped = rows.len() > cap;
+    rows.truncate(cap);
+    Ok((rows, capped))
+}
 
+async fn backfill_assertions(
+    planning: &PlanningTruthMaintenanceStorage,
+    storage: &StorageClient,
+    space: &str,
+    resolver: &mut DocAuthorityResolver<'_>,
+    cap: usize,
+) -> PipelineResult<ClassificationBackfillStats> {
+    let (records, capped) = rows(
+        planning,
+        &AssertionRepository::new(storage.clone()),
+        space,
+        cap,
+    )
+    .await?;
+    let mut stats = ClassificationBackfillStats {
+        scanned: records.len(),
+        capped,
+        ..ClassificationBackfillStats::default()
+    };
+    for before in records {
+        if !is_baseline(&before.base.security) {
+            continue;
+        }
+        let revisions = vec![before.evidence.revision.id().clone()];
+        let Some(docs) = resolver.documents(&revisions).await? else {
+            stats.unresolved += 1;
+            continue;
+        };
+        let mut after = before.clone();
+        if !inherit_documents(&mut after.base, &docs)? {
+            stats.unresolved += 1;
+            continue;
+        }
+        planning.stage_source_classification(before, after, &docs)?;
+        stats.updated += 1;
+    }
     Ok(stats)
 }
 
 async fn backfill_attributes(
+    planning: &PlanningTruthMaintenanceStorage,
     storage: &StorageClient,
-    space_id: &str,
-    resolver: &mut DocSecurityResolver,
-    scan_cap: usize,
-) -> Result<ClassificationBackfillStats, PipelineError> {
-    let repo = AttributeRepository::new(storage.clone());
-    let mut stats = ClassificationBackfillStats::default();
-    let mut cursor: Option<RecordId> = None;
-
-    loop {
-        let page = repo
-            .list(space_id, PAGE_SIZE, cursor.as_ref())
-            .await
-            .map_err(PipelineError::StorageError)?;
-        if page.is_empty() {
-            break;
+    space: &str,
+    resolver: &mut DocAuthorityResolver<'_>,
+    cap: usize,
+) -> PipelineResult<ClassificationBackfillStats> {
+    let (records, capped) = rows(
+        planning,
+        &AttributeRepository::new(storage.clone()),
+        space,
+        cap,
+    )
+    .await?;
+    let mut stats = ClassificationBackfillStats {
+        scanned: records.len(),
+        capped,
+        ..ClassificationBackfillStats::default()
+    };
+    for before in records {
+        if !is_baseline(&before.base.security) {
+            continue;
         }
-
-        for mut attribute in page.clone() {
-            stats.scanned += 1;
-            if !is_baseline(&attribute.base.security) {
-                continue;
-            }
-
-            let mut sources = Vec::new();
-            for evidence in &attribute.evidence {
-                if let Some(security) = resolver
-                    .security_for_revision(evidence.span.revision.id())
-                    .await?
-                {
-                    sources.push(security);
-                }
-            }
-
-            let Some(security) = combine(&sources) else {
-                stats.unresolved += 1;
-                continue;
-            };
-
-            attribute.base.security = security;
-            let id = attribute.base.id.clone();
-            repo.update(space_id, &id, attribute)
-                .await
-                .map_err(PipelineError::StorageError)?;
-            stats.updated += 1;
+        let revisions = before
+            .evidence
+            .iter()
+            .map(|evidence| evidence.span.revision.id().clone())
+            .collect::<Vec<_>>();
+        let Some(docs) = resolver.documents(&revisions).await? else {
+            stats.unresolved += 1;
+            continue;
+        };
+        let mut after = before.clone();
+        if !inherit_documents(&mut after.base, &docs)? {
+            stats.unresolved += 1;
+            continue;
         }
-
-        if page.len() < PAGE_SIZE {
-            break;
-        }
-        if stats.scanned >= scan_cap {
-            stats.capped = true;
-            break;
-        }
-        cursor = page.last().map(|last| last.base.id.clone());
+        planning.stage_source_classification(before, after, &docs)?;
+        stats.updated += 1;
     }
-
     Ok(stats)
 }
 
 async fn backfill_rels(
+    planning: &PlanningTruthMaintenanceStorage,
     storage: &StorageClient,
-    space_id: &str,
-    resolver: &mut DocSecurityResolver,
-    scan_cap: usize,
-) -> Result<ClassificationBackfillStats, PipelineError> {
-    let repo = RelRepository::new(storage.clone());
-    let mut stats = ClassificationBackfillStats::default();
-    let mut cursor: Option<RecordId> = None;
-
-    loop {
-        let page = repo
-            .list(space_id, PAGE_SIZE, cursor.as_ref())
-            .await
-            .map_err(PipelineError::StorageError)?;
-        if page.is_empty() {
-            break;
+    space: &str,
+    resolver: &mut DocAuthorityResolver<'_>,
+    cap: usize,
+) -> PipelineResult<ClassificationBackfillStats> {
+    let (records, capped) =
+        rows(planning, &RelRepository::new(storage.clone()), space, cap).await?;
+    let mut stats = ClassificationBackfillStats {
+        scanned: records.len(),
+        capped,
+        ..ClassificationBackfillStats::default()
+    };
+    for before in records {
+        if !is_baseline(&before.base.security) {
+            continue;
         }
-
-        for mut rel in page.clone() {
-            stats.scanned += 1;
-            if !is_baseline(&rel.base.security) {
-                continue;
-            }
-
-            let mut sources = Vec::new();
-            for evidence in &rel.evidence {
-                if let Some(security) = resolver
-                    .security_for_revision(evidence.span.revision.id())
-                    .await?
-                {
-                    sources.push(security);
-                }
-            }
-
-            let Some(security) = combine(&sources) else {
-                stats.unresolved += 1;
-                continue;
-            };
-
-            rel.base.security = security;
-            let id = rel.base.id.clone();
-            repo.update(space_id, &id, rel)
-                .await
-                .map_err(PipelineError::StorageError)?;
-            stats.updated += 1;
+        let revisions = before
+            .evidence
+            .iter()
+            .map(|evidence| evidence.span.revision.id().clone())
+            .collect::<Vec<_>>();
+        let Some(docs) = resolver.documents(&revisions).await? else {
+            stats.unresolved += 1;
+            continue;
+        };
+        let mut after = before.clone();
+        if !inherit_documents(&mut after.base, &docs)? {
+            stats.unresolved += 1;
+            continue;
         }
-
-        if page.len() < PAGE_SIZE {
-            break;
-        }
-        if stats.scanned >= scan_cap {
-            stats.capped = true;
-            break;
-        }
-        cursor = page.last().map(|last| last.base.id.clone());
+        planning.stage_source_classification(before, after, &docs)?;
+        stats.updated += 1;
     }
-
     Ok(stats)
 }
 
 async fn backfill_events(
+    planning: &PlanningTruthMaintenanceStorage,
     storage: &StorageClient,
-    space_id: &str,
-    resolver: &mut DocSecurityResolver,
-    scan_cap: usize,
-) -> Result<ClassificationBackfillStats, PipelineError> {
-    let repo = EventRepository::new(storage.clone());
-    let assertion_repo = AssertionRepository::new(storage.clone());
-    let mut stats = ClassificationBackfillStats::default();
-    let mut cursor: Option<RecordId> = None;
-
-    loop {
-        let page = repo
-            .list(space_id, PAGE_SIZE, cursor.as_ref())
-            .await
-            .map_err(PipelineError::StorageError)?;
-        if page.is_empty() {
-            break;
+    space: &str,
+    resolver: &mut DocAuthorityResolver<'_>,
+    cap: usize,
+) -> PipelineResult<ClassificationBackfillStats> {
+    let (records, capped) =
+        rows(planning, &EventRepository::new(storage.clone()), space, cap).await?;
+    let mut stats = ClassificationBackfillStats {
+        scanned: records.len(),
+        capped,
+        ..ClassificationBackfillStats::default()
+    };
+    for before in records {
+        if !is_baseline(&before.base.security) {
+            continue;
         }
-
-        for mut event in page.clone() {
-            stats.scanned += 1;
-            if !is_baseline(&event.base.security) {
-                continue;
+        let mut revisions = Vec::new();
+        let mut missing = false;
+        let repo = AssertionRepository::new(storage.clone());
+        for assertion in &before.assertion_refs {
+            let live = repo.get(space, assertion.id()).await?;
+            if let Some(row) = planning.current_row(live, assertion.id(), false)? {
+                revisions.push(row.evidence.revision.id().clone());
+            } else {
+                missing = true;
+                break;
             }
-
-            // Events reach their document one hop further out than the other
-            // kinds: through the assertions that evidence them.
-            let mut sources = Vec::new();
-            for assertion_ref in &event.assertion_refs {
-                let assertion = assertion_repo
-                    .get(space_id, assertion_ref.id())
-                    .await
-                    .map_err(PipelineError::StorageError)?;
-                if let Some(assertion) = assertion {
-                    if let Some(security) = resolver
-                        .security_for_revision(assertion.evidence.revision.id())
-                        .await?
-                    {
-                        sources.push(security);
-                    }
-                }
-            }
-
-            let Some(security) = combine(&sources) else {
-                stats.unresolved += 1;
-                continue;
-            };
-
-            event.base.security = security;
-            let id = event.base.id.clone();
-            repo.update(space_id, &id, event)
-                .await
-                .map_err(PipelineError::StorageError)?;
-            stats.updated += 1;
         }
-
-        if page.len() < PAGE_SIZE {
-            break;
+        if missing {
+            stats.unresolved += 1;
+            continue;
         }
-        if stats.scanned >= scan_cap {
-            stats.capped = true;
-            break;
+        let Some(docs) = resolver.documents(&revisions).await? else {
+            stats.unresolved += 1;
+            continue;
+        };
+        let mut after = before.clone();
+        if !inherit_documents(&mut after.base, &docs)? {
+            stats.unresolved += 1;
+            continue;
         }
-        cursor = page.last().map(|last| last.base.id.clone());
+        planning.stage_source_classification(before, after, &docs)?;
+        stats.updated += 1;
     }
-
     Ok(stats)
 }
 
@@ -485,15 +470,39 @@ mod tests {
 
     const SPACE: &str = "test_space";
 
-    const SCHEMA: &str = r"
-        DEFINE TABLE assertion SCHEMALESS;
-        DEFINE TABLE rel SCHEMALESS;
-        DEFINE TABLE attribute SCHEMALESS;
-        DEFINE TABLE event SCHEMALESS;
-        DEFINE TABLE entity SCHEMALESS;
-        DEFINE TABLE doc SCHEMALESS;
-        DEFINE TABLE doc_revision SCHEMALESS;
-    ";
+    async fn test_storage(embedded: bool) -> StorageClient {
+        let storage = if embedded {
+            StorageClient::new_embedded().await
+        } else {
+            StorageClient::new_memory().await
+        }
+        .expect("store");
+        if !embedded {
+            storage
+                .query_checked(include_str!(
+                    "../../../migrations/sql/031_source_publication.surql"
+                ))
+                .await
+                .expect("canonical schema");
+        }
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    SPACE.into(),
+                    "test".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .expect("space");
+        storage
+    }
 
     fn base_with(table: TableName, security: Security) -> BaseFields {
         let mut base = BaseFields::new(
@@ -510,7 +519,8 @@ mod tests {
     async fn seed_doc(storage: &StorageClient, security: Security) -> RecordId {
         let doc_id = RecordId::new_v4(TableName::Doc);
         let mut doc_base = BaseFields::new(doc_id.clone(), SPACE.to_string(), "test".to_string());
-        doc_base.security = security;
+        doc_base.security = security.clone();
+        doc_base.subjects_state = SubjectsState::Complete;
         DocRepository::new(storage.clone())
             .create(Doc {
                 base: doc_base,
@@ -528,10 +538,16 @@ mod tests {
         let revision_id = RecordId::new_v4(TableName::DocRevision);
         DocRevisionRepository::new(storage.clone())
             .create(DocRevision {
-                base: BaseFields::new(revision_id.clone(), SPACE.to_string(), "test".to_string()),
+                base: {
+                    let mut base =
+                        BaseFields::new(revision_id.clone(), SPACE.to_string(), "test".to_string());
+                    base.security = security;
+                    base.subjects_state = SubjectsState::Complete;
+                    base
+                },
                 doc: Link::new(doc_id),
                 text: "text".to_string(),
-                text_hash: "hash".to_string(),
+                text_hash: crate::extraction::AssertionValidator::hash_quote("text"),
                 renderer: RendererMetadata {
                     name: "test".to_string(),
                     version: "1.0.0".to_string(),
@@ -553,8 +569,8 @@ mod tests {
             revision: Link::new(revision_id.clone()),
             node: None,
             start: 0,
-            end: 10,
-            quote_hash: "hash".to_string(),
+            end: 4,
+            quote_hash: crate::extraction::AssertionValidator::hash_quote("text"),
         }
     }
 
@@ -608,10 +624,8 @@ mod tests {
     }
 
     /// Every derived kind, unclassified, all tracing back to one classified doc.
-    #[tokio::test]
-    async fn backfill_reclassifies_every_derived_kind() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+    async fn reclassifies_every_derived_kind(embedded: bool) {
+        let storage = test_storage(embedded).await;
 
         let revision_id = seed_doc(&storage, owner_only()).await;
         let assertion_id = seed_unclassified_assertion(&storage, &revision_id, "key-1").await;
@@ -706,12 +720,20 @@ mod tests {
         assert_eq!(event.base.security, expected);
     }
 
+    #[tokio::test]
+    async fn backfill_reclassifies_every_derived_kind() {
+        reclassifies_every_derived_kind(false).await;
+    }
+    #[tokio::test]
+    async fn embedded_backfill_reclassifies_every_derived_kind() {
+        reclassifies_every_derived_kind(true).await;
+    }
+
     /// The pass must converge: a second run writes nothing. Without this the
     /// sweep would rewrite the same rows every 15 minutes forever.
     #[tokio::test]
     async fn backfill_is_idempotent() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        let storage = test_storage(false).await;
 
         let revision_id = seed_doc(&storage, owner_only()).await;
         seed_unclassified_assertion(&storage, &revision_id, "key-1").await;
@@ -733,8 +755,7 @@ mod tests {
     /// written to — otherwise it would churn on every sweep.
     #[tokio::test]
     async fn unclassified_source_leaves_record_untouched() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        let storage = test_storage(false).await;
 
         let revision_id = seed_doc(&storage, baseline()).await;
         let assertion_id = seed_unclassified_assertion(&storage, &revision_id, "key-1").await;
@@ -757,8 +778,7 @@ mod tests {
     /// classification for the record.
     #[tokio::test]
     async fn missing_source_document_is_reported_not_guessed() {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(SCHEMA).await.expect("schema");
+        let storage = test_storage(false).await;
 
         let orphan_revision = RecordId::new_v4(TableName::DocRevision);
         let assertion_id = seed_unclassified_assertion(&storage, &orphan_revision, "key-1").await;
@@ -775,6 +795,112 @@ mod tests {
             .expect("get assertion")
             .expect("assertion exists");
         assert!(is_baseline(&assertion.base.security));
+    }
+
+    async fn prepared_backfill_is_atomic(embedded: bool) {
+        let storage = test_storage(embedded).await;
+        let revision = seed_doc(&storage, owner_only()).await;
+        let assertion_id = seed_unclassified_assertion(&storage, &revision, "prepared").await;
+        let planning = PlanningTruthMaintenanceStorage::new(storage.clone(), SPACE, None)
+            .await
+            .unwrap();
+        let result = prepare_classification_backfill_sweep(&planning, &storage, SPACE)
+            .await
+            .unwrap();
+        assert_eq!(result.updated, 1);
+        let assertions = AssertionRepository::new(storage.clone());
+        assert!(is_baseline(
+            &assertions
+                .get(SPACE, &assertion_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .base
+                .security
+        ));
+        let revision_row = DocRevisionRepository::new(storage.clone())
+            .get(SPACE, &revision)
+            .await
+            .unwrap()
+            .unwrap();
+        let docs = DocRepository::new(storage.clone());
+        let mut doc = docs
+            .get(SPACE, revision_row.doc.id())
+            .await
+            .unwrap()
+            .unwrap();
+        doc.base
+            .security
+            .handling
+            .push("concurrent restriction".into());
+        let id = doc.base.id.clone();
+        docs.update(SPACE, &id, doc).await.unwrap();
+        assert!(planning
+            .commit(
+                "classification_backfill",
+                SPACE,
+                &serde_json::json!({"test":true}),
+                &result
+            )
+            .await
+            .is_err());
+        assert!(is_baseline(
+            &assertions
+                .get(SPACE, &assertion_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .base
+                .security
+        ));
+        assert!(elephant_storage::SystemEventRepository::new(storage)
+            .list(SPACE, 100, None)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn embedded_backfill_prepares_without_writes_and_rejects_changed_doc() {
+        prepared_backfill_is_atomic(true).await;
+    }
+    #[tokio::test]
+    async fn surreal_backfill_prepares_without_writes_and_rejects_changed_doc() {
+        prepared_backfill_is_atomic(false).await;
+    }
+
+    #[test]
+    fn classification_preserves_subject_uncertainty_and_rejects_mixed_policy() {
+        let mut base = base_with(TableName::Assertion, baseline());
+        let mut doc_base = base_with(TableName::Doc, owner_only());
+        doc_base.subjects_state = SubjectsState::Partial;
+        doc_base
+            .subjects
+            .push(Link::new(RecordId::new_v4(TableName::Entity)));
+        let doc = Doc {
+            base: doc_base,
+            title: "classification".into(),
+            text: "text".into(),
+            sidecar_text: None,
+            source: None,
+            media_attachments: vec![],
+            rendition_key: "test".into(),
+            metadata: serde_json::json!({}),
+        };
+        assert!(inherit_documents(&mut base, std::slice::from_ref(&doc)).unwrap());
+        assert_eq!(base.subjects_state, SubjectsState::Partial);
+        assert_eq!(base.subjects, doc.base.subjects);
+        let mut incompatible = doc.clone();
+        incompatible.base.security.policy_id = "unrelated-policy".into();
+        let before = base.clone();
+        assert!(matches!(
+            inherit_documents(&mut base, &[doc, incompatible]),
+            Err(crate::error::PipelineError::ValidationError(_))
+        ));
+        assert_eq!(
+            serde_json::to_value(&base).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
     }
 
     fn baseline() -> Security {
@@ -825,7 +951,7 @@ mod tests {
 
     #[test]
     fn combine_returns_none_when_nothing_to_propagate() {
-        assert_eq!(combine(&[]), None);
+        assert_eq!(combine(&[]).unwrap(), None);
     }
 
     #[test]
@@ -838,8 +964,12 @@ mod tests {
         };
 
         // Order must not matter: the sealed document wins either way.
-        let sealed_last = combine(&[open.clone(), owner_only()]).expect("combined");
-        let sealed_first = combine(&[owner_only(), open]).expect("combined");
+        let sealed_last = combine(&[open.clone(), owner_only()])
+            .expect("compatible policies")
+            .expect("combined");
+        let sealed_first = combine(&[owner_only(), open])
+            .expect("compatible policies")
+            .expect("combined");
         assert_eq!(sealed_last, sealed_first);
 
         assert_eq!(sealed_last.level, 2);

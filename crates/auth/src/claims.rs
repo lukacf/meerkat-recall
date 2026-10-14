@@ -23,6 +23,14 @@ pub struct Claims {
     /// Space ID the token grants access to.
     #[serde(default)]
     pub space_id: Option<String>,
+    /// Explicit granted-space ceiling. Absence preserves the legacy single-space
+    /// claim; an explicitly empty set grants no space. Never selects a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spaces: Option<Vec<String>>,
+    /// Explicit short-lived authority for this named space's HTTP management.
+    /// Absence never enables bootstrap; ordinary service grants remain current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_space: Option<String>,
     /// Scopes/permissions granted.
     #[serde(default)]
     pub scopes: Vec<String>,
@@ -44,6 +52,16 @@ pub struct Claims {
 }
 
 impl Claims {
+    /// Checks the space ceiling without selecting a space or granting ABAC access.
+    #[must_use]
+    pub fn permits_space(&self, selected: &str) -> bool {
+        elephant_types::validation::validate_space_id(selected).is_ok()
+            && self.spaces.as_ref().map_or_else(
+                || self.space_id.as_deref() == Some(selected),
+                |spaces| spaces.iter().any(|space| space == selected),
+            )
+    }
+
     /// Checks if the claims include a specific scope.
     #[must_use]
     #[allow(dead_code)]

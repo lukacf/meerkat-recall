@@ -9,7 +9,7 @@ use crate::error::PipelineResult;
 use chrono::Utc;
 use elephant_storage::{EmbeddedRecord, EmbeddedStore, StorageClient, StorageError};
 use elephant_types::records::rel::Rel;
-use elephant_types::records::{AuditLog, Doc, Entity, Source, SystemEvent};
+use elephant_types::records::{AuditLog, Doc, Entity, Source};
 use std::time::Duration;
 use tracing::info;
 
@@ -143,26 +143,8 @@ impl RetentionWorker {
     }
 
     async fn cleanup_system_events(&self) -> PipelineResult<usize> {
-        if let Some(store) = self.client.embedded_store() {
-            let cutoff = retention_cutoff(self.retention_period)?;
-            let deleted = cleanup_created_before::<SystemEvent>(store.as_ref(), cutoff).await?;
-            if deleted > 0 {
-                info!("Cleaned up {} old system events", deleted);
-            }
-            return Ok(deleted);
-        }
-
         let cutoff = retention_cutoff(self.retention_period)?;
-        let query = "DELETE system_event WHERE created_at < <datetime> $cutoff RETURN BEFORE";
-        let mut response = self
-            .client
-            .query_bind(query, serde_json::json!({ "cutoff": cutoff.to_rfc3339() }))
-            .await?;
-
-        let deleted = parse_deleted_count(
-            &mut response,
-            "Failed to parse retention system event delete",
-        )?;
+        let deleted = elephant_storage::event_sequence::retire_before(&self.client, cutoff).await?;
         if deleted > 0 {
             info!("Cleaned up {} old system events", deleted);
         }
@@ -299,8 +281,8 @@ mod tests {
                  CREATE doc:live SET space_id = 'default';
                  CREATE audit_log:old SET space_id = 'default', created_at = <datetime> '2020-01-01T00:00:00Z';
                  CREATE audit_log:fresh SET space_id = 'default', created_at = time::now();
-                 CREATE system_event:old SET space_id = 'default', created_at = <datetime> '2020-01-01T00:00:00Z';
-                 CREATE system_event:fresh SET space_id = 'default', created_at = time::now();",
+                 CREATE system_event:old SET space_id = 'default', seq = 1, created_at = <datetime> '2020-01-01T00:00:00Z';
+                 CREATE system_event:fresh SET space_id = 'default', seq = 2, created_at = time::now();",
             )
             .await
             .expect("seed rows")

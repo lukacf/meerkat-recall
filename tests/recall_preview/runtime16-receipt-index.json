@@ -1,0 +1,53 @@
+{
+  "format": "recall-independent-runtime-receipt-index/v1",
+  "scope": "original centrally executed Runtime16; qualification performed no execution",
+  "product_acceptance": false,
+  "source": "a7e46c17fad0be72b2d483afafe8d1675356d65e",
+  "evidence_manifest_sha256": "be63be01331388bc68823d5d46e8bcf8c1e16a60ae5e4b9ad2e8c46f74265911",
+  "receipt_sha256": "616d03e73c8b073249af4f208880706466686eadf2c1ff330211121d8f87e86a",
+  "raw_log_sha256": "995caa2f5a21b1297f37f7196e5d8e910e59f4aa1698b73ae784444f41e79bc5",
+  "summary": {
+    "counts": {
+      "PASS": 3267,
+      "SIGABRT": 11,
+      "FAIL": 117
+    },
+    "tests_observed": 3395,
+    "tests_expected": 3395,
+    "skipped": 101,
+    "exit_code": 100,
+    "head": "a7e46c17fad0be72b2d483afafe8d1675356d65e",
+    "final": true,
+    "runtime_pass": false,
+    "parser": "first occurrence of package+test; excludes repeated terminal failure summary"
+  },
+  "started": "2026-10-07T03:06:02.725864+00:00",
+  "finished": "2026-10-07T03:33:02.786000+00:00",
+  "elapsed_seconds": 1620.0599359499756,
+  "qualification_owned_original_nonpasses": [
+    {
+      "status": "SIGABRT",
+      "name": "elephant-pipeline maintenance_commit::tests::independent_wiki_definition_oracles::surreal_actual_planner_never_revives_deleted_definition_or_replaces_sibling",
+      "location": null,
+      "error": "thread 'maintenance_commit::tests::independent_wiki_definition_oracles::surreal_actual_planner_never_revives_deleted_definition_or_replaces_sibling' (992684) has overflowed its stack\nfatal runtime error: stack overflow, aborting\n(test aborted with signal 6: SIGABRT)"
+    },
+    {
+      "status": "FAIL",
+      "name": "elephant-storage source_publication_manifest::tests::independent_contact_erasure_oracles::embedded_corrupt_survivor_refuses_physical_purge_then_recovers_original_intent",
+      "location": "crates/storage/src/../../../tests/recall_preview/source_lifecycle_contact_oracles.rs:100:14",
+      "error": "called `Result::unwrap()` on an `Err` value: ErasureInProgress"
+    },
+    {
+      "status": "FAIL",
+      "name": "elephant-storage source_publication_manifest::tests::independent_contact_erasure_oracles::surreal_corrupt_survivor_refuses_physical_purge_then_recovers_original_intent",
+      "location": "crates/storage/src/../../../tests/recall_preview/source_lifecycle_contact_oracles.rs:105:17",
+      "error": "called `Result::unwrap()` on an `Err` value: ErasureInProgress"
+    }
+  ],
+  "limits": [
+    "Source repairs and new candidatefamilies outsidea7e are not covered by this receipt.",
+    "All128 nonpasses require current exact evidence after repair; no complete plan gatequalified.",
+    "Original85ignored same-head lane stillseparate; no final85 result received byD.",
+    "Ownwiki nestedfuture source review e59 doesnotprove runtimefix; bothcorruptsurvivor fault-restoration failures await correctprivateguard seam, notweakenedbarrier."
+  ]
+}

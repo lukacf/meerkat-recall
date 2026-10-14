@@ -1,0 +1,82 @@
+{
+  "format": "recall-public-graph-fixture/v1",
+  "source_request": {
+    "source": {
+      "id": "source:b27ab4f6-2aba-5086-881d-0f4b0580fdb8",
+      "space_id": "qualification-business",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "business-policy",
+        "level": 7,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "type": "manual",
+      "hash": "64cd96e795bbc0fcc28d94cc6fd77f848b67d0e31cb28291c9dbe560936b6e26",
+      "external_id": "workload/atlas-03",
+      "uri": "https://example.invalid/recall-workload/business/03",
+      "metadata": {}
+    },
+    "doc": {
+      "id": "doc:efc118e3-b79f-5515-b16f-16e9fae1b665",
+      "space_id": "qualification-business",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "business-policy",
+        "level": 7,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "title": "workload/atlas-03",
+      "text": "For business project Atlas-03, the responsible custodian is Bruno-03. Its approved supply limit is 134 units. This record applies only to business scope.\nBruno-03 now maintains the Atlas-03 amber competition notebook.",
+      "source": null,
+      "sidecar_text": null,
+      "media_attachments": [],
+      "rendition_key": "d28/text/workload/atlas-03/full-fw08-a-r2",
+      "metadata": {}
+    },
+    "ingest_mode": "graph",
+    "intake": {
+      "revision_id": "full-fw08-a-r2",
+      "idempotency_key": "literal-c0356a6f765327a9e877e7e949e80e903747e1a81783ec3a781c81720bdf58dc"
+    }
+  },
+  "rendered_text": "For business project Atlas-03, the responsible custodian is Bruno-03. Its approved supply limit is 134 units. This record applies only to business scope.\nBruno-03 now maintains the Atlas-03 amber competition notebook.\n",
+  "rendered_sha256": "bd58b710886c7bd02703b5c04e9884a6f8b5af95956eed52a2dcbe200d4919ea",
+  "expected_assertions": [
+    {
+      "subject_text": "Bruno-03",
+      "predicate_raw": "maintains",
+      "object_text": "Atlas-03 amber competition notebook",
+      "object_literal": null,
+      "subject_entity_type": "person",
+      "object_entity_type": "document",
+      "confidence": 1.0,
+      "significance": "medium",
+      "source_event_time": null,
+      "start": 154,
+      "end": 217,
+      "quote": "Bruno-03 now maintains the Atlas-03 amber competition notebook.",
+      "quote_hash": "155590584c653fdebb846c1b642da87a34a20c6a1221521cac4b8107de40f824"
+    }
+  ],
+  "extract_rule_id": "business-fw08-a-extract"
+}

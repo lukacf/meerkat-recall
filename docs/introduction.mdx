@@ -12,6 +12,20 @@ Applications connect through HTTP. Agents use MCP tools to ingest evidence,
 search, navigate relationships, and read cited context. Spaces and
 attribute-based access control restrict what each caller can see or change.
 
+Recall can serve any application or agent stack through those interfaces. In
+Meerkat, Core runs agents and Meta manages the application and its agent memory
+lifecycle. Recall adds shared knowledge with sources, relationships and access
+rules. You can use it independently or add it to an existing Meerkat application.
+See the [Meerkat introduction](https://docs.rkat.ai/introduction) for component choices.
+
+This branch targets Recall 0.9.0 with exact-pinned Meerkat 0.9.0 dependencies.
+The latest published Recall release is
+[v0.1.0](https://github.com/lukacf/meerkat-recall/releases/tag/v0.1.0), which uses
+Meerkat 0.8.51. Start with [binary installation](/installation) and
+[service setup](/operations/service-setup); consult the
+[release notes](https://github.com/lukacf/meerkat-recall/releases) for supported
+platforms and known limits.
+
 ## Follow one piece of evidence
 
 Suppose a project note says, "Alice owns the Project Cedar test plan."
@@ -26,7 +40,7 @@ Suppose a project note says, "Alice owns the Project Cedar test plan."
    and freshness information, subject to the reader's authorization.
 
 ```mermaid
-flowchart LR
+flowchart TB
     Source["Source material"] --> Evidence["Document evidence"]
     Evidence --> Claims["Extracted assertions"]
     Claims --> Graph["Graph and truth slots"]
@@ -70,7 +84,9 @@ evidence they were built from. See [documents](/concepts/documents) and
 [assertions](/concepts/assertions).
 
 **Storage is an operational choice.** SurrealDB is the default durable backend.
-The embedded `elephant-db` kernel runs in memory and supports snapshots. The
+The managed embedded `elephant-db` runtime synchronizes acknowledged commits
+to a write-ahead log when a persistent destination is configured; explicitly
+ephemeral library/test stores remain volatile. The
 [deployment guide](/operations/deployment) explains persistence and runtime
 configuration.
 

@@ -1,0 +1,39 @@
+{
+  "format": "recall-gateway-runtime-inputs/v2",
+  "artifact_source_commit": "0000000000000000000000000000000000000000",
+  "recall_bundle": {
+    "root": "/REPLACE/verified-recall-bundle",
+    "provenance_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "paired_bundle": {
+    "root": "/REPLACE/verified-paired-bundle",
+    "build_provenance_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "source_provenance_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "packages": [
+    {
+      "file": {
+        "path": "/REPLACE/reviewed-python3.11-minimal.deb",
+        "bytes": 0,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "package": "python3.11-minimal",
+      "version": "3.11.REPLACE-WITH-REVIEWED-VERSION",
+      "architecture": "amd64"
+    }
+  ],
+  "package_paths": [
+    "usr/bin/python3",
+    "usr/lib/python3.11",
+    "lib/x86_64-linux-gnu",
+    "usr/lib/x86_64-linux-gnu",
+    "lib64"
+  ],
+  "harness_files": [
+    {
+      "repository_path": "scripts/qualification/primary_provider_driver.py",
+      "bytes": 0,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

@@ -139,6 +139,12 @@ impl DocRevisionRepository {
         Self { client }
     }
 
+    /// Shares the client for preparation through the canonical transaction owner.
+    #[must_use]
+    pub fn storage_client(&self) -> StorageClient {
+        self.client.clone()
+    }
+
     /// Gets multiple revisions by ID while preserving the requested order.
     ///
     /// Missing or soft-deleted revisions are skipped.
@@ -271,7 +277,9 @@ impl DocRevisionRepository {
     }
 
     /// Converts a DocRevision to a SurrealDB value for insertion.
-    fn doc_revision_to_value(item: &DocRevision) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn doc_revision_to_value(
+        item: &DocRevision,
+    ) -> StorageResult<surrealdb::sql::Value> {
         let mut obj = crate::surreal::base_fields_to_object(&item.base)?;
         obj.insert(
             "doc".to_string(),
@@ -478,6 +486,37 @@ impl Repository<DocRevision> for DocRevisionRepository {
     }
 }
 
+impl DocRevisionRepository {
+    /// Reads physical row state for atomic source lifecycle inverse preparation.
+    pub(crate) async fn get_including_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<DocRevision>> {
+        if let Some(store) = self.client.embedded_store() {
+            return store.get::<DocRevision>(space_id, id, true).await;
+        }
+
+        // Record access; the space_id/deleted_at WHERE clause preserves space
+        // isolation — a cross-space id resolves to NONE.
+        let mut response = self
+            .client
+            .query_bind(
+                &format!(
+                    "SELECT {DOC_REVISION_PROJECTION} FROM ONLY $id WHERE space_id = $space_id"
+                ),
+                crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
+            )
+            .await?;
+
+        let item: Option<DocRevisionDb> = response
+            .take(0)
+            .map_err(|e| StorageError::QueryError(format!("Failed to parse doc_revision: {e}")))?;
+
+        item.map(DocRevision::try_from).transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -580,6 +619,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_doc_revision() {
         let repo = setup_test_repo().await;
         let item = create_test_doc_revision();
@@ -591,6 +634,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_doc_revision() {
         let repo = setup_test_repo().await;
         let item = create_test_doc_revision();
@@ -604,6 +651,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_doc_revision_by_id() {
         let repo = setup_test_repo().await;
         let item = create_test_doc_revision();
@@ -617,6 +668,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_doc_revision_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_doc_revision();
@@ -636,6 +691,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_doc_revision() {
         let repo = setup_test_repo().await;
         let item = create_test_doc_revision();
@@ -651,6 +710,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_doc_revision() {
         let repo = setup_test_repo().await;
         let item = create_test_doc_revision();
@@ -683,6 +746,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_doc_revision_cross_space_get_is_none_embedded() {
         let client = StorageClient::new_embedded().await.unwrap();
         let repo = DocRevisionRepository::new(client);
@@ -690,6 +757,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_by_id_skips_deleted_revision() {
         let repo = setup_test_repo().await;
         let item = create_test_doc_revision();

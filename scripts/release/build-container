@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# One scheduled Cargo build produces both the container and exact Linux archive.
+# No publication, installation, service launch or provider call.
+set -euo pipefail
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$root"
+if [[ $# != 2 ]]; then
+  echo 'usage: scripts/release/build-container LOCAL_TAG OUTPUT_DIRECTORY' >&2
+  exit 2
+fi
+exec python3 scripts/release/container_artifact.py build --tag "$1" --output-dir "$2"

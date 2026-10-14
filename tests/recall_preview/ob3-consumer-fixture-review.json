@@ -1,0 +1,28 @@
+{
+  "format": "recall-ob3-consumer-fixture-review/v1",
+  "source_commit": "753e44efc98b5c6cf9cf754c69dda8e65a5e02f1",
+  "source_review_only": true,
+  "execution_authorized": false,
+  "product_acceptance": false,
+  "fixture_sha256": "096b43e37f1e3ca6d4afacfe2b1fa544d059f2244edd6238848132d9fe644402",
+  "fixture_path": "docs/internal/recall-preview-contract/ob3-consumer-fixtures.json",
+  "documentation_sha256": "6c7a8efa9b54c72afb1655b244b256fe83b777c6c95dee82abc77810f22b2c10",
+  "documentation_path": "docs/internal/recall-preview-contract/ob3-consumer-fixtures.md",
+  "case_count": 14,
+  "source_blockers_in_core_fixture_scope": [],
+  "reviewed_properties": [
+    "Original persisted idempotency key, full request and expected generation retained across uncertain retry; historical replay cannot be treated as current head.",
+    "A-B-A uses a new original intent and current generation; coverage tracks current A2 operation even if an older A remains published.",
+    "Changed immutable A negative captures current head_A2 and overrides expected_generation with it; fresh unseen key isolates immutable-input refusal, preserving original current head/operation.",
+    "External source/revision identities remain separate from typed immutable DocRevision identity; exact complete rendered quote and half-open UTF8 span remain mandatory.",
+    "One explicit20-to10 new size request preserves all constraints and counts one logical read; source2MB admission and complete262144JSON response limits remain distinct.",
+    "Absent expected sources cannot trigger unconstrained current-evidence claims. Actual configured outage requires positive reads for every independently predeclared expected participant, exact accounting and all requested workers completed.",
+    "Lifecycle removal requires actual consumer seam; physical source deletion plus bounded backup retention is OB3 gate, with restore replay a separate Recall requirement.",
+    "Outage adapter fields now follow root-relayed original ob3-recall-outage-1 short names and fallback reasons, including refused and transport; original expected participant set cannot come from candidate verdict."
+  ],
+  "remaining_external_custody": [
+    "Original OB3 schema commit and raw schema hash still require root relay and exact producer-source review. This does not block delivery of the core A-B-A/head/evidence/size fixtures.",
+    "No actual OB3 worker/twin-run/production-clone execution occurred here. Original signed receipts and independently declared requested/expected-participant sets remain required.",
+    "No artifact, source max-size Graph,140-concurrent-call, installed-runtime, physical-erasure or backup-retention acceptance is inferred."
+  ]
+}

@@ -1,0 +1,119 @@
+{
+  "format": "recall-primary-provider-proposal/v1",
+  "status": "proposal-not-authorized",
+  "evidence_class": "planning-only",
+  "catalog_file": "provider-catalog-facts.json",
+  "catalog_file_sha256": "9b40bf9b99a93b3f6d1ba7cf0b402fd46b01b4aac42205c9681c8e894a03e2ce",
+  "corpus_canonical_sha256": "fa6a84149483d3511fd559ac9a13e89d6c1c041ae97d6f15084b52b7d7f21c1b",
+  "expectations_file": "semantic-expectations-approval.json",
+  "source_review_sha": "d3c78fec62bfb3583abe1feef78dc84e651be364",
+  "source_revisions_per_backend": 28,
+  "original_queries_per_backend": 24,
+  "backends": [
+    "surreal-db",
+    "elephant-db"
+  ],
+  "ranking_modes": [
+    "semantic",
+    "hybrid"
+  ],
+  "generation": {
+    "provider": "openai",
+    "model": "gpt-6.1-sol",
+    "reasoning_effort": "medium",
+    "reasoning_selection": "explicit medium inserted by pinned OpenAI Responses adapter for catalog-recognized reasoning models; installed wire capture pending",
+    "max_input_tokens": 32768,
+    "max_output_tokens": 16384
+  },
+  "spaces": [
+    {
+      "id": "semantics-household",
+      "policy": "synthetic-household",
+      "level": 3,
+      "connection_id": "qualification-household-openai",
+      "embedding_profile_id": "qualification-household-small-1536-v1",
+      "generation_profile_id": "qualification-household-sol-v1",
+      "embedding_model": "text-embedding-3-small",
+      "dimensions": 1536
+    },
+    {
+      "id": "semantics-business",
+      "policy": "synthetic-business",
+      "level": 7,
+      "connection_id": "qualification-business-openai",
+      "embedding_profile_id": "qualification-business-large-3072-v1",
+      "generation_profile_id": "qualification-business-sol-v1",
+      "embedding_model": "text-embedding-3-large",
+      "dimensions": 3072
+    }
+  ],
+  "provider": {
+    "endpoint": "https://api.openai.com/v1",
+    "credential_ref": "OPENAI_API_KEY",
+    "account_id": null,
+    "account_isolation_claim": false,
+    "version_kind": "operator-pinned-configuration-with-mutable-provider-alias",
+    "operator_deployment_version": null,
+    "preprocessing": "text-v1",
+    "service_tier": "standard",
+    "regional_processing": false,
+    "hosted_paid_tools": false
+  },
+  "dispatch_limits_per_backend": {
+    "document_embedding": 28,
+    "query_embedding": 48,
+    "triage": 0,
+    "extraction": 56,
+    "support_verification": 56,
+    "summary": 8,
+    "promotion_and_identity_disambiguation": 4,
+    "truth_maintenance": 4,
+    "wiki_planner_writer_verifier": 12
+  },
+  "embedding_max_total_input_tokens_per_dispatch": 8192,
+  "budgets": {
+    "dispatches_both_backends": 432,
+    "usd_stop_cap": "75.00",
+    "wall_time_seconds": 5400,
+    "max_concurrent_dispatches": 2,
+    "model_deadline_seconds": 120,
+    "response_bytes": 262144,
+    "retry_policy": "Every physical retry/continuation reserves a new full dispatch allowance; unknown usage never releases reservation."
+  },
+  "required_primary_operations": [
+    "document_embedding",
+    "query_embedding",
+    "extraction",
+    "support_verification"
+  ],
+  "conditional_operations": [
+    "summary",
+    "promotion_disambiguation",
+    "identity_disambiguation",
+    "truth_maintenance",
+    "wiki_planner",
+    "wiki_writer",
+    "wiki_verifier"
+  ],
+  "no_model_operations": [
+    "deterministic-default-triage",
+    "text-passthrough-render"
+  ],
+  "distinct_gates": [
+    "local-fastembed-pinned-assets-and-installed-inference",
+    "cross-provider-and-independent-account-isolation",
+    "gpt-6-astra-medium-consumer-fleet-parity",
+    "darwin-arm64-native-install",
+    "container-persistent-volume-install",
+    "approximately-140-measured-overlapping-calls",
+    "source-erasure-and-backup-retention-and-recall-restore-barrier"
+  ],
+  "unfilled_prerequisites": [
+    "Exact source and installed artifact hashes, features and schema.",
+    "Approved real account/deployment identity and explicit credential reference custody.",
+    "Trusted physical-dispatch input/output/count/money/time enforcement with independent denial tests.",
+    "Recorded outgoing reasoning selection and account access to exact models.",
+    "Run-specific explicit user spending approval after runnable artifact and enforcement are reviewable."
+  ],
+  "execution_authorized": false
+}

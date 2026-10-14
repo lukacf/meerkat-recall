@@ -1,0 +1,25 @@
+{
+  "format": "recall-installed-fake-vectors-run/v1",
+  "execution_authorized": false,
+  "backend": "surreal-db",
+  "source_commit": "REPLACE_WITH_EXACT_INSTALLED_SOURCE_SHA",
+  "archive": "/inputs/exact-native-archive.tar.gz",
+  "archive_sha256": "REPLACE_WITH_EXACT_ARCHIVE_SHA256",
+  "binary_sha256": "REPLACE_WITH_EXACT_INSTALLED_BINARY_SHA256",
+  "run_directory": "/work/new-isolated-seed17-surreal-local384",
+  "expectation_review": "/inputs/independent-seeded-plan-review.json",
+  "expectation_review_sha256": "REPLACE_WITH_EXACT_INDEPENDENT_REVIEW_SHA256",
+  "nonce": "REPLACE_WITH_NEW_RUN_NONCE",
+  "fixture_timestamp": "2026-10-07T00:00:00Z",
+  "expires_at": "REPLACE_WITH_ROOT_ALLOCATED_EXPIRY",
+  "original_allocation_clock": {
+    "mono_before_ns": 0,
+    "wall_ns": 0,
+    "mono_after_ns": 0
+  },
+  "seed": 17,
+  "configuration": "local384",
+  "external_provider_sends": 0,
+  "paid_model_calls": 0,
+  "fresh_spaces_authorized": ["semantics-household", "semantics-business"]
+}

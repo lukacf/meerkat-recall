@@ -1,0 +1,165 @@
+# Render the image to its qualified registry digest before any deployment.
+# Requires a CSI StorageClass supporting ReadWriteOncePod (GKE PD CSI supports it).
+apiVersion: v1
+kind: Service
+metadata:
+  name: meerkat-recall
+spec:
+  clusterIP: None
+  selector:
+    app: meerkat-recall
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: meerkat-recall
+spec:
+  serviceName: meerkat-recall
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app: meerkat-recall
+  template:
+    metadata:
+      labels:
+        app: meerkat-recall
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 75
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: schema
+          image: RECALL_IMAGE_BY_DIGEST
+          command: ["/bin/sh", "-ec", "mkdir -p /var/lib/meerkat-recall/data/config; exec meerkat-recall migrate"]
+          envFrom:
+            - configMapRef:
+                name: meerkat-recall
+            - secretRef:
+                name: meerkat-recall-auth
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/meerkat-recall/data}
+            - {name: recovery, mountPath: /var/lib/meerkat-recall/recovery}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        - name: probe-token
+          image: RECALL_IMAGE_BY_DIGEST
+          command: ["/bin/sh", "-ec"]
+          args:
+            - >-
+              meerkat-recall service-token issue --subject recall-readiness
+              --space "$RECALL_PROBE_SPACE" --scope read:status --read-only
+              --expires-in 3600 --output /run/recall-tokens/readiness
+          envFrom:
+            - configMapRef: {name: meerkat-recall}
+            - secretRef: {name: meerkat-recall-auth}
+          volumeMounts:
+            - {name: tokens, mountPath: /run/recall-tokens}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      containers:
+        - name: recall
+          image: RECALL_IMAGE_BY_DIGEST
+          args: ["meerkat-recall", "serve", "--shutdown-timeout-seconds", "60"]
+          ports:
+            - {name: http, containerPort: 3000}
+          envFrom:
+            - configMapRef: {name: meerkat-recall}
+            - secretRef: {name: meerkat-recall-auth}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/meerkat-recall/data}
+            - {name: data, mountPath: /var/lib/meerkat-recall/.elephant, subPath: config}
+            - {name: recovery, mountPath: /var/lib/meerkat-recall/recovery}
+            - {name: backups, mountPath: /var/lib/meerkat-recall/backups}
+            - {name: tokens, mountPath: /run/recall-tokens, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+          startupProbe:
+            httpGet: {path: /v1/health, port: http}
+            periodSeconds: 5
+            failureThreshold: 120
+          livenessProbe:
+            httpGet: {path: /v1/health, port: http}
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - exec meerkat-recall --api-url http://127.0.0.1:3000 --token-file /run/recall-tokens/readiness status --require-ready --space "$RECALL_PROBE_SPACE"
+            periodSeconds: 10
+            timeoutSeconds: 12
+            failureThreshold: 1
+          resources:
+            requests: {cpu: "2", memory: 4Gi}
+            limits: {cpu: "8", memory: 16Gi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        - name: probe-token-rotation
+          image: RECALL_IMAGE_BY_DIGEST
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              while sleep 1800; do
+                next="/run/recall-tokens/.readiness.$$"
+                meerkat-recall service-token issue --subject recall-readiness \
+                  --space "$RECALL_PROBE_SPACE" --scope read:status --read-only \
+                  --expires-in 3600 --output "$next"
+                mv "$next" /run/recall-tokens/readiness
+              done
+          envFrom:
+            - configMapRef: {name: meerkat-recall}
+            - secretRef: {name: meerkat-recall-auth}
+          volumeMounts:
+            - {name: tokens, mountPath: /run/recall-tokens}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: "1", memory: 256Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumes:
+        - name: tokens
+          emptyDir: {medium: Memory}
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOncePod]
+        resources: {requests: {storage: 100Gi}}
+    - metadata: {name: recovery}
+      spec:
+        accessModes: [ReadWriteOncePod]
+        resources: {requests: {storage: 10Gi}}
+    - metadata: {name: backups}
+      spec:
+        accessModes: [ReadWriteOncePod]
+        resources: {requests: {storage: 100Gi}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meerkat-recall
+data:
+  ELEPHANT_HOST: 0.0.0.0
+  ELEPHANT_PORT: "3000"
+  ELEPHANT_DB: surreal-db
+  SURREALDB_URL: rocksdb:///var/lib/meerkat-recall/data/store
+  SURREALDB_NAMESPACE: recall
+  SURREALDB_DATABASE: main
+  ELEPHANT_DURABILITY_PATH: /var/lib/meerkat-recall/recovery
+  ELEPHANT_SNAPSHOT_DIR: /var/lib/meerkat-recall/backups
+  JWT_ISSUER: recall-local
+  JWT_AUDIENCE: recall
+  RECALL_PROBE_SPACE: operations
+  XDG_CACHE_HOME: /tmp/recall-cache
+  PIPELINE_SKILLS_DIR: /usr/share/meerkat-recall/skills

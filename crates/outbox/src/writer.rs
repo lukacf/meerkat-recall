@@ -28,60 +28,25 @@ impl OutboxWriter {
 
     /// Writes an event to the outbox.
     ///
-    /// Allocates a sequence number and persists the event.
+    /// Reserves its sequence and persists the event in one transaction, above
+    /// both current events and the durable floor retained by earlier deletions.
     ///
     /// # Errors
     ///
     /// Returns an error if sequence allocation or persistence fails.
     pub async fn write(&self, payload: OutboxPayload) -> OutboxResult<SystemEvent> {
-        if let Some(store) = self.client.embedded_store() {
-            return store
-                .mutate(|mutation| {
-                    let seq = mutation
-                        .scan::<SystemEvent>()?
-                        .into_iter()
-                        .filter(|event| event.base.space_id == payload.space_id)
-                        .map(|event| event.seq)
-                        .max()
-                        .unwrap_or(0)
-                        + 1;
-
-                    let id = RecordId::new_v4(TableName::SystemEvent);
-                    let mut base =
-                        BaseFields::new(id, payload.space_id.clone(), payload.actor.clone());
-                    base.security = Security {
-                        policy_id: "default".to_string(),
-                        level: 0,
-                        labels: vec![],
-                        handling: vec![],
-                    };
-                    base.provenance = Provenance::default();
-                    if let Some(run_id) = &payload.run_id {
-                        base.provenance.run_id = Some(run_id.clone());
-                    }
-                    base.subjects_state = SubjectsState::Complete;
-
-                    let event = SystemEvent {
-                        base,
-                        seq,
-                        event_type: payload.event_type.clone(),
-                        payload: serde_json::to_value(&payload).unwrap_or_default(),
-                    };
-
-                    mutation.create(event.clone())?;
-                    Ok(event)
-                })
-                .await
-                .map_err(|error| OutboxError::WriteError(error.to_string()));
-        }
-
+        let serialized_payload = serde_json::to_value(&payload)
+            .map_err(|error| OutboxError::WriteError(error.to_string()))?;
+        // Embedded mutations serialize locally. Keep the native writer's
+        // existing conflict retry limit and backoff around the whole transaction.
+        let attempts = if self.client.embedded_store().is_some() {
+            1
+        } else {
+            MAX_WRITE_RETRIES
+        };
         let mut last_error: Option<OutboxError> = None;
 
-        for attempt in 0..MAX_WRITE_RETRIES {
-            // Get next sequence number for this space
-            let seq = self.next_sequence(&payload.space_id).await?;
-
-            // Create the system event
+        for attempt in 0..attempts {
             let id = RecordId::new_v4(TableName::SystemEvent);
             let mut base = BaseFields::new(id, payload.space_id.clone(), payload.actor.clone());
             base.security = Security {
@@ -98,16 +63,19 @@ impl OutboxWriter {
 
             let event = SystemEvent {
                 base,
-                seq,
+                // Only the atomic storage helper assigns the actual sequence.
+                seq: 0,
                 event_type: payload.event_type.clone(),
-                payload: serde_json::to_value(&payload).unwrap_or_default(),
+                payload: serialized_payload.clone(),
             };
 
-            // Persist to SurrealDB
-            match self.persist(&event).await {
-                Ok(()) => return Ok(event),
+            match elephant_storage::event_sequence::append_system_event(&self.client, event)
+                .await
+                .map_err(|error| OutboxError::WriteError(error.to_string()))
+            {
+                Ok(event) => return Ok(event),
                 Err(OutboxError::WriteError(msg)) => {
-                    if Self::is_retryable_write_error(&msg) && attempt + 1 < MAX_WRITE_RETRIES {
+                    if Self::is_retryable_write_error(&msg) && attempt + 1 < attempts {
                         last_error = Some(OutboxError::WriteError(msg));
                         let backoff_ms = 5u64.saturating_mul((attempt + 1) as u64);
                         sleep(Duration::from_millis(backoff_ms)).await;
@@ -124,30 +92,6 @@ impl OutboxWriter {
         }))
     }
 
-    /// Gets the next sequence number for a space.
-    async fn next_sequence(&self, space_id: &str) -> OutboxResult<i64> {
-        #[derive(serde::Deserialize, Default)]
-        struct MaxSeq {
-            max_seq: Option<i64>,
-        }
-
-        let mut result = self
-            .client
-            .query_bind(
-                "SELECT math::max(seq) as max_seq FROM system_event WHERE space_id = $space_id GROUP ALL",
-                serde_json::json!({ "space_id": space_id }),
-            )
-            .await
-            .map_err(|e| OutboxError::SequenceError(e.to_string()))?;
-
-        let rows: Vec<MaxSeq> = result
-            .take(0)
-            .map_err(|e| OutboxError::SequenceError(e.to_string()))?;
-
-        let max = rows.first().and_then(|r| r.max_seq).unwrap_or(0);
-        Ok(max + 1)
-    }
-
     fn is_retryable_write_error(msg: &str) -> bool {
         let lower = msg.to_lowercase();
         lower.contains("unique")
@@ -155,72 +99,6 @@ impl OutboxWriter {
             || lower.contains("system_event_space_seq")
             || lower.contains("conflict")
             || lower.contains("retry")
-    }
-
-    /// Persists a system event to storage.
-    async fn persist(&self, event: &SystemEvent) -> OutboxResult<()> {
-        let id_str = event.base.id.to_string();
-        let uuid = id_str.split(':').nth(1).unwrap_or("");
-        let bindings = serde_json::json!({
-            "id": uuid,
-            "space_id": event.base.space_id,
-            "created_at": event.base.created_at,
-            "updated_at": event.base.updated_at,
-            "created_by": event.base.created_by,
-            "deleted_at": event.base.deleted_at,
-            "security": event.base.security,
-            "provenance": event.base.provenance,
-            "subjects": event
-                .base
-                .subjects
-                .iter()
-                .map(|s| s.id().to_string())
-                .collect::<Vec<_>>(),
-            "subjects_state": match event.base.subjects_state {
-                SubjectsState::Complete => "complete",
-                SubjectsState::Partial => "partial",
-                SubjectsState::Unknown => "unknown",
-            },
-            "seq": event.seq,
-            "event_type": event.event_type,
-            "payload": event.payload,
-        });
-
-        let mut response = self
-            .client
-            .query_bind(
-                r"
-                CREATE type::thing('system_event', $id) CONTENT {
-                    space_id: $space_id,
-                    created_at: type::datetime($created_at),
-                    updated_at: type::datetime($updated_at),
-                    created_by: $created_by,
-                    deleted_at: IF $deleted_at IS NONE THEN NONE ELSE type::datetime($deleted_at) END,
-                    security: $security,
-                    provenance: {
-                        sources: array::map($provenance.sources, |$s| type::thing(string::split($s, ':')[0], string::split($s, ':')[1])),
-                        extractor: $provenance.extractor,
-                        run_id: $provenance.run_id,
-                        chain: $provenance.chain
-                    },
-                    subjects: IF $subjects IS NONE THEN NONE ELSE array::map($subjects, |$s| type::thing(string::split($s, ':')[0], string::split($s, ':')[1])) END,
-                    subjects_state: $subjects_state,
-                    seq: $seq,
-                    event_type: $event_type,
-                    payload: $payload
-                };
-                ",
-                bindings,
-            )
-            .await
-            .map_err(|e| OutboxError::WriteError(e.to_string()))?;
-
-        // Ensure statement errors surface (SurrealDB may return per-statement errors in Response).
-        let _: surrealdb::Value = response
-            .take(0usize)
-            .map_err(|e| OutboxError::WriteError(e.to_string()))?;
-
-        Ok(())
     }
 }
 
@@ -265,6 +143,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain the original writer fixture lifetime through event sequence, type and space assertions."
+    )]
     async fn test_write_event() {
         let writer = setup_test_writer().await;
         let payload = OutboxPayload::new(
@@ -281,6 +163,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain one original writer fixture across the complete sequence loop and every monotonicity assertion."
+    )]
     async fn test_sequence_increments() {
         let writer = setup_test_writer().await;
 
@@ -296,6 +182,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain the original writer fixture lifetime through all interleaved per-space sequence assertions."
+    )]
     async fn test_sequence_per_space() {
         let writer = setup_test_writer().await;
 
@@ -328,6 +218,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain the original writer fixture lifetime through the exact serialized records and run-id assertions."
+    )]
     async fn test_payload_serialization() {
         use crate::producer::{EventOperation, RecordRef};
 

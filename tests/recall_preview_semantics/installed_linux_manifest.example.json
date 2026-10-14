@@ -1,0 +1,13 @@
+{
+  "format": "recall-installed-linux-run/v1",
+  "execution_authorized": false,
+  "backend": "elephant-db",
+  "archive": "/absolute/reviewed/candidate.tar.gz",
+  "archive_sha256": "REPLACE_TRUSTED_ARCHIVE_SHA256",
+  "source_commit": "REPLACE_EXACT_SOURCE_COMMIT",
+  "binary_sha256": "REPLACE_TRUSTED_BINARY_SHA256",
+  "run_directory": "/absolute/new-private-run-directory",
+  "expectation_review": "/absolute/D-owned-expectation-review.json",
+  "expectation_review_sha256": "REPLACE_INDEPENDENT_REVIEW_SHA256",
+  "expires_at": "REPLACE_UTC_AUTHORIZATION_DEADLINE"
+}

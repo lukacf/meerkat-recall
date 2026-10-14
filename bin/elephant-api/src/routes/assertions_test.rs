@@ -44,14 +44,19 @@ mod tests {
     use chrono::Utc;
     use tower::ServiceExt;
 
-    use elephant_storage::MockAssertionRepository;
+    use elephant_storage::{
+        AssertionRepository, DocRepository, DocRevisionRepository, MockAssertionRepository,
+        Repository, SourceRepository, StorageClient,
+    };
     use elephant_types::ids::TableName;
     use elephant_types::records::assertion::{
         Assertion, AssertionRetryState, EvidenceSpan, ResolutionStatus,
     };
     use elephant_types::records::base::{BaseFields, Provenance, Security, SubjectsState};
-    use elephant_types::records::doc_revision::DocRevision;
+    use elephant_types::records::doc_revision::{DocRevision, RendererMetadata, RevisionStatus};
+    use elephant_types::records::{Doc, Source, SourceType};
     use elephant_types::{Link, RecordId};
+    use sha2::{Digest, Sha256};
 
     use crate::auth::Principal as AuthPrincipal;
     use crate::authz::AuthzService;
@@ -123,6 +128,77 @@ mod tests {
             significance: None,
             lifecycle_tier: "active".to_string(),
         }
+    }
+
+    // Source-filtered searches use the real current-source reader. Supply its
+    // immutable evidence and live parents, including their subject envelopes.
+    async fn create_source_evidence(
+        storage: &StorageClient,
+        name: &str,
+        subjects: &[RecordId],
+    ) -> (RecordId, EvidenceSpan) {
+        let fields = |table| {
+            let mut base = BaseFields::new(
+                RecordId::new_v4(table),
+                "test_space".into(),
+                "test_agent".into(),
+            );
+            base.subjects_state = SubjectsState::Complete;
+            base.subjects = subjects.iter().cloned().map(Link::new).collect();
+            base
+        };
+        let source = SourceRepository::new(storage.clone())
+            .create(Source::new(
+                fields(TableName::Source),
+                SourceType::Manual,
+                name.into(),
+            ))
+            .await
+            .unwrap();
+        let text = format!("{name} knows Test Object");
+        let hash = format!("sha256:{}", hex::encode(Sha256::digest(text.as_bytes())));
+        let end = u32::try_from(text.len()).unwrap();
+        let doc = DocRepository::new(storage.clone())
+            .create(Doc {
+                base: fields(TableName::Doc),
+                title: name.into(),
+                text: text.clone(),
+                sidecar_text: None,
+                source: Some(Link::new(source.base.id.clone())),
+                media_attachments: vec![],
+                rendition_key: name.into(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let revision = DocRevisionRepository::new(storage.clone())
+            .create(DocRevision {
+                base: fields(TableName::DocRevision),
+                doc: Link::new(doc.base.id),
+                text,
+                text_hash: hash.clone(),
+                renderer: RendererMetadata {
+                    name: "fixture".into(),
+                    version: "1".into(),
+                    config_hash: None,
+                },
+                manifest: None,
+                supersedes: None,
+                status: RevisionStatus::Active,
+                rendered_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        (
+            source.base.id,
+            EvidenceSpan {
+                revision: Link::new(revision.base.id),
+                node: None,
+                start: 0,
+                end,
+                quote_hash: hash,
+            },
+        )
     }
 
     #[tokio::test]
@@ -333,6 +409,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_restore_requires_read_authorization() {
         let authz = Arc::new(AuthzService::new());
         let repo = Arc::new(MockAssertionRepository::empty());
@@ -411,6 +491,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_update_resolution_requires_read_authorization() {
         let authz = Arc::new(AuthzService::new());
         let repo = Arc::new(MockAssertionRepository::empty());
@@ -613,32 +697,32 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_search_assertions_filters_by_source_id() {
-        let app = setup_test_app().await;
-        let source_id = RecordId::new_v4(TableName::Source);
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let repo = AssertionRepository::new(storage.clone());
+        let (source_id, evidence) = create_source_evidence(&storage, "Alice", &[]).await;
+        let (unrelated_source, unrelated_evidence) =
+            create_source_evidence(&storage, "Bob", &[]).await;
+        let app = assertion_routes()
+            .layer(middleware::from_fn(mock_auth))
+            .with_state(Arc::new(AssertionsState::new(
+                storage,
+                Arc::new(AuthzService::new()),
+            )));
 
         let mut matching = create_test_assertion("Alice", "knows");
         matching.base.provenance.sources.push(source_id.clone());
+        matching.evidence = evidence;
         let mut unrelated = create_test_assertion("Bob", "knows");
-        unrelated
-            .base
-            .provenance
-            .sources
-            .push(RecordId::new_v4(TableName::Source));
+        unrelated.base.provenance.sources.push(unrelated_source);
+        unrelated.evidence = unrelated_evidence;
 
         for assertion in [matching, unrelated] {
-            let _ = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/v1/assertions")
-                        .header("content-type", "application/json")
-                        .body(Body::from(serde_json::to_string(&assertion).unwrap()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
+            repo.create(assertion).await.unwrap();
         }
 
         let search_req = serde_json::json!({
@@ -936,6 +1020,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_entity_filter_search_counts_only_authorized_rows() {
         use elephant_storage::Repository;
 
@@ -1002,6 +1090,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_entity_filter_search_pages_past_the_scan_batch() {
         use elephant_storage::Repository;
 
@@ -1071,16 +1163,20 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_combined_filters_with_subject_allowlist() {
-        use elephant_storage::Repository;
-
         let entity_a = RecordId::new_v4(TableName::Entity);
         let entity_b = RecordId::new_v4(TableName::Entity);
-        let source = RecordId::new_v4(TableName::Source);
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let (source, evidence) =
+            create_source_evidence(&storage, "Combined", std::slice::from_ref(&entity_a)).await;
         let allowed = entity_a.clone();
         let authz = Arc::new(AuthzService::new());
-        let repo = Arc::new(MockAssertionRepository::empty());
-        let state = Arc::new(AssertionsState::new_with_repo(repo.clone(), authz));
+        let repo = AssertionRepository::new(storage.clone());
+        let state = Arc::new(AssertionsState::new(storage, authz));
         let app = assertion_routes()
             .layer(middleware::from_fn(
                 move |mut req: Request<Body>, next: Next| {
@@ -1109,6 +1205,10 @@ mod tests {
                 assertion.object_entity = object.map(|id| Link::new(id.clone()));
                 assertion.resolution_status = status;
                 assertion.base.provenance.sources = vec![source.clone()];
+                assertion.evidence = evidence.clone();
+                // Endpoint subjects remain part of the actual HasSecurity
+                // view even when the stored explicit subjects array is empty.
+                assert!(assertion.base.subjects.is_empty());
                 assertion
             };
         // Matching and allowed; then one each failing predicate, status, and

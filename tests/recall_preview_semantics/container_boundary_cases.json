@@ -1,0 +1,76 @@
+{
+  "format": "recall-container-boundary-cases/v1",
+  "independent_contract": "tests/recall_preview/container-boundary-contract.json",
+  "backends": [
+    "elephant-db",
+    "surreal-db"
+  ],
+  "gates": [
+    "D11",
+    "D15",
+    "D21",
+    "D38"
+  ],
+  "required_cases": [
+    "CB01",
+    "CB02",
+    "CB03",
+    "CB04",
+    "CB05",
+    "CB06",
+    "CB07",
+    "CB08",
+    "CB09",
+    "CB10",
+    "CC01",
+    "CC02",
+    "CC03",
+    "CC04",
+    "CC05",
+    "CC06",
+    "restore_observation",
+    "replay_observation",
+    "physical_erasure_inventory"
+  ],
+  "limits": {
+    "per_backend_seconds": 1500,
+    "combined_http_calls": 1000,
+    "independent_poll_clients": 3,
+    "per_request_seconds": 5,
+    "restore_request_seconds": 120,
+    "poll_interval_ms": 25,
+    "transport_response_bytes": 270336,
+    "search_dto_bytes": 262144,
+    "external_provider_sends": 0,
+    "backends_sequential": true,
+    "private_capture_bytes": 134217728,
+    "reserved_command_capture_bytes": 33554432,
+    "journal_intent_archive_bytes": 131072,
+    "journal_intent_count": 16,
+    "journal_intent_file_bytes": 4096
+  },
+  "explicit_prerequisites": {
+    "CC04": "Actual indexed publication with positive exact-revision lexical hit before absent-token control.",
+    "CB07": "D-reviewed two-source Graph fixture with full <=12k grounded quotes: actual limit20 whole response over262144 and newlimit10 fits; old single262145 quote remains unsupported/unmet.",
+    "CB09": "Actual indexed source plus owned provider accounting and query approval revocation.",
+    "CB06_embedded": "Existing supported embedded unavailable trigger; absent control remains unmet.",
+    "physical_erasure_inventory": "Typed offline inspector plus owned PV/media/backup inventory; post-replay404 is insufficient."
+  },
+  "claims": {
+    "source_and_mock_only": true,
+    "continuous_barrier_proof": false,
+    "physical_erasure_from_coverage": false,
+    "metadata_zero_is_positive_lexical_control": false,
+    "product_acceptance": false
+  },
+  "allocation": "All original base allocation and review fields plus boundary_review and boundary_review_sha256; independent review pins every additional dependency before lazy parser import.",
+  "required_source_dependencies": {
+    "offline_snapshot_cli": "lifecycle compact-v2 adapter/CLI atop erasure588267f/1b920af decoder; explicit --compact-records requires recall-snapshot-inspection-v2 with lossless blobs; coherent pinned image and D strict v2 decoder required; actual worst-escaped Graph aggregate measurements remain pending",
+    "async_framing": "semantics4a7b24 body_limit keyword",
+    "physical_export_oracle": "qualification-owned snapshot_report_oracle.py and PHYSICAL_EXPORT_EXPECTATIONS.md, exact composed hash review required",
+    "public_graph_fixture": "Grounding shared transport/ControlledSpy/GraphFixture including immutable Revision GET; exact source hashes pinned before import. Literal E recipes and D original plan/file/canonical hashes mandatory."
+  },
+  "inspection_collection_scope": "Actual installed offline CLI against ONLY owned backup volume read-only; complete tagged baseline, post-erasure before restore, and post-replay reports. Actual original payload-free journal intent capture uses a separate only-journal readonly offline container. D sole evaluator receives actual URI Metadata fixture receipts and all reports; full PV/WAL/media/previous snapshot/registered backup gate remains unmet. Original five-second retention expiry/deletion checks remain.",
+  "graph_allocation": "Optional graph_plan/private file and graph_plan_sha256; D boundary review also pins graph_case_contract=cb07-two-source-complete-evidence-v1 plus complete graph_input_sha256 map. Missing original plan leaves CC04/CB07/CB09 unmet. graph_helper_image_id mustbe suppliedlocalsha256 and pinnedbyDreview; helperDockerfile source is in complete dependencyinventory.",
+  "graph_topology": "Exact owned Recall network namespace via unprivileged controlled Python helper container; provider binds127.0.0.1 only, privateUnixcontrol throughowned dockerexec. Additional supplied local helper image and exact copied source hashes required. One only allocated private fixture directory bind; filelocked ledger preserves original combined1000 public+spy calls/1500s/128MiB capture. Public response270336 unchanged; finite128x3072 controlled vector batch bodycap2MiB shares sameoriginalcapture."
+}

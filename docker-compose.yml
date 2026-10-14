@@ -3,9 +3,11 @@
 
 services:
   surrealdb:
-    image: surrealdb/surrealdb:v2.4.1
+    # Build/load the reviewed paired server first; vanilla images lack its capability.
+    image: "${RECALL_SURREAL_IMAGE:?Set RECALL_SURREAL_IMAGE to the reviewed paired server image}"
+    pull_policy: never
     container_name: elephant-surrealdb
-    user: "0:0"
+    user: "65532:65532"
     command:
       - start
       - --log=info
@@ -18,7 +20,7 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:
-      test: ["CMD", "/surreal", "is-ready"]
+      test: ["CMD", "/usr/local/bin/recall-surreal", "is-ready"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -32,7 +34,8 @@ services:
     pull_policy: build
     container_name: elephant
     depends_on:
-      - surrealdb
+      surrealdb:
+        condition: service_healthy
     environment:
       - RUST_LOG=info
       - ELEPHANT_HOST=0.0.0.0
@@ -49,6 +52,9 @@ services:
       - SURREALDB_DATABASE=${SURREALDB_DATABASE:-test}
       - SURREALDB_USER=root
       - SURREALDB_PASS=root
+      # Separate from the replaceable remote database; migrate and serve share it.
+      - ELEPHANT_DURABILITY_PATH=/var/lib/meerkat-recall/recovery
+      - ELEPHANT_SNAPSHOT_DIR=/var/lib/meerkat-recall/backups
       # Worker configuration (pipeline runs inside the same container by default)
       - PIPELINE_EMBED_ENABLED=true
       - PIPELINE_PROMOTE_ENABLED=true
@@ -69,6 +75,7 @@ services:
       - PIPELINE_MAINTENANCE_MCP_URL=http://127.0.0.1:3000/mcp/maintenance
       - PIPELINE_SKILLS_DIR=/skills
     volumes:
+      - recall_state:/var/lib/meerkat-recall
       - ./skills:/skills:ro
     ports:
       - "127.0.0.1:${ELEPHANT_PORT:-3000}:3000"
@@ -82,4 +89,6 @@ services:
 
 volumes:
   surrealdb_data:
+    driver: local
+  recall_state:
     driver: local

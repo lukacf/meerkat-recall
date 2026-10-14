@@ -35,6 +35,9 @@ zip = "2.2"
 pdf-inspector = { version = "=1.25.2", default-features = false }
 
 [dev-dependencies]
+elephant-migrations = { path = "../migrations" }
+surrealdb = { workspace = true }
+jsonwebtoken = { workspace = true }
 tokio-test = { workspace = true }
 rstest = { workspace = true }
 serial_test = "3.2"

@@ -1,0 +1,82 @@
+{
+  "format": "recall-public-graph-fixture/v1",
+  "source_request": {
+    "source": {
+      "id": "source:aec7093f-f8d3-51f5-a55b-1bb854972b72",
+      "space_id": "qualification-business",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "business-policy",
+        "level": 7,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "type": "manual",
+      "hash": "c9f0c07b095ddca4b3be85e7f7824b9b697d74d49ca5ff0cb4f484a5cd471882",
+      "external_id": "workload/atlas-07",
+      "uri": "https://example.invalid/recall-workload/business/07",
+      "metadata": {}
+    },
+    "doc": {
+      "id": "doc:5de31747-15d5-5c65-8561-14f3f662e14d",
+      "space_id": "qualification-business",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "business-policy",
+        "level": 7,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "title": "workload/atlas-07",
+      "text": "For business project Atlas-07, the responsible custodian is Bruno-07. Its approved supply limit is 138 units. This record applies only to business scope.\nBruno-07 now maintains the Atlas-07 new intake notebook.",
+      "source": null,
+      "sidecar_text": null,
+      "media_attachments": [],
+      "rendition_key": "d28/text/workload/atlas-07/full-fw09-intake-r2",
+      "metadata": {}
+    },
+    "ingest_mode": "graph",
+    "intake": {
+      "revision_id": "full-fw09-intake-r2",
+      "idempotency_key": "literal-b756bb34487308e7bfa01acf8f8113f5e85273f1e554ae57bb15480d628b8a7e"
+    }
+  },
+  "rendered_text": "For business project Atlas-07, the responsible custodian is Bruno-07. Its approved supply limit is 138 units. This record applies only to business scope.\nBruno-07 now maintains the Atlas-07 new intake notebook.\n",
+  "rendered_sha256": "92d51e58d775ac0218caff084683d94e1ff910fc53ee11053b7e845b56c8cfb1",
+  "expected_assertions": [
+    {
+      "subject_text": "Bruno-07",
+      "predicate_raw": "maintains",
+      "object_text": "Atlas-07 new intake notebook",
+      "object_literal": null,
+      "subject_entity_type": "person",
+      "object_entity_type": "document",
+      "confidence": 1.0,
+      "significance": "medium",
+      "source_event_time": null,
+      "start": 154,
+      "end": 210,
+      "quote": "Bruno-07 now maintains the Atlas-07 new intake notebook.",
+      "quote_hash": "7d2150c2218b13d8763d175afae82a97e8d608b802b92aea8ce02eeffb8caaa6"
+    }
+  ],
+  "extract_rule_id": "business-fw09-intake-extract"
+}

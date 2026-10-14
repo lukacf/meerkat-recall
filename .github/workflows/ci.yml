@@ -26,6 +26,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - name: Validate local Compose examples
+        env:
+          # Required interpolation only: config does not pull or start this image.
+          RECALL_SURREAL_IMAGE: recall-surreal:config-check
         run: |
           docker compose config --quiet
           docker compose -f docker-compose.dev.yml config --quiet
@@ -110,7 +113,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Run workspace unit gate
-        run: make test-unit
+        run: make test-unit NEXTEST_ARGS=--no-fail-fast
 
   test-all:
     name: Full test suite (all features)
@@ -136,7 +139,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Run full suite
-        run: make test-all
+        run: make test-all NEXTEST_ARGS=--no-fail-fast
 
   e2e:
     name: E2E tests

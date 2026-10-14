@@ -1121,6 +1121,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn test_create_source() {
         let repo = setup_test_repo().await;
         let source = create_test_source(SourceType::Email, "abc123");
@@ -1185,6 +1189,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn test_get_source() {
         let repo = setup_test_repo().await;
         let source = create_test_source(SourceType::Calendar, "def456");
@@ -1198,6 +1206,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn test_missing_hash_is_error() {
         let repo = setup_test_repo().await;
         let source = create_test_source(SourceType::Manual, "hash123");
@@ -1222,6 +1234,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn test_mark_graph_ready_if_quiescent_requires_no_pending_graph_work() {
         let repo = setup_embedded_test_repo().await;
         let source = create_test_source(SourceType::Manual, "graph-ready-hash");
@@ -1317,6 +1333,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn test_mark_graph_ready_if_quiescent_ignores_historical_failed_graph_work() {
         let repo = setup_embedded_test_repo().await;
         let source = create_test_source(SourceType::Manual, "graph-ready-failed-hash");
@@ -1398,6 +1418,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
+    )]
     async fn test_mark_graph_ready_if_quiescent_blocks_current_failed_graph_work() {
         let repo = setup_embedded_test_repo().await;
         let mut source = create_test_source(SourceType::Manual, "graph-ready-current-failed-hash");

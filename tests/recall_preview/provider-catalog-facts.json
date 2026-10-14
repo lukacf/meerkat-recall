@@ -1,0 +1,74 @@
+{
+  "format": "recall-provider-catalog-facts/v1",
+  "retrieved_at": "2026-10-06T22:24:28.620246+00:00",
+  "custody": "D read public official catalog pages; normalized facts, not a raw-page archive or account-access probe",
+  "models": {
+    "gpt-6.1-sol": {
+      "url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+      "kind": "generation",
+      "identity": "mutable-provider-alias",
+      "context_tokens": 1050000,
+      "max_output_tokens": 128000,
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_reasoning_effort": "medium",
+      "usd_per_million": {
+        "input": "2.00",
+        "cache_write": "2.50",
+        "output": "10.00"
+      }
+    },
+    "gpt-6-astra": {
+      "url": "https://developers.openai.com/api/docs/models/gpt-6-astra",
+      "kind": "generation",
+      "identity": "mutable-provider-alias",
+      "context_tokens": 1050000,
+      "max_output_tokens": 128000,
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "usd_per_million": {
+        "input": "10.00",
+        "cache_write": "12.50",
+        "output": "50.00"
+      }
+    },
+    "text-embedding-3-small": {
+      "url": "https://developers.openai.com/api/docs/models/text-embedding-3-small",
+      "limits_url": "https://developers.openai.com/api/docs/guides/embeddings",
+      "kind": "embedding",
+      "identity": "mutable-provider-alias",
+      "default_dimensions": 1536,
+      "max_input_tokens_per_item": 8192,
+      "usd_per_million": {
+        "input": "0.02"
+      }
+    },
+    "text-embedding-3-large": {
+      "url": "https://developers.openai.com/api/docs/models/text-embedding-3-large",
+      "limits_url": "https://developers.openai.com/api/docs/guides/embeddings",
+      "kind": "embedding",
+      "identity": "mutable-provider-alias",
+      "default_dimensions": 3072,
+      "max_input_tokens_per_item": 8192,
+      "usd_per_million": {
+        "input": "0.13"
+      }
+    }
+  },
+  "pricing_scope": "Standard nonregional requests, no hosted billable tools, no long-context requests. Generation reserves every input token at the higher cache-write rate; no cache discount assumed.",
+  "limitations": [
+    "Catalog availability is not account entitlement.",
+    "A catalog digest pins these facts, not remote weights.",
+    "Revalidate prices before requesting final paid-run approval; changes require a new manifest before execution."
+  ]
+}

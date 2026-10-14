@@ -20,9 +20,13 @@ use crate::client::StorageClient;
 use crate::error::{StorageError, StorageResult};
 
 const BATCH: usize = 500;
-// A migration_history record: that table is declared by 001_init and on the
-// storage allowlist (an unknown table breaks entity merges).
-const MARKER: &str = "migration_history:fake_embedding_purge_v1";
+/// Name of the optional completed repair receipt in `migration_history`.
+///
+/// This maintenance receipt is not a schema migration and cannot establish
+/// that any schema definition was applied.
+pub const RECEIPT_NAME: &str = "fake_embedding_purge_v1";
+/// Exact checksum written by the retained fake-vector repair.
+pub const RECEIPT_CHECKSUM: &str = "fake-embedding-ramp-v1";
 
 /// What one purge pass removed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -201,9 +205,11 @@ pub async fn purge_fake_embeddings(client: &StorageClient) -> StorageResult<Fake
             ..FakeEmbeddingPurge::default()
         });
     }
+    // The table is declared by 001_init and is on the storage allowlist.
+    let marker = format!("migration_history:{RECEIPT_NAME}");
     let done: Vec<IdRow> = take(
         client
-            .query_checked(&format!("SELECT id FROM {MARKER}"))
+            .query_checked(&format!("SELECT id FROM {marker}"))
             .await?,
         "purge marker",
     )?;
@@ -242,8 +248,8 @@ pub async fn purge_fake_embeddings(client: &StorageClient) -> StorageResult<Fake
     .await?;
     client
         .query_checked(&format!(
-            "UPSERT {MARKER} SET name = 'fake_embedding_purge_v1', \
-             applied_at = time::now(), checksum = 'fake-embedding-ramp-v1'"
+            "UPSERT {marker} SET name = '{RECEIPT_NAME}', \
+             applied_at = time::now(), checksum = '{RECEIPT_CHECKSUM}'"
         ))
         .await?;
     Ok(report)

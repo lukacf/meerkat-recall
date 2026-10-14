@@ -1,0 +1,48 @@
+{
+  "format": "recall-independent-source-review/v1",
+  "authority": "qualification",
+  "reviewed_source": "55b2a904e1300fb1dfce4255f440839d8344cb45",
+  "scope": "selected complete-input concrete OpenAI/FastEmbed/provider profile and independent test source",
+  "verdict": "no blocking defect found in selected source review",
+  "execution_authorized": false,
+  "product_acceptance": false,
+  "files": {
+    "crates/embeddings/src/provider.rs": "98ea32d9723a38b33fcbcb26d3a84330fab2db738b57147c7b060fe399156f95",
+    "crates/embeddings/src/provider_full_input.rs": "34a886f9dd3c35c84bdedca964a08d8597800e6d930adec8f39ece0cd83444fd",
+    "crates/embeddings/src/provider_full_input_tests.rs": "e308821c9d333b2ca9bf1eec18a8291265d1d495077e08cdb6fd22eaa9d760fd",
+    "crates/embeddings/src/provider_local_dispatch.rs": "1803806faec14aa2e69686a6a0ea7cfe3cfe1f4d7fbea48b2f282d4171d1e8ea",
+    "crates/embeddings/src/provider_local_input_tests.rs": "389708c9dad57337e0ec1eb8d2a825d7590abd33daa27c5ba3992e2d473342fe",
+    "crates/embeddings/src/governed.rs": "ea4952da1c80961be174340876c39689dd5b27e292400678cf306759a9b07de3",
+    "crates/embeddings/src/pinned_fastembed.rs": "3ef43e24178934f1b8e547398edfb9a552dca34b108ff387714d0c27c71bfd17",
+    "crates/types/src/provider_binding.rs": "4010b79623e6fb48b79840e61d27939b78fb0485dbf3705d1769106e3100b82f",
+    "tests/recall_preview/embedding-full-input-fixtures.json": "a5ff1331370d02e0dbb9be58257ba425d5cb12e47e571a1458347dbfbccfa828",
+    "docs/embedding-full-input-runtime.md": "f20b9f442af05cd8c97b4aaa44a2fa69bf911d4aa85dbbb3dae0653def6f9c7b"
+  },
+  "static_literal_checks": {
+    "segmentation_cases": 7,
+    "aggregation_cases": 5,
+    "complete_source_bytes": 2000000,
+    "segments": 977,
+    "final_original_bytes": 1152,
+    "actual_sdk_fixture_expected_calls": 10,
+    "method": "independent original literal SHA/UTF8/offset/weighted arithmetic only; no product helper or test execution"
+  },
+  "reviewed_predicates": [
+    "v1 sends complete original input; individual oversize refuses; whole-request fitting splits complete inputs without prefix deletion.",
+    "v2 uses ordered <=2048-byte UTF8 segments, preserves both indexed/unindexed rejection halves, refuses unsplittable scalar, and maintains each original input separately.",
+    "f64 byte-weighted accumulation requires exact contiguous complete byte coverage and finite nonzero final norm; no output escapes before all original inputs succeed.",
+    "Actual SDK rejects missing/duplicate/foreign indices, wrong vector shape, nonfinite/zero vectors and partial success; suffix-sensitive and complete2MB actual transport test source authored.",
+    "Every remote physical retry/segment invokes same dispatch authority/admission, then rereads current binding/credential; rejected attempts retain unknown usage and original reservation.",
+    "Local safe limit binds approved model/tokenizer; actual inference tokenizer truncation disabled; special tokens counted; explicit physical batch prevents hidden sub-batches.",
+    "Local inference admission occurs in executing blocking thread after model mutex and blocking pool wait; queued cancellation prevents inference, admitted inference preserves measured usage if caller drops.",
+    "Actual governed factory consumes inspected recipe; original partition includes preprocessing; v2 requires supported vector provider and explicit new profile, v1 defaults unchanged.",
+    "Independent test source includes literal UTF8/suffix/norm controls, complete2MB ten-call actual SDK fixture, actual observer size-retry budget/revocation, and actual blocking-queue negative plus positive control."
+  ],
+  "limits": [
+    "No Cargo, Rust execution, HTTP fixture service, actual local model, live provider, artifact or benchmark run performed by D.",
+    "Controlled vector arithmetic and tokenizer controls establish source expectations only, not semantic relevance or actual ONNX inference.",
+    "Full2MB SDK fixture does not alone prove whole-source Graph processing, pipeline node coverage, provider allocation feasibility or measured latency.",
+    "Current worker-recipe lifetime/HTTP exposure separately reviewed by E/C/B; this review does not close that inspection seam.",
+    "Physical retries remain under original cumulative observer/gateway budgets; complete byte coverage can honestly fail when those budgets refuse."
+  ]
+}

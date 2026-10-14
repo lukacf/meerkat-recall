@@ -9,6 +9,32 @@ assume local `SKIP_AUTH` development; authenticated instances require an
 `Authorization: Bearer <token>` header. MCP tool availability depends on the
 [endpoint profile](/mcp/overview).
 
+## Search an exact source revision
+
+Use `POST /v1/spaces/{space}/search` or MCP `search_scoped` for explicit source
+coverage and byte-addressed evidence:
+
+```json
+{
+  "query": "Who owns the test plan?",
+  "ranking_mode": "hybrid",
+  "limit": 5,
+  "source_revision_constraints": {"meeting-42":"r1"}
+}
+```
+
+Select the authorized named space and use `read:doc:raw`. The response contains
+`results`, `coverage` and `partial`; evidence binds source/revision, exact quotes
+and half-open UTF-8 byte spans. Rendered evidence also identifies its immutable
+rendered revision. `complete` coverage with zero results can mean no match;
+pending, stale, missing or withdrawn coverage does not establish that conclusion.
+
+Choose `lexical`, `semantic` or `hybrid` explicitly. Lexical needs no model;
+semantic requires an approved indexed profile and does not silently fall back
+to lexical results. The retained `search_docs` route below has a different
+compatibility contract and reports any fallback explicitly. Do not infer the
+scoped API's coverage from those legacy aggregate results.
+
 ## Choose the question before the search
 
 | Question | Start with | Inspect next |
@@ -67,13 +93,12 @@ Scores rank search results; they are not probabilities that the document's
 claims are true. A successful lexical fallback should not be described to a
 reader as embedding-based evidence.
 
-With the OpenAI embedding provider, each input is capped at 24,000 characters
-before sending. Inputs that the provider still rejects for length are shortened
-further; oversized batches are split. The resulting vector represents the
-retained prefix, so a passage near the end of a long input may not influence
-semantic ranking. Stored source text and evidence are not truncated by this
-embedding step. A progressing worker is not proof that every pending record
-already has an embedding.
+Governed embeddings bind an immutable provider/model/preprocessing profile.
+The full-input preprocessing mode preserves all input through bounded segmentation
+and aggregation; exact-input mode refuses an oversized input instead of silently
+embedding a prefix. Provider limits or unavailable approvals can make semantic
+search unavailable. A progressing worker is not proof that every pending record
+already has an embedding. See [processing approvals](/operations/service-setup#approve-processing).
 
 The REST route enters semantic mode only when both `query` and `k` are present.
 Omit `k` for a lexical query. Its response shape differs from the MCP envelope;

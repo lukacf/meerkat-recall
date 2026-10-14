@@ -1,27 +1,44 @@
 # Meerkat Recall
 
-Meerkat Recall is a Rust knowledge system for applications and AI agents. It combines
-entity graphs, document and vector search, evidence-backed extraction, and
-truth maintenance behind HTTP and MCP interfaces with space isolation and
-attribute-based access control.
+Meerkat Recall is an open-source knowledge system for applications and AI
+agents, written in Rust. It keeps source documents, extracted claims, entities
+and relationships together, so an answer can carry the evidence behind it.
+Document, vector and graph retrieval work over the same knowledge, with space
+isolation, access control and background maintenance as sources change.
 
-This is pre-1.0 software. The workspace version is a development version until
-verified artifacts and release notes appear on the
-[releases page](https://github.com/lukacf/meerkat-recall/releases).
+Use it as a standalone service through HTTP or MCP, from any agent stack.
+Within Meerkat, Core runs agents and Meta manages their application and memory
+lifecycle; Recall adds shared, evidence-backed knowledge. It is an optional,
+independently released component. See the
+[Meerkat introduction](https://docs.rkat.ai/introduction) to choose your starting point.
+
+This branch targets Recall 0.9.0 with the published Meerkat 0.9.0 SDK.
+The latest published Recall release is
+[v0.1.0](https://github.com/lukacf/meerkat-recall/releases/tag/v0.1.0).
+Find source, native downloads, supported platforms and known limits in the
+[release notes](https://github.com/lukacf/meerkat-recall/releases).
+
+Read the [Recall documentation](https://docs.rkat.ai/recall/introduction) for
+setup, HTTP and MCP integration, deployment, and the knowledge model.
 
 ## Installation paths
 
-The candidate binary distribution targets Linux x86-64 and macOS ARM64.
+Native releases target Linux x86-64 and macOS ARM64.
 [Binary installation](docs/installation.mdx) covers the archive layout,
-checksums, and model-provider prerequisites. Candidate availability is not a
-published release; use only artifacts supplied with their matching release
-record. The source demo below is a separate build without model extraction.
+checksums, and model-provider prerequisites. Use each archive with its matching
+release record. The source demo below is a separate build without model extraction.
 
 The command is `meerkat-recall`; native archives retain an `elephant` alias
-through the 0.1 line. Existing `.elephant` configuration, `ELEPHANT_*` variables,
+for existing deployments. Existing `.elephant` configuration, `ELEPHANT_*` variables,
 database names and HTTP/MCP wire identifiers remain unchanged. The first
 release provides source and native downloads, without a registry-published
 Rust library.
+
+For a persistent native service, follow [service setup](docs/operations/service-setup.mdx).
+Recall 0.9.0 exact-pins the published Meerkat 0.9.0 family. The SDK now includes
+the native provider transport protections previously carried as Recall patches.
+The v0.1.0 artifacts continue using their original Meerkat 0.8.51 dependencies.
+Consult the release notes for tested behavior and remaining limits.
 
 ## Try the Living Wiki demo
 
@@ -43,22 +60,37 @@ The first source build can take several minutes. Press Ctrl-C to stop it.
 
 ## Run a persistent local server
 
-Docker Compose runs Meerkat Recall and SurrealDB. For semantic ingestion, copy
-[.env.example](.env.example) to `.env` and configure `OPENAI_API_KEY` for the
-Compose embedding provider and `ANTHROPIC_API_KEY` for its extraction model.
-These calls can incur provider charges.
+Docker Compose runs Meerkat Recall and its paired remote SurrealDB server.
+First build and load the reviewed image using the
+[paired server recipe](packaging/recall-surreal/README.md); set
+`RECALL_SURREAL_IMAGE` to its actual local tag or digest. Vanilla SurrealDB
+cannot satisfy the required reference-fence capability, and the Compose
+example does not imply an available qualified image.
+
+For semantic ingestion, copy [.env.example](.env.example) to `.env` and configure
+credentials plus explicit approved per-space processing bindings. The retained
+environment defaults select OpenAI embeddings and Anthropic extraction; they
+do not approve a provider for a space. Model calls can incur provider charges.
 
 ```bash
 cp .env.example .env
-# Edit .env with your local provider configuration before continuing.
-docker compose up -d surrealdb
-docker compose run --rm elephant meerkat-recall migrate
+# Edit .env with your local configuration; use your actual paired image below.
+export RECALL_SURREAL_IMAGE=recall-surreal:REVIEWED_SOURCE
+docker compose up -d --wait surrealdb
+docker compose run --build --rm elephant meerkat-recall migrate
 docker compose up -d elephant
 curl -fsS http://localhost:3000/v1/runtime/status
 ```
 
-Wait for `semantic_ingest_ready: true` before ingesting evidence. A successful
-health request alone does not establish extraction readiness. The local
+The `surrealdb_data` volume holds the database and `recall_state` retains the
+original recovery journal and managed backups. Migration and serving use the
+same journal; normal Compose shutdown preserves both volumes. See [DEV.md](DEV.md)
+for the local-process variant and recovery constraints.
+
+Configure the selected space's processing approvals and inspect its status before
+expecting semantic completion. Durable source acceptance can remain available
+without workers; acceptance alone does not establish searchable publication.
+A successful liveness request alone does not establish extraction readiness. The local
 Compose configuration uses development authentication bypass; see
 [deployment and authentication](docs/operations/deployment.mdx) before
 exposing an instance to other users.
@@ -70,7 +102,7 @@ Meerkat Recall's public command is `meerkat-recall` ([CLI reference](docs/cli/ov
 - `worker` runs separate workers against a shared SurrealDB server.
 - `migrate` applies the SurrealDB schema.
 - `status` checks a running server.
-- `snapshot export/import` transfers a live embedded ElephantDB snapshot.
+- `snapshot export/restore` (with `import` as an alias) coordinates a managed snapshot directory through the running HTTP service for either retained backend.
 
 ## Connect an MCP client
 
@@ -102,7 +134,7 @@ complete task, or use the [HTTP API](docs/api/overview.mdx) and
 | Backend | Selection | Persistence |
 | --- | --- | --- |
 | SurrealDB | `ELEPHANT_DB=surreal-db` (default) | Durable server or embedded database; requires schema migrations |
-| ElephantDB | `ELEPHANT_DB=elephant-db` | In-memory graph/vector kernel with explicit snapshot import/export |
+| ElephantDB | `ELEPHANT_DB=elephant-db` | Graph/vector kernel with durable managed commits when a persistent destination is configured; explicit backup/restore |
 
 Spaces isolate tenants. Sources and immutable document revisions retain the
 evidence; extraction stages artifacts before committing assertions,
@@ -110,9 +142,12 @@ relationships, attributes, and events. Truth maintenance records agreement and
 conflict over time. Living Wiki pages are derived views with citations,
 authorization, and freshness receipts.
 
-Embedded ElephantDB is volatile between snapshots. Load a previous snapshot
-with `ELEPHANT_DB_SNAPSHOT_LOAD` and export before shutdown when persistence is
-needed. SurrealDB is the normal durable deployment path.
+Managed ElephantDB with a persistent destination synchronizes each acknowledged
+mutation to its write-ahead log and replays it on startup. Snapshot export is a
+backup operation, not the ordinary commit durability boundary. Explicitly
+ephemeral library/test stores remain volatile. See
+[managed embedded commit durability](docs/embedded-durable-commits.md) for
+configuration, recovery and erasure behavior.
 
 Embedded SurrealDB has finite engine query deadlines, defaulting to 30 seconds.
 Remote SurrealDB requires its own server-side query deadline. See
@@ -159,3 +194,9 @@ Licensed under either of the following, at your option:
 
 - [Apache License, Version 2.0](LICENSE-APACHE)
 - [MIT License](LICENSE-MIT)
+
+Third-party components retain their own licenses. In particular, the patched
+SurrealDB components use BUSL-1.1; the project license does not replace those
+terms. Native archives include component licenses and patched sources. See
+[third-party notices](THIRD_PARTY_NOTICES.md) and
+[the component source notices](scripts/release/THIRD_PARTY_SOURCE_NOTICES.txt).

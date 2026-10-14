@@ -7,18 +7,12 @@
 
 use chrono::{DateTime, Utc};
 use elephant_storage::{
-    surreal::thing_from_record_id, EmbeddedMutation, EmbeddedStore, EntityRepository, Repository,
-    StorageClient, StorageError, TransactionExt,
+    surreal::thing_from_record_id, EmbeddedMutation, StorageClient, StorageError,
 };
 use elephant_types::ids::TableName;
-use elephant_types::records::assertion::Assertion;
-use elephant_types::records::attribute::Attribute;
-use elephant_types::records::doc::Doc;
-use elephant_types::records::entity::EntityStatus;
-use elephant_types::records::event::Event;
-use elephant_types::records::identity::EntityIdentityKey;
-use elephant_types::records::{Entity, Rel, SystemEvent};
-use elephant_types::{Link, RecordId};
+#[cfg(test)]
+use elephant_types::records::{entity::EntityStatus, Entity};
+use elephant_types::RecordId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -519,27 +513,6 @@ fn parse_field_path_segments(path: &str) -> IdentityResult<Vec<PathSegment>> {
         .collect()
 }
 
-fn repoint_entity_links(
-    subjects: &mut Vec<Link<Entity>>,
-    merged_ids: &[RecordId],
-    survivor_id: &RecordId,
-) -> bool {
-    let mut changed = false;
-    for subject in subjects.iter_mut() {
-        if merged_ids.iter().any(|merged_id| subject.id() == merged_id) {
-            *subject = Link::new(survivor_id.clone());
-            changed = true;
-        }
-    }
-
-    if changed {
-        subjects.sort_by_key(|subject| subject.id().to_string());
-        subjects.dedup_by(|lhs, rhs| lhs.id() == rhs.id());
-    }
-
-    changed
-}
-
 fn parse_entity_record_id(value: &Value) -> Option<RecordId> {
     serde_json::from_value::<RecordId>(value.clone())
         .ok()
@@ -650,7 +623,28 @@ fn rewrite_segments(
 fn is_builtin_storage_table(table_name: &str) -> bool {
     TableName::from_str(table_name).is_ok()
         || table_name.starts_with("emb__")
-        || matches!(table_name, "migration_history" | "fact")
+        || table_name.starts_with("source_")
+        || table_name.starts_with("canonical_")
+        || table_name.starts_with("work_")
+        || table_name.starts_with("erasure_")
+        || matches!(
+            table_name,
+            "migration_history"
+                | "recall_durability"
+                | "fact"
+                | "publication_schema"
+                | "provider_call_receipt"
+                | "outbox_checkpoint"
+                | "outbox_sequence"
+                | "space_grant"
+                | "restore_barrier"
+                | "entity_profile_embedding"
+                // Private core controls are not consumer reference tables.
+                // A merge must neither rewrite the payload-free physical fence
+                // nor relabel a standing delegation's immutable authority.
+                | "native_read_fence"
+                | "watch_delegation"
+        )
 }
 
 async fn ensure_declared_extension_tables(
@@ -664,59 +658,6 @@ async fn ensure_declared_extension_tables(
         return Err(IdentityError::MergeConflict(format!(
             "Extension table `{table_name}` exists in storage but is not declared by the loaded extension manifests"
         )));
-    }
-
-    Ok(())
-}
-
-async fn ensure_declared_extension_rows_have_space_id(
-    storage: &StorageClient,
-    registry: &ReferenceRegistry,
-) -> IdentityResult<()> {
-    for table_name in registry.tables() {
-        let mut response = storage
-            .query(&format!(
-                "SELECT id FROM {table_name} WHERE space_id IS NONE LIMIT 1"
-            ))
-            .await?;
-        let rows: Vec<Value> = response.take(0).map_err(|e| {
-            IdentityError::StorageError(StorageError::QueryError(format!(
-                "Failed to inspect extension table `{table_name}` for missing space_id: {e}"
-            )))
-        })?;
-        if !rows.is_empty() {
-            return Err(IdentityError::MergeConflict(format!(
-                "Extension table `{table_name}` contains rows without `space_id` and cannot be safely rewritten during merge"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-async fn ensure_declared_extension_rows_are_rewriteable(
-    storage: &StorageClient,
-    registry: &ReferenceRegistry,
-    space_id: &str,
-) -> IdentityResult<()> {
-    let escaped_space_id = escape_surql_string(space_id);
-
-    for table_name in registry.owned_tables_without_rewrite_declarations() {
-        let mut response = storage
-            .query(&format!(
-                "SELECT id FROM {table_name} WHERE space_id = '{escaped_space_id}' LIMIT 1"
-            ))
-            .await?;
-        let rows: Vec<Value> = response.take(0).map_err(|e| {
-            IdentityError::StorageError(StorageError::QueryError(format!(
-                "Failed to inspect extension table `{table_name}` for undeclared entity rewrites: {e}"
-            )))
-        })?;
-        if !rows.is_empty() {
-            return Err(IdentityError::MergeConflict(format!(
-                "Extension table `{table_name}` contains rows in space `{space_id}` but has no rewrite declarations; declare entity refs before merging"
-            )));
-        }
     }
 
     Ok(())
@@ -765,10 +706,8 @@ pub fn rewrite_extension_rows_in_mutation(
     merged_ids: &[RecordId],
     survivor_id: &RecordId,
 ) -> IdentityResult<usize> {
-    if let Some(table_name) = mutation
-        .extension_table_names()
-        .into_iter()
-        .find(|table_name| !registry.owns_table(table_name))
+    if let Some(table_name) =
+        find_undeclared_extension_table(mutation.extension_table_names(), registry)
     {
         return Err(IdentityError::MergeConflict(format!(
             "Extension table `{table_name}` is present in embedded state but not declared by the loaded extension manifests"
@@ -836,12 +775,14 @@ pub fn rewrite_extension_rows_in_mutation(
 }
 
 /// Metadata key carrying Angel protectee attribution on docs and entities.
+#[cfg(test)]
 const ANGEL_PROTECTEES_METADATA_KEY: &str = "angel_protectees";
 
 /// Reads `metadata.angel_protectees` as a list of string ids.
 ///
 /// Missing keys, non-array values, and non-string elements yield an empty /
 /// filtered list rather than an error.
+#[cfg(test)]
 fn angel_protectees_from_metadata(metadata: &Value) -> Vec<String> {
     metadata
         .get(ANGEL_PROTECTEES_METADATA_KEY)
@@ -860,6 +801,7 @@ fn angel_protectees_from_metadata(metadata: &Value) -> Vec<String> {
 ///
 /// Returns `true` when the stored value changed so callers can skip
 /// persisting no-op unions.
+#[cfg(test)]
 fn union_angel_protectees_into_metadata(metadata: &mut Value, ids: &[String]) -> bool {
     if ids.is_empty() {
         return false;
@@ -885,288 +827,403 @@ fn union_angel_protectees_into_metadata(metadata: &mut Value, ids: &[String]) ->
     true
 }
 
-#[allow(clippy::too_many_lines)]
-async fn apply_entity_merge_rewrites_embedded(
-    store: &EmbeddedStore,
-    space_id: &str,
-    survivor_id: &RecordId,
-    merged_entity_ids: &[RecordId],
-    now: DateTime<Utc>,
-    registry: &ReferenceRegistry,
-) -> IdentityResult<()> {
-    let survivor_id = survivor_id.clone();
-    let merged_entity_ids = merged_entity_ids.to_vec();
-    let registry = registry.clone();
-    store
-        .mutate(move |mutation| {
-            for mut key in mutation.scan::<EntityIdentityKey>()? {
-                if key.base.space_id != space_id
-                    || key.base.deleted_at.is_some()
-                    || !merged_entity_ids.iter().any(|id| key.entity.id() == id)
-                {
-                    continue;
-                }
-                key.entity = Link::new(survivor_id.clone());
-                key.base.updated_at = now;
-                mutation.replace(key)?;
-            }
-
-            for mut rel in mutation.scan::<Rel>()? {
-                if rel.base.space_id != space_id {
-                    continue;
-                }
-                let changed_subject = merged_entity_ids.iter().any(|id| rel.subject.id() == id);
-                if changed_subject {
-                    rel.subject = Link::new(survivor_id.clone());
-                }
-                let changed_object = merged_entity_ids.iter().any(|id| rel.object.id() == id);
-                if changed_object {
-                    rel.object = Link::new(survivor_id.clone());
-                }
-                let changed_subjects =
-                    repoint_entity_links(&mut rel.base.subjects, &merged_entity_ids, &survivor_id);
-                if changed_subject || changed_object || changed_subjects {
-                    rel.base.updated_at = now;
-                    mutation.replace(rel)?;
-                }
-            }
-
-            for mut attribute in mutation.scan::<Attribute>()? {
-                if attribute.base.space_id != space_id {
-                    continue;
-                }
-                let changed_subject = merged_entity_ids
-                    .iter()
-                    .any(|id| attribute.subject.id() == id);
-                if changed_subject {
-                    attribute.subject = Link::new(survivor_id.clone());
-                }
-                let changed_subjects = repoint_entity_links(
-                    &mut attribute.base.subjects,
-                    &merged_entity_ids,
-                    &survivor_id,
-                );
-                if changed_subject || changed_subjects {
-                    attribute.base.updated_at = now;
-                    mutation.replace(attribute)?;
-                }
-            }
-
-            for mut assertion in mutation.scan::<Assertion>()? {
-                if assertion.base.space_id != space_id {
-                    continue;
-                }
-                let changed_subject = assertion
-                    .subject_entity
-                    .as_ref()
-                    .is_some_and(|link| merged_entity_ids.iter().any(|id| link.id() == id));
-                if changed_subject {
-                    assertion.subject_entity = Some(Link::new(survivor_id.clone()));
-                }
-                let changed_object = assertion
-                    .object_entity
-                    .as_ref()
-                    .is_some_and(|link| merged_entity_ids.iter().any(|id| link.id() == id));
-                if changed_object {
-                    assertion.object_entity = Some(Link::new(survivor_id.clone()));
-                }
-                let changed_subjects = repoint_entity_links(
-                    &mut assertion.base.subjects,
-                    &merged_entity_ids,
-                    &survivor_id,
-                );
-                if changed_subject || changed_object || changed_subjects {
-                    assertion.base.updated_at = now;
-                    mutation.replace(assertion)?;
-                }
-            }
-
-            for mut doc in mutation.scan::<Doc>()? {
-                if doc.base.space_id != space_id {
-                    continue;
-                }
-                if repoint_entity_links(&mut doc.base.subjects, &merged_entity_ids, &survivor_id) {
-                    doc.base.updated_at = now;
-                    mutation.replace(doc)?;
-                }
-            }
-
-            for mut event in mutation.scan::<Event>()? {
-                if event.base.space_id != space_id {
-                    continue;
-                }
-                if repoint_entity_links(&mut event.base.subjects, &merged_entity_ids, &survivor_id)
-                {
-                    event.base.updated_at = now;
-                    mutation.replace(event)?;
-                }
-            }
-
-            for mut event in mutation.scan::<SystemEvent>()? {
-                if event.base.space_id != space_id {
-                    continue;
-                }
-                if repoint_entity_links(&mut event.base.subjects, &merged_entity_ids, &survivor_id)
-                {
-                    event.base.updated_at = now;
-                    mutation.replace(event)?;
-                }
-            }
-
-            rewrite_extension_rows_in_mutation(
-                mutation,
-                space_id,
-                &registry,
-                &merged_entity_ids,
-                &survivor_id,
-            )
-            .map_err(|e| StorageError::QueryError(e.to_string()))?;
-
-            let mut merged_protectees: Vec<String> = Vec::new();
-            for merged_id in &merged_entity_ids {
-                let Some(mut merged_entity) = mutation.get::<Entity>(space_id, merged_id, true)?
-                else {
-                    continue;
-                };
-                merged_protectees.extend(angel_protectees_from_metadata(&merged_entity.metadata));
-                merged_entity.status = EntityStatus::Merged;
-                merged_entity.redirect_to = Some(Link::new(survivor_id.clone()));
-                merged_entity.base.updated_at = now;
-                mutation.replace(merged_entity)?;
-            }
-
-            // Attribution survives the merge: union the merged entities'
-            // angel_protectees into the survivor's metadata.
-            if !merged_protectees.is_empty() {
-                if let Some(mut survivor) = mutation.get::<Entity>(space_id, &survivor_id, true)? {
-                    if union_angel_protectees_into_metadata(
-                        &mut survivor.metadata,
-                        &merged_protectees,
-                    ) {
-                        survivor.base.updated_at = now;
-                        mutation.replace(survivor)?;
-                    }
-                }
-            }
-
-            Ok(())
-        })
-        .await?;
-    Ok(())
-}
-
-/// Applies the core and extension entity-reference rewrites for a merge across
-/// the configured storage backend.
+/// Prepare a complete explicit equivalence without mutating canonical records.
+/// The caller authorizes all old/proposed envelopes before committing.
 ///
 /// # Errors
+/// Returns an error for missing identities, undeclared or malformed references,
+/// incomplete authorization envelopes, or failed storage reads.
+pub async fn prepare_entity_merge(
+    storage: &StorageClient,
+    space_id: &str,
+    entity_a: &RecordId,
+    entity_b: &RecordId,
+    selection: elephant_storage::entity_merge_repository::MergeSelection,
+    actor: &str,
+    registry: &ReferenceRegistry,
+) -> IdentityResult<elephant_storage::entity_merge_repository::PreparedEntityMerge> {
+    prepare_entity_merge_group(
+        storage,
+        space_id,
+        entity_a,
+        std::slice::from_ref(entity_b),
+        selection,
+        actor,
+        registry,
+    )
+    .await
+}
+
+/// Prepare an equivalence over an existing maintenance overlay, without a
+/// second epoch or commit.
 ///
-/// Returns an error if the storage write path fails or an extension manifest
-/// declaration is invalid for the active backend.
+/// Install registry epoch guards before capturing the
+/// outer plan. Consume the returned bundle with `into_prepared_plan` and let the
+/// original caller commit with its original attempt.
+///
+/// # Errors
+/// Returns an error for stale original snapshots, invalid references, or
+/// unrepresentable authorization envelopes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the merge API explicit about the original plan, registry, actor, and record selection."
+)]
+pub async fn prepare_entity_merge_on_plan(
+    storage: &StorageClient,
+    space_id: &str,
+    entity_a: &RecordId,
+    entity_b: &RecordId,
+    selection: elephant_storage::entity_merge_repository::MergeSelection,
+    actor: &str,
+    registry: &ReferenceRegistry,
+    plan: &elephant_storage::canonical_commit::CanonicalPlan,
+) -> IdentityResult<elephant_storage::entity_merge_repository::PreparedEntityMerge> {
+    prepare_entity_merge_group_on_plan(
+        storage,
+        space_id,
+        entity_a,
+        std::slice::from_ref(entity_b),
+        selection,
+        actor,
+        registry,
+        Some(plan),
+    )
+    .await
+}
+
+async fn prepare_entity_merge_group(
+    storage: &StorageClient,
+    space_id: &str,
+    entity_a: &RecordId,
+    others: &[RecordId],
+    selection: elephant_storage::entity_merge_repository::MergeSelection,
+    actor: &str,
+    registry: &ReferenceRegistry,
+) -> IdentityResult<elephant_storage::entity_merge_repository::PreparedEntityMerge> {
+    prepare_entity_merge_group_on_plan(
+        storage, space_id, entity_a, others, selection, actor, registry, None,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the original plan and registry explicit alongside the merge selection and actor."
+)]
+async fn prepare_entity_merge_group_on_plan(
+    storage: &StorageClient,
+    space_id: &str,
+    entity_a: &RecordId,
+    others: &[RecordId],
+    selection: elephant_storage::entity_merge_repository::MergeSelection,
+    actor: &str,
+    registry: &ReferenceRegistry,
+    prior_plan: Option<&elephant_storage::canonical_commit::CanonicalPlan>,
+) -> IdentityResult<elephant_storage::entity_merge_repository::PreparedEntityMerge> {
+    use elephant_storage::canonical_extension::{
+        load_extension_rows, CanonicalExtensionEffect, NativeExtensionValue,
+    };
+    let mut tables: Vec<_> = registry.tables().map(str::to_owned).collect();
+    tables.sort();
+    // Shared sweep callers install registry guards before capturing the outer
+    // epoch. Preparation over that plan must remain read-only, including DDL.
+    if prior_plan.is_none() {
+        elephant_storage::canonical_commit::ensure_extension_epoch_guards(storage, &tables).await?;
+    }
+    let mut prepared = elephant_storage::EntityMergeRepository::new(storage.clone())
+        .prepare_merge_group_on_plan(space_id, entity_a, others, selection, actor, prior_plan)
+        .await?;
+    ensure_declared_extension_tables(storage, registry).await?;
+    let mut effects = Vec::new();
+    for table in tables {
+        let declarations = registry.get_table_refs(&table);
+        let live = load_extension_rows(storage, &table).await?;
+        let rows = extension_rows_on_plan(&table, live, prior_plan)?;
+        for before in rows {
+            let NativeExtensionValue::Object(object) = &before else {
+                return Err(IdentityError::MergeConflict(
+                    "extension row must be an object".into(),
+                ));
+            };
+            let Some(NativeExtensionValue::Strand(row_space)) = object.get("space_id") else {
+                return Err(IdentityError::MergeConflict(
+                    "extension row lacks its owning space".into(),
+                ));
+            };
+            if row_space.0 != space_id {
+                continue;
+            }
+            if declarations.is_empty() {
+                return Err(IdentityError::MergeConflict(format!(
+                    "extension table {table} has no declared identity references"
+                )));
+            }
+            let Some(NativeExtensionValue::Thing(id)) = object.get("id") else {
+                return Err(IdentityError::MergeConflict(
+                    "extension row lacks native identity".into(),
+                ));
+            };
+            let id = id.clone();
+            let mut after = before.clone();
+            let mut changed = false;
+            for declaration in declarations {
+                if declaration.should_rewrite() {
+                    changed |= rewrite_declared_entity_refs_native(
+                        &mut after,
+                        declaration,
+                        &prepared.outcome().merged,
+                        &prepared.outcome().survivor.base.id,
+                    )?;
+                }
+            }
+            if changed {
+                effects.push(CanonicalExtensionEffect {
+                    id,
+                    before: Some(before),
+                    after: Some(after),
+                });
+            }
+        }
+    }
+    prepared.attach_extensions(effects).await?;
+    Ok(prepared)
+}
+
+fn extension_rows_on_plan(
+    table: &str,
+    live: Vec<elephant_storage::canonical_extension::NativeExtensionValue>,
+    prior: Option<&elephant_storage::canonical_commit::CanonicalPlan>,
+) -> IdentityResult<Vec<elephant_storage::canonical_extension::NativeExtensionValue>> {
+    use elephant_storage::canonical_extension::NativeExtensionValue as Native;
+    let mut rows = std::collections::BTreeMap::new();
+    for row in live {
+        let Native::Object(object) = &row else {
+            return Err(IdentityError::MergeConflict(
+                "extension row must be an object".into(),
+            ));
+        };
+        let Some(Native::Thing(id)) = object.get("id") else {
+            return Err(IdentityError::MergeConflict(
+                "extension row lacks native identity".into(),
+            ));
+        };
+        rows.insert(id.to_string(), row);
+    }
+    if let Some(plan) = prior {
+        for effect in plan
+            .extension_effects
+            .iter()
+            .filter(|effect| effect.id.tb == table)
+        {
+            let current = rows.remove(&effect.id.to_string());
+            if current != effect.before {
+                return Err(IdentityError::MergeConflict(
+                    "extension changed from original maintenance snapshot".into(),
+                ));
+            }
+            if let Some(after) = &effect.after {
+                rows.insert(effect.id.to_string(), after.clone());
+            }
+        }
+    }
+    Ok(rows.into_values().collect())
+}
+
+/// Trusted direct callers use the same canonical bundle as public adapters.
+/// Public transports must use `prepare_entity_merge` and preflight every row.
+///
+/// # Errors
+/// Returns an error when preparation fails, an observed input changes, source
+/// support is no longer eligible, or the atomic canonical transaction fails.
 pub async fn apply_entity_merge_rewrites(
     storage: &StorageClient,
     space_id: &str,
     survivor_id: &RecordId,
     merged_entity_ids: &[RecordId],
-    now: DateTime<Utc>,
+    _now: DateTime<Utc>,
     registry: &ReferenceRegistry,
 ) -> IdentityResult<()> {
-    if let Some(store) = storage.embedded_store() {
-        return apply_entity_merge_rewrites_embedded(
-            &store,
-            space_id,
-            survivor_id,
-            merged_entity_ids,
-            now,
-            registry,
-        )
-        .await;
+    if merged_entity_ids.is_empty() {
+        return Ok(());
     }
-
-    ensure_declared_extension_tables(storage, registry).await?;
-    ensure_declared_extension_rows_have_space_id(storage, registry).await?;
-    ensure_declared_extension_rows_are_rewriteable(storage, registry, space_id).await?;
-
-    // Attribution survives the merge: read the merged entities' and
-    // survivor's angel_protectees up front so the rewrite transaction can
-    // union them onto the survivor.
-    let entity_repo = EntityRepository::new(storage.clone());
-    let mut merged_protectees: Vec<String> = Vec::new();
-    for merged_id in merged_entity_ids {
-        if let Some(merged_entity) = entity_repo.get(space_id, merged_id).await? {
-            merged_protectees.extend(angel_protectees_from_metadata(&merged_entity.metadata));
-        }
-    }
-    let survivor_protectees_update = if merged_protectees.is_empty() {
-        None
-    } else {
-        match entity_repo.get(space_id, survivor_id).await? {
-            Some(survivor) => {
-                let mut metadata = survivor.metadata;
-                union_angel_protectees_into_metadata(&mut metadata, &merged_protectees)
-                    .then(|| angel_protectees_from_metadata(&metadata))
-            }
-            None => None,
-        }
-    };
-
-    let survivor_thing = thing_from_record_id(survivor_id);
-    let mut tx = storage.transaction();
-    let escaped_space_id = escape_surql_string(space_id);
-
-    for merged_id in merged_entity_ids {
-        let merged_id_str = merged_id.to_string();
-        tx = tx.add_statement(format!(
-            "UPDATE entity_identity_key SET entity = {survivor_thing}, updated_at = time::now() WHERE space_id = '{escaped_space_id}' AND string::concat(meta::tb(entity), ':', meta::id(entity)) = '{merged_id_str}' AND deleted_at IS NONE"
-        ));
-    }
-
-    for merged_id in merged_entity_ids {
-        let new_thing = thing_from_record_id(survivor_id);
-
-        for (table, field) in CORE_ENTITY_REF_TABLES {
-            if *table == "entity_identity_key" {
-                continue;
-            }
-            let mut decl = ReferenceDeclaration::new(*table, *field);
-            if *field == "subjects" {
-                decl = decl.with_many();
-            }
-            tx = tx.add_statement(generate_scoped_rewrite_query(
-                &decl,
-                space_id,
-                merged_id,
-                survivor_id,
-            )?);
-        }
-
-        for decl in registry.rewrite_refs() {
-            tx = tx.add_statement(generate_scoped_rewrite_query(
-                decl,
-                space_id,
-                merged_id,
-                survivor_id,
-            )?);
-        }
-
-        let merged_thing = thing_from_record_id(merged_id);
-        tx = tx.add_statement(format!(
-            "UPDATE {merged_thing} SET status = 'merged', redirect_to = {new_thing}, updated_at = time::now()"
-        ));
-    }
-
-    if let Some(protectees) = survivor_protectees_update {
-        let values = protectees
-            .iter()
-            .map(|id| format!("'{}'", escape_surql_string(id)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        tx = tx.add_statement(format!(
-            "UPDATE {survivor_thing} SET metadata.{ANGEL_PROTECTEES_METADATA_KEY} = [{values}], updated_at = time::now()"
-        ));
-    }
-
-    let _ = tx.execute().await?;
+    prepare_entity_merge_group(
+        storage,
+        space_id,
+        survivor_id,
+        merged_entity_ids,
+        elephant_storage::entity_merge_repository::MergeSelection::KeepA,
+        "identity.explicit_merge",
+        registry,
+    )
+    .await?
+    .commit()
+    .await?;
     Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the native reference shapes and recursive rewrite rules together in the prepared merge."
+)]
+fn rewrite_declared_entity_refs_native(
+    row: &mut elephant_storage::canonical_extension::NativeExtensionValue,
+    declaration: &ReferenceDeclaration,
+    merged: &[RecordId],
+    survivor: &RecordId,
+) -> IdentityResult<bool> {
+    use elephant_storage::canonical_extension::NativeExtensionValue as Native;
+    fn one(value: &mut Native, merged: &[RecordId], survivor: &RecordId) -> IdentityResult<bool> {
+        let current = match value {
+            Native::Thing(id) if id.tb == "entity" => {
+                elephant_storage::surreal::record_id_from_thing(id)
+                    .map_err(|error| IdentityError::MergeConflict(error.to_string()))?
+            }
+            Native::Strand(id) => {
+                id.0.parse::<RecordId>()
+                    .map_err(|error| IdentityError::MergeConflict(error.to_string()))?
+            }
+            Native::Object(object) => {
+                let Some(Native::Strand(table)) = object.get("tb").or_else(|| object.get("table"))
+                else {
+                    return Err(IdentityError::MergeConflict(
+                        "entity reference object lacks a table".into(),
+                    ));
+                };
+                let Some(Native::Strand(id)) = object.get("id") else {
+                    return Err(IdentityError::MergeConflict(
+                        "entity reference object lacks an identity".into(),
+                    ));
+                };
+                if table.0 != "entity" {
+                    return Err(IdentityError::MergeConflict(
+                        "entity reference object names a different table".into(),
+                    ));
+                }
+                elephant_storage::parse_id(&id.0, TableName::Entity)?
+            }
+            Native::None | Native::Null => return Ok(false),
+            _ => {
+                return Err(IdentityError::MergeConflict(
+                    "declared entity reference has an invalid native shape".into(),
+                ))
+            }
+        };
+        if current.table() != TableName::Entity {
+            return Err(IdentityError::MergeConflict(
+                "declared entity reference names a different table".into(),
+            ));
+        }
+        if !merged.contains(&current) {
+            return Ok(false);
+        }
+        match value {
+            Native::Object(object) => {
+                let qualified =
+                    matches!(object.get("id"), Some(Native::Strand(id)) if id.0.contains(':'));
+                object.insert(
+                    "id".into(),
+                    Native::from(if qualified {
+                        survivor.to_string()
+                    } else {
+                        survivor.id().to_string()
+                    }),
+                );
+            }
+            Native::Thing(_) => *value = Native::Thing(thing_from_record_id(survivor)),
+            _ => *value = Native::from(survivor.to_string()),
+        }
+        Ok(true)
+    }
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Cloned native values stay immutable in this set; regex ordering compares pattern text, not cache state."
+    )]
+    fn leaf(
+        value: &mut Native,
+        many: bool,
+        merged: &[RecordId],
+        survivor: &RecordId,
+    ) -> IdentityResult<bool> {
+        if !many {
+            return one(value, merged, survivor);
+        }
+        if matches!(value, Native::None | Native::Null) {
+            return Ok(false);
+        }
+        let Native::Array(items) = value else {
+            return Err(IdentityError::MergeConflict(
+                "declared reference array has an invalid shape".into(),
+            ));
+        };
+        let mut changed = false;
+        for value in items.iter_mut() {
+            changed |= one(value, merged, survivor)?;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let old_len = items.len();
+        items.0.retain(|value| seen.insert(value.clone()));
+        Ok(changed || old_len != items.len())
+    }
+    fn walk(
+        value: &mut Native,
+        path: &[PathSegment],
+        declaration: &ReferenceDeclaration,
+        merged: &[RecordId],
+        survivor: &RecordId,
+    ) -> IdentityResult<bool> {
+        let Some(segment) = path.first() else {
+            return leaf(
+                value,
+                declaration.cardinality == ReferenceCardinality::Many,
+                merged,
+                survivor,
+            );
+        };
+        if matches!(value, Native::None | Native::Null) && !declaration.required {
+            return Ok(false);
+        }
+        let Native::Object(object) = value else {
+            return Err(IdentityError::MergeConflict(
+                "declared reference path traverses a non-object".into(),
+            ));
+        };
+        let (name, repeated) = match segment {
+            PathSegment::Field(name) => (name, false),
+            PathSegment::Each(name) => (name, true),
+        };
+        let Some(next) = object.get_mut(name) else {
+            return if declaration.required {
+                Err(IdentityError::MergeConflict(
+                    "required extension reference is absent".into(),
+                ))
+            } else {
+                Ok(false)
+            };
+        };
+        if !repeated {
+            return walk(next, &path[1..], declaration, merged, survivor);
+        }
+        if path.len() == 1 {
+            return leaf(next, true, merged, survivor);
+        }
+        let Native::Array(items) = next else {
+            return Err(IdentityError::MergeConflict(
+                "repeated reference path is not an array".into(),
+            ));
+        };
+        let mut changed = false;
+        for item in items.iter_mut() {
+            changed |= walk(item, &path[1..], declaration, merged, survivor)?;
+        }
+        Ok(changed)
+    }
+    walk(
+        row,
+        &parse_field_path_segments(&declaration.field_path)?,
+        declaration,
+        merged,
+        survivor,
+    )
 }
 
 #[cfg(test)]
@@ -1186,7 +1243,27 @@ mod tests {
         clippy::cognitive_complexity
     )]
     use super::*;
+    use elephant_storage::{EmbeddedStore, Repository};
     use elephant_types::ids::TableName;
+
+    async fn register_merge_space(storage: &StorageClient, space: &str) {
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: elephant_types::records::base::BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    space.into(),
+                    "fixture".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn test_reference_declaration() {
@@ -1407,6 +1484,35 @@ mod tests {
             &ReferenceRegistry::new(),
         );
         assert!(undeclared.is_none());
+    }
+
+    #[test]
+    fn private_core_controls_do_not_admit_similarly_named_extension_tables() {
+        let registry = ReferenceRegistry::new();
+        assert!(find_undeclared_extension_table(
+            ["native_read_fence".into(), "watch_delegation".into()],
+            &registry,
+        )
+        .is_none());
+        for unknown in [
+            "native_read_fence_custom",
+            "watch_delegation_custom",
+            "native_custom",
+            "watch_custom",
+            "sampleapp_todo",
+        ] {
+            assert_eq!(
+                find_undeclared_extension_table(
+                    [
+                        "native_read_fence".into(),
+                        "watch_delegation".into(),
+                        unknown.into()
+                    ],
+                    &registry,
+                ),
+                Some(unknown.into()),
+            );
+        }
     }
 
     #[test]
@@ -1694,6 +1800,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain the original embedded storage fixture lifetime through union rewrites and final survivor and merged-entity assertions."
+    )]
     fn test_apply_entity_merge_rewrites_embedded_unions_angel_protectees() {
         use elephant_types::records::base::BaseFields;
         use elephant_types::records::entity::EntityType;
@@ -1724,7 +1834,9 @@ mod tests {
             }
         }
 
-        let store = EmbeddedStore::new();
+        let storage = tokio_test::block_on(StorageClient::new_embedded()).unwrap();
+        tokio_test::block_on(register_merge_space(&storage, "space"));
+        let store = storage.embedded_store().unwrap();
         let survivor = make_entity("Alice Chen", &["child-a"]);
         let merged = make_entity("Alice", &["child-b", "child-a"]);
         let survivor_id = survivor.base.id.clone();
@@ -1737,8 +1849,8 @@ mod tests {
         })
         .unwrap();
 
-        tokio_test::block_on(apply_entity_merge_rewrites_embedded(
-            &store,
+        tokio_test::block_on(apply_entity_merge_rewrites(
+            &storage,
             "space",
             &survivor_id,
             std::slice::from_ref(&merged_id),
@@ -1823,5 +1935,196 @@ mod tests {
         assert!(validate_identifier("has spaces").is_err());
         assert!(validate_identifier("semi;colon").is_err());
         assert!(validate_identifier("quote'mark").is_err());
+    }
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain original storage, repository and prepared-merge lifetimes through authorization, commit and all native extension post-commit assertions on both backends."
+    )]
+    async fn actual_extension_merge(embedded: bool) {
+        use elephant_storage::canonical_extension::{
+            load_extension_rows, NativeExtensionValue as Native,
+        };
+        use elephant_storage::{EntityRepository, StorageConfig};
+        use elephant_types::records::{base::BaseFields, entity::EntityType};
+        let storage = if embedded {
+            StorageClient::new_embedded().await
+        } else {
+            StorageClient::new(StorageConfig::default()).await
+        }
+        .unwrap();
+        if !embedded {
+            storage
+                .query_checked(include_str!(
+                    "../../migrations/sql/031_source_publication.surql"
+                ))
+                .await
+                .unwrap();
+        }
+        register_merge_space(&storage, "home").await;
+        let entities = EntityRepository::new(storage.clone());
+        let make = |name: &str| {
+            Entity::new(
+                BaseFields::new(
+                    RecordId::new_v4(TableName::Entity),
+                    "home".into(),
+                    "test".into(),
+                ),
+                EntityType::new("person"),
+                name.into(),
+            )
+        };
+        let a = entities.create(make("A")).await.unwrap();
+        let b = entities.create(make("B")).await.unwrap();
+        let row = serde_json::json!({"id":"sampleapp_note:note-1","space_id":"home",
+            "security":a.base.security,"subjects":[],"subjects_state":"complete",
+            "owner":b.base.id,"nested":{"related":[b.base.id,a.base.id],"untouched":{"empty":null}},"type":"consumer-kind"});
+        if let Some(store) = storage.embedded_store() {
+            store
+                .mutate(|tx| {
+                    tx.upsert_extension_row("sampleapp_note", row.clone())?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        } else {
+            let mut native = elephant_storage::surreal::json_to_surreal(row).unwrap();
+            let Native::Object(object) = &mut native else {
+                unreachable!()
+            };
+            object.remove("id");
+            object.insert(
+                "owner".into(),
+                Native::Thing(thing_from_record_id(&b.base.id)),
+            );
+            storage
+                .query_bind_checked(
+                    "CREATE type::thing('sampleapp_note', 'note-1') CONTENT $row;",
+                    std::collections::BTreeMap::<String, Native>::from([("row".into(), native)]),
+                )
+                .await
+                .unwrap();
+        }
+        let before = load_extension_rows(&storage, "sampleapp_note")
+            .await
+            .unwrap()
+            .remove(0);
+        let mut registry = ReferenceRegistry::new();
+        registry.register(ReferenceDeclaration::new("sampleapp_note", "owner"));
+        registry
+            .register(ReferenceDeclaration::new("sampleapp_note", "nested.related[]").with_many());
+        let prepared = prepare_entity_merge(
+            &storage,
+            "home",
+            &a.base.id,
+            &b.base.id,
+            elephant_storage::entity_merge_repository::MergeSelection::KeepA,
+            "test",
+            &registry,
+        )
+        .await
+        .unwrap();
+        assert!(prepared
+            .authorizations()
+            .unwrap()
+            .iter()
+            .any(|row| row.id.contains("note-1")));
+        prepared.commit().await.unwrap();
+        let after = load_extension_rows(&storage, "sampleapp_note")
+            .await
+            .unwrap()
+            .remove(0);
+        let Native::Object(before) = before else {
+            unreachable!()
+        };
+        let Native::Object(after) = after else {
+            unreachable!()
+        };
+        assert_eq!(after.get("type"), before.get("type"));
+        let Native::Object(nested) = after.get("nested").unwrap() else {
+            unreachable!()
+        };
+        let Native::Object(original_nested) = before.get("nested").unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(nested.get("untouched"), original_nested.get("untouched"));
+        assert_eq!(
+            nested.get("related"),
+            Some(&Native::Array(
+                vec![Native::from(a.base.id.to_string())].into()
+            ))
+        );
+        if embedded {
+            assert_eq!(
+                after.get("owner"),
+                Some(&Native::from(a.base.id.to_string()))
+            );
+        } else {
+            assert_eq!(
+                after.get("owner"),
+                Some(&Native::Thing(thing_from_record_id(&a.base.id)))
+            );
+        }
+    }
+
+    #[test]
+    fn native_reference_preparation_reads_prior_effects_and_keeps_before_images() {
+        use elephant_storage::canonical_commit::CanonicalPlan;
+        use elephant_storage::canonical_extension::{
+            CanonicalExtensionEffect, NativeExtensionValue as Native,
+        };
+        let a = RecordId::new_v4(TableName::Entity);
+        let b = RecordId::new_v4(TableName::Entity);
+        let mut before = elephant_storage::surreal::json_to_surreal(serde_json::json!({
+            "space_id":"home", "owner":b, "untouched":"original"
+        }))
+        .unwrap();
+        let id = elephant_storage::surreal::json_to_surreal(serde_json::json!("note-1")).unwrap();
+        // Obtain the exact native Thing without adding a direct driver dependency.
+        let native_id = thing_from_record_id(&RecordId::new_v4(TableName::Entity));
+        let mut native_id = native_id;
+        native_id.tb = "sampleapp_note".into();
+        let Native::Object(object) = &mut before else {
+            unreachable!()
+        };
+        object.insert("id".into(), Native::Thing(native_id.clone()));
+        object.insert("opaque".into(), id);
+        let mut pending = before.clone();
+        let Native::Object(object) = &mut pending else {
+            unreachable!()
+        };
+        object.insert("untouched".into(), Native::from("prepared earlier"));
+        let prior = CanonicalPlan {
+            extension_effects: vec![CanonicalExtensionEffect {
+                id: native_id,
+                before: Some(before.clone()),
+                after: Some(pending),
+            }],
+            ..CanonicalPlan::default()
+        };
+        let mut selected =
+            extension_rows_on_plan("sampleapp_note", vec![before.clone()], Some(&prior)).unwrap();
+        let declaration = ReferenceDeclaration::new("sampleapp_note", "owner");
+        assert!(
+            rewrite_declared_entity_refs_native(&mut selected[0], &declaration, &[b], &a).unwrap()
+        );
+        let Native::Object(after) = &selected[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            after.get("untouched"),
+            Some(&Native::from("prepared earlier"))
+        );
+        assert_eq!(after.get("owner"), Some(&Native::from(a.to_string())));
+        assert_eq!(prior.extension_effects[0].before.as_ref(), Some(&before));
+        assert!(extension_rows_on_plan("sampleapp_note", vec![], Some(&prior)).is_err());
+    }
+
+    #[test]
+    fn embedded_actual_canonical_extension_merge() {
+        tokio_test::block_on(actual_extension_merge(true));
+    }
+    #[test]
+    fn surreal_actual_canonical_extension_merge() {
+        tokio_test::block_on(actual_extension_merge(false));
     }
 }

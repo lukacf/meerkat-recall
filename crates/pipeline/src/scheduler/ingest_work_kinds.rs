@@ -297,6 +297,58 @@ pub async fn execute_triage_source<T: TriagePlugin>(
     policy_version: &str,
     actor: &str,
 ) -> Result<TriageSourceResult, PipelineError> {
+    execute_triage_source_inner(
+        source,
+        triage_plugin,
+        budget_enforcer,
+        decision_repo,
+        space_id,
+        policy_version,
+        actor,
+        true,
+    )
+    .await
+}
+
+/// Plan triage inside an already-accounted worker attempt. Reservations and
+/// physical usage belong to its WorkRun; the decision records estimates only.
+/// The caller retains responsibility for a fenced continuation on budget denial.
+///
+/// # Errors
+/// Returns triage, budget-read, per-item-cap, or decision persistence failures.
+pub async fn execute_triage_source_for_work_attempt<T: TriagePlugin>(
+    source: &Source,
+    triage_plugin: &T,
+    budget_enforcer: &BudgetEnforcer,
+    decision_repo: &IngestDecisionRepository,
+    space_id: &str,
+    policy_version: &str,
+    actor: &str,
+) -> Result<TriageSourceResult, PipelineError> {
+    execute_triage_source_inner(
+        source,
+        triage_plugin,
+        budget_enforcer,
+        decision_repo,
+        space_id,
+        policy_version,
+        actor,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_triage_source_inner<T: TriagePlugin>(
+    source: &Source,
+    triage_plugin: &T,
+    budget_enforcer: &BudgetEnforcer,
+    decision_repo: &IngestDecisionRepository,
+    space_id: &str,
+    policy_version: &str,
+    actor: &str,
+    reserve_triage: bool,
+) -> Result<TriageSourceResult, PipelineError> {
     // 1. Create budget snapshot
     let budget_snapshot = budget_enforcer.create_snapshot().await?;
 
@@ -324,16 +376,29 @@ pub async fn execute_triage_source<T: TriagePlugin>(
         .current_running_for_kind(worker_kind)
         .await?;
 
-    let budget_check = budget_enforcer
-        .check_all_budgets_and_reserve(
-            triage_result.decision,
-            triage_result.estimated_cost,
-            estimated_tokens,
-            estimated_wall_time_secs,
-            worker_kind,
-            current_running,
-        )
-        .await?;
+    let budget_check = if reserve_triage {
+        budget_enforcer
+            .check_all_budgets_and_reserve(
+                triage_result.decision,
+                triage_result.estimated_cost,
+                estimated_tokens,
+                estimated_wall_time_secs,
+                worker_kind,
+                current_running,
+            )
+            .await?
+    } else {
+        budget_enforcer
+            .check_all_budgets(
+                triage_result.decision,
+                triage_result.estimated_cost,
+                estimated_tokens,
+                estimated_wall_time_secs,
+                worker_kind,
+                current_running,
+            )
+            .await?
+    };
 
     if let Some(cap_breach) = budget_check.cap_breach {
         return Err(match cap_breach {
@@ -390,7 +455,9 @@ pub async fn execute_triage_source<T: TriagePlugin>(
             }
         };
 
-    if was_downgraded && budget_enforcer.downgrade_policy() == DowngradePolicy::DegradeModeWithQueue
+    if reserve_triage
+        && was_downgraded
+        && budget_enforcer.downgrade_policy() == DowngradePolicy::DegradeModeWithQueue
     {
         if let (Some(original), Some(reason)) = (original_mode, downgrade_reason.as_deref()) {
             budget_enforcer
@@ -407,7 +474,7 @@ pub async fn execute_triage_source<T: TriagePlugin>(
     }
 
     // 6. Reserve estimated cost for the decided mode
-    let cost_ledger_id = if final_mode == IngestMode::Skip {
+    let cost_ledger_id = if !reserve_triage || final_mode == IngestMode::Skip {
         None
     } else if budget_check.reserved_ledger_id.is_some() {
         budget_check.reserved_ledger_id
@@ -533,10 +600,68 @@ pub async fn execute_upgrade_ingest_mode(
     target_mode: IngestMode,
     budget_enforcer: &BudgetEnforcer,
     estimated_cost: f64,
-    _reason: &str,
+    reason: &str,
 ) -> Result<UpgradeIngestModeResult, PipelineError> {
-    // Validate upgrade direction (can only go to higher modes)
-    if !is_valid_upgrade(current_mode, target_mode) {
+    execute_upgrade_ingest_mode_inner(
+        source,
+        current_mode,
+        target_mode,
+        budget_enforcer,
+        estimated_cost,
+        reason,
+        ModeAdmission::StrictUpgrade,
+    )
+    .await
+}
+
+/// Checks materialization of an accepted source revision, including rebuilding
+/// at its existing Retrieval or Graph mode. Its caller retains the original
+/// publication attempt and configuration through rendering and finalization.
+/// This path never creates legacy upgrade work; the caller retries its own item.
+///
+/// # Errors
+/// Returns invalid transitions, budget reads, and per-item-cap failures.
+pub async fn execute_upgrade_ingest_mode_for_work_attempt(
+    source: &Source,
+    current_mode: IngestMode,
+    target_mode: IngestMode,
+    budget_enforcer: &BudgetEnforcer,
+    estimated_cost: f64,
+    reason: &str,
+) -> Result<UpgradeIngestModeResult, PipelineError> {
+    execute_upgrade_ingest_mode_inner(
+        source,
+        current_mode,
+        target_mode,
+        budget_enforcer,
+        estimated_cost,
+        reason,
+        ModeAdmission::AcceptedRevision,
+    )
+    .await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModeAdmission {
+    StrictUpgrade,
+    AcceptedRevision,
+}
+
+async fn execute_upgrade_ingest_mode_inner(
+    source: &Source,
+    current_mode: IngestMode,
+    target_mode: IngestMode,
+    budget_enforcer: &BudgetEnforcer,
+    estimated_cost: f64,
+    _reason: &str,
+    admission: ModeAdmission,
+) -> Result<UpgradeIngestModeResult, PipelineError> {
+    // An immutable accepted replacement can retain the published mode while
+    // still requiring its own materialization. Legacy requests only deepen.
+    let rebuild_accepted_revision = admission == ModeAdmission::AcceptedRevision
+        && current_mode == target_mode
+        && matches!(target_mode, IngestMode::Retrieval | IngestMode::Graph);
+    if !is_valid_upgrade(current_mode, target_mode) && !rebuild_accepted_revision {
         return Err(PipelineError::InvalidStateTransition {
             from: current_mode.to_string(),
             to: target_mode.to_string(),
@@ -590,7 +715,9 @@ pub async fn execute_upgrade_ingest_mode(
             denied_reason: None,
         }),
         BudgetCheckResult::Rejected { reason } | BudgetCheckResult::Downgrade { reason, .. } => {
-            if budget_enforcer.downgrade_policy() == DowngradePolicy::DegradeModeWithQueue {
+            if admission == ModeAdmission::StrictUpgrade
+                && budget_enforcer.downgrade_policy() == DowngradePolicy::DegradeModeWithQueue
+            {
                 let _ = budget_enforcer
                     .queue_mode_upgrade(
                         &source.base.id,
@@ -911,6 +1038,222 @@ mod tests {
 
         assert_eq!(result.decided_mode, IngestMode::Metadata);
         assert!(!result.was_downgraded);
+    }
+
+    async fn attempt_triage_accounting_contract(storage: StorageClient) {
+        if storage.embedded_store().is_none() {
+            storage.query(SCHEMA).await.expect("schema");
+        }
+        let source = make_source();
+        let budget = BudgetEnforcer::new(storage.clone(), Budget::default(), "test_space".into());
+        let original_ledger = budget
+            .reserve_cost(IngestMode::Graph, "work_attempt", 1.0)
+            .await
+            .expect("original attempt reservation");
+        let ledger = elephant_storage::CostLedgerDailyRepository::new(storage.clone());
+        let before = ledger.list("test_space", 100, None).await.expect("before");
+        let decisions = IngestDecisionRepository::new(storage.clone());
+        let result = execute_triage_source_for_work_attempt(
+            &source,
+            &GraphTriagePlugin::new(),
+            &budget,
+            &decisions,
+            "test_space",
+            "v1",
+            "fixture",
+        )
+        .await
+        .expect("attempt triage");
+        let decision = decisions
+            .get("test_space", &result.decision_id)
+            .await
+            .expect("get")
+            .expect("decision");
+        assert!((decision.estimated_cost - 5.0).abs() < f64::EPSILON);
+        assert!(
+            decision.cost_ledger_id.is_none(),
+            "decision cannot create an unowned reservation"
+        );
+        let after = ledger.list("test_space", 100, None).await.expect("after");
+        assert_eq!(before.len(), after.len());
+        let original = ledger
+            .get("test_space", &original_ledger)
+            .await
+            .expect("original")
+            .expect("retained");
+        assert!((original.reserved_euros - 1.0).abs() < f64::EPSILON);
+        assert!(original.reconciled_euros.abs() < f64::EPSILON);
+        let denied_budget = BudgetEnforcer::new(
+            storage.clone(),
+            Budget {
+                daily_euros_graph: 1.0,
+                downgrade_policy: DowngradePolicy::DegradeModeWithQueue,
+                ..Budget::default()
+            },
+            "test_space".into(),
+        );
+        let denied = execute_triage_source_for_work_attempt(
+            &source,
+            &GraphTriagePlugin::new(),
+            &denied_budget,
+            &decisions,
+            "test_space",
+            "v1",
+            "fixture",
+        )
+        .await
+        .expect("record denied planning");
+        assert!(denied.was_downgraded);
+        let upgrade = execute_upgrade_ingest_mode_for_work_attempt(
+            &source,
+            IngestMode::Metadata,
+            IngestMode::Graph,
+            &denied_budget,
+            5.0,
+            "fixture",
+        )
+        .await
+        .expect("denied upgrade");
+        assert!(!upgrade.allowed);
+        assert!(upgrade.denied_reason.is_some());
+        assert!(
+            WorkItemRepository::new(storage)
+                .list("test_space", 100, None)
+                .await
+                .expect("queued work")
+                .is_empty(),
+            "accepted worker must retain its original publication on continuations"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_attempt_triage_does_not_reserve_future_work_or_enqueue_unfenced_upgrade() {
+        attempt_triage_accounting_contract(StorageClient::new_embedded().await.expect("embedded"))
+            .await;
+    }
+    #[tokio::test]
+    async fn surreal_attempt_triage_does_not_reserve_future_work_or_enqueue_unfenced_upgrade() {
+        attempt_triage_accounting_contract(StorageClient::new_memory().await.expect("memory"))
+            .await;
+    }
+
+    async fn accepted_revision_same_mode_contract(storage: StorageClient) {
+        if storage.embedded_store().is_none() {
+            storage.query(SCHEMA).await.expect("schema");
+        }
+        let allowed_budget =
+            BudgetEnforcer::new(storage.clone(), Budget::default(), "test_space".into());
+        let denied_budget = BudgetEnforcer::new(
+            storage.clone(),
+            Budget {
+                daily_euros_retrieval: 0.5,
+                daily_euros_graph: 0.5,
+                downgrade_policy: DowngradePolicy::DegradeModeWithQueue,
+                ..Budget::default()
+            },
+            "test_space".into(),
+        );
+        for mode in [IngestMode::Retrieval, IngestMode::Graph] {
+            let mut source = make_source();
+            source.current_ingest_mode = Some(mode);
+            let original = serde_json::to_value(&source).expect("original source");
+            let admitted = execute_upgrade_ingest_mode_for_work_attempt(
+                &source,
+                mode,
+                mode,
+                &allowed_budget,
+                1.0,
+                "accepted replacement",
+            )
+            .await
+            .expect("same-mode accepted revision requires materialization");
+            assert!(admitted.allowed);
+            assert_eq!(admitted.source_id, source.base.id);
+            assert_eq!(admitted.previous_mode, mode);
+            assert_eq!(admitted.new_mode, mode);
+            assert!(admitted.denied_reason.is_none());
+
+            let legacy = execute_upgrade_ingest_mode(
+                &source,
+                mode,
+                mode,
+                &allowed_budget,
+                1.0,
+                "legacy upgrade",
+            )
+            .await;
+            assert!(matches!(
+                legacy,
+                Err(PipelineError::InvalidStateTransition { from, to })
+                    if from == mode.to_string() && to == mode.to_string()
+            ));
+
+            let denied = execute_upgrade_ingest_mode_for_work_attempt(
+                &source,
+                mode,
+                mode,
+                &denied_budget,
+                1.0,
+                "accepted replacement exceeds daily budget",
+            )
+            .await
+            .expect("same-mode rebuild still checks budget");
+            assert!(!denied.allowed);
+            assert_eq!(denied.previous_mode, mode);
+            assert_eq!(denied.new_mode, mode);
+            assert!(denied.denied_reason.is_some());
+            assert_eq!(
+                serde_json::to_value(&source).expect("retained source"),
+                original
+            );
+        }
+
+        let source = make_source();
+        for (current, target) in [
+            (IngestMode::Graph, IngestMode::Retrieval),
+            (IngestMode::Retrieval, IngestMode::Metadata),
+            (IngestMode::Metadata, IngestMode::Metadata),
+            (IngestMode::Skip, IngestMode::Skip),
+        ] {
+            assert!(matches!(
+                execute_upgrade_ingest_mode_for_work_attempt(
+                    &source, current, target, &allowed_budget, 1.0, "invalid accepted transition",
+                )
+                .await,
+                Err(PipelineError::InvalidStateTransition { from, to })
+                    if from == current.to_string() && to == target.to_string()
+            ));
+        }
+        assert!(
+            WorkItemRepository::new(storage.clone())
+                .list("test_space", 100, None)
+                .await
+                .expect("queued work")
+                .is_empty(),
+            "budget refusal must preserve the original accepted attempt, never queue unbound work"
+        );
+        assert!(
+            elephant_storage::CostLedgerDailyRepository::new(storage)
+                .list("test_space", 100, None)
+                .await
+                .expect("cost ledger")
+                .is_empty(),
+            "mode admission must not reserve or reconcile another attempt's cost"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_accepted_revision_rebuilds_same_mode_with_budget_and_legacy_guards() {
+        accepted_revision_same_mode_contract(
+            StorageClient::new_embedded().await.expect("embedded"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn surreal_accepted_revision_rebuilds_same_mode_with_budget_and_legacy_guards() {
+        accepted_revision_same_mode_contract(StorageClient::new_memory().await.expect("memory"))
+            .await;
     }
 
     #[tokio::test]

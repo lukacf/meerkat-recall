@@ -7,6 +7,15 @@
 //! - Progress tracking with ETA estimation
 //! - Supersession of old revisions/assertions/rels/attributes
 
+mod atomic;
+mod budget;
+mod failure;
+mod maintenance_job;
+mod source_job;
+
+pub use budget::guard_physical_dispatch;
+pub use failure::reconcile_failed_work;
+
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -14,31 +23,32 @@ use elephant_storage::{
     AssertionRepository, AttributeRepository, DocRepository, DocRevisionRepository, RelRepository,
     Repository, ReprocessJobRepository, SourceRepository, StorageClient, WorkRunRepository,
 };
+#[cfg(test)]
 use elephant_types::records::assertion::ResolutionStatus;
-use elephant_types::records::base::{BaseFields, Extractor, Provenance};
+use elephant_types::records::base::BaseFields;
+#[cfg(test)]
+use elephant_types::records::base::{Extractor, Provenance};
+#[cfg(test)]
 use elephant_types::records::doc::Doc;
-use elephant_types::records::doc_revision::{DocRevision, RevisionStatus};
+use elephant_types::records::doc_revision::DocRevision;
+#[cfg(test)]
+use elephant_types::records::doc_revision::RevisionStatus;
+#[cfg(test)]
 use elephant_types::records::rel::ClaimStatus;
 use elephant_types::records::reprocess::{
     ReprocessJob, ReprocessProgress, ReprocessStatus, ReprocessTargetStage, SelectionCriteria,
 };
 use elephant_types::records::source::{Source, SourceType};
+#[cfg(test)]
 use elephant_types::records::work::WorkRun;
 use elephant_types::{Link, RecordId, TableName};
 use std::str::FromStr;
 
 use crate::error::{PipelineError, PipelineResult};
-use crate::extraction::ExtractorRegistry;
-use crate::renderer::default::{DefaultTextRenderer, PassthroughRenderer};
-use crate::renderer::multimodal::MultimodalRenderer;
+#[cfg(test)]
 use crate::renderer::{RenderContext, RendererRegistry};
-use crate::scheduler::evidence_work_kinds::{execute_build_doc_tree, DocTreeConfig};
-use crate::scheduler::extraction_work_kinds::{
-    execute_extract_assertions, execute_plan_extraction, ExtractionPlanConfig,
-};
 use crate::truth_maintenance::{
-    execute_tm_recompute, RecomputePriority, RepositoryTruthMaintenanceStorage, TmContext,
-    TruthMaintenanceStorage,
+    execute_tm_recompute, RecomputePriority, TmContext, TruthMaintenanceStorage,
 };
 
 // ============================================================================
@@ -96,8 +106,28 @@ pub struct JobCreationResult {
     pub estimated_sources: u64,
 }
 
+/// A read-only snapshot of original accepted source-operation usage. This is
+/// neither source completion authority nor a currency budget reservation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReprocessSourceUsage {
+    /// Original accepted operations represented in this snapshot.
+    pub operation_count: u64,
+    /// Distinct physical dispatch receipts across all attempts and plans.
+    pub physical_calls: u64,
+    /// Complete input token sum, or unknown.
+    pub input_tokens: Option<u64>,
+    /// Complete output token sum, or unknown.
+    pub output_tokens: Option<u64>,
+    /// Monetary total backed by actual billing evidence; never inferred from
+    /// a missing receipt or a provider/model name.
+    pub monetary_euros: Option<f64>,
+    /// All included operations and their observed usage are closed. Pricing
+    /// may still be unknown even when this is true.
+    pub complete: bool,
+}
+
 /// Result of reprocess execution.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReprocessResult {
     /// Number of sources processed.
     pub sources_processed: u64,
@@ -105,12 +135,26 @@ pub struct ReprocessResult {
     pub revisions_created: u64,
     /// Number of assertions superseded.
     pub assertions_superseded: u64,
+    /// Existing assertions reconsidered without manufacturing extraction evidence.
+    #[serde(default)]
+    pub assertions_reprocessed: u64,
+    /// Events retired while re-resolving their assertion support.
+    #[serde(default)]
+    pub events_superseded: u64,
+    /// New entity identities prepared by assertion re-resolution.
+    #[serde(default)]
+    pub entities_created: u64,
     /// Number of relationships superseded.
     pub rels_superseded: u64,
     /// Number of attributes superseded.
     pub attributes_superseded: u64,
-    /// Total cost spent in euros.
+    /// Retained legacy recorded cost. This field is not proof of measured
+    /// source-child spending; consult `source_usage.monetary_euros`.
     pub cost_spent_euros: f64,
+    /// Current original-operation accounting for source replacement jobs.
+    /// Absent for maintenance-only jobs and before source admission.
+    #[serde(default)]
+    pub source_usage: Option<ReprocessSourceUsage>,
     /// Whether the job was paused (vs completed).
     pub paused: bool,
     /// Error message if failed.
@@ -118,12 +162,12 @@ pub struct ReprocessResult {
     /// Conflict groups the recompute deferred; the caller must enqueue a
     /// tm_resolve_slot work item per group.
     pub pending_conflict_groups: Vec<RecordId>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct SourceReprocessResult {
-    revisions_created: u64,
-    assertions_superseded: u64,
+    /// Accepted source operations still awaiting canonical publication.
+    #[serde(default)]
+    pub pending_operations: Vec<String>,
+    /// More durable work remains, including sources awaiting admission capacity.
+    #[serde(default)]
+    pub continuation_required: bool,
 }
 
 /// Repository bundle for executing reprocess jobs.
@@ -140,7 +184,7 @@ pub struct ReprocessExecutionContext {
 }
 
 /// Result of supersession operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupersessionResult {
     /// ID of the old record that was superseded.
     pub old_id: RecordId,
@@ -261,10 +305,6 @@ pub async fn create_reprocess_job(
     created_by: &str,
     config: Option<&ReprocessConfig>,
 ) -> PipelineResult<JobCreationResult> {
-    use elephant_storage::Repository;
-    use elephant_types::records::base::{BaseFields, Provenance, Security, SubjectsState};
-    use elephant_types::TableName;
-
     // Validate criteria first
     validate_selection_criteria(&criteria).map_err(|errors| {
         let error_msg = errors
@@ -283,13 +323,11 @@ pub async fn create_reprocess_job(
 
     // Apply config defaults
     let config = config.cloned().unwrap_or_default();
+    budget::validate_limit(config.default_budget_limit_euros)?;
 
     // Create job record
     let id = RecordId::new_v4(TableName::ReprocessJob);
-    let mut base = BaseFields::new(id, space_id.to_string(), created_by.to_string());
-    base.security = Security::default();
-    base.provenance = Provenance::default();
-    base.subjects_state = SubjectsState::Complete;
+    let base = BaseFields::new(id, space_id.to_string(), created_by.to_string());
 
     let job = ReprocessJob {
         base,
@@ -307,8 +345,10 @@ pub async fn create_reprocess_job(
         reason: None,
     };
 
-    // Persist via repository
-    let created = repository.create(job).await?;
+    // The internal factory follows the same configured-space envelope and
+    // atomic original-producer/initial-handoff contract as public creation.
+    let prepared = repository.prepare_creation(job).await?;
+    let created = repository.create_prepared_with_work(prepared).await?;
 
     // Estimated sources is 0 until Phase 10 wires source counting
     Ok(JobCreationResult {
@@ -329,9 +369,8 @@ pub async fn create_reprocess_job(
 ///
 /// Returns an error if the job is not found, in an invalid state, or storage fails.
 ///
-/// # Phase 10 Note
-/// Full batch processing with source iteration requires wiring SourceRepository.
-/// This implementation handles state transitions and budget checking.
+/// Source replacement dispatches durable accepted operations; resolution and
+/// maintenance effects share the job's original captured canonical plan.
 pub async fn execute_reprocess_job(
     ctx: &ReprocessExecutionContext,
     job_id: &RecordId,
@@ -339,205 +378,85 @@ pub async fn execute_reprocess_job(
     space_id: &str,
     config: &ReprocessConfig,
 ) -> PipelineResult<ReprocessResult> {
-    use elephant_storage::Repository;
+    Box::pin(execute_reprocess_job_with_attempt(
+        ctx,
+        job_id,
+        work_run_id,
+        space_id,
+        config,
+        None,
+    ))
+    .await
+}
 
-    let now = Utc::now();
-
-    // Get the job
+/// Runs retained reprocessing under the original successful queue claim.
+/// A pending source operation is not completion; callers must schedule a retry.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_reprocess_job_with_attempt(
+    ctx: &ReprocessExecutionContext,
+    job_id: &RecordId,
+    work_run_id: &RecordId,
+    space_id: &str,
+    config: &ReprocessConfig,
+    attempt: Option<elephant_types::publication::AttemptFence>,
+) -> PipelineResult<ReprocessResult> {
+    let planning = Box::pin(
+        crate::maintenance_commit::PlanningTruthMaintenanceStorage::new(
+            ctx.storage.clone(),
+            space_id,
+            attempt.clone(),
+        ),
+    )
+    .await?;
     let job = ctx
         .job_repo
         .get(space_id, job_id)
         .await?
         .ok_or_else(|| PipelineError::NotFound(format!("ReprocessJob not found: {job_id}")))?;
-
-    let work_run = ctx
+    planning.observe(&job)?;
+    let run = ctx
         .work_run_repo
         .get(space_id, work_run_id)
         .await?
         .ok_or_else(|| PipelineError::NotFound(format!("WorkRun not found: {work_run_id}")))?;
-
-    // Check job status - must be Pending or Paused to execute
-    match job.status {
-        ReprocessStatus::Pending | ReprocessStatus::Paused => {}
-        ReprocessStatus::Running => {
+    if let Some(fence) = &attempt {
+        let saved = run.metrics.custom.get("attempt_fence").and_then(|value| {
+            serde_json::from_value::<elephant_types::publication::AttemptFence>(value.clone()).ok()
+        });
+        if fence.space_id != space_id
+            || &fence.work_item_id != run.work_item.id()
+            || saved.as_ref() != Some(fence)
+            || run.base.deleted_at.is_some()
+        {
             return Err(PipelineError::InvalidState(
-                "Job is already running".to_string(),
+                "Reprocess run differs from original attempt".into(),
             ));
         }
-        ReprocessStatus::Completed => {
-            return Err(PipelineError::InvalidState(
-                "Job is already completed".to_string(),
-            ));
-        }
-        ReprocessStatus::Failed => {
-            return Err(PipelineError::InvalidState(
-                "Job has failed, cannot resume".to_string(),
-            ));
-        }
-        ReprocessStatus::Cancelled => {
-            return Err(PipelineError::InvalidState("Job was cancelled".to_string()));
-        }
+        planning.observe(&run)?;
     }
-
-    // Transition to Running
-    let mut updated_job = job.clone();
-    updated_job.status = ReprocessStatus::Running;
-    updated_job.started_at = updated_job.started_at.or(Some(now));
-
-    let mut updated_job = ctx
-        .job_repo
-        .update_if_status_in(
-            space_id,
-            job_id,
-            updated_job,
-            &[ReprocessStatus::Pending, ReprocessStatus::Paused],
-        )
-        .await?
-        .ok_or_else(|| {
-            PipelineError::InvalidState("Job already claimed by another worker".to_string())
-        })?;
-
-    // Check budget before processing
-    if check_budget_limit(&updated_job) {
-        let mut paused_job = updated_job.clone();
-        paused_job.status = if config.pause_on_budget_limit {
-            ReprocessStatus::Paused
-        } else {
-            ReprocessStatus::Failed
-        };
-        if !config.pause_on_budget_limit {
-            paused_job.error = Some("Budget limit exceeded".to_string());
-        }
-
-        ctx.job_repo.update(space_id, job_id, paused_job).await?;
-
-        return Ok(ReprocessResult {
-            paused: config.pause_on_budget_limit,
-            error: if config.pause_on_budget_limit {
-                None
-            } else {
-                Some("Budget limit exceeded".to_string())
-            },
-            ..Default::default()
-        });
-    }
-
-    let remaining_capacity = remaining_daily_capacity(&updated_job, now);
-    if remaining_capacity == Some(0) {
-        let mut paused_job = updated_job.clone();
-        paused_job.status = ReprocessStatus::Paused;
-        ctx.job_repo.update(space_id, job_id, paused_job).await?;
-
-        return Ok(ReprocessResult {
-            paused: true,
-            ..Default::default()
-        });
-    }
-
-    let max_to_process = remaining_capacity
-        .map(|cap| cap.min(config.batch_size as u64) as usize)
-        .unwrap_or(config.batch_size);
-
-    if max_to_process == 0 {
-        let mut paused_job = updated_job.clone();
-        paused_job.status = ReprocessStatus::Paused;
-        ctx.job_repo.update(space_id, job_id, paused_job).await?;
-        return Ok(ReprocessResult {
-            paused: true,
-            ..Default::default()
-        });
-    }
-
-    let selected_sources = select_sources_for_reprocess(
-        ctx,
-        space_id,
-        &updated_job.selection_criteria,
-        max_to_process,
-    )
-    .await?;
-
-    let mut result = ReprocessResult {
-        sources_processed: selected_sources.len() as u64,
-        ..Default::default()
-    };
-
-    let mut succeeded = 0_u64;
-    for source in &selected_sources {
-        match process_source_for_reprocess(
+    if should_reextract(&job.target_stages) {
+        // Both branches have substantial independent state. Keeping their
+        // futures out of this frame also bounds callers that select only one.
+        return Box::pin(source_job::execute(
             ctx,
-            source,
+            job,
+            work_run_id,
             space_id,
-            &updated_job.selection_criteria,
-            &updated_job.target_stages,
-            &work_run,
-        )
-        .await
-        {
-            Ok(process_result) => {
-                result.assertions_superseded += process_result.assertions_superseded;
-                result.revisions_created += process_result.revisions_created;
-                succeeded += 1;
-            }
-            Err(err) => {
-                result.error = Some(err.to_string());
-                break;
-            }
-        }
+            config,
+            attempt,
+            planning,
+        ))
+        .await;
     }
-
-    if result.error.is_none()
-        && (result.assertions_superseded > 0 || should_remaintain(&updated_job.target_stages))
-    {
-        let tm_storage = RepositoryTruthMaintenanceStorage::new(ctx.storage.clone());
-        tm_storage
-            .mark_all_slots_stale(space_id, "reprocess_supersession")
-            .await?;
-        match execute_tm_recompute(
-            &TmContext::none(),
-            space_id,
-            RecomputePriority::Normal,
-            1000,
-            &tm_storage,
-        )
-        .await
-        {
-            Ok(recompute) => {
-                // Multi-value-group slots are deferred out of the recompute
-                // lease; surface them so the work-item arm enqueues resolves.
-                result.pending_conflict_groups = recompute.pending_conflict_groups;
-            }
-            Err(err) => {
-                result.error = Some(err.to_string());
-            }
-        }
-    }
-
-    updated_job.progress.total_sources = updated_job
-        .progress
-        .total_sources
-        .max(selected_sources.len() as u64);
-    updated_job.progress.processed_sources += result.sources_processed;
-    updated_job.progress.succeeded_sources += succeeded;
-    updated_job.progress.failed_sources += result.sources_processed.saturating_sub(succeeded);
-    updated_job.progress.cost_spent_euros += result.cost_spent_euros;
-    if updated_job.progress.total_sources > 0 {
-        updated_job.progress.progress_percent = (updated_job.progress.processed_sources as f32
-            / updated_job.progress.total_sources as f32)
-            * 100.0;
-    }
-
-    if result.error.is_some() {
-        updated_job.status = ReprocessStatus::Failed;
-        updated_job.error = result.error.clone();
-        ctx.job_repo.update(space_id, job_id, updated_job).await?;
-        return Ok(result);
-    }
-
-    updated_job.status = ReprocessStatus::Completed;
-    updated_job.completed_at = Some(Utc::now());
-    ctx.job_repo.update(space_id, job_id, updated_job).await?;
-
-    Ok(result)
+    Box::pin(maintenance_job::execute(
+        ctx,
+        job,
+        work_run_id,
+        space_id,
+        config,
+        planning,
+    ))
+    .await
 }
 
 fn remaining_daily_capacity(job: &ReprocessJob, now: DateTime<Utc>) -> Option<u64> {
@@ -650,38 +569,60 @@ async fn source_matches_assertion_filters(
         return Ok(true);
     }
 
-    let docs = ctx
-        .doc_repo
-        .find_by_source(space_id, &source.base.id, 1000)
-        .await?;
-
-    for doc in docs {
-        let revisions = ctx.doc_revision_repo.find_by_doc(&doc.base.id).await?;
-        for revision in revisions {
-            let assertions = ctx
-                .assertion_repo
-                .find_by_revision(space_id, &revision.base.id, 1000)
-                .await?;
-            for assertion in assertions {
-                if assertion_matches_criteria(&assertion, criteria) {
-                    return Ok(true);
-                }
+    // Selection is a complete predicate over the source, not the first 1,000
+    // assertions/documents. Follow matching assertions back to actual records.
+    let mut cursor = None;
+    loop {
+        let page = ctx
+            .assertion_repo
+            .list(space_id, 256, cursor.as_ref())
+            .await?;
+        if page.is_empty() {
+            return Ok(false);
+        }
+        let next = page.last().map(|row| row.base.id.clone());
+        if next == cursor {
+            return Err(PipelineError::InvalidState(
+                "Assertion selection did not advance".into(),
+            ));
+        }
+        for assertion in page {
+            if !assertion_matches_criteria(&assertion, criteria) {
+                continue;
+            }
+            let Some(revision) = ctx
+                .doc_revision_repo
+                .get(space_id, assertion.evidence.revision.id())
+                .await?
+            else {
+                continue;
+            };
+            let Some(doc) = ctx.doc_repo.get(space_id, revision.doc.id()).await? else {
+                continue;
+            };
+            if doc
+                .source
+                .as_ref()
+                .is_some_and(|link| link.id() == &source.base.id)
+            {
+                return Ok(true);
             }
         }
+        cursor = next;
     }
-
-    Ok(false)
 }
 
 fn assertion_matches_criteria(
     assertion: &elephant_types::records::assertion::Assertion,
     criteria: &SelectionCriteria,
 ) -> bool {
+    // Public criteria name predicate IDs. Pending assertions may only have a
+    // raw alias, whose retained lookup contract is ASCII case-insensitive.
     let predicate_match = criteria.predicate_ids.is_empty()
-        || criteria
-            .predicate_ids
-            .iter()
-            .any(|pred| pred == &assertion.predicate_raw);
+        || criteria.predicate_ids.iter().any(|pred| {
+            assertion.predicate_id.as_ref() == Some(pred)
+                || assertion.predicate_raw.eq_ignore_ascii_case(pred)
+        });
 
     let version_match = match criteria.extractor_version_before.as_ref() {
         None => true,
@@ -695,204 +636,6 @@ fn assertion_matches_criteria(
     };
 
     predicate_match && version_match
-}
-
-async fn process_source_for_reprocess(
-    ctx: &ReprocessExecutionContext,
-    source: &Source,
-    space_id: &str,
-    criteria: &SelectionCriteria,
-    target_stages: &[ReprocessTargetStage],
-    work_run: &WorkRun,
-) -> PipelineResult<SourceReprocessResult> {
-    let should_rerender = should_rerender(target_stages);
-    let should_reextract = should_reextract(target_stages);
-    let should_resolve = should_reresolve(target_stages);
-
-    if !should_reextract && !should_resolve {
-        return Ok(SourceReprocessResult::default());
-    }
-
-    let docs = ctx
-        .doc_repo
-        .find_by_source(space_id, &source.base.id, 1000)
-        .await?;
-    let mut result = SourceReprocessResult::default();
-
-    if should_reextract {
-        let mut renderer_registry = RendererRegistry::new();
-        renderer_registry.register(Box::new(DefaultTextRenderer::new()));
-        renderer_registry.register(Box::new(MultimodalRenderer::new()));
-        renderer_registry.register(Box::new(PassthroughRenderer::new()));
-
-        let extractor_registry = ExtractorRegistry::with_defaults();
-        let extractor = extractor_registry
-            .find_by_id("elephant.extractor.default")
-            .or_else(|| extractor_registry.all().first().map(|e| e.as_ref()))
-            .ok_or_else(|| {
-                PipelineError::ConfigError("No extractor available for reprocess".to_string())
-            })?;
-
-        let tree_config = DocTreeConfig::default();
-        let plan_config = ExtractionPlanConfig::default();
-
-        for doc in docs {
-            let revisions = ctx.doc_revision_repo.find_by_doc(&doc.base.id).await?;
-            let Some(active_revision) = revisions
-                .iter()
-                .find(|revision| revision.status == RevisionStatus::Active)
-            else {
-                continue;
-            };
-
-            let new_revision = if should_rerender {
-                build_rerendered_revision(
-                    &renderer_registry,
-                    &ctx.storage,
-                    &doc,
-                    space_id,
-                    work_run,
-                )
-                .await?
-            } else {
-                build_reprocess_revision(&doc, active_revision, space_id, work_run)?
-            };
-            let created_revision = ctx.doc_revision_repo.create(new_revision).await?;
-            let processing_result: PipelineResult<()> = async {
-                execute_build_doc_tree(&ctx.storage, &created_revision.base.id, &tree_config)
-                    .await?;
-
-                let plan_result = execute_plan_extraction(
-                    &ctx.storage,
-                    &created_revision.base.id,
-                    "reprocess",
-                    &plan_config,
-                    &work_run.base.id,
-                    space_id,
-                    &work_run.worker_id,
-                )
-                .await?;
-
-                for selection in &plan_result.plan.node_selections {
-                    let _extract_result = execute_extract_assertions(
-                        &ctx.storage,
-                        extractor,
-                        &selection.node_id,
-                        &created_revision.base.id,
-                        &work_run.base.id,
-                        space_id,
-                        &work_run.worker_id,
-                        None,
-                    )
-                    .await?;
-                    // Inline promotion already runs inside execute_extract_assertions.
-                    // No separate commit step needed.
-                }
-
-                if should_rerender {
-                    let mut activated_revision = created_revision.clone();
-                    activated_revision.status = RevisionStatus::Active;
-                    activated_revision.supersedes =
-                        Some(Link::new(active_revision.base.id.clone()));
-                    ctx.doc_revision_repo
-                        .update(space_id, &created_revision.base.id, activated_revision)
-                        .await?;
-
-                    let mut superseded_revision = active_revision.clone();
-                    superseded_revision.status = RevisionStatus::Superseded;
-                    ctx.doc_revision_repo
-                        .update(space_id, &active_revision.base.id, superseded_revision)
-                        .await?;
-
-                    ctx.doc_repo
-                        .update_render_projection(space_id, &doc.base.id, &created_revision.text)
-                        .await?;
-                } else {
-                    ctx.doc_repo
-                        .update_render_projection(space_id, &doc.base.id, &created_revision.text)
-                        .await?;
-                    supersede_revision(
-                        &ctx.doc_revision_repo,
-                        &active_revision.base.id,
-                        &created_revision.base.id,
-                        space_id,
-                    )
-                    .await?;
-                }
-
-                Ok(())
-            }
-            .await;
-            if let Err(error) = processing_result {
-                let _ = ctx
-                    .doc_revision_repo
-                    .delete(space_id, &created_revision.base.id)
-                    .await;
-                return Err(error);
-            }
-            result.revisions_created += 1;
-
-            let assertions = ctx
-                .assertion_repo
-                .find_by_revision(space_id, &active_revision.base.id, 1000)
-                .await?;
-            for assertion in assertions {
-                if !assertion_matches_criteria(&assertion, criteria) {
-                    continue;
-                }
-                mark_assertion_superseded(&ctx.assertion_repo, &assertion.base.id, space_id)
-                    .await?;
-                result.assertions_superseded += 1;
-            }
-        }
-
-        return Ok(result);
-    }
-
-    // Resolve-only path: no re-render/re-chunk/re-extract, just enqueue resolution.
-    for doc in docs {
-        let revisions = ctx.doc_revision_repo.find_by_doc(&doc.base.id).await?;
-        let Some(active_revision) = revisions
-            .iter()
-            .find(|revision| revision.status == RevisionStatus::Active)
-        else {
-            continue;
-        };
-
-        let assertions = ctx
-            .assertion_repo
-            .find_by_revision(space_id, &active_revision.base.id, 1000)
-            .await?;
-        let mut resolution_targets: Vec<RecordId> = Vec::new();
-        for assertion in assertions {
-            if !assertion_matches_criteria(&assertion, criteria) {
-                continue;
-            }
-            resolution_targets.push(assertion.base.id.clone());
-        }
-
-        if should_resolve && !resolution_targets.is_empty() {
-            // In the simplified pipeline, resolution happens inline during extraction.
-            // For resolve-only reprocessing, trigger a full re-extract instead.
-            tracing::info!(
-                "Resolve-only reprocess for doc {}: re-extracting {} assertions",
-                doc.base.id,
-                resolution_targets.len(),
-            );
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                result.assertions_superseded += resolution_targets.len() as u64;
-            }
-        }
-    }
-
-    Ok(result)
-}
-
-fn should_rerender(target_stages: &[ReprocessTargetStage]) -> bool {
-    target_stages
-        .iter()
-        .any(|stage| matches!(stage, ReprocessTargetStage::ReRender))
 }
 
 fn should_reextract(target_stages: &[ReprocessTargetStage]) -> bool {
@@ -912,41 +655,7 @@ fn should_reresolve(target_stages: &[ReprocessTargetStage]) -> bool {
         .any(|stage| matches!(stage, ReprocessTargetStage::ReResolve))
 }
 
-fn should_remaintain(target_stages: &[ReprocessTargetStage]) -> bool {
-    target_stages
-        .iter()
-        .any(|stage| matches!(stage, ReprocessTargetStage::ReMaintain))
-}
-
-fn build_reprocess_revision(
-    doc: &Doc,
-    active_revision: &DocRevision,
-    space_id: &str,
-    work_run: &WorkRun,
-) -> PipelineResult<DocRevision> {
-    let mut base = BaseFields::new(
-        RecordId::new_v4(TableName::DocRevision),
-        space_id.to_string(),
-        doc.base.created_by.clone(),
-    );
-    base.security = doc.base.security.clone();
-    base.provenance = build_reprocess_provenance(&doc.base.provenance, work_run);
-    base.subjects = doc.base.subjects.clone();
-    base.subjects_state = doc.base.subjects_state;
-
-    Ok(DocRevision {
-        base,
-        doc: Link::new(doc.base.id.clone()),
-        text: active_revision.text.clone(),
-        text_hash: active_revision.text_hash.clone(),
-        renderer: active_revision.renderer.clone(),
-        manifest: active_revision.manifest.clone(),
-        supersedes: None,
-        status: RevisionStatus::Active,
-        rendered_at: Utc::now(),
-    })
-}
-
+#[cfg(test)]
 async fn build_rerendered_revision(
     registry: &RendererRegistry,
     storage: &StorageClient,
@@ -1005,6 +714,7 @@ async fn build_rerendered_revision(
     })
 }
 
+#[cfg(test)]
 fn build_reprocess_provenance(previous: &Provenance, work_run: &WorkRun) -> Provenance {
     let mut provenance = previous.clone();
     provenance.work_run_id = Some(work_run.base.id.clone());
@@ -1109,39 +819,14 @@ pub async fn supersede_revision(
     new_revision_id: &RecordId,
     space_id: &str,
 ) -> PipelineResult<SupersessionResult> {
-    let now = Utc::now();
-
-    // Get and update old revision
-    let mut old_revision = repository
-        .get(space_id, old_revision_id)
-        .await?
-        .ok_or_else(|| {
-            PipelineError::NotFound(format!("Old revision not found: {old_revision_id}"))
-        })?;
-
-    old_revision.status = RevisionStatus::Superseded;
-    repository
-        .update(space_id, old_revision_id, old_revision)
-        .await?;
-
-    // Get and update new revision to set supersedes link
-    let mut new_revision = repository
-        .get(space_id, new_revision_id)
-        .await?
-        .ok_or_else(|| {
-            PipelineError::NotFound(format!("New revision not found: {new_revision_id}"))
-        })?;
-
-    new_revision.supersedes = Some(Link::new(old_revision_id.clone()));
-    repository
-        .update(space_id, new_revision_id, new_revision)
-        .await?;
-
-    Ok(SupersessionResult {
-        old_id: old_revision_id.clone(),
-        new_id: new_revision_id.clone(),
-        superseded_at: now,
-    })
+    atomic::supersede::<DocRevision, _>(
+        repository.storage_client(),
+        repository,
+        old_revision_id,
+        new_revision_id,
+        space_id,
+    )
+    .await
 }
 
 /// Supersede an old assertion with a new one.
@@ -1163,49 +848,17 @@ pub async fn supersede_assertion(
     new_assertion_id: &RecordId,
     space_id: &str,
 ) -> PipelineResult<SupersessionResult> {
-    let now = Utc::now();
-
-    // Get and update old assertion
-    let mut old_assertion = repository
-        .get(space_id, old_assertion_id)
-        .await?
-        .ok_or_else(|| {
-            PipelineError::NotFound(format!("Old assertion not found: {old_assertion_id}"))
-        })?;
-
-    old_assertion.resolution_status = ResolutionStatus::Superseded;
-    repository
-        .update(space_id, old_assertion_id, old_assertion)
-        .await?;
-
-    Ok(SupersessionResult {
-        old_id: old_assertion_id.clone(),
-        new_id: new_assertion_id.clone(),
-        superseded_at: now,
-    })
+    atomic::supersede::<elephant_types::records::Assertion, _>(
+        repository.storage_client(),
+        repository,
+        old_assertion_id,
+        new_assertion_id,
+        space_id,
+    )
+    .await
 }
 
 /// Mark an assertion as superseded without linking to a replacement.
-async fn mark_assertion_superseded(
-    repository: &AssertionRepository,
-    old_assertion_id: &RecordId,
-    space_id: &str,
-) -> PipelineResult<()> {
-    let mut old_assertion = repository
-        .get(space_id, old_assertion_id)
-        .await?
-        .ok_or_else(|| {
-            PipelineError::NotFound(format!("Old assertion not found: {old_assertion_id}"))
-        })?;
-
-    old_assertion.resolution_status = ResolutionStatus::Superseded;
-    repository
-        .update(space_id, old_assertion_id, old_assertion)
-        .await?;
-
-    Ok(())
-}
-
 /// Supersede an old rel with a new one.
 ///
 /// Updates the old rel's status to `Superseded` and sets the temporal_audit.superseded_at.
@@ -1225,22 +878,14 @@ pub async fn supersede_rel(
     new_rel_id: &RecordId,
     space_id: &str,
 ) -> PipelineResult<SupersessionResult> {
-    let now = Utc::now();
-
-    // Get and update old rel
-    let mut old_rel = repository
-        .get(space_id, old_rel_id)
-        .await?
-        .ok_or_else(|| PipelineError::NotFound(format!("Old rel not found: {old_rel_id}")))?;
-
-    old_rel.status = ClaimStatus::Superseded;
-    repository.update(space_id, old_rel_id, old_rel).await?;
-
-    Ok(SupersessionResult {
-        old_id: old_rel_id.clone(),
-        new_id: new_rel_id.clone(),
-        superseded_at: now,
-    })
+    atomic::supersede::<elephant_types::records::Rel, _>(
+        repository.storage_client(),
+        repository,
+        old_rel_id,
+        new_rel_id,
+        space_id,
+    )
+    .await
 }
 
 /// Supersede an old attribute with a new one.
@@ -1262,26 +907,14 @@ pub async fn supersede_attribute(
     new_attribute_id: &RecordId,
     space_id: &str,
 ) -> PipelineResult<SupersessionResult> {
-    let now = Utc::now();
-
-    // Get and update old attribute
-    let mut old_attribute = repository
-        .get(space_id, old_attribute_id)
-        .await?
-        .ok_or_else(|| {
-            PipelineError::NotFound(format!("Old attribute not found: {old_attribute_id}"))
-        })?;
-
-    old_attribute.status = ClaimStatus::Superseded;
-    repository
-        .update(space_id, old_attribute_id, old_attribute)
-        .await?;
-
-    Ok(SupersessionResult {
-        old_id: old_attribute_id.clone(),
-        new_id: new_attribute_id.clone(),
-        superseded_at: now,
-    })
+    atomic::supersede::<elephant_types::records::Attribute, _>(
+        repository.storage_client(),
+        repository,
+        old_attribute_id,
+        new_attribute_id,
+        space_id,
+    )
+    .await
 }
 
 // ============================================================================
@@ -1314,6 +947,58 @@ mod tests {
     use crate::renderer::RendererRegistry;
     use chrono::{NaiveDate, TimeZone};
     use elephant_types::records::reprocess::default_reprocess_target_stages;
+
+    #[test]
+    fn reprocess_dispatch_future_types_fit_the_default_stack_budget() {
+        // Infer actual composed future types without constructing a backend,
+        // allocating a large future on the stack, or polling any work.
+        fn dispatch_bytes<F: std::future::Future>(
+            _: impl FnOnce(ReprocessExecutionContext, RecordId, RecordId, ReprocessConfig) -> F,
+        ) -> usize {
+            std::mem::size_of::<F>()
+        }
+        fn maintenance_bytes<F: std::future::Future>(
+            _: impl FnOnce(
+                ReprocessExecutionContext,
+                ReprocessJob,
+                RecordId,
+                ReprocessConfig,
+                crate::maintenance_commit::PlanningTruthMaintenanceStorage,
+            ) -> F,
+        ) -> usize {
+            std::mem::size_of::<F>()
+        }
+        for (phase, bytes) in [
+            (
+                "direct dispatch",
+                dispatch_bytes(|ctx, job, run, config| async move {
+                    execute_reprocess_job(&ctx, &job, &run, "test_space", &config).await
+                }),
+            ),
+            (
+                "attempt dispatch",
+                dispatch_bytes(|ctx, job, run, config| async move {
+                    execute_reprocess_job_with_attempt(
+                        &ctx,
+                        &job,
+                        &run,
+                        "test_space",
+                        &config,
+                        None,
+                    )
+                    .await
+                }),
+            ),
+            (
+                "retained maintenance",
+                maintenance_bytes(|ctx, job, run, config, planning| async move {
+                    maintenance_job::execute(&ctx, job, &run, "test_space", &config, planning).await
+                }),
+            ),
+        ] {
+            assert!(bytes <= 128 * 1024, "{phase} future is {bytes} bytes");
+        }
+    }
 
     // ========================================================================
     // Selection Criteria Validation Tests
@@ -1586,6 +1271,7 @@ mod tests {
     use elephant_types::records::base::{
         BaseFields, Extractor, Provenance, Security, SubjectsState,
     };
+    #[cfg(test)]
     use elephant_types::records::doc::Doc;
     use elephant_types::records::doc_revision::{DocRevision, RendererMetadata};
     use elephant_types::records::rel::{EvidenceRef, Rel, TimeBasis};
@@ -1593,14 +1279,9 @@ mod tests {
     use elephant_types::records::truth::TruthSlot;
     use elephant_types::records::work::{WorkRun, WorkRunMetrics};
     use elephant_types::Link;
-    use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(92000);
-
-    const REPROCESS_SCHEMA: &str = r"
-        DEFINE TABLE reprocess_job SCHEMALESS;
-    ";
 
     const REPROCESS_EXEC_SCHEMA: &str = r"
         DEFINE TABLE reprocess_job SCHEMALESS;
@@ -1633,20 +1314,63 @@ mod tests {
             ..StorageConfig::default()
         };
         let client = StorageClient::new(config).await.unwrap();
-        client.query(REPROCESS_SCHEMA).await.unwrap();
+        elephant_migrations::apply_schema(&client).await.unwrap();
+        elephant_storage::SpaceConfigRepository::new(client.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    "test_space".into(),
+                    "oracle".into(),
+                ),
+                embedding_provider: "unconfigured".into(),
+                embedding_model: "unconfigured".into(),
+                embedding_dims: 1,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .unwrap();
         ReprocessJobRepository::new(client)
     }
 
     async fn setup_execution_context() -> ReprocessExecutionContext {
+        setup_execution_context_with_space_base(BaseFields::new(
+            RecordId::new_v4(TableName::SpaceConfig),
+            "test_space".into(),
+            "oracle".into(),
+        ))
+        .await
+    }
+
+    async fn setup_execution_context_with_space_base(
+        base: BaseFields,
+    ) -> ReprocessExecutionContext {
         std::env::remove_var("ANTHROPIC_API_KEY");
 
-        let db_id = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let config = StorageConfig {
-            database: format!("reprocess_execute_test_{db_id}"),
-            ..StorageConfig::default()
-        };
-        let client = StorageClient::new(config).await.unwrap();
-        client.query(REPROCESS_EXEC_SCHEMA).await.unwrap();
+        let client = StorageClient::new_memory().await.unwrap();
+        elephant_migrations::apply_schema(&client).await.unwrap();
+        elephant_storage::SpaceConfigRepository::new(client.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base,
+                embedding_provider: "unconfigured".into(),
+                embedding_model: "unconfigured".into(),
+                embedding_dims: 1,
+                processing: Some(elephant_types::provider_binding::SpaceProcessingConfig {
+                    generation: 1,
+                    index_generation: 0,
+                    policy_id: "oracle".into(),
+                    connections: Default::default(),
+                    profiles: Default::default(),
+                    bindings: Default::default(),
+                    active_embedding_profile_id: None,
+                    pending_reindex: None,
+                }),
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .unwrap();
 
         ReprocessExecutionContext {
             storage: client.clone(),
@@ -1692,6 +1416,25 @@ mod tests {
         work_run_id
     }
 
+    async fn persist_test_entity(storage: &StorageClient, space: &str, name: &str) -> RecordId {
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::Entity),
+            space.into(),
+            "test_agent".into(),
+        );
+        base.subjects_state = SubjectsState::Complete;
+        elephant_storage::EntityRepository::new(storage.clone())
+            .create(Entity::new(
+                base,
+                elephant_types::records::EntityType::new("person"),
+                name.into(),
+            ))
+            .await
+            .expect("actual entity")
+            .base
+            .id
+    }
+
     fn make_source(
         space_id: &str,
         source_type: SourceType,
@@ -1722,7 +1465,7 @@ mod tests {
             source: Some(Link::new(source_id.clone())),
             media_attachments: Vec::new(),
             rendition_key: format!("rendition_{}", uuid::Uuid::new_v4()),
-            metadata: serde_json::Value::Null,
+            metadata: serde_json::json!({}),
         }
     }
 
@@ -1736,8 +1479,8 @@ mod tests {
         DocRevision {
             base,
             doc: Link::new(doc_id.clone()),
-            text: "Revision text".to_string(),
-            text_hash: "hash".to_string(),
+            text: "Alice works at Acme".to_string(),
+            text_hash: crate::extraction::AssertionValidator::hash_quote("Alice works at Acme"),
             renderer: RendererMetadata {
                 name: "default".to_string(),
                 version: "1.0".to_string(),
@@ -1780,8 +1523,10 @@ mod tests {
                 revision: Link::new(revision_id.clone()),
                 node: None,
                 start: 0,
-                end: 5,
-                quote_hash: "hash".to_string(),
+                end: u32::try_from("Alice works at Acme".len()).expect("fixture span"),
+                quote_hash: crate::extraction::AssertionValidator::hash_quote(
+                    "Alice works at Acme",
+                ),
             },
             source_event_time: None,
             observed_at: Utc::now(),
@@ -1801,24 +1546,28 @@ mod tests {
         }
     }
 
-    fn compute_security_hash_for_test(security: &Security) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(security.policy_id.as_bytes());
-        hasher.update(security.level.to_be_bytes());
-
-        let mut labels = security.labels.clone();
-        labels.sort();
-        for label in labels {
-            hasher.update(label.as_bytes());
-        }
-
-        let mut handling = security.handling.clone();
-        handling.sort();
-        for handle in handling {
-            hasher.update(handle.as_bytes());
-        }
-
-        format!("{:x}", hasher.finalize())
+    #[test]
+    fn predicate_selection_matches_canonical_ids_and_retained_alias_case_semantics() {
+        let mut assertion = make_assertion(
+            "test_space",
+            &RecordId::new_v4(TableName::DocRevision),
+            "WorksAt",
+            Some("1.0.0"),
+        );
+        assertion.predicate_id = Some("employment.works_at".into());
+        let mut criteria = SelectionCriteria {
+            predicate_ids: vec!["worksat".into()],
+            extractor_version_before: Some("2.0.0".into()),
+            ..Default::default()
+        };
+        assert!(assertion_matches_criteria(&assertion, &criteria));
+        criteria.predicate_ids = vec!["employment.works_at".into()];
+        assert!(assertion_matches_criteria(&assertion, &criteria));
+        criteria.predicate_ids = vec!["EMPLOYMENT.WORKS_AT".into()];
+        assert!(!assertion_matches_criteria(&assertion, &criteria));
+        criteria.predicate_ids = vec!["worksat".into()];
+        criteria.extractor_version_before = Some("1.0.0".into());
+        assert!(!assertion_matches_criteria(&assertion, &criteria));
     }
 
     fn make_rel(
@@ -1834,19 +1583,6 @@ mod tests {
         base.provenance = Provenance::default();
         base.subjects_state = SubjectsState::Complete;
 
-        let evidence = EvidenceRef {
-            assertion: Link::new(RecordId::new_v4(elephant_types::TableName::Assertion)),
-            span: EvidenceSpan {
-                revision: Link::new(RecordId::new_v4(elephant_types::TableName::DocRevision)),
-                node: None,
-                start: 0,
-                end: 5,
-                quote_hash: "hash".to_string(),
-            },
-            time_basis: TimeBasis::ObservedAt,
-            time_value: Utc::now(),
-        };
-
         Rel {
             base,
             subject: Link::new(subject_id.clone()),
@@ -1855,7 +1591,7 @@ mod tests {
             status: ClaimStatus::Candidate,
             confidence: 0.8,
             validity_window: None,
-            evidence: vec![evidence],
+            evidence: vec![],
             temporal_audit: None,
         }
     }
@@ -1928,6 +1664,62 @@ mod tests {
         assert_eq!(retrieved.unwrap().name, "Integration Test Job");
     }
 
+    #[tokio::test]
+    async fn internal_reprocess_factory_uses_current_space_scope_and_initial_handoff() {
+        let mut original_base = BaseFields::new(
+            RecordId::new_v4(TableName::SpaceConfig),
+            "test_space".into(),
+            "oracle".into(),
+        );
+        original_base.security.policy_id = "private-space".into();
+        original_base.security.level = 7;
+        original_base.subjects_state = SubjectsState::Complete;
+        original_base.subjects = vec![Link::new(RecordId::new_v4(TableName::Entity))];
+        let ctx = setup_execution_context_with_space_base(original_base).await;
+        let configurations = elephant_storage::SpaceConfigRepository::new(ctx.storage.clone());
+        let configuration = configurations
+            .get_by_space_id("test_space")
+            .await
+            .unwrap()
+            .unwrap();
+        let created = super::create_reprocess_job(
+            &ctx.job_repo,
+            "scoped internal job",
+            SelectionCriteria {
+                source_types: vec!["manual".into()],
+                ..Default::default()
+            },
+            vec![ReprocessTargetStage::ReMaintain],
+            "test_space",
+            "original actor",
+            None,
+        )
+        .await
+        .unwrap()
+        .job;
+        assert_eq!(created.base.security, configuration.base.security);
+        assert_eq!(created.base.subjects, configuration.base.subjects);
+        assert_eq!(
+            created.base.subjects_state,
+            configuration.base.subjects_state
+        );
+        assert_eq!(created.base.created_by, "original actor");
+        let work = WorkItemRepository::new(ctx.storage.clone())
+            .find_by_idempotency_key(
+                "test_space",
+                &format!("{WORK_KIND_EXECUTE_REPROCESS_JOB}:{}", created.base.id),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(work.base.security, created.base.security);
+        assert_eq!(work.base.subjects, created.base.subjects);
+        assert_eq!(
+            ctx.job_repo.ensure_work(&created).await.unwrap(),
+            work.base.id
+        );
+    }
+
     /// Integration test: execute_reprocess_job state transitions
     #[tokio::test]
     async fn test_execute_job_integration() {
@@ -1983,7 +1775,7 @@ mod tests {
             "execute_reprocess_job should succeed"
         );
 
-        // Verify job transitioned to Completed
+        // Acceptance remains pending until the source finalizer publishes.
         let final_job = ctx
             .job_repo
             .get("test_space", &job_id)
@@ -1992,18 +1784,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             final_job.status,
-            ReprocessStatus::Completed,
-            "Job should be completed"
+            ReprocessStatus::Running,
+            "Accepted work is not completed publication"
         );
         assert!(final_job.started_at.is_some(), "started_at should be set");
         assert!(
-            final_job.completed_at.is_some(),
-            "completed_at should be set"
+            final_job.completed_at.is_none(),
+            "completion needs the finalizer certificate"
         );
     }
 
     #[tokio::test]
-    async fn test_execute_reprocess_job_selects_and_supersedes() {
+    async fn test_execute_reprocess_job_selects_without_premature_supersession() {
         let ctx = setup_execution_context().await;
 
         let within_range = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
@@ -2046,7 +1838,7 @@ mod tests {
             date_from: Some(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()),
             date_to: Some(NaiveDate::from_ymd_opt(2024, 12, 31).unwrap()),
             extractor_version_before: Some("2.0.0".to_string()),
-            predicate_ids: vec!["works_at".to_string()],
+            predicate_ids: vec!["WoRkS_aT".to_string()],
             ..Default::default()
         };
 
@@ -2082,8 +1874,9 @@ mod tests {
             "reprocess error: {:?}",
             result.error
         );
-        assert_eq!(result.revisions_created, 1);
-        assert_eq!(result.assertions_superseded, 1);
+        assert_eq!(result.revisions_created, 0);
+        assert_eq!(result.pending_operations.len(), 1);
+        assert_eq!(result.assertions_superseded, 0);
 
         let updated_good = ctx
             .assertion_repo
@@ -2098,7 +1891,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(updated_good.resolution_status, ResolutionStatus::Superseded);
+        assert_eq!(updated_good, assertion_good);
         assert_eq!(updated_bad.resolution_status, ResolutionStatus::Resolved);
 
         let revisions = ctx
@@ -2106,51 +1899,74 @@ mod tests {
             .find_by_doc(&doc_good.base.id)
             .await
             .unwrap();
-        assert_eq!(revisions.len(), 2);
-        let new_revision = revisions
-            .iter()
-            .find(|rev| rev.base.id != rev_good.base.id)
-            .unwrap();
-        let old_revision = revisions
-            .iter()
-            .find(|rev| rev.base.id == rev_good.base.id)
-            .unwrap();
-        assert_eq!(old_revision.status, RevisionStatus::Superseded);
-        assert_eq!(new_revision.status, RevisionStatus::Active);
-        assert_eq!(
-            new_revision.supersedes.as_ref().unwrap().id(),
-            &rev_good.base.id
+        assert_eq!(revisions, vec![rev_good]);
+        let publication = elephant_storage::source_publication::SourcePublicationRepository::new(
+            ctx.storage.clone(),
         );
-        assert_eq!(new_revision.renderer.name, "elephant.renderer.text");
-
-        let new_assertions = ctx
-            .assertion_repo
-            .find_by_revision("test_space", &new_revision.base.id, 1000)
+        assert!(publication
+            .head("test_space", &source_good.base.id)
             .await
-            .unwrap();
-        if let Some(assertion) = new_assertions.first() {
-            // Inline promotion resolves assertions during extraction.
-            assert_eq!(assertion.resolution_status, ResolutionStatus::Resolved);
-            assert_eq!(assertion.evidence.revision.id(), &new_revision.base.id);
-            assert!(assertion.evidence.node.is_some());
-        }
+            .unwrap()
+            .is_some());
+        assert!(publication
+            .head("test_space", &source_bad.base.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
-    async fn test_reprocess_reresolve_enqueues_resolution_work() {
+    async fn test_reprocess_reresolve_preserves_existing_assertion_evidence() {
         let ctx = setup_execution_context().await;
 
-        let source = make_source("test_space", SourceType::Email, Some(Utc::now()));
+        let security = elephant_storage::SpaceConfigRepository::new(ctx.storage.clone())
+            .get_by_space_id("test_space")
+            .await
+            .unwrap()
+            .unwrap()
+            .base
+            .security;
+        let mut source = make_source("test_space", SourceType::Email, Some(Utc::now()));
+        source.base.security.clone_from(&security);
         ctx.source_repo.create(source.clone()).await.unwrap();
-        let doc = make_doc("test_space", &source.base.id);
+        let mut doc = make_doc("test_space", &source.base.id);
+        doc.base.security.clone_from(&security);
         ctx.doc_repo.create(doc.clone()).await.unwrap();
-        let revision = make_doc_revision("test_space", &doc.base.id);
+        let mut revision = make_doc_revision("test_space", &doc.base.id);
+        revision.base.security.clone_from(&security);
         ctx.doc_revision_repo
             .create(revision.clone())
             .await
             .unwrap();
-        let assertion = make_assertion("test_space", &revision.base.id, "works_at", Some("1.0.0"));
-        ctx.assertion_repo.create(assertion.clone()).await.unwrap();
+        let entities = elephant_storage::EntityRepository::new(ctx.storage.clone());
+        let mut subject_base = source.base.clone();
+        subject_base.id = RecordId::new_v4(TableName::Entity);
+        let subject = entities
+            .create(elephant_types::records::Entity::new(
+                subject_base,
+                elephant_types::records::EntityType::new("person"),
+                "Alice".into(),
+            ))
+            .await
+            .unwrap();
+        let mut object_base = source.base.clone();
+        object_base.id = RecordId::new_v4(TableName::Entity);
+        let object = entities
+            .create(elephant_types::records::Entity::new(
+                object_base,
+                elephant_types::records::EntityType::new("organization"),
+                "Acme".into(),
+            ))
+            .await
+            .unwrap();
+        let mut assertion =
+            make_assertion("test_space", &revision.base.id, "works_at", Some("1.0.0"));
+        assertion.base.security = security;
+        assertion.base.provenance.sources = vec![source.base.id.clone()];
+        assertion.subject_entity = Some(Link::new(subject.base.id.clone()));
+        assertion.object_entity = Some(Link::new(object.base.id.clone()));
+        assertion.base.subjects = vec![Link::new(subject.base.id.clone())];
+        let assertion = ctx.assertion_repo.create(assertion).await.unwrap();
 
         let criteria = SelectionCriteria {
             source_types: vec!["email".to_string()],
@@ -2189,12 +2005,18 @@ mod tests {
         .await
         .unwrap();
 
-        // In the simplified pipeline, resolve-only reprocessing logs and counts
-        // assertions (inline promotion handles resolution during extraction).
-        assert!(
-            result.assertions_superseded > 0,
-            "expected superseded assertions"
-        );
+        assert_eq!(result.assertions_reprocessed, 1);
+        let preserved = ctx
+            .assertion_repo
+            .get("test_space", &assertion.base.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.evidence, assertion.evidence);
+        assert_eq!(preserved.assertion_key, assertion.assertion_key);
+        assert_eq!(preserved.resolution_status, ResolutionStatus::Resolved);
+        assert_eq!(preserved.subject_entity, assertion.subject_entity);
+        assert_eq!(preserved.object_entity, assertion.object_entity);
     }
 
     #[tokio::test]
@@ -2215,10 +2037,11 @@ mod tests {
         let assertion = make_assertion("test_space", &revision.base.id, "works_at", Some("1.0.0"));
         ctx.assertion_repo.create(assertion).await.unwrap();
 
-        let subject_id = RecordId::new_v4(elephant_types::TableName::Entity);
-        let object_id = RecordId::new_v4(elephant_types::TableName::Entity);
+        let subject_id = persist_test_entity(&ctx.storage, "test_space", "Alice").await;
+        let object_id = persist_test_entity(&ctx.storage, "test_space", "Acme").await;
         let security = Security::default();
-        let security_hash = compute_security_hash_for_test(&security);
+        let rel = make_rel("test_space", &subject_id, &object_id, "works_at", &security);
+        let security_hash = crate::truth_maintenance::compute_record_partition(&rel.base);
         let slot_key = compute_slot_key(
             &subject_id.to_string(),
             Some(&object_id.to_string()),
@@ -2229,7 +2052,6 @@ mod tests {
 
         let rel_repo = RelRepository::new(ctx.storage.clone());
         let truth_slot_repo = TruthSlotRepository::new(ctx.storage.clone());
-        let rel = make_rel("test_space", &subject_id, &object_id, "works_at", &security);
         rel_repo.create(rel).await.unwrap();
 
         let old_computed_at = Utc::now() - chrono::Duration::days(10);
@@ -2251,7 +2073,7 @@ mod tests {
             &ctx.job_repo,
             "Truth Slot Recompute Job",
             criteria,
-            default_reprocess_target_stages(),
+            vec![ReprocessTargetStage::ReMaintain],
             "test_space",
             "test_agent",
             None,
@@ -2298,120 +2120,151 @@ mod tests {
         use crate::truth_maintenance::compute_slot_key;
         use elephant_types::records::attribute::{Attribute, Literal};
 
-        let ctx = setup_execution_context().await;
+        for limit in [None, Some(10.0)] {
+            let ctx = setup_execution_context().await;
 
-        let source = make_source("test_space", SourceType::Email, Some(Utc::now()));
-        ctx.source_repo.create(source.clone()).await.unwrap();
-        let doc = make_doc("test_space", &source.base.id);
-        ctx.doc_repo.create(doc.clone()).await.unwrap();
-        let revision = make_doc_revision("test_space", &doc.base.id);
-        ctx.doc_revision_repo
-            .create(revision.clone())
+            let source = make_source("test_space", SourceType::Email, Some(Utc::now()));
+            ctx.source_repo.create(source.clone()).await.unwrap();
+            let doc = make_doc("test_space", &source.base.id);
+            ctx.doc_repo.create(doc.clone()).await.unwrap();
+            let revision = make_doc_revision("test_space", &doc.base.id);
+            ctx.doc_revision_repo
+                .create(revision.clone())
+                .await
+                .unwrap();
+            let assertion = make_assertion("test_space", &revision.base.id, "age", Some("1.0.0"));
+            ctx.assertion_repo.create(assertion).await.unwrap();
+
+            let subject_id = persist_test_entity(&ctx.storage, "test_space", "Alice").await;
+            let security = Security::default();
+
+            // Two divergent surviving claims: recompute cannot commit inline.
+            let attr_repo = elephant_storage::AttributeRepository::new(ctx.storage.clone());
+            for value in [35_i64, 36] {
+                let id = RecordId::new_v4(elephant_types::TableName::Attribute);
+                let mut base =
+                    BaseFields::new(id, "test_space".to_string(), "test_agent".to_string());
+                base.security = security.clone();
+                base.subjects_state = SubjectsState::Complete;
+                let attr = Attribute {
+                    base,
+                    subject: Link::new(subject_id.clone()),
+                    attr_type: "age".to_string(),
+                    value: Literal::Integer(value),
+                    status: ClaimStatus::Candidate,
+                    confidence: 0.8,
+                    validity_window: None,
+                    evidence: vec![],
+                    temporal_audit: None,
+                };
+                attr_repo.create(attr).await.unwrap();
+            }
+
+            let before_claims = attr_repo.list("test_space", 100, None).await.unwrap();
+            let security_hash = crate::truth_maintenance::compute_record_partition(
+                &before_claims.first().expect("actual claim").base,
+            );
+            let slot_key =
+                compute_slot_key(&subject_id.to_string(), None, "age", None, &security_hash);
+            let truth_slot_repo = TruthSlotRepository::new(ctx.storage.clone());
+            let mut slot = make_truth_slot(
+                "test_space",
+                &slot_key,
+                &subject_id,
+                "age",
+                &security_hash,
+                Utc::now() - chrono::Duration::days(10),
+            );
+            slot.slot_type = "attribute".to_string();
+            let before_slot = truth_slot_repo.create(slot).await.unwrap();
+
+            let criteria = SelectionCriteria {
+                source_types: vec!["email".to_string()],
+                ..Default::default()
+            };
+            let config = ReprocessConfig {
+                default_budget_limit_euros: limit,
+                ..Default::default()
+            };
+            let creation_result = super::create_reprocess_job(
+                &ctx.job_repo,
+                "Pending Conflict Groups Job",
+                criteria,
+                vec![ReprocessTargetStage::ReMaintain],
+                "test_space",
+                "test_agent",
+                Some(&config),
+            )
             .await
             .unwrap();
-        let assertion = make_assertion("test_space", &revision.base.id, "age", Some("1.0.0"));
-        ctx.assertion_repo.create(assertion).await.unwrap();
+            let job_id = creation_result.job.base.id.clone();
+            let work_run_id = create_test_work_run(
+                &ctx,
+                "test_space",
+                "reprocess_worker",
+                "1.2.3",
+                Some("model_v1"),
+            )
+            .await;
 
-        let subject_id = RecordId::new_v4(elephant_types::TableName::Entity);
-        let security = Security::default();
-        let security_hash = compute_security_hash_for_test(&security);
-        let slot_key = compute_slot_key(&subject_id.to_string(), None, "age", None, &security_hash);
+            let result =
+                super::execute_reprocess_job(&ctx, &job_id, &work_run_id, "test_space", &config)
+                    .await
+                    .unwrap();
 
-        // Two divergent surviving claims: recompute cannot commit inline.
-        let attr_repo = elephant_storage::AttributeRepository::new(ctx.storage.clone());
-        for value in [35_i64, 36] {
-            let id = RecordId::new_v4(elephant_types::TableName::Attribute);
-            let mut base = BaseFields::new(id, "test_space".to_string(), "test_agent".to_string());
-            base.security = security.clone();
-            base.subjects_state = SubjectsState::Complete;
-            let attr = Attribute {
-                base,
-                subject: Link::new(subject_id.clone()),
-                attr_type: "age".to_string(),
-                value: Literal::Integer(value),
-                status: ClaimStatus::Candidate,
-                confidence: 0.8,
-                validity_window: None,
-                evidence: vec![EvidenceRef {
-                    assertion: Link::new(RecordId::new_v4(elephant_types::TableName::Assertion)),
-                    span: EvidenceSpan {
-                        revision: Link::new(RecordId::new_v4(
-                            elephant_types::TableName::DocRevision,
-                        )),
-                        node: None,
-                        start: 0,
-                        end: 5,
-                        quote_hash: "hash".to_string(),
-                    },
-                    time_basis: TimeBasis::ObservedAt,
-                    time_value: Utc::now(),
-                }],
-                temporal_audit: None,
-            };
-            attr_repo.create(attr).await.unwrap();
+            if limit.is_some() {
+                assert!(result.paused);
+                assert!(result.pending_conflict_groups.is_empty());
+                assert_eq!(
+                    truth_slot_repo
+                        .get("test_space", &before_slot.base.id)
+                        .await
+                        .unwrap(),
+                    Some(before_slot)
+                );
+                assert_eq!(
+                    attr_repo.list("test_space", 100, None).await.unwrap(),
+                    before_claims
+                );
+                assert!(
+                    elephant_storage::ConflictGroupRepository::new(ctx.storage.clone())
+                        .list("test_space", 100, None)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    elephant_storage::WorkArtifactRepository::new(ctx.storage.clone())
+                        .list("test_space", 100, None)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                let saved = ctx
+                    .job_repo
+                    .get("test_space", &job_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.status, ReprocessStatus::Paused);
+                assert_eq!(saved.error.as_deref(), Some(budget::UNPRICED));
+                continue;
+            }
+            assert_eq!(
+                result.pending_conflict_groups.len(),
+                1,
+                "divergent slot must surface as a pending conflict group"
+            );
+
+            let conflict_repo = elephant_storage::ConflictGroupRepository::new(ctx.storage.clone());
+            let group = conflict_repo
+                .find_unresolved_by_slot_key_and_type("test_space", &slot_key, "attribute")
+                .await
+                .unwrap()
+                .expect("conflict group upserted");
+            assert_eq!(group.base.id, result.pending_conflict_groups[0]);
+            assert_eq!(group.claim_ids.len(), 2);
         }
-
-        let truth_slot_repo = TruthSlotRepository::new(ctx.storage.clone());
-        let mut slot = make_truth_slot(
-            "test_space",
-            &slot_key,
-            &subject_id,
-            "age",
-            &security_hash,
-            Utc::now() - chrono::Duration::days(10),
-        );
-        slot.slot_type = "attribute".to_string();
-        truth_slot_repo.create(slot).await.unwrap();
-
-        let criteria = SelectionCriteria {
-            source_types: vec!["email".to_string()],
-            ..Default::default()
-        };
-        let creation_result = super::create_reprocess_job(
-            &ctx.job_repo,
-            "Pending Conflict Groups Job",
-            criteria,
-            default_reprocess_target_stages(),
-            "test_space",
-            "test_agent",
-            None,
-        )
-        .await
-        .unwrap();
-        let job_id = creation_result.job.base.id.clone();
-        let work_run_id = create_test_work_run(
-            &ctx,
-            "test_space",
-            "reprocess_worker",
-            "1.2.3",
-            Some("model_v1"),
-        )
-        .await;
-
-        let result = super::execute_reprocess_job(
-            &ctx,
-            &job_id,
-            &work_run_id,
-            "test_space",
-            &ReprocessConfig::default(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            result.pending_conflict_groups.len(),
-            1,
-            "divergent slot must surface as a pending conflict group"
-        );
-
-        let conflict_repo = elephant_storage::ConflictGroupRepository::new(ctx.storage.clone());
-        let group = conflict_repo
-            .find_unresolved_by_slot_key_and_type("test_space", &slot_key, "attribute")
-            .await
-            .unwrap()
-            .expect("conflict group upserted");
-        assert_eq!(group.base.id, result.pending_conflict_groups[0]);
-        assert_eq!(group.claim_ids.len(), 2);
     }
 
     #[tokio::test]
@@ -2423,10 +2276,11 @@ mod tests {
         let source = make_source("test_space", SourceType::Email, Some(Utc::now()));
         ctx.source_repo.create(source).await.unwrap();
 
-        let subject_id = RecordId::new_v4(elephant_types::TableName::Entity);
-        let object_id = RecordId::new_v4(elephant_types::TableName::Entity);
+        let subject_id = persist_test_entity(&ctx.storage, "test_space", "Alice").await;
+        let object_id = persist_test_entity(&ctx.storage, "test_space", "Acme").await;
         let security = Security::default();
-        let security_hash = compute_security_hash_for_test(&security);
+        let rel = make_rel("test_space", &subject_id, &object_id, "works_at", &security);
+        let security_hash = crate::truth_maintenance::compute_record_partition(&rel.base);
         let slot_key = compute_slot_key(
             &subject_id.to_string(),
             Some(&object_id.to_string()),
@@ -2437,7 +2291,6 @@ mod tests {
 
         let rel_repo = RelRepository::new(ctx.storage.clone());
         let truth_slot_repo = TruthSlotRepository::new(ctx.storage.clone());
-        let rel = make_rel("test_space", &subject_id, &object_id, "works_at", &security);
         rel_repo.create(rel).await.unwrap();
 
         let old_computed_at = Utc::now() - chrono::Duration::days(7);
@@ -2499,7 +2352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reprocess_sets_new_provenance_from_work_run() {
+    async fn test_reprocess_retains_intent_run_without_fabricating_extraction_provenance() {
         let ctx = setup_execution_context().await;
 
         let source = make_source("test_space", SourceType::Email, Some(Utc::now()));
@@ -2554,62 +2407,25 @@ mod tests {
             .find_by_doc(&doc.base.id)
             .await
             .unwrap();
-        let new_revision = revisions
-            .iter()
-            .find(|rev| rev.base.id != revision.base.id)
-            .unwrap();
-        assert_eq!(
-            new_revision.base.provenance.run_id,
-            Some(work_run_id.to_string())
-        );
-        assert_eq!(
-            new_revision.base.provenance.work_run_id.as_ref(),
-            Some(&work_run_id)
-        );
-        assert_eq!(
-            new_revision.base.provenance.config_id.as_deref(),
-            Some("config_hash")
-        );
-        assert_eq!(
-            new_revision.base.provenance.extractor,
-            Some(Extractor {
-                name: Some("reprocess_worker".to_string()),
-                version: Some("9.9.9".to_string()),
-                model: Some("model_v2".to_string()),
-            })
-        );
-
-        let new_assertions = ctx
-            .assertion_repo
-            .find_by_revision("test_space", &new_revision.base.id, 1000)
-            .await
-            .unwrap();
-        if let Some(assertion) = new_assertions.first() {
-            assert_eq!(
-                assertion.base.provenance.run_id,
-                Some(work_run_id.to_string())
-            );
-            assert_eq!(
-                assertion.base.provenance.work_run_id.as_ref(),
-                Some(&work_run_id)
-            );
-            // config_id is set by the extractor's apply_work_run_provenance,
-            // not by inline promotion. In reprocess tests with mock extractors,
-            // it may or may not be present depending on the mock setup.
-        }
-        let updated_work_run = ctx
+        assert_eq!(revisions, vec![revision]);
+        let intents = source_job::load_source_artifacts(
+            &elephant_storage::WorkArtifactRepository::new(ctx.storage.clone()),
+            "test_space",
+            &job_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].work_run.id(), &work_run_id);
+        assert_eq!(intents[0].base.provenance.sources, vec![source.base.id]);
+        let stored_run = ctx
             .work_run_repo
             .get("test_space", &work_run_id)
             .await
             .unwrap()
             .unwrap();
-        // Extractor provenance is set on the work_run by execute_extract_assertions,
-        // then propagated to assertions via apply_work_run_provenance.
-        // Verify work_run has the extractor info.
-        assert!(
-            updated_work_run.prompt_id.is_some() || updated_work_run.model_version.is_some(),
-            "work_run should have extractor provenance"
-        );
+        assert_eq!(stored_run.worker_version, "9.9.9");
+        assert_eq!(stored_run.model_version.as_deref(), Some("model_v2"));
     }
 
     #[tokio::test]
@@ -2760,14 +2576,6 @@ mod tests {
     use elephant_types::records::attribute::{Attribute, Literal};
     use elephant_types::records::entity::Entity;
 
-    const SUPERSESSION_SCHEMA: &str = r"
-        DEFINE TABLE doc_revision SCHEMALESS;
-        DEFINE TABLE assertion SCHEMALESS;
-        DEFINE TABLE rel SCHEMALESS;
-        DEFINE TABLE attribute SCHEMALESS;
-        DEFINE TABLE entity SCHEMALESS;
-    ";
-
     async fn setup_supersession_repos(
         db_id: u64,
     ) -> (
@@ -2782,7 +2590,23 @@ mod tests {
             ..StorageConfig::default()
         };
         let client = StorageClient::new(config).await.unwrap();
-        client.query(SUPERSESSION_SCHEMA).await.unwrap();
+        elephant_migrations::apply_schema(&client).await.unwrap();
+        elephant_storage::SpaceConfigRepository::new(client.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: elephant_types::records::BaseFields::new(
+                    RecordId::new_v4(elephant_types::TableName::SpaceConfig),
+                    "test_space".into(),
+                    "test_agent".into(),
+                ),
+                embedding_provider: "unconfigured".into(),
+                embedding_model: "unconfigured".into(),
+                embedding_dims: 1,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .unwrap();
 
         (
             DocRevisionRepository::new(client.clone()),
@@ -2797,11 +2621,28 @@ mod tests {
     #[tokio::test]
     async fn test_supersede_revision_integration() {
         let db_id = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let (doc_rev_repo, _, _, _, _) = setup_supersession_repos(db_id).await;
+        let (doc_rev_repo, _, _, _, storage) = setup_supersession_repos(db_id).await;
 
         // Create old revision
         let old_id = RecordId::new_v4(elephant_types::TableName::DocRevision);
         let doc_id = RecordId::new_v4(elephant_types::TableName::Doc);
+        DocRepository::new(storage)
+            .create(Doc {
+                base: elephant_types::records::BaseFields::new(
+                    doc_id.clone(),
+                    "test_space".into(),
+                    "test_agent".into(),
+                ),
+                title: "authored document".into(),
+                text: "Old content".into(),
+                sidecar_text: None,
+                source: None,
+                media_attachments: vec![],
+                rendition_key: uuid::Uuid::new_v4().to_string(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
         let old_revision = DocRevision {
             base: elephant_types::records::base::BaseFields::new(
                 old_id.clone(),
@@ -2849,7 +2690,10 @@ mod tests {
         // Supersede
         let result = super::supersede_revision(&doc_rev_repo, &old_id, &new_id, "test_space").await;
 
-        assert!(result.is_ok(), "supersede_revision should succeed");
+        assert!(
+            result.is_ok(),
+            "supersede_revision should succeed: {result:?}"
+        );
         let supersession = result.unwrap();
         assert_eq!(supersession.old_id, old_id);
         assert_eq!(supersession.new_id, new_id);
@@ -2959,7 +2803,10 @@ mod tests {
         let result =
             super::supersede_assertion(&assertion_repo, &old_id, &new_id, "test_space").await;
 
-        assert!(result.is_ok(), "supersede_assertion should succeed");
+        assert!(
+            result.is_ok(),
+            "supersede_assertion should succeed: {result:?}"
+        );
 
         // Verify old assertion is superseded
         let old_updated = assertion_repo
@@ -2977,11 +2824,10 @@ mod tests {
     #[tokio::test]
     async fn test_supersede_rel_integration() {
         let db_id = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let (_, _, rel_repo, _, _) = setup_supersession_repos(db_id).await;
+        let (_, _, rel_repo, _, storage) = setup_supersession_repos(db_id).await;
 
-        // Entity IDs don't need to exist in DB for rel creation (schemaless)
-        let subject_id = RecordId::new_v4(elephant_types::TableName::Entity);
-        let object_id = RecordId::new_v4(elephant_types::TableName::Entity);
+        let subject_id = persist_test_entity(&storage, "test_space", "Alice").await;
+        let object_id = persist_test_entity(&storage, "test_space", "Acme").await;
 
         // Create old rel
         let old_id = RecordId::new_v4(elephant_types::TableName::Rel);
@@ -3024,7 +2870,7 @@ mod tests {
         // Supersede
         let result = super::supersede_rel(&rel_repo, &old_id, &new_id, "test_space").await;
 
-        assert!(result.is_ok(), "supersede_rel should succeed");
+        assert!(result.is_ok(), "supersede_rel should succeed: {result:?}");
 
         // Verify old rel is superseded
         let old_updated = rel_repo.get("test_space", &old_id).await.unwrap().unwrap();
@@ -3035,10 +2881,9 @@ mod tests {
     #[tokio::test]
     async fn test_supersede_attribute_integration() {
         let db_id = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let (_, _, _, attr_repo, _) = setup_supersession_repos(db_id).await;
+        let (_, _, _, attr_repo, storage) = setup_supersession_repos(db_id).await;
 
-        // Entity ID doesn't need to exist in DB (schemaless)
-        let subject_id = RecordId::new_v4(elephant_types::TableName::Entity);
+        let subject_id = persist_test_entity(&storage, "test_space", "Alice").await;
 
         // Create old attribute
         let old_id = RecordId::new_v4(elephant_types::TableName::Attribute);
@@ -3081,7 +2926,10 @@ mod tests {
         // Supersede
         let result = super::supersede_attribute(&attr_repo, &old_id, &new_id, "test_space").await;
 
-        assert!(result.is_ok(), "supersede_attribute should succeed");
+        assert!(
+            result.is_ok(),
+            "supersede_attribute should succeed: {result:?}"
+        );
 
         // Verify old attribute is superseded
         let old_updated = attr_repo.get("test_space", &old_id).await.unwrap().unwrap();

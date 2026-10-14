@@ -99,7 +99,7 @@ impl KnowledgeViewDefinitionRepository {
         Self { client }
     }
 
-    fn to_value(definition: &KnowledgeViewDefinition) -> StorageResult<Value> {
+    pub(crate) fn to_value(definition: &KnowledgeViewDefinition) -> StorageResult<Value> {
         let mut object = crate::surreal::base_fields_to_object(&definition.base)?;
         object.insert("title".to_string(), definition.title.clone().into());
         object.insert(
@@ -174,6 +174,24 @@ impl KnowledgeViewDefinitionRepository {
         space_id: &str,
         id: &RecordId,
     ) -> StorageResult<Option<KnowledgeViewDefinition>> {
+        self.get_internal(space_id, id, false).await
+    }
+
+    /// Loads the exact definition, including a tombstone, for canonical CAS.
+    pub async fn get_including_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<KnowledgeViewDefinition>> {
+        self.get_internal(space_id, id, true).await
+    }
+
+    async fn get_internal(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        include_deleted: bool,
+    ) -> StorageResult<Option<KnowledgeViewDefinition>> {
         if id.table() != TableName::KnowledgeViewDefinition {
             return Err(StorageError::TypeError(
                 elephant_types::TypeError::InvalidRecordId(id.to_string()),
@@ -181,18 +199,19 @@ impl KnowledgeViewDefinitionRepository {
         }
         if let Some(store) = self.client.embedded_store() {
             return store
-                .get::<KnowledgeViewDefinition>(space_id, id, false)
+                .get::<KnowledgeViewDefinition>(space_id, id, include_deleted)
                 .await;
         }
         let mut response = self
             .client
             .query_bind(
                 &format!(
-                    "SELECT {DEFINITION_PROJECTION} FROM $id WHERE space_id = $space_id AND deleted_at IS NONE"
+                    "SELECT {DEFINITION_PROJECTION} FROM $id WHERE space_id = $space_id AND ($include_deleted OR deleted_at IS NONE)"
                 ),
                 crate::bindings! {
                     "id" => crate::surreal::thing_from_record_id(id),
                     "space_id" => space_id,
+                    "include_deleted" => include_deleted,
                 },
             )
             .await?;
@@ -280,7 +299,7 @@ impl KnowledgeViewDefinitionRepository {
     }
 }
 
-fn validate_definition(definition: &KnowledgeViewDefinition) -> StorageResult<()> {
+pub(crate) fn validate_definition(definition: &KnowledgeViewDefinition) -> StorageResult<()> {
     if definition.base.id.table() != TableName::KnowledgeViewDefinition
         || definition.title.trim().is_empty()
         || definition.title.len() > 200

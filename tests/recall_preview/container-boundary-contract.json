@@ -1,0 +1,293 @@
+{
+  "format": "recall-container-boundary-expectations/v1",
+  "execution_authorized": false,
+  "provider_dispatch_authorized": false,
+  "product_acceptance": false,
+  "source_basis": {
+    "public_errors": "crates/types/src/public_error.rs::ErrorCode",
+    "http_search": "bin/elephant-api/src/routes/scoped_search.rs::search",
+    "mcp_search": "crates/mcp/src/scoped_search.rs::ScopedSearchHandler",
+    "coverage": "crates/mcp/src/scoped_search.rs::coverage",
+    "mcp_projection": "bin/elephant-api/src/mcp.rs::public_tool_error",
+    "joined_source": "988af6f38bd773127d0ea7d0f2044191cae897c8"
+  },
+  "routes": {
+    "http_search": "POST /v1/spaces/{space}/search",
+    "mcp_transport": "POST /mcp/full",
+    "mcp_search_tool": "search_scoped",
+    "head": "GET /v1/spaces/{space}/sources/{external_key}/head",
+    "readiness": "GET /v1/readiness",
+    "restore": "POST /v1/system/snapshot/restore"
+  },
+  "error_cases": [
+    {
+      "id": "CB01",
+      "error_code": "unauthorized",
+      "http_status": 401,
+      "retryable": false,
+      "trigger": "Omit or invalidate signed credentials on actual HTTP search and MCP transport. No private content, known source identity or provider dispatch."
+    },
+    {
+      "id": "CB02",
+      "error_code": "forbidden_space",
+      "http_status": 403,
+      "retryable": false,
+      "trigger": "Use an otherwise valid household-only grant-backed principal against business path/header and known IDs. Preserve the same source under an independently authorized reader."
+    },
+    {
+      "id": "CB03",
+      "error_code": "capability_disabled",
+      "http_status": 403,
+      "retryable": false,
+      "trigger": "Actually configure read_only. Call the exposed source mutation and MCP retract_source; original heads/operations unchanged. Read/search remains usable. Do not substitute an unknown tool."
+    },
+    {
+      "id": "CB04",
+      "error_code": "not_found",
+      "http_status": 404,
+      "retryable": false,
+      "trigger": "Read a fresh authorized absent source head. Separately query its explicit constraint: that search succeeds with missing coverage and partial=true; missing coverage is not HTTP404."
+    },
+    {
+      "id": "CB05",
+      "error_code": "conflict_generation",
+      "http_status": 409,
+      "retryable": false,
+      "trigger": "After a real original acceptance, submit a changed explicit source intent with stale expected_generation. Preserve original head/operation and observe no new accepted work. Stale search coverage is separately a200 success, not this error."
+    },
+    {
+      "id": "CB06",
+      "error_code": "unavailable",
+      "http_status": 503,
+      "retryable": true,
+      "trigger": "Against the paired native backend, establish a healthy positive control then stop only the owned paired server and call an actual storage-dependent HTTP/MCP operation. Service-wide not_ready is distinct and cannot stand in for unavailable. Embedded backend remains unmet if no existing supported failure control produces this category."
+    },
+    {
+      "id": "CB07",
+      "error_code": "payload_too_large",
+      "http_status": 413,
+      "retryable": false,
+      "trigger": "Actually publish the two independently reviewed Graph Sources and select20 complete results, including at least18 supported claim quotes, whose encoded response exceeds262144bytes. Both transports must return the small typed error without truncation. One explicitly new limit10 request retains every other constraint and must fit as complete evidence. Count actual selected bytes, including required raw/rendered coordinates and full ToolResponse/MCP framing. Missing actual publication/selection/framing is UNMET."
+    },
+    {
+      "id": "CB08",
+      "error_code": "invalid_request",
+      "http_status": 400,
+      "retryable": false,
+      "trigger": "Call exact search with limit51 or empty original query; no silent clamp or provider dispatch."
+    },
+    {
+      "id": "CB09",
+      "error_code": "provider_unapproved",
+      "http_status": 403,
+      "retryable": false,
+      "trigger": "On an actual published indexed source, revoke/miss the current query profile approval and request semantic search. Zero subsequent owned-provider sends; do not accept empty lexical rescue."
+    },
+    {
+      "id": "CB10",
+      "error_code": "not_ready",
+      "http_status": 503,
+      "retryable": true,
+      "trigger": "Observe the actual restore/recovery barrier while a separate client calls public data endpoints. Original erasedA must never appear; missing journal start remains distinct and cannot prove a sampled replay interval."
+    }
+  ],
+  "error_envelope": {
+    "exact_fields": [
+      "error_code",
+      "message",
+      "retryable"
+    ],
+    "message_unicode_scalars_max": 512,
+    "hidden_fixture_bytes": "absent",
+    "raw_backend_queries": "absent",
+    "secrets": "absent",
+    "mcp_tool_failure": "HTTP200 only after successful transport; JSON-RPC originalid/version, result.isError=true and one JSON text content block containing exact PublicError. Authentication/current-space middleware may instead fail HTTP401/403 with exact PublicError before any MCP tool response. Do not rewrite one into the other."
+  },
+  "coverage_cases": [
+    {
+      "id": "CC01",
+      "state": "missing",
+      "trigger": "Constrain a fresh absent authorized external key/revision.",
+      "published_revision": null,
+      "desired_revision": null,
+      "partial": true,
+      "results": "No evidence for the constrained absent key."
+    },
+    {
+      "id": "CC02",
+      "state": "pending",
+      "trigger": "Actually accept a fresh Metadata/Graph source with workers disabled, before any publication.",
+      "published_revision": null,
+      "desired_revision": "original accepted revision",
+      "partial": true,
+      "results": "No current-source evidence. The accepted202 response is not completed publication."
+    },
+    {
+      "id": "CC03",
+      "state": "stale",
+      "trigger": "Constrain an opaque revision different from both current desired and current published revisions under an active source.",
+      "published_revision": "actual prior complete publication",
+      "desired_revision": "actual accepted desired revision",
+      "partial": true,
+      "results": "No evidence pretending the requested stale revision is current. An old still-published revision during pending replacement may legitimately be complete and is not this case."
+    },
+    {
+      "id": "CC04",
+      "state": "complete",
+      "trigger": "First prove a positive exact-revision lexical hit from the same real published source; then issue a fixed absent token query with the same constraints.",
+      "published_revision": "same actual requested revision",
+      "desired_revision": "same actual requested revision",
+      "partial": false,
+      "results": []
+    },
+    {
+      "id": "CC05",
+      "state": "retracted",
+      "trigger": "Actually retract the original accepted source and query the same original constraint.",
+      "published_revision": "capture actual DTO, do not invent an erased value",
+      "desired_revision": "capture actual DTO",
+      "partial": true,
+      "results": "No retracted evidence. Authorization denial is not this lifecycle state."
+    },
+    {
+      "id": "CC06",
+      "state": "erased",
+      "trigger": "Actually erase the original accepted source and query it under the intended permitted tombstone visibility.",
+      "published_revision": "capture actual DTO",
+      "desired_revision": "capture actual DTO",
+      "partial": true,
+      "results": "No erased evidence. Public404/coverage alone does not prove physical erasure."
+    }
+  ],
+  "coverage_wire": "HTTP200 SearchResponse; MCP successful ToolResponse data through original JSON-RPC response. Exactcoverage state/requested/published/desired captured, partial independent from results. Do not turn pending/stale/missing into transport errors or complete empty success.",
+  "oversized_fixture": {
+    "mode": "Graph",
+    "contract_revision": 2,
+    "root_decision_times": [
+      "2026-10-07T02:30:28Z",
+      "2026-10-07T02:36:09Z"
+    ],
+    "source_count": 2,
+    "source_raw_bytes_each": 65018,
+    "source_rendered_bytes_each": 65019,
+    "maximum_source_bytes": 2000000,
+    "supported_claims_per_source": 10,
+    "complete_quote_bytes_each": 6500,
+    "maximum_selected_window_bytes": 12000,
+    "source_recipe_files": [
+      {
+        "path": "container-response-budget-0.json",
+        "file_sha256": "5d84a9e4640ea6cfea18d03b7bde2859f31775b9efa4a812e3d799b0fc6ed667",
+        "canonical_sha256": "bbb0508a0adfa26276f25a404fddeebfa97d81ba8aa7e34cd8bea2ad112f7b6d"
+      },
+      {
+        "path": "container-response-budget-1.json",
+        "file_sha256": "40698c876b7d43e913858ee43f307102413712e60c7c59f1d2b6aafcaad3fda7",
+        "canonical_sha256": "b92aee9b1470b354e902120b602e90f5da3c7d089d5bcac51479523e621cfb2d"
+      }
+    ],
+    "arithmetic_path": "tests/recall_preview/graph-recipes/container-response-budget-arithmetic.json",
+    "arithmetic_sha256": "f90aab89f3bcec4362a3d623f90bc22dbb39763548637054388ad2fdf3f010bc",
+    "literal_source_commit": "513f5e3a807e9bc1ed6cfb5f05826cca2b28826c",
+    "reviewed_arithmetic_commit": "9acaa075a57de56bbe46c34168635129da3b8f27",
+    "query": "oversees",
+    "ranking_mode": "lexical",
+    "source_revision_constraints": {
+      "boundary/graph-response-budget-0": "boundary-response-r1",
+      "boundary/graph-response-budget-1": "boundary-response-r1"
+    },
+    "limit20": {
+      "required_selected_results": 20,
+      "minimum_selected_supported_claims": 18,
+      "maximum_selected_chunks": 2,
+      "expected_selected_entities": 0,
+      "quote_only_response_bytes_lower_bound": 387036,
+      "response_budget_bytes": 262144,
+      "required_http_status": 413,
+      "required_error_code": "payload_too_large"
+    },
+    "limit10": {
+      "required_actual_new_request_limit": 10,
+      "maximum_claim_result_encoded_bytes": 22116,
+      "maximum_chunk_result_encoded_bytes": 6709,
+      "full_response_bytes_upper_bound": 221584,
+      "response_budget_bytes": 262144,
+      "required_http_status": 200,
+      "required_complete_evidence": true,
+      "mcp_jsonrpc_bytes_upper_bound": 252277,
+      "mcp_streamed_capture_bytes_upper_bound": 256373,
+      "original_collector_response_bytes": 270336,
+      "mcp_tool_response_bytes_upper_bound": 221603
+    },
+    "wire_contract": {
+      "format": "recall-dual-coordinate-evidence/v1",
+      "required_additive_fields": [
+        "rendered_span",
+        "rendered_quote_sha256",
+        "rendered_text_sha256",
+        "doc_id"
+      ],
+      "hash_encoding": "64 lowercase hexadecimal ASCII bytes without prefix",
+      "original_span_and_quote": "exact supplied source UTF8 minimal contiguous cover",
+      "rendered_reference": "exact full immutable DocRevision text and selected span hashes; doc_id from the same authorized current Doc and internal_doc_revision_id from that full revision; no duplicated full rendered quote",
+      "span_coordinate_decimal_digits_upper_bound": 5,
+      "internal_revision_id_encoded_string_bytes": 51,
+      "doc_id_encoded_string_bytes": 42,
+      "doc_id_shape": "doc:<36-byte canonical UUID>; same original ReadEligibility document, not derived from external source or revision strings",
+      "finite_score_encoded_bytes_upper_bound": 32,
+      "mcp_jsonrpc_id_decimal_digits_upper_bound": 20,
+      "mcp_result_representation": "one content type=text containing compact ToolResponse {ok:true,data:SearchResponse} JSON, isError=false, no structuredContent or metadata",
+      "mcp_stream_framing_reserve_bytes": 4096
+    },
+    "requires_real_public_acceptance_and_worker_finalization": true,
+    "requires_actual_selected_claims_and_complete_framing": true,
+    "controlled_model_output_is_not_quality": true,
+    "no_fabricated_canonical_receipt": true,
+    "one_smaller_request_only": "Newlimit10 request with same query, filters, original source/revision constraints and principal; no automatic recursive retries.",
+    "if_unavailable": "unmet prerequisite, no artificial response/collector failure substitution",
+    "superseded_single_quote_recipe": {
+      "minimum_original_quote_bytes": 262145,
+      "status": "unsupported_and_unmet_not_passed",
+      "reason": "Original default extractor window is at most12000bytes; a single supported262145byte quote cannot be published through that path. Root explicitly approved this equivalent whole-selected-response gate, preserving full supported individual quote exactness and original response limits."
+    }
+  },
+  "restore_interval": {
+    "before": "Actual erasedA absent and independentB exact public payload; readiness ready before original registered old-backup restore.",
+    "during": "Launch restore on separate client. Independently sample readiness and original A/B reads with complete monotonic request/response intervals and bounded original bodies. A must never return erased content at any point. Require at least one actual readiness recovery/notReady observation and a contemporaneous real data not_ready refusal before claiming observed barrier. Finalstate404 alone is insufficient.",
+    "after": "Actualrestore finishes; readiness recovers; A stillabsent; B exactfullbaseline unchanged; originaljournal unchanged. Capture all raw statuses/reasons/timestamps.",
+    "unobserved_interval": "unmet, never continuous-refusal pass; no productfaultswitch, rawDBpause, fakebarrier or catchandignore."
+  },
+  "bounds": {
+    "per_backend_seconds": 1500,
+    "http_calls_per_backend": 1000,
+    "independent_poll_clients": 3,
+    "per_request_seconds": 5,
+    "restore_request_seconds": 120,
+    "poll_interval_ms": 25,
+    "poll_window_seconds": 120,
+    "transport_response_bytes": 270336,
+    "search_dto_bytes": 262144,
+    "private_capture_bytes": 134217728,
+    "all_backends_sequential": true,
+    "provider_external_sends": 0,
+    "source_text_max_bytes": 2000000
+  },
+  "physical_erasure_separate": {
+    "embedded": "Existing quiesced registered export plus bounded typed SnapshotPayload.tables inventory and owned PV/backup/media inspection. Exact independent B baseline.",
+    "surreal": "Existing verifiednativeexport requires pinned SurrealAST typed offline inspector; until allocated completephysicalgateUNMET. No arbitraryliveDBquery API orbytecanary-onlyclaim.",
+    "journal": "Original independentpayload-freejournal remains; never reconstructerasedpayload forinspectionproof."
+  },
+  "custody": {
+    "expectations": "qualification",
+    "new_container_boundary_driver": "finalization",
+    "shared_transport": "semantics",
+    "physical_inspection": "erasure/finalization existing owned seams"
+  },
+  "limitations": [
+    "No paid probes or service execution authorized",
+    "Exact artifact/image/source/dependency hashes and isolation required before execution",
+    "Missing prerequisites and unobserved categories remain explicit unmet",
+    "Default0 metadata-only container fixture does not qualify D28 household3/business7",
+    "No real provider, semantic relevance, consumer fallback or full physical erasure claim from taxonomy alone"
+  ]
+}

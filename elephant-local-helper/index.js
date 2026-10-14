@@ -133,7 +133,7 @@ function globMatch(filepath, pattern) {
 // Create MCP server
 const server = new McpServer({
   name: "elephant-local-helper",
-  version: "0.1.0",
+  version: "0.9.0",
 });
 
 // Tool: ingest_file

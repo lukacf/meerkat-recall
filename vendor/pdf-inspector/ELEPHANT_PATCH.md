@@ -6,6 +6,9 @@ This directory contains the published crate, excluding Cargo's registry marker
 and the upstream lockfile. Elephant's workspace lockfile controls dependencies.
 The original license, manifest, source, and bundled decoding tables are retained.
 
+The two vendored Cargo manifests add a direct `flate2` dependency already present
+in the workspace lockfile, for bounded Flate completion/checksum validation.
+
 Only `src/extractor/mod.rs`, `src/extractor/content_stream.rs`,
 `src/extractor/xobjects.rs`, and `src/types.rs` differ from the published source:
 
@@ -13,8 +16,15 @@ Only `src/extractor/mod.rs`, `src/extractor/content_stream.rs`,
   Form XObjects and invisible text already present in OCR text layers.
 - Resolve inherited page XObject resources, with nearest-definition semantics
   and a bounded, cycle-safe parent walk.
-- Fail plain extraction on page read failures or page/form resource limits,
-  so a partial document is never reported as complete after those failures.
+- Fail plain extraction on page read failures or page/form resource limits.
+  Resolve every declared page content stream (including indirect arrays), reject
+  missing or malformed entries, and propagate filter decoding failures. Validate
+  complete Flate streams and their checksum before decoding page or Form content;
+  lopdf's best-effort Flate decoder alone can accept a partial decoded prefix.
+  All filter layers and assembled page content retain the existing byte bound.
+- Clip plain text runs against the rotated visible page box even on sparse pages
+  or small crops. Wholly outside runs and annotations are excluded; intersecting
+  runs remain intact because run geometry cannot reliably clip individual glyphs.
 - Group lines without filtering page numbers; omit image placeholder items.
 - Add an internal serializer that preserves spacing and literal text without
   generating superscript or subscript HTML. Existing formatted APIs retain

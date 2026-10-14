@@ -1,0 +1,204 @@
+{
+  "format": "recall-preview-workload-allocation-proposal/v1",
+  "proposal_only": true,
+  "execution_authorized": false,
+  "provider_dispatch_authorized": false,
+  "live_ready": false,
+  "accounting_mode": "separate-exclusive-semantic140-embedding-reservation/v1",
+  "custody": {
+    "corpus_sha256": "e3201eb81bc294391e445a431a847f88603ec0631e23b6068d6f44cf0944ff0f",
+    "contract_sha256": "d334f2c3fcddd134f4765704bbee91e0d917bab9865fc7c27ff19df7942adaa8",
+    "primary_semantic_proposal_sha256": "2745c63cd9826ddcb702565d1c0d97cac86056fda465525f2f07a12da879cc12",
+    "primary_gateway_delta_sha256": "c651a0e50a8ee5adcfa0debbf11c9967c4d2e09f52cd7b7e428052a57b698d23",
+    "provider_catalog_facts_sha256": "9b40bf9b99a93b3f6d1ba7cf0b402fd46b01b4aac42205c9681c8e894a03e2ce"
+  },
+  "spaces": {
+    "qualification-household": {
+      "sources": 25,
+      "embedding_model": "text-embedding-3-small",
+      "dimensions": 1536
+    },
+    "qualification-business": {
+      "sources": 25,
+      "embedding_model": "text-embedding-3-large",
+      "dimensions": 3072
+    }
+  },
+  "cohorts": [
+    {
+      "id": "elephant-db-preparation",
+      "backend": "elephant-db",
+      "phase": "preparation",
+      "single_use": true,
+      "exclusive": true,
+      "duration_seconds": 3600,
+      "max_active_physical_dispatches": 2,
+      "physical_attempts_per_space": {
+        "qualification-household": 225,
+        "qualification-business": 225
+      },
+      "max_physical_attempts": 450,
+      "public_source_accepts": 50,
+      "public_search_requests": 0,
+      "harness_retries": 0
+    },
+    {
+      "id": "elephant-db-measurement",
+      "backend": "elephant-db",
+      "phase": "measurement",
+      "single_use": true,
+      "exclusive": true,
+      "duration_seconds": 120,
+      "max_active_physical_dispatches": 140,
+      "physical_attempts_per_space": {
+        "qualification-household": 840,
+        "qualification-business": 840
+      },
+      "max_physical_attempts": 1680,
+      "public_source_accepts": 0,
+      "public_search_requests": 560,
+      "harness_retries": 0
+    },
+    {
+      "id": "surreal-db-preparation",
+      "backend": "surreal-db",
+      "phase": "preparation",
+      "single_use": true,
+      "exclusive": true,
+      "duration_seconds": 3600,
+      "max_active_physical_dispatches": 2,
+      "physical_attempts_per_space": {
+        "qualification-household": 225,
+        "qualification-business": 225
+      },
+      "max_physical_attempts": 450,
+      "public_source_accepts": 50,
+      "public_search_requests": 0,
+      "harness_retries": 0
+    },
+    {
+      "id": "surreal-db-measurement",
+      "backend": "surreal-db",
+      "phase": "measurement",
+      "single_use": true,
+      "exclusive": true,
+      "duration_seconds": 120,
+      "max_active_physical_dispatches": 140,
+      "physical_attempts_per_space": {
+        "qualification-household": 840,
+        "qualification-business": 840
+      },
+      "max_physical_attempts": 1680,
+      "public_source_accepts": 0,
+      "public_search_requests": 560,
+      "harness_retries": 0
+    }
+  ],
+  "sequential_backend_runs": true,
+  "preparation": {
+    "method": "POST",
+    "path": "/v1/sources/ingest",
+    "ingest_mode": "retrieval",
+    "source_type": "manual",
+    "intake_count_per_backend": 50,
+    "generative_roles_allowed": [],
+    "sdk_max_retries_field": 3,
+    "sdk_total_physical_attempts_per_logical_batch": 3,
+    "worker_environment": {
+      "PIPELINE_WORK_TRANSIENT_RETRY_MAX_ATTEMPTS": "3"
+    },
+    "ordinary_worker_attempts": 3,
+    "ordinary_capacity_formula": "2 backends * 2 spaces * 25 sources * 3 ordinary worker attempts * 3 SDK sends = 900",
+    "batch_bound_scope": "gateway inspects actual predispatch input array; published original node/revision inventory is separate preparation evidence",
+    "expected_tree": "short original paragraph plus chunk; actual original node inventory required, never inferred from 202",
+    "recovery_limit": "Recovery, blocked-attempt refunds and additional stage work can exceed ordinary retry arithmetic; original gateway ceilings remain absolute stop limits."
+  },
+  "measurement": {
+    "requests_per_backend": 560,
+    "requests_per_space_per_backend": 280,
+    "callers": 140,
+    "sequential_requests_per_caller": 4,
+    "request_timeout_seconds": 8,
+    "duration_seconds": 120,
+    "max_response_bytes": 262144,
+    "wire_limit": 50,
+    "harness_retries": 0,
+    "warmup_requests": 0,
+    "capacity_formula": "2 backends *560 original one-input queries *3 SDK sends =3360",
+    "actual_overlap": "computed from retained original intervals, never inferred from caller/worker counts",
+    "provider_attribution": "exclusive original cohort totals only; per-public-request provider attempt association remains unmet"
+  },
+  "physical_limits": {
+    "max_attempts": 4260,
+    "global_duration_seconds": 7800,
+    "physical_request_seconds": 120,
+    "physical_request_deadline": "minimum of120 seconds and original remaining cohort/allocation deadline",
+    "original_request_bytes": 131072,
+    "forwarded_request_bytes": 131072,
+    "response_bytes": 8388608,
+    "minimum_embedding_input_items": 1,
+    "maximum_embedding_input_items": 64,
+    "embedding_total_input_token_upper_bound": 8192,
+    "token_bound_method": "Whole canonical embedding request JSON UTF-8 bytes plus64 per input item; gateway-enforced upper bound8192, not observed tokenizer usage.",
+    "capture_metadata_bytes_per_attempt": 32768,
+    "capture_reserved_bytes": 42949672960,
+    "max_wire_and_attempt_capture_bytes": 36991795200
+  },
+  "money": {
+    "currency": "USD",
+    "cap_nano_usd": 5000000000,
+    "reservation_nano_usd_per_embedding_attempt": 1064960,
+    "maximum_reservation_nano_usd": 4536729600,
+    "rate_nano_usd_per_input_token": 130,
+    "rate_basis": "uniform standard text-embedding-3-large 0.13 USD per million input tokens; standard nonregional terms only",
+    "cache_discounts": false,
+    "embedding_refunds": false,
+    "reverify_official_terms_before_live_allocation": true
+  },
+  "admission": {
+    "generation_disabled": true,
+    "original_432_manifest_unchanged": true,
+    "new_original_ledger_required": true,
+    "ledger_reinitialization_for_retry_forbidden": true,
+    "phase_change_requires_closed_setup_and_no_active_pending_admission": true,
+    "unknown_or_failed_attempt_keeps_full_reservation": true,
+    "exhaustion_result": "incomplete qualification; no automatic fresh budget or scope reduction"
+  },
+  "required_live_identity": [
+    "exact source/artifact/binary hashes",
+    "gateway/bridge/collector/preparation code hashes",
+    "original journal/ledger identity and unique run nonce",
+    "approved account/endpoint/credential generations",
+    "actual space/config/profile/binding fingerprints",
+    "original accepted source/operation/revision and published node/index inventory",
+    "actual worker retry configuration",
+    "explicit UTC start/expiry and separate spending authorization"
+  ],
+  "excluded_but_still_required": [
+    "large2MB/shared payload completion",
+    "no-op ingest and revision transitions",
+    "retraction and independent support",
+    "permission/grant/provider revocation negatives",
+    "outage and degraded consumer fallback",
+    "consumer default20 and one payload_too_large retry at10",
+    "Graph extraction/verification/identity/TM/wiki semantic corpus"
+  ],
+  "source_review": {
+    "root": "ROOT0816 source implementation only; execution/provider_dispatch/live_ready remain false",
+    "independent_oracle": "E source obligations: exact immutable query/evidence and original timestamp order/transport errors/actual peaks; final composed review required",
+    "accounting": "B e91ecf bounded consultation; hard caps include failures/splits/recovery, no refunds/reset"
+  },
+  "profile_id": "semantic140-v1",
+  "capture_limits": {
+    "preparation_bytes_per_backend": 268435456,
+    "measurement_rows_bytes_per_backend": 536870912,
+    "measurement_observation_bytes_per_backend": 536870912,
+    "runtime_originals_bytes_per_backend": 2147483648,
+    "physical_capture_bytes": 47244640256,
+    "extra_free_headroom_bytes": 1073741824,
+    "per_export_channel_bytes_unchanged": 21474836480,
+    "per_export_indexed_files_unchanged": 10532
+  },
+  "clock_caveat": "7800 seconds is one original absolute truncating ceiling; full phase windows plus all maximum begins/closes sum8000 before other work. Completion is not guaranteed and no phase/backend renews it.",
+  "overlap": "Require140 actual request-lifetime and write-complete/waiting-response peaks, recomputed from finite original ordered row timestamps. No server-execution concurrency claim or manufactured delay."
+}

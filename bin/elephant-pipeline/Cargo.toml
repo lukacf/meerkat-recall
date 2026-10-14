@@ -27,6 +27,7 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+uuid = { workspace = true }
 
 [features]
 rocksdb = ["elephant-storage/rocksdb"]
@@ -36,6 +37,14 @@ fastembed = ["elephant-embeddings/fastembed"]
 test-utils = []
 
 [dev-dependencies]
+axum = { workspace = true }
+futures = { workspace = true }
+meerkat = { workspace = true }
+meerkat-core = { workspace = true }
+tempfile = "3"
+uuid = { workspace = true }
+elephant-auth = { path = "../../crates/auth" }
+elephant-policy = { path = "../../crates/policy" }
 tokio-test = { workspace = true }
 rstest = { workspace = true }
 

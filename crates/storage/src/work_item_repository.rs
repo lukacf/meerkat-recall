@@ -323,7 +323,7 @@ impl WorkItemRepository {
 
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 &format!(
                     "SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE space_id = $space_id AND status = 'runnable' AND deleted_at IS NONE AND array::any([run_after IS NONE, run_after <= time::now()]) ORDER BY priority DESC, created_at ASC LIMIT {limit}"
                 ),
@@ -355,6 +355,34 @@ impl WorkItemRepository {
             self.update_if_status(space_id, id, item, expected).await?;
         }
         Ok(())
+    }
+
+    /// Retries exactly the failed work item authorized by a request boundary.
+    /// The guard and hot/cold reactivation are one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if the authorized pre-state changed or is not failed.
+    pub async fn retry_authorized(&self, observed: &WorkItem) -> StorageResult<WorkItem> {
+        let conflict = || crate::lifecycle_guard::guard_conflict("WorkItem", &observed.base.id);
+        if observed.status != WorkItemStatus::Failed || observed.base.deleted_at.is_some() {
+            return Err(conflict());
+        }
+        let mut retry = observed.clone();
+        retry.status = WorkItemStatus::Runnable;
+        retry.leased_by = None;
+        retry.lease_expires_at = None;
+        retry.run_after = None;
+        crate::work_retention::update_item_guarded(
+            &self.client,
+            &observed.base.space_id,
+            &observed.base.id,
+            retry,
+            Some(WorkItemStatus::Failed),
+            Some(observed),
+        )
+        .await?
+        .ok_or_else(conflict)
     }
 
     /// Finds a work item by idempotency key.
@@ -417,7 +445,7 @@ impl WorkItemRepository {
         };
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 &format!(
                     "SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE space_id = $space_id AND status = $status AND deleted_at IS NONE{run_after_clause} ORDER BY priority DESC, created_at ASC LIMIT {limit}"
                 ),
@@ -475,7 +503,7 @@ impl WorkItemRepository {
         };
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 &format!(
                     "SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE space_id = $space_id AND status = $status AND deleted_at IS NONE{run_after_clause} ORDER BY priority DESC, created_at ASC"
                 ),
@@ -513,7 +541,7 @@ impl WorkItemRepository {
 
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 &format!(
                     "SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE {RUNNABLE_WORK_FILTER} ORDER BY priority DESC, created_at ASC LIMIT {limit}"
                 ),
@@ -563,7 +591,7 @@ impl WorkItemRepository {
 
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 &format!(
                     "SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE status = $status AND kind = $kind AND deleted_at IS NONE AND array::any([run_after IS NONE, run_after <= time::now()]) ORDER BY priority DESC, created_at ASC LIMIT {limit}"
                 ),
@@ -630,7 +658,7 @@ impl WorkItemRepository {
         };
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 &format!(
                     "SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE space_id = $space_id AND status = $status AND kind = $kind AND deleted_at IS NONE{run_after_clause} ORDER BY priority DESC, created_at ASC LIMIT {limit}"
                 ),
@@ -691,7 +719,7 @@ impl WorkItemRepository {
         let kinds = kinds.iter().map(ToString::to_string).collect::<Vec<_>>();
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 &format!(
                     "SELECT {WORK_ITEM_PROJECTION} FROM work_item \
                      WHERE space_id = $space_id \
@@ -759,7 +787,7 @@ impl WorkItemRepository {
 
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 r"UPDATE work_item SET run_after = $run_after, updated_at = time::now()
                   WHERE space_id = $space_id
                     AND deleted_at IS NONE
@@ -787,7 +815,9 @@ impl WorkItemRepository {
     }
 
     /// Returns the most recently updated active work item of one kind,
-    /// including future runnable items. This lets event-driven maintenance
+    /// including future runnable items.
+    ///
+    /// This lets event-driven maintenance
     /// reuse the durable configuration carried by an existing managed chain.
     pub async fn find_latest_by_kind(
         &self,
@@ -819,7 +849,7 @@ impl WorkItemRepository {
 
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 &format!(
                     "SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE space_id = $space_id AND kind = $kind AND status != 'cancelled' AND status != 'failed' AND deleted_at IS NONE ORDER BY updated_at DESC, id DESC LIMIT 1"
                 ),
@@ -869,7 +899,7 @@ impl WorkItemRepository {
 
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 &format!(
                     "UPDATE work_item SET status = 'cancelled', last_error = 'superseded_by_graph_change', updated_at = time::now() WHERE space_id = $space_id AND kind = $kind AND id != $keep_id AND (status = 'runnable' OR status = 'pending') AND deleted_at IS NONE RETURN {WORK_ITEM_PROJECTION}"
                 ),
@@ -911,7 +941,7 @@ impl WorkItemRepository {
 
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 RUNNING_COUNT_QUERY,
                 crate::bindings! { "space_id" => space_id, "kind" => kind },
             )
@@ -946,7 +976,7 @@ impl WorkItemRepository {
                 .count());
         }
 
-        let mut response = self.client.query(RUNNABLE_COUNT_QUERY).await?;
+        let mut response = self.client.query_checked(RUNNABLE_COUNT_QUERY).await?;
         let rows: Vec<WorkCount> = response.take(0).map_err(|error| {
             StorageError::QueryError(format!("Failed to parse runnable work count: {error}"))
         })?;
@@ -994,6 +1024,11 @@ impl WorkItemRepository {
         mut record: WorkItem,
         expected_status: WorkItemStatus,
     ) -> StorageResult<Option<WorkItem>> {
+        if expected_status == WorkItemStatus::Running || record.status == WorkItemStatus::Running {
+            return Err(StorageError::Conflict(
+                "work_attempt_required: dependency promotion cannot claim or finish a lease".into(),
+            ));
+        }
         if let Some(store) = self.client.embedded_store() {
             return store
                 .mutate(|mutation| {
@@ -1088,65 +1123,16 @@ impl WorkItemRepository {
         worker_id: &str,
         lease_duration_secs: u64,
     ) -> StorageResult<bool> {
-        let lease_seconds = i64::try_from(lease_duration_secs).map_err(|err| {
-            StorageError::QueryError(format!(
-                "Invalid lease_duration_secs {lease_duration_secs}: {err}"
-            ))
-        })?;
-        let lease_duration = chrono::Duration::try_seconds(lease_seconds).ok_or_else(|| {
-            StorageError::QueryError(format!(
-                "Invalid lease_duration_secs {lease_duration_secs}: out of range"
-            ))
-        })?;
-        let lease_expires = chrono::Utc::now() + lease_duration;
-
-        if let Some(store) = self.client.embedded_store() {
-            return store
-                .mutate(|mutation| {
-                    let Some(mut item) = mutation.get::<WorkItem>(space_id, id, false)? else {
-                        return Ok(false);
-                    };
-
-                    let lease_available = item
-                        .lease_expires_at
-                        .is_none_or(|expires| expires < Utc::now());
-                    if !lease_available
-                        || !matches!(
-                            item.status,
-                            WorkItemStatus::Pending | WorkItemStatus::Runnable
-                        )
-                    {
-                        return Ok(false);
-                    }
-
-                    item.status = WorkItemStatus::Running;
-                    item.leased_by = Some(worker_id.to_string());
-                    item.lease_expires_at = Some(lease_expires);
-                    item.attempts = item.attempts.saturating_add(1);
-                    item.base.updated_at = Utc::now();
-                    let _ = mutation.replace(item)?;
-                    Ok(true)
-                })
-                .await;
-        }
-
-        let mut response = self
-            .client
-            .query_bind(
-                "UPDATE $id SET status = 'running', leased_by = $worker_id, lease_expires_at = $lease_expires, attempts = attempts + 1, updated_at = time::now() WHERE space_id = $space_id AND (status = 'pending' OR status = 'runnable') AND (IF lease_expires_at IS NONE THEN true ELSE type::datetime(lease_expires_at) < time::now() END) RETURN AFTER",
-                crate::bindings! {
-                    "id" => crate::surreal::thing_from_record_id(id),
-                    "space_id" => space_id,
-                    "worker_id" => worker_id,
-                    "lease_expires" => crate::surreal::datetime_from_chrono(lease_expires),
-                },
-            )
-            .await?;
-
-        let updated: Vec<WorkItemDb> = response.take(0).map_err(|e| {
-            StorageError::QueryError(format!("Failed to parse work_item lease update: {e}"))
-        })?;
-        Ok(!updated.is_empty())
+        let duration = i64::try_from(lease_duration_secs)
+            .ok()
+            .and_then(chrono::Duration::try_seconds)
+            .ok_or_else(|| {
+                StorageError::DataIntegrityError("Invalid lease duration".to_string())
+            })?;
+        Ok(self
+            .claim_with_lease(space_id, id, worker_id, Utc::now() + duration)
+            .await?
+            .is_some())
     }
 
     /// Extends a running work item's lease while preserving ownership.
@@ -1165,44 +1151,18 @@ impl WorkItemRepository {
         worker_id: &str,
         lease_expires: chrono::DateTime<Utc>,
     ) -> StorageResult<Option<WorkItem>> {
-        if let Some(store) = self.client.embedded_store() {
-            return store
-                .mutate(|mutation| {
-                    let Some(mut item) = mutation.get::<WorkItem>(space_id, id, false)? else {
-                        return Ok(None);
-                    };
-                    if item.status != WorkItemStatus::Running
-                        || item.leased_by.as_deref() != Some(worker_id)
-                    {
-                        return Ok(None);
-                    }
-                    item.lease_expires_at = Some(lease_expires);
-                    item.base.updated_at = Utc::now();
-                    Ok(Some(mutation.replace(item)?))
-                })
-                .await;
-        }
-
-        let mut response = self
-            .client
-            .query_bind(
-                "UPDATE $id SET lease_expires_at = $lease_expires, updated_at = time::now() WHERE space_id = $space_id AND status = 'running' AND leased_by = $worker_id RETURN AFTER",
-                crate::bindings! {
-                    "id" => crate::surreal::thing_from_record_id(id),
-                    "space_id" => space_id,
-                    "worker_id" => worker_id,
-                    "lease_expires" => crate::surreal::datetime_from_chrono(lease_expires),
-                },
-            )
-            .await?;
-        let updated: Vec<WorkItemDb> = response.take(0).map_err(|error| {
-            StorageError::QueryError(format!("Failed to parse work_item lease renewal: {error}"))
-        })?;
-        updated
-            .into_iter()
-            .next()
-            .map(WorkItem::try_from)
-            .transpose()
+        crate::work_attempt_repository::transition(
+            &self.client,
+            space_id,
+            id,
+            worker_id,
+            WorkItemStatus::Running,
+            Some(lease_expires),
+            None,
+            None,
+            false,
+        )
+        .await
     }
 
     /// Claims a work item with a lease using optimistic locking.
@@ -1220,55 +1180,60 @@ impl WorkItemRepository {
         worker_id: &str,
         lease_expires: chrono::DateTime<chrono::Utc>,
     ) -> StorageResult<Option<WorkItem>> {
-        if let Some(store) = self.client.embedded_store() {
-            return store
-                .mutate(|mutation| {
-                    let Some(mut item) = mutation.get::<WorkItem>(space_id, id, false)? else {
-                        return Ok(None);
-                    };
-                    if item.status != WorkItemStatus::Runnable {
-                        return Ok(None);
-                    }
+        crate::work_attempt_repository::claim(&self.client, space_id, id, worker_id, lease_expires)
+            .await
+    }
 
-                    item.status = WorkItemStatus::Running;
-                    item.leased_by = Some(worker_id.to_string());
-                    item.lease_expires_at = Some(lease_expires);
-                    item.attempts = item.attempts.saturating_add(1);
-                    item.base.updated_at = Utc::now();
-                    Ok(Some(mutation.replace(item)?))
-                })
-                .await;
+    /// Claim only the exact work envelope already authorized by the caller.
+    ///
+    /// # Errors
+    /// Propagates storage errors; changed authority or unavailable work returns None.
+    pub async fn claim_authorized(
+        &self,
+        observed: &WorkItem,
+        worker: &str,
+        expires: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Option<WorkItem>> {
+        crate::work_attempt_repository::claim_observed(
+            &self.client,
+            &observed.base.space_id,
+            &observed.base.id,
+            worker,
+            expires,
+            Some(observed),
+        )
+        .await
+    }
+
+    /// Finish the authorized observed envelope with the caller's original token.
+    ///
+    /// # Errors
+    /// Rejects nonterminal outcomes; changed authority or lost lease returns None.
+    pub async fn finish_authorized(
+        &self,
+        observed: &WorkItem,
+        original_token: &str,
+        status: WorkItemStatus,
+        error: Option<String>,
+    ) -> StorageResult<Option<WorkItem>> {
+        if !matches!(status, WorkItemStatus::Done | WorkItemStatus::Failed) {
+            return Err(StorageError::DataIntegrityError(
+                "Authorized completion requires a terminal work outcome".into(),
+            ));
         }
-
-        // Atomic conditional update: only update if status is runnable
-        let mut response = self
-            .client
-            .query_bind(
-                "UPDATE $id SET status = 'running', leased_by = $worker_id, lease_expires_at = $lease_expires, attempts = attempts + 1, updated_at = time::now() WHERE space_id = $space_id AND status = 'runnable' RETURN AFTER",
-                crate::bindings! {
-                    "id" => crate::surreal::thing_from_record_id(id),
-                    "space_id" => space_id,
-                    "worker_id" => worker_id,
-                    "lease_expires" => crate::surreal::datetime_from_chrono(lease_expires),
-                },
-            )
-            .await?;
-
-        // Try to parse the updated item
-        let items: Vec<WorkItemDb> = response.take(0).map_err(|e| {
-            StorageError::QueryError(format!("Failed to parse work_item claim: {e}"))
-        })?;
-
-        if items.is_empty() {
-            // No item was updated - either doesn't exist, wrong space, or already claimed
-            Ok(None)
-        } else {
-            // Item was successfully claimed
-            let item_db = items.into_iter().next().ok_or_else(|| {
-                StorageError::QueryError("Empty result after successful update".to_string())
-            })?;
-            Ok(Some(WorkItem::try_from(item_db)?))
-        }
+        crate::work_attempt_repository::transition_observed(
+            &self.client,
+            &observed.base.space_id,
+            &observed.base.id,
+            original_token,
+            status,
+            None,
+            None,
+            error,
+            false,
+            Some(observed),
+        )
+        .await
     }
 
     /// Updates a running work item owned by the worker, clearing its lease.
@@ -1282,54 +1247,18 @@ impl WorkItemRepository {
         status: WorkItemStatus,
         last_error: Option<String>,
     ) -> StorageResult<Option<WorkItem>> {
-        if let Some(store) = self.client.embedded_store() {
-            return store
-                .mutate(|mutation| {
-                    let Some(mut item) = mutation.get::<WorkItem>(space_id, id, false)? else {
-                        return Ok(None);
-                    };
-                    if item.status != WorkItemStatus::Running
-                        || item.leased_by.as_deref() != Some(worker_id)
-                    {
-                        return Ok(None);
-                    }
-
-                    item.status = status;
-                    item.leased_by = None;
-                    item.lease_expires_at = None;
-                    item.last_error = last_error;
-                    item.base.updated_at = Utc::now();
-                    Ok(Some(mutation.replace(item)?))
-                })
-                .await;
-        }
-
-        let mut response = self
-            .client
-            .query_bind(
-                "UPDATE $id SET status = $status, leased_by = NONE, lease_expires_at = NONE, last_error = $last_error, updated_at = time::now() WHERE space_id = $space_id AND status = 'running' AND leased_by = $worker_id RETURN AFTER",
-                crate::bindings! {
-                    "id" => crate::surreal::thing_from_record_id(id),
-                    "space_id" => space_id,
-                    "worker_id" => worker_id,
-                    "status" => status.to_string(),
-                    "last_error" => last_error,
-                },
-            )
-            .await?;
-
-        let items: Vec<WorkItemDb> = response.take(0).map_err(|e| {
-            StorageError::QueryError(format!("Failed to parse work_item update: {e}"))
-        })?;
-        if items.is_empty() {
-            return Ok(None);
-        }
-
-        let item_db = items.into_iter().next().ok_or_else(|| {
-            StorageError::QueryError("Empty result after successful update".to_string())
-        })?;
-
-        Ok(Some(WorkItem::try_from(item_db)?))
+        crate::work_attempt_repository::transition(
+            &self.client,
+            space_id,
+            id,
+            worker_id,
+            status,
+            None,
+            None,
+            last_error,
+            false,
+        )
+        .await
     }
 
     /// Requeues a running work item with a delay, clearing its lease.
@@ -1343,112 +1272,128 @@ impl WorkItemRepository {
         delay_secs: i64,
         last_error: Option<String>,
     ) -> StorageResult<Option<WorkItem>> {
-        if let Some(store) = self.client.embedded_store() {
-            let delay = chrono::Duration::try_seconds(delay_secs).ok_or_else(|| {
-                StorageError::QueryError(format!("Invalid delay_secs {delay_secs}"))
-            })?;
-            return store
-                .mutate(|mutation| {
-                    let Some(mut item) = mutation.get::<WorkItem>(space_id, id, false)? else {
-                        return Ok(None);
-                    };
-                    if item.status != WorkItemStatus::Running
-                        || item.leased_by.as_deref() != Some(worker_id)
-                    {
-                        return Ok(None);
-                    }
-
-                    item.status = WorkItemStatus::Runnable;
-                    item.leased_by = None;
-                    item.lease_expires_at = None;
-                    item.run_after = Some(Utc::now() + delay);
-                    item.last_error = last_error;
-                    item.base.updated_at = Utc::now();
-                    Ok(Some(mutation.replace(item)?))
-                })
-                .await;
-        }
-
-        let mut response = self
-            .client
-            .query_bind(
-                "UPDATE $id SET status = 'runnable', leased_by = NONE, lease_expires_at = NONE, run_after = time::now() + $delay_duration, last_error = $last_error, updated_at = time::now() WHERE space_id = $space_id AND status = 'running' AND leased_by = $worker_id RETURN AFTER",
-                crate::bindings! {
-                    "id" => crate::surreal::thing_from_record_id(id),
-                    "space_id" => space_id,
-                    "worker_id" => worker_id,
-                    "delay_duration" => surrealdb::sql::Duration::from_secs(u64::try_from(delay_secs).unwrap_or(0)),
-                    "last_error" => last_error,
-                },
-            )
-            .await?;
-
-        let items: Vec<WorkItemDb> = response.take(0).map_err(|e| {
-            StorageError::QueryError(format!("Failed to parse work_item requeue: {e}"))
+        let delay = chrono::Duration::try_seconds(delay_secs.max(0)).ok_or_else(|| {
+            StorageError::DataIntegrityError(format!("Invalid retry delay: {delay_secs}"))
         })?;
-        if items.is_empty() {
-            return Ok(None);
-        }
-
-        let item_db = items.into_iter().next().ok_or_else(|| {
-            StorageError::QueryError("Empty result after successful update".to_string())
-        })?;
-
-        Ok(Some(WorkItem::try_from(item_db)?))
+        crate::work_attempt_repository::transition(
+            &self.client,
+            space_id,
+            id,
+            worker_id,
+            WorkItemStatus::Runnable,
+            None,
+            Some(Utc::now() + delay),
+            last_error,
+            false,
+        )
+        .await
     }
 
-    /// Force-completes a work item regardless of lease ownership.
-    ///
-    /// Used when a worker legitimately completed work but lost its lease
-    /// (e.g. due to an expired-lease sweep). Only transitions from runnable state
-    /// to avoid conflicting with items actively being worked on.
-    pub async fn force_complete(
+    /// Recoverable configuration failures do not consume the transient retry
+    /// allowance. The durable attempt generation remains monotonic.
+    pub async fn requeue_configuration_blocked(
         &self,
         space_id: &str,
         id: &RecordId,
+        token: &str,
+        delay_secs: i64,
+        message: String,
     ) -> StorageResult<Option<WorkItem>> {
+        let delay = chrono::Duration::try_seconds(delay_secs.clamp(30, 3600)).ok_or_else(|| {
+            StorageError::DataIntegrityError("Invalid configuration retry delay".to_string())
+        })?;
+        self.requeue_without_attempt_charge(
+            space_id,
+            id,
+            token,
+            delay,
+            format!("configuration_blocked: {message}"),
+        )
+        .await
+    }
+
+    /// Rechecks unfinished local prerequisites without charging a provider retry.
+    ///
+    /// The original live attempt must own the transition. Dependency polling has
+    /// a one-second floor, independent of configuration-repair backoff.
+    pub async fn requeue_pending_dependencies(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        token: &str,
+        delay_secs: i64,
+        message: String,
+    ) -> StorageResult<Option<WorkItem>> {
+        let delay = chrono::Duration::try_seconds(delay_secs.clamp(1, 3600)).ok_or_else(|| {
+            StorageError::DataIntegrityError("Invalid dependency retry delay".to_string())
+        })?;
+        self.requeue_without_attempt_charge(
+            space_id,
+            id,
+            token,
+            delay,
+            format!("pending_dependencies: {message}"),
+        )
+        .await
+    }
+
+    async fn requeue_without_attempt_charge(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+        token: &str,
+        delay: chrono::Duration,
+        message: String,
+    ) -> StorageResult<Option<WorkItem>> {
+        crate::work_attempt_repository::transition(
+            &self.client,
+            space_id,
+            id,
+            token,
+            WorkItemStatus::Runnable,
+            None,
+            Some(Utc::now() + delay),
+            Some(message),
+            true,
+        )
+        .await
+    }
+
+    /// Atomically releases every expired Running lease, independent of space
+    /// activity. Missing expiry is malformed ownership and is recoverable too.
+    pub async fn recover_expired_leases_all_spaces(&self) -> StorageResult<usize> {
         if let Some(store) = self.client.embedded_store() {
             return store
                 .mutate(|mutation| {
-                    let Some(mut item) = mutation.get::<WorkItem>(space_id, id, false)? else {
-                        return Ok(None);
-                    };
-                    if item.status != WorkItemStatus::Runnable {
-                        return Ok(None);
+                    let now = Utc::now();
+                    let mut recovered = 0;
+                    for item in mutation.scan::<WorkItem>()? {
+                        if item.base.deleted_at.is_some()
+                            || item.status != WorkItemStatus::Running
+                            || item.lease_expires_at.is_some_and(|expiry| expiry > now)
+                        {
+                            continue;
+                        }
+                        crate::work_attempt_repository::recover_embedded(mutation, item, now)?;
+                        recovered += 1;
                     }
-
-                    item.status = WorkItemStatus::Done;
-                    item.leased_by = None;
-                    item.lease_expires_at = None;
-                    item.base.updated_at = Utc::now();
-                    Ok(Some(mutation.replace(item)?))
+                    Ok(recovered)
                 })
                 .await;
         }
-
-        let mut response = self
-            .client
-            .query_bind(
-                "UPDATE $id SET status = 'done', leased_by = NONE, lease_expires_at = NONE, updated_at = time::now() WHERE space_id = $space_id AND status = 'runnable' RETURN AFTER",
-                crate::bindings! {
-                    "id" => crate::surreal::thing_from_record_id(id),
-                    "space_id" => space_id,
-                },
-            )
-            .await?;
-
-        let items: Vec<WorkItemDb> = response.take(0).map_err(|e| {
-            StorageError::QueryError(format!("Failed to parse work_item force complete: {e}"))
-        })?;
-        if items.is_empty() {
-            return Ok(None);
-        }
-
-        let item_db = items.into_iter().next().ok_or_else(|| {
-            StorageError::QueryError("Empty result after successful update".to_string())
-        })?;
-
-        Ok(Some(WorkItem::try_from(item_db)?))
+        let mut response = self.client.query_checked(
+            "BEGIN TRANSACTION;
+             LET $expired = SELECT VALUE id FROM work_item WHERE status = 'running' AND deleted_at IS NONE AND array::any([lease_expires_at IS NONE, lease_expires_at <= time::now()]);
+             UPDATE work_attempt SET status = 'runnable', lease_expires_at = NONE WHERE work_item_id IN $expired;
+             UPDATE $expired SET status = 'runnable', leased_by = NONE, lease_expires_at = NONE, last_error = 'lease_expired: recovered abandoned attempt', updated_at = time::now();
+             RETURN $expired; COMMIT TRANSACTION;"
+        ).await?;
+        let recovered: Vec<surrealdb::sql::Thing> = response
+            .take(response.num_statements() - 1)
+            .map_err(|error| {
+                StorageError::DataIntegrityError(format!("Invalid lease recovery result: {error}"))
+            })?;
+        Ok(recovered.len())
     }
 
     /// Releases an expired lease, returning the item to runnable state.
@@ -1462,37 +1407,41 @@ impl WorkItemRepository {
         if let Some(store) = self.client.embedded_store() {
             return store
                 .mutate(|mutation| {
-                    let Some(mut item) = mutation.get::<WorkItem>(space_id, id, false)? else {
+                    let Some(item) = mutation.get::<WorkItem>(space_id, id, false)? else {
                         return Ok(None);
                     };
                     let lease_expired = item
                         .lease_expires_at
-                        .is_some_and(|expires| expires < Utc::now());
+                        .is_none_or(|expires| expires <= Utc::now());
                     if item.status != WorkItemStatus::Running || !lease_expired {
                         return Ok(None);
                     }
 
-                    item.status = WorkItemStatus::Runnable;
-                    item.leased_by = None;
-                    item.lease_expires_at = None;
-                    item.base.updated_at = Utc::now();
-                    Ok(Some(mutation.replace(item)?))
+                    Ok(Some(crate::work_attempt_repository::recover_embedded(
+                        mutation,
+                        item,
+                        Utc::now(),
+                    )?))
                 })
                 .await;
         }
 
         let mut response = self
             .client
-            .query_bind(
-                "UPDATE $id SET status = 'runnable', leased_by = NONE, lease_expires_at = NONE, updated_at = time::now() WHERE space_id = $space_id AND status = 'running' AND (IF lease_expires_at IS NONE THEN false ELSE type::datetime(lease_expires_at) < time::now() END) RETURN AFTER",
+            .query_bind_checked(
+                &format!("BEGIN TRANSACTION;
+                LET $updated = UPDATE $id SET status = 'runnable', leased_by = NONE, lease_expires_at = NONE, updated_at = time::now() WHERE space_id = $space_id AND status = 'running' AND deleted_at IS NONE AND array::any([lease_expires_at IS NONE, lease_expires_at <= time::now()]) RETURN {WORK_ITEM_PROJECTION};
+                IF array::len($updated) > 0 {{ UPDATE $attempt_id SET status = 'runnable', lease_expires_at = NONE; }};
+                RETURN $updated; COMMIT TRANSACTION;"),
                 crate::bindings! {
                     "id" => crate::surreal::thing_from_record_id(id),
                     "space_id" => space_id,
+                    "attempt_id" => crate::work_attempt_repository::attempt_id(id),
                 },
             )
             .await?;
 
-        let items: Vec<WorkItemDb> = response.take(0).map_err(|e| {
+        let items: Vec<WorkItemDb> = response.take(response.num_statements() - 1).map_err(|e| {
             StorageError::QueryError(format!("Failed to parse work_item lease release: {e}"))
         })?;
         if items.is_empty() {
@@ -1591,8 +1540,8 @@ mod tests {
         };
         let client = StorageClient::new(config).await.unwrap();
 
-        client.query(WORK_ITEM_SCHEMA).await.unwrap();
-        client.query(WORK_EDGE_SCHEMA).await.unwrap();
+        client.query_checked(WORK_ITEM_SCHEMA).await.unwrap();
+        client.query_checked(WORK_EDGE_SCHEMA).await.unwrap();
 
         client
     }
@@ -1678,6 +1627,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_work_item() {
         let repo = setup_test_repo().await;
         let item = create_test_work_item("extract");
@@ -1689,6 +1642,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_work_item() {
         let repo = setup_test_repo().await;
         let item = create_test_work_item("embed");
@@ -1765,6 +1722,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_work_item_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_work_item("promote");
@@ -1783,6 +1744,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_if_status_enforces_expected_status() {
         let repo = setup_test_repo().await;
         let item = create_test_work_item("transition");
@@ -1816,6 +1781,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_if_status_uses_target_id_not_payload_id() {
         let repo = setup_test_repo().await;
         let target = repo
@@ -1859,20 +1828,31 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_requeue_with_delay() {
         let repo = setup_test_repo().await;
         let mut item = create_test_work_item("requeue");
-        item.status = WorkItemStatus::Running;
-        item.leased_by = Some("worker-1".to_string());
-        item.lease_expires_at = Some(Utc::now() + chrono::Duration::seconds(60));
-
+        item.status = WorkItemStatus::Runnable;
         let created = repo.create(item).await.expect("create");
-
+        let claimed = repo
+            .claim_with_lease(
+                "test_space",
+                &created.base.id,
+                "worker-1",
+                Utc::now() + chrono::Duration::seconds(60),
+            )
+            .await
+            .expect("claim")
+            .expect("claimed");
+        let token = claimed.leased_by.as_deref().expect("token");
         let updated = repo
             .requeue_with_delay(
                 "test_space",
                 &created.base.id,
-                "worker-1",
+                token,
                 30,
                 Some("queued".to_string()),
             )
@@ -1886,6 +1866,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_release_expired_lease_does_not_release_unexpired_lease() {
         let repo = setup_test_repo().await;
         let mut item = create_test_work_item("lease");
@@ -1910,28 +1894,42 @@ mod tests {
             .expect("get")
             .expect("work item");
         assert_eq!(fetched.status, WorkItemStatus::Running);
-        assert_eq!(fetched.leased_by.as_deref(), Some("worker-1"));
+        assert!(fetched
+            .leased_by
+            .as_deref()
+            .is_some_and(|token| token.starts_with("worker-1:")));
         assert!(fetched.lease_expires_at.is_some());
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_renew_lease_preserves_worker_ownership() {
         let repo = setup_test_repo().await;
         let mut item = create_test_work_item("renew-lease");
         item.status = WorkItemStatus::Runnable;
         let created = repo.create(item).await.expect("create");
-        assert!(repo
-            .acquire_lease("test_space", &created.base.id, "worker-1", 60)
+        let claimed = repo
+            .claim_with_lease(
+                "test_space",
+                &created.base.id,
+                "worker-1",
+                Utc::now() + chrono::Duration::seconds(60),
+            )
             .await
-            .expect("acquire lease"));
+            .expect("claim")
+            .expect("claimed");
+        let token = claimed.leased_by.as_deref().expect("token");
 
         let extended_until = Utc::now() + chrono::Duration::hours(4);
         let renewed = repo
-            .renew_lease("test_space", &created.base.id, "worker-1", extended_until)
+            .renew_lease("test_space", &created.base.id, token, extended_until)
             .await
             .expect("renew lease")
             .expect("owned running item");
-        assert_eq!(renewed.leased_by.as_deref(), Some("worker-1"));
+        assert_eq!(renewed.leased_by.as_deref(), Some(token));
         assert_eq!(renewed.lease_expires_at, Some(extended_until));
 
         let rejected = repo
@@ -1942,6 +1940,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_runnable_excludes_future_run_after() {
         let repo = setup_test_repo().await;
 
@@ -1965,6 +1967,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_find_by_status_limited_uses_status_filter() {
         let repo = setup_embedded_test_repo().await;
 
@@ -1989,6 +1995,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_find_by_status_and_kind_excludes_delayed_runnable_items() {
         let repo = setup_embedded_test_repo().await;
 
@@ -2017,6 +2027,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_latest_by_kind_includes_future_managed_work() {
         let repo = setup_embedded_test_repo().await;
         let mut future = create_test_work_item("managed");
@@ -2033,6 +2047,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_cancel_queued_by_kind_except_preserves_replacement_and_running_work() {
         let repo = setup_embedded_test_repo().await;
         let mut old = create_test_work_item("managed");
@@ -2077,6 +2095,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_runnable_all_spaces_does_not_truncate_ready_items_behind_delayed_ones() {
         let repo = setup_test_repo().await;
 
@@ -2102,6 +2124,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_claim_with_lease_ignores_stale_lease_fields_on_runnable_item() {
         let repo = setup_test_repo().await;
 
@@ -2123,7 +2149,311 @@ mod tests {
             .expect("runnable item should be claimable");
 
         assert_eq!(claimed.status, WorkItemStatus::Running);
-        assert_eq!(claimed.leased_by.as_deref(), Some("worker-1"));
+        assert!(claimed
+            .leased_by
+            .as_deref()
+            .is_some_and(|token| token.starts_with("worker-1:")));
         assert_eq!(claimed.attempts, 1);
     }
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
+    async fn generic_updates_cannot_replace_attempt_authority(client: StorageClient) {
+        let repo = WorkItemRepository::new(client);
+        let mut item = create_test_work_item("authority-boundary");
+        item.status = WorkItemStatus::Runnable;
+        let item = repo.create(item).await.expect("create");
+        let mut forged = item.clone();
+        forged.status = WorkItemStatus::Running;
+        assert!(repo
+            .update("test_space", &item.base.id, forged.clone())
+            .await
+            .is_err());
+        assert!(repo
+            .update_if_status_and_dependencies_done(
+                "test_space",
+                &item.base.id,
+                forged,
+                WorkItemStatus::Runnable
+            )
+            .await
+            .is_err());
+        let claimed = repo
+            .claim_with_lease(
+                "test_space",
+                &item.base.id,
+                "worker",
+                Utc::now() + chrono::Duration::minutes(5),
+            )
+            .await
+            .expect("claim")
+            .expect("runnable");
+        let attempt =
+            crate::work_attempt_repository::fence_from_claim(&claimed).expect("authority");
+        let mut forged_done = claimed.clone();
+        forged_done.status = WorkItemStatus::Done;
+        assert!(repo
+            .update("test_space", &item.base.id, forged_done.clone())
+            .await
+            .is_err());
+        assert!(repo
+            .update_if_status(
+                "test_space",
+                &item.base.id,
+                forged_done.clone(),
+                WorkItemStatus::Running
+            )
+            .await
+            .is_err());
+        assert!(repo
+            .update_if_status_and_dependencies_done(
+                "test_space",
+                &item.base.id,
+                forged_done,
+                WorkItemStatus::Running
+            )
+            .await
+            .is_err());
+        let untouched = repo
+            .get("test_space", &item.base.id)
+            .await
+            .expect("lookup")
+            .expect("live");
+        assert_eq!(untouched.status, WorkItemStatus::Running);
+        assert_eq!(
+            crate::work_attempt_repository::fence_from_claim(&untouched).expect("fence"),
+            attempt
+        );
+        let completed = repo
+            .update_running_for_worker(
+                "test_space",
+                &item.base.id,
+                &attempt.lease_token,
+                WorkItemStatus::Done,
+                None,
+            )
+            .await
+            .expect("finish")
+            .expect("owned");
+        assert_eq!(completed.status, WorkItemStatus::Done);
+    }
+
+    async fn requeue_cadence(
+        repo: &WorkItemRepository,
+        id: &RecordId,
+        token: &str,
+        dependency: bool,
+        seconds: i64,
+    ) -> StorageResult<Option<WorkItem>> {
+        if dependency {
+            repo.requeue_pending_dependencies(
+                "test_space",
+                id,
+                token,
+                seconds,
+                "original prerequisite".into(),
+            )
+            .await
+        } else {
+            repo.requeue_configuration_blocked(
+                "test_space",
+                id,
+                token,
+                seconds,
+                "original prerequisite".into(),
+            )
+            .await
+        }
+    }
+
+    async fn charged_cadence_claim(repo: &WorkItemRepository, kind: &str) -> WorkItem {
+        let mut item = create_test_work_item(kind);
+        item.status = WorkItemStatus::Runnable;
+        let original = repo.create(item).await.expect("create original work");
+        // Retain two actual charged attempts. A local wait refunds only its
+        // own unused attempt, not prior execution or claim generations.
+        for _ in 0..2 {
+            let claim = repo
+                .claim_with_lease(
+                    "test_space",
+                    &original.base.id,
+                    "cadence-worker",
+                    Utc::now() + chrono::Duration::minutes(5),
+                )
+                .await
+                .expect("claim")
+                .expect("runnable original");
+            repo.requeue_with_delay(
+                "test_space",
+                &original.base.id,
+                claim.leased_by.as_deref().expect("original token"),
+                0,
+                None,
+            )
+            .await
+            .expect("charged retry")
+            .expect("owned original");
+        }
+        repo.claim_with_lease(
+            "test_space",
+            &original.base.id,
+            "cadence-worker",
+            Utc::now() + chrono::Duration::minutes(5),
+        )
+        .await
+        .expect("claim local wait")
+        .expect("owned original")
+    }
+
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
+    async fn persisted_retry_cadence_contract(client: StorageClient, dependency: bool) {
+        let repo = WorkItemRepository::new(client);
+        let cases = if dependency {
+            [(i64::MIN, 1), (5, 5), (i64::MAX, 3600)]
+        } else {
+            [(i64::MIN, 30), (5, 30), (i64::MAX, 3600)]
+        };
+        for (requested, expected) in cases {
+            let claim =
+                charged_cadence_claim(&repo, &format!("cadence-{dependency}-{requested}")).await;
+            let fence = crate::work_attempt_repository::fence_from_claim(&claim)
+                .expect("original durable fence");
+            assert_eq!(claim.attempts, 3);
+            assert_eq!(fence.generation, 3);
+            assert!(requeue_cadence(
+                &repo,
+                &claim.base.id,
+                "foreign-token",
+                dependency,
+                requested
+            )
+            .await
+            .expect("foreign owner refused")
+            .is_none());
+            assert_eq!(
+                repo.get("test_space", &claim.base.id).await.expect("read"),
+                Some(claim.clone())
+            );
+
+            let before = Utc::now();
+            let requeued = requeue_cadence(
+                &repo,
+                &claim.base.id,
+                &fence.lease_token,
+                dependency,
+                requested,
+            )
+            .await
+            .expect("persist original delay")
+            .expect("original attempt transitioned");
+            let after = Utc::now();
+            let due = requeued.run_after.expect("persisted deadline");
+            assert!(due >= before + chrono::Duration::seconds(expected));
+            assert!(due <= after + chrono::Duration::seconds(expected));
+            let prefix = if dependency {
+                "pending_dependencies"
+            } else {
+                "configuration_blocked"
+            };
+            let mut expected_item = claim.clone();
+            expected_item.status = WorkItemStatus::Runnable;
+            expected_item.attempts = 2;
+            expected_item.leased_by = None;
+            expected_item.lease_expires_at = None;
+            expected_item.run_after = Some(due);
+            expected_item.last_error = Some(format!("{prefix}: original prerequisite"));
+            expected_item.base.updated_at = requeued.base.updated_at;
+            assert_eq!(
+                requeued, expected_item,
+                "no work input or durable claim envelope changed"
+            );
+            assert_eq!(
+                repo.get("test_space", &claim.base.id)
+                    .await
+                    .expect("persisted read"),
+                Some(requeued.clone())
+            );
+            assert!(requeue_cadence(
+                &repo,
+                &claim.base.id,
+                &fence.lease_token,
+                dependency,
+                requested
+            )
+            .await
+            .expect("retired owner refused")
+            .is_none());
+            assert_eq!(
+                repo.get("test_space", &claim.base.id)
+                    .await
+                    .expect("unchanged read"),
+                Some(requeued)
+            );
+            if expected == 3600 {
+                assert!(repo
+                    .claim_with_lease(
+                        "test_space",
+                        &claim.base.id,
+                        "premature-worker",
+                        Utc::now() + chrono::Duration::minutes(5),
+                    )
+                    .await
+                    .expect("future work stays deferred")
+                    .is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_pending_dependencies_keep_short_cadence_and_attempt_fence() {
+        persisted_retry_cadence_contract(
+            StorageClient::new_embedded().await.expect("embedded"),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn surreal_pending_dependencies_keep_short_cadence_and_attempt_fence() {
+        persisted_retry_cadence_contract(StorageClient::new_memory().await.expect("memory"), true)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn embedded_configuration_backoff_keeps_floor_and_attempt_fence() {
+        persisted_retry_cadence_contract(
+            StorageClient::new_embedded().await.expect("embedded"),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn surreal_configuration_backoff_keeps_floor_and_attempt_fence() {
+        persisted_retry_cadence_contract(StorageClient::new_memory().await.expect("memory"), false)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn embedded_generic_updates_cannot_replace_attempt_authority() {
+        generic_updates_cannot_replace_attempt_authority(
+            StorageClient::new_embedded().await.unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn surreal_generic_updates_cannot_replace_attempt_authority() {
+        generic_updates_cannot_replace_attempt_authority(
+            StorageClient::new_memory().await.unwrap(),
+        )
+        .await;
+    }
 }
+
+#[path = "standing_watch_queue.rs"]
+mod standing_watch_queue;

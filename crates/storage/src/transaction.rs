@@ -174,6 +174,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."
+    )]
     async fn test_transaction_builder_single_statement() -> Result<(), Box<dyn std::error::Error>> {
         let client = StorageClient::new(StorageConfig::default()).await?;
 
@@ -219,6 +223,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."
+    )]
     async fn test_transaction_add_statements_iterator() -> Result<(), Box<dyn std::error::Error>> {
         let client = StorageClient::new(StorageConfig::default()).await?;
 

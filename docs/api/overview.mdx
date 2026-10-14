@@ -13,6 +13,7 @@ Use the HTTP API from application code and scripts. For a first integration:
 
 | Task | Reference |
 | --- | --- |
+| Synchronize source revisions | [Versioned source lifecycle](/api/sources#versioned-source-ingestion) |
 | Ingest and inspect evidence | [Documents](/api/documents), [Sources](/api/sources) |
 | Read or edit the graph | [Entities](/api/entities), [Relationships](/api/relationships) |
 | Inspect claims and vocabulary | [Assertions](/api/assertions), [Predicates](/api/predicates) |
@@ -51,9 +52,16 @@ does not grant access. Configured issuer and audience restrictions also apply.
 |---|---|
 | `sub` | Principal subject identifier |
 | `exp` | Expiration time as a Unix timestamp in seconds |
-| `space_id` | Tenant space the token is scoped to |
+| `space_id` | Explicit single-space selection when signed |
+| `spaces` | Authorized multi-space ceiling; requests still select one space |
 | `scopes` | Array of permission scopes (e.g., `read:entity`, `write:doc`) |
 | `clearances` | ABAC policy clearances for the principal |
+
+Issue credentials with the local `service-token` CLI and create current local
+service grants separately. Path-selected space and `X-Space-Id` must agree;
+MCP and operation polling use the header. A signed multi-space ceiling does not
+select a default or override a revoked grant. Global management tokens cannot
+perform ordinary data access. See [service setup](/operations/service-setup).
 
 <Note>
   In development mode, set the environment variable `SKIP_AUTH=true` to bypass JWT validation entirely. Never use this in production.
@@ -78,7 +86,13 @@ Most REST data responses return JSON; SSE and no-content responses are exception
 
 ## Error Responses
 
-Resource handlers use a structured JSON error body:
+The versioned source and scoped-search APIs use
+`{error_code, message, retryable}`. Handle codes such as `conflict_generation`,
+`not_ready`, `unknown_space`, `provider_unapproved` and `payload_too_large`;
+retryability does not reconcile a stale generation on the caller's behalf.
+
+Retained resource handlers use the structured JSON body below:
+
 
 ```json
 {

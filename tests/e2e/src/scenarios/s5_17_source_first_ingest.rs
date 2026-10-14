@@ -48,6 +48,7 @@ fn test_principal(space_id: &str) -> Principal {
 #[tokio::test]
 async fn scenario_s5_17_source_first_ingest() -> anyhow::Result<()> {
     let harness = Harness::new().await?;
+    super::register_scenario_space(&harness.client, "default").await?;
     let dispatcher = create_dispatcher(harness.client.clone(), test_principal("default"));
     let doc = Doc {
         base: BaseFieldsBuilder::new("default")

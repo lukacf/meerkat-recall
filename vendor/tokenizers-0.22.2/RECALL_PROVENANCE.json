@@ -1,0 +1,25 @@
+{
+  "name": "tokenizers",
+  "version": "0.22.2",
+  "archive_url": "https://static.crates.io/crates/tokenizers/tokenizers-0.22.2.crate",
+  "metadata_url": "https://crates.io/api/v1/crates/tokenizers/0.22.2",
+  "archive_sha256": "b238e22d44a15349529690fb07bd645cf58149a1b1e44d6cb5bd1641ff1a6223",
+  "archive_bytes": 186345,
+  "license": "Apache-2.0",
+  "upstream_vcs": {
+    "git": {
+      "sha1": "6573f2c56172bac56f211e77934be3215adef2c2"
+    },
+    "path_in_vcs": "tokenizers"
+  },
+  "license_file_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+  "modified_files": [
+    "Cargo.toml"
+  ],
+  "modifications": [
+    "Use maintained pastey =0.2.3 under the existing paste import name.",
+    "Require macro_rules_attribute >=0.2.3, whose release replaces paste with pastey."
+  ],
+  "rust_source_changed": false,
+  "upstream_features_changed": false
+}

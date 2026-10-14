@@ -1,0 +1,1074 @@
+{
+  "format": "recall-qualification-binding-draft/v1",
+  "status": "unapproved-not-applied",
+  "live_ready": false,
+  "proposal_sha256": "2745c63cd9826ddcb702565d1c0d97cac86056fda465525f2f07a12da879cc12",
+  "source_contracts": [
+    "crates/types/src/provider_binding.rs",
+    "crates/embeddings/src/governed.rs",
+    "tests/recall_preview_semantics/gateway/policy.py"
+  ],
+  "gateway_bindings": [
+    {
+      "id": "surreal_db_household_embedding",
+      "backend": "surreal-db",
+      "space": "semantics-household",
+      "operation": "embedding",
+      "model": "text-embedding-3-small",
+      "connection_id": "qualification-surreal-db-household-embedding",
+      "profile_id": "qualification-surreal-db-household-embedding-profile-v1",
+      "dimensions": 1536
+    },
+    {
+      "id": "surreal_db_household_extraction",
+      "backend": "surreal-db",
+      "space": "semantics-household",
+      "operation": "extraction",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-surreal-db-household-extraction",
+      "profile_id": "qualification-surreal-db-household-extraction-profile-v1"
+    },
+    {
+      "id": "surreal_db_household_support_verification",
+      "backend": "surreal-db",
+      "space": "semantics-household",
+      "operation": "support_verification",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-surreal-db-household-support-verification",
+      "profile_id": "qualification-surreal-db-household-support-verification-profile-v1"
+    },
+    {
+      "id": "surreal_db_household_summary",
+      "backend": "surreal-db",
+      "space": "semantics-household",
+      "operation": "summary",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-surreal-db-household-summary",
+      "profile_id": "qualification-surreal-db-household-summary-profile-v1"
+    },
+    {
+      "id": "surreal_db_household_promotion_and_identity_disambiguation",
+      "backend": "surreal-db",
+      "space": "semantics-household",
+      "operation": "promotion_and_identity_disambiguation",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-surreal-db-household-promotion-and-identity-disambiguation",
+      "profile_id": "qualification-surreal-db-household-promotion-and-identity-disambiguation-profile-v1"
+    },
+    {
+      "id": "surreal_db_household_truth_maintenance",
+      "backend": "surreal-db",
+      "space": "semantics-household",
+      "operation": "truth_maintenance",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-surreal-db-household-truth-maintenance",
+      "profile_id": "qualification-surreal-db-household-truth-maintenance-profile-v1"
+    },
+    {
+      "id": "surreal_db_household_wiki_planner_writer_verifier",
+      "backend": "surreal-db",
+      "space": "semantics-household",
+      "operation": "wiki_planner_writer_verifier",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-surreal-db-household-wiki-planner-writer-verifier",
+      "profile_id": "qualification-surreal-db-household-wiki-planner-writer-verifier-profile-v1"
+    },
+    {
+      "id": "surreal_db_business_embedding",
+      "backend": "surreal-db",
+      "space": "semantics-business",
+      "operation": "embedding",
+      "model": "text-embedding-3-large",
+      "connection_id": "qualification-surreal-db-business-embedding",
+      "profile_id": "qualification-surreal-db-business-embedding-profile-v1",
+      "dimensions": 3072
+    },
+    {
+      "id": "surreal_db_business_extraction",
+      "backend": "surreal-db",
+      "space": "semantics-business",
+      "operation": "extraction",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-surreal-db-business-extraction",
+      "profile_id": "qualification-surreal-db-business-extraction-profile-v1"
+    },
+    {
+      "id": "surreal_db_business_support_verification",
+      "backend": "surreal-db",
+      "space": "semantics-business",
+      "operation": "support_verification",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-surreal-db-business-support-verification",
+      "profile_id": "qualification-surreal-db-business-support-verification-profile-v1"
+    },
+    {
+      "id": "surreal_db_business_summary",
+      "backend": "surreal-db",
+      "space": "semantics-business",
+      "operation": "summary",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-surreal-db-business-summary",
+      "profile_id": "qualification-surreal-db-business-summary-profile-v1"
+    },
+    {
+      "id": "surreal_db_business_promotion_and_identity_disambiguation",
+      "backend": "surreal-db",
+      "space": "semantics-business",
+      "operation": "promotion_and_identity_disambiguation",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-surreal-db-business-promotion-and-identity-disambiguation",
+      "profile_id": "qualification-surreal-db-business-promotion-and-identity-disambiguation-profile-v1"
+    },
+    {
+      "id": "surreal_db_business_truth_maintenance",
+      "backend": "surreal-db",
+      "space": "semantics-business",
+      "operation": "truth_maintenance",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-surreal-db-business-truth-maintenance",
+      "profile_id": "qualification-surreal-db-business-truth-maintenance-profile-v1"
+    },
+    {
+      "id": "surreal_db_business_wiki_planner_writer_verifier",
+      "backend": "surreal-db",
+      "space": "semantics-business",
+      "operation": "wiki_planner_writer_verifier",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-surreal-db-business-wiki-planner-writer-verifier",
+      "profile_id": "qualification-surreal-db-business-wiki-planner-writer-verifier-profile-v1"
+    },
+    {
+      "id": "elephant_db_household_embedding",
+      "backend": "elephant-db",
+      "space": "semantics-household",
+      "operation": "embedding",
+      "model": "text-embedding-3-small",
+      "connection_id": "qualification-elephant-db-household-embedding",
+      "profile_id": "qualification-elephant-db-household-embedding-profile-v1",
+      "dimensions": 1536
+    },
+    {
+      "id": "elephant_db_household_extraction",
+      "backend": "elephant-db",
+      "space": "semantics-household",
+      "operation": "extraction",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-elephant-db-household-extraction",
+      "profile_id": "qualification-elephant-db-household-extraction-profile-v1"
+    },
+    {
+      "id": "elephant_db_household_support_verification",
+      "backend": "elephant-db",
+      "space": "semantics-household",
+      "operation": "support_verification",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-elephant-db-household-support-verification",
+      "profile_id": "qualification-elephant-db-household-support-verification-profile-v1"
+    },
+    {
+      "id": "elephant_db_household_summary",
+      "backend": "elephant-db",
+      "space": "semantics-household",
+      "operation": "summary",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-elephant-db-household-summary",
+      "profile_id": "qualification-elephant-db-household-summary-profile-v1"
+    },
+    {
+      "id": "elephant_db_household_promotion_and_identity_disambiguation",
+      "backend": "elephant-db",
+      "space": "semantics-household",
+      "operation": "promotion_and_identity_disambiguation",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-elephant-db-household-promotion-and-identity-disambiguation",
+      "profile_id": "qualification-elephant-db-household-promotion-and-identity-disambiguation-profile-v1"
+    },
+    {
+      "id": "elephant_db_household_truth_maintenance",
+      "backend": "elephant-db",
+      "space": "semantics-household",
+      "operation": "truth_maintenance",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-elephant-db-household-truth-maintenance",
+      "profile_id": "qualification-elephant-db-household-truth-maintenance-profile-v1"
+    },
+    {
+      "id": "elephant_db_household_wiki_planner_writer_verifier",
+      "backend": "elephant-db",
+      "space": "semantics-household",
+      "operation": "wiki_planner_writer_verifier",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-elephant-db-household-wiki-planner-writer-verifier",
+      "profile_id": "qualification-elephant-db-household-wiki-planner-writer-verifier-profile-v1"
+    },
+    {
+      "id": "elephant_db_business_embedding",
+      "backend": "elephant-db",
+      "space": "semantics-business",
+      "operation": "embedding",
+      "model": "text-embedding-3-large",
+      "connection_id": "qualification-elephant-db-business-embedding",
+      "profile_id": "qualification-elephant-db-business-embedding-profile-v1",
+      "dimensions": 3072
+    },
+    {
+      "id": "elephant_db_business_extraction",
+      "backend": "elephant-db",
+      "space": "semantics-business",
+      "operation": "extraction",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-elephant-db-business-extraction",
+      "profile_id": "qualification-elephant-db-business-extraction-profile-v1"
+    },
+    {
+      "id": "elephant_db_business_support_verification",
+      "backend": "elephant-db",
+      "space": "semantics-business",
+      "operation": "support_verification",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-elephant-db-business-support-verification",
+      "profile_id": "qualification-elephant-db-business-support-verification-profile-v1"
+    },
+    {
+      "id": "elephant_db_business_summary",
+      "backend": "elephant-db",
+      "space": "semantics-business",
+      "operation": "summary",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-elephant-db-business-summary",
+      "profile_id": "qualification-elephant-db-business-summary-profile-v1"
+    },
+    {
+      "id": "elephant_db_business_promotion_and_identity_disambiguation",
+      "backend": "elephant-db",
+      "space": "semantics-business",
+      "operation": "promotion_and_identity_disambiguation",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-elephant-db-business-promotion-and-identity-disambiguation",
+      "profile_id": "qualification-elephant-db-business-promotion-and-identity-disambiguation-profile-v1"
+    },
+    {
+      "id": "elephant_db_business_truth_maintenance",
+      "backend": "elephant-db",
+      "space": "semantics-business",
+      "operation": "truth_maintenance",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-elephant-db-business-truth-maintenance",
+      "profile_id": "qualification-elephant-db-business-truth-maintenance-profile-v1"
+    },
+    {
+      "id": "elephant_db_business_wiki_planner_writer_verifier",
+      "backend": "elephant-db",
+      "space": "semantics-business",
+      "operation": "wiki_planner_writer_verifier",
+      "model": "gpt-6.1-sol",
+      "connection_id": "qualification-elephant-db-business-wiki-planner-writer-verifier",
+      "profile_id": "qualification-elephant-db-business-wiki-planner-writer-verifier-profile-v1"
+    }
+  ],
+  "space_processing_configurations": [
+    {
+      "backend": "surreal-db",
+      "space_id": "semantics-household",
+      "security": {
+        "policy_id": "synthetic-household",
+        "level": 3,
+        "labels": [],
+        "handling": []
+      },
+      "processing": {
+        "generation": 1,
+        "index_generation": 0,
+        "policy_id": "synthetic-household",
+        "connections": {
+          "qualification-surreal-db-household-embedding": {
+            "id": "qualification-surreal-db-household-embedding",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_household_embedding",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-surreal-db-household-extraction": {
+            "id": "qualification-surreal-db-household-extraction",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_household_extraction",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-surreal-db-household-support-verification": {
+            "id": "qualification-surreal-db-household-support-verification",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_household_support_verification",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-surreal-db-household-summary": {
+            "id": "qualification-surreal-db-household-summary",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_household_summary",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-surreal-db-household-promotion-and-identity-disambiguation": {
+            "id": "qualification-surreal-db-household-promotion-and-identity-disambiguation",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_household_promotion_and_identity_disambiguation",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-surreal-db-household-truth-maintenance": {
+            "id": "qualification-surreal-db-household-truth-maintenance",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_household_truth_maintenance",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-surreal-db-household-wiki-planner-writer-verifier": {
+            "id": "qualification-surreal-db-household-wiki-planner-writer-verifier",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_household_wiki_planner_writer_verifier",
+            "credential_generation": 1,
+            "revoked": false
+          }
+        },
+        "profiles": {
+          "qualification-surreal-db-household-embedding-profile-v1": {
+            "id": "qualification-surreal-db-household-embedding-profile-v1",
+            "connection_id": "qualification-surreal-db-household-embedding",
+            "model": "text-embedding-3-small",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": 1536,
+            "preprocessing": "text-v1"
+          },
+          "qualification-surreal-db-household-extraction-profile-v1": {
+            "id": "qualification-surreal-db-household-extraction-profile-v1",
+            "connection_id": "qualification-surreal-db-household-extraction",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-surreal-db-household-support-verification-profile-v1": {
+            "id": "qualification-surreal-db-household-support-verification-profile-v1",
+            "connection_id": "qualification-surreal-db-household-support-verification",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-surreal-db-household-summary-profile-v1": {
+            "id": "qualification-surreal-db-household-summary-profile-v1",
+            "connection_id": "qualification-surreal-db-household-summary",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-surreal-db-household-promotion-and-identity-disambiguation-profile-v1": {
+            "id": "qualification-surreal-db-household-promotion-and-identity-disambiguation-profile-v1",
+            "connection_id": "qualification-surreal-db-household-promotion-and-identity-disambiguation",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-surreal-db-household-truth-maintenance-profile-v1": {
+            "id": "qualification-surreal-db-household-truth-maintenance-profile-v1",
+            "connection_id": "qualification-surreal-db-household-truth-maintenance",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-surreal-db-household-wiki-planner-writer-verifier-profile-v1": {
+            "id": "qualification-surreal-db-household-wiki-planner-writer-verifier-profile-v1",
+            "connection_id": "qualification-surreal-db-household-wiki-planner-writer-verifier",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          }
+        },
+        "bindings": {
+          "document_embedding": {
+            "id": "surreal_db_household_embedding_document_embedding",
+            "profile_id": "qualification-surreal-db-household-embedding-profile-v1",
+            "revoked": false
+          },
+          "query_embedding": {
+            "id": "surreal_db_household_embedding_query_embedding",
+            "profile_id": "qualification-surreal-db-household-embedding-profile-v1",
+            "revoked": false
+          },
+          "extraction": {
+            "id": "surreal_db_household_extraction_extraction",
+            "profile_id": "qualification-surreal-db-household-extraction-profile-v1",
+            "revoked": false
+          },
+          "support_verification": {
+            "id": "surreal_db_household_support_verification_support_verification",
+            "profile_id": "qualification-surreal-db-household-support-verification-profile-v1",
+            "revoked": false
+          },
+          "summary": {
+            "id": "surreal_db_household_summary_summary",
+            "profile_id": "qualification-surreal-db-household-summary-profile-v1",
+            "revoked": false
+          },
+          "promotion_disambiguation": {
+            "id": "surreal_db_household_promotion_and_identity_disambiguation_promotion_disambiguation",
+            "profile_id": "qualification-surreal-db-household-promotion-and-identity-disambiguation-profile-v1",
+            "revoked": false
+          },
+          "identity_disambiguation": {
+            "id": "surreal_db_household_promotion_and_identity_disambiguation_identity_disambiguation",
+            "profile_id": "qualification-surreal-db-household-promotion-and-identity-disambiguation-profile-v1",
+            "revoked": false
+          },
+          "truth_maintenance": {
+            "id": "surreal_db_household_truth_maintenance_truth_maintenance",
+            "profile_id": "qualification-surreal-db-household-truth-maintenance-profile-v1",
+            "revoked": false
+          },
+          "wiki_planner": {
+            "id": "surreal_db_household_wiki_planner_writer_verifier_wiki_planner",
+            "profile_id": "qualification-surreal-db-household-wiki-planner-writer-verifier-profile-v1",
+            "revoked": false
+          },
+          "wiki_writer": {
+            "id": "surreal_db_household_wiki_planner_writer_verifier_wiki_writer",
+            "profile_id": "qualification-surreal-db-household-wiki-planner-writer-verifier-profile-v1",
+            "revoked": false
+          },
+          "wiki_verifier": {
+            "id": "surreal_db_household_wiki_planner_writer_verifier_wiki_verifier",
+            "profile_id": "qualification-surreal-db-household-wiki-planner-writer-verifier-profile-v1",
+            "revoked": false
+          }
+        },
+        "active_embedding_profile_id": "qualification-surreal-db-household-embedding-profile-v1",
+        "pending_reindex": null
+      }
+    },
+    {
+      "backend": "surreal-db",
+      "space_id": "semantics-business",
+      "security": {
+        "policy_id": "synthetic-business",
+        "level": 7,
+        "labels": [],
+        "handling": []
+      },
+      "processing": {
+        "generation": 1,
+        "index_generation": 0,
+        "policy_id": "synthetic-business",
+        "connections": {
+          "qualification-surreal-db-business-embedding": {
+            "id": "qualification-surreal-db-business-embedding",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_business_embedding",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-surreal-db-business-extraction": {
+            "id": "qualification-surreal-db-business-extraction",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_business_extraction",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-surreal-db-business-support-verification": {
+            "id": "qualification-surreal-db-business-support-verification",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_business_support_verification",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-surreal-db-business-summary": {
+            "id": "qualification-surreal-db-business-summary",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_business_summary",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-surreal-db-business-promotion-and-identity-disambiguation": {
+            "id": "qualification-surreal-db-business-promotion-and-identity-disambiguation",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_business_promotion_and_identity_disambiguation",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-surreal-db-business-truth-maintenance": {
+            "id": "qualification-surreal-db-business-truth-maintenance",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_business_truth_maintenance",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-surreal-db-business-wiki-planner-writer-verifier": {
+            "id": "qualification-surreal-db-business-wiki-planner-writer-verifier",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_surreal_db_business_wiki_planner_writer_verifier",
+            "credential_generation": 1,
+            "revoked": false
+          }
+        },
+        "profiles": {
+          "qualification-surreal-db-business-embedding-profile-v1": {
+            "id": "qualification-surreal-db-business-embedding-profile-v1",
+            "connection_id": "qualification-surreal-db-business-embedding",
+            "model": "text-embedding-3-large",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": 3072,
+            "preprocessing": "text-v1"
+          },
+          "qualification-surreal-db-business-extraction-profile-v1": {
+            "id": "qualification-surreal-db-business-extraction-profile-v1",
+            "connection_id": "qualification-surreal-db-business-extraction",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-surreal-db-business-support-verification-profile-v1": {
+            "id": "qualification-surreal-db-business-support-verification-profile-v1",
+            "connection_id": "qualification-surreal-db-business-support-verification",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-surreal-db-business-summary-profile-v1": {
+            "id": "qualification-surreal-db-business-summary-profile-v1",
+            "connection_id": "qualification-surreal-db-business-summary",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-surreal-db-business-promotion-and-identity-disambiguation-profile-v1": {
+            "id": "qualification-surreal-db-business-promotion-and-identity-disambiguation-profile-v1",
+            "connection_id": "qualification-surreal-db-business-promotion-and-identity-disambiguation",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-surreal-db-business-truth-maintenance-profile-v1": {
+            "id": "qualification-surreal-db-business-truth-maintenance-profile-v1",
+            "connection_id": "qualification-surreal-db-business-truth-maintenance",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-surreal-db-business-wiki-planner-writer-verifier-profile-v1": {
+            "id": "qualification-surreal-db-business-wiki-planner-writer-verifier-profile-v1",
+            "connection_id": "qualification-surreal-db-business-wiki-planner-writer-verifier",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          }
+        },
+        "bindings": {
+          "document_embedding": {
+            "id": "surreal_db_business_embedding_document_embedding",
+            "profile_id": "qualification-surreal-db-business-embedding-profile-v1",
+            "revoked": false
+          },
+          "query_embedding": {
+            "id": "surreal_db_business_embedding_query_embedding",
+            "profile_id": "qualification-surreal-db-business-embedding-profile-v1",
+            "revoked": false
+          },
+          "extraction": {
+            "id": "surreal_db_business_extraction_extraction",
+            "profile_id": "qualification-surreal-db-business-extraction-profile-v1",
+            "revoked": false
+          },
+          "support_verification": {
+            "id": "surreal_db_business_support_verification_support_verification",
+            "profile_id": "qualification-surreal-db-business-support-verification-profile-v1",
+            "revoked": false
+          },
+          "summary": {
+            "id": "surreal_db_business_summary_summary",
+            "profile_id": "qualification-surreal-db-business-summary-profile-v1",
+            "revoked": false
+          },
+          "promotion_disambiguation": {
+            "id": "surreal_db_business_promotion_and_identity_disambiguation_promotion_disambiguation",
+            "profile_id": "qualification-surreal-db-business-promotion-and-identity-disambiguation-profile-v1",
+            "revoked": false
+          },
+          "identity_disambiguation": {
+            "id": "surreal_db_business_promotion_and_identity_disambiguation_identity_disambiguation",
+            "profile_id": "qualification-surreal-db-business-promotion-and-identity-disambiguation-profile-v1",
+            "revoked": false
+          },
+          "truth_maintenance": {
+            "id": "surreal_db_business_truth_maintenance_truth_maintenance",
+            "profile_id": "qualification-surreal-db-business-truth-maintenance-profile-v1",
+            "revoked": false
+          },
+          "wiki_planner": {
+            "id": "surreal_db_business_wiki_planner_writer_verifier_wiki_planner",
+            "profile_id": "qualification-surreal-db-business-wiki-planner-writer-verifier-profile-v1",
+            "revoked": false
+          },
+          "wiki_writer": {
+            "id": "surreal_db_business_wiki_planner_writer_verifier_wiki_writer",
+            "profile_id": "qualification-surreal-db-business-wiki-planner-writer-verifier-profile-v1",
+            "revoked": false
+          },
+          "wiki_verifier": {
+            "id": "surreal_db_business_wiki_planner_writer_verifier_wiki_verifier",
+            "profile_id": "qualification-surreal-db-business-wiki-planner-writer-verifier-profile-v1",
+            "revoked": false
+          }
+        },
+        "active_embedding_profile_id": "qualification-surreal-db-business-embedding-profile-v1",
+        "pending_reindex": null
+      }
+    },
+    {
+      "backend": "elephant-db",
+      "space_id": "semantics-household",
+      "security": {
+        "policy_id": "synthetic-household",
+        "level": 3,
+        "labels": [],
+        "handling": []
+      },
+      "processing": {
+        "generation": 1,
+        "index_generation": 0,
+        "policy_id": "synthetic-household",
+        "connections": {
+          "qualification-elephant-db-household-embedding": {
+            "id": "qualification-elephant-db-household-embedding",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_household_embedding",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-elephant-db-household-extraction": {
+            "id": "qualification-elephant-db-household-extraction",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_household_extraction",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-elephant-db-household-support-verification": {
+            "id": "qualification-elephant-db-household-support-verification",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_household_support_verification",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-elephant-db-household-summary": {
+            "id": "qualification-elephant-db-household-summary",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_household_summary",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-elephant-db-household-promotion-and-identity-disambiguation": {
+            "id": "qualification-elephant-db-household-promotion-and-identity-disambiguation",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_household_promotion_and_identity_disambiguation",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-elephant-db-household-truth-maintenance": {
+            "id": "qualification-elephant-db-household-truth-maintenance",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_household_truth_maintenance",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-elephant-db-household-wiki-planner-writer-verifier": {
+            "id": "qualification-elephant-db-household-wiki-planner-writer-verifier",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_household_wiki_planner_writer_verifier",
+            "credential_generation": 1,
+            "revoked": false
+          }
+        },
+        "profiles": {
+          "qualification-elephant-db-household-embedding-profile-v1": {
+            "id": "qualification-elephant-db-household-embedding-profile-v1",
+            "connection_id": "qualification-elephant-db-household-embedding",
+            "model": "text-embedding-3-small",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": 1536,
+            "preprocessing": "text-v1"
+          },
+          "qualification-elephant-db-household-extraction-profile-v1": {
+            "id": "qualification-elephant-db-household-extraction-profile-v1",
+            "connection_id": "qualification-elephant-db-household-extraction",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-elephant-db-household-support-verification-profile-v1": {
+            "id": "qualification-elephant-db-household-support-verification-profile-v1",
+            "connection_id": "qualification-elephant-db-household-support-verification",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-elephant-db-household-summary-profile-v1": {
+            "id": "qualification-elephant-db-household-summary-profile-v1",
+            "connection_id": "qualification-elephant-db-household-summary",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-elephant-db-household-promotion-and-identity-disambiguation-profile-v1": {
+            "id": "qualification-elephant-db-household-promotion-and-identity-disambiguation-profile-v1",
+            "connection_id": "qualification-elephant-db-household-promotion-and-identity-disambiguation",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-elephant-db-household-truth-maintenance-profile-v1": {
+            "id": "qualification-elephant-db-household-truth-maintenance-profile-v1",
+            "connection_id": "qualification-elephant-db-household-truth-maintenance",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-elephant-db-household-wiki-planner-writer-verifier-profile-v1": {
+            "id": "qualification-elephant-db-household-wiki-planner-writer-verifier-profile-v1",
+            "connection_id": "qualification-elephant-db-household-wiki-planner-writer-verifier",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          }
+        },
+        "bindings": {
+          "document_embedding": {
+            "id": "elephant_db_household_embedding_document_embedding",
+            "profile_id": "qualification-elephant-db-household-embedding-profile-v1",
+            "revoked": false
+          },
+          "query_embedding": {
+            "id": "elephant_db_household_embedding_query_embedding",
+            "profile_id": "qualification-elephant-db-household-embedding-profile-v1",
+            "revoked": false
+          },
+          "extraction": {
+            "id": "elephant_db_household_extraction_extraction",
+            "profile_id": "qualification-elephant-db-household-extraction-profile-v1",
+            "revoked": false
+          },
+          "support_verification": {
+            "id": "elephant_db_household_support_verification_support_verification",
+            "profile_id": "qualification-elephant-db-household-support-verification-profile-v1",
+            "revoked": false
+          },
+          "summary": {
+            "id": "elephant_db_household_summary_summary",
+            "profile_id": "qualification-elephant-db-household-summary-profile-v1",
+            "revoked": false
+          },
+          "promotion_disambiguation": {
+            "id": "elephant_db_household_promotion_and_identity_disambiguation_promotion_disambiguation",
+            "profile_id": "qualification-elephant-db-household-promotion-and-identity-disambiguation-profile-v1",
+            "revoked": false
+          },
+          "identity_disambiguation": {
+            "id": "elephant_db_household_promotion_and_identity_disambiguation_identity_disambiguation",
+            "profile_id": "qualification-elephant-db-household-promotion-and-identity-disambiguation-profile-v1",
+            "revoked": false
+          },
+          "truth_maintenance": {
+            "id": "elephant_db_household_truth_maintenance_truth_maintenance",
+            "profile_id": "qualification-elephant-db-household-truth-maintenance-profile-v1",
+            "revoked": false
+          },
+          "wiki_planner": {
+            "id": "elephant_db_household_wiki_planner_writer_verifier_wiki_planner",
+            "profile_id": "qualification-elephant-db-household-wiki-planner-writer-verifier-profile-v1",
+            "revoked": false
+          },
+          "wiki_writer": {
+            "id": "elephant_db_household_wiki_planner_writer_verifier_wiki_writer",
+            "profile_id": "qualification-elephant-db-household-wiki-planner-writer-verifier-profile-v1",
+            "revoked": false
+          },
+          "wiki_verifier": {
+            "id": "elephant_db_household_wiki_planner_writer_verifier_wiki_verifier",
+            "profile_id": "qualification-elephant-db-household-wiki-planner-writer-verifier-profile-v1",
+            "revoked": false
+          }
+        },
+        "active_embedding_profile_id": "qualification-elephant-db-household-embedding-profile-v1",
+        "pending_reindex": null
+      }
+    },
+    {
+      "backend": "elephant-db",
+      "space_id": "semantics-business",
+      "security": {
+        "policy_id": "synthetic-business",
+        "level": 7,
+        "labels": [],
+        "handling": []
+      },
+      "processing": {
+        "generation": 1,
+        "index_generation": 0,
+        "policy_id": "synthetic-business",
+        "connections": {
+          "qualification-elephant-db-business-embedding": {
+            "id": "qualification-elephant-db-business-embedding",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_business_embedding",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-elephant-db-business-extraction": {
+            "id": "qualification-elephant-db-business-extraction",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_business_extraction",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-elephant-db-business-support-verification": {
+            "id": "qualification-elephant-db-business-support-verification",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_business_support_verification",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-elephant-db-business-summary": {
+            "id": "qualification-elephant-db-business-summary",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_business_summary",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-elephant-db-business-promotion-and-identity-disambiguation": {
+            "id": "qualification-elephant-db-business-promotion-and-identity-disambiguation",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_business_promotion_and_identity_disambiguation",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-elephant-db-business-truth-maintenance": {
+            "id": "qualification-elephant-db-business-truth-maintenance",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_business_truth_maintenance",
+            "credential_generation": 1,
+            "revoked": false
+          },
+          "qualification-elephant-db-business-wiki-planner-writer-verifier": {
+            "id": "qualification-elephant-db-business-wiki-planner-writer-verifier",
+            "provider": "openai",
+            "account_id": "REQUIRES_APPROVED_ACCOUNT_IDENTITY",
+            "endpoint": "http://127.0.0.1:43129/v1",
+            "credential_ref": "RECALL_GATEWAY_elephant_db_business_wiki_planner_writer_verifier",
+            "credential_generation": 1,
+            "revoked": false
+          }
+        },
+        "profiles": {
+          "qualification-elephant-db-business-embedding-profile-v1": {
+            "id": "qualification-elephant-db-business-embedding-profile-v1",
+            "connection_id": "qualification-elephant-db-business-embedding",
+            "model": "text-embedding-3-large",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": 3072,
+            "preprocessing": "text-v1"
+          },
+          "qualification-elephant-db-business-extraction-profile-v1": {
+            "id": "qualification-elephant-db-business-extraction-profile-v1",
+            "connection_id": "qualification-elephant-db-business-extraction",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-elephant-db-business-support-verification-profile-v1": {
+            "id": "qualification-elephant-db-business-support-verification-profile-v1",
+            "connection_id": "qualification-elephant-db-business-support-verification",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-elephant-db-business-summary-profile-v1": {
+            "id": "qualification-elephant-db-business-summary-profile-v1",
+            "connection_id": "qualification-elephant-db-business-summary",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-elephant-db-business-promotion-and-identity-disambiguation-profile-v1": {
+            "id": "qualification-elephant-db-business-promotion-and-identity-disambiguation-profile-v1",
+            "connection_id": "qualification-elephant-db-business-promotion-and-identity-disambiguation",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-elephant-db-business-truth-maintenance-profile-v1": {
+            "id": "qualification-elephant-db-business-truth-maintenance-profile-v1",
+            "connection_id": "qualification-elephant-db-business-truth-maintenance",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          },
+          "qualification-elephant-db-business-wiki-planner-writer-verifier-profile-v1": {
+            "id": "qualification-elephant-db-business-wiki-planner-writer-verifier-profile-v1",
+            "connection_id": "qualification-elephant-db-business-wiki-planner-writer-verifier",
+            "model": "gpt-6.1-sol",
+            "model_version": "REQUIRES_APPROVED_OPERATOR_DEPLOYMENT_VERSION",
+            "dimensions": null,
+            "preprocessing": "text-v1"
+          }
+        },
+        "bindings": {
+          "document_embedding": {
+            "id": "elephant_db_business_embedding_document_embedding",
+            "profile_id": "qualification-elephant-db-business-embedding-profile-v1",
+            "revoked": false
+          },
+          "query_embedding": {
+            "id": "elephant_db_business_embedding_query_embedding",
+            "profile_id": "qualification-elephant-db-business-embedding-profile-v1",
+            "revoked": false
+          },
+          "extraction": {
+            "id": "elephant_db_business_extraction_extraction",
+            "profile_id": "qualification-elephant-db-business-extraction-profile-v1",
+            "revoked": false
+          },
+          "support_verification": {
+            "id": "elephant_db_business_support_verification_support_verification",
+            "profile_id": "qualification-elephant-db-business-support-verification-profile-v1",
+            "revoked": false
+          },
+          "summary": {
+            "id": "elephant_db_business_summary_summary",
+            "profile_id": "qualification-elephant-db-business-summary-profile-v1",
+            "revoked": false
+          },
+          "promotion_disambiguation": {
+            "id": "elephant_db_business_promotion_and_identity_disambiguation_promotion_disambiguation",
+            "profile_id": "qualification-elephant-db-business-promotion-and-identity-disambiguation-profile-v1",
+            "revoked": false
+          },
+          "identity_disambiguation": {
+            "id": "elephant_db_business_promotion_and_identity_disambiguation_identity_disambiguation",
+            "profile_id": "qualification-elephant-db-business-promotion-and-identity-disambiguation-profile-v1",
+            "revoked": false
+          },
+          "truth_maintenance": {
+            "id": "elephant_db_business_truth_maintenance_truth_maintenance",
+            "profile_id": "qualification-elephant-db-business-truth-maintenance-profile-v1",
+            "revoked": false
+          },
+          "wiki_planner": {
+            "id": "elephant_db_business_wiki_planner_writer_verifier_wiki_planner",
+            "profile_id": "qualification-elephant-db-business-wiki-planner-writer-verifier-profile-v1",
+            "revoked": false
+          },
+          "wiki_writer": {
+            "id": "elephant_db_business_wiki_planner_writer_verifier_wiki_writer",
+            "profile_id": "qualification-elephant-db-business-wiki-planner-writer-verifier-profile-v1",
+            "revoked": false
+          },
+          "wiki_verifier": {
+            "id": "elephant_db_business_wiki_planner_writer_verifier_wiki_verifier",
+            "profile_id": "qualification-elephant-db-business-wiki-planner-writer-verifier-profile-v1",
+            "revoked": false
+          }
+        },
+        "active_embedding_profile_id": "qualification-elephant-db-business-embedding-profile-v1",
+        "pending_reindex": null
+      }
+    }
+  ],
+  "required_before_use": [
+    "Root/D/C review of the exact draft and its changed connection/profile IDs",
+    "Approved real account identity and operator deployment version replacing placeholders",
+    "D proposal update/review of one shared embedding capability and combined 76 dispatch cap per backend",
+    "Approved gateway/installed isolation/token-bound/capture artifacts and explicit execution authorization",
+    "Runner persists these processing configurations through existing named-space owner APIs, then reads back exact tokens before source acceptance"
+  ],
+  "limits": [
+    "No settings or credentials have been installed; no request has been made",
+    "Document and query embedding share one active profile; separate 28/48 quotas are not enforced by the combined gateway capability",
+    "Promotion/identity share their approved grouped gateway quota; wiki planner/writer/verifier share their grouped quota",
+    "No triage, media_render or reindex approval is added to this qualification subset",
+    "Explicit reasoning effort and service tier still require reviewed actual wire evidence; they are not ModelProfile fields"
+  ],
+  "gateway_proposal_delta_sha256": "c651a0e50a8ee5adcfa0debbf11c9967c4d2e09f52cd7b7e428052a57b698d23"
+}

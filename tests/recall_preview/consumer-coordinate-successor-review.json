@@ -1,0 +1,43 @@
+{
+  "format": "recall-independent-source-review/v1",
+  "authority": "qualification",
+  "reviewed_source": "23c20e572a0800bdd0786a780c57e2ba4c76d580",
+  "scope": "corrected synthetic consumer June quote and exact raw/rendered literal hashes",
+  "verdict": "selected source ACK",
+  "product_acceptance": false,
+  "execution_authorized": false,
+  "files": {
+    "docs/internal/recall-preview-contract/examples-coordinate-v2.json": "efba2b27934b29439019a3896f4dd5cc8ed1dafcbc4f52d8f5f89e721a5f76b4"
+  },
+  "static_checks": {
+    "quote_bytes": 24,
+    "rendered_bytes": 25,
+    "raw_interval": [
+      0,
+      24
+    ],
+    "rendered_interval": [
+      0,
+      24
+    ],
+    "original_wrong_interval_refuses": true,
+    "contract_directory_span_quote_pairs": 2,
+    "retained_original_defects": [
+      {
+        "file": "examples.json",
+        "path": "/search/response/results/0/evidence/0",
+        "quote_bytes": 24,
+        "span": {
+          "start": 0,
+          "end": 23
+        }
+      }
+    ]
+  },
+  "limits": [
+    "Original examples.json and original core14 packet unchanged.",
+    "No product/provider/consumer runtime executed.",
+    "Current OB3 v1 reader does not inspect immutable GET; rendered-only checks cannot prove raw mapping, stale accepted input or correct repeated occurrence.",
+    "This review does not approve a future parent Doc field, revised full response bound or normative renderer successor; those require their own concrete source review."
+  ]
+}

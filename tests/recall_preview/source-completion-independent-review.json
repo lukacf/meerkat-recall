@@ -1,0 +1,43 @@
+{
+  "format": "recall-independent-source-review/v1",
+  "reviewed_at": "2026-10-07T04:19:39.839440+00:00",
+  "reviewer": "qualification",
+  "source_commits": {
+    "maintenance": "71ea0aed5fdac2544099612aa5801894241f2902",
+    "dispatcher_oracle": "a89784bb61a9bc0e6037d7290520d8e16339f596",
+    "completed_retry": "5b0ae2f7e74bb8d1a69b3617afac698923494bc4",
+    "operation_identity_and_preflight_truthfulness": "026c9e8bc14150766a6359fb94152636992ff56e"
+  },
+  "decision": "selected-source-ack",
+  "scope": [
+    "Original ALL-stage selection remains unchanged; ReMaintain runs only when requested and original admitted operations are complete.",
+    "Original selection digest/request/current completion certificates and current source head are checked before maintenance. Existing owner-authorized source support remains separate from selection artifacts.",
+    "Real stale invalidation, recompute, original source certificate artifacts, job transition, outbox and receipt share the original planning adapter and captured attempt/epoch.",
+    "One-time seed avoids repeating global invalidation; changed original request is refused. Continuation receipt scope includes actual captured epoch.",
+    "Pending groups, skipped slots or remaining stale slots prevent completed_at. Original completion artifact retains its original WorkRun and rejects changed certificate/auth/provenance.",
+    "Dispatcher fixture retains original default stages/empty email selection/unresolved group and checks typed PendingDependencies, original Runnable work/refunded attempts/future retry and unsuccessful original fenced run.",
+    "Completed ReMaintain retry now requires the original committed maintenance seed and unchanged original request; changed or missing seed refuses without reconstruction.",
+    "Completion request sorts a copy of original operation IDs. All six order permutations bind equally; changed/missing/additional/substituted duplicate IDs and configuration rotation remain distinct. Caller receipts and selection membership remain unchanged.",
+    "Preflight control now names its actual refusal point and requires canonical_effect_changed or canonical_row_exists; all original no-mutation/outbox/receipt assertions remain. Generic storage late-fault controls are separately identified, not claimed as completion-path late rollback."
+  ],
+  "authored_owner_controls": {
+    "maintenance": 8,
+    "maintenance_async_controls_both_backends": 6,
+    "dispatcher_original_test_strengthened": 1,
+    "maintenance_pure_encoding_and_type_controls": 2
+  },
+  "validation": {
+    "source_read": true,
+    "tests_executed_by_reviewer": false,
+    "cargo_executed_by_reviewer": false,
+    "runtime_pass_claimed": false
+  },
+  "limits": [
+    "Historical 71ea collision test label overstated late rollback. Owner026c accurately corrects selector/comment/docs to before-image preflight refusal; this review certifies no completion-specific late-fault execution.",
+    "New completion controls use empty source selection; nonempty original publication/erasure support remains covered by existing owner fixtures and requires central execution.",
+    "Isolated retained-certificate control is artifact idempotency only, not an invented source-publication certificate.",
+    "Future-type size assertions and boxing do not establish runtime SIGABRT resolution.",
+    "Native survivor and ancestry failures remain independent runtime gates."
+  ],
+  "successor_reviewed_at": "2026-10-07T04:24:11.397935+00:00"
+}

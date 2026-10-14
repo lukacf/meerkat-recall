@@ -1,0 +1,202 @@
+{
+  "format": "recall-independent-runtime17-receipt-index/v1",
+  "reviewed_at": "2026-10-07T04:06:51.009695+00:00",
+  "source_commit": "4979bb883adde3d8fa884d6e820a6a1a1a76dfc4",
+  "evidence_manifest_sha256": "36671b7d0c3b3f001040602b9fd21b8a0bf857a5c34f6b40e5d8c9cbc2a4beaa",
+  "receipt_sha256": "ff1247479e6f10e7886b119b7bda6eb28536edcb26b1fac6ae7c11aa4ef3b4b4",
+  "original_payloads_verified": 33,
+  "counts": {
+    "PASS": 242,
+    "FAIL": 15,
+    "SIGABRT": 5
+  },
+  "executed": 262,
+  "skipped": 3037,
+  "exit_code": 100,
+  "selection_groups": {
+    "original runtime16 nonpass": {
+      "count": 128,
+      "statuses": {
+        "FAIL": 13,
+        "PASS": 110,
+        "SIGABRT": 5
+      }
+    },
+    "original ignored85": {
+      "count": 85,
+      "statuses": {
+        "PASS": 84,
+        "FAIL": 1
+      }
+    },
+    "new source-declared controls": {
+      "count": 49,
+      "statuses": {
+        "PASS": 48,
+        "FAIL": 1
+      }
+    }
+  },
+  "selected_D_originals": [
+    {
+      "status": "PASS",
+      "name": "elephant-pipeline maintenance_commit::tests::independent_wiki_definition_oracles::surreal_actual_planner_never_revives_deleted_definition_or_replaces_sibling"
+    },
+    {
+      "status": "FAIL",
+      "name": "elephant-pipeline reprocess::budget::independent_producer_ancestry::native_actual_256_work_and_257_source_boundaries",
+      "location": null,
+      "error": "Elapsed(())"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-storage source_publication_manifest::tests::independent_contact_erasure_oracles::embedded_corrupt_survivor_refuses_physical_purge_then_recovers_original_intent"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-storage source_publication_manifest::tests::independent_contact_erasure_oracles::surreal_corrupt_survivor_refuses_physical_purge_then_recovers_original_intent"
+    }
+  ],
+  "full_input_control_passes": 26,
+  "product_acceptance": false,
+  "limits": [
+    "Focused central controlled test gate only; 20 nonpasses remain.",
+    "Original three Runtime16 D nonpasses now PASS; native 240-second ancestry timeout persists.",
+    "Later ancestry markers and product repairs are outside this executed source.",
+    "No live model/provider quality, installed artifact, full physical export/restore/media/WAL/retention or measured 140-call acceptance."
+  ],
+  "original_files": {
+    "cargo.log": {
+      "sha256": "7906b886f31bd1da33f68473baedbc8ab38c5c826138b0d0d00a7c1d3c53e3ac",
+      "bytes": 240646
+    },
+    "receipt.json": {
+      "sha256": "ff1247479e6f10e7886b119b7bda6eb28536edcb26b1fac6ae7c11aa4ef3b4b4",
+      "bytes": 36759
+    },
+    "summary.json": {
+      "sha256": "89487ddc67ce04fc480ae02a685e4ac7669936b54bd1b776ad5a8effdb77d1f8",
+      "bytes": 349
+    },
+    "results.json": {
+      "sha256": "366d12351aec358629318dca1094caecafb61a29ec61b60669668b19b664469d",
+      "bytes": 112218
+    },
+    "failures.json": {
+      "sha256": "f2bab0704a868b6582adf18600cb240776cee9b288825819a2cfd50a7987181c",
+      "bytes": 76493
+    },
+    "package-counts.json": {
+      "sha256": "eb15c761f04b6896b2475ab9746c8d4c028ce62be7d9f4a7dd648df44df3e830",
+      "bytes": 811
+    },
+    "owner-counts.json": {
+      "sha256": "4d763459f84510a9e9e8e1ed5ab6f511798199b77d6333151afab77f56389f7c",
+      "bytes": 162
+    },
+    "runtime-analysis.json": {
+      "sha256": "a81a029c8f86a32b7c85e98f17382fdf8404aae038b704e224cbca09296973a0",
+      "bytes": 2852
+    },
+    "parser-source.py": {
+      "sha256": "4f47fa021d894ccebcdfed3ae87e9e40a5bd6018e072474f753df845588c26c7",
+      "bytes": 5033
+    },
+    "launcher-source.py": {
+      "sha256": "9b87f93bc4d756ee8649b8f949cc0c62e94c760829224f03007d01b48483eb61",
+      "bytes": 6151
+    },
+    "sealer-source.py": {
+      "sha256": "1f208d10d6455490a3423356a6a0ec0b2ce52d55ba2dd5548896302100c53722",
+      "bytes": 8743
+    },
+    "integration-workspace-tests-16-comparison.json": {
+      "sha256": "2ad51e2baf40392c845966986ef12dbcb5ec2d31b31c24e1afa6ecd85e53667b",
+      "bytes": 381902
+    },
+    "integration-ignored-offline-2-comparison.json": {
+      "sha256": "d9afe57e5bf281b3e7845098f680642bf1152c77e631179265741d68f8e36620",
+      "bytes": 104992
+    },
+    "selection-coverage.json": {
+      "sha256": "376c5c51cfad6321a8ca7cfda1e22d806e8515d635eb36083f711791f8ce240a",
+      "bytes": 46336
+    },
+    "owner-erasure.json": {
+      "sha256": "de4a51f557be51d320b8258469b2655b5f698fc635bf7bc9e4f513cd9c1b240b",
+      "bytes": 1131
+    },
+    "owner-finalization.json": {
+      "sha256": "ab7c42368df3eb0023b4e82b986a38ef2eb5a3904e11064e5f1f70484891a267",
+      "bytes": 931
+    },
+    "owner-grounding.json": {
+      "sha256": "92229039919aaa9011117efedb10cc0535091877c947ab62e8297450a7b008cc",
+      "bytes": 1907
+    },
+    "owner-intake.json": {
+      "sha256": "ef323f8cdea2c44cc0fa173a712e7a3be594d31947578028a36c4b438e90f06a",
+      "bytes": 886
+    },
+    "owner-integrity.json": {
+      "sha256": "af166752f38938181ce58841bf619b0c8a940c47566b1e1b758b39dac62e7bcb",
+      "bytes": 420
+    },
+    "owner-maintenance.json": {
+      "sha256": "c7049299c2124b4de85a2b8aa47fe1829776a24f7431f17832d3d63fcf7d7fbb",
+      "bytes": 1089
+    },
+    "owner-recovery.json": {
+      "sha256": "91065a99cf3a431b65241676408eab36caa3d4c9eeef205baf6d37d181178687",
+      "bytes": 68963
+    },
+    "owner-semantics.json": {
+      "sha256": "912474e09bf3f4f8278e8a6a93a447bb1ed649df2d8e47c8bf0aff1da2790c25",
+      "bytes": 786
+    },
+    "owner-surface.json": {
+      "sha256": "0af269740565976e8b2af91686742cac674af2a54f248df595b1d04a530d8a88",
+      "bytes": 404
+    },
+    "nextest.toml": {
+      "sha256": "79cfa29a804f3b6e48b8c31bb8f8ca352c9647b3ff5fe4d23b72735db8fd5ac6",
+      "bytes": 328
+    },
+    "source-provenance.json": {
+      "sha256": "baebe815a0c1cc61b024da51d1e50474ae4435aee9aeb824727f720d8062d9a5",
+      "bytes": 1177
+    },
+    "lock-static.json": {
+      "sha256": "c6be19943a33966e0a5511192eda632fbd872280c33f5c7345adc4a24b425734",
+      "bytes": 438
+    },
+    "additional-offline-targets.json": {
+      "sha256": "62eafa508d7c1b3280ffdf351f6249852a67e1d8963d0db3204f00d58d24a5fc",
+      "bytes": 7747
+    },
+    "inspector-target-audit.json": {
+      "sha256": "450c8267adef8952fa7f41bbbd39343e5162b08a163188c2bdc2971a9221428c",
+      "bytes": 4714
+    },
+    "selection-filter.txt": {
+      "sha256": "e836e884dd4161e6e4c32d709023472098d13184cc5f6b227b01a772897244eb",
+      "bytes": 32071
+    },
+    "selection-audit.json": {
+      "sha256": "c408facfd4fe2b42419d54ea4867bb5ec01adc9b699f442ca5308f0dea2678db",
+      "bytes": 84465
+    },
+    "source-cut.txt": {
+      "sha256": "29ffd9baaff2fd15d8919ec48fb65e9c2a68c1bcebce3f2cc5192e0464040798",
+      "bytes": 945
+    },
+    "prior-ignored-owner-routing.json": {
+      "sha256": "1d850af392b8cff0e59284f7effa5a6521c288b3d48c1a2127c10af7b94e6751",
+      "bytes": 1243
+    },
+    "root-source-cut-authorization.txt": {
+      "sha256": "c7a3ce0cfd29b11e968fa71a25ec63b06f1ce0b2a03b2d3085c3ab4cd3107cf2",
+      "bytes": 610
+    }
+  }
+}

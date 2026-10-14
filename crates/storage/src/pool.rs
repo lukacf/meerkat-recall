@@ -222,7 +222,7 @@ impl ConnectionPool {
         config.namespace.clone_from(&session_key.namespace);
         config.database.clone_from(&session_key.database);
 
-        let client = StorageClient::new(config).await?;
+        let client = Box::pin(StorageClient::new(config)).await?;
 
         // Phase 3: Insert client into pool (re-acquire lock)
         {
@@ -343,6 +343,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."
+    )]
     async fn test_connection_pool_creation() {
         let pool = ConnectionPool::new(PoolConfig::default());
         let stats = pool.stats().await;
@@ -351,6 +355,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."
+    )]
     async fn test_connection_pool_get_client() {
         let pool = ConnectionPool::new(PoolConfig::default());
         let config = StorageConfig::default(); // Uses mem://
@@ -365,6 +373,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."
+    )]
     async fn test_connection_pool_session_reuse() {
         let pool = ConnectionPool::new(PoolConfig::default());
         let config = StorageConfig::default();
@@ -384,6 +396,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."
+    )]
     async fn test_connection_pool_multiple_sessions() {
         let pool = ConnectionPool::new(PoolConfig::default());
         let config = StorageConfig::default();
@@ -402,6 +418,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."
+    )]
     async fn test_connection_pool_remove_session() {
         let pool = ConnectionPool::new(PoolConfig::default());
         let config = StorageConfig::default();

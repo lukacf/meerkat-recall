@@ -1,0 +1,82 @@
+{
+  "format": "recall-public-graph-fixture/v1",
+  "source_request": {
+    "source": {
+      "id": "source:7e9bbb40-091e-5c32-99cf-f5c2e79e812d",
+      "space_id": "qualification-household",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "household-policy",
+        "level": 3,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "type": "manual",
+      "hash": "d6c61c5216fe70880fd13dbda980e48912884aa3ca088e62fbbc8baadcb4e8a1",
+      "external_id": "workload/atlas-03",
+      "uri": "https://example.invalid/recall-workload/household/03",
+      "metadata": {}
+    },
+    "doc": {
+      "id": "doc:1f4dbc09-e2d7-5c3b-ae5f-6d15eb142c4d",
+      "space_id": "qualification-household",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "household-policy",
+        "level": 3,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "title": "workload/atlas-03",
+      "text": "For household project Atlas-03, the responsible custodian is Helena-03. Its approved supply limit is 34 units. This record applies only to household scope.\nHelena-03 now maintains the Atlas-03 cobalt competition notebook.",
+      "source": null,
+      "sidecar_text": null,
+      "media_attachments": [],
+      "rendition_key": "d28/text/workload/atlas-03/full-fw08-b-r2",
+      "metadata": {}
+    },
+    "ingest_mode": "graph",
+    "intake": {
+      "revision_id": "full-fw08-b-r2",
+      "idempotency_key": "literal-4a678430f45afcc4d54a6d080959ba22c50aee6942161a154d5728a5172e076b"
+    }
+  },
+  "rendered_text": "For household project Atlas-03, the responsible custodian is Helena-03. Its approved supply limit is 34 units. This record applies only to household scope.\nHelena-03 now maintains the Atlas-03 cobalt competition notebook.\n",
+  "rendered_sha256": "f857a1de158f5d010969f42a4a2fbb6b4d7c4eb54d6035ca34d9f666c976d05f",
+  "expected_assertions": [
+    {
+      "subject_text": "Helena-03",
+      "predicate_raw": "maintains",
+      "object_text": "Atlas-03 cobalt competition notebook",
+      "object_literal": null,
+      "subject_entity_type": "person",
+      "object_entity_type": "document",
+      "confidence": 1.0,
+      "significance": "medium",
+      "source_event_time": null,
+      "start": 156,
+      "end": 221,
+      "quote": "Helena-03 now maintains the Atlas-03 cobalt competition notebook.",
+      "quote_hash": "9d599a69237e9149aadb0feaa50be437beaa32fcd031907cd28761f5be7e5e3c"
+    }
+  ],
+  "extract_rule_id": "household-fw08-b-extract"
+}

@@ -188,6 +188,10 @@ async fn assert_queue_plans(client: &StorageClient) {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client in the original fixture scope through assertions and cleanup."
+)]
 async fn production_queue_queries_use_indexes() {
     let client = StorageClient::new_memory().await.expect("Surreal memory");
     // Existing duplicate keys must not prevent this additive migration.
@@ -211,6 +215,10 @@ async fn production_queue_queries_use_indexes() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+)]
 async fn indexed_due_predicate_preserves_missing_null_and_scheduled_semantics() {
     let client = indexed_client().await;
     let repo = WorkItemRepository::new(client.clone());
@@ -242,6 +250,10 @@ async fn indexed_due_predicate_preserves_missing_null_and_scheduled_semantics() 
     );
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep repo in the original fixture scope through assertions and cleanup."
+)]
 async fn exercise_aggregate_counts(client: StorageClient) {
     let repo = WorkItemRepository::new(client);
     assert_eq!(repo.count_runnable().await.expect("empty runnable"), 0);
@@ -343,6 +355,10 @@ async fn measure_queue_operations(repo: &WorkItemRepository, history: usize) -> 
 /// Explicit expensive lane: more than 70,000 records, never part of unit gates.
 #[tokio::test]
 #[ignore = "explicit 50k-history queue scale lane"]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep repo in the original fixture scope through assertions and cleanup."
+)]
 async fn queue_indexes_scale_past_fifty_thousand_and_counts_are_exact() {
     let client = indexed_client().await;
     let repo = WorkItemRepository::new(client.clone());
@@ -466,6 +482,10 @@ async fn dependent_child(client: &StorageClient, sequence: u128, parent: &Record
     child
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep repo in the original fixture scope through assertions and cleanup."
+)]
 async fn measure_dependency_promotion(
     client: &StorageClient,
     parent: &RecordId,
@@ -520,6 +540,10 @@ async fn measure_dependency_promotion(
     elapsed[2]
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep repo in the original fixture scope through assertions and cleanup."
+)]
 async fn prepare_failed_recovery_fixture(client: &StorageClient) -> [RecordId; 2] {
     let repo = WorkItemRepository::new(client.clone());
     let mut cold = item(900_100, WorkItemStatus::Failed);
@@ -553,6 +577,10 @@ async fn prepare_failed_recovery_fixture(client: &StorageClient) -> [RecordId; 2
     [cold_id, hot_id]
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep repo in the original fixture scope through assertions and cleanup."
+)]
 async fn measure_failed_recovery(
     client: &StorageClient,
     expected: &[RecordId; 2],
@@ -597,6 +625,10 @@ async fn measure_failed_recovery(
 /// Exercises the production correlated promotion query, not a simplified proxy.
 #[tokio::test]
 #[ignore = "explicit 50k-cold-history dependency scale lane"]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+)]
 async fn dependency_promotion_stays_bounded_with_fifty_thousand_cold_items() {
     let client = indexed_client().await;
     client
@@ -732,6 +764,10 @@ async fn measure_retention_pass(client: &StorageClient, first: u128, runs: usize
 
 #[tokio::test]
 #[ignore = "explicit 50k-completed-attempt retention scale lane"]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep client in the original fixture scope through assertions and cleanup."
+)]
 async fn retention_pass_stays_bounded_with_fifty_thousand_completed_attempts() {
     let client = indexed_client().await;
     client

@@ -137,7 +137,7 @@ That commit phase is what creates assertions, relationships, attributes, and eve
 
 <Steps>
   <Step title="Resolve Subject Entity">
-    Look up by `subject_entity_id` (if the LLM found a match) or by identity key (lowercased display name). Identity-key reuse is type-guarded: all matches are fetched and the incoming type (normalized first) must be compatible with the candidate's -- `topic` is the unknown bucket and acts as a wildcard, upgrading to the specific incoming type on reuse. Ambiguous or type-incompatible matches route to an LLM disambiguator (`PIPELINE_PROMOTION_DISAMBIGUATION_MODEL`, active when `ANTHROPIC_API_KEY` is set); without one, incompatible types create a new entity rather than risking a false merge. Create if nothing matches.
+    Look up by `subject_entity_id` (if the LLM found a match) or by identity key (lowercased display name). Identity-key reuse is type-guarded: all matches are fetched and the incoming type (normalized first) must be compatible with the candidate's -- `topic` is the unknown bucket and acts as a wildcard, upgrading to the specific incoming type on reuse. Ambiguous or type-incompatible matches route to an LLM disambiguator using the current space's approved `promotion_disambiguation` binding; without one, incompatible types create a new entity rather than risking a false merge. Create if nothing matches.
   </Step>
   <Step title="Resolve Object Entity">
     Same process for entity-to-entity assertions. Skipped for literal-valued assertions.

@@ -1,0 +1,20 @@
+{
+  "format": "recall-full-context-catalog/v1",
+  "retrieved_at": "2026-10-06T23:38:47.412978+00:00",
+  "model": "gpt-6.1-sol",
+  "context_tokens": 1050000,
+  "max_output_tokens": 128000,
+  "service_tier": "standard",
+  "regional_processing": false,
+  "hosted_paid_tools": false,
+  "long_context_usd_per_million": {
+    "input": "4.00",
+    "cache_write": "5.00",
+    "output": "15.00"
+  },
+  "model_url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+  "pricing_url": "https://developers.openai.com/api/docs/pricing",
+  "output_limit_url": "https://developers.openai.com/api/reference/python/resources/responses/methods/create",
+  "custody": "Public official documentation review only; normalized facts, no account/model request or raw-page archive.",
+  "limit": "Mutable model alias and current published contractual limits/prices, not a remote deployment pin or guarantee against provider billing defects."
+}

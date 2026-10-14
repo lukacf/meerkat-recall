@@ -8,6 +8,8 @@
 //! - Rel/Attribute synthesis from resolved assertions
 //! - Retry mechanics for abstained assertions
 
+pub(crate) mod reprocess;
+
 #[cfg(feature = "meerkat-extraction")]
 use std::str::FromStr;
 use std::sync::Arc;
@@ -36,15 +38,13 @@ use elephant_types::{Link, RecordId, TableName};
 use serde::{Deserialize, Serialize};
 
 use crate::error::PipelineError;
+use crate::maintenance_commit::{same_partition, PlanningTruthMaintenanceStorage};
 use crate::predicate::{can_use_for_truth, PredicateProposalData, ProposedAlias};
 use crate::provenance::apply_work_run_provenance;
-use crate::scheduler::budget::BudgetEnforcer;
+use crate::scheduler::budget::{BudgetCheckResult, BudgetEnforcer};
 use crate::scheduler::staged_commit::StagedCommit;
-
-// run_anthropic_prompt is not used by the agentic disambiguator but may be used elsewhere
-#[cfg(feature = "meerkat-extraction")]
-#[allow(unused_imports)]
-use crate::llm::run_anthropic_prompt;
+use crate::truth_maintenance::TruthMaintenanceStorage;
+use elephant_types::publication::AttemptFence;
 
 // ============================================================================
 // Match Keys
@@ -233,7 +233,6 @@ pub trait ResolutionDisambiguator: Send + Sync + std::fmt::Debug {
 #[cfg(feature = "meerkat-extraction")]
 #[derive(Debug)]
 pub struct AgenticDisambiguator {
-    model: String,
     storage: StorageClient,
     /// Maximum tool call iterations before forcing a decision.
     max_iterations: usize,
@@ -245,11 +244,11 @@ pub struct AgenticDisambiguator {
 
 #[cfg(feature = "meerkat-extraction")]
 impl AgenticDisambiguator {
-    /// Creates a new agentic disambiguator.
+    /// Creates a new agentic disambiguator. The legacy model hint is retained
+    /// for caller compatibility; the current space binding selects the model.
     #[must_use]
-    pub fn new(model: impl Into<String>, storage: StorageClient) -> Self {
+    pub fn new(_model: impl Into<String>, storage: StorageClient) -> Self {
         Self {
-            model: model.into(),
             storage,
             max_iterations: 3,
             assertion_limit: 5,
@@ -542,16 +541,52 @@ impl DisambiguatorToolDispatcher {
 }
 
 #[cfg(feature = "meerkat-extraction")]
+async fn collect_disambiguation_turn(
+    mut stream: impl futures::Stream<Item = Result<meerkat::LlmEvent, meerkat::LlmError>> + Unpin,
+) -> Result<(String, Vec<meerkat::ToolCall>), PipelineError> {
+    use futures::StreamExt;
+    use meerkat::{LlmDoneOutcome, LlmEvent};
+
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    while let Some(result) = stream.next().await {
+        match result
+            .map_err(|error| PipelineError::ExtractionError(format!("LLM stream error: {error}")))?
+        {
+            LlmEvent::TextDelta { delta, .. } => content.push_str(&delta),
+            LlmEvent::ToolCallComplete { id, name, args, .. } => {
+                tool_calls.push(meerkat::ToolCall::new(id, name, args));
+            }
+            LlmEvent::Done {
+                outcome: LlmDoneOutcome::Success { .. },
+            } => {
+                return Ok((content, tool_calls));
+            }
+            LlmEvent::Done {
+                outcome: LlmDoneOutcome::Error { error },
+            } => {
+                return Err(PipelineError::ExtractionError(format!(
+                    "LLM stream error: {error}"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Err(PipelineError::ExtractionError(
+        "LLM stream ended without a completion outcome".into(),
+    ))
+}
+
+#[cfg(feature = "meerkat-extraction")]
 #[async_trait]
 impl ResolutionDisambiguator for AgenticDisambiguator {
     async fn disambiguate(
         &self,
         ctx: DisambiguationContext,
     ) -> Result<Option<RecordId>, PipelineError> {
-        use futures::StreamExt;
         use meerkat::{
-            AnthropicClient, AssistantBlock, BlockAssistantMessage, LlmClient, LlmEvent,
-            LlmRequest, Message, SystemMessage, ToolDef, UserMessage,
+            AssistantBlock, BlockAssistantMessage, LlmRequest, Message, SystemMessage, ToolDef,
+            UserMessage,
         };
         use serde_json::value::RawValue;
 
@@ -559,19 +594,13 @@ impl ResolutionDisambiguator for AgenticDisambiguator {
             return Ok(None);
         }
 
-        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-            Ok(key) => key,
-            Err(_) => {
-                tracing::warn!(
-                    model = %self.model,
-                    "ANTHROPIC_API_KEY not set, skipping disambiguation"
-                );
-                return Ok(None);
-            }
-        };
-
-        let client = AnthropicClient::new(api_key)
-            .map_err(|e| PipelineError::ExtractionError(e.to_string()))?;
+        let context = crate::provider_dispatch::ProviderDispatchContext::new(
+            elephant_storage::SpaceConfigRepository::new(self.storage.clone()),
+            &ctx.assertion.base.space_id,
+        );
+        let (model, client, _provenance) = context
+            .model_client(elephant_types::provider_binding::ModelOperation::IdentityDisambiguation)
+            .await?;
 
         // Build tool definitions
         let tool_defs: Vec<Arc<ToolDef>> = Self::tool_definitions()
@@ -613,7 +642,7 @@ impl ResolutionDisambiguator for AgenticDisambiguator {
             }
 
             let request = LlmRequest {
-                model: self.model.clone(),
+                model: model.clone(),
                 messages: messages.clone(),
                 tools: tool_defs.clone(),
                 tool_choice: Default::default(),
@@ -623,29 +652,8 @@ impl ResolutionDisambiguator for AgenticDisambiguator {
                 provider_params: None,
             };
 
-            let mut stream = client.stream(&request);
-            let mut content = String::new();
-            let mut tool_calls: Vec<meerkat::ToolCall> = Vec::new();
-
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(event) => match event {
-                        LlmEvent::TextDelta { delta, .. } => {
-                            content.push_str(&delta);
-                        }
-                        LlmEvent::ToolCallComplete { id, name, args, .. } => {
-                            tool_calls.push(meerkat::ToolCall::new(id, name, args));
-                        }
-                        LlmEvent::Done { .. } => break,
-                        _ => {}
-                    },
-                    Err(e) => {
-                        return Err(PipelineError::ExtractionError(format!(
-                            "LLM stream error: {e}"
-                        )));
-                    }
-                }
-            }
+            let (content, tool_calls) =
+                collect_disambiguation_turn(client.stream(&request)).await?;
 
             // If no tool calls, try to parse the response as an entity ID
             if tool_calls.is_empty() {
@@ -1418,6 +1426,10 @@ pub fn score_candidates(
 #[allow(missing_docs)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResolutionPatch {
+    /// Epoch captured before decision/candidate/provider reads. Background
+    /// decisions must retain it through staging, validation and commit.
+    #[serde(default)]
+    pub prepared_epoch: Option<String>,
     pub assertion_id: RecordId,
     pub resolved_subject: Option<RecordId>,
     pub resolved_object: Option<RecordId>,
@@ -1581,44 +1593,161 @@ pub async fn apply_resolution_patch(
     backoff_config: &BackoffConfig,
     max_attempts: Option<u32>,
 ) -> Result<(), PipelineError> {
-    let assertion_repo = AssertionRepository::new(storage.clone());
-    let assertion = assertion_repo
-        .get(space_id, &patch.assertion_id)
-        .await
-        .map_err(PipelineError::StorageError)?
-        .ok_or_else(|| PipelineError::NotFound(patch.assertion_id.to_string()))?;
-    if assertion.resolution_status != ResolutionStatus::Pending {
-        return Err(PipelineError::InvalidState(format!(
-            "Assertion {} is no longer pending",
-            patch.assertion_id
-        )));
+    apply_resolution_patches_with_attempt(
+        storage,
+        space_id,
+        &patch.assertion_id.to_string(),
+        std::slice::from_ref(patch),
+        backoff_config,
+        max_attempts,
+        None,
+    )
+    .await
+}
+
+/// Apply every resolution patch in one canonical transaction with audit/outbox.
+/// The stable commit identity is normally the bundle artifact ID. Background
+/// callers must pass the original claimed attempt, never reconstruct a new one.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_resolution_patches_with_attempt(
+    storage: &StorageClient,
+    space_id: &str,
+    commit_id: &str,
+    patches: &[ResolutionPatch],
+    backoff_config: &BackoffConfig,
+    max_attempts: Option<u32>,
+    attempt: Option<AttemptFence>,
+) -> Result<(), PipelineError> {
+    let planning = PlanningTruthMaintenanceStorage::new(storage.clone(), space_id, attempt).await?;
+    let request = resolution_request(patches, backoff_config, max_attempts);
+    if planning
+        .replay::<()>("resolution", commit_id, &request)
+        .await?
+        .is_some()
+    {
+        return Ok(());
     }
+    prepare_resolution_patches(&planning, space_id, patches, backoff_config, max_attempts).await?;
+    planning
+        .commit("resolution", commit_id, &request, &())
+        .await?;
+    Ok(())
+}
 
-    let updated =
-        apply_resolution_patch_to_assertion(assertion, patch, backoff_config, max_attempts);
+fn resolution_request(
+    patches: &[ResolutionPatch],
+    backoff: &BackoffConfig,
+    max_attempts: Option<u32>,
+) -> serde_json::Value {
+    serde_json::json!({"patches": patches, "base_delay_secs": backoff.base_delay_secs,
+        "max_delay_secs": backoff.max_delay_secs, "max_attempts": max_attempts})
+}
 
-    let updated = assertion_repo
-        .update_if_resolution_status(
-            space_id,
-            &patch.assertion_id,
-            updated,
-            ResolutionStatus::Pending,
-        )
-        .await
-        .map_err(PipelineError::StorageError)?;
-    if updated.is_none() {
-        return Err(PipelineError::InvalidState(format!(
-            "Assertion {} was updated by another resolution patch",
-            patch.assertion_id
-        )));
+/// Prepare patches against the same epoch/read set as their surrounding bundle.
+/// No live mutation occurs if a later patch, evidence check or precondition fails.
+pub async fn prepare_resolution_patches(
+    planning: &PlanningTruthMaintenanceStorage,
+    space_id: &str,
+    patches: &[ResolutionPatch],
+    backoff: &BackoffConfig,
+    max_attempts: Option<u32>,
+) -> Result<(), PipelineError> {
+    let mut seen = std::collections::HashSet::new();
+    for patch in patches {
+        if let Some(expected) = &patch.prepared_epoch {
+            if planning.prepared_epoch()?.as_ref() != Some(expected) {
+                return Err(PipelineError::InvalidState(
+                    "resolution decision inputs changed; reprepare".to_owned(),
+                ));
+            }
+        } else if planning.has_attempt() {
+            return Err(PipelineError::InvalidState(
+                "background resolution lacks its original decision epoch".to_owned(),
+            ));
+        }
+
+        if !seen.insert(patch.assertion_id.clone()) {
+            return Err(PipelineError::InvalidInput(
+                "resolution batch contains duplicate assertion targets".to_owned(),
+            ));
+        }
+        if !patch.confidence.is_finite()
+            || !(0.0..=1.0).contains(&patch.confidence)
+            || patch.resolution_method.trim().is_empty()
+            || (patch.status == ResolutionStatus::Abstained
+                && patch
+                    .abstention_reason
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty()))
+            || (patch.status == ResolutionStatus::Resolved
+                && patch.resolved_subject.is_none()
+                && patch.resolved_object.is_none())
+        {
+            return Err(PipelineError::InvalidInput(
+                "invalid resolution patch payload".to_owned(),
+            ));
+        }
+        let before = planning
+            .get_assertion(space_id, &patch.assertion_id)
+            .await?
+            .ok_or_else(|| PipelineError::NotFound(patch.assertion_id.to_string()))?;
+        if before.resolution_status != ResolutionStatus::Pending {
+            return Err(PipelineError::InvalidState(format!(
+                "assertion {} is no longer pending",
+                patch.assertion_id
+            )));
+        }
+        planning.validate_assertion_evidence(&before).await?;
+        for id in patch
+            .resolved_subject
+            .iter()
+            .chain(patch.resolved_object.iter())
+        {
+            let entity = planning
+                .get_entity(space_id, id)
+                .await?
+                .ok_or_else(|| PipelineError::NotFound(id.to_string()))?;
+            if !same_partition(&before.base, &entity.base)? {
+                return Err(PipelineError::InvalidState(
+                    "resolved entity crosses the assertion support/security partition".to_owned(),
+                ));
+            }
+        }
+        let mut after =
+            apply_resolution_patch_to_assertion(before.clone(), patch, backoff, max_attempts);
+        after.base.updated_at = Utc::now();
+        planning.stage_assertion(before.clone(), after.clone())?;
+        let now = Utc::now();
+        planning
+            .create_audit_log(elephant_types::records::AuditLog {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::AuditLog),
+                    space_id.to_owned(),
+                    "resolution".to_owned(),
+                ),
+                action: elephant_types::records::AuditAction::Update,
+                actor: "resolution".to_owned(),
+                record: patch.assertion_id.clone(),
+                before: Some(
+                    serde_json::to_value(&before)
+                        .map_err(|e| PipelineError::InvalidInput(e.to_string()))?,
+                ),
+                after: Some(
+                    serde_json::to_value(&after)
+                        .map_err(|e| PipelineError::InvalidInput(e.to_string()))?,
+                ),
+                timestamp: now,
+                reason: Some("resolution_patch".to_owned()),
+            })
+            .await?;
     }
-
     Ok(())
 }
 
 #[allow(missing_docs)]
 #[derive(Debug, Clone)]
 pub struct ResolutionPatchWorkflow {
+    attempt: Option<AttemptFence>,
     staged_commit: StagedCommit,
     storage: StorageClient,
 }
@@ -1628,9 +1757,17 @@ impl ResolutionPatchWorkflow {
     #[must_use]
     pub fn new(storage: StorageClient) -> Self {
         Self {
+            attempt: None,
             staged_commit: StagedCommit::new(storage.clone()),
             storage,
         }
+    }
+
+    /// Bind compatibility dispatch to the original currently claimed attempt.
+    #[must_use]
+    pub fn with_attempt(mut self, attempt: AttemptFence) -> Self {
+        self.attempt = Some(attempt);
+        self
     }
 
     /// Stages a draft resolution patch artifact for later validation and commit.
@@ -1640,12 +1777,21 @@ impl ResolutionPatchWorkflow {
         patch: ResolutionPatch,
         space_id: &str,
     ) -> Result<WorkArtifact, PipelineError> {
-        let artifact_id = RecordId::new_v4(TableName::WorkArtifact);
-        let mut base = BaseFields::new(
-            artifact_id,
-            space_id.to_string(),
-            "resolution_patch_workflow".to_string(),
-        );
+        let assertion = AssertionRepository::new(self.storage.clone())
+            .get(space_id, &patch.assertion_id)
+            .await?
+            .ok_or_else(|| PipelineError::NotFound(patch.assertion_id.to_string()))?;
+        let run = WorkRunRepository::new(self.storage.clone())
+            .get(space_id, work_run_id)
+            .await?
+            .ok_or_else(|| PipelineError::NotFound(work_run_id.to_string()))?;
+        let mut base = assertion.base.clone();
+        elephant_storage::public_mutation::inherit_public_envelope(&mut base, &run.base)?;
+        base.id = RecordId::new_v4(TableName::WorkArtifact);
+        base.created_at = Utc::now();
+        base.updated_at = base.created_at;
+        base.created_by = "resolution_patch_workflow".into();
+        base.deleted_at = None;
         apply_work_run_provenance(&self.storage, work_run_id, space_id, &mut base.provenance)
             .await?;
 
@@ -1698,7 +1844,7 @@ impl ResolutionPatchWorkflow {
             .await
     }
 
-    /// Commits a validated resolution patch into the target assertion.
+    /// Commits a validated resolution patch with its artifact and propagation.
     pub async fn commit_resolution_patch(
         &self,
         space_id: &str,
@@ -1706,57 +1852,292 @@ impl ResolutionPatchWorkflow {
         backoff_config: &BackoffConfig,
         max_attempts: Option<u32>,
     ) -> Result<WorkArtifact, PipelineError> {
-        let artifact_repo = WorkArtifactRepository::new(self.storage.clone());
-        let artifact = artifact_repo
-            .get(space_id, artifact_id)
-            .await
-            .map_err(PipelineError::StorageError)?
-            .ok_or_else(|| PipelineError::NotFound(artifact_id.to_string()))?;
-        let patch: ResolutionPatch =
-            serde_json::from_value(artifact.data.clone()).map_err(|e| {
-                PipelineError::InvalidInput(format!("Invalid resolution patch data: {e}"))
-            })?;
+        self.commit_resolution_patch_batch(
+            space_id,
+            std::slice::from_ref(artifact_id),
+            backoff_config,
+            max_attempts,
+        )
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| PipelineError::InvalidState("resolution batch returned no artifact".into()))
+    }
 
-        let work_run_repo = WorkRunRepository::new(self.storage.clone());
-        let work_run = work_run_repo
-            .get(space_id, artifact.work_run.id())
-            .await
-            .map_err(PipelineError::StorageError)?
-            .ok_or_else(|| PipelineError::NotFound(artifact.work_run.id().to_string()))?;
-        let actual_cost = work_run.metrics.estimated_cost_euros;
-        let budget_enforcer = BudgetEnforcer::new(
+    /// Apply a complete exposed batch, including all artifact statuses, atomically.
+    pub async fn commit_resolution_patch_batch(
+        &self,
+        space_id: &str,
+        artifact_ids: &[RecordId],
+        backoff_config: &BackoffConfig,
+        max_attempts: Option<u32>,
+    ) -> Result<Vec<WorkArtifact>, PipelineError> {
+        self.commit_resolution_artifact_batch(
+            space_id,
+            artifact_ids,
+            backoff_config,
+            max_attempts,
+            false,
+        )
+        .await
+    }
+
+    /// Atomically applies validated resolution bundles and their exact source
+    /// artifacts. Every bundle must retain the original decision epoch and run.
+    pub async fn commit_resolution_bundle_batch(
+        &self,
+        space_id: &str,
+        artifact_ids: &[RecordId],
+        backoff_config: &BackoffConfig,
+        max_attempts: Option<u32>,
+    ) -> Result<Vec<WorkArtifact>, PipelineError> {
+        self.commit_resolution_artifact_batch(
+            space_id,
+            artifact_ids,
+            backoff_config,
+            max_attempts,
+            true,
+        )
+        .await
+    }
+
+    async fn commit_resolution_artifact_batch(
+        &self,
+        space_id: &str,
+        artifact_ids: &[RecordId],
+        backoff_config: &BackoffConfig,
+        max_attempts: Option<u32>,
+        bundles: bool,
+    ) -> Result<Vec<WorkArtifact>, PipelineError> {
+        use crate::scheduler::staged_commit::{
+            CommitBundleArtifactData, CommitBundleKind, CommitBundlePayload,
+            COMMIT_BUNDLE_ARTIFACT_TYPE,
+        };
+        if artifact_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let planning = PlanningTruthMaintenanceStorage::new(
             self.storage.clone(),
-            Budget::default(),
-            space_id.to_string(),
-        );
-        let storage = self.storage.clone();
-        let patch = patch.clone();
-        let backoff_config = backoff_config.clone();
-
-        self.staged_commit
-            .commit_with_budget_check(
-                space_id,
-                artifact_id,
-                &budget_enforcer,
-                IngestMode::Graph,
-                actual_cost,
-                move |_| {
-                    let storage = storage.clone();
-                    let patch = patch.clone();
-                    let backoff_config = backoff_config.clone();
-                    async move {
-                        apply_resolution_patch(
-                            &storage,
-                            space_id,
-                            &patch,
-                            &backoff_config,
-                            max_attempts,
-                        )
-                        .await
+            space_id,
+            self.attempt.clone(),
+        )
+        .await?;
+        let artifact_repo = WorkArtifactRepository::new(self.storage.clone());
+        let mut ids = artifact_ids.to_vec();
+        ids.sort();
+        ids.dedup();
+        if ids.len() != artifact_ids.len() {
+            return Err(PipelineError::InvalidInput(
+                "duplicate resolution artifact".into(),
+            ));
+        }
+        let mut artifacts = Vec::new();
+        let mut patches = Vec::new();
+        let mut source_artifacts = Vec::new();
+        let mut source_ids = std::collections::HashSet::new();
+        for id in &ids {
+            let artifact = artifact_repo
+                .get(space_id, id)
+                .await?
+                .ok_or_else(|| PipelineError::NotFound(id.to_string()))?;
+            let patch = if bundles {
+                if artifact.artifact_type != COMMIT_BUNDLE_ARTIFACT_TYPE {
+                    return Err(PipelineError::InvalidInput(
+                        "not a resolution bundle".into(),
+                    ));
+                }
+                let bundle: CommitBundleArtifactData =
+                    serde_json::from_value(artifact.data.clone()).map_err(|e| {
+                        PipelineError::InvalidInput(format!("invalid resolution bundle: {e}"))
+                    })?;
+                let CommitBundlePayload::ResolutionPatchSet(patch) = bundle.payload else {
+                    return Err(PipelineError::InvalidInput(
+                        "not a resolution bundle payload".into(),
+                    ));
+                };
+                if bundle.bundle_kind != CommitBundleKind::ResolutionPatchSet
+                    || bundle.source_artifact_type != RESOLUTION_PATCH_ARTIFACT_TYPE
+                    || patch.prepared_epoch.is_none()
+                {
+                    return Err(PipelineError::InvalidState(
+                        "resolution bundle lacks original decision authority".into(),
+                    ));
+                }
+                let source_id = bundle.source_artifact_id.parse::<RecordId>().map_err(|e| {
+                    PipelineError::InvalidInput(format!("invalid resolution source artifact: {e}"))
+                })?;
+                if !source_ids.insert(source_id.clone()) {
+                    return Err(PipelineError::InvalidInput(
+                        "duplicate resolution source artifact".into(),
+                    ));
+                }
+                let source = artifact_repo
+                    .get(space_id, &source_id)
+                    .await?
+                    .ok_or_else(|| PipelineError::NotFound(source_id.to_string()))?;
+                let encoded_patch = serde_json::to_value(&patch).map_err(|e| {
+                    PipelineError::InvalidInput(format!("invalid resolution patch: {e}"))
+                })?;
+                if source.artifact_type != RESOLUTION_PATCH_ARTIFACT_TYPE
+                    || source.work_run != artifact.work_run
+                    || !same_partition(&source.base, &artifact.base)?
+                    || source.data != encoded_patch
+                {
+                    return Err(PipelineError::InvalidState(
+                        "resolution bundle differs from its original source artifact".into(),
+                    ));
+                }
+                source_artifacts.push(source);
+                patch
+            } else {
+                if artifact.artifact_type != RESOLUTION_PATCH_ARTIFACT_TYPE {
+                    return Err(PipelineError::InvalidInput(
+                        "not a resolution patch artifact".into(),
+                    ));
+                }
+                serde_json::from_value(artifact.data.clone()).map_err(|e| {
+                    PipelineError::InvalidInput(format!("invalid resolution patch: {e}"))
+                })?
+            };
+            artifacts.push(artifact);
+            patches.push(patch);
+        }
+        let patch_request = resolution_request(&patches, backoff_config, max_attempts);
+        let kind = if bundles {
+            "resolution_bundles"
+        } else {
+            "resolution_artifacts"
+        };
+        let request = if bundles {
+            // Lifecycle timestamps/statuses change on success; immutable request
+            // identity and original authority must remain bound on replay.
+            let original_artifacts: Vec<_> = artifacts
+                .iter()
+                .chain(&source_artifacts)
+                .map(|row| {
+                    serde_json::json!({"id":row.base.id,"data":row.data,"work_run":row.work_run,
+                    "security":row.base.security,"subjects":row.base.subjects,
+                    "subjects_state":row.base.subjects_state,"provenance":row.base.provenance})
+                })
+                .collect();
+            serde_json::json!({"resolution":patch_request,"artifacts":original_artifacts})
+        } else {
+            patch_request
+        };
+        let scope = crate::maintenance_commit::request_fingerprint(&ids)?;
+        if let Some(previous) = planning.replay(kind, &scope, &request).await? {
+            return Ok(previous);
+        }
+        if artifacts
+            .iter()
+            .chain(&source_artifacts)
+            .any(|row| row.status != ArtifactStatus::Validated)
+        {
+            return Err(PipelineError::InvalidState(
+                "resolution batch has an artifact without a matching complete receipt".into(),
+            ));
+        }
+        let mut runs = std::collections::HashSet::new();
+        let mut estimated_cost = 0.0;
+        for artifact in &artifacts {
+            if runs.insert(artifact.work_run.id().clone()) {
+                let run = WorkRunRepository::new(self.storage.clone())
+                    .get(space_id, artifact.work_run.id())
+                    .await?
+                    .ok_or_else(|| PipelineError::NotFound(artifact.work_run.id().to_string()))?;
+                if !run.metrics.estimated_cost_euros.is_finite()
+                    || run.metrics.estimated_cost_euros < 0.0
+                {
+                    return Err(PipelineError::InvalidState(
+                        "resolution run cost is invalid".into(),
+                    ));
+                }
+                planning.observe(&run)?;
+                if bundles {
+                    for member in artifacts
+                        .iter()
+                        .filter(|member| member.work_run == artifact.work_run)
+                    {
+                        if !crate::maintenance_commit::contains_authorization(
+                            &member.base,
+                            &run.base,
+                        )? || run
+                            .base
+                            .provenance
+                            .sources
+                            .iter()
+                            .any(|id| !member.base.provenance.sources.contains(id))
+                        {
+                            return Err(PipelineError::InvalidState(
+                                "resolution artifact weakened its run authority".into(),
+                            ));
+                        }
                     }
-                },
-            )
-            .await
+                }
+                estimated_cost += run.metrics.estimated_cost_euros;
+            }
+        }
+        if !estimated_cost.is_finite() {
+            return Err(PipelineError::InvalidState(
+                "resolution batch cost overflowed".into(),
+            ));
+        }
+        let budget =
+            BudgetEnforcer::new(self.storage.clone(), Budget::default(), space_id.to_owned());
+        match budget
+            .check_budget_at_commit(IngestMode::Graph, estimated_cost)
+            .await?
+        {
+            BudgetCheckResult::Allowed => {}
+            other => {
+                return Err(PipelineError::BudgetExceeded(format!(
+                    "resolution commit budget refused: {other:?}"
+                )))
+            }
+        }
+        if bundles {
+            for (artifact, patch) in artifacts.iter().zip(&patches) {
+                let assertion = AssertionRepository::new(self.storage.clone())
+                    .get(space_id, &patch.assertion_id)
+                    .await?
+                    .ok_or_else(|| PipelineError::NotFound(patch.assertion_id.to_string()))?;
+                planning.observe(&assertion)?;
+                if !crate::maintenance_commit::contains_authorization(
+                    &artifact.base,
+                    &assertion.base,
+                )? || assertion
+                    .base
+                    .provenance
+                    .sources
+                    .iter()
+                    .any(|id| !artifact.base.provenance.sources.contains(id))
+                {
+                    return Err(PipelineError::InvalidState(
+                        "resolution artifact weakened its assertion authority".into(),
+                    ));
+                }
+            }
+        }
+        prepare_resolution_patches(&planning, space_id, &patches, backoff_config, max_attempts)
+            .await?;
+        for artifact in source_artifacts {
+            let mut after = artifact.clone();
+            after.status = ArtifactStatus::Committed;
+            after.committed_at = Some(Utc::now());
+            after.base.updated_at = Utc::now();
+            planning.stage_artifact(artifact, after)?;
+        }
+        let mut committed = Vec::new();
+        for artifact in artifacts {
+            let mut after = artifact.clone();
+            after.status = ArtifactStatus::Committed;
+            after.committed_at = Some(Utc::now());
+            after.base.updated_at = Utc::now();
+            planning.stage_artifact(artifact, after.clone())?;
+            committed.push(after);
+        }
+        planning.commit(kind, &scope, &request, &committed).await?;
+        Ok(committed)
     }
 }
 
@@ -1828,21 +2209,20 @@ pub mod commit_resolution_patches {
             .find_by_work_run(work_run_id)
             .await
             .map_err(PipelineError::StorageError)?;
-        let mut results = Vec::new();
-        for artifact in artifacts {
-            if artifact.status == ArtifactStatus::Validated {
-                let committed = workflow
-                    .commit_resolution_patch(
-                        space_id,
-                        &artifact.base.id,
-                        backoff_config,
-                        max_attempts,
+        let ids = artifacts
+            .into_iter()
+            .filter(|row| {
+                row.artifact_type == super::RESOLUTION_PATCH_ARTIFACT_TYPE
+                    && matches!(
+                        row.status,
+                        ArtifactStatus::Validated | ArtifactStatus::Committed
                     )
-                    .await?;
-                results.push(committed);
-            }
-        }
-        Ok(results)
+            })
+            .map(|row| row.base.id)
+            .collect::<Vec<_>>();
+        workflow
+            .commit_resolution_patch_batch(space_id, &ids, backoff_config, max_attempts)
+            .await
     }
 }
 
@@ -2152,5 +2532,45 @@ mod agentic_resolution_tests {
             .expect("outgoing relations should be an array");
         assert_eq!(outgoing.len(), 1);
         assert_eq!(outgoing[0]["rel_type"], serde_json::Value::from("works_at"));
+    }
+    #[cfg(feature = "meerkat-extraction")]
+    #[tokio::test]
+    async fn disambiguation_requires_successful_terminal_outcome() {
+        use meerkat::{LlmDoneOutcome, LlmError, LlmEvent, StopReason};
+        let text = || {
+            Ok(LlmEvent::TextDelta {
+                delta: "entity:chosen".into(),
+                meta: None,
+            })
+        };
+        for events in [
+            vec![
+                text(),
+                Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Error {
+                        error: LlmError::ServerOverloaded,
+                    },
+                }),
+            ],
+            vec![text(), Err(LlmError::ServerOverloaded)],
+            vec![text()],
+        ] {
+            assert!(matches!(
+                collect_disambiguation_turn(futures::stream::iter(events)).await,
+                Err(PipelineError::ExtractionError(_))
+            ));
+        }
+        let (content, calls) = collect_disambiguation_turn(futures::stream::iter([
+            text(),
+            Ok(LlmEvent::Done {
+                outcome: LlmDoneOutcome::Success {
+                    stop_reason: StopReason::EndTurn,
+                },
+            }),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(content, "entity:chosen");
+        assert!(calls.is_empty());
     }
 }

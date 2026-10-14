@@ -35,11 +35,13 @@
 //!
 //! Two tiers:
 //! - `scenario_s5_19_truth_adjudication_deterministic` (CI-safe): claims are
-//!   seeded through real inline promotion with fixture assertions and the TM
-//!   phase runs with a scripted `FakeAdjudicator`. No env, no network.
+//!   published through accepted sources, a real dispatcher/finalizer and fixed
+//!   independently supported assertions. Embeddings use loopback HTTP transport
+//!   spies only; the scripted adjudicator does not qualify model semantics.
 //! - `scenario_s5_19_truth_adjudication_real_llm` (`#[ignore]`): real document
 //!   ingestion, `AgenticExtractor` extraction, and a real
-//!   `AgenticSlotAdjudicator`. Requires `ANTHROPIC_API_KEY`.
+//!   `AgenticSlotAdjudicator`. Requires explicit `RECALL_E2E_PROCESSING_CONFIG`
+//!   and the credential references it approves; never executed by source review.
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -106,7 +108,7 @@ use meerkat_core::types::{ToolCallView, ToolResult};
 
 use crate::Harness;
 
-const SPACE_ID: &str = "default";
+const SPACE_ID: &str = "truth-adjudication";
 const ACTOR: &str = "scenario";
 
 const DOC_A_TEXT: &str =
@@ -216,8 +218,11 @@ async fn run_truth_maintenance_phase(
     );
 
     let tm_storage = RepositoryTruthMaintenanceStorage::new(client.clone());
-    let detect =
-        execute_tm_detect_conflicts_from_outbox_events(&outbox_events, &tm_storage).await?;
+    let detect = Box::pin(execute_tm_detect_conflicts_from_outbox_events(
+        &outbox_events,
+        &tm_storage,
+    ))
+    .await?;
     eprintln!(
         "[s5_19] TM detect: events={} conflicts={} direct_commits={} groups={}",
         detect.events_processed,
@@ -227,7 +232,13 @@ async fn run_truth_maintenance_phase(
     );
 
     for commit in &detect.direct_commits {
-        execute_tm_commit(&commit.resolution, &commit.input, SPACE_ID, &tm_storage).await?;
+        Box::pin(execute_tm_commit(
+            &commit.resolution,
+            &commit.input,
+            SPACE_ID,
+            &tm_storage,
+        ))
+        .await?;
     }
 
     let conflict_repo = ConflictGroupRepository::new(client.clone());
@@ -240,13 +251,24 @@ async fn run_truth_maintenance_phase(
         let Some(group) = conflict_repo.get(SPACE_ID, group_id).await? else {
             continue;
         };
-        let (resolution, input) =
-            resolve_conflict_group_with_storage(ctx, &group, SPACE_ID, &tm_storage).await?;
+        let (resolution, input) = Box::pin(resolve_conflict_group_with_storage(
+            ctx,
+            &group,
+            SPACE_ID,
+            &tm_storage,
+        ))
+        .await?;
         eprintln!(
             "[s5_19] resolved group {} ({}): {resolution:?}",
             group_id, group.slot_type
         );
-        execute_tm_commit(&resolution, &input, SPACE_ID, &tm_storage).await?;
+        Box::pin(execute_tm_commit(
+            &resolution,
+            &input,
+            SPACE_ID,
+            &tm_storage,
+        ))
+        .await?;
         resolved_group_ids.push(group_id.clone());
     }
 
@@ -577,105 +599,6 @@ async fn assert_semantics_llm_proposed(
 // Deterministic tier: fixture promotion + scripted adjudicator
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn create_revision_with_node(
-    client: &StorageClient,
-    title: &str,
-    text: &str,
-) -> anyhow::Result<(RecordId, RecordId)> {
-    let doc_repo = DocRepository::new(client.clone());
-    let revision_repo = DocRevisionRepository::new(client.clone());
-    let node_repo = DocNodeRepository::new(client.clone());
-
-    let doc_id = RecordId::new_v4(TableName::Doc);
-    let doc = Doc {
-        base: BaseFields::new(doc_id.clone(), SPACE_ID.to_string(), ACTOR.to_string()),
-        title: title.to_string(),
-        text: text.to_string(),
-        sidecar_text: None,
-        source: None,
-        media_attachments: Vec::new(),
-        rendition_key: format!("s5-19-{}", uuid::Uuid::new_v4()),
-        metadata: serde_json::json!({}),
-    };
-    doc_repo.create(doc).await?;
-
-    let revision_id = RecordId::new_v4(TableName::DocRevision);
-    let revision = DocRevision {
-        base: BaseFields::new(revision_id.clone(), SPACE_ID.to_string(), ACTOR.to_string()),
-        doc: Link::new(doc_id),
-        text: text.to_string(),
-        text_hash: format!("s5-19-hash-{}", uuid::Uuid::new_v4()),
-        renderer: RendererMetadata {
-            name: "fixture_renderer".to_string(),
-            version: "1.0.0".to_string(),
-            config_hash: None,
-        },
-        manifest: None,
-        supersedes: None,
-        status: RevisionStatus::Active,
-        rendered_at: Utc::now(),
-    };
-    revision_repo.create(revision).await?;
-
-    let node_id = RecordId::new_v4(TableName::DocNode);
-    let node = DocNode {
-        base: BaseFields::new(node_id.clone(), SPACE_ID.to_string(), ACTOR.to_string()),
-        revision: Link::new(revision_id.clone()),
-        role: NodeRole::Paragraph,
-        span: TextSpan::new(0, u32::try_from(text.len()).unwrap_or(u32::MAX)),
-        node_key: format!("node:{node_id}"),
-        text: None,
-        parent: None,
-        position: 0,
-        depth: 1,
-        embedding_model: None,
-        collection: None,
-    };
-    node_repo.create(node).await?;
-
-    Ok((revision_id, node_id))
-}
-
-async fn create_work_run(client: &StorageClient) -> anyhow::Result<RecordId> {
-    let item_repo = WorkItemRepository::new(client.clone());
-    let run_repo = WorkRunRepository::new(client.clone());
-
-    let item_id = RecordId::new_v4(TableName::WorkItem);
-    let item = WorkItem {
-        base: BaseFields::new(item_id.clone(), SPACE_ID.to_string(), ACTOR.to_string()),
-        kind: "extract_assertions".to_string(),
-        payload: serde_json::json!({}),
-        status: WorkItemStatus::Runnable,
-        priority: 5,
-        idempotency_key: format!("s5-19:{}", uuid::Uuid::new_v4()),
-        attempts: 0,
-        lease_expires_at: None,
-        leased_by: None,
-        run_after: None,
-        last_error: None,
-    };
-    item_repo.create(item).await?;
-
-    let work_run_id = RecordId::new_v4(TableName::WorkRun);
-    let run = WorkRun {
-        base: BaseFields::new(work_run_id.clone(), SPACE_ID.to_string(), ACTOR.to_string()),
-        work_item: Link::new(item_id),
-        attempt: 1,
-        started_at: Utc::now(),
-        completed_at: None,
-        success: false,
-        error: None,
-        metrics: WorkRunMetrics::default(),
-        worker_id: "s5-19-worker".to_string(),
-        worker_version: "1.0.0".to_string(),
-        model_version: None,
-        prompt_id: None,
-        config_hash: None,
-    };
-    run_repo.create(run).await?;
-    Ok(work_run_id)
-}
-
 fn fixture_assertion(
     revision_id: &RecordId,
     subject: &str,
@@ -687,6 +610,7 @@ fn fixture_assertion(
 ) -> RawAssertion {
     let object_entity_type = object_text.map(|_| "organization".to_string());
     RawAssertion {
+        support_verification: None,
         subject_text: subject.to_string(),
         predicate_text: predicate.to_string(),
         object_text: object_text.map(ToString::to_string),
@@ -712,50 +636,118 @@ fn fixture_assertion(
     }
 }
 
+struct HrFixtureExtractor {
+    manifest: PluginManifest,
+    assertions: Vec<RawAssertion>,
+}
+struct HrSupport;
+#[async_trait]
+impl elephant_pipeline::extraction::AssertionSupportVerifier for HrSupport {
+    fn identity(&self) -> &str {
+        "hr-known-answer-v1"
+    }
+    async fn verify(
+        &self,
+        candidates: &[elephant_pipeline::extraction::SupportCandidate],
+    ) -> Result<Vec<elephant_pipeline::extraction::SupportVerdict>, PipelineError> {
+        Ok(candidates
+            .iter()
+            .map(|candidate| {
+                let known_source = [DOC_A_TEXT, DOC_B_TEXT].contains(&candidate.quote.trim());
+                let age = candidate.claim["predicate"] == "age"
+                    && candidate.claim["object"].is_null()
+                    && candidate.claim["literal"]
+                        == serde_json::to_value(Literal::Integer(35)).unwrap();
+                let employment = candidate.claim["predicate"] == "works_at"
+                    && candidate.claim["literal"].is_null()
+                    && ((candidate.quote.trim() == DOC_A_TEXT
+                        && candidate.claim["object"] == "King")
+                        || (candidate.quote.trim() == DOC_B_TEXT
+                            && candidate.claim["object"] == "Blizzard Entertainment"));
+                elephant_pipeline::extraction::SupportVerdict {
+                    index: candidate.index,
+                    supported: known_source
+                        && candidate.claim["subject"] == "Alice Andersson"
+                        && (age || employment)
+                        && candidate.claim["event_time"].is_null()
+                        && candidate.claim["event_title"].is_null(),
+                }
+            })
+            .collect())
+    }
+}
+#[async_trait]
+impl Extractor for HrFixtureExtractor {
+    fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+    async fn extract(&self, ctx: ExtractionContext) -> Result<ExtractionResult, PipelineError> {
+        use elephant_pipeline::extraction::{verify_assertion_support, AssertionValidator};
+        if ![DOC_A_TEXT, DOC_B_TEXT].contains(&ctx.node_text.trim()) {
+            return Ok(ExtractionResult::empty("hr-known-answer-v1".into()));
+        }
+        let mut assertions = self.assertions.clone();
+        for raw in &mut assertions {
+            raw.quote = Some(ctx.node_text.clone());
+            raw.evidence_span = EvidenceSpan {
+                revision: Link::new(ctx.revision_id.clone()),
+                node: Some(Link::new(ctx.node_id.clone())),
+                start: 0,
+                end: u32::try_from(ctx.node_text.len())
+                    .map_err(|error| PipelineError::InvalidInput(error.to_string()))?,
+                quote_hash: AssertionValidator::hash_quote(&ctx.node_text),
+            };
+        }
+        verify_assertion_support(&mut assertions, &ctx.node_text, &HrSupport).await?;
+        Ok(ExtractionResult::new(
+            assertions,
+            0,
+            "hr-known-answer-v1".into(),
+        ))
+    }
+}
+
 async fn promote_fixture_doc(
     client: &StorageClient,
+    fixture: &crate::grounded_source_fixture::GroundedSourceFixture,
     title: &str,
     text: &str,
     assertions: &[RawAssertion],
 ) -> anyhow::Result<RecordId> {
-    let (revision_id, node_id) = create_revision_with_node(client, title, text).await?;
-    let work_run_id = create_work_run(client).await?;
-
-    // Rebind the fixture evidence spans onto the freshly created revision.
-    let assertions: Vec<RawAssertion> = assertions
-        .iter()
-        .cloned()
-        .map(|mut assertion| {
-            assertion.evidence_span.revision = Link::new(revision_id.clone());
-            assertion
-        })
-        .collect();
-
-    promote_assertions_inline(
-        client,
-        SPACE_ID,
-        &assertions,
-        &work_run_id,
-        &node_id,
-        &revision_id,
-        ACTOR,
-    )
-    .await?;
-    Ok(revision_id)
+    let extractor = HrFixtureExtractor {
+        manifest: elephant_pipeline::extraction::DefaultExtractor::new()
+            .manifest()
+            .clone(),
+        assertions: assertions.to_vec(),
+    };
+    let accepted = Box::pin(fixture.publish_text(client, title, text, &extractor)).await?;
+    let doc = accepted
+        .document
+        .ok_or_else(|| anyhow::anyhow!("source has no document"))?;
+    let revision = DocRevisionRepository::new(client.clone())
+        .find_by_doc(&doc.base.id)
+        .await?
+        .into_iter()
+        .find(|revision| revision.status == RevisionStatus::Active)
+        .ok_or_else(|| anyhow::anyhow!("source has no active immutable revision"))?;
+    Ok(revision.base.id)
 }
 
 /// Deterministic sibling of the real-LLM scenario: identical two-doc claim
-/// structure seeded through real inline promotion, identical explicit TM phase,
+/// structure published through accepted sources and the production dispatcher, identical explicit TM phase,
 /// with a scripted adjudicator verdict instead of a live model.
 #[tokio::test]
 async fn scenario_s5_19_truth_adjudication_deterministic() -> anyhow::Result<()> {
     let harness = Harness::new().await?;
     let client = &harness.client;
+    let fixture =
+        crate::grounded_source_fixture::GroundedSourceFixture::new(client, SPACE_ID).await?;
 
     // Doc A: works_at King + age 35.
     let placeholder = RecordId::new_v4(TableName::DocRevision);
-    promote_fixture_doc(
+    let revision_a = Box::pin(promote_fixture_doc(
         client,
+        &fixture,
         "HR profile 2020",
         DOC_A_TEXT,
         &[
@@ -778,12 +770,13 @@ async fn scenario_s5_19_truth_adjudication_deterministic() -> anyhow::Result<()>
                 (62, 88),
             ),
         ],
-    )
+    ))
     .await?;
 
     // Doc B: works_at Blizzard Entertainment + age 35.
-    promote_fixture_doc(
+    let revision_b = Box::pin(promote_fixture_doc(
         client,
+        &fixture,
         "HR update 2024",
         DOC_B_TEXT,
         &[
@@ -806,12 +799,32 @@ async fn scenario_s5_19_truth_adjudication_deterministic() -> anyhow::Result<()>
                 (0, 20),
             ),
         ],
-    )
+    ))
     .await?;
 
-    let alice = find_entity_by_name(client, "alice andersson")
-        .await?
-        .expect("promotion must create the Alice entity");
+    // The two source mentions are explicitly known to identify the same
+    // person in this fixture. Reconcile through the real authorized operation;
+    // matching display names alone never permits automatic source pooling.
+    use crate::grounded_source_fixture::{
+        fixture_entity_for_revision, merge_fixture_entity_ids, FixtureMentionRole,
+    };
+    let alice_a = fixture_entity_for_revision(
+        client,
+        SPACE_ID,
+        &revision_a,
+        "Alice Andersson",
+        FixtureMentionRole::Subject,
+    )
+    .await?;
+    let alice_b = fixture_entity_for_revision(
+        client,
+        SPACE_ID,
+        &revision_b,
+        "Alice Andersson",
+        FixtureMentionRole::Subject,
+    )
+    .await?;
+    let alice = merge_fixture_entity_ids(client, SPACE_ID, &alice_a, &alice_b).await?;
     let king = find_entity_by_name(client, "king")
         .await?
         .expect("promotion must create the King entity");
@@ -839,7 +852,7 @@ async fn scenario_s5_19_truth_adjudication_deterministic() -> anyhow::Result<()>
     let ctx = TmContext {
         adjudicator: Some(fake.clone()),
     };
-    let outcome = run_truth_maintenance_phase(client, &ctx).await?;
+    let outcome = Box::pin(run_truth_maintenance_phase(client, &ctx)).await?;
 
     dump_graph_state(client).await?;
 
@@ -969,17 +982,41 @@ fn test_principal() -> Principal {
     }
 }
 
-fn employment_space_config() -> SpaceConfig {
+fn employment_space_config() -> anyhow::Result<SpaceConfig> {
     let base = BaseFields::new(
         RecordId::new_v4(TableName::SpaceConfig),
         SPACE_ID.to_string(),
         ACTOR.to_string(),
     );
-    SpaceConfig {
+    let processing: elephant_types::provider_binding::SpaceProcessingConfig =
+        serde_json::from_str(&std::env::var("RECALL_E2E_PROCESSING_CONFIG")?)?;
+    let profile_id = processing
+        .active_embedding_profile_id
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow::anyhow!("live test configuration lacks active embedding profile ID")
+        })?;
+    let profile = processing
+        .profiles
+        .get(profile_id)
+        .ok_or_else(|| anyhow::anyhow!("live test configuration lacks active embedding profile"))?;
+    let connection = processing
+        .connections
+        .get(&profile.connection_id)
+        .ok_or_else(|| anyhow::anyhow!("live test configuration lacks embedding connection"))?;
+    let provider = connection.provider.clone();
+    let model = profile.model.clone();
+    let dimensions = i32::try_from(
+        profile
+            .dimensions
+            .ok_or_else(|| anyhow::anyhow!("live test profile lacks dimensions"))?,
+    )?;
+    Ok(SpaceConfig {
         base,
-        embedding_provider: "fake".to_string(),
-        embedding_model: "test-model".to_string(),
-        embedding_dims: 8,
+        embedding_provider: provider,
+        embedding_model: model,
+        embedding_dims: dimensions,
+        processing: Some(processing),
         purpose: Some(
             "Employment history and personal facts about people — who works where, since when, \
              and basic biographical attributes. Use canonical snake_case predicates and reuse \
@@ -988,7 +1025,7 @@ fn employment_space_config() -> SpaceConfig {
                 .to_string(),
         ),
         skill: None,
-    }
+    })
 }
 
 /// Bridge: `elephant_mcp::ToolDispatcher` -> `meerkat::AgentToolDispatcher`,
@@ -1089,290 +1126,18 @@ fn create_in_process_extractor(storage: &StorageClient) -> InProcessAgenticExtra
     }
 }
 
-/// Promotes a staged extraction artifact through real inline promotion,
-/// mirroring the pipeline's commit_artifacts arm (same as s5_14).
-async fn promote_extraction_artifact(
-    storage: &StorageClient,
-    artifact_id: &RecordId,
-    work_run_id: &RecordId,
-) -> anyhow::Result<()> {
-    let artifact_repo = WorkArtifactRepository::new(storage.clone());
-    let artifact = artifact_repo
-        .get(SPACE_ID, artifact_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("extraction artifact not found: {artifact_id}"))?;
-    let data: ExtractionArtifactData = serde_json::from_value(artifact.data)?;
-    let revision_id = RecordId::from_str(&data.revision_id)?;
-    let node_id = RecordId::from_str(&data.node_id)?;
-    let assertions = data
-        .assertions
-        .iter()
-        .map(|assertion| assertion.to_raw(&revision_id, &node_id))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    promote_assertions_inline(
-        storage,
-        SPACE_ID,
-        &assertions,
-        work_run_id,
-        &node_id,
-        &revision_id,
-        ACTOR,
-    )
-    .await?;
-    Ok(())
-}
-
-async fn create_pipeline_work_run(
-    storage: &StorageClient,
-    item_id: &RecordId,
-) -> anyhow::Result<RecordId> {
-    let repo = WorkRunRepository::new(storage.clone());
-    let work_run_id = RecordId::new_v4(TableName::WorkRun);
-    let work_run = WorkRun {
-        base: BaseFields::new(work_run_id.clone(), SPACE_ID.to_string(), ACTOR.to_string()),
-        work_item: Link::new(item_id.clone()),
-        attempt: 1,
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        success: true,
-        error: None,
-        metrics: WorkRunMetrics::default(),
-        worker_id: "s5-19-worker".to_string(),
-        worker_version: "test".to_string(),
-        model_version: None,
-        prompt_id: None,
-        config_hash: None,
-    };
-    repo.create(work_run).await?;
-    Ok(work_run_id)
-}
-
-/// Drives ingestion work items to quiescence: render -> plan -> extract ->
-/// inline promotion. TM work kinds stay untouched; the explicit TM phase runs
-/// afterwards (nothing enqueues TM items in-process).
-async fn drive_ingestion_pipeline(
-    storage: StorageClient,
-    extractor: &InProcessAgenticExtractor,
-    max_steps: usize,
-) -> anyhow::Result<()> {
-    let item_repo = WorkItemRepository::new(storage.clone());
-    let doc_repo = DocRepository::new(storage.clone());
-    let dag = elephant_pipeline::scheduler::DagExecutor::new(storage.clone());
-
-    let mut registry = RendererRegistry::new();
-    registry.register(Box::new(PassthroughRenderer::new()));
-
-    for step in 0..max_steps {
-        let runnable = item_repo
-            .find_by_status(SPACE_ID, WorkItemStatus::Runnable)
-            .await?;
-        if runnable.is_empty() {
-            eprintln!("[s5_19] pipeline quiesced after {step} steps");
-            return Ok(());
-        }
-
-        for item in runnable {
-            let item_id = item.base.id.clone();
-            let _ = item_repo
-                .update_status(SPACE_ID, &item_id, WorkItemStatus::Running)
-                .await;
-            let work_run_id = create_pipeline_work_run(&storage, &item_id).await?;
-            eprintln!("[s5_19] step={step} kind={} id={}", item.kind, item_id);
-
-            match item.kind.as_str() {
-                work_kinds::RENDER_DOC_KIND => {
-                    let doc_id = item
-                        .payload
-                        .get("doc_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("render_doc missing doc_id payload"))?;
-                    let doc_id = RecordId::from_str(doc_id).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let doc = doc_repo
-                        .get(SPACE_ID, &doc_id)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
-
-                    let render_result = work_kinds::execute_render_doc(
-                        &storage,
-                        &registry,
-                        &doc,
-                        Some("text/plain"),
-                    )
-                    .await?;
-                    execute_build_doc_tree(
-                        &storage,
-                        &render_result.revision_id,
-                        &DocTreeConfig::default(),
-                    )
-                    .await?;
-
-                    let plan_item = WorkItem {
-                        base: BaseFields::new(
-                            RecordId::new_v4(TableName::WorkItem),
-                            SPACE_ID.to_string(),
-                            ACTOR.to_string(),
-                        ),
-                        kind: work_kinds::PLAN_EXTRACTION_KIND.to_string(),
-                        payload: serde_json::json!({
-                            "revision_id": render_result.revision_id.to_string(),
-                            "policy_version": "default",
-                            "extractor_id": "elephant.extractor.agentic",
-                            "allow_raw_quotes": false,
-                            "ingest_mode": "graph",
-                        }),
-                        status: WorkItemStatus::Runnable,
-                        priority: item.priority,
-                        idempotency_key: format!("plan_extraction:{}", render_result.revision_id),
-                        attempts: 0,
-                        lease_expires_at: None,
-                        leased_by: None,
-                        run_after: None,
-                        last_error: None,
-                    };
-                    let _ = item_repo.create(plan_item).await?;
-                }
-                work_kinds::PLAN_EXTRACTION_KIND => {
-                    let revision_id = item
-                        .payload
-                        .get("revision_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("plan_extraction missing revision_id"))?;
-                    let revision_id = RecordId::from_str(revision_id)?;
-
-                    let config = ExtractionPlanConfig::default();
-                    let result = execute_plan_extraction(
-                        &storage,
-                        &revision_id,
-                        "default",
-                        &config,
-                        &work_run_id,
-                        SPACE_ID,
-                        ACTOR,
-                    )
-                    .await?;
-
-                    for selection in result.plan.node_selections {
-                        let extract_item = WorkItem {
-                            base: BaseFields::new(
-                                RecordId::new_v4(TableName::WorkItem),
-                                SPACE_ID.to_string(),
-                                ACTOR.to_string(),
-                            ),
-                            kind: work_kinds::EXTRACT_ASSERTIONS_KIND.to_string(),
-                            payload: serde_json::json!({
-                                "node_id": selection.node_id.to_string(),
-                                "revision_id": revision_id.to_string(),
-                                "extractor_id": "elephant.extractor.agentic",
-                                "allow_raw_quotes": false,
-                                "estimated_tokens": selection.estimated_tokens,
-                                "estimated_cost_euros": 0.0,
-                                "ingest_mode": "graph",
-                            }),
-                            status: WorkItemStatus::Runnable,
-                            priority: item.priority,
-                            idempotency_key: format!(
-                                "extract_assertions:{}:{}",
-                                revision_id, selection.node_id
-                            ),
-                            attempts: 0,
-                            lease_expires_at: None,
-                            leased_by: None,
-                            run_after: None,
-                            last_error: None,
-                        };
-                        let _ = item_repo.create(extract_item).await?;
-                    }
-                }
-                work_kinds::EXTRACT_ASSERTIONS_KIND => {
-                    let node_id = item
-                        .payload
-                        .get("node_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("extract_assertions missing node_id"))?;
-                    let revision_id = item
-                        .payload
-                        .get("revision_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("extract_assertions missing revision_id"))?;
-                    let node_id = RecordId::from_str(node_id)?;
-                    let revision_id = RecordId::from_str(revision_id)?;
-
-                    // One real extraction pass per doc node, then inline
-                    // promotion so outbox events exist for the TM phase.
-                    let result = execute_extract_assertions(
-                        &storage,
-                        extractor,
-                        &node_id,
-                        &revision_id,
-                        &work_run_id,
-                        SPACE_ID,
-                        ACTOR,
-                        None,
-                    )
-                    .await?;
-                    eprintln!(
-                        "[s5_19] extracted {} assertions (artifact={})",
-                        result.assertions_extracted, result.artifact_id
-                    );
-                    promote_extraction_artifact(&storage, &result.artifact_id, &work_run_id)
-                        .await?;
-                }
-                // Source-lifecycle triage arms live in the pipeline binary
-                // (BudgetEnforcer, triage plugin, staged-commit executors) and
-                // are not exported for tests. `ingest_doc_simple` has already
-                // materialized the Doc, and the test enqueues `render_doc`
-                // directly with graph mode pinned, so these are no-ops here.
-                work_kinds::TRIAGE_SOURCE_KIND
-                | work_kinds::INGEST_METADATA_KIND
-                | work_kinds::INGEST_SOURCE_STUB_KIND
-                | work_kinds::UPGRADE_INGEST_MODE_KIND
-                | work_kinds::TM_DETECT_CONFLICTS_KIND
-                | work_kinds::TM_RESOLVE_SLOT_KIND
-                | work_kinds::TM_COMMIT_KIND
-                | work_kinds::TM_RECOMPUTE_KIND
-                | work_kinds::EMBED_CHUNKS_KIND
-                | work_kinds::BUILD_DOC_TREE_KIND
-                | work_kinds::WORK_KIND_FRESHNESS_SWEEP
-                | work_kinds::experimental::validate_artifacts::KIND
-                | work_kinds::experimental::commit_artifacts::KIND => {}
-                other => {
-                    eprintln!("[s5_19] WARNING: unhandled work kind: {other}");
-                }
-            }
-
-            item_repo
-                .update_status(SPACE_ID, &item_id, WorkItemStatus::Done)
-                .await?;
-            let _ = dag.on_item_completed(SPACE_ID, &item_id).await;
-        }
-    }
-
-    anyhow::bail!("pipeline did not quiesce within {max_steps} steps")
-}
-
 #[tokio::test]
-#[ignore = "real LLM extraction + adjudication; requires ANTHROPIC_API_KEY"]
+#[ignore = "live providers; requires explicit RECALL_E2E_PROCESSING_CONFIG and approved credentials"]
 async fn scenario_s5_19_truth_adjudication_real_llm() -> anyhow::Result<()> {
-    if !anthropic_key_present() {
-        eprintln!("skipping: ANTHROPIC_API_KEY not set");
-        return Ok(());
-    }
-
     let harness = Harness::new().await?;
     let client = &harness.client;
 
     SpaceConfigRepository::new(client.clone())
-        .create(employment_space_config())
+        .create(employment_space_config()?)
         .await?;
 
-    // Real ingestion of the two sources through the MCP surface.
-    // `ingest_doc_simple` persists the Doc immediately and enqueues the
-    // source-first triage chain; that chain's executors live in the pipeline
-    // binary, so the test pins graph mode by enqueuing `render_doc` per doc
-    // directly (the triage/lifecycle items no-op in the drive loop).
+    // Real source acceptance supplies immutable input and original fences.
     let dispatcher = create_dispatcher(client.clone(), test_principal());
-    let item_repo = WorkItemRepository::new(client.clone());
     for (title, text) in [
         ("HR profile 2020", DOC_A_TEXT),
         ("HR update 2024", DOC_B_TEXT),
@@ -1385,34 +1150,6 @@ async fn scenario_s5_19_truth_adjudication_real_llm() -> anyhow::Result<()> {
             .await?;
         let decoded: ToolResponse<serde_json::Value> = serde_json::from_value(response)?;
         assert!(decoded.ok, "ingest_doc_simple must succeed for '{title}'");
-
-        let doc = DocRepository::new(client.clone())
-            .list(SPACE_ID, 100, None)
-            .await?
-            .into_iter()
-            .find(|doc| doc.title == title)
-            .unwrap_or_else(|| panic!("ingest_doc_simple must persist doc '{title}'"));
-        let render_item = WorkItem {
-            base: BaseFields::new(
-                RecordId::new_v4(TableName::WorkItem),
-                SPACE_ID.to_string(),
-                ACTOR.to_string(),
-            ),
-            kind: work_kinds::RENDER_DOC_KIND.to_string(),
-            payload: serde_json::json!({
-                "doc_id": doc.base.id.to_string(),
-                "ingest_mode": "graph",
-            }),
-            status: WorkItemStatus::Runnable,
-            priority: 5,
-            idempotency_key: format!("render_doc:{}", doc.base.id),
-            attempts: 0,
-            lease_expires_at: None,
-            leased_by: None,
-            run_after: None,
-            last_error: None,
-        };
-        item_repo.create(render_item).await?;
     }
 
     // One extraction pass per doc, promoted inline. The default 24 tool-call
@@ -1421,12 +1158,57 @@ async fn scenario_s5_19_truth_adjudication_real_llm() -> anyhow::Result<()> {
     // prompt itself instructs calling search_entities); give the loop room.
     let _tool_call_budget_guard = set_env_var_scoped("PIPELINE_MAX_EXTRACT_TOOL_CALLS", "64");
     let extractor = create_in_process_extractor(client);
-    drive_ingestion_pipeline(client.clone(), &extractor, 60).await?;
+    crate::pipeline_driver::drive_pipeline(client, SPACE_ID, &extractor, 300).await?;
     dump_graph_state(client).await?;
 
-    let alice = find_entity_by_name(client, "alice")
-        .await?
-        .expect("extraction must produce the Alice Andersson entity");
+    let docs = DocRepository::new(client.clone())
+        .list(SPACE_ID, 100, None)
+        .await?;
+    assert!(docs.len() < 100, "bounded two-document fixture");
+    let mut alice_inputs = Vec::new();
+    for expected_text in [DOC_A_TEXT, DOC_B_TEXT] {
+        let doc = docs
+            .iter()
+            .find(|doc| doc.text == expected_text)
+            .expect("actual accepted fixture document");
+        let revision = DocRevisionRepository::new(client.clone())
+            .find_by_doc(&doc.base.id)
+            .await?
+            .into_iter()
+            .find(|revision| revision.status == RevisionStatus::Active)
+            .expect("actual current fixture render");
+        let assertions = elephant_storage::AssertionRepository::new(client.clone())
+            .find_by_revision(SPACE_ID, &revision.base.id, 100)
+            .await?;
+        let entities = assertions
+            .iter()
+            .filter(|assertion| {
+                assertion.subject_text.eq_ignore_ascii_case("Alice")
+                    || assertion
+                        .subject_text
+                        .eq_ignore_ascii_case("Alice Andersson")
+            })
+            .filter_map(|assertion| {
+                assertion
+                    .subject_entity
+                    .as_ref()
+                    .map(|entity| entity.id().clone())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            entities.len(),
+            1,
+            "one explicit Alice mention in each known source"
+        );
+        alice_inputs.push(entities.into_iter().next().expect("Alice mention"));
+    }
+    let alice = crate::grounded_source_fixture::merge_fixture_entity_ids(
+        client,
+        SPACE_ID,
+        &alice_inputs[0],
+        &alice_inputs[1],
+    )
+    .await?;
     let king = find_entity_by_name(client, "king")
         .await?
         .expect("extraction must produce the King entity");
@@ -1446,9 +1228,18 @@ async fn scenario_s5_19_truth_adjudication_real_llm() -> anyhow::Result<()> {
     }
     eprintln!("[s5_19] adjudication model: {}", config.model);
     let ctx = TmContext {
-        adjudicator: Some(Arc::new(AgenticSlotAdjudicator::new(config))),
+        adjudicator: Some(Arc::new(
+            AgenticSlotAdjudicator::new(config)
+                .with_provider_context(
+                    elephant_pipeline::provider_dispatch::ProviderDispatchContext::new(
+                        SpaceConfigRepository::new(client.clone()),
+                        SPACE_ID,
+                    ),
+                )
+                .await?,
+        )),
     };
-    let outcome = run_truth_maintenance_phase(client, &ctx).await?;
+    let outcome = Box::pin(run_truth_maintenance_phase(client, &ctx)).await?;
 
     dump_graph_state(client).await?;
 

@@ -1,0 +1,10 @@
+{
+  "crate_sha256": "ba423d9e7e665e4c735a1d4669c3a067135e4a574edf88af215f7f2b815e70ed",
+  "extraction": "Exact locally cached .crate verified against the existing workspace Cargo.lock; no dependency upgrade.",
+  "package": "surrealdb-core",
+  "registry": "registry+https://github.com/rust-lang/crates.io-index",
+  "source_revision": "8afd2ba0b6c0e232f19f42070e8811b323324c4c",
+  "upstream_file_manifest": "../surrealdb-core-2.6.5-upstream-sha256.json",
+  "upstream_repository": "https://github.com/surrealdb/surrealdb",
+  "version": "2.6.5"
+}

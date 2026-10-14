@@ -1,0 +1,56 @@
+{
+  "format": "recall-independent-provider-transport-contract/v1",
+  "authority": "qualification",
+  "execution_authorized": false,
+  "product_acceptance": false,
+  "producer_owner": "grounding",
+  "predicate_owner": "finalization",
+  "consumer_owner": "lifecycle",
+  "capture_member": "transport",
+  "transport_format": "recall-provider-transport/v2",
+  "transport_fields": [
+    "format",
+    "started_mono",
+    "request_started_mono",
+    "deadline_mono",
+    "read_completed_mono",
+    "response_headers",
+    "eof_observed",
+    "remaining_length",
+    "chunked",
+    "response_closed"
+  ],
+  "response_header_fields": [
+    "content_length",
+    "transfer_encoding",
+    "content_encoding",
+    "content_type"
+  ],
+  "header_capture_limits": {
+    "values_per_name": 16,
+    "utf8_bytes_per_value": 4096,
+    "charged_to_original_capture_cap": true
+  },
+  "clock_unit": "original finite monotonic seconds, same gateway boot/controller",
+  "maximum_original_response_seconds": 120,
+  "predicates": [
+    "started_mono is sampled once where the existing deadline is derived, before connection; deadline=started+original reserve seconds, never reset.",
+    "request_started_mono is the original actual pre-conn.request sample after current authority/admission.",
+    "read_completed_mono is sampled at actual successful read1 EOF/framing checks, before capture/fsync/SQLite finalization.",
+    "Original phase_start <= started <= request_started <= read_completed < deadline; deadline-started <=120 and original phase/whole deadline bounds hold.",
+    "Missing pre-send/read observations remain null on failure; no successful transport proof may contain them.",
+    "Header arrays preserve exact original get_all values and duplicates. Refuse >1 CL/TE/CE/CT, CL together with TE, invalid/non-ASCII/nondecimal/oversize CL, TE other than chunked ignoring case and surrounding whitespace, or CE other than absent/exact identity.",
+    "Content type agrees with original outer capture, using original application/octet-stream default only when absent.",
+    "Content-Length equals exact original response byte count and remaining_length=0.",
+    "Chunked transfer requires original chunked=true, response_closed=true and remaining_length null or0.",
+    "Close-delimited response requires no CL/TE, chunked=false, remaining_length=null, response_closed=true and actual EOF.",
+    "eof_observed=true only when original read1 returns empty before deadline; a watchdog shutdown at/after deadline refuses.",
+    "Original raw response hash/length, completion, explicit incomplete and streaming terminal-event predicates remain mandatory. HTTP EOF alone is insufficient.",
+    "Original failed/incomplete/cancelled dispatches retain unknown liability and cannot qualify preparation; no refunds."
+  ],
+  "compatibility": [
+    "New cohort capture extension; old legacy ledger/close rows and existing Settlement two-field transport contract remain unchanged.",
+    "Original historical captures without these facts remain insufficient for this new transport predicate; no reconstructed EOF/time/header fields.",
+    "No extra provider sends, no enlarged allocations, and no actual execution authorized."
+  ]
+}

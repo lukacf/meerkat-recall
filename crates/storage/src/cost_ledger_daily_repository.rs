@@ -309,7 +309,7 @@ impl CostLedgerDailyRepository {
         // Query for retrieval mode spending
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 RETRIEVAL_DAILY_SPENDING_QUERY,
                 crate::bindings! {
                     "space_id" => space_id,
@@ -327,7 +327,7 @@ impl CostLedgerDailyRepository {
         // Query for graph mode spending
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 GRAPH_DAILY_SPENDING_QUERY,
                 crate::bindings! {
                     "space_id" => space_id,
@@ -611,6 +611,95 @@ impl CostLedgerDailyRepository {
         Ok(())
     }
 
+    /// Reconciles a reservation and its shared budget guard atomically, once.
+    /// Zero measured usage still releases the reservation and records a run.
+    pub async fn reconcile_attempt(
+        &self,
+        space: &str,
+        ledger_id: &RecordId,
+        guard_id: &RecordId,
+        actual_units: f64,
+        tokens: u64,
+        success: bool,
+    ) -> StorageResult<bool> {
+        if !actual_units.is_finite() || actual_units < 0.0 || ledger_id == guard_id {
+            return Err(StorageError::DataIntegrityError(
+                "Invalid attempt accounting".to_string(),
+            ));
+        }
+        let ledger = self
+            .get(space, ledger_id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound(ledger_id.to_string()))?;
+        let initial_guard =
+            Self::new_budget_guard_record(guard_id, space, ledger.date, ledger.mode, Utc::now());
+        if let Some(store) = self.client.embedded_store() {
+            return store
+                .mutate(|tx| {
+                    let mut ledger = tx
+                        .get::<CostLedgerDaily>(space, ledger_id, false)?
+                        .ok_or_else(|| StorageError::NotFound(ledger_id.to_string()))?;
+                    if ledger.total_runs > 0 {
+                        return Ok(false);
+                    }
+                    let guard = tx.get::<CostLedgerDaily>(space, guard_id, false)?;
+                    let existed = guard.is_some();
+                    let mut guard = guard.unwrap_or(initial_guard);
+                    guard.reserved_euros = (guard.reserved_euros - ledger.reserved_euros).max(0.0);
+                    guard.reconciled_euros += actual_units;
+                    guard.total_euros += actual_units;
+                    guard.total_tokens = guard.total_tokens.saturating_add(tokens);
+                    guard.total_runs = guard.total_runs.saturating_add(1);
+                    guard.total_failures = guard.total_failures.saturating_add(u32::from(!success));
+                    guard.base.updated_at = Utc::now();
+                    ledger.reserved_euros = 0.0;
+                    ledger.reconciled_euros = actual_units;
+                    ledger.total_euros = actual_units;
+                    ledger.total_tokens = tokens;
+                    ledger.total_runs = 1;
+                    ledger.total_items = 1;
+                    ledger.total_failures = u32::from(!success);
+                    ledger.base.updated_at = Utc::now();
+                    tx.replace(ledger)?;
+                    if existed {
+                        tx.replace(guard)?;
+                    } else {
+                        tx.create(guard)?;
+                    }
+                    Ok(true)
+                })
+                .await;
+        }
+        let mut response = self.client.query_bind_checked(
+            "BEGIN TRANSACTION;
+             LET $ledger = SELECT * FROM ONLY $id WHERE space_id = $space AND deleted_at IS NONE;
+             IF $ledger IS NONE { THROW 'accounting_ledger_missing'; };
+             LET $applied = IF $ledger.total_runs = 0 {
+               LET $guard = SELECT * FROM ONLY $guard_id;
+               IF $guard IS NONE { CREATE $guard_id CONTENT $initial_guard; };
+               IF $guard IS NOT NONE AND $guard.space_id != $space { THROW 'accounting_guard_space_mismatch'; };
+               UPDATE $guard_id SET reserved_euros = math::max([reserved_euros - $ledger.reserved_euros, 0.0]), reconciled_euros += $actual, total_euros += $actual, total_tokens += $tokens, total_runs += 1, total_failures += $failures, updated_at = time::now();
+               UPDATE $id SET reserved_euros = 0.0, reconciled_euros = $actual, total_euros = $actual, total_tokens = $tokens, total_runs = 1, total_items = 1, total_failures = $failures, updated_at = time::now();
+               RETURN true;
+             } ELSE { RETURN false; };
+             RETURN $applied; COMMIT TRANSACTION;",
+            crate::bindings! {
+                "id" => crate::surreal::thing_from_record_id(ledger_id), "space" => space,
+                "guard_id" => crate::surreal::thing_from_record_id(guard_id),
+                "initial_guard" => Self::cost_ledger_daily_to_value(&initial_guard)?,
+                "actual" => actual_units, "tokens" => tokens, "failures" => u32::from(!success),
+            },
+        ).await?;
+        response
+            .take::<Option<bool>>(response.num_statements() - 1)
+            .map_err(|error| {
+                StorageError::DataIntegrityError(format!("Invalid accounting receipt: {error}"))
+            })?
+            .ok_or_else(|| {
+                StorageError::DataIntegrityError("Missing accounting receipt".to_string())
+            })
+    }
+
     /// Converts a CostLedgerDaily to a SurrealDB value for insertion.
     fn cost_ledger_daily_to_value(item: &CostLedgerDaily) -> StorageResult<surrealdb::sql::Value> {
         use std::collections::BTreeMap;
@@ -757,7 +846,7 @@ impl Repository<CostLedgerDaily> for CostLedgerDailyRepository {
 
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 &cost_ledger_daily_lookup_query(),
                 crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id },
             )
@@ -854,7 +943,7 @@ impl Repository<CostLedgerDaily> for CostLedgerDailyRepository {
 
         let mut response = self
             .client
-            .query_bind(
+            .query_bind_checked(
                 &query,
                 crate::bindings! {
                     "cursor" => cursor.map_or(surrealdb::sql::Value::None, |r| {
@@ -906,7 +995,10 @@ mod tests {
         };
         let client = StorageClient::new(config).await.unwrap();
 
-        client.query(COST_LEDGER_DAILY_SCHEMA).await.unwrap();
+        client
+            .query_checked(COST_LEDGER_DAILY_SCHEMA)
+            .await
+            .unwrap();
 
         CostLedgerDailyRepository::new(client)
     }
@@ -931,6 +1023,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_cost_ledger_daily() {
         let repo = setup_test_repo().await;
         let item = create_test_cost_ledger_daily();
@@ -945,6 +1041,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_cost_ledger_daily() {
         let repo = setup_test_repo().await;
         let item = create_test_cost_ledger_daily();
@@ -957,6 +1057,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_cost_ledger_daily_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_cost_ledger_daily();
@@ -981,6 +1085,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_cost_ledger_daily() {
         let repo = setup_test_repo().await;
         let item = create_test_cost_ledger_daily();
@@ -1005,6 +1113,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_cost_ledger_daily() {
         let repo = setup_test_repo().await;
         let item = create_test_cost_ledger_daily();
@@ -1018,6 +1130,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_aggregate_daily_spending_empty() {
         let repo = setup_test_repo().await;
         let date = NaiveDate::from_ymd_opt(2024, 7, 15).unwrap();
@@ -1034,6 +1150,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_aggregate_daily_spending_with_data() {
         let repo = setup_test_repo().await;
         let date = NaiveDate::from_ymd_opt(2024, 7, 15).unwrap();
@@ -1078,6 +1198,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_aggregate_daily_spending_different_dates() {
         let repo = setup_test_repo().await;
         let date1 = NaiveDate::from_ymd_opt(2024, 7, 15).unwrap();

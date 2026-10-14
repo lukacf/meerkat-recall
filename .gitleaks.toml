@@ -12,3 +12,183 @@ regexTarget = "match"
 regexes = [
   '''assertion_key[:,]\s+"(unique_key_abc123|different_key_xyz789|test_key_one|test_key_two)"''',
 ]
+
+# Reviewed false positives retain default detection everywhere else. Each entry
+# requires both an exact file path and the reviewed literal match. Fixtures are
+# synthetic; SHA-256 values are public integrity digests, not credentials.
+
+[[allowlists]]
+description = "Example idempotency labels, not authentication credentials"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^crates/mcp/src/handlers/public_sources\.rs$''']
+regexTarget = "match"
+regexes = [
+  '''^idempotency_key":"withdraw-meeting-42"$''',
+]
+
+[[allowlists]]
+description = "Example idempotency labels, not authentication credentials"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^docs/internal/recall-preview-contract/ob3-consumer-fixtures\.json$''']
+regexTarget = "match"
+regexes = [
+  '''^Idempotency-Key": "ob3-fixture-A-from-B"$''',
+  '''^Idempotency-Key": "ob3-fixture-B-from-A"$''',
+  '''^Idempotency-Key": "ob3-fixture-unseen-stale"$''',
+]
+
+[[allowlists]]
+description = "Deterministic reference-token or membership test vectors"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^packaging/recall-surreal/source\.lock\.json$''']
+regexTarget = "match"
+regexes = [
+  '''^number_token": "03d2d2962853eaa5410909793d65f296968ae5e6024ab522121d575cf1108454"$''',
+  '''^string_token": "40e9322203b5e4d741f086599f851ac1b7c4e8a2e0bad1398da4ffde5911874c"$''',
+]
+
+[[allowlists]]
+description = "Deterministic reference-token or membership test vectors"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^scripts/qualification/native_private_membership_test\.py$''']
+regexTarget = "match"
+regexes = [
+  '''^key="e360a4bf-fe85-5ff8-9871-3f7dcaa1851f"$''',
+]
+
+[[allowlists]]
+description = "Qualification process restart label, not authentication data"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^scripts/qualification/runtime_package_bootstrap\.py$''']
+regexTarget = "match"
+regexes = [
+  '''^recall-authenticated-service", cwd=self\.root $''',
+]
+
+[[allowlists]]
+description = "Deterministic JWT authorization test vectors"
+condition = "AND"
+targetRules = ["jwt"]
+paths = ['''^tests/recall_preview/auth_tokens\.json$''']
+regexTarget = "match"
+regexes = [
+  '''^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiJxdWFsaWZpY2F0aW9uLXNlcnZpY2UiLCJleHAiOjEsImlhdCI6MTcwNDA2NzIwMCwiaXNzIjoicXVhbGlmaWNhdGlvbi1vbmx5IiwiYXVkIjpbInF1YWxpZmljYXRpb24tYXBpIl0sInNwYWNlcyI6WyJhbHBoYSIsImJldGEiXSwic2NvcGVzIjpbIioiXSwiY2xlYXJhbmNlcyI6W3sicG9saWN5X2lkIjoiZGVmYXVsdCIsIm1heF9sZXZlbCI6MCwibGFiZWxzIjpbXSwiaGFuZGxpbmdfYWxsb3ciOltdfV19\.SDWKxi3IY_cwj4vYUVYt1qqVNGRBmOhTdOmf3GJ0v3w"$''',
+  '''^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiJxdWFsaWZpY2F0aW9uLXNlcnZpY2UiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTcwNDA2NzIwMCwiaXNzIjoiYW5vdGhlci1pc3N1ZXIiLCJhdWQiOlsicXVhbGlmaWNhdGlvbi1hcGkiXSwic3BhY2VzIjpbImFscGhhIiwiYmV0YSJdLCJzY29wZXMiOlsiKiJdLCJjbGVhcmFuY2VzIjpbeyJwb2xpY3lfaWQiOiJkZWZhdWx0IiwibWF4X2xldmVsIjowLCJsYWJlbHMiOltdLCJoYW5kbGluZ19hbGxvdyI6W119XX0\.agje1Q-DK7QocE0pgOqu27o8MhOMbKQHKZPv8uz_VPI"$''',
+  '''^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiJxdWFsaWZpY2F0aW9uLXNlcnZpY2UiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTcwNDA2NzIwMCwiaXNzIjoicXVhbGlmaWNhdGlvbi1vbmx5IiwiYXVkIjpbImFub3RoZXItYXBpIl0sInNwYWNlcyI6WyJhbHBoYSIsImJldGEiXSwic2NvcGVzIjpbIioiXSwiY2xlYXJhbmNlcyI6W3sicG9saWN5X2lkIjoiZGVmYXVsdCIsIm1heF9sZXZlbCI6MCwibGFiZWxzIjpbXSwiaGFuZGxpbmdfYWxsb3ciOltdfV19\.vIELXgmkXGe3CUzy7qGtwjmghZhHplL8CDPcLp7tc6s"$''',
+  '''^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiJxdWFsaWZpY2F0aW9uLXNlcnZpY2UiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTcwNDA2NzIwMCwiaXNzIjoicXVhbGlmaWNhdGlvbi1vbmx5IiwiYXVkIjpbInF1YWxpZmljYXRpb24tYXBpIl0sInNwYWNlcyI6W10sInNjb3BlcyI6WyIqIl0sImNsZWFyYW5jZXMiOlt7InBvbGljeV9pZCI6ImRlZmF1bHQiLCJtYXhfbGV2ZWwiOjAsImxhYmVscyI6W10sImhhbmRsaW5nX2FsbG93IjpbXX1dfQ\.uI8oLq6PAs62Hh5QKAdDgs3yl0m3t_RYBgycD2LXNnY"$''',
+  '''^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiJxdWFsaWZpY2F0aW9uLXNlcnZpY2UiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTcwNDA2NzIwMCwiaXNzIjoicXVhbGlmaWNhdGlvbi1vbmx5IiwiYXVkIjpbInF1YWxpZmljYXRpb24tYXBpIl0sInNwYWNlcyI6WyJhbHBoYSIsImJldGEiXSwic2NvcGVzIjpbIioiXSwiY2xlYXJhbmNlcyI6W3sicG9saWN5X2lkIjoiZGVmYXVsdCIsIm1heF9sZXZlbCI6MCwibGFiZWxzIjpbXSwiaGFuZGxpbmdfYWxsb3ciOltdfV19\.NGqVdVaulbTsh22tAG1wHR6-rTNEbHU8vB7r8qwDMho"$''',
+  '''^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiJxdWFsaWZpY2F0aW9uLXNlcnZpY2UiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTcwNDA2NzIwMCwiaXNzIjoicXVhbGlmaWNhdGlvbi1vbmx5IiwiYXVkIjpbInF1YWxpZmljYXRpb24tYXBpIl0sInNwYWNlcyI6WyJhbHBoYSIsImJldGEiXSwic2NvcGVzIjpbIioiXSwiY2xlYXJhbmNlcyI6W3sicG9saWN5X2lkIjoiZGVmYXVsdCIsIm1heF9sZXZlbCI6MCwibGFiZWxzIjpbXSwiaGFuZGxpbmdfYWxsb3ciOltdfV19\.i-jhQKxwUDUj4NCJ9hjJVWsiT-KLUTKp3oFFa7lnL8E"$''',
+  '''^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiJxdWFsaWZpY2F0aW9uLXNlcnZpY2UiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTcwNDA2NzIwMCwiaXNzIjoicXVhbGlmaWNhdGlvbi1vbmx5IiwiYXVkIjpbInF1YWxpZmljYXRpb24tYXBpIl0sInNwYWNlcyI6WyJhbHBoYSJdLCJzY29wZXMiOlsiKiJdLCJjbGVhcmFuY2VzIjpbeyJwb2xpY3lfaWQiOiJkZWZhdWx0IiwibWF4X2xldmVsIjowLCJsYWJlbHMiOltdLCJoYW5kbGluZ19hbGxvdyI6W119XX0\.RsrKVH3ctVI82YYaAXsWOlyL5RShheJO7qdkY929s8A"$''',
+]
+
+[[allowlists]]
+description = "Public SHA-256 integrity fingerprints"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^tests/recall_preview/full-workload-runtime-input-review\.json$''']
+regexTarget = "match"
+regexes = [
+  '''^credential_sha256": "4c9b616f4526031aa6d694db880d5eda4b870670399de8f7c95f02fa7b3e3220"$''',
+]
+
+[[allowlists]]
+description = "Public SHA-256 integrity fingerprints"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^tests/recall_preview/graph-recipes/container-spy\.json$''']
+regexTarget = "match"
+regexes = [
+  '''^credential_sha256": "4c9b616f4526031aa6d694db880d5eda4b870670399de8f7c95f02fa7b3e3220"$''',
+]
+
+[[allowlists]]
+description = "Public SHA-256 integrity fingerprints"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^tests/recall_preview/graph-recipes/workload-spy\.json$''']
+regexTarget = "match"
+regexes = [
+  '''^credential_sha256": "4c9b616f4526031aa6d694db880d5eda4b870670399de8f7c95f02fa7b3e3220"$''',
+]
+
+[[allowlists]]
+description = "Public SHA-256 integrity fingerprints"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^vendor/surrealdb-2\.6\.5-upstream-sha256\.json$''']
+regexTarget = "match"
+regexes = [
+  '''^access\.rs": "42879fb1aaa0beca7912a8b295b6dec8afec06feba07d9878f67b60bbe376cc1"$''',
+  '''^api\.rs": "d79baadf6e49ff8aa6ac9bf8506dc1434a450f55a91bb03325988b4bc9591215"$''',
+  '''^auth\.rs": "9516c25fad13672a17bc138e6a0fa5421bb8f46c4228a99174ab6adddd67b362"$''',
+  '''^auth_limit\.rs": "030c79212559bf650bec42332b21110eac1da7f2f4cb783b5e7806c366f59807"$''',
+  '''^authenticate\.rs": "038f5eef8aa26299438f7ab676155cfe8f8ebefa850a4cdc7bbea3ca73dc7354"$''',
+]
+
+[[allowlists]]
+description = "Public SHA-256 integrity fingerprints"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^vendor/surrealdb-core-2\.6\.5-upstream-sha256\.json$''']
+regexTarget = "match"
+regexes = [
+  '''^access\.rs": "13249ee6a5656a26f8411b633d8e6ec1c5888a05d17b340d0b307e3bfd935d44"$''',
+  '''^access\.rs": "3d9033d7448529c734104f98d8ce4a329361e4938412322cde8cb7f0457a4d5f"$''',
+  '''^access\.rs": "a5885c23ea5245cda7e8d335c7aea757dcfade7e8b6c46bc8a0f7666ff243e27"$''',
+  '''^access\.rs": "bf4ce345ed366692a0e9d47d6a578c36fa97efdb560716fe6a06d242755887e6"$''',
+  '''^access\.rs": "f10d9566e89a5ae4c830ad84cabec2e2f45e8616991a5a79f7a56d4ac1839b87"$''',
+  '''^access_type\.rs": "6ded7f10604bfae0cdbe88a152721d6dd83855fc3d21d3329f34c8e00268bad9"$''',
+  '''^api\.rs": "3568a7e964b9ba7b110c681e65dca635d7ab40aa213322ff67ae660136e5e586"$''',
+  '''^api\.rs": "59fa2285a9623531a7dcb8c4f7aa96d46921e59d0fd99cd17e9df4258038cb79"$''',
+  '''^api\.rs": "a877d435c99e0190e95766305bae30e74f90e22922a4bd9aaa1497f93f194ff5"$''',
+  '''^api\.rs": "c6352b518614d2e4fd62657eff6fc4fce49b8a47dd3ae60bca73cd2920e70f22"$''',
+  '''^api\.rs": "e44d53cdd9ad68e43e3672640254ceaa658498ba23ef94cb28538751f60d3a36"$''',
+  '''^auth\.rs": "8272a9879b9204b0ac1fbfc234e9f56a9c5a00020455f4a7ce1f7afe2d20b998"$''',
+  '''^bkeys\.rs": "e31611a0a1c5bbe12507e21beafbf6ff1dd9aae7cce5f42b54d232240437e70f"$''',
+  '''^key\.rs": "2f1db4b933ccab12d6b882b7ba327c71ecd934f2b82b37aa784560669c035305"$''',
+  '''^key\.rs": "87e8b5377aa370530a4beb5d2768169956287db9927e2f1e8b22d4796582b3a5"$''',
+  '''^key\.rs": "a328c5026c959ad99183572ac648e9b4ef569c48c9fc1b97fe4ef9eb808298b6"$''',
+  '''^multiwriter_different_keys\.rs": "8e7031db249b0d7c080047460f71756984a087a8bddf60791950579b57eecc90"$''',
+  '''^multiwriter_same_keys_allow\.rs": "0beb24d1b6cdf623228fe31640823d137ba6b740bda4cc34f5f2a71678b1f310"$''',
+  '''^multiwriter_same_keys_conflict\.rs": "ae5303ed95d4028f30150a2d9e72fe6c8c74de4f3052f70c0c140092899d238d"$''',
+  '''^token\.rs": "13c8eb5d0973c92f29fc8f6e8bfc46927e6c2b7869faa5cadd5994a2f34e91d0"$''',
+  '''^token\.rs": "a854f475fd9551ac1eeff4775cf9bf3eef87a4a5f81f12d0bca283d69ec7c9d4"$''',
+  '''^token\.rs": "bed4183beaaee571d48d8edac0bc13a5d1c191017ea3f61d73a1532fe86668bd"$''',
+  '''^token_buffer\.rs": "5c380f52aece3443cb412090b5b39eb56dbe8dd204f519a97daf755501b9edfb"$''',
+  '''^tokenizer\.rs": "1e5fcb1166c8aa47a8f099b5789c9e098bc7b04223b6aab25143ce6e2ee09d02"$''',
+  '''^tokenizer\.rs": "f342ff2b3b73fc3224ede10be023a5ad10c703e1a4582375d6cb9a945ce572c6"$''',
+  '''^v1_to_2_migrate_to_access\.rs": "e1d6be8e69e346317e2a677dd9fa4ab7d70cc2bd08d0c0e639972d18b0fa3c08"$''',
+]
+
+[[allowlists]]
+description = "Upstream cfg(test) JWT signing fixture, never runtime key material"
+condition = "AND"
+targetRules = ["private-key"]
+paths = ['''^vendor/surrealdb-core-2\.6\.5/src/iam/signin\.rs$''']
+regexTarget = "match"
+regexes = [
+  '''^\x2d{5}BEGIN PRIVATE KEY\x2d{5}\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQC7VJTUt9Us8cKj\nMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDuictGeurT8jNbvJZHtCSuYEvu\nNMoSfm76oqFvAp8Gy0iz5sxjZmSnXyCdPEovGhLa0VzMaQ8s\+CLOyS56YyCFGeJZ\nqgtzJ6GR3eqoYSW9b9UMvkBpZODSctWSNGj3P7jRFDO5VoTwCQAWbFnOjDfH5Ulg\np2PKSQnSJP3AJLQNFNe7br1XbrhV//eO\+t51mIpGSDCUv3E0DDFcWDTH9cXDTTlR\nZVEiR2BwpZOOkE/Z0/BVnhZYL71oZV34bKfWjQIt6V/isSMahdsAASACp4ZTGtwi\nVuNd9tybAgMBAAECggEBAKTmjaS6tkK8BlPXClTQ2vpz/N6uxDeS35mXpqasqskV\nlaAidgg/sWqpjXDbXr93otIMLlWsM\+X0CqMDgSXKejLS2jx4GDjI1ZTXg\+\+0AMJ8\nsJ74pWzVDOfmCEQ/7wXs3\+cbnXhKriO8Z036q92Qc1\+N87SI38nkGa0ABH9CN83H\nmQqt4fB7UdHzuIRe/me2PGhIq5ZBzj6h3BpoPGzEP\+x3l9YmK8t/1cN0pqI\+dQwY\ndgfGjackLu/2qH80MCF7IyQaseZUOJyKrCLtSD/Iixv/hzDEUPfOCjFDgTpzf3cw\nta8\+oE4wHCo1iI1/4TlPkwmXx4qSXtmw4aQPz7IDQvECgYEA8KNThCO2gsC2I9PQ\nDM/8Cw0O983WCDY\+oi\+7JPiNAJwv5DYBqEZB1QYdj06YD16XlC/HAZMsMku1na2T\nN0driwenQQWzoev3g2S7gRDoS/FCJSI3jJ\+kjgtaA7Qmzlgk1TxODN\+G1H91HW7t\n0l7VnL27IWyYo2qRRK3jzxqUiPUCgYEAx0oQs2reBQGMVZnApD1jeq7n4MvNLcPv\nt8b/eU9iUv6Y4Mj0Suo/AU8lYZXm8ubbqAlwz2VSVunD2tOplHyMUrtCtObAfVDU\nAhCndKaA9gApgfb3xw1IKbuQ1u4IF1FJl3VtumfQn//LiH1B3rXhcdyo3/vIttEk\n48RakUKClU8CgYEAzV7W3COOlDDcQd935DdtKBFRAPRPAlspQUnzMi5eSHMD/ISL\nDY5IiQHbIH83D4bvXq0X7qQoSBSNP7Dvv3HYuqMhf0DaegrlBuJllFVVq9qPVRnK\nxt1Il2HgxOBvbhOT\+9in1BzA\+YJ99UzC85O0Qz06A\+CmtHEy4aZ2kj5hHjECgYEA\nmNS4\+A8Fkss8Js1RieK2LniBxMgmYml3pfVLKGnzmng7H2\+cwPLhPIzIuwytXywh\n2bzbsYEfYx3EoEVgMEpPhoarQnYPukrJO4gwE2o5Te6T5mJSZGlQJQj9q4ZB2Dfz\net6INsK0oG8XVGXSpQvQh3RUYekCZQkBBFcpqWpbIEsCgYAnM3DQf3FJoSnXaMhr\nVBIovic5l0xFkEHskAjFTevO86Fsz1C2aSeRKSqGFoOQ0tmJzBEs1R6KqnHInicD\nTQrKhArgLXX4v3CddjfTRJkFWDbE/CkvKZNOrcf1nhaGCPspRJj2KUkj1Fhl9Cnc\ndn/RsYEONbwQSjIfMPkvxF\+8HQ==\n\x2d{5}END PRIVATE KEY\x2d{5}$''',
+]
+
+[[allowlists]]
+description = "Upstream cfg(test) JWT signing fixture, never runtime key material"
+condition = "AND"
+targetRules = ["private-key"]
+paths = ['''^vendor/surrealdb-core-2\.6\.5/src/iam/signup\.rs$''']
+regexTarget = "match"
+regexes = [
+  '''^\x2d{5}BEGIN PRIVATE KEY\x2d{5}\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQC7VJTUt9Us8cKj\nMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDuictGeurT8jNbvJZHtCSuYEvu\nNMoSfm76oqFvAp8Gy0iz5sxjZmSnXyCdPEovGhLa0VzMaQ8s\+CLOyS56YyCFGeJZ\nqgtzJ6GR3eqoYSW9b9UMvkBpZODSctWSNGj3P7jRFDO5VoTwCQAWbFnOjDfH5Ulg\np2PKSQnSJP3AJLQNFNe7br1XbrhV//eO\+t51mIpGSDCUv3E0DDFcWDTH9cXDTTlR\nZVEiR2BwpZOOkE/Z0/BVnhZYL71oZV34bKfWjQIt6V/isSMahdsAASACp4ZTGtwi\nVuNd9tybAgMBAAECggEBAKTmjaS6tkK8BlPXClTQ2vpz/N6uxDeS35mXpqasqskV\nlaAidgg/sWqpjXDbXr93otIMLlWsM\+X0CqMDgSXKejLS2jx4GDjI1ZTXg\+\+0AMJ8\nsJ74pWzVDOfmCEQ/7wXs3\+cbnXhKriO8Z036q92Qc1\+N87SI38nkGa0ABH9CN83H\nmQqt4fB7UdHzuIRe/me2PGhIq5ZBzj6h3BpoPGzEP\+x3l9YmK8t/1cN0pqI\+dQwY\ndgfGjackLu/2qH80MCF7IyQaseZUOJyKrCLtSD/Iixv/hzDEUPfOCjFDgTpzf3cw\nta8\+oE4wHCo1iI1/4TlPkwmXx4qSXtmw4aQPz7IDQvECgYEA8KNThCO2gsC2I9PQ\nDM/8Cw0O983WCDY\+oi\+7JPiNAJwv5DYBqEZB1QYdj06YD16XlC/HAZMsMku1na2T\nN0driwenQQWzoev3g2S7gRDoS/FCJSI3jJ\+kjgtaA7Qmzlgk1TxODN\+G1H91HW7t\n0l7VnL27IWyYo2qRRK3jzxqUiPUCgYEAx0oQs2reBQGMVZnApD1jeq7n4MvNLcPv\nt8b/eU9iUv6Y4Mj0Suo/AU8lYZXm8ubbqAlwz2VSVunD2tOplHyMUrtCtObAfVDU\nAhCndKaA9gApgfb3xw1IKbuQ1u4IF1FJl3VtumfQn//LiH1B3rXhcdyo3/vIttEk\n48RakUKClU8CgYEAzV7W3COOlDDcQd935DdtKBFRAPRPAlspQUnzMi5eSHMD/ISL\nDY5IiQHbIH83D4bvXq0X7qQoSBSNP7Dvv3HYuqMhf0DaegrlBuJllFVVq9qPVRnK\nxt1Il2HgxOBvbhOT\+9in1BzA\+YJ99UzC85O0Qz06A\+CmtHEy4aZ2kj5hHjECgYEA\nmNS4\+A8Fkss8Js1RieK2LniBxMgmYml3pfVLKGnzmng7H2\+cwPLhPIzIuwytXywh\n2bzbsYEfYx3EoEVgMEpPhoarQnYPukrJO4gwE2o5Te6T5mJSZGlQJQj9q4ZB2Dfz\net6INsK0oG8XVGXSpQvQh3RUYekCZQkBBFcpqWpbIEsCgYAnM3DQf3FJoSnXaMhr\nVBIovic5l0xFkEHskAjFTevO86Fsz1C2aSeRKSqGFoOQ0tmJzBEs1R6KqnHInicD\nTQrKhArgLXX4v3CddjfTRJkFWDbE/CkvKZNOrcf1nhaGCPspRJj2KUkj1Fhl9Cnc\ndn/RsYEONbwQSjIfMPkvxF\+8HQ==\n\x2d{5}END PRIVATE KEY\x2d{5}$''',
+]
+
+[[allowlists]]
+description = "Frozen SHA-256 known answer for a synthetic cache-key tuple"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^tests/recall_preview_semantics/gateway/test_cache_metadata\.py$''']
+regexTarget = "match"
+regexes = ["""^BOUNDED_CACHE_KEY = '1bbf41cec50f7a9f8f1a7c27e5df82ff209dc65810be759e77ba7095f0e5a76b'$"""]

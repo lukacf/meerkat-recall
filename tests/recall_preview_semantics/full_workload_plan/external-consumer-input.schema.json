@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Original full-workload external consumer input descriptors",
+  "description": "Shape of external_consumer_receipts in both independently approved allocation and run manifest. Exact descriptor equality and original byte custody remain mandatory. This schema grants no execution or acceptance authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "FW13": { "$ref": "#/$defs/consumer" },
+    "FW14": { "$ref": "#/$defs/consumer" }
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/",
+          "description": "Actual original canonical absolute regular-file path, owned by the current task user with no group or other permissions. Runtime reader rejects symlinks and retains the opened file identity through the read. No example or generated path establishes custody."
+        },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "consumer": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["owner", "original"],
+          "properties": {
+            "owner": { "enum": ["OB3", "HomeCore"] },
+            "original": { "$ref": "#/$defs/file" }
+          },
+          "description": "Historical import without independently frozen expectation bytes. Remains unmet for the OB3 v2 consistency oracle; no expectation may be reconstructed from this receipt."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["owner", "original", "expectations"],
+          "properties": {
+            "owner": { "const": "OB3" },
+            "original": { "$ref": "#/$defs/file" },
+            "expectations": { "$ref": "#/$defs/file" }
+          },
+          "description": "Two separately pinned original byte inputs to the independent OB3 oracle. Each is bounded to four MiB and both count toward the unchanged aggregate input/capture limits. Expectations must predate evaluation and originate in the original reviewed recipe/controller/baseline."
+        }
+      ]
+    }
+  }
+}

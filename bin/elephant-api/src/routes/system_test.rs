@@ -131,11 +131,23 @@ mod tests {
         )
     }
 
+    async fn configure_lifecycle_space(storage: &StorageClient) {
+        let config: elephant_types::records::SpaceConfig = serde_json::from_value(serde_json::json!({
+            "id":RecordId::new_v4(TableName::SpaceConfig),"space_id":"test_space","created_at":Utc::now(),"updated_at":Utc::now(),"created_by":"test",
+            "security":{"policy_id":"default","level":0,"labels":[],"handling":[]},"provenance":{},"subjects":[],"subjects_state":"complete","embedding_provider":"fake","embedding_model":"test","embedding_dims":8
+        })).expect("space fixture");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(config)
+            .await
+            .expect("space");
+    }
+
     async fn setup_embedded_test_app() -> (Router, Arc<SystemState>) {
         let authz = Arc::new(AuthzService::new());
         let storage = StorageClient::new_embedded()
             .await
             .expect("embedded storage");
+        configure_lifecycle_space(&storage).await;
         let state = Arc::new(SystemState::new(storage, authz));
         (
             system_routes()
@@ -150,6 +162,7 @@ mod tests {
         let storage = StorageClient::new_embedded()
             .await
             .expect("embedded storage");
+        configure_lifecycle_space(&storage).await;
         let state = Arc::new(SystemState::new(storage, authz));
         (system_routes().with_state(state.clone()), state)
     }
@@ -225,7 +238,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_revert_audit_reverts_entity_update() {
-        let (app, entity_repo, audit_repo) = setup_test_app().await;
+        let (app, state) = setup_embedded_test_app().await;
+        let entity_repo = state.entity_repo.clone();
+        let audit_repo = state.audit_repo.clone();
 
         let original = create_test_entity("Original");
         let entity_id = original.base.id.clone();
@@ -344,7 +359,7 @@ mod tests {
             actor: "test-user".to_string(),
             record: created.base.id.clone(),
             before: Some(serde_json::to_value(&original).expect("serialize before")),
-            after: Some(serde_json::to_value(&created).expect("serialize after")),
+            after: None, // Legacy delete receipts omitted the tombstone after-image.
             timestamp: Utc::now(),
             reason: Some("test".to_string()),
         };
@@ -384,11 +399,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_revert_audit_rejects_missing_space_id() {
         let authz = Arc::new(AuthzService::new());
         let storage = StorageClient::new_embedded()
             .await
             .expect("embedded storage");
+        configure_lifecycle_space(&storage).await;
         let state = Arc::new(SystemState::new(storage, authz));
         let app = system_routes()
             .layer(middleware::from_fn(mock_auth_without_space))

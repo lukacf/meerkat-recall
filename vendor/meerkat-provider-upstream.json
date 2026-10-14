@@ -1,0 +1,46 @@
+{
+  "format": "meerkat-recall-provider-upstream/v1",
+  "version": "0.9.0",
+  "source_repository": "https://github.com/lukacf/meerkat",
+  "source_commit": "a00bafaf1d862fb41112ff1f30312b350ad05246",
+  "license": "MIT OR Apache-2.0",
+  "replaces": "provider-http-backport.json (historical Recall 0.1.0 patched dependencies)",
+  "packages": [
+    {
+      "name": "meerkat-llm-core",
+      "version": "0.9.0",
+      "registry_archive_sha256": "5cbeaf3557f99a4d70b23e660c3fcdea2a98c76bed654d592aed13cc8e6b1fe5",
+      "source_path": "crates/meerkat-llm-core"
+    },
+    {
+      "name": "meerkat-openai",
+      "version": "0.9.0",
+      "registry_archive_sha256": "7ddc48536d12edb2055dc23f3b29d57351c324354af3d9ff11ad40e558c1c91d",
+      "source_path": "crates/meerkat-openai"
+    },
+    {
+      "name": "meerkat-gemini",
+      "version": "0.9.0",
+      "registry_archive_sha256": "91ea561a56c4d48b94ee7655de6505a7972f8bdd03ba3fbe070d9be7371ab3e9",
+      "source_path": "crates/meerkat-gemini"
+    }
+  ],
+  "required_behavior": [
+    "Native provider HTTP clients disable all redirects.",
+    "HTTP 3xx responses produce terminal InvalidConfig errors without exposing response bodies or Location.",
+    "OpenAI, compatible OpenAI and Gemini retain HTTP construction failure and refuse requests instead of falling back to a default client."
+  ],
+  "qualification": "This record identifies selected source and published package checksums. It does not establish runtime qualification for a Recall release.",
+  "license_files": {
+    "LICENSE-MIT": {
+      "sha256": "b45d1f632f83aeb359da8e2b8716ad72591ec7267a489fdda39989c618d65a0f",
+      "source": "meerkat-0.9.0/LICENSE-MIT",
+      "native_path": "licenses/meerkat-0.9.0/LICENSE-MIT"
+    },
+    "LICENSE-APACHE": {
+      "sha256": "3a0ffd02ca79c2a687921b0f5d8094f2f6a7058a4c01775d1351ea6514fcd180",
+      "source": "meerkat-0.9.0/LICENSE-APACHE",
+      "native_path": "licenses/meerkat-0.9.0/LICENSE-APACHE"
+    }
+  }
+}

@@ -1,0 +1,551 @@
+{
+  "format": "recall-independent-central-receipt-index/v1",
+  "source_commit": "a8df4c7520e5f2cf09649f3c0b2961d7620b5589",
+  "evidence_manifest_sha256": "5f734239ece75b7d1b6873a462808cbbdaf80a24a4a52da58d80f42101defeba",
+  "original_results_path": "/home/luka/recall-orchestration/validation/integration-workspace-tests-11/results.json",
+  "original_results_sha256": "08d181d04a2a68891bebe7d43f63c973dc10f86c1affea8ee38bea6655b2d071",
+  "executed_by_qualification": false,
+  "product_acceptance": false,
+  "overall_counts": {
+    "PASS": 3102,
+    "FAIL": 58,
+    "SIGABRT": 7
+  },
+  "selected_preview_counts": {
+    "PASS": 103,
+    "FAIL": 4,
+    "SIGABRT": 1
+  },
+  "selection_rule": "literal recall_preview_ substring in original executed test name; does not imply complete gate coverage",
+  "selected_preview_results": [
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_acroform_field_values"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_blank_page_is_empty"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_corpus_has_exactly_the_frozen_members"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_corrupt_later_page_is_total_error"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_crop_visibility"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_existing_invisible_ocr_layer"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_image_only_is_empty"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_missing_header_is_error"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_inherited_form_resources"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_multilingual_tounicode"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_nested_and_repeated_forms"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_page_order_and_literal_markup"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_unfinished_catalog_is_error"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_winansi"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_parse_failures_create_no_source_document_operation_or_work"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp::recall_preview_pdf pdf_active_intake_retains_exact_immutable_text_without_publication"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_attempt_mcp mcp_claim_and_complete_require_current_record_scope_space_and_clearance"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_attempt_mcp mcp_completion_cannot_adopt_successor_or_other_work_lease"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_auth mcp_http_rechecks_live_grants_and_scope_attenuation_for_each_signed_request"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_auth retained_source_contact_route_uses_signed_admission_atomic_preflight_and_raw_projection"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_auth runtime_transport_fixture_child"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_auth scoped_http_checks_signed_authority_and_next_request_live_grants"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_auth signed_mcp_runtime_gates_mutations_without_disabling_read_only_reads"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_corrections public_annotation_survives_but_changed_relationship_cannot_reuse_unchanged_assertion_proof"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_crash acknowledged_queue_claim_survives_sigkill_and_reclaim_advances_attempt"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_crash acknowledged_source_acceptance_survives_sigkill_without_snapshot"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_crash acknowledged_whole_source_publication_survives_sigkill_with_exact_effects_and_outbox"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_crash crash_fixture_child"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_crash every_erasure_boundary_recovers_before_ready_after_real_sigkill"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_crash failed_and_successful_outbox_acknowledgments_recover_truthfully_after_sigkill"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_crash restored_generation_cannot_replay_pre_restore_wal_after_sigkill"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_durability backup_cannot_be_restored_with_unrelated_empty_erasure_journal"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_durability corrupted_backup_is_refused_before_live_dataset_changes"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_durability existing_named_backup_generation_cannot_be_overwritten"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_durability expired_registered_backup_is_physically_deleted_and_cannot_restore"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_durability named_restore_replaces_complete_dataset_and_preserves_source_less_authority"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_erasure erase_reverses_nested_decision_fields_while_preserving_independent_later_metadata"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_erasure active_graph_erasure_and_old_backup_restore_preserve_other_space_and_source_less_authority"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_erasure erasing_published_b_reopens_a_hidden_by_cross_source_decision"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_erasure retract_hides_published_graph_and_old_finalization_cannot_reactivate_it"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_erasure native_erasure_preserves_key_types_and_independent_neighbors_but_fences_exact_late_references_after_restore"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_erasure restoring_backup_predating_source_keeps_erased_descendant_and_native_membership_fences"
+    },
+    {
+      "status": "FAIL",
+      "name": "elephant-scenarios::recall_preview_erasure_closure erased_evidence_removes_source_and_mixed_view_history_but_preserves_independent_projection",
+      "location": null,
+      "error": "MCP operation did not succeed: {\"ok\":false,\"error\":\"Access denied: missing scope: write:assertion\",\"error_code\":\"forbidden_space\",\"retryable\":false}"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_erasure_closure trusted_shared_media_preserves_exact_surviving_owner_and_bytes_until_last_owner_erased"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_finalization bundle_cannot_complete_after_its_validated_candidate_was_changed"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_finalization deleted_configuration_revokes_a_previously_ready_source_finalizer"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_finalization complete_metadata_requires_every_declared_bundle_then_replays_one_receipt"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_erasure_closure erasure_physically_removes_populated_hot_and_cold_history_without_changing_independent_rows"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_finalization quiet_named_spaces_remain_discoverable_when_all_queue_items_are_done"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_finalization registered_bundle_waits_for_its_original_commit_stage_to_finish"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_finalization sealed_expected_work_cannot_shrink_grow_or_change_after_partial_progress"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_graph complete_graph_and_receipt_wait_for_real_index_rows_and_embedding_work"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_graph mutually_consistent_tampered_staging_cannot_invent_a_support_verdict"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_graph public_claim_evidence_keeps_support_beyond_an_unrelated_quote_prefix"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_grounding direct_node_promotion_cannot_bypass_whole_source_finalization"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_grounding deleted_source_or_document_prevents_preparation_from_valid_evidence"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_graph public_lexical_read_returns_exact_published_bytes_and_never_substitutes_pending_revision"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_grounding exact_grounded_plan_preserves_classified_lineage_without_live_publication"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_inventory authorized_inventory_keeps_tombstones_and_binds_cursor_to_current_caller_and_space"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_outbox callback_failure_after_durable_effect_keeps_checkpoint_and_replays_without_duplicate_work"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_inventory wholly_unauthorized_inventory_is_empty_without_hidden_count_continuations"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers adapters::active_long_summary_dispatch_and_revocation_are_governed"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_outbox restore_cannot_split_consumer_effect_from_its_checkpoint_acknowledgment"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers adapters::actual_identity_promotion_adapter_dispatch_and_retry_are_governed"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers adapters::actual_identity_resolution_uses_assertion_space_and_current_approval"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers adapters::actual_identity_sweep_requires_approval_and_keeps_a_revoked_retry_pending"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers adapters::actual_tm_adapter_refuses_wrong_space_and_revoked_retry"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_grounding unsupported_high_confidence_output_never_creates_canonical_knowledge"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers cache::actual_entity_search_handler_preserves_space_and_rechecks_warm_approval"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers cache::supported_embedded_snapshot_restore_cannot_reuse_pre_restore_vector_payload"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers cache::physical_entity_deletion_is_visible_immediately_on_warmed_handle"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers cache::warm_entity_handle_does_not_cross_same_dimension_spaces_or_profile_identity"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers cached_generation_rejects_model_override_and_revoked_connection"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers adapters::actual_wiki_planner_organizer_writer_and_verifier_check_current_approval"
+    },
+    {
+      "status": "SIGABRT",
+      "name": "elephant-scenarios::recall_preview_providers extraction::actual_extractor_and_independent_support_use_current_distinct_approvals",
+      "location": null,
+      "error": "thread 'extraction::actual_extractor_and_independent_support_use_current_distinct_approvals' (76806) has overflowed its stack\nfatal runtime error: stack overflow, aborting\n(test aborted with signal 6: SIGABRT)"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers immutable_partition_changes_are_refused_while_rotation_is_distinct"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers malformed_or_misdirected_http_cannot_count_as_zero_outbound"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers missing_and_wrong_space_approvals_emit_zero_outbound_requests"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers refusal_oracle_distinguishes_sdk_terminal_error_success_and_empty_stream"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers every_governed_operation_uses_its_current_space_transport"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers credential_rotation_changes_transport_without_changing_vector_identity"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers revoked_pinned_clients_and_agent_continuations_never_dispatch"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers actual_embedding_http_retry_rechecks_committed_revocation"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers scoped_index::pending_aba_acceptance_keeps_old_index_evidence_with_partial_coverage"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers scoped_index::actual_index_semantic_mode_preserves_matched_node_and_global_similarity"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_publication actual_canonical_faults_roll_back_every_effect_outbox_and_receipt_then_retry"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_publication canonical_commit_identity_cannot_be_reused_for_changed_semantics"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_publication changed_policy_after_authorization_cannot_accept_replacement"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_publication concurrent_new_identity_invalidates_a_plan_even_without_changed_dependencies"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_publication concurrent_source_replacements_have_one_acceptance_winner"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_publication historical_revision_reacceptance_requires_fresh_key_and_current_cas_without_rebinding_input"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_publication newer_desired_revision_fences_prior_publication_even_before_it_publishes"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_publication same_external_source_and_idempotency_keys_are_independent_across_named_spaces"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_publication source_acceptance_is_revision_exact_idempotent_and_desired_head_fenced"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_publication same_worker_reclaim_fences_old_publication_completion_and_renewal"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_publication source_byte_limit_has_no_partial_acceptance_on_oversize"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_recovery quiet_named_spaces_recover_without_default_or_unrelated_runnable_work"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_source_http source_http_distinguishes_decoded_utf8_and_encoded_body_limits_without_partial_acceptance"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_source_http source_http_observation_retry_keeps_operation_and_queue_identity_but_changed_input_conflicts"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_surface http_and_mcp_enforce_same_search_input_bounds_before_storage_or_models"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_surface identical_external_identity_has_independent_coverage_in_each_selected_space"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_surface route_space_and_raw_scope_are_checked_before_lookup"
+    },
+    {
+      "status": "FAIL",
+      "name": "elephant-scenarios::recall_preview_wiki classified_editorial_article_and_cached_read_keep_exact_original_evidence",
+      "location": null,
+      "error": "Validation error: Wiki context contains unsupported or withdrawn dependencies"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers scoped_index::semantic_window_reaches_requested_source_after_401_ineligible_nodes"
+    },
+    {
+      "status": "FAIL",
+      "name": "elephant-scenarios::recall_preview_wiki view_publication_refuses_zero_span_stale_hash_and_consistent_policy_downgrade",
+      "location": null,
+      "error": "Validation error: Wiki context contains unsupported or withdrawn dependencies"
+    },
+    {
+      "status": "FAIL",
+      "name": "elephant-scenarios::recall_preview_wiki source_retract_or_replacement_after_writer_start_prevents_stale_wiki_publication",
+      "location": null,
+      "error": "deadline has elapsed"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_search_window ineligible_partition_prefix_cannot_become_complete_empty_semantic_search"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-scenarios::recall_preview_providers scoped_index::indexed_random_vectors_fail_frozen_semantic_expectations_on_both_backends"
+    }
+  ],
+  "prior_writer_review_results": [
+    {
+      "status": "PASS",
+      "name": "elephant-api space_grants::tests::each_request_observes_current_revocation_and_scope_attenuation"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-embeddings governed::tests::revocation_after_rate_limit_fences_internal_http_retry"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp handlers::identity::tests::merge_denied_dependent_record_leaves_all_inputs_unchanged"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp handlers::predicates::tests::test_validate_predicate_proposal_accepts_valid_draft"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-mcp handlers::predicates::tests::test_validate_predicate_proposal_rejects_missing_predicate"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-pipeline maintenance::tests::active_whole_sweep_commits_hygiene_dedupe_registry_and_audits"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-pipeline maintenance_commit::tests::active_resolution_batch_never_persists_its_valid_prefix"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-pipeline maintenance_commit::tests::active_resolution_replay_is_complete_and_changed_payload_conflicts"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-pipeline maintenance_commit::tests::configuration_change_after_capture_refuses_entire_plan"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-pipeline maintenance_commit::tests::fabricated_or_stale_attempt_cannot_commit_source_less_maintenance"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-pipeline maintenance_commit::tests::original_claim_cancelled_after_preparation_cannot_publish"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-pipeline maintenance_commit::tests::late_transaction_failure_rolls_back_claim_audit_outbox_and_receipt_on_both_backends"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-pipeline maintenance_commit::tests::semantic_memo_acknowledges_staleness_without_reapplying_a_verdict"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-pipeline maintenance_commit::tests::source_change_after_capture_refuses_even_source_less_effects"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-pipeline provider_dispatch::model::tests::sdk_http_callback_rechecks_revocation_after_durable_observer"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-pipeline reprocess::tests::test_supersede_rel_integration"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-storage canonical_commit::tests::embedded_atomic_bundle_faults_replay_and_space_isolation"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-storage canonical_commit::tests::embedded_independent_factual_edits_cannot_refresh_old_source_credit"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-storage canonical_commit::tests::surreal_atomic_bundle_faults_replay_and_space_isolation"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-storage canonical_commit::tests::surreal_independent_factual_edits_cannot_refresh_old_source_credit"
+    },
+    {
+      "status": "PASS",
+      "name": "elephant-storage read_eligibility::tests::wiki_typed_dependency_root_preserves_parent_subject_requirements"
+    }
+  ],
+  "scope": "Immutable original central Runtime11 rows. Source repairs and all later staged feature groups require subsequent exact execution. Test success establishes only that exercised case, not installed/live/consumer acceptance."
+}

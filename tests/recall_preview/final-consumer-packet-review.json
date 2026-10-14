@@ -1,0 +1,51 @@
+{
+  "format": "recall-independent-consumer-packet-review/v1",
+  "authority": "qualification",
+  "packet_manifest_sha256": "26880957f349fe6515f7d5532b303c3a062c15a40044370eb940204f04a94a09",
+  "reviewed_product_source": "eaefde70859023e10c5078f266948b03586ba697",
+  "independent_wire_review_source": "ecf531dd8be77ec60d7844cd14dc88213ee2468a",
+  "verdict": "bounded exact-source packet ACK",
+  "product_acceptance": false,
+  "execution_authorized": false,
+  "files": [
+    {
+      "name": "final-evidence-wire-source-review.json",
+      "bytes": 4230,
+      "sha256": "59203bfc7712fc8ece7bd5c39349736a45512ff70030474c004947d98acd4b65"
+    },
+    {
+      "name": "rendered-coordinate-edge-oracles.json",
+      "bytes": 2333,
+      "sha256": "b3eb02844b08f6a0e75bdece8daf6a16184c971e88584072fda513116688dbf1"
+    },
+    {
+      "name": "search-evidence-route-v3.json",
+      "bytes": 1969,
+      "sha256": "7828fbf7048e31338caf9711952da348a79a2272b689f345bad8cc05205b8659"
+    },
+    {
+      "name": "search-evidence-route-v3.md",
+      "bytes": 4450,
+      "sha256": "1a7a7e061a6a245b0a2b5bf2a6e050a2b2e1313d64415101a60f55453aad1cc2"
+    },
+    {
+      "name": "text-renderer-evidence-coordinates.md",
+      "bytes": 5552,
+      "sha256": "6a91c1d239a84ddee1d3ac1d7450f363975fdff4da906fb433db4b5d4e1d50bb"
+    }
+  ],
+  "checks": [
+    "All five original payload byte counts andSHA256 match exact manifest; originalmanifest hash independently verified.",
+    "Required nine-field doc_id/exactparent revision link and24bytequote/25byterendered content/fullhash/slices checked without producthelpers.",
+    "Route scope/read eligibility/current source mapping/503changedread/publishedR1pendingR2 statements agree with reviewed actualsource.",
+    "Top-level flattened id/directdocLink/renderer null|string/currentbare64hex textHash andseparate12065536GET cap agree with actualDTO/hash/route source.",
+    "HTTP262144 versusMCPinner262144 andouterwirelarger/collector270336 distinction agrees with actualserializer boundaries; optional one new20to10request preservesconstraints andoriginalretryablefalse.",
+    "GnormativeUnicode/CRLF/empty/trailingblank/repeatedmapping document reviewed against actualalgorithm; Dedge literals retained originalbytes.",
+    "Revision object explicitly onlyexpectedfield projection, notfabricatedcompleteDTO orruntimeevidence."
+  ],
+  "limits": [
+    "Sourcepacket only; no actual consumer, runtime, provider, installedartifact or wire framing acceptance.",
+    "Rendered-only checks cannot prove original raw occurrence/currentpublication; need originalpushedraw binding for independentmapping.",
+    "Originalpreviousconsumerpackets unchanged; delivery remains parent-owned."
+  ]
+}

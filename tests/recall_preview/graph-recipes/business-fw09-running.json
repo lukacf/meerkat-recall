@@ -1,0 +1,82 @@
+{
+  "format": "recall-public-graph-fixture/v1",
+  "source_request": {
+    "source": {
+      "id": "source:906e3e82-660e-5320-9ab4-3e88b0ea98ce",
+      "space_id": "qualification-business",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "business-policy",
+        "level": 7,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "type": "manual",
+      "hash": "25f8d985d453f583713cf6096c0a1e32408a871b13296ff3e74cb5b86fc3a11d",
+      "external_id": "workload/atlas-04",
+      "uri": "https://example.invalid/recall-workload/business/04",
+      "metadata": {}
+    },
+    "doc": {
+      "id": "doc:148cc0e4-9977-5902-84dd-e99652495e2f",
+      "space_id": "qualification-business",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "business-policy",
+        "level": 7,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "title": "workload/atlas-04",
+      "text": "For business project Atlas-04, the responsible custodian is Bruno-04. Its approved supply limit is 135 units. This record applies only to business scope.\nBruno-04 now maintains the Atlas-04 running backlog notebook.",
+      "source": null,
+      "sidecar_text": null,
+      "media_attachments": [],
+      "rendition_key": "d28/text/workload/atlas-04/full-fw09-running-r2",
+      "metadata": {}
+    },
+    "ingest_mode": "graph",
+    "intake": {
+      "revision_id": "full-fw09-running-r2",
+      "idempotency_key": "literal-ca89b8c3ce1a3fc5c1a27fa5bb71237795ad1b086991af694a5a0145f25c9b7b"
+    }
+  },
+  "rendered_text": "For business project Atlas-04, the responsible custodian is Bruno-04. Its approved supply limit is 135 units. This record applies only to business scope.\nBruno-04 now maintains the Atlas-04 running backlog notebook.\n",
+  "rendered_sha256": "1713d7f4233245736912f7c8f34829dbd706eaa79e6b1697ea6f1e2d51f19f47",
+  "expected_assertions": [
+    {
+      "subject_text": "Bruno-04",
+      "predicate_raw": "maintains",
+      "object_text": "Atlas-04 running backlog notebook",
+      "object_literal": null,
+      "subject_entity_type": "person",
+      "object_entity_type": "document",
+      "confidence": 1.0,
+      "significance": "medium",
+      "source_event_time": null,
+      "start": 154,
+      "end": 215,
+      "quote": "Bruno-04 now maintains the Atlas-04 running backlog notebook.",
+      "quote_hash": "1fdc5c65799ea97587f94a6d6e7a2a57183188b991db8d317287650991d3de40"
+    }
+  ],
+  "extract_rule_id": "business-fw09-running-extract"
+}

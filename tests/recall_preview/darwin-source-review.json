@@ -1,0 +1,33 @@
+{
+  "format": "recall-darwin-independent-source-review/v1",
+  "source_review": "acknowledged within stated offline subset",
+  "execution_authorized": false,
+  "approved": false,
+  "product_acceptance": false,
+  "runner_source_commit": "b84f39860ec8cd091ce4a98fd3a7328c68b03884",
+  "recipe_source_commit": "89d26cf00694d9e25b166813ee00513dfd5215f9",
+  "runner_tree_files": {
+    "scripts/qualification/darwin_offline_native.py": "8062ed2ab76b05d0102590f69e2823f5a9383eab4342ee9c99a3c2681770f4cd",
+    "tests/recall_preview_semantics/darwin_offline_cases.json": "6eab8d972351bad3192a9b9ae32ab39e2b71af7c632e3331b44cd559a9a12938",
+    "scripts/qualification/darwin_offline_child.py": "e8f138af122ac5a1cdee34310dc1eb66a8eb097b25f2837197d0486c3225927c",
+    "scripts/qualification/installed_linux_offline.py": "2d13ea81d2af4e7a5371bd677b9213634faf7f0c9a0e08c06d5611c4b5fb6810",
+    "scripts/qualification/recall_preview.py": "63b6afe0f2024e4405e6df5ed46b41acf941532ac62d45138c8fde220eb3abdb",
+    "scripts/release/artifact.py": "caef46ce6b737fcdf16c587722491b556f587188f890371a2b44d75d7eded234",
+    "tests/recall_preview_semantics/installed_linux_cases.json": "c791d9cdf2293e83ff393c8ece8811878c9d4cc915589d4ced2ff8b5cc890719",
+    "tests/recall_preview/fixtures.py": "ffb15f35c3ad295234284c74c6022cfda2ad1b69a998018b9a8a55db0013be87",
+    "tests/recall_preview/corpus.json": "db32f03681b52a7e1f3409fcb997f995cb970463db6aa173dc572dc2a0b06951",
+    "tests/recall_preview/matrix.py": "2abfbc474b5598e5d82190bd47ad554b1899ba8c5b002b1b9f1a0dd1ca30c306",
+    "tests/recall_preview/oracle.py": "57ffffe9ca1dfbe98e984494611d6de07239dd5fff3ffe8454c3dff7ea3dfbbf"
+  },
+  "recipe_sha256": "3a64b7e7733106e68c32e9ed6ff2bbfc2245db3da5700110ce0cb52a3bf76f31",
+  "executed_by_qualification": [],
+  "peer_mock_receipt": "L reports14 offline controls after test-only7404899; D did not execute or repin as actual macOS results.",
+  "limits": "Exact prebuilt native artifact, local elephant-db/Surreal rocksdb engines, classified metadata/durability/CLI subset only. No semantic/provider/physical erasure/deployment claim.",
+  "remaining": [
+    "Exact joined transitive hashes and D allocation review record before execution",
+    "Actual arm64 macOS26.5.2/minimum-load-command receipt",
+    "Real Seatbelt denials plus owned bind positive; unavailable => UNMET",
+    "Actual kqueue/process identity, bounded cleanup and resource receipts",
+    "Independently scheduled single native build lane; heavy-work floor250GiB and continuous supervisor"
+  ]
+}

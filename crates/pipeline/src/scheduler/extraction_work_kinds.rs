@@ -9,7 +9,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 use elephant_storage::doc_node_repository::DocNodeRepository;
@@ -99,6 +98,9 @@ pub struct ExtractionArtifactData {
 /// Serialized raw assertion for storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializedRawAssertion {
+    /// Independent support verification, never an extractor confidence claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_verification: Option<crate::extraction::SupportVerification>,
     /// Raw subject mention text.
     pub subject_text: String,
     /// Raw predicate text.
@@ -107,11 +109,14 @@ pub struct SerializedRawAssertion {
     pub object_text: Option<String>,
     /// Literal value.
     pub object_literal: Option<serde_json::Value>,
+    /// Typed literal retained so staging cannot change date/time/value semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_object_literal: Option<Literal>,
     /// Evidence span start.
     pub evidence_start: u32,
     /// Evidence span end.
     pub evidence_end: u32,
-    /// Quote hash (computed from quote if present).
+    /// Exact SHA-256 quote hash captured against immutable revision bytes.
     pub quote_hash: Option<String>,
     /// Confidence score.
     pub confidence: f64,
@@ -145,7 +150,7 @@ pub struct SerializedRawAssertion {
 }
 
 impl SerializedRawAssertion {
-    /// Creates from a RawAssertion, computing quote hash if quote is present.
+    /// Preserves a raw assertion without inventing evidence or support.
     pub fn from_raw(raw: &RawAssertion) -> Result<Self, PipelineError> {
         if raw.evidence_span.node.is_none() {
             return Err(PipelineError::InvalidInput(
@@ -153,10 +158,8 @@ impl SerializedRawAssertion {
             ));
         }
 
-        let quote_hash = raw
-            .quote
-            .as_ref()
-            .map(|q| AssertionValidator::hash_quote(q));
+        let quote_hash = (!raw.evidence_span.quote_hash.is_empty())
+            .then(|| raw.evidence_span.quote_hash.clone());
 
         // Serialize Literal to JSON value if present
         let object_literal = match raw.object_literal.as_ref() {
@@ -165,10 +168,12 @@ impl SerializedRawAssertion {
         };
 
         Ok(Self {
+            support_verification: raw.support_verification.clone(),
             subject_text: raw.subject_text.clone(),
             predicate_text: raw.predicate_text.clone(),
             object_text: raw.object_text.clone(),
             object_literal,
+            typed_object_literal: raw.object_literal.clone(),
             evidence_start: raw.evidence_span.start,
             evidence_end: raw.evidence_span.end,
             quote_hash,
@@ -191,16 +196,32 @@ impl SerializedRawAssertion {
         revision_id: &RecordId,
         node_id: &RecordId,
     ) -> Result<RawAssertion, PipelineError> {
-        let quote_hash = self
-            .quote_hash
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| self.derived_quote_hash(revision_id, node_id));
+        let quote_hash =
+            self.quote_hash
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .filter(|value| AssertionValidator::is_quote_hash(value))
+                .ok_or_else(|| {
+                    PipelineError::ValidationError(
+                "An immutable source quote hash is required; synthetic evidence is forbidden".into()
+            )
+                })?;
+        if let Some(literal) = &self.typed_object_literal {
+            if self.object_literal.as_ref() != Some(&literal_to_json_value(literal)?) {
+                return Err(PipelineError::ValidationError(
+                    "Staged literal representations disagree".into(),
+                ));
+            }
+        }
         Ok(RawAssertion {
+            support_verification: self.support_verification.clone(),
             subject_text: self.subject_text.clone(),
             predicate_text: self.predicate_text.clone(),
             object_text: self.object_text.clone(),
-            object_literal: self.object_literal.as_ref().map(json_value_to_literal),
+            object_literal: self
+                .typed_object_literal
+                .clone()
+                .or_else(|| self.object_literal.as_ref().map(json_value_to_literal)),
             evidence_span: elephant_types::records::assertion::EvidenceSpan {
                 revision: Link::new(revision_id.clone()),
                 node: Some(Link::new(node_id.clone())),
@@ -220,30 +241,6 @@ impl SerializedRawAssertion {
             object_entity_type: self.object_entity_type.clone(),
             significance: self.significance.clone(),
         })
-    }
-
-    fn derived_quote_hash(&self, revision_id: &RecordId, node_id: &RecordId) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(revision_id.to_string().as_bytes());
-        hasher.update(b"|");
-        hasher.update(node_id.to_string().as_bytes());
-        hasher.update(b"|");
-        hasher.update(self.subject_text.as_bytes());
-        hasher.update(b"|");
-        hasher.update(self.predicate_text.as_bytes());
-        hasher.update(b"|");
-        if let Some(object_text) = self.object_text.as_deref() {
-            hasher.update(object_text.as_bytes());
-        }
-        hasher.update(b"|");
-        if let Some(object_literal) = self.object_literal.as_ref() {
-            hasher.update(object_literal.to_string().as_bytes());
-        }
-        hasher.update(b"|");
-        hasher.update(self.evidence_start.to_string().as_bytes());
-        hasher.update(b"|");
-        hasher.update(self.evidence_end.to_string().as_bytes());
-        format!("derived:{}", hex::encode(hasher.finalize()))
     }
 }
 
@@ -347,6 +344,8 @@ pub async fn execute_plan_extraction(
         ));
     }
 
+    let source_stage =
+        super::source_stage::SourceStageContext::load(storage, space_id, work_run_id).await?;
     let node_repo = DocNodeRepository::new(storage.clone());
     let revision_repo = DocRevisionRepository::new(storage.clone());
     let artifact_repo = WorkArtifactRepository::new(storage.clone());
@@ -360,102 +359,84 @@ pub async fn execute_plan_extraction(
         .filter(|revision| revision.status == RevisionStatus::Active)
         .ok_or_else(|| PipelineError::NotFound(revision_id.to_string()))?;
 
-    let _text_len = revision.text.len();
+    let doc = DocRepository::new(storage.clone())
+        .get(space_id, revision.doc.id())
+        .await?
+        .ok_or_else(|| {
+            PipelineError::ValidationError("Extraction plan document is missing".into())
+        })?;
+    let source_id = doc
+        .source
+        .as_ref()
+        .ok_or_else(|| {
+            PipelineError::ValidationError("Extraction plan document has no source".into())
+        })?
+        .id();
+    let source = SourceRepository::new(storage.clone())
+        .get(space_id, source_id)
+        .await?
+        .ok_or_else(|| {
+            PipelineError::ValidationError("Extraction plan source is missing".into())
+        })?;
+    super::grounding::validate_revision_lineage(&source, &doc, &revision, space_id)?;
+    if let Some(context) = &source_stage {
+        context.require_source(&source.base.id)?;
+    }
+    let all_nodes = node_repo.find_by_revision(revision_id).await?;
+    let plan = prepare_extraction_plan(&revision, &all_nodes, policy_version, config)?;
+    let total_tokens = plan.total_estimated_tokens();
 
-    // Fetch all nodes for this revision
-    let all_nodes = node_repo
-        .find_by_revision(revision_id)
-        .await
-        .map_err(PipelineError::StorageError)?;
-
-    // Build extraction plan with hierarchical selection
-    let mut plan = ExtractionPlan::new(revision_id.clone(), policy_version.to_string())
-        .with_stop_conditions(config.stop_conditions.clone());
-
-    let mut total_tokens: u32 = 0;
-    let mut priority: u32 = 0;
-
-    // Select nodes based on preferred roles, grouping small nodes into batches.
-    for preferred_role in &config.preferred_roles {
-        let mut matching_nodes: Vec<&DocNode> = all_nodes
-            .iter()
-            .filter(|n| n.role == *preferred_role)
-            .collect();
-        matching_nodes
-            .sort_by_key(|node| (node.span.start, node.span.end, node.base.id.to_string()));
-
-        // Skip this role if all individual nodes exceed per-node limit
-        let any_fit = matching_nodes.iter().any(|n| {
-            let span_len = n.span.end.saturating_sub(n.span.start);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let tokens = (f64::from(span_len) * config.tokens_per_char) as u32;
-            tokens <= config.max_tokens_per_node
-        });
-        if !any_fit && !matching_nodes.is_empty() {
-            continue;
-        }
-
-        let mut selected_any = false;
-
-        // Group adjacent nodes into batches of ~max_tokens_per_node tokens
-        let mut batch_nodes: Vec<&DocNode> = Vec::new();
-        let mut batch_tokens: u32 = 0;
-
-        for node in &matching_nodes {
-            let span_len = node.span.end.saturating_sub(node.span.start);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let node_tokens = (f64::from(span_len) * config.tokens_per_char) as u32;
-
-            // Single node exceeds limit — skip it
-            if node_tokens > config.max_tokens_per_node {
-                continue;
+    // A configuration replan has separate attempt-local stage identities. A
+    // retry may reuse its exact persisted plan; it cannot relabel older output.
+    let artifact_id = match &source_stage {
+        Some(context) => context.artifact_id(
+            EXTRACTION_PLAN_ARTIFACT_TYPE,
+            revision_id,
+            None,
+            work_run_id,
+        )?,
+        None => RecordId::new_v4(TableName::WorkArtifact),
+    };
+    if let Some(context) = &source_stage {
+        if let Some(artifact) = context
+            .replay(
+                storage,
+                &artifact_id,
+                EXTRACTION_PLAN_ARTIFACT_TYPE,
+                work_run_id,
+            )
+            .await?
+        {
+            let recorded: ExtractionPlan = serde_json::from_value(artifact.data)
+                .map_err(|error| PipelineError::ValidationError(error.to_string()))?;
+            if recorded != plan
+                || artifact.base.security != revision.base.security
+                || artifact.base.subjects != revision.base.subjects
+                || artifact.base.subjects_state != revision.base.subjects_state
+            {
+                return Err(PipelineError::ValidationError(
+                    "Persisted extraction plan changed within one producer attempt".into(),
+                ));
             }
-
-            // Would this node overflow the current batch?
-            if !batch_nodes.is_empty() && batch_tokens + node_tokens > config.max_tokens_per_node {
-                // Flush current batch as a selection
-                if let Some(sel) = flush_batch(&batch_nodes, batch_tokens, priority) {
-                    if total_tokens + sel.estimated_tokens > config.stop_conditions.max_tokens {
-                        break;
-                    }
-                    total_tokens += sel.estimated_tokens;
-                    plan.add_node(sel);
-                    priority += 1;
-                    selected_any = true;
-                }
-                batch_nodes.clear();
-                batch_tokens = 0;
-            }
-
-            batch_nodes.push(node);
-            batch_tokens += node_tokens;
-        }
-
-        // Flush remaining batch
-        if !batch_nodes.is_empty() {
-            if let Some(sel) = flush_batch(&batch_nodes, batch_tokens, priority) {
-                if total_tokens + sel.estimated_tokens <= config.stop_conditions.max_tokens {
-                    total_tokens += sel.estimated_tokens;
-                    plan.add_node(sel);
-                    priority += 1;
-                    selected_any = true;
-                }
-            }
-        }
-
-        if selected_any {
-            break;
+            return Ok(PlanExtractionResult {
+                nodes_selected: plan.node_count(),
+                estimated_tokens: total_tokens,
+                plan,
+                artifact_id,
+            });
         }
     }
-
-    // Estimate cost (simplified: $0.001 per 1000 tokens)
-    let estimated_cost = f64::from(total_tokens) * 0.000_001;
-    let plan = plan.with_estimated_cost(estimated_cost);
-
-    // Persist plan as work artifact
-    let artifact_id = RecordId::new_v4(TableName::WorkArtifact);
+    let mut artifact_data = serde_json::to_value(&plan)
+        .map_err(|error| PipelineError::ConfigError(error.to_string()))?;
+    if let Some(context) = &source_stage {
+        context.tag(&mut artifact_data)?;
+        context.ensure_current(storage).await?;
+    }
+    // Persist the complete plan only after every validation succeeds.
     let mut base = BaseFields::new(artifact_id.clone(), space_id.to_string(), actor.to_string());
     base.security = revision.base.security.clone();
+    base.subjects = revision.base.subjects.clone();
+    base.subjects_state = revision.base.subjects_state;
     base.provenance = revision.base.provenance.clone();
     apply_work_run_provenance(storage, work_run_id, space_id, &mut base.provenance).await?;
 
@@ -463,8 +444,7 @@ pub async fn execute_plan_extraction(
         base,
         work_run: Link::new(work_run_id.clone()),
         artifact_type: EXTRACTION_PLAN_ARTIFACT_TYPE.to_string(),
-        data: serde_json::to_value(&plan)
-            .map_err(|e| PipelineError::ConfigError(format!("Serialization error: {e}")))?,
+        data: artifact_data,
         status: ArtifactStatus::Draft,
         validation_errors: None,
         validated_at: None,
@@ -484,42 +464,299 @@ pub async fn execute_plan_extraction(
     })
 }
 
-/// Creates a `NodeSelection` from a batch of adjacent nodes.
-fn flush_batch(
-    nodes: &[&elephant_types::records::doc_node::DocNode],
-    batch_tokens: u32,
-    priority: u32,
-) -> Option<NodeSelection> {
-    let first = nodes.first()?;
-    let last = nodes.last()?;
-
-    Some(NodeSelection {
-        node_id: first.base.id.clone(),
-        node_ids: nodes.iter().map(|n| n.base.id.clone()).collect(),
-        role: first.role,
-        priority,
-        estimated_tokens: batch_tokens,
-        span_start: first.span.start,
-        span_end: last.span.end,
-    })
+/// Prepare complete rendered coverage. Budget limits never authorize sealing a
+/// successful partial plan. Lower-priority roles fill gaps left by larger nodes.
+fn prepare_extraction_plan(
+    revision: &DocRevision,
+    nodes: &[DocNode],
+    policy_version: &str,
+    config: &ExtractionPlanConfig,
+) -> Result<ExtractionPlan, PipelineError> {
+    let text_len = u32::try_from(revision.text.len())
+        .map_err(|error| PipelineError::InvalidInput(error.to_string()))?;
+    if revision.text_hash != AssertionValidator::hash_quote(&revision.text) {
+        return Err(PipelineError::ValidationError(
+            "Extraction revision text and immutable hash disagree".into(),
+        ));
+    }
+    if !config.tokens_per_char.is_finite()
+        || config.tokens_per_char <= 0.0
+        || config.max_tokens_per_node == 0
+        || config.stop_conditions.max_nodes == 0
+        || config.stop_conditions.max_tokens == 0
+        || !config.stop_conditions.budget_cap_euros.is_finite()
+        || config.stop_conditions.budget_cap_euros < 0.0
+        || !config.stop_conditions.coverage_threshold.is_finite()
+        || !(0.0..=1.0).contains(&config.stop_conditions.coverage_threshold)
+    {
+        return Err(PipelineError::InvalidInput(
+            "Invalid extraction coverage or budget configuration".into(),
+        ));
+    }
+    let mut plan = ExtractionPlan::new(revision.base.id.clone(), policy_version.into())
+        .with_stop_conditions(config.stop_conditions.clone());
+    let mut selected_nodes = 0_usize;
+    for node in nodes {
+        if node.base.space_id != revision.base.space_id
+            || node.base.is_deleted()
+            || node.revision.id() != &revision.base.id
+            || !super::grounding::same_authorization_partition(&node.base, &revision.base)
+            || node.span.start > node.span.end
+            || revision
+                .text
+                .get(node.span.start as usize..node.span.end as usize)
+                .is_none()
+        {
+            return Err(PipelineError::ValidationError(
+                "Extraction plan contains invalid node lineage or spans".into(),
+            ));
+        }
+    }
+    for role in &config.preferred_roles {
+        let mut candidates: Vec<_> = nodes.iter().filter(|node| node.role == *role).collect();
+        candidates.sort_by_key(|node| (node.span.start, node.span.end, node.base.id.to_string()));
+        let mut batch: Vec<&DocNode> = Vec::new();
+        for node in candidates {
+            if node.span.start == node.span.end
+                || estimated_span_tokens(node.span.start, node.span.end, config)?
+                    > config.max_tokens_per_node
+            {
+                continue;
+            }
+            let ranges = selected_ranges(&plan.node_selections, &batch);
+            if !has_uncovered_text(&revision.text, node.span.start, node.span.end, &ranges) {
+                continue;
+            }
+            if let Some(first) = batch.first() {
+                let batch_end = batch
+                    .iter()
+                    .map(|node| node.span.end)
+                    .max()
+                    .unwrap_or(first.span.end)
+                    .max(node.span.end);
+                if estimated_span_tokens(first.span.start, batch_end, config)?
+                    > config.max_tokens_per_node
+                {
+                    append_batch(&mut plan, &batch, config, &mut selected_nodes)?;
+                    batch.clear();
+                }
+            }
+            batch.push(node);
+        }
+        append_batch(&mut plan, &batch, config, &mut selected_nodes)?;
+        if !has_uncovered_text(
+            &revision.text,
+            0,
+            text_len,
+            &selected_ranges(&plan.node_selections, &[]),
+        ) {
+            break;
+        }
+    }
+    let ranges = selected_ranges(&plan.node_selections, &[]);
+    if has_uncovered_text(&revision.text, 0, text_len, &ranges) {
+        return Err(PipelineError::InvalidState("Extraction plan cannot cover the complete source revision within its configured node limits".into()));
+    }
+    let mut covered_bytes = 0_u32;
+    let mut end = 0_u32;
+    for (start, range_end) in ranges {
+        let start = start.max(end);
+        if range_end > start {
+            covered_bytes += range_end - start;
+            end = range_end;
+        }
+    }
+    plan.estimated_cost_euros = f64::from(plan.total_estimated_tokens()) * 0.000_001;
+    plan.coverage = Some(crate::extraction::ExtractionCoverage {
+        revision_text_hash: revision.text_hash.clone(),
+        revision_text_len: text_len,
+        selected_byte_count: covered_bytes,
+        complete: true,
+        empty_reason: plan
+            .node_selections
+            .is_empty()
+            .then(|| "empty_or_whitespace".into()),
+    });
+    Ok(plan)
 }
 
-/// Loads extraction skill body from the filesystem skills directory.
-///
-/// Uses `PIPELINE_SKILLS_DIR` env var (default: `./skills`).
-/// Best-effort: returns None on any error to avoid blocking extraction.
-async fn load_skill_body(skill_id: &str) -> Option<String> {
-    let skill_path = skills_dir_from_env().join(skill_id).join("SKILL.md");
+fn estimated_span_tokens(
+    start: u32,
+    end: u32,
+    config: &ExtractionPlanConfig,
+) -> Result<u32, PipelineError> {
+    let estimated = (f64::from(end - start) * config.tokens_per_char).ceil();
+    if estimated > f64::from(u32::MAX) {
+        return Err(PipelineError::BudgetExceeded(
+            "Extraction span estimate exceeds supported token range".into(),
+        ));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(estimated as u32)
+}
 
-    match tokio::fs::read_to_string(&skill_path).await {
-        Ok(content) => {
-            let body = strip_yaml_frontmatter(&content);
-            tracing::info!(skill_id, "Loaded extraction skill");
-            Some(body)
+fn selected_ranges(selections: &[NodeSelection], batch: &[&DocNode]) -> Vec<(u32, u32)> {
+    let mut ranges: Vec<_> = selections
+        .iter()
+        .map(|selection| (selection.span_start, selection.span_end))
+        .collect();
+    if let (Some(first), Some(end)) = (batch.first(), batch.iter().map(|node| node.span.end).max())
+    {
+        ranges.push((first.span.start, end));
+    }
+    ranges.sort();
+    ranges
+}
+
+fn has_uncovered_text(text: &str, start: u32, end: u32, ranges: &[(u32, u32)]) -> bool {
+    let mut cursor = start;
+    for &(range_start, range_end) in ranges {
+        if range_end <= cursor {
+            continue;
         }
-        Err(e) => {
-            tracing::warn!(skill_id, error = %e, "Failed to load extraction skill, continuing without");
-            None
+        if range_start >= end {
+            break;
+        }
+        if range_start > cursor
+            && !text[cursor as usize..range_start.min(end) as usize]
+                .trim()
+                .is_empty()
+        {
+            return true;
+        }
+        cursor = cursor.max(range_end).min(end);
+        if cursor == end {
+            return false;
+        }
+    }
+    cursor < end && !text[cursor as usize..end as usize].trim().is_empty()
+}
+
+fn append_batch(
+    plan: &mut ExtractionPlan,
+    nodes: &[&DocNode],
+    config: &ExtractionPlanConfig,
+    selected_nodes: &mut usize,
+) -> Result<(), PipelineError> {
+    let Some(first) = nodes.first() else {
+        return Ok(());
+    };
+    let end = nodes
+        .iter()
+        .map(|node| node.span.end)
+        .max()
+        .unwrap_or(first.span.end);
+    let tokens = estimated_span_tokens(first.span.start, end, config)?;
+    let total = plan
+        .total_estimated_tokens()
+        .checked_add(tokens)
+        .ok_or_else(|| PipelineError::BudgetExceeded("Extraction token count overflow".into()))?;
+    // One coalesced window becomes one bounded work item. Counting its raw
+    // structural members would reject large sources despite bounded fanout.
+    let count = selected_nodes
+        .checked_add(1)
+        .ok_or_else(|| PipelineError::BudgetExceeded("Extraction node count overflow".into()))?;
+    if tokens > config.max_tokens_per_node
+        || total > config.stop_conditions.max_tokens
+        || count > config.stop_conditions.max_nodes as usize
+        || f64::from(total) * 0.000_001 > config.stop_conditions.budget_cap_euros
+    {
+        return Err(PipelineError::BudgetExceeded(
+            "Complete source extraction exceeds token, node or estimated cost budget".into(),
+        ));
+    }
+    let priority = u32::try_from(plan.node_count())
+        .map_err(|error| PipelineError::InvalidInput(error.to_string()))?;
+    plan.add_node(NodeSelection {
+        node_id: first.base.id.clone(),
+        node_ids: nodes.iter().map(|node| node.base.id.clone()).collect(),
+        role: first.role,
+        priority,
+        estimated_tokens: tokens,
+        span_start: first.span.start,
+        span_end: end,
+    });
+    *selected_nodes = count;
+    Ok(())
+}
+
+/// Read the actual installed asset. Explicit configuration never silently
+/// substitutes another skill or continues with an absent/empty instruction body.
+fn read_skill_body_from_directory(
+    skill_id: &str,
+    skills_dir: &std::path::Path,
+) -> Result<String, PipelineError> {
+    let canonical = match canonical_skill_id_from_directory(skill_id, skills_dir)? {
+        Some(canonical) => Some(canonical),
+        None => {
+            let legacy = canonical_skill_id_legacy(skill_id);
+            if legacy == skill_id {
+                None
+            } else {
+                canonical_skill_id_from_directory(&legacy, skills_dir)?
+            }
+        }
+    }
+    .ok_or_else(|| {
+        PipelineError::ConfigError(format!(
+            "extraction_skill_missing: configured skill {skill_id:?} is not installed"
+        ))
+    })?;
+    let root = skills_dir.canonicalize().map_err(|error| {
+        PipelineError::ConfigError(format!("extraction_skill_unreadable: {error}"))
+    })?;
+    let path = root
+        .join(&canonical)
+        .join("SKILL.md")
+        .canonicalize()
+        .map_err(|error| {
+            PipelineError::ConfigError(format!(
+                "extraction_skill_unreadable: {canonical:?}: {error}"
+            ))
+        })?;
+    if !path.starts_with(&root) {
+        return Err(PipelineError::ConfigError(
+            "extraction_skill_unreadable: asset is outside the configured skills directory".into(),
+        ));
+    }
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        PipelineError::ConfigError(format!(
+            "extraction_skill_unreadable: {canonical:?}: {error}"
+        ))
+    })?;
+    let body = strip_yaml_frontmatter(&content);
+    if body.trim().is_empty() {
+        return Err(PipelineError::ConfigError(format!(
+            "extraction_skill_empty: {canonical:?} has no instruction body"
+        )));
+    }
+    Ok(body)
+}
+
+fn explicit_skill_source(source: &str) -> bool {
+    matches!(
+        source,
+        "doc.metadata"
+            | "source.metadata"
+            | "space_config"
+            | "env.source_type_map"
+            | "env.default_skill"
+    )
+}
+
+fn load_guidance_skill_body(
+    guidance: &ExtractionGuidance,
+    skills_dir: &std::path::Path,
+) -> Result<Option<String>, PipelineError> {
+    let Some(skill_id) = guidance.requested_skill_id.as_deref() else {
+        return Ok(None);
+    };
+    match read_skill_body_from_directory(skill_id, skills_dir) {
+        Ok(body) => Ok(Some(body)),
+        Err(error) if explicit_skill_source(guidance.skill_source) => Err(error),
+        Err(error) => {
+            tracing::warn!(skill_id, %error, "Inferred extraction guidance asset is unavailable");
+            Ok(None)
         }
     }
 }
@@ -541,6 +778,7 @@ struct ExtractionGuidance {
     purpose: Option<String>,
     purpose_source: &'static str,
     skill_id: Option<String>,
+    requested_skill_id: Option<String>,
     skill_source: &'static str,
     resolution_trace: Vec<String>,
 }
@@ -631,70 +869,104 @@ fn collect_skill_ids_recursive(
     root: &std::path::Path,
     current: &std::path::Path,
     skill_ids: &mut Vec<String>,
-) {
-    let Ok(entries) = std::fs::read_dir(current) else {
-        return;
-    };
-
-    let mut has_skill_md = false;
-    let mut child_dirs: Vec<std::path::PathBuf> = Vec::new();
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            child_dirs.push(path);
-            continue;
+) -> Result<(), PipelineError> {
+    let entries = match std::fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(error) if current == root && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(())
         }
-        let is_skill_file = path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"));
-        if is_skill_file {
+        Err(error) => {
+            return Err(PipelineError::ConfigError(format!(
+                "extraction_skill_unreadable: skill catalog: {error}"
+            )))
+        }
+    };
+    let mut has_skill_md = false;
+    let mut child_dirs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            PipelineError::ConfigError(format!(
+                "extraction_skill_unreadable: skill catalog: {error}"
+            ))
+        })?;
+        let kind = entry.file_type().map_err(|error| {
+            PipelineError::ConfigError(format!(
+                "extraction_skill_unreadable: skill catalog: {error}"
+            ))
+        })?;
+        // Do not recurse through symlinks or accidentally index a different
+        // asset tree under an alias. The configured root itself may be a link.
+        if kind.is_dir() {
+            child_dirs.push(entry.path());
+        } else if kind.is_file() && entry.file_name() == "SKILL.md" {
             has_skill_md = true;
         }
     }
-
     if has_skill_md {
         if let Ok(relative) = current.strip_prefix(root) {
-            let id_parts: Vec<String> = relative
+            let parts: Vec<_> = relative
                 .components()
-                .map(|part| part.as_os_str().to_string_lossy().to_string())
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
                 .collect();
-            if !id_parts.is_empty() {
-                skill_ids.push(id_parts.join("/"));
+            if !parts.is_empty() {
+                skill_ids.push(parts.join("/"));
             }
         }
     }
-
-    for child_dir in child_dirs {
-        collect_skill_ids_recursive(root, &child_dir, skill_ids);
+    child_dirs.sort();
+    for child in child_dirs {
+        collect_skill_ids_recursive(root, &child, skill_ids)?;
     }
+    Ok(())
 }
 
-fn discovered_skill_aliases(
-    skills_dir: &std::path::Path,
-) -> std::collections::HashMap<String, String> {
-    let mut skill_ids: Vec<String> = Vec::new();
-    collect_skill_ids_recursive(skills_dir, skills_dir, &mut skill_ids);
+type SkillAliases = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
 
-    let mut aliases = std::collections::HashMap::new();
-    for skill_id in skill_ids {
-        let canonical = skill_id.replace('\\', "/").to_ascii_lowercase();
+fn discovered_skill_aliases(skills_dir: &std::path::Path) -> Result<SkillAliases, PipelineError> {
+    let mut skill_ids = Vec::new();
+    collect_skill_ids_recursive(skills_dir, skills_dir, &mut skill_ids)?;
+    let mut aliases: SkillAliases = Default::default();
+    for canonical in skill_ids {
         for alias in skill_alias_candidates(&canonical) {
-            aliases.entry(alias).or_insert_with(|| canonical.clone());
+            aliases.entry(alias).or_default().insert(canonical.clone());
         }
     }
-    aliases
+    Ok(aliases)
 }
 
-fn canonical_skill_id_from_directory(raw: &str, skills_dir: &std::path::Path) -> Option<String> {
-    let aliases = discovered_skill_aliases(skills_dir);
-    for candidate in skill_alias_candidates(raw) {
-        if let Some(canonical) = aliases.get(&candidate) {
-            return Some(canonical.clone());
-        }
+fn canonical_skill_id_from_directory(
+    raw: &str,
+    skills_dir: &std::path::Path,
+) -> Result<Option<String>, PipelineError> {
+    let normalized = raw.trim().replace('\\', "/");
+    if normalized.is_empty()
+        || std::path::Path::new(&normalized)
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(PipelineError::ConfigError(
+            "extraction_skill_missing: skill ID must be a nonempty relative catalog name".into(),
+        ));
     }
-    None
+    let aliases = discovered_skill_aliases(skills_dir)?;
+    // An exact canonical path wins even when its basename is shared. Preserve
+    // the actual installed path's case on case-sensitive filesystems.
+    if aliases.values().any(|ids| ids.contains(&normalized)) {
+        return Ok(Some(normalized));
+    }
+    let key = normalized.to_ascii_lowercase();
+    let compact = skill_alias_key(&key);
+    let matches: std::collections::BTreeSet<_> = [key, compact]
+        .iter()
+        .filter_map(|key| aliases.get(key))
+        .flatten()
+        .cloned()
+        .collect();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => Err(PipelineError::ConfigError(format!("extraction_skill_ambiguous: {raw:?} names multiple installed skills; use their canonical relative path"))),
+    }
 }
 
 fn canonical_skill_id_legacy(raw: &str) -> String {
@@ -718,11 +990,13 @@ fn canonical_skill_id(raw: &str) -> String {
     }
 
     let skills_dir = skills_dir_from_env();
-    if let Some(canonical) = canonical_skill_id_from_directory(trimmed, &skills_dir) {
-        return canonical;
+    match canonical_skill_id_from_directory(trimmed, &skills_dir) {
+        Ok(Some(canonical)) => canonical,
+        Ok(None) => canonical_skill_id_legacy(trimmed),
+        // Preserve the requested ID for the strict execution/readiness check.
+        // In particular, ambiguity must never become a legacy default alias.
+        Err(_) => trimmed.to_owned(),
     }
-
-    canonical_skill_id_legacy(trimmed)
 }
 
 fn domain_to_skill(domain: &str) -> Option<&'static str> {
@@ -774,7 +1048,7 @@ fn source_type_skill_from_env(source_type: SourceType) -> Option<String> {
         .get(key)
         .or_else(|| parsed.get("*"))
         .map(String::as_str)
-        .map(canonical_skill_id)
+        .map(ToString::to_string)
 }
 
 fn choose_with_trace<const N: usize>(
@@ -787,7 +1061,10 @@ fn choose_with_trace<const N: usize>(
         match candidate {
             Some(value) => {
                 if include_value_on_hit {
-                    trace.push(format!("{label}:{source}=hit:{value}"));
+                    // The trace reports the resolved skill just like skill_id;
+                    // keep the original alias separately for strict asset lookup.
+                    let resolved = canonical_skill_id(&value);
+                    trace.push(format!("{label}:{source}=hit:{resolved}"));
                 } else {
                     trace.push(format!("{label}:{source}=hit"));
                 }
@@ -815,14 +1092,6 @@ fn resolve_extraction_guidance(
         "purpose",
         [
             (
-                "space_config",
-                space_config
-                    .and_then(|cfg| cfg.purpose.as_deref())
-                    .map(str::trim)
-                    .filter(|p| !p.is_empty())
-                    .map(ToString::to_string),
-            ),
-            (
                 "doc.metadata",
                 doc_metadata
                     .and_then(|m| read_metadata_string(m, &["extraction_purpose", "purpose"])),
@@ -831,6 +1100,14 @@ fn resolve_extraction_guidance(
                 "source.metadata",
                 source_metadata
                     .and_then(|m| read_metadata_string(m, &["extraction_purpose", "purpose"])),
+            ),
+            (
+                "space_config",
+                space_config
+                    .and_then(|cfg| cfg.purpose.as_deref())
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(ToString::to_string),
             ),
             (
                 "env.default_purpose",
@@ -848,44 +1125,40 @@ fn resolve_extraction_guidance(
         "skill",
         [
             (
+                "doc.metadata",
+                doc_metadata.and_then(|m| {
+                    read_metadata_string(
+                        m,
+                        &[
+                            "extraction_skill",
+                            "extraction_skill_id",
+                            "skill",
+                            "skill_id",
+                        ],
+                    )
+                }),
+            ),
+            (
+                "source.metadata",
+                source_metadata.and_then(|m| {
+                    read_metadata_string(
+                        m,
+                        &[
+                            "extraction_skill",
+                            "extraction_skill_id",
+                            "skill",
+                            "skill_id",
+                        ],
+                    )
+                }),
+            ),
+            (
                 "space_config",
                 space_config
                     .and_then(|cfg| cfg.skill.as_deref())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .map(canonical_skill_id),
-            ),
-            (
-                "doc.metadata",
-                doc_metadata
-                    .and_then(|m| {
-                        read_metadata_string(
-                            m,
-                            &[
-                                "extraction_skill",
-                                "extraction_skill_id",
-                                "skill",
-                                "skill_id",
-                            ],
-                        )
-                    })
-                    .map(|s| canonical_skill_id(&s)),
-            ),
-            (
-                "source.metadata",
-                source_metadata
-                    .and_then(|m| {
-                        read_metadata_string(
-                            m,
-                            &[
-                                "extraction_skill",
-                                "extraction_skill_id",
-                                "skill",
-                                "skill_id",
-                            ],
-                        )
-                    })
-                    .map(|s| canonical_skill_id(&s)),
+                    .map(ToString::to_string),
             ),
             (
                 "doc.domain",
@@ -919,9 +1192,7 @@ fn resolve_extraction_guidance(
             ),
             (
                 "env.default_skill",
-                std::env::var("PIPELINE_DEFAULT_EXTRACTION_SKILL")
-                    .ok()
-                    .map(|s| canonical_skill_id(&s)),
+                std::env::var("PIPELINE_DEFAULT_EXTRACTION_SKILL").ok(),
             ),
         ],
         true,
@@ -930,7 +1201,8 @@ fn resolve_extraction_guidance(
     ExtractionGuidance {
         purpose: purpose.as_ref().map(|(p, _)| p.clone()),
         purpose_source: purpose.map(|(_, src)| src).unwrap_or("none"),
-        skill_id: skill.as_ref().map(|(s, _)| s.clone()),
+        skill_id: skill.as_ref().map(|(s, _)| canonical_skill_id(s)),
+        requested_skill_id: skill.as_ref().map(|(s, _)| s.clone()),
         skill_source: skill.map(|(_, src)| src).unwrap_or("none"),
         resolution_trace,
     }
@@ -953,6 +1225,23 @@ pub fn resolve_extraction_guidance_status(
     }
 }
 
+/// Validate selected explicit extraction guidance assets without a model call.
+///
+/// Uses the same installed catalog/body checks as active extraction. Missing,
+/// ambiguous, unreadable or empty explicit assets are configuration errors.
+/// Inferred defaults retain their optional behavior.
+///
+/// # Errors
+/// Returns a configuration error when a selected explicit asset is unavailable.
+pub fn validate_extraction_guidance_assets(
+    space_config: Option<&SpaceConfig>,
+    doc: Option<&Doc>,
+    source: Option<&Source>,
+) -> Result<(), PipelineError> {
+    let guidance = resolve_extraction_guidance(space_config, doc, source);
+    load_guidance_skill_body(&guidance, &skills_dir_from_env()).map(|_| ())
+}
+
 /// Loads entities already created from earlier chunks of the same document.
 ///
 /// Queries assertions linked to this revision, extracts entity IDs from their
@@ -964,6 +1253,7 @@ async fn load_known_entities_for_revision(
     storage: &StorageClient,
     space_id: &str,
     revision_id: &RecordId,
+    expected_base: &BaseFields,
 ) -> Vec<KnownEntity> {
     use elephant_storage::EntityRepository;
     use elephant_types::records::entity::{Entity, EntityStatus};
@@ -987,8 +1277,12 @@ async fn load_known_entities_for_revision(
         entity_repo: &EntityRepository,
         space_id: &str,
         entity_id: &RecordId,
+        expected_base: &BaseFields,
     ) -> Option<Entity> {
         let entity = entity_repo.get(space_id, entity_id).await.ok().flatten()?;
+        if !super::grounding::same_support_partition(&entity.base, expected_base) {
+            return None;
+        }
         if entity.status == EntityStatus::Merged {
             if let Some(redirect_to) = entity.redirect_to.as_ref() {
                 return entity_repo
@@ -996,7 +1290,10 @@ async fn load_known_entities_for_revision(
                     .await
                     .ok()
                     .flatten()
-                    .or(Some(entity));
+                    .filter(|target| {
+                        target.status != EntityStatus::Merged
+                            && super::grounding::same_support_partition(&target.base, expected_base)
+                    });
             }
         }
         Some(entity)
@@ -1008,8 +1305,11 @@ async fn load_known_entities_for_revision(
         seen: &mut std::collections::HashSet<RecordId>,
         known: &mut Vec<KnownEntity>,
         entity_id: &RecordId,
+        expected_base: &BaseFields,
     ) {
-        let Some(entity) = load_canonical_entity(entity_repo, space_id, entity_id).await else {
+        let Some(entity) =
+            load_canonical_entity(entity_repo, space_id, entity_id, expected_base).await
+        else {
             return;
         };
         if !seen.insert(entity.base.id.clone()) {
@@ -1034,6 +1334,7 @@ async fn load_known_entities_for_revision(
                 &mut seen,
                 &mut known,
                 subject_link.id(),
+                expected_base,
             )
             .await;
         }
@@ -1044,6 +1345,7 @@ async fn load_known_entities_for_revision(
                 &mut seen,
                 &mut known,
                 subject_entity.id(),
+                expected_base,
             )
             .await;
         }
@@ -1054,12 +1356,22 @@ async fn load_known_entities_for_revision(
                 &mut seen,
                 &mut known,
                 object_entity.id(),
+                expected_base,
             )
             .await;
         }
     }
 
     known
+}
+
+// Keep concrete source-work child construction out of the producer poll frame.
+// The caller polls the same future in its original task and authority scopes.
+#[inline(never)]
+fn boxed_extraction_work<F: std::future::Future>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
 }
 
 /// Executes the `extract_assertions` work kind.
@@ -1080,7 +1392,77 @@ pub async fn execute_extract_assertions<E: Extractor + ?Sized>(
     actor: &str,
     span_override: Option<(u32, u32)>,
 ) -> Result<ExtractAssertionsResult, PipelineError> {
+    boxed_extraction_work(|| {
+        execute_extract_assertions_inner(
+            storage,
+            extractor,
+            node_id,
+            revision_id,
+            work_run_id,
+            space_id,
+            actor,
+            span_override,
+            None,
+        )
+    })
+    .await
+}
+
+/// Active source producer with one bounded, charged whole-batch repair policy.
+///
+/// # Errors
+/// Returns typed repair, evidence, authority, provider or persistence failures.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_source_extraction<E: Extractor + ?Sized>(
+    storage: &StorageClient,
+    extractor: &E,
+    node_id: &RecordId,
+    revision_id: &RecordId,
+    work_run_id: &RecordId,
+    space_id: &str,
+    actor: &str,
+    span_override: Option<(u32, u32)>,
+    configured_max_attempts: u32,
+) -> Result<ExtractAssertionsResult, PipelineError> {
+    boxed_extraction_work(|| {
+        execute_extract_assertions_inner(
+            storage,
+            extractor,
+            node_id,
+            revision_id,
+            work_run_id,
+            space_id,
+            actor,
+            span_override,
+            Some(configured_max_attempts),
+        )
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn execute_extract_assertions_inner<E: Extractor + ?Sized>(
+    storage: &StorageClient,
+    extractor: &E,
+    node_id: &RecordId,
+    revision_id: &RecordId,
+    work_run_id: &RecordId,
+    space_id: &str,
+    actor: &str,
+    span_override: Option<(u32, u32)>,
+    configured_max_attempts: Option<u32>,
+) -> Result<ExtractAssertionsResult, PipelineError> {
     let overall_started = Instant::now();
+    let source_stage = boxed_extraction_work(|| {
+        super::source_stage::SourceStageContext::load(storage, space_id, work_run_id)
+    })
+    .await?;
+    if source_stage.is_some() && configured_max_attempts.is_some() {
+        boxed_extraction_work(|| {
+            super::extraction_repair::current_run(storage, space_id, work_run_id)
+        })
+        .await?;
+    }
     let node_repo = DocNodeRepository::new(storage.clone());
     let doc_repo = DocRepository::new(storage.clone());
     let revision_repo = DocRevisionRepository::new(storage.clone());
@@ -1097,8 +1479,7 @@ pub async fn execute_extract_assertions<E: Extractor + ?Sized>(
 
     // Fetch the revision to get text. Point get by id instead of loading
     // every active revision just to .find() this one.
-    let revision = revision_repo
-        .get_by_id(revision_id)
+    let revision = boxed_extraction_work(|| revision_repo.get_by_id(revision_id))
         .await
         .map_err(PipelineError::StorageError)?
         .filter(|revision| revision.status == RevisionStatus::Active)
@@ -1112,7 +1493,11 @@ pub async fn execute_extract_assertions<E: Extractor + ?Sized>(
         (node.span.start as usize, node.span.end as usize)
     };
 
-    if end > revision.text.len() || start > end {
+    if end > revision.text.len()
+        || start >= end
+        || !revision.text.is_char_boundary(start)
+        || !revision.text.is_char_boundary(end)
+    {
         return Err(PipelineError::InvalidInput(format!(
             "Span [{}, {}) is out of bounds for revision text length {}",
             start,
@@ -1121,13 +1506,89 @@ pub async fn execute_extract_assertions<E: Extractor + ?Sized>(
         )));
     }
 
-    let node_text = revision.text[start..end].to_string();
+    let node_text = revision
+        .text
+        .get(start..end)
+        .ok_or_else(|| PipelineError::InvalidInput("Extraction span splits UTF-8".into()))?
+        .to_string();
+    let lineage = boxed_extraction_work(|| {
+        super::grounding::load_grounding_lineage(storage, space_id, revision_id, node_id)
+    })
+    .await?;
+    if lineage.node.revision.id() != revision_id {
+        return Err(PipelineError::ValidationError(
+            "Extraction node belongs to another revision".into(),
+        ));
+    }
+
+    let artifact_id = match &source_stage {
+        Some(context) => {
+            context.require_source(&lineage.source.base.id)?;
+            context.artifact_id(
+                KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE,
+                revision_id,
+                Some(node_id),
+                work_run_id,
+            )?
+        }
+        None => RecordId::new_v4(TableName::WorkArtifact),
+    };
+    if let Some(context) = &source_stage {
+        if let Some(artifact) = boxed_extraction_work(|| {
+            context.replay(
+                storage,
+                &artifact_id,
+                KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE,
+                work_run_id,
+            )
+        })
+        .await?
+        {
+            if artifact.data.get("_source_window") != Some(&serde_json::json!([start, end]))
+                || artifact.base.security != node.base.security
+                || artifact.base.subjects != node.base.subjects
+                || artifact.base.subjects_state != node.base.subjects_state
+            {
+                return Err(PipelineError::ValidationError(
+                    "Persisted extraction window or authorization changed".into(),
+                ));
+            }
+            let data: ExtractionArtifactData = serde_json::from_value(artifact.data)
+                .map_err(|error| PipelineError::ValidationError(error.to_string()))?;
+            if data.source_id.as_deref() != Some(lineage.source.base.id.to_string().as_str())
+                || data.node_id != node_id.to_string()
+                || data.revision_id != revision_id.to_string()
+                || usize::try_from(data.revision_text_len).ok() != Some(revision.text.len())
+            {
+                return Err(PipelineError::ValidationError(
+                    "Persisted extraction belongs to another immutable input".into(),
+                ));
+            }
+            if let Some(max_attempts) = configured_max_attempts {
+                boxed_extraction_work(|| {
+                    super::extraction_repair::validate_producer(
+                        storage,
+                        space_id,
+                        work_run_id,
+                        &artifact_id,
+                        max_attempts,
+                    )
+                })
+                .await?;
+            }
+            return Ok(ExtractAssertionsResult {
+                artifact_id,
+                assertions_extracted: data.assertions.len(),
+                tokens_used: data.tokens_used,
+                model: data.model,
+            });
+        }
+    }
 
     // Load space config, then resolve extraction purpose/skill from
     // space config + doc/source metadata + source type defaults.
     let space_config_repo = SpaceConfigRepository::new(storage.clone());
-    let space_config = space_config_repo
-        .get_by_space_id(space_id)
+    let space_config = boxed_extraction_work(|| space_config_repo.get_by_space_id(space_id))
         .await
         .map_err(PipelineError::StorageError)?;
 
@@ -1157,16 +1618,17 @@ pub async fn execute_extract_assertions<E: Extractor + ?Sized>(
         "Resolved extraction guidance"
     );
 
-    // Load extraction skill body if a skill was resolved.
-    let skill_body = if let Some(ref skill_id) = guidance.skill_id {
-        load_skill_body(skill_id).await
-    } else {
-        None
-    };
+    // Resolve and read explicit assets before any extractor/model dispatch.
+    let skill_body = load_guidance_skill_body(&guidance, &skills_dir_from_env())?;
 
     // Load entities already created from earlier chunks of this document.
     // This enables the LLM to reuse entity IDs instead of creating duplicates.
-    let known_entities = load_known_entities_for_revision(storage, space_id, revision_id).await;
+    let mut expected_entity_base = lineage.source.base.clone();
+    lineage.inherit(&mut expected_entity_base);
+    let known_entities = boxed_extraction_work(|| {
+        load_known_entities_for_revision(storage, space_id, revision_id, &expected_entity_base)
+    })
+    .await;
     let guidance_ms = guidance_started.elapsed().as_millis();
     let media_attachments = doc
         .as_ref()
@@ -1174,7 +1636,7 @@ pub async fn execute_extract_assertions<E: Extractor + ?Sized>(
         .unwrap_or_default();
 
     // Create extraction context
-    let ctx = ExtractionContext::new(
+    let mut ctx = ExtractionContext::new(
         node_id.clone(),
         node_text,
         revision_id.clone(),
@@ -1191,9 +1653,35 @@ pub async fn execute_extract_assertions<E: Extractor + ?Sized>(
     .with_source_timestamp(source.as_ref().and_then(|item| item.timestamp))
     .with_media_attachments(media_attachments);
 
+    if let (Some(context), Some(max_attempts)) = (&source_stage, configured_max_attempts) {
+        boxed_extraction_work(|| {
+            super::extraction_repair::prepare(
+                storage,
+                extractor,
+                context,
+                &lineage,
+                work_run_id,
+                [start, end],
+                max_attempts,
+                &mut ctx,
+            )
+        })
+        .await?;
+    }
+    // Recheck the original plan after guidance reads and before model work.
+    if let Some(context) = &source_stage {
+        boxed_extraction_work(|| context.ensure_current(storage)).await?;
+    }
     // Execute extraction
     let extract_started = Instant::now();
-    let mut extraction_result = extractor.extract(ctx).await?;
+    let repairing = ctx.repair.is_some();
+    let mut extraction_result = extractor.extract(ctx).await.map_err(|error| {
+        if repairing && matches!(error, PipelineError::BudgetExceeded(_)) {
+            PipelineError::GroundingRepairExhausted
+        } else {
+            error
+        }
+    })?;
     let extract_ms = extract_started.elapsed().as_millis();
     apply_revision_offsets(
         &mut extraction_result.raw_assertions,
@@ -1207,6 +1695,9 @@ pub async fn execute_extract_assertions<E: Extractor + ?Sized>(
         assertion.evidence_span.node = Some(Link::new(node_id.clone()));
     }
 
+    if let Some(context) = &source_stage {
+        boxed_extraction_work(|| context.ensure_current(storage)).await?;
+    }
     let persistence_started = Instant::now();
     // Persist model/prompt identifiers on the work run for provenance.
     let manifest = extractor.manifest();
@@ -1232,7 +1723,7 @@ pub async fn execute_extract_assertions<E: Extractor + ?Sized>(
         .collect::<Result<Vec<_>, _>>()?;
 
     let artifact_data = ExtractionArtifactData {
-        source_id: None,
+        source_id: source.as_ref().map(|source| source.base.id.to_string()),
         node_id: node_id.to_string(),
         revision_id: revision_id.to_string(),
         assertions: serialized_assertions,
@@ -1242,19 +1733,34 @@ pub async fn execute_extract_assertions<E: Extractor + ?Sized>(
         revision_text_len: revision.text.len() as u32,
     };
 
-    // Create work artifact
-    let artifact_id = RecordId::new_v4(TableName::WorkArtifact);
+    let mut artifact_data = serde_json::to_value(&artifact_data)
+        .map_err(|error| PipelineError::ConfigError(error.to_string()))?;
+    if let Some(context) = &source_stage {
+        context.tag(&mut artifact_data)?;
+        artifact_data
+            .as_object_mut()
+            .ok_or_else(|| {
+                PipelineError::ValidationError("Extraction payload is not an object".into())
+            })?
+            .insert("_source_window".into(), serde_json::json!([start, end]));
+        boxed_extraction_work(|| context.ensure_current(storage)).await?;
+    }
+    // Create this producer's immutable work artifact.
     let mut base = BaseFields::new(artifact_id.clone(), space_id.to_string(), actor.to_string());
     base.security = node.base.security.clone();
+    base.subjects = node.base.subjects.clone();
+    base.subjects_state = node.base.subjects_state;
     base.provenance = node.base.provenance.clone();
-    apply_work_run_provenance(storage, work_run_id, space_id, &mut base.provenance).await?;
+    boxed_extraction_work(|| {
+        apply_work_run_provenance(storage, work_run_id, space_id, &mut base.provenance)
+    })
+    .await?;
 
     let artifact = WorkArtifact {
         base,
         work_run: Link::new(work_run_id.clone()),
         artifact_type: KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE.to_string(),
-        data: serde_json::to_value(&artifact_data)
-            .map_err(|e| PipelineError::ConfigError(format!("Serialization error: {e}")))?,
+        data: artifact_data,
         status: ArtifactStatus::Draft,
         validation_errors: None,
         validated_at: None,
@@ -1265,6 +1771,20 @@ pub async fn execute_extract_assertions<E: Extractor + ?Sized>(
         .create(artifact)
         .await
         .map_err(PipelineError::StorageError)?;
+    if source_stage.is_some() {
+        if let Some(max_attempts) = configured_max_attempts {
+            boxed_extraction_work(|| {
+                super::extraction_repair::validate_producer(
+                    storage,
+                    space_id,
+                    work_run_id,
+                    &artifact_id,
+                    max_attempts,
+                )
+            })
+            .await?;
+        }
+    }
     let persistence_ms = persistence_started.elapsed().as_millis();
     tracing::info!(
         node_id = %node_id,
@@ -1295,21 +1815,10 @@ pub async fn execute_extract_assertions<E: Extractor + ?Sized>(
 fn apply_revision_offsets(
     assertions: &mut [RawAssertion],
     node_span_start: u32,
-    _revision_text_len: usize,
+    revision_text_len: usize,
 ) -> Result<(), PipelineError> {
     for assertion in assertions {
-        let start = assertion.evidence_span.start;
-        let end = assertion.evidence_span.end;
-
-        let offset_start = start.checked_add(node_span_start).ok_or_else(|| {
-            PipelineError::InvalidInput("Evidence span start overflow".to_string())
-        })?;
-        let offset_end = end
-            .checked_add(node_span_start)
-            .ok_or_else(|| PipelineError::InvalidInput("Evidence span end overflow".to_string()))?;
-
-        assertion.evidence_span.start = offset_start;
-        assertion.evidence_span.end = offset_end;
+        assertion.translate_evidence_offset(node_span_start, revision_text_len)?;
     }
 
     Ok(())
@@ -1420,6 +1929,187 @@ mod routing_tests {
             space_id.to_string(),
             "tester".to_string(),
         )
+    }
+
+    fn coverage_revision(text: &str) -> DocRevision {
+        DocRevision {
+            base: base(TableName::DocRevision, "coverage"),
+            doc: Link::new(RecordId::new_v4(TableName::Doc)),
+            text: text.into(),
+            text_hash: AssertionValidator::hash_quote(text),
+            renderer: RendererMetadata {
+                name: "coverage-fixture".into(),
+                version: "1".into(),
+                config_hash: None,
+            },
+            manifest: None,
+            supersedes: None,
+            status: RevisionStatus::Active,
+            rendered_at: Utc::now(),
+        }
+    }
+
+    fn coverage_node(revision: &DocRevision, role: NodeRole, start: u32, end: u32) -> DocNode {
+        let mut node_base = revision.base.clone();
+        node_base.id = RecordId::new_v4(TableName::DocNode);
+        DocNode {
+            node_key: format!("{role}:{start}:{end}"),
+            base: node_base,
+            revision: Link::new(revision.base.id.clone()),
+            role,
+            span: elephant_types::records::doc_node::TextSpan::new(start, end),
+            text: None,
+            parent: None,
+            position: 0,
+            depth: 0,
+            embedding_model: None,
+            collection: None,
+        }
+    }
+
+    fn coverage_config() -> ExtractionPlanConfig {
+        ExtractionPlanConfig {
+            preferred_roles: vec![NodeRole::Section, NodeRole::Chunk],
+            tokens_per_char: 1.0,
+            max_tokens_per_node: 8,
+            ..ExtractionPlanConfig::default()
+        }
+    }
+
+    #[test]
+    fn coverage_falls_back_for_oversized_sections_without_silently_losing_tail() {
+        let revision = coverage_revision("abcdefghijklmno");
+        let nodes = vec![
+            coverage_node(&revision, NodeRole::Section, 0, 5),
+            coverage_node(&revision, NodeRole::Section, 5, 15),
+            coverage_node(&revision, NodeRole::Chunk, 5, 10),
+            coverage_node(&revision, NodeRole::Chunk, 10, 15),
+        ];
+        let plan = prepare_extraction_plan(&revision, &nodes, "v1", &coverage_config()).unwrap();
+        assert_eq!(plan.node_selections.len(), 3);
+        assert_eq!(plan.node_selections[2].span_end, 15);
+        let proof = plan.coverage.unwrap();
+        assert!(proof.complete);
+        assert_eq!(proof.revision_text_hash, revision.text_hash);
+        assert_eq!(proof.selected_byte_count, 15);
+        assert_eq!(proof.revision_text_len, 15);
+        assert_eq!(proof.empty_reason, None);
+        assert!(prepare_extraction_plan(&revision, &nodes[..2], "v1", &coverage_config()).is_err());
+    }
+
+    #[test]
+    fn coverage_node_token_and_cost_caps_never_return_partial_success() {
+        let revision = coverage_revision("abcdefghijklmno");
+        let nodes: Vec<_> = [(0, 5), (5, 10), (10, 15)]
+            .into_iter()
+            .map(|(start, end)| coverage_node(&revision, NodeRole::Chunk, start, end))
+            .collect();
+        let mut node_limited = coverage_config();
+        node_limited.stop_conditions.max_nodes = 2;
+        let mut token_limited = coverage_config();
+        token_limited.stop_conditions.max_tokens = 14;
+        let mut cost_limited = coverage_config();
+        cost_limited.stop_conditions.budget_cap_euros = 0.000_014;
+        for config in [node_limited, token_limited, cost_limited] {
+            assert!(matches!(
+                prepare_extraction_plan(&revision, &nodes, "v1", &config),
+                Err(PipelineError::BudgetExceeded(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn coverage_counts_overlap_once_and_is_independent_of_repository_order() {
+        let revision = coverage_revision("abcdefghijkl");
+        let mut nodes = vec![
+            coverage_node(&revision, NodeRole::Chunk, 0, 8),
+            coverage_node(&revision, NodeRole::Chunk, 4, 12),
+        ];
+        let plan = prepare_extraction_plan(&revision, &nodes, "v1", &coverage_config()).unwrap();
+        nodes.reverse();
+        let reversed =
+            prepare_extraction_plan(&revision, &nodes, "v1", &coverage_config()).unwrap();
+        assert_eq!(plan, reversed);
+        assert_eq!(plan.total_estimated_tokens(), 16);
+        assert_eq!(plan.coverage.unwrap().selected_byte_count, 12);
+    }
+
+    #[test]
+    fn coverage_accounts_for_full_coalesced_window_including_gaps() {
+        let revision = coverage_revision("a  b");
+        let nodes = vec![
+            coverage_node(&revision, NodeRole::Chunk, 0, 1),
+            coverage_node(&revision, NodeRole::Chunk, 3, 4),
+        ];
+        let plan = prepare_extraction_plan(&revision, &nodes, "v1", &coverage_config()).unwrap();
+        assert_eq!(plan.node_count(), 1);
+        assert_eq!(plan.total_estimated_tokens(), 4);
+        assert_eq!(plan.coverage.unwrap().selected_byte_count, 4);
+    }
+
+    #[test]
+    fn coverage_empty_plan_requires_explicit_whitespace_reason() {
+        for text in ["", " \n\t", "\u{2003}"] {
+            let revision = coverage_revision(text);
+            let plan = prepare_extraction_plan(&revision, &[], "v1", &coverage_config()).unwrap();
+            let proof = plan.coverage.unwrap();
+            assert!(proof.complete);
+            assert_eq!(proof.selected_byte_count, 0);
+            assert_eq!(proof.empty_reason.as_deref(), Some("empty_or_whitespace"));
+        }
+        let revision = coverage_revision("not empty");
+        assert!(prepare_extraction_plan(&revision, &[], "v1", &coverage_config()).is_err());
+    }
+
+    #[test]
+    fn coverage_rejects_split_utf8_foreign_nodes_and_changed_revision() {
+        let mut revision = coverage_revision("éabc");
+        let invalid = coverage_node(&revision, NodeRole::Chunk, 1, 5);
+        assert!(prepare_extraction_plan(&revision, &[invalid], "v1", &coverage_config()).is_err());
+        let mut foreign = coverage_node(&revision, NodeRole::Chunk, 0, 5);
+        foreign.base.space_id = "another-space".into();
+        assert!(prepare_extraction_plan(&revision, &[foreign], "v1", &coverage_config()).is_err());
+        let valid = coverage_node(&revision, NodeRole::Chunk, 0, 5);
+        revision.text = "abcde".into();
+        assert!(prepare_extraction_plan(&revision, &[valid], "v1", &coverage_config()).is_err());
+    }
+
+    #[test]
+    fn complete_large_sources_fan_out_within_bounded_default_work_items() {
+        for bytes in [1_130_000_u32, 2_000_000_u32] {
+            let revision = coverage_revision(&"x".repeat(bytes as usize));
+            let nodes: Vec<_> = (0..bytes)
+                .step_by(462)
+                .map(|start| {
+                    coverage_node(&revision, NodeRole::Chunk, start, (start + 512).min(bytes))
+                })
+                .collect();
+            assert!(
+                nodes.len() > 1_000,
+                "raw members exceed the former incorrect job count"
+            );
+            let config = ExtractionPlanConfig::default();
+            let plan =
+                prepare_extraction_plan(&revision, &nodes, "large-input-v1", &config).unwrap();
+            assert!(plan.node_count() < 200);
+            assert!(plan
+                .node_selections
+                .iter()
+                .all(|selection| selection.estimated_tokens <= 3_000));
+            assert!(plan.total_estimated_tokens() <= config.stop_conditions.max_tokens);
+            let coverage = plan.coverage.unwrap();
+            assert!(coverage.complete);
+            assert_eq!(coverage.selected_byte_count, bytes);
+        }
+    }
+
+    #[test]
+    fn coverage_threshold_does_not_authorize_omitting_a_short_claim() {
+        let revision = coverage_revision("abcdefgh z");
+        let node = coverage_node(&revision, NodeRole::Chunk, 0, 8);
+        let mut config = coverage_config();
+        config.stop_conditions.coverage_threshold = 0.5;
+        assert!(prepare_extraction_plan(&revision, &[node], "v1", &config).is_err());
     }
 
     fn make_doc(space_id: &str, metadata: Value) -> Doc {
@@ -1654,6 +2344,7 @@ mod routing_tests {
         let placeholder_revision =
             Link::<DocRevision>::new(RecordId::new_v4(TableName::DocRevision));
         let mut assertions = vec![RawAssertion {
+            support_verification: None,
             subject_text: "Ada".to_string(),
             predicate_text: "attends".to_string(),
             object_text: Some("Example School".to_string()),
@@ -1691,12 +2382,27 @@ mod routing_tests {
         let assertion_repo = AssertionRepository::new(storage.clone());
         let revision_id = RecordId::new_v4(TableName::DocRevision);
 
+        let source_id = RecordId::new_v4(TableName::Source);
+        let scoped_entity = |name: &str, kind: &str| {
+            let mut entity = make_entity("space-1", name, kind);
+            entity.base.provenance.sources = vec![source_id.clone()];
+            entity
+                .base
+                .provenance
+                .chain
+                .push(elephant_types::records::base::ProvenanceStep {
+                    step: "grounded_promotion".into(),
+                    input: revision_id.to_string(),
+                    output: entity.base.id.to_string(),
+                });
+            entity
+        };
         let subject = entity_repo
-            .create(make_entity("space-1", "Ada", "person"))
+            .create(scoped_entity("Ada", "person"))
             .await
             .expect("create subject");
         let object = entity_repo
-            .create(make_entity("space-1", "Example School", "org"))
+            .create(scoped_entity("Example School", "org"))
             .await
             .expect("create object");
         assertion_repo
@@ -1709,13 +2415,32 @@ mod routing_tests {
             .await
             .expect("create assertion");
 
-        let known = load_known_entities_for_revision(&storage, "space-1", &revision_id).await;
+        let known =
+            load_known_entities_for_revision(&storage, "space-1", &revision_id, &subject.base)
+                .await;
 
         assert_eq!(known.len(), 2);
         assert!(known.iter().any(|entity| entity.display_name == "Ada"));
         assert!(known
             .iter()
             .any(|entity| entity.display_name == "Example School"));
+        let mut other_revision = subject.base.clone();
+        other_revision.provenance.chain.clear();
+        assert!(load_known_entities_for_revision(
+            &storage,
+            "space-1",
+            &revision_id,
+            &other_revision
+        )
+        .await
+        .is_empty());
+        let mut other_policy = subject.base.clone();
+        other_policy.security.policy_id = "unrelated".into();
+        assert!(
+            load_known_entities_for_revision(&storage, "space-1", &revision_id, &other_policy)
+                .await
+                .is_empty()
+        );
     }
 
     #[derive(Clone)]
@@ -1772,6 +2497,7 @@ mod routing_tests {
         skill: Option<&str>,
     ) -> SpaceConfig {
         SpaceConfig {
+            processing: None,
             base: base(TableName::SpaceConfig, space_id),
             embedding_provider: "openai".to_string(),
             embedding_model: "text-embedding-3-large".to_string(),
@@ -1811,7 +2537,7 @@ mod routing_tests {
     }
 
     #[test]
-    fn test_space_config_skill_and_purpose_take_precedence() {
+    fn test_doc_metadata_precedes_source_and_space_guidance() {
         let space = make_space_config(
             "space-1",
             Some("space purpose"),
@@ -1834,13 +2560,17 @@ mod routing_tests {
         );
 
         let resolved = resolve_extraction_guidance(Some(&space), Some(&doc), Some(&source));
-        assert_eq!(resolved.purpose.as_deref(), Some("space purpose"));
-        assert_eq!(resolved.purpose_source, "space_config");
+        assert_eq!(resolved.purpose.as_deref(), Some("doc purpose"));
+        assert_eq!(resolved.purpose_source, "doc.metadata");
+        assert_eq!(resolved.skill_id.as_deref(), Some("extraction/fiction"));
+        assert_eq!(resolved.skill_source, "doc.metadata");
         assert_eq!(
-            resolved.skill_id.as_deref(),
-            Some("extraction/custom-comms")
+            resolved.resolution_trace,
+            [
+                "purpose:doc.metadata=hit",
+                "skill:doc.metadata=hit:extraction/fiction"
+            ]
         );
-        assert_eq!(resolved.skill_source, "space_config");
     }
 
     #[test]
@@ -1859,6 +2589,67 @@ mod routing_tests {
         assert_eq!(resolved.skill_source, "doc.metadata");
         assert_eq!(resolved.purpose.as_deref(), Some("extract story events"));
         assert_eq!(resolved.purpose_source, "doc.metadata");
+    }
+
+    #[test]
+    fn test_source_guidance_precedes_space_when_document_override_is_blank() {
+        let space = make_space_config("space-1", Some("space purpose"), Some("fiction"));
+        let doc = make_doc(
+            "space-1",
+            serde_json::json!({
+                "purpose": " ", "extraction_skill": "", "domain": "fiction"
+            }),
+        );
+        let source = make_source(
+            "space-1",
+            SourceType::Web,
+            serde_json::json!({
+                "purpose": "source purpose", "extraction_skill": "technical-docs"
+            }),
+        );
+        let resolved = resolve_extraction_guidance(Some(&space), Some(&doc), Some(&source));
+        assert_eq!(resolved.purpose.as_deref(), Some("source purpose"));
+        assert_eq!(resolved.purpose_source, "source.metadata");
+        assert_eq!(
+            resolved.skill_id.as_deref(),
+            Some("extraction/technical-docs")
+        );
+        assert_eq!(resolved.skill_source, "source.metadata");
+        assert_eq!(
+            resolved.resolution_trace,
+            [
+                "purpose:doc.metadata=miss",
+                "purpose:source.metadata=hit",
+                "skill:doc.metadata=miss",
+                "skill:source.metadata=hit:extraction/technical-docs"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_space_explicit_guidance_precedes_inferred_document_domain() {
+        let space = make_space_config("space-1", Some("space purpose"), Some("technical-docs"));
+        let doc = make_doc("space-1", serde_json::json!({"domain": "fiction"}));
+        let source = make_source("space-1", SourceType::Web, serde_json::json!({}));
+        let status = resolve_extraction_guidance_status(Some(&space), Some(&doc), Some(&source));
+        assert_eq!(status.purpose.as_deref(), Some("space purpose"));
+        assert_eq!(status.purpose_source, "space_config");
+        assert_eq!(
+            status.skill_id.as_deref(),
+            Some("extraction/technical-docs")
+        );
+        assert_eq!(status.skill_source, "space_config");
+        assert_eq!(
+            status.resolution_trace,
+            [
+                "purpose:doc.metadata=miss",
+                "purpose:source.metadata=miss",
+                "purpose:space_config=hit",
+                "skill:doc.metadata=miss",
+                "skill:source.metadata=miss",
+                "skill:space_config=hit:extraction/technical-docs"
+            ]
+        );
     }
 
     #[test]
@@ -1887,9 +2678,196 @@ mod routing_tests {
     #[test]
     fn test_canonical_skill_id_is_derived_from_skills_directory() {
         let skills_dir = make_temp_skills_dir();
-        let resolved = canonical_skill_id_from_directory("custom_ops", &skills_dir);
+        let resolved = canonical_skill_id_from_directory("custom_ops", &skills_dir)
+            .expect("unambiguous alias");
         assert_eq!(resolved.as_deref(), Some("extraction/custom-ops"));
         std::fs::remove_dir_all(skills_dir).expect("cleanup temp skills dir");
+    }
+
+    #[test]
+    fn explicit_skill_reads_actual_body_and_missing_does_not_use_space_default() {
+        let root = make_temp_skills_dir();
+        let doc = make_doc(
+            "space-1",
+            serde_json::json!({"extraction_skill":"custom_ops"}),
+        );
+        let guidance = resolve_extraction_guidance(None, Some(&doc), None);
+        assert_eq!(
+            load_guidance_skill_body(&guidance, &root)
+                .unwrap()
+                .as_deref(),
+            Some("# Custom Ops\n\nTest skill")
+        );
+        let missing = make_doc(
+            "space-1",
+            serde_json::json!({"extraction_skill":"missing-custom-skill"}),
+        );
+        let space = make_space_config("space-1", None, Some("extraction/custom-ops"));
+        let guidance = resolve_extraction_guidance(Some(&space), Some(&missing), None);
+        assert_eq!(guidance.skill_source, "doc.metadata");
+        let error = load_guidance_skill_body(&guidance, &root).unwrap_err();
+        assert!(
+            matches!(error, PipelineError::ConfigError(ref message) if message.starts_with("extraction_skill_missing:"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_skill_alias_requires_canonical_path_and_rechecks_original_request() {
+        let root = make_temp_skills_dir();
+        let doc = make_doc(
+            "space-1",
+            serde_json::json!({"extraction_skill":"custom_ops"}),
+        );
+        let guidance = resolve_extraction_guidance(None, Some(&doc), None);
+        std::fs::create_dir_all(root.join("another/custom-ops")).unwrap();
+        std::fs::write(
+            root.join("another/custom-ops/SKILL.md"),
+            "Other explicit instructions",
+        )
+        .unwrap();
+        assert!(
+            matches!(canonical_skill_id_from_directory("custom_ops", &root), Err(PipelineError::ConfigError(message)) if message.starts_with("extraction_skill_ambiguous:"))
+        );
+        assert!(load_guidance_skill_body(&guidance, &root).is_err());
+        assert_eq!(
+            read_skill_body_from_directory("another/custom-ops", &root).unwrap(),
+            "Other explicit instructions"
+        );
+        assert_eq!(
+            canonical_skill_id_from_directory("extraction/custom-ops", &root)
+                .unwrap()
+                .as_deref(),
+            Some("extraction/custom-ops")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_skill_rejects_empty_unreadable_and_foreign_paths() {
+        let root = make_temp_skills_dir();
+        let asset = root.join("extraction/custom-ops/SKILL.md");
+        std::fs::write(&asset, "---\nname: custom\n---\n  ").unwrap();
+        assert!(
+            matches!(read_skill_body_from_directory("custom_ops", &root), Err(PipelineError::ConfigError(message)) if message.starts_with("extraction_skill_empty:"))
+        );
+        std::fs::write(&asset, [0xff, 0xfe]).unwrap();
+        assert!(
+            matches!(read_skill_body_from_directory("custom_ops", &root), Err(PipelineError::ConfigError(message)) if message.starts_with("extraction_skill_unreadable:"))
+        );
+        assert!(read_skill_body_from_directory("../custom-ops", &root).is_err());
+        assert!(read_skill_body_from_directory("/extraction/custom-ops", &root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn absent_explicit_skill_keeps_optional_inferred_default() {
+        let root = make_temp_skills_dir();
+        let source = make_source("space-1", SourceType::Manual, serde_json::json!({}));
+        let guidance = resolve_extraction_guidance(None, None, Some(&source));
+        assert_eq!(guidance.skill_source, "source.type_default");
+        assert!(load_guidance_skill_body(&guidance, &root)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_explicit_skill_blocks_active_extractor_and_artifact_creation() {
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let mut doc = make_doc(
+            "space-1",
+            serde_json::json!({"extraction_skill": format!("missing-oracle-{}", uuid::Uuid::new_v4())}),
+        );
+        let hash = AssertionValidator::hash_quote(&doc.text);
+        let source = SourceRepository::new(storage.clone())
+            .create(Source::new(
+                base(TableName::Source, "space-1"),
+                SourceType::Manual,
+                hash.clone(),
+            ))
+            .await
+            .unwrap();
+        doc.source = Some(Link::new(source.base.id.clone()));
+        doc.base.provenance.sources = vec![source.base.id.clone()];
+        let doc = DocRepository::new(storage.clone())
+            .create(doc)
+            .await
+            .unwrap();
+        let mut revision_base = base(TableName::DocRevision, "space-1");
+        revision_base.provenance.sources = vec![source.base.id.clone()];
+        revision_base
+            .provenance
+            .chain
+            .push(elephant_types::records::base::ProvenanceStep {
+                step: "source_content".into(),
+                input: source.base.id.to_string(),
+                output: hash.clone(),
+            });
+        let revision = DocRevisionRepository::new(storage.clone())
+            .create(DocRevision {
+                base: revision_base,
+                doc: Link::new(doc.base.id),
+                text: doc.text,
+                text_hash: hash,
+                renderer: RendererMetadata {
+                    name: "retained".into(),
+                    version: "1".into(),
+                    config_hash: None,
+                },
+                manifest: None,
+                status: RevisionStatus::Active,
+                supersedes: None,
+                rendered_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let node = DocNodeRepository::new(storage.clone())
+            .create(DocNode {
+                base: base(TableName::DocNode, "space-1"),
+                revision: Link::new(revision.base.id.clone()),
+                role: NodeRole::Chunk,
+                span: elephant_types::records::doc_node::TextSpan::new(0, 4),
+                node_key: "body".into(),
+                text: None,
+                parent: None,
+                position: 0,
+                depth: 1,
+                embedding_model: None,
+                collection: None,
+            })
+            .await
+            .unwrap();
+        let item = WorkItemRepository::new(storage.clone())
+            .create(make_work_item("space-1"))
+            .await
+            .unwrap();
+        let run = WorkRunRepository::new(storage.clone())
+            .create(make_work_run("space-1", item.base.id))
+            .await
+            .unwrap();
+        let extractor = CapturingExtractor::new();
+        let error = execute_extract_assertions(
+            &storage,
+            &extractor,
+            &node.base.id,
+            &revision.base.id,
+            &run.base.id,
+            "space-1",
+            "oracle",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, PipelineError::ConfigError(message) if message.starts_with("extraction_skill_missing:"))
+        );
+        assert!(extractor.seen.lock().unwrap().is_none());
+        assert!(WorkArtifactRepository::new(storage)
+            .list("space-1", 10, None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1913,8 +2891,8 @@ mod routing_tests {
             resolved
                 .resolution_trace
                 .iter()
-                .any(|step| step == "purpose:space_config=miss"),
-            "expected trace to include purpose fallback misses"
+                .all(|step| !step.contains("space_config")),
+            "trace must stop at the document winner, before unused space defaults"
         );
     }
 
@@ -1971,6 +2949,8 @@ mod routing_tests {
 
     #[tokio::test]
     async fn test_execute_extract_assertions_passes_media_context_to_extractor() {
+        use crate::renderer::multimodal::{FakeMediaRender, MultimodalRenderer};
+        use crate::renderer::RendererRegistry;
         let storage = StorageClient::new_memory().await.expect("storage");
         let doc_repo = DocRepository::new(storage.clone());
         let revision_repo = DocRevisionRepository::new(storage.clone());
@@ -1978,20 +2958,61 @@ mod routing_tests {
         let work_item_repo = WorkItemRepository::new(storage.clone());
         let work_run_repo = WorkRunRepository::new(storage.clone());
 
-        let doc = doc_repo
-            .create(make_media_doc("space-1"))
+        let source = elephant_storage::SourceRepository::new(storage.clone())
+            .create(Source::new(
+                base(TableName::Source, "space-1"),
+                SourceType::Manual,
+                crate::extraction::AssertionValidator::hash_quote("original media fixture"),
+            ))
             .await
-            .expect("create doc");
+            .expect("source");
+        let mut input = make_media_doc("space-1");
+        input.source = Some(Link::new(source.base.id));
+        input.media_attachments[1].duration_ms = Some(24_000);
+        let doc = doc_repo.create(input).await.expect("create doc");
+        let mut renderers = RendererRegistry::new();
+        renderers.register(Box::new(MultimodalRenderer::for_tests(vec![
+            FakeMediaRender {
+                attachment_id: "att-image".into(),
+                derived_text: "Frame details".into(),
+            },
+            FakeMediaRender {
+                attachment_id: "att-video".into(),
+                derived_text: "Alex works in Terminal. Claude reviews code.".into(),
+            },
+        ])));
+        let rendered = super::super::evidence_work_kinds::execute_render_doc(
+            &storage,
+            &renderers,
+            &doc,
+            Some("video/mp4"),
+        )
+        .await
+        .expect("render immutable media revision");
         let revision = revision_repo
-            .create(make_media_revision("space-1", doc.base.id.clone()))
+            .get_by_id(&rendered.revision_id)
             .await
-            .expect("create revision");
+            .expect("load rendered revision")
+            .expect("revision");
+        let binding = revision
+            .manifest
+            .as_ref()
+            .expect("media manifest")
+            .span_bindings
+            .iter()
+            .find(|binding| binding.attachment_id == "att-video")
+            .expect("actual video span");
+        let mut node_base = revision.base.clone();
+        node_base.id = RecordId::new_v4(TableName::DocNode);
         let node = node_repo
             .create(DocNode {
-                base: base(TableName::DocNode, "space-1"),
+                base: node_base,
                 revision: Link::new(revision.base.id.clone()),
                 role: NodeRole::Chunk,
-                span: elephant_types::records::doc_node::TextSpan::new(60, 180),
+                span: elephant_types::records::doc_node::TextSpan::new(
+                    binding.text_start,
+                    binding.text_end,
+                ),
                 node_key: "chunk-1".to_string(),
                 text: None,
                 parent: None,

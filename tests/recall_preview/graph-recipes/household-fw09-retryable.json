@@ -1,0 +1,82 @@
+{
+  "format": "recall-public-graph-fixture/v1",
+  "source_request": {
+    "source": {
+      "id": "source:c50c4217-8e00-5257-85ee-66456473e52e",
+      "space_id": "qualification-household",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "household-policy",
+        "level": 3,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "type": "manual",
+      "hash": "a87277eb8588eeb024dd59e695030c8e963736c6fa8978c14c7d80c91a35ceb1",
+      "external_id": "workload/atlas-06",
+      "uri": "https://example.invalid/recall-workload/household/06",
+      "metadata": {}
+    },
+    "doc": {
+      "id": "doc:536137d1-68ac-56a2-b2fb-77579423ef90",
+      "space_id": "qualification-household",
+      "created_at": "2026-10-07T00:00:00Z",
+      "updated_at": "2026-10-07T00:00:00Z",
+      "created_by": "d28-qualification",
+      "deleted_at": null,
+      "provenance": {
+        "sources": [],
+        "chain": []
+      },
+      "security": {
+        "policy_id": "household-policy",
+        "level": 3,
+        "labels": [],
+        "handling": []
+      },
+      "subjects": [],
+      "subjects_state": "unknown",
+      "title": "workload/atlas-06",
+      "text": "For household project Atlas-06, the responsible custodian is Helena-06. Its approved supply limit is 37 units. This record applies only to household scope.\nHelena-06 now maintains the Atlas-06 retryable backlog notebook.",
+      "source": null,
+      "sidecar_text": null,
+      "media_attachments": [],
+      "rendition_key": "d28/text/workload/atlas-06/full-fw09-retryable-r2",
+      "metadata": {}
+    },
+    "ingest_mode": "graph",
+    "intake": {
+      "revision_id": "full-fw09-retryable-r2",
+      "idempotency_key": "literal-e0647a75dc00029969d6b8904d164527a01df3bd10737c0979db0dcc77924502"
+    }
+  },
+  "rendered_text": "For household project Atlas-06, the responsible custodian is Helena-06. Its approved supply limit is 37 units. This record applies only to household scope.\nHelena-06 now maintains the Atlas-06 retryable backlog notebook.\n",
+  "rendered_sha256": "7d1115a6cf92bb04993d5964c721417fb857dfb5dcbb8d1173405e50a6542eff",
+  "expected_assertions": [
+    {
+      "subject_text": "Helena-06",
+      "predicate_raw": "maintains",
+      "object_text": "Atlas-06 retryable backlog notebook",
+      "object_literal": null,
+      "subject_entity_type": "person",
+      "object_entity_type": "document",
+      "confidence": 1.0,
+      "significance": "medium",
+      "source_event_time": null,
+      "start": 156,
+      "end": 220,
+      "quote": "Helena-06 now maintains the Atlas-06 retryable backlog notebook.",
+      "quote_hash": "4662ae86d297dfac2d9b0e951a1f305a0c74cdd63bc16d0023263c42aa7049f3"
+    }
+  ],
+  "extract_rule_id": "household-fw09-retryable-extract"
+}

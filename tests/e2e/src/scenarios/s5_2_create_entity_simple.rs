@@ -41,6 +41,7 @@ fn test_principal(space_id: &str) -> Principal {
 #[tokio::test]
 async fn scenario_s5_2_create_entity_simple() -> anyhow::Result<()> {
     let harness = Harness::new().await?;
+    super::register_scenario_space(&harness.client, "default").await?;
     let dispatcher = create_dispatcher(harness.client.clone(), test_principal("default"));
 
     let params = serde_json::json!({

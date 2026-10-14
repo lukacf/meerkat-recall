@@ -32,6 +32,120 @@ use super::word_gaps::{
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
+/// Decode content without lopdf's best-effort fallback to raw or partial data.
+/// Every filter layer shares the caller's output limit. Flate completion is
+/// checked explicitly because lopdf logs corrupt/truncated zlib errors and can
+/// return the prefix it decoded as a successful stream.
+pub(crate) fn complete_content_stream(
+    stream: &lopdf::Stream,
+    limit: usize,
+) -> Result<Vec<u8>, PdfError> {
+    let filters = match stream.dict.get(b"Filter") {
+        Err(_) | Ok(Object::Null) => Vec::new(),
+        Ok(_) => stream.filters()?,
+    };
+    if filters.is_empty() {
+        if stream.content.len() > limit {
+            return Err(PdfError::Parse(
+                "content stream exceeds the byte limit".into(),
+            ));
+        }
+        return Ok(stream.content.clone());
+    }
+
+    let mut data = stream.content.clone();
+    for (index, filter) in filters.iter().enumerate() {
+        let filter: &[u8] = match *filter {
+            b"Fl" => b"FlateDecode",
+            b"AHx" => b"ASCIIHexDecode",
+            b"A85" => b"ASCII85Decode",
+            b"LZW" => b"LZWDecode",
+            b"RL" => b"RunLengthDecode",
+            name => name,
+        };
+        if filter == b"FlateDecode" {
+            validate_complete_flate(&data, limit)?;
+        }
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("Filter", Object::Name(filter.to_vec()));
+        match stream.dict.get(b"DecodeParms") {
+            Ok(Object::Array(params)) => {
+                if let Some(param) = params.get(index) {
+                    dict.set("DecodeParms", param.clone());
+                }
+            }
+            Ok(param) if filters.len() == 1 => dict.set("DecodeParms", param.clone()),
+            _ => {}
+        }
+        data = lopdf::Stream::new(dict, data).decompressed_content_with_limit(limit)?;
+    }
+    Ok(data)
+}
+
+fn validate_complete_flate(data: &[u8], limit: usize) -> Result<(), PdfError> {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    let mut decoder = Decompress::new(true);
+    let mut output = [0_u8; 16 * 1024];
+    let mut consumed = 0;
+    loop {
+        let before_in = decoder.total_in();
+        let before_out = decoder.total_out();
+        let status = decoder
+            .decompress(&data[consumed..], &mut output, FlushDecompress::None)
+            .map_err(|error| {
+                PdfError::Parse(format!("invalid Flate content stream: {error}"))
+            })?;
+        consumed += (decoder.total_in() - before_in) as usize;
+        if decoder.total_out() > limit as u64 {
+            return Err(PdfError::Parse(
+                "content stream exceeds the byte limit".into(),
+            ));
+        }
+        if status == Status::StreamEnd {
+            return Ok(());
+        }
+        if decoder.total_in() == before_in && decoder.total_out() == before_out {
+            return Err(PdfError::Parse("incomplete Flate content stream".into()));
+        }
+    }
+}
+
+/// Read every declared Contents entry, including indirect arrays, without
+/// silently omitting missing references or non-stream entries. No Contents (or
+/// an explicit null) denotes a valid blank page. Reference walks are bounded
+/// by lopdf's dereference limit; content bytes include stream separators.
+fn complete_page_content(
+    doc: &Document,
+    page_id: ObjectId,
+    limit: usize,
+) -> Result<Vec<u8>, PdfError> {
+    let page = doc.get_dictionary(page_id)?;
+    let Ok(contents) = page.get(b"Contents") else {
+        return Ok(Vec::new());
+    };
+    let (_, contents) = doc.dereference(contents)?;
+    if matches!(contents, Object::Null) {
+        return Ok(Vec::new());
+    }
+    let entries = match contents {
+        Object::Array(entries) => entries.as_slice(),
+        single => std::slice::from_ref(single),
+    };
+    let mut result = Vec::new();
+    for entry in entries {
+        let (_, entry) = doc.dereference(entry)?;
+        let stream = entry.as_stream()?;
+        let remaining = limit.checked_sub(result.len() + 1).ok_or_else(|| {
+            PdfError::Parse("page content exceeds the byte limit".into())
+        })?;
+        let data = complete_content_stream(stream, remaining)?;
+        result.extend_from_slice(&data);
+        result.push(b'\n');
+    }
+    Ok(result)
+}
+
 /// Strip PDF comments (% to end of line) from content stream bytes.
 ///
 /// Some PDF generators (e.g. PD4ML) embed comments in content streams that
@@ -447,6 +561,7 @@ pub(crate) fn extract_page_text_items_with_options(
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
 ) -> Result<(PageExtraction, bool, PageRotation, bool, Vec<RunCoverage>), PdfError> {
+    form_budget.require_complete |= options.require_complete;
     let include_invisible = options.include_invisible;
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
@@ -586,7 +701,13 @@ pub(crate) fn extract_page_text_items_with_options(
     // page instead of exhausting memory — same degradation as the operator
     // cap below.
     use crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES;
-    let content_data = match doc.get_page_content_with_limit(page_id, MAX_PAGE_CONTENT_BYTES) {
+    let page_content = if options.require_complete {
+        complete_page_content(doc, page_id, MAX_PAGE_CONTENT_BYTES)
+    } else {
+        doc.get_page_content_with_limit(page_id, MAX_PAGE_CONTENT_BYTES)
+            .map_err(PdfError::from)
+    };
+    let content_data = match page_content {
         Ok(data) => data,
         Err(e) => {
             if options.require_complete {

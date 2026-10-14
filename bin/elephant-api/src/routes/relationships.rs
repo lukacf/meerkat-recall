@@ -20,6 +20,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use elephant_storage::canonical_commit::CanonicalRecord;
+use elephant_storage::public_mutation::{inherit_public_envelope, PublicMutation};
 use elephant_storage::{
     parse_id, PaginatedResult, RelRepository, SearchCriteria, StorageClient, StorageError,
     StorageResult,
@@ -34,6 +36,11 @@ use crate::routes::require_space_id;
 
 /// Shared state for relationship handlers.
 pub struct RelationshipsState {
+    /// Current source authority; absent only in repository unit fixtures.
+    pub storage: Option<StorageClient>,
+    /// Canonical client, absent only for isolated repository mocks.
+    pub mutation_storage: Option<StorageClient>,
+
     /// Relationship repository.
     pub rel_repo: Arc<dyn RelRepo>,
     /// Authorization service.
@@ -49,6 +56,12 @@ pub trait RelRepo: Send + Sync {
         space_id: &str,
         id: &elephant_types::RecordId,
         authorized: &Rel,
+    ) -> StorageResult<Rel>;
+    async fn replace_authorized(
+        &self,
+        observed: &Rel,
+        proposed: Rel,
+        restore: bool,
     ) -> StorageResult<Rel>;
     async fn create(&self, record: Rel) -> StorageResult<Rel>;
     async fn get(
@@ -83,6 +96,15 @@ impl RelRepo for RelRepository {
         authorized: &Rel,
     ) -> StorageResult<Rel> {
         Self::restore_guarded(self, space_id, id, authorized).await
+    }
+
+    async fn replace_authorized(
+        &self,
+        observed: &Rel,
+        proposed: Rel,
+        restore: bool,
+    ) -> StorageResult<Rel> {
+        Self::replace_authorized(self, observed, proposed, restore).await
     }
 
     async fn create(&self, record: Rel) -> StorageResult<Rel> {
@@ -154,6 +176,36 @@ impl RelRepo for elephant_storage::MockRelRepository {
         Self::restore(self, space_id, id).await
     }
 
+    async fn replace_authorized(
+        &self,
+        observed: &Rel,
+        proposed: Rel,
+        restore: bool,
+    ) -> StorageResult<Rel> {
+        let current =
+            Self::get_with_deleted(self, &observed.base.space_id, &observed.base.id).await?;
+        if !current.is_some_and(|current| {
+            current.base.updated_at == observed.base.updated_at
+                && elephant_storage::base_envelope_unchanged(&current.base, &observed.base)
+                && current.subject == observed.subject
+                && current.object == observed.object
+        }) {
+            return Err(StorageError::Conflict(
+                "relationship changed since authorization".into(),
+            ));
+        }
+        if restore {
+            Self::restore(self, &observed.base.space_id, &observed.base.id).await?;
+        }
+        elephant_storage::Repository::update(
+            self,
+            &observed.base.space_id,
+            &observed.base.id,
+            proposed,
+        )
+        .await
+    }
+
     async fn create(&self, record: Rel) -> StorageResult<Rel> {
         elephant_storage::Repository::create(self, record).await
     }
@@ -205,7 +257,10 @@ impl RelationshipsState {
     #[must_use]
     pub fn new(client: StorageClient, authz: AuthzState) -> Self {
         Self {
-            rel_repo: Arc::new(RelRepository::new(client)),
+            storage: Some(client.clone()),
+            rel_repo: Arc::new(RelRepository::new(client.clone())),
+            mutation_storage: Some(client),
+
             authz,
         }
     }
@@ -214,8 +269,164 @@ impl RelationshipsState {
     #[must_use]
     #[cfg(test)]
     pub fn new_with_repo(rel_repo: Arc<dyn RelRepo>, authz: AuthzState) -> Self {
-        Self { rel_repo, authz }
+        Self {
+            storage: None,
+            rel_repo,
+            authz,
+            mutation_storage: None,
+        }
     }
+}
+
+async fn begin_relationship_mutation(
+    state: &RelationshipsState,
+    space: &str,
+) -> StorageResult<Option<PublicMutation>> {
+    match &state.mutation_storage {
+        Some(storage) => PublicMutation::begin(storage.clone(), space)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+#[expect(
+    clippy::significant_drop_tightening,
+    clippy::too_many_lines,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
+async fn authorize_relationship_endpoints(
+    state: &RelationshipsState,
+    principal: &AuthPrincipal,
+    mutation: &mut PublicMutation,
+    rel: &mut Rel,
+    inherit: bool,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let Some(storage) = &state.mutation_storage else {
+        return Ok(());
+    };
+    let repo = elephant_storage::EntityRepository::new(storage.clone());
+    let original = rel.base.clone();
+    let mut prepared = rel.base.clone();
+    for id in [rel.subject.id(), rel.object.id()] {
+        let entity = elephant_storage::Repository::get(&repo, &rel.base.space_id, id)
+            .await
+            .map_err(relationship_storage_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiError::not_found(
+                        "Relationship endpoint",
+                        &id.to_string(),
+                    )),
+                )
+            })?;
+        state
+            .authz
+            .authorize_record_read(principal, &entity, "read:entity")
+            .map_err(|error| {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(ApiError::validation(error.message)),
+                )
+            })?;
+        inherit_public_envelope(&mut prepared, &entity.base).map_err(|error| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::validation(error.to_string())),
+            )
+        })?;
+        mutation.depend_on(CanonicalRecord::Entity(Box::new(entity)));
+    }
+    for evidence in &rel.evidence {
+        let assertion = elephant_storage::Repository::get(
+            &elephant_storage::AssertionRepository::new(storage.clone()),
+            &rel.base.space_id,
+            evidence.assertion.id(),
+        )
+        .await
+        .map_err(relationship_storage_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::validation(
+                    "Relationship assertion is not live in selected space",
+                )),
+            )
+        })?;
+        let denied = |error: crate::authz::AuthzError| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::validation(error.message)),
+            )
+        };
+        state
+            .authz
+            .authorize_record_read(principal, &assertion, "read:assertion")
+            .map_err(denied)?;
+        if assertion.evidence != evidence.span {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::validation(
+                    "Relationship span differs from referenced assertion",
+                )),
+            ));
+        }
+        mutation
+            .observe_relationship_assertion(rel, &assertion)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError::validation(error.to_string())),
+                )
+            })?;
+        mutation.depend_on(CanonicalRecord::Assertion(Box::new(assertion.clone())));
+        let (doc, revision, node) = mutation
+            .observe_evidence(&evidence.span)
+            .await
+            .map_err(relationship_storage_error)?;
+        state
+            .authz
+            .authorize_record_read(principal, &doc, "read:doc:raw")
+            .map_err(denied)?;
+        state
+            .authz
+            .authorize_record_read(principal, &revision, "read:doc:raw")
+            .map_err(denied)?;
+        inherit_public_envelope(&mut prepared, &assertion.base)
+            .map_err(relationship_storage_error)?;
+        inherit_public_envelope(&mut prepared, &doc.base).map_err(relationship_storage_error)?;
+        inherit_public_envelope(&mut prepared, &revision.base)
+            .map_err(relationship_storage_error)?;
+        if let Some(node) = &node {
+            state
+                .authz
+                .authorize_record_read(principal, node, "read:doc:raw")
+                .map_err(denied)?;
+            inherit_public_envelope(&mut prepared, &node.base)
+                .map_err(relationship_storage_error)?;
+        }
+        if let Some(source) = &doc.source {
+            if !prepared.provenance.sources.contains(source.id()) {
+                prepared.provenance.sources.push(source.id().clone());
+            }
+        }
+    }
+    if inherit {
+        rel.base = prepared;
+    } else if original.security != prepared.security
+        || original.subjects != prepared.subjects
+        || original.subjects_state != prepared.subjects_state
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::validation(
+                "Relationship envelope must cover endpoint restrictions",
+            )),
+        ));
+    }
+    Ok(())
 }
 
 /// Relationship search request.
@@ -317,10 +528,15 @@ async fn count_visible_relationship_search_results(
             break;
         };
 
-        if !state
-            .authz
-            .filter_records(principal, vec![rel], REL_SEARCH_SCOPE)
-            .is_empty()
+        if !super::current_read::filter(
+            state.storage.as_ref(),
+            &state.authz,
+            principal,
+            vec![rel],
+            REL_SEARCH_SCOPE,
+        )
+        .await?
+        .is_empty()
         {
             total_visible = total_visible.saturating_add(1);
         }
@@ -399,9 +615,14 @@ async fn rerun_relationship_search_after_authz_filter(
             break;
         };
 
-        let allowed = state
-            .authz
-            .filter_records(principal, vec![rel], REL_SEARCH_SCOPE);
+        let allowed = super::current_read::filter(
+            state.storage.as_ref(),
+            &state.authz,
+            principal,
+            vec![rel],
+            REL_SEARCH_SCOPE,
+        )
+        .await?;
         if let Some(rel) = allowed.into_iter().next() {
             if visible.len() < limit {
                 visible.push(rel);
@@ -481,9 +702,14 @@ async fn search_relationships(
     })?;
 
     let page_len = result.results.len();
-    let filtered = state
-        .authz
-        .filter_records(&principal, result.results, REL_SEARCH_SCOPE);
+    let filtered = super::current_read::filter(
+        state.storage.as_ref(),
+        &state.authz,
+        &principal,
+        result.results,
+        REL_SEARCH_SCOPE,
+    )
+    .await?;
 
     if filtered.len() != page_len {
         return rerun_relationship_search_after_authz_filter(
@@ -508,6 +734,10 @@ async fn search_relationships(
 }
 
 /// POST /v1/relationships - Create relationship.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn create_relationship(
     State(state): State<Arc<RelationshipsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -517,6 +747,12 @@ async fn create_relationship(
     let mut rel = rel;
     rel.base.space_id = require_space_id(&principal)?;
 
+    let mut mutation = begin_relationship_mutation(&state, &rel.base.space_id)
+        .await
+        .map_err(relationship_storage_error)?;
+    if let Some(mutation) = &mut mutation {
+        authorize_relationship_endpoints(&state, &principal, mutation, &mut rel, true).await?;
+    }
     state
         .authz
         .authorize_record_write(&principal, &rel, "write:relationship")
@@ -531,7 +767,15 @@ async fn create_relationship(
             )
         })?;
 
-    match state.rel_repo.create(rel).await {
+    state
+        .authz
+        .authorize_record_read(&principal, &rel, "read:relationship")
+        .map_err(|e| (StatusCode::FORBIDDEN, Json(ApiError::validation(e.message))))?;
+    let result = match mutation {
+        Some(mutation) => mutation.create(rel, &principal.subject).await,
+        None => state.rel_repo.create(rel).await,
+    };
+    match result {
         Ok(created) => Ok((StatusCode::CREATED, Json(created))),
         Err(StorageError::Conflict(msg)) => Err((
             StatusCode::CONFLICT,
@@ -541,10 +785,7 @@ async fn create_relationship(
                 details: None,
             }),
         )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 
@@ -576,17 +817,112 @@ async fn get_relationship(
                         }),
                     )
                 })?;
-            Ok(Json(rel))
+            Ok(Json(
+                super::current_read::require(
+                    state.storage.as_ref(),
+                    &state.authz,
+                    &principal,
+                    rel,
+                    "read:relationship",
+                )
+                .await?,
+            ))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ApiError::not_found("Relationship", &id)),
         )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
+}
+
+fn relationship_storage_error(error: StorageError) -> (StatusCode, Json<ApiError>) {
+    if matches!(error, StorageError::ErasureInProgress) {
+        return ApiError::storage(&error);
+    }
+    if let StorageError::Conflict(message) = error {
+        (
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                code: "CONFLICT".into(),
+                message,
+                details: None,
+            }),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::internal(error.to_string())),
+        )
+    }
+}
+
+async fn save_authorized_relationship(
+    state: &RelationshipsState,
+    principal: &AuthPrincipal,
+    mut mutation: Option<&mut PublicMutation>,
+    mut proposed: Rel,
+    observed: Option<&Rel>,
+    restore: bool,
+) -> ApiResult<Rel> {
+    if let Some(mutation) = mutation.as_deref_mut() {
+        authorize_relationship_endpoints(
+            state,
+            principal,
+            mutation,
+            &mut proposed,
+            observed.is_none(),
+        )
+        .await?;
+    }
+    let denied = |message: String| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(ApiError {
+                code: "ACCESS_DENIED".into(),
+                message,
+                details: None,
+            }),
+        )
+    };
+    for record in observed.into_iter().chain(std::iter::once(&proposed)) {
+        state
+            .authz
+            .authorize_record_read(principal, record, "read:relationship")
+            .map_err(|e| denied(e.message))?;
+        state
+            .authz
+            .authorize_record_write(principal, record, "write:relationship")
+            .map_err(|e| denied(e.message))?;
+    }
+    let result = if let Some(existing) = observed {
+        elephant_policy::authorize_ordinary_update(&existing.base, &proposed.base)
+            .map_err(|e| denied(e.to_string()))?;
+        // Equivalent label/subject sets are accepted by the policy. Keep the
+        // authorized representation so storage can compare the envelope exactly.
+        proposed.base.security.clone_from(&existing.base.security);
+        proposed.base.subjects.clone_from(&existing.base.subjects);
+        proposed.base.subjects_state = existing.base.subjects_state;
+        match mutation {
+            Some(mutation) => {
+                mutation
+                    .replace(existing, proposed, restore, &principal.subject)
+                    .await
+            }
+            None => {
+                state
+                    .rel_repo
+                    .replace_authorized(existing, proposed, restore)
+                    .await
+            }
+        }
+    } else {
+        match mutation {
+            Some(mutation) => mutation.create(proposed, &principal.subject).await,
+            None => state.rel_repo.create(proposed).await,
+        }
+    };
+    result.map(Json).map_err(relationship_storage_error)
 }
 
 /// PUT /v1/relationships/{id} - Update relationship.
@@ -597,67 +933,51 @@ async fn update_relationship(
     Json(rel): Json<Rel>,
 ) -> ApiResult<Rel> {
     let space_id = require_space_id(&principal)?;
+    let mut mutation = begin_relationship_mutation(&state, &space_id)
+        .await
+        .map_err(relationship_storage_error)?;
     let rid = parse_id(&id, TableName::Rel).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(ApiError::validation(e.to_string())),
         )
     })?;
-    match state.rel_repo.get(&space_id, &rid).await {
-        Ok(Some(existing)) => {
-            state
-                .authz
-                .authorize_record_write(&principal, &existing, "write:relationship")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-            state
-                .authz
-                .authorize_record_write(&principal, &rel, "write:relationship")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-
-            match state.rel_repo.update(&space_id, &rid, rel).await {
-                Ok(updated) => Ok(Json(updated)),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
-            }
-        }
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError::not_found("Relationship", &id)),
-        )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
-    }
+    let existing = state
+        .rel_repo
+        .get(&space_id, &rid)
+        .await
+        .map_err(relationship_storage_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::not_found("Relationship", &id)),
+            )
+        })?;
+    save_authorized_relationship(
+        &state,
+        &principal,
+        mutation.as_mut(),
+        rel,
+        Some(&existing),
+        false,
+    )
+    .await
 }
 
 /// DELETE /v1/relationships/{id} - Soft delete relationship.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn delete_relationship(
     State(state): State<Arc<RelationshipsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     let space_id = require_space_id(&principal)?;
+    let mutation = begin_relationship_mutation(&state, &space_id)
+        .await
+        .map_err(relationship_storage_error)?;
     let rid = parse_id(&id, TableName::Rel).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -680,32 +1000,40 @@ async fn delete_relationship(
                     )
                 })?;
 
-            match state.rel_repo.delete(&space_id, &rid).await {
+            let result = match &mutation {
+                Some(mutation) => mutation
+                    .delete(&existing, &principal.subject)
+                    .await
+                    .map(|_| ()),
+                None => state.rel_repo.delete(&space_id, &rid).await,
+            };
+            match result {
                 Ok(()) => Ok(StatusCode::NO_CONTENT),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
+                Err(e) => Err(ApiError::storage(&e)),
             }
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ApiError::not_found("Relationship", &id)),
         )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 
 /// POST /v1/relationships/{id}/restore - Restore soft-deleted relationship.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn restore_relationship(
     State(state): State<Arc<RelationshipsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(id): Path<String>,
 ) -> ApiResult<Rel> {
     let space_id = require_space_id(&principal)?;
+    let mut mutation = begin_relationship_mutation(&state, &space_id)
+        .await
+        .map_err(relationship_storage_error)?;
     let rid = parse_id(&id, TableName::Rel).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -714,6 +1042,17 @@ async fn restore_relationship(
     })?;
     match state.rel_repo.get_with_deleted(&space_id, &rid).await {
         Ok(Some(existing)) => {
+            if let Some(mutation) = &mut mutation {
+                let mut proposal = existing.clone();
+                authorize_relationship_endpoints(
+                    &state,
+                    &principal,
+                    mutation,
+                    &mut proposal,
+                    false,
+                )
+                .await?;
+            }
             state
                 .authz
                 .authorize_record_write(&principal, &existing, "write:relationship")
@@ -742,11 +1081,16 @@ async fn restore_relationship(
                     )
                 })?;
 
-            match state
-                .rel_repo
-                .restore_guarded(&space_id, &rid, &existing)
-                .await
-            {
+            let result = match &mutation {
+                Some(mutation) => mutation.restore(&existing, &principal.subject).await,
+                None => {
+                    state
+                        .rel_repo
+                        .restore_guarded(&space_id, &rid, &existing)
+                        .await
+                }
+            };
+            match result {
                 Ok(restored) => Ok(Json(restored)),
                 Err(elephant_storage::StorageError::Conflict(_)) => Err((
                     StatusCode::CONFLICT,
@@ -756,20 +1100,14 @@ async fn restore_relationship(
                         details: None,
                     }),
                 )),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
+                Err(e) => Err(ApiError::storage(&e)),
             }
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ApiError::not_found("Relationship", &id)),
         )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 
@@ -780,35 +1118,29 @@ async fn upsert_relationship(
     Json(rel): Json<Rel>,
 ) -> ApiResult<Rel> {
     let space_id = require_space_id(&principal)?;
-
+    let mut mutation = begin_relationship_mutation(&state, &space_id)
+        .await
+        .map_err(relationship_storage_error)?;
     if rel.base.space_id != space_id {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ApiError::validation("Space ID mismatch")),
         ));
     }
-
-    state
-        .authz
-        .authorize_record_write(&principal, &rel, "write:relationship")
-        .map_err(|e| {
-            (
-                StatusCode::FORBIDDEN,
-                Json(ApiError {
-                    code: e.code,
-                    message: e.message,
-                    details: None,
-                }),
-            )
-        })?;
-
-    match state.rel_repo.upsert(rel).await {
-        Ok(updated) => Ok(Json(updated)),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
-    }
+    let existing = state
+        .rel_repo
+        .get_with_deleted(&space_id, &rel.base.id)
+        .await
+        .map_err(relationship_storage_error)?;
+    save_authorized_relationship(
+        &state,
+        &principal,
+        mutation.as_mut(),
+        rel,
+        existing.as_ref(),
+        true,
+    )
+    .await
 }
 
 /// POST /v1/relationships/batch - Batch operations.
@@ -820,65 +1152,49 @@ async fn batch_relationships(
     let space_id = require_space_id(&principal)?;
     let mut succeeded = Vec::new();
     let mut failed = Vec::new();
-
     for (index, rel) in req.items.into_iter().enumerate() {
-        let rid = rel.base.id.clone();
-
-        let result = match state.rel_repo.get_with_deleted(&space_id, &rid).await {
-            Ok(Some(existing)) => {
-                if let Err(e) =
-                    state
-                        .authz
-                        .authorize_record_write(&principal, &existing, "write:relationship")
-                {
-                    failed.push(BatchError {
-                        index,
-                        error: e.message,
-                    });
-                    continue;
-                }
-                if let Err(e) =
-                    state
-                        .authz
-                        .authorize_record_write(&principal, &rel, "write:relationship")
-                {
-                    failed.push(BatchError {
-                        index,
-                        error: e.message,
-                    });
-                    continue;
-                }
-                if existing.base.deleted_at.is_some() {
-                    let _ = state.rel_repo.restore(&space_id, &rid).await;
-                }
-                state.rel_repo.update(&space_id, &rid, rel).await
+        let mut mutation = match begin_relationship_mutation(&state, &space_id).await {
+            Ok(mutation) => mutation,
+            Err(error @ elephant_storage::StorageError::ErasureInProgress) => {
+                return Err(ApiError::storage(&error));
             }
-            Ok(None) => {
-                if let Err(e) =
-                    state
-                        .authz
-                        .authorize_record_write(&principal, &rel, "write:relationship")
-                {
-                    failed.push(BatchError {
-                        index,
-                        error: e.message,
-                    });
-                    continue;
-                }
-                state.rel_repo.create(rel).await
+            Err(error) => {
+                failed.push(BatchError {
+                    index,
+                    error: error.to_string(),
+                });
+                continue;
             }
-            Err(e) => Err(e),
         };
-
+        let result = match state
+            .rel_repo
+            .get_with_deleted(&space_id, &rel.base.id)
+            .await
+        {
+            Ok(existing) => {
+                save_authorized_relationship(
+                    &state,
+                    &principal,
+                    mutation.as_mut(),
+                    rel,
+                    existing.as_ref(),
+                    true,
+                )
+                .await
+            }
+            Err(error) => Err(relationship_storage_error(error)),
+        };
         match result {
-            Ok(d) => succeeded.push(d),
-            Err(e) => failed.push(BatchError {
+            Ok(Json(record)) => succeeded.push(record),
+            Err((status, Json(error))) if error.code == "NOT_READY" => {
+                return Err((status, Json(error)));
+            }
+            Err((_, Json(error))) => failed.push(BatchError {
                 index,
-                error: e.to_string(),
+                error: error.message,
             }),
         }
     }
-
     Ok(Json(BatchResponse { succeeded, failed }))
 }
 

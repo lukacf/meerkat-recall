@@ -1,0 +1,73 @@
+{
+  "format": "recall-snapshot-inspector-source-review/v1",
+  "source_commit": "67a830406ebf8e61419e7c304fcb5440ccc2b05e",
+  "source_review_only": true,
+  "execution_authorized": false,
+  "executed_by_qualification": false,
+  "product_acceptance": false,
+  "target": {
+    "package": "meerkat-recall-bin",
+    "kind": "test",
+    "name": "cli_snapshot_inspect",
+    "source": "bin/elephant/tests/cli_snapshot_inspect.rs",
+    "tests": [
+      "actual_named_export_inspection_is_offline_private_by_default_and_read_only",
+      "raw_inventory_requires_explicit_json_and_missing_bundle_never_calls_api"
+    ],
+    "backend_iterations": [
+      "elephant-db",
+      "surreal-db"
+    ],
+    "required_features": [],
+    "future_central_gate_only": true,
+    "runtime8_selection": false
+  },
+  "prerequisites": [
+    "Built CARGO_BIN_EXE_meerkat-recall; actual memory-backed storage for both backend implementations; owned temporary directories and named exports.",
+    "No external provider, server, Docker, production credentials, signing key, bearer file or recovery journal required by the inspector child.",
+    "Retain centrally reviewed all-features graph and bounded child-process/test supervision; no owner Cargo authorization."
+  ],
+  "reviewed_properties": [
+    "Literal AST traversal with pinned parser, never query evaluation or database import.",
+    "Pinned Bytes display and decode use STANDARD_NO_PAD; local structural decoder matches this format.",
+    "Pinned object export uses bare or double-quoted keys; duplicate-aware scan precedes trust in parsed objects.",
+    "Record identities retain table and native key type; string-looking references remain strings; duplicate identities refuse.",
+    "Raw schema statements are included with explicit records because definitions can contain source-bearing literals.",
+    "Bounded manifest/payload reads reject leaf symlinks/nonregular files and check opened identity/size; manifest digest validates complete payload.",
+    "CLI inspection dispatch precedes management-client construction; complete raw records require explicit --json --include-records.",
+    "Compact report serialization is bounded before output; unknown value/statement/shape or exceeded limit refuses without a partial successful report."
+  ],
+  "limits": {
+    "manifest_bytes": 65536,
+    "payload_bytes": 67108864,
+    "rows": 200000,
+    "statements": 100000,
+    "tables": 256,
+    "depth": 128,
+    "nodes": 2000000,
+    "string_bytes": 1048576,
+    "references": 100000,
+    "report_bytes": 33554432
+  },
+  "open_scope_limits": [
+    "A valid 2,000,000-byte source exceeds the fixed 1 MiB encoded-string limit. Full maximum-source physical qualification is UNMET until a finite complete envelope is reviewed.",
+    "Escaped JSON and nested serialized control payloads can exceed raw UTF-8 source size. Raising only to 2 MB is insufficient without accounting for actual layers.",
+    "Native geometry and versioned inserts are explicitly unsupported; their presence yields incomplete, never absence evidence.",
+    "Successful exported inventory does not inspect live persistent storage, WAL, media bytes or registered backup deletion.",
+    "CLI tests exercise a workspace-built binary, not the final installed native archive or container artifact."
+  ],
+  "source_hashes": {
+    "crates/storage/src/snapshot_inspection.rs": "68325273003e52f7167a967acb9d6f03139ff77ecbdfa5d0e008c63d473f1afa",
+    "crates/storage/src/snapshot_inspection_json.rs": "5b2eafea2c956d0e40024b611d8fe13944c4c4b22f517f646824516ef2689de3",
+    "crates/storage/src/snapshot_inspection_native.rs": "880a84e9b3588ffaf7215d0234b5c4d0aeef504668a75938028deae48a63e244",
+    "crates/storage/src/snapshot_inspection_tests.rs": "157e7f726c85c4cac950d94f24dd95f3b90a878ca30679ac24f79417683b54e4",
+    "bin/elephant/src/snapshot.rs": "d8c292e2a78827292ab22098b3bde997f76d9a95922c55b7d48e6bbdd02617b2",
+    "bin/elephant/src/main.rs": "61758a97a08ad73dbcc3f4798710e842db9cd6c5592fcfc0ad14510e37a8a295",
+    "bin/elephant/tests/cli_snapshot_inspect.rs": "86aa339848d1cc0ffa53d91a971105e2ac0b405266e65c7aa1eccc71fc29391f",
+    "bin/elephant/Cargo.toml": "0b58a72b5c56187c7d768d83a8ba8d06cd58f3b67d7442a9bf5b397a4a9ee858",
+    "vendor/surrealdb-core-2.6.5/src/sql/bytes.rs": "cf636d20ccf99f180a158925dd5cbd9a5bbcae1adbed3a50df281433a7485595",
+    "vendor/surrealdb-core-2.6.5/src/sql/object.rs": "c151ec695df2af1c448eef350bfa3337c5b1021c7c4d4422280c257b271fac2c",
+    "vendor/surrealdb-core-2.6.5/src/sql/escape.rs": "ed28489706763e8ff35f96af3c0a1e93c8eab4ed45a46a30b89e91a20cdacd6f",
+    "vendor/surrealdb-core-2.6.5/src/kvs/export/v2.rs": "7a210d405c68296e958dca300264bc246abc2890ef398f361f67a0d3f33df9e8"
+  }
+}

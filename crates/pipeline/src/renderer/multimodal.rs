@@ -25,7 +25,10 @@ use elephant_types::records::work::{Determinism, PluginManifest, RetryPolicy};
 use super::{RenderContext, RenderResult, Renderer};
 use crate::error::PipelineError;
 #[cfg(feature = "meerkat-extraction")]
-use crate::media::load_media_bytes;
+use crate::media::load_media_input;
+
+#[cfg(feature = "meerkat-extraction")]
+mod input_guard;
 
 #[cfg(feature = "meerkat-extraction")]
 const DEFAULT_MULTIMODAL_RENDER_MODEL: &str = "gpt-5.6-sol";
@@ -49,6 +52,7 @@ trait MediaRenderAnalyzer: Send + Sync {
         &self,
         ctx: &RenderContext,
         attachments: &[DocMediaAttachment],
+        original_work: Option<&elephant_types::records::WorkItem>,
     ) -> Result<Vec<AttachmentRenderAnalysis>, PipelineError>;
 }
 
@@ -134,6 +138,29 @@ impl Renderer for MultimodalRenderer {
     }
 
     async fn render(&self, ctx: RenderContext) -> Result<RenderResult, PipelineError> {
+        self.render_input(ctx, None).await
+    }
+
+    async fn render_for_work(
+        &self,
+        ctx: RenderContext,
+        original_work: &elephant_types::records::WorkItem,
+    ) -> Result<RenderResult, PipelineError> {
+        self.render_input(ctx, Some(original_work)).await
+    }
+}
+
+impl MultimodalRenderer {
+    async fn render_input(
+        &self,
+        ctx: RenderContext,
+        original_work: Option<&elephant_types::records::WorkItem>,
+    ) -> Result<RenderResult, PipelineError> {
+        if ctx.doc.base.space_id != ctx.space_id {
+            return Err(PipelineError::ConfigError(
+                "provider_authorization: document space differs from media render context".into(),
+            ));
+        }
         if ctx.doc.media_attachments.is_empty() {
             return Ok(RenderResult::failed(
                 "Document has no media attachments to render".to_string(),
@@ -143,7 +170,7 @@ impl Renderer for MultimodalRenderer {
 
         let analyses = self
             .analyzer
-            .analyze(&ctx, &ctx.doc.media_attachments)
+            .analyze(&ctx, &ctx.doc.media_attachments, original_work)
             .await?;
 
         let (text, manifest) = build_render_projection(&ctx.doc, &analyses);
@@ -226,7 +253,7 @@ fn build_render_projection(
 
 #[cfg(feature = "meerkat-extraction")]
 struct DefaultMediaRenderAnalyzer {
-    service: Arc<dyn meerkat_core::service::SessionService>,
+    concurrency: tokio::sync::Semaphore,
     model: String,
     timeout_secs: u64,
 }
@@ -253,12 +280,8 @@ impl DefaultMediaRenderAnalyzer {
     }
 
     fn with_settings(model: String, timeout_secs: u64, max_render_concurrent: usize) -> Self {
-        let factory =
-            meerkat::AgentFactory::new(std::env::temp_dir().join("elephant-multimodal-renderer"));
-        let config = meerkat::Config::default();
-        let service = meerkat::build_ephemeral_service(factory, config, max_render_concurrent);
         Self {
-            service: Arc::new(service),
+            concurrency: tokio::sync::Semaphore::new(max_render_concurrent.max(1)),
             model,
             timeout_secs,
         }
@@ -280,21 +303,29 @@ impl MediaRenderAnalyzer for DefaultMediaRenderAnalyzer {
         &self,
         ctx: &RenderContext,
         attachments: &[DocMediaAttachment],
+        original_work: Option<&elephant_types::records::WorkItem>,
     ) -> Result<Vec<AttachmentRenderAnalysis>, PipelineError> {
         use meerkat_core::schema::MeerkatSchema;
-        use meerkat_core::service::{DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions};
-        use meerkat_core::{ContentInput, CreateSessionRequest, OutputSchema};
+        use meerkat_core::{ContentInput, OutputSchema};
+        let _permit = self
+            .concurrency
+            .acquire()
+            .await
+            .map_err(|_| PipelineError::ConfigError("media renderer stopped".into()))?;
 
+        let mut inputs = input_guard::PreparedMediaInputs::capture(ctx, original_work).await?;
         let mut parts = Vec::with_capacity(attachments.len());
         for attachment in attachments {
-            let (bytes, duration_ms) =
-                load_media_bytes(ctx.storage.as_ref(), &ctx.space_id, attachment).await?;
+            let loaded = load_media_input(ctx.storage.as_ref(), &ctx.space_id, attachment).await?;
+            inputs.retain(attachment, &loaded)?;
             parts.push(LoadedAttachment {
                 attachment: attachment.clone(),
-                encoded: BASE64_STANDARD.encode(bytes),
-                duration_ms,
+                encoded: BASE64_STANDARD.encode(loaded.bytes),
+                duration_ms: loaded.duration_ms,
             });
         }
+        inputs.verify_current().await?;
+        let inputs = Arc::new(inputs);
 
         let blocks = build_segment_blocks(&ctx.doc, &parts);
         let total = parts.len();
@@ -322,41 +353,54 @@ impl MediaRenderAnalyzer for DefaultMediaRenderAnalyzer {
             format: Default::default(),
         };
 
-        let build = SessionBuildOptions {
-            provider: provider_for_model(&self.model),
-            output_schema: Some(schema),
-            structured_output_retries: Some(2),
-            ..SessionBuildOptions::default()
-        };
-
-        let request = CreateSessionRequest {
-            model: self.model.clone(),
-            prompt: ContentInput::Blocks(blocks),
-            system_prompt: meerkat_core::SystemPromptOverride::Set(
-                "You are Elephant's multimodal renderer. Produce a faithful text projection of visible content. Prefer concrete people, apps, sites, groups, visible text, filenames, URLs, and time-anchored observations. Do not emit generic scaffolding.".to_string(),
-            ),
-            max_tokens: Some(render_output_max_tokens(total)),
-            event_tx: None,
-            initial_turn: InitialTurnPolicy::RunImmediately,
-            deferred_prompt_policy: DeferredPromptPolicy::Discard,
-            build: Some(build),
-            labels: None,
-            injected_context: Vec::new(),
-        };
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(self.timeout_secs),
-            self.service.create_session(request),
+        let mut build = meerkat::AgentBuildConfig::new(self.model.clone());
+        build.output_schema = Some(schema);
+        build.structured_output_retries = Some(2);
+        build.max_tokens = Some(render_output_max_tokens(total));
+        build.system_prompt = meerkat_core::SystemPromptOverride::Set(
+            "You are Elephant's multimodal renderer. Produce a faithful text projection of visible content. Prefer concrete people, apps, sites, groups, visible text, filenames, URLs, and time-anchored observations. Do not emit generic scaffolding.".into());
+        build.override_shell = meerkat::ToolCategoryOverride::Disable;
+        build.override_mob = meerkat::ToolCategoryOverride::Disable;
+        let storage = ctx.storage.clone().ok_or_else(|| {
+            PipelineError::ConfigError(
+                "provider_authorization: media rendering requires storage context".into(),
+            )
+        })?;
+        crate::provider_dispatch::ProviderDispatchContext::new(
+            elephant_storage::SpaceConfigRepository::new(storage),
+            &ctx.space_id,
         )
+        .with_additional_observer(inputs.clone())
+        .govern_agent_build(
+            elephant_types::provider_binding::ModelOperation::MediaRender,
+            &mut build,
+        )
+        .await?;
+        let factory =
+            meerkat::AgentFactory::new(std::env::temp_dir().join("elephant-multimodal-renderer"));
+        let result = tokio::time::timeout(Duration::from_secs(self.timeout_secs), async {
+            let mut agent = Box::pin(factory.build_agent(build, &meerkat::Config::default()))
+                .await
+                .map_err(|error| {
+                    PipelineError::ExtractionError(format!("Multimodal build failed: {error}"))
+                })?;
+            Box::pin(agent.run(ContentInput::Blocks(blocks)))
+                .await
+                .map_err(|error| {
+                    PipelineError::ExtractionError(format!("Multimodal render failed: {error}"))
+                })
+        })
         .await
         .map_err(|_| {
             PipelineError::ExtractionError(format!(
                 "Multimodal render timed out after {}s",
                 self.timeout_secs
             ))
-        })?
-        .map_err(|e| PipelineError::ExtractionError(format!("Multimodal render failed: {e}")))?;
+        })??;
 
+        // A response cannot publish a projection after the original input or
+        // execution authority changed while the provider was running.
+        inputs.verify_current().await?;
         let structured = result.structured_output.ok_or_else(|| {
             PipelineError::ExtractionError(
                 "Multimodal render returned no structured output".to_string(),
@@ -425,23 +469,11 @@ impl MediaRenderAnalyzer for DefaultMediaRenderAnalyzer {
         &self,
         _ctx: &RenderContext,
         _attachments: &[DocMediaAttachment],
+        _original_work: Option<&elephant_types::records::WorkItem>,
     ) -> Result<Vec<AttachmentRenderAnalysis>, PipelineError> {
         Err(PipelineError::ConfigError(
             "Multimodal rendering requires `meerkat-extraction`".to_string(),
         ))
-    }
-}
-
-#[cfg(feature = "meerkat-extraction")]
-fn provider_for_model(model: &str) -> Option<meerkat_core::Provider> {
-    if model.starts_with("gemini-") {
-        Some(meerkat_core::Provider::Gemini)
-    } else if model.starts_with("gpt-") {
-        Some(meerkat_core::Provider::OpenAI)
-    } else if model.starts_with("claude-") {
-        Some(meerkat_core::Provider::Anthropic)
-    } else {
-        None
     }
 }
 
@@ -546,6 +578,7 @@ impl MediaRenderAnalyzer for QueueMediaRenderAnalyzer {
         &self,
         _ctx: &RenderContext,
         attachments: &[DocMediaAttachment],
+        _original_work: Option<&elephant_types::records::WorkItem>,
     ) -> Result<Vec<AttachmentRenderAnalysis>, PipelineError> {
         let mut renders = self
             .renders

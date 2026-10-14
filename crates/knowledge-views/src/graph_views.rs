@@ -5,9 +5,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use chrono::Utc;
 use elephant_storage::{
     AssertionRepository, AttributeRepository, EntityRepository, KnowledgeViewDefinitionRepository,
-    KnowledgeViewRepository, RelRepository, Repository, StorageClient, StorageError, StorageResult,
+    KnowledgeViewRepository, PreparedKnowledgeViewAuthority, RelRepository, Repository,
+    StorageClient, StorageError, StorageResult,
 };
-use elephant_types::records::base::{BaseFields, SubjectsState};
+use elephant_types::records::base::{BaseFields, Security, SubjectsState};
 use elephant_types::records::{
     Assertion, Attribute, CitationKind, ClaimStatus, CompilerReceipt, Entity, KnowledgeCitation,
     KnowledgeDependency, KnowledgeStatement, KnowledgeView, KnowledgeViewBlock,
@@ -28,7 +29,7 @@ use super::{
 /// Stable identity of the graph-view compiler.
 pub const GRAPH_COMPILER_NAME: &str = "elephant.graph_view";
 /// Contract version of the graph-view compiler.
-pub const GRAPH_COMPILER_VERSION: u32 = 3;
+pub const GRAPH_COMPILER_VERSION: u32 = 6;
 
 /// Result of a graph-view compile-or-reuse operation.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +40,19 @@ pub struct CompiledGraphView {
     pub revision: KnowledgeViewRevision,
     /// Whether this call published a new revision.
     pub changed: bool,
+}
+
+/// Read-only graph context, never an implicit publication receipt.
+#[derive(Debug, Clone)]
+pub struct PreparedGraphView {
+    /// Stable view representation.
+    pub view: KnowledgeView,
+    /// Exact prepared content and underlying dependencies.
+    pub revision: KnowledgeViewRevision,
+    /// Original epoch captured before any graph input was read.
+    pub observed_epoch: String,
+    /// True only when this exact revision already exists in storage.
+    pub persisted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -57,26 +71,46 @@ struct Selection {
 /// Compiler for governed topic, community, and query definitions.
 #[derive(Clone, Debug)]
 pub struct GraphViewCompiler {
+    storage: StorageClient,
     views: KnowledgeViewRepository,
     definitions: KnowledgeViewDefinitionRepository,
     entities: EntityRepository,
     relations: RelRepository,
     attributes: AttributeRepository,
     assertions: AssertionRepository,
+    authority: Option<PreparedKnowledgeViewAuthority>,
 }
 
 impl GraphViewCompiler {
-    /// Creates a graph-view compiler.
+    /// Creates a direct-library graph-view compiler. Managed invocations must
+    /// attach their original prepared authority before any compilation reads.
     #[must_use]
     pub fn new(storage: StorageClient) -> Self {
         Self {
+            storage: storage.clone(),
             views: KnowledgeViewRepository::new(storage.clone()),
             definitions: KnowledgeViewDefinitionRepository::new(storage.clone()),
             entities: EntityRepository::new(storage.clone()),
             relations: RelRepository::new(storage.clone()),
             attributes: AttributeRepository::new(storage.clone()),
             assertions: AssertionRepository::new(storage),
+            authority: None,
         }
+    }
+
+    /// Retain the original invocation proof for context reads, cache reuse, and
+    /// publication. This does not capture or refresh an attempt or grant.
+    #[must_use]
+    pub fn with_managed_authority(mut self, authority: PreparedKnowledgeViewAuthority) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    async fn verify_authority(&self, space_id: &str) -> StorageResult<()> {
+        if let Some(authority) = &self.authority {
+            Box::pin(authority.verify_current_for_space(space_id)).await?;
+        }
+        Ok(())
     }
 
     /// Returns the stable-view repository.
@@ -91,23 +125,90 @@ impl GraphViewCompiler {
         space_id: &str,
         definition: &KnowledgeViewDefinition,
     ) -> StorageResult<Option<KnowledgeView>> {
+        Box::pin(self.verify_authority(space_id)).await?;
         let fingerprint = security_fingerprint(&definition.base.security)?;
-        self.views
-            .find_by_key(space_id, &graph_view_key(&definition.base.id, &fingerprint))
-            .await
+        let existing = Box::pin(
+            self.views
+                .find_by_key(space_id, &graph_view_key(&definition.base.id, &fingerprint)),
+        )
+        .await?;
+        Box::pin(self.verify_authority(space_id)).await?;
+        Ok(existing)
     }
 
-    /// Compiles a governed graph-view definition.
-    #[allow(clippy::too_many_lines)]
+    /// Prepare a current graph context without publishing intermediate rows.
+    pub async fn prepare_context(
+        &self,
+        space_id: &str,
+        definition_id: &RecordId,
+        force: bool,
+    ) -> StorageResult<PreparedGraphView> {
+        Box::pin(self.verify_authority(space_id)).await?;
+        let observed_epoch = Box::pin(
+            elephant_storage::canonical_commit::CanonicalRepository::new(self.storage.clone())
+                .epoch(space_id),
+        )
+        .await?;
+        let compiled =
+            Box::pin(self.prepare_at_epoch(space_id, definition_id, force, &observed_epoch))
+                .await?;
+        Box::pin(self.verify_authority(space_id)).await?;
+        Ok(PreparedGraphView {
+            view: compiled.view,
+            revision: compiled.revision,
+            observed_epoch,
+            persisted: !compiled.changed,
+        })
+    }
+
+    /// Compile and atomically publish a governed graph-view definition.
     pub async fn compile(
         &self,
         space_id: &str,
         definition_id: &RecordId,
         force: bool,
     ) -> StorageResult<CompiledGraphView> {
-        let definition = self
-            .definitions
-            .get(space_id, definition_id)
+        let prepared = Box::pin(self.prepare_context(space_id, definition_id, force)).await?;
+        if prepared.persisted {
+            Box::pin(self.verify_authority(space_id)).await?;
+            return Ok(CompiledGraphView {
+                view: prepared.view,
+                revision: prepared.revision,
+                changed: false,
+            });
+        }
+        let (view, revision) = if let Some(authority) = &self.authority {
+            Box::pin(self.views.publish_at_epoch_with_authority(
+                prepared.view,
+                prepared.revision,
+                &prepared.observed_epoch,
+                authority,
+            ))
+            .await?
+        } else {
+            Box::pin(self.views.publish_at_epoch(
+                prepared.view,
+                prepared.revision,
+                &prepared.observed_epoch,
+            ))
+            .await?
+        };
+        Ok(CompiledGraphView {
+            view,
+            revision,
+            changed: true,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn prepare_at_epoch(
+        &self,
+        space_id: &str,
+        definition_id: &RecordId,
+        force: bool,
+        observed_epoch: &str,
+    ) -> StorageResult<CompiledGraphView> {
+        let definition = Box::pin(self.definitions.get(space_id, definition_id))
             .await?
             .ok_or_else(|| StorageError::NotFound(definition_id.to_string()))?;
         if !super::has_complete_definition_subject_contract(&definition) {
@@ -118,24 +219,10 @@ impl GraphViewCompiler {
         let security = definition.base.security.clone();
         let fingerprint = security_fingerprint(&security)?;
         let key = graph_view_key(definition_id, &fingerprint);
-        let existing = self.views.find_by_key(space_id, &key).await?;
-        if !force {
-            if let Some(existing_view) = existing.as_ref() {
-                if let Some(current) = self.views.get_current_revision(existing_view).await? {
-                    if super::reusable_current_revision(
-                        existing_view,
-                        &current,
-                        GRAPH_COMPILER_VERSION,
-                    ) {
-                        return Ok(CompiledGraphView {
-                            view: existing_view.clone(),
-                            revision: current,
-                            changed: false,
-                        });
-                    }
-                }
-            }
-        }
+        let existing = Box::pin(self.views.find_by_key(space_id, &key)).await?;
+        // Recompute the bounded selection before cache reuse: an old dependency
+        // list cannot prove that no new matching relation or document appeared.
+
         let selection = match &definition.selector {
             KnowledgeViewSelector::Topic {
                 topic,
@@ -143,7 +230,7 @@ impl GraphViewCompiler {
                 max_hops,
                 max_members,
             } => {
-                self.select_graph(
+                Box::pin(self.select_graph(
                     space_id,
                     std::slice::from_ref(topic),
                     relation_types,
@@ -151,7 +238,7 @@ impl GraphViewCompiler {
                     *max_members,
                     true,
                     &security,
-                )
+                ))
                 .await?
             }
             KnowledgeViewSelector::Community {
@@ -160,7 +247,7 @@ impl GraphViewCompiler {
                 max_hops,
                 max_members,
             } => {
-                self.select_graph(
+                Box::pin(self.select_graph(
                     space_id,
                     seeds,
                     relation_types,
@@ -168,7 +255,7 @@ impl GraphViewCompiler {
                     *max_members,
                     false,
                     &security,
-                )
+                ))
                 .await?
             }
             KnowledgeViewSelector::Query {
@@ -178,7 +265,7 @@ impl GraphViewCompiler {
                 scan_limit,
                 max_members,
             } => {
-                self.select_query(
+                Box::pin(self.select_query(
                     space_id,
                     entity_types,
                     name_contains.as_deref(),
@@ -186,22 +273,40 @@ impl GraphViewCompiler {
                     *scan_limit,
                     *max_members,
                     &security,
-                )
+                ))
                 .await?
             }
         };
-        let assertions = self
-            .load_assertions(space_id, &selection, &security)
-            .await?;
-        let draft = build_graph_draft(&definition, &selection, &assertions, &fingerprint)?;
+        let assertions = Box::pin(self.load_assertions(space_id, &selection, &security)).await?;
+        let mut draft = build_graph_draft(&definition, &selection, &assertions, &fingerprint)?;
+        let source_ids = graph_input_sources(&definition, &selection, &assertions);
+        let evidence_envelopes = Box::pin(super::ground_citation_evidence(
+            &self.storage,
+            space_id,
+            &security,
+            &mut draft,
+            GRAPH_COMPILER_NAME,
+            GRAPH_COMPILER_VERSION,
+            &source_ids,
+        ))
+        .await?;
 
         if !force {
             if let Some(existing_view) = existing.as_ref() {
-                if let Some(current) = self.views.get_current_revision(existing_view).await? {
+                if let Some(current) =
+                    Box::pin(self.views.get_current_revision(existing_view)).await?
+                {
                     if existing_view.state != ProjectionState::Dirty
                         && current.compiler.dependency_hash == draft.dependency_hash
                         && current.compiler.version == GRAPH_COMPILER_VERSION
+                        && Box::pin(super::projection_is_current(&self.storage, &current)).await?
                     {
+                        Box::pin(super::verify_projection_epoch(
+                            &self.storage,
+                            space_id,
+                            observed_epoch,
+                        ))
+                        .await?;
                         return Ok(CompiledGraphView {
                             view: existing_view.clone(),
                             revision: current,
@@ -212,115 +317,38 @@ impl GraphViewCompiler {
             }
         }
 
-        let now = Utc::now();
-        let view_id = existing.as_ref().map_or_else(
-            || {
-                RecordId::new(
-                    TableName::KnowledgeView,
-                    Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()),
-                )
+        let compiled = assemble_graph_revision(
+            space_id,
+            definition_id,
+            GraphRevisionAssembly {
+                definition,
+                selection,
+                assertions,
+                evidence_envelopes,
+                existing,
+                draft,
+                security,
+                fingerprint,
+                key,
             },
-            |view| view.base.id.clone(),
         );
-        let revision_number = existing
-            .as_ref()
-            .map_or(1, |view| view.revision_count.saturating_add(1));
-        let revision_id = RecordId::new_v7(TableName::KnowledgeViewRevision);
-        let mut scope = super::ProjectionSubjects::default();
-        scope.include(&definition);
-        for member in &selection.members {
-            scope.include(&member.entity);
-            if let Some(relation) = &member.via_relation {
-                scope.include(relation);
-            }
-            for attribute in &member.matching_attributes {
-                scope.include(attribute);
-            }
+        if !Box::pin(super::projection_is_current(
+            &self.storage,
+            &compiled.revision,
+        ))
+        .await?
+        {
+            return Err(StorageError::Conflict(
+                "Graph projection has invalid or withdrawn evidence".into(),
+            ));
         }
-        for assertion in assertions.values() {
-            scope.include(assertion);
-        }
-        let (subjects, mut subjects_state) = scope.finish();
-        if selection.truncated {
-            subjects_state = SubjectsState::Partial;
-        }
-        let provenance = projection_provenance(
-            &draft.citations,
-            &draft.dependency_hash,
-            GRAPH_COMPILER_NAME,
-            GRAPH_COMPILER_VERSION,
-        );
-        let mut view_base = existing.as_ref().map_or_else(
-            || {
-                let mut base = BaseFields::new(
-                    view_id.clone(),
-                    space_id.to_string(),
-                    GRAPH_COMPILER_NAME.to_string(),
-                );
-                base.security = security.clone();
-                base
-            },
-            |view| view.base.clone(),
-        );
-        view_base.updated_at = now;
-        view_base.deleted_at = None;
-        view_base.security.clone_from(&security);
-        view_base.subjects.clone_from(&subjects);
-        view_base.subjects_state = subjects_state;
-        view_base.provenance.clone_from(&provenance);
-        let kind = definition.selector.kind();
-        let view = KnowledgeView {
-            base: view_base,
-            key,
-            kind,
-            surface: KnowledgeViewSurface::Inspector,
-            publication_status: KnowledgeViewPublicationStatus::Draft,
-            root_record: definition_id.to_string(),
-            title: definition.title.clone(),
-            slug: stable_slug(&definition.title, definition_id, "view"),
-            security_fingerprint: fingerprint.clone(),
-            current_revision: Some(revision_id.to_string()),
-            revision_count: revision_number,
-            state: draft.freshness.state,
-            state_reason: projection_state_reason(&draft.freshness),
-            published_at: Some(now),
-        };
-        let mut revision_base = BaseFields::new(
-            revision_id,
-            space_id.to_string(),
-            GRAPH_COMPILER_NAME.to_string(),
-        );
-        revision_base.security = security;
-        revision_base.subjects = subjects;
-        revision_base.subjects_state = subjects_state;
-        revision_base.provenance = provenance;
-        let revision = KnowledgeViewRevision {
-            base: revision_base,
-            view_id: view.base.id.to_string(),
-            revision: revision_number,
-            kind,
-            root_record: definition_id.to_string(),
-            blocks: draft.blocks,
-            rendered_markdown: draft.rendered_markdown,
-            citations: draft.citations,
-            dependencies: draft.dependencies,
-            freshness: draft.freshness,
-            validation: draft.validation,
-            compiler: CompilerReceipt {
-                compiler: GRAPH_COMPILER_NAME.to_string(),
-                version: GRAPH_COMPILER_VERSION,
-                dependency_hash: draft.dependency_hash,
-                policy_fingerprint: fingerprint,
-            },
-            compiled_at: now,
-            supersedes: existing.and_then(|view| view.current_revision),
-        };
-        let (view, revision) = self.views.publish(view, revision).await?;
-        Ok(CompiledGraphView {
-            view,
-            revision,
-            changed: true,
-        })
+        Box::pin(super::verify_projection_epoch(
+            &self.storage,
+            space_id,
+            observed_epoch,
+        ))
+        .await?;
+        Ok(compiled)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -342,9 +370,7 @@ impl GraphViewCompiler {
             .collect::<Vec<_>>();
         ordered_seeds.sort();
         for seed_id in ordered_seeds {
-            let seed = self
-                .entities
-                .get(space_id, &seed_id)
+            let seed = Box::pin(self.entities.get(space_id, &seed_id))
                 .await?
                 .filter(|entity| entity.base.security == *security)
                 .ok_or_else(|| StorageError::NotFound(seed_id.to_string()))?;
@@ -368,8 +394,8 @@ impl GraphViewCompiler {
             if distance >= max_hops {
                 continue;
             }
-            let mut edges = self.relations.find_outgoing(space_id, &current).await?;
-            edges.extend(self.relations.find_incoming(space_id, &current).await?);
+            let mut edges = Box::pin(self.relations.find_outgoing(space_id, &current)).await?;
+            edges.extend(Box::pin(self.relations.find_incoming(space_id, &current)).await?);
             edges.retain(|edge| {
                 edge.base.security == *security
                     && edge.status == ClaimStatus::Approved
@@ -393,7 +419,7 @@ impl GraphViewCompiler {
                     truncated = true;
                     break;
                 }
-                let Some(entity) = self.entities.get(space_id, neighbor_id).await? else {
+                let Some(entity) = Box::pin(self.entities.get(space_id, neighbor_id)).await? else {
                     continue;
                 };
                 if entity.base.security != *security {
@@ -441,10 +467,7 @@ impl GraphViewCompiler {
         let mut matching = Vec::new();
         while scanned < usize::from(scan_limit) {
             let page_limit = (usize::from(scan_limit) - scanned).min(250);
-            let page = self
-                .entities
-                .list(space_id, page_limit, cursor.as_ref())
-                .await?;
+            let page = Box::pin(self.entities.list(space_id, page_limit, cursor.as_ref())).await?;
             if page.is_empty() {
                 break;
             }
@@ -467,10 +490,11 @@ impl GraphViewCompiler {
                 }
                 let mut matching_attributes = Vec::new();
                 if !filters.is_empty() {
-                    let attributes = self
-                        .attributes
-                        .find_by_subject_entity(space_id, &entity.base.id)
-                        .await?;
+                    let attributes = Box::pin(
+                        self.attributes
+                            .find_by_subject_entity(space_id, &entity.base.id),
+                    )
+                    .await?;
                     for filter in filters {
                         let Some(attribute) = attributes.iter().find(|attribute| {
                             attribute.base.security == *security
@@ -537,7 +561,7 @@ impl GraphViewCompiler {
             .collect::<BTreeSet<_>>();
         let mut assertions = HashMap::new();
         for id in ids {
-            if let Some(assertion) = self.assertions.get(space_id, &id).await? {
+            if let Some(assertion) = Box::pin(self.assertions.get(space_id, &id)).await? {
                 if assertion.base.security == *security {
                     assertions.insert(id, assertion);
                 }
@@ -545,6 +569,184 @@ impl GraphViewCompiler {
         }
         Ok(assertions)
     }
+}
+
+// Consume the completed selection before polling final current-evidence and
+// epoch checks. Pure revision assembly has no nested storage future or write.
+struct GraphRevisionAssembly {
+    definition: KnowledgeViewDefinition,
+    selection: Selection,
+    assertions: HashMap<RecordId, Assertion>,
+    evidence_envelopes: Vec<BaseFields>,
+    existing: Option<KnowledgeView>,
+    draft: RevisionDraft,
+    security: Security,
+    fingerprint: String,
+    key: String,
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_lines)]
+fn assemble_graph_revision(
+    space_id: &str,
+    definition_id: &RecordId,
+    assembly: GraphRevisionAssembly,
+) -> CompiledGraphView {
+    let GraphRevisionAssembly {
+        definition,
+        selection,
+        assertions,
+        evidence_envelopes,
+        existing,
+        draft,
+        security,
+        fingerprint,
+        key,
+    } = assembly;
+    let now = Utc::now();
+    let view_id = existing.as_ref().map_or_else(
+        || {
+            RecordId::new(
+                TableName::KnowledgeView,
+                Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()),
+            )
+        },
+        |view| view.base.id.clone(),
+    );
+    let revision_number = existing
+        .as_ref()
+        .map_or(1, |view| view.revision_count.saturating_add(1));
+    let revision_id = RecordId::new_v7(TableName::KnowledgeViewRevision);
+    let mut scope = super::ProjectionSubjects::default();
+    scope.include(&definition);
+    for member in &selection.members {
+        scope.include(&member.entity);
+        if let Some(relation) = &member.via_relation {
+            scope.include(relation);
+        }
+        for attribute in &member.matching_attributes {
+            scope.include(attribute);
+        }
+    }
+    for assertion in assertions.values() {
+        scope.include(assertion);
+    }
+    for base in &evidence_envelopes {
+        scope.include_base(base);
+    }
+    let (subjects, mut subjects_state) = scope.finish();
+    if selection.truncated && subjects_state == SubjectsState::Complete {
+        subjects_state = SubjectsState::Partial;
+    }
+    let mut provenance = projection_provenance(
+        &draft.citations,
+        &draft.dependency_hash,
+        GRAPH_COMPILER_NAME,
+        GRAPH_COMPILER_VERSION,
+    );
+    super::extend_projection_sources(&mut provenance, &evidence_envelopes);
+    provenance
+        .sources
+        .extend(definition.base.provenance.sources.iter().cloned());
+    provenance.sources.sort();
+    provenance.sources.dedup();
+    let mut view_base = existing.as_ref().map_or_else(
+        || {
+            let mut base = BaseFields::new(
+                view_id.clone(),
+                space_id.to_string(),
+                GRAPH_COMPILER_NAME.to_string(),
+            );
+            base.security = security.clone();
+            base
+        },
+        |view| view.base.clone(),
+    );
+    view_base.updated_at = now;
+    view_base.deleted_at = None;
+    view_base.security.clone_from(&security);
+    view_base.subjects.clone_from(&subjects);
+    view_base.subjects_state = subjects_state;
+    view_base.provenance.clone_from(&provenance);
+    let kind = definition.selector.kind();
+    let view = KnowledgeView {
+        base: view_base,
+        key,
+        kind,
+        surface: KnowledgeViewSurface::Inspector,
+        publication_status: KnowledgeViewPublicationStatus::Draft,
+        root_record: definition_id.to_string(),
+        title: definition.title.clone(),
+        slug: stable_slug(&definition.title, definition_id, "view"),
+        security_fingerprint: fingerprint.clone(),
+        current_revision: Some(revision_id.to_string()),
+        revision_count: revision_number,
+        state: draft.freshness.state,
+        state_reason: projection_state_reason(&draft.freshness),
+        published_at: Some(now),
+    };
+    let mut revision_base = BaseFields::new(
+        revision_id,
+        space_id.to_string(),
+        GRAPH_COMPILER_NAME.to_string(),
+    );
+    revision_base.security = security;
+    revision_base.subjects = subjects;
+    revision_base.subjects_state = subjects_state;
+    revision_base.provenance = provenance;
+    let revision = KnowledgeViewRevision {
+        base: revision_base,
+        view_id: view.base.id.to_string(),
+        revision: revision_number,
+        kind,
+        root_record: definition_id.to_string(),
+        blocks: draft.blocks,
+        rendered_markdown: draft.rendered_markdown,
+        citations: draft.citations,
+        dependencies: draft.dependencies,
+        freshness: draft.freshness,
+        validation: draft.validation,
+        compiler: CompilerReceipt {
+            compiler: GRAPH_COMPILER_NAME.to_string(),
+            version: GRAPH_COMPILER_VERSION,
+            dependency_hash: draft.dependency_hash,
+            policy_fingerprint: fingerprint,
+        },
+        compiled_at: now,
+        supersedes: existing.and_then(|view| view.current_revision),
+    };
+    CompiledGraphView {
+        view,
+        revision,
+        changed: true,
+    }
+}
+
+// A root or definition can contribute source lineage without a selected
+// membership path or span citation. Resolve those original inputs through the
+// same current-read authority as cited evidence; provenance alone is not an
+// observed semantic dependency or a source authorization envelope.
+fn graph_input_sources(
+    definition: &KnowledgeViewDefinition,
+    selection: &Selection,
+    assertions: &HashMap<RecordId, Assertion>,
+) -> Vec<RecordId> {
+    std::iter::once(&definition.base)
+        .chain(selection.members.iter().flat_map(|member| {
+            std::iter::once(&member.entity.base)
+                .chain(member.via_relation.iter().map(|relation| &relation.base))
+                .chain(
+                    member
+                        .matching_attributes
+                        .iter()
+                        .map(|attribute| &attribute.base),
+                )
+        }))
+        .chain(assertions.values().map(|assertion| &assertion.base))
+        .flat_map(|base| base.provenance.sources.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn build_graph_draft(
@@ -988,6 +1190,71 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn graph_preparation_child_future_types_are_bounded() {
+        fn bytes<A, F: std::future::Future>(_: impl FnOnce(A) -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        // Uncalled typed closures measure real compiler methods, including the
+        // inner preparation and selection futures. They construct no storage or
+        // runtime and make no claim about nested machine poll-frame sizes.
+        let phases = [
+            (
+                "prepare context",
+                bytes(
+                    |(compiler, id): (&'static GraphViewCompiler, &'static RecordId)| {
+                        compiler.prepare_context("space", id, false)
+                    },
+                ),
+            ),
+            (
+                "prepare at epoch",
+                bytes(
+                    |(compiler, id): (&'static GraphViewCompiler, &'static RecordId)| {
+                        compiler.prepare_at_epoch("space", id, false, "original-epoch")
+                    },
+                ),
+            ),
+            (
+                "compile",
+                bytes(
+                    |(compiler, id): (&'static GraphViewCompiler, &'static RecordId)| {
+                        compiler.compile("space", id, false)
+                    },
+                ),
+            ),
+            (
+                "select graph",
+                bytes(
+                    |(compiler, security): (&'static GraphViewCompiler, &'static Security)| {
+                        compiler.select_graph("space", &[], &[], 1, 32, true, security)
+                    },
+                ),
+            ),
+            (
+                "select query",
+                bytes(
+                    |(compiler, security): (&'static GraphViewCompiler, &'static Security)| {
+                        compiler.select_query("space", &[], None, &[], 32, 32, security)
+                    },
+                ),
+            ),
+            (
+                "load assertions",
+                bytes(
+                    |(compiler, selection, security): (
+                        &'static GraphViewCompiler,
+                        &'static Selection,
+                        &'static Security,
+                    )| compiler.load_assertions("space", selection, security),
+                ),
+            ),
+        ];
+        for (phase, size) in phases {
+            assert!(size <= 32 * 1024, "{phase} future is {size} bytes");
+        }
+    }
+
     fn entity(name: &str, entity_type: &str) -> Entity {
         Entity {
             base: BaseFields::new(
@@ -1012,6 +1279,163 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        clippy::significant_drop_tightening,
+        reason = "Keep the complete attempt/space counterexample and original fixture cleanup order together."
+    )]
+    async fn managed_graph_reads_keep_original_attempt_and_space() {
+        use elephant_storage::{canonical_commit::CanonicalRepository, WorkItemRepository};
+        use elephant_types::records::{WorkItem, WorkItemStatus};
+
+        for embedded in [true, false] {
+            let storage = if embedded {
+                StorageClient::new_embedded().await.expect("embedded")
+            } else {
+                let storage = StorageClient::new_memory().await.expect("native memory");
+                elephant_migrations::apply_schema(&storage)
+                    .await
+                    .expect("schema");
+                storage
+            };
+            crate::tests::register_space(&storage).await;
+            let works = WorkItemRepository::new(storage.clone());
+            let original = works
+                .create(WorkItem {
+                    base: BaseFields::new(
+                        RecordId::new_v4(TableName::WorkItem),
+                        "space".into(),
+                        "graph-authority-test".into(),
+                    ),
+                    kind: "wiki_compile".into(),
+                    payload: serde_json::json!({}),
+                    status: WorkItemStatus::Runnable,
+                    priority: 0,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    attempts: 0,
+                    lease_expires_at: None,
+                    leased_by: None,
+                    run_after: None,
+                    last_error: None,
+                })
+                .await
+                .expect("original work");
+            let original = works
+                .claim_with_lease(
+                    "space",
+                    &original.base.id,
+                    "original-graph-worker",
+                    Utc::now() + chrono::Duration::minutes(5),
+                )
+                .await
+                .expect("claim")
+                .expect("claimed");
+            let fence = elephant_storage::work_attempt_repository::fence_from_claim(&original)
+                .expect("original fence");
+            let views = KnowledgeViewRepository::new(storage.clone());
+            let proof = views
+                .prepare_managed_publication("space", Some(&fence), None)
+                .await
+                .expect("original managed proof");
+            let compiler =
+                GraphViewCompiler::new(storage.clone()).with_managed_authority(proof.clone());
+            let missing = KnowledgeViewDefinition {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::KnowledgeViewDefinition),
+                    "space".into(),
+                    "graph-authority-test".into(),
+                ),
+                title: "Missing definition read sentinel".into(),
+                publication_status: KnowledgeViewPublicationStatus::Draft,
+                related_articles: Vec::new(),
+                navigation: None,
+                selector: KnowledgeViewSelector::Query {
+                    entity_types: Vec::new(),
+                    name_contains: None,
+                    attributes: Vec::new(),
+                    scan_limit: 10,
+                    max_members: 10,
+                },
+            };
+            assert!(compiler
+                .find_existing("space", &missing)
+                .await
+                .expect("authorized lookup")
+                .is_none());
+            assert!(matches!(
+                compiler
+                    .prepare_context("space", &missing.base.id, false)
+                    .await,
+                Err(StorageError::NotFound(_))
+            ));
+            assert_original_authority_refused(
+                compiler
+                    .prepare_context("different-space", &missing.base.id, false)
+                    .await,
+            );
+            works
+                .requeue_with_delay("space", &original.base.id, &fence.lease_token, 0, None)
+                .await
+                .expect("original guarded release")
+                .expect("released");
+            let successor = works
+                .claim_with_lease(
+                    "space",
+                    &original.base.id,
+                    "successor-graph-worker",
+                    Utc::now() + chrono::Duration::minutes(5),
+                )
+                .await
+                .expect("successor claim")
+                .expect("successor claimed");
+            let successor_fence =
+                elephant_storage::work_attempt_repository::fence_from_claim(&successor)
+                    .expect("successor fence");
+            assert_ne!(fence, successor_fence);
+            views
+                .prepare_managed_publication("space", Some(&successor_fence), None)
+                .await
+                .expect("successor itself is valid")
+                .verify_current()
+                .await
+                .expect("live successor");
+            let canonical = CanonicalRepository::new(storage);
+            let epoch = canonical.epoch("space").await.expect("original read epoch");
+            assert_original_authority_refused(proof.verify_current().await);
+            assert_original_authority_refused(compiler.find_existing("space", &missing).await);
+            assert_original_authority_refused(
+                compiler
+                    .clone()
+                    .prepare_context("space", &missing.base.id, false)
+                    .await,
+            );
+            assert_original_authority_refused(
+                compiler.compile("space", &missing.base.id, true).await,
+            );
+            assert_eq!(
+                canonical.epoch("space").await.expect("unchanged epoch"),
+                epoch
+            );
+        }
+    }
+
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Consume the original result at the authority assertion boundary, preserving existing test calls."
+    )]
+    fn assert_original_authority_refused<T: std::fmt::Debug>(result: StorageResult<T>) {
+        assert!(
+            matches!(&result, Err(StorageError::Conflict(message))
+                if message == "knowledge_view_original_authority_changed"),
+            "expected original authority refusal, got {result:?}"
+        );
+    }
+
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain the repository handle through both draft/publication assertions and original cleanup."
+    )]
     async fn assert_inspector_draft(compiler: &GraphViewCompiler, result: &CompiledGraphView) {
         assert_eq!(result.view.kind, KnowledgeViewKind::Topic);
         assert_eq!(result.view.surface, KnowledgeViewSurface::Inspector);
@@ -1043,8 +1467,173 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        clippy::large_futures,
+        reason = "Preserve original embedded fixture ownership and the unboxed awaited lineage-test future."
+    )]
+    async fn embedded_graph_roots_resolve_source_lineage_without_spans() {
+        let storage = StorageClient::new_embedded()
+            .await
+            .expect("embedded storage");
+        assert_graph_roots_resolve_source_lineage_without_spans(storage).await;
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        clippy::large_futures,
+        reason = "Preserve original migrated fixture ownership and the unboxed awaited lineage-test future."
+    )]
+    async fn surreal_graph_roots_resolve_source_lineage_without_spans() {
+        let storage = StorageClient::new(elephant_storage::StorageConfig {
+            url: "mem://".into(),
+            database: format!("graph_lineage_{}", Uuid::new_v4()),
+            ..elephant_storage::StorageConfig::default()
+        })
+        .await
+        .expect("native storage");
+        elephant_migrations::apply_schema(&storage)
+            .await
+            .expect("native schema");
+        assert_graph_roots_resolve_source_lineage_without_spans(storage).await;
+    }
+
+    // These real repository inputs exercise the retained source-first path
+    // without preview heads. The original Definition integration regressions
+    // separately retain their immutable-publication, raw-normalization and
+    // pending-generation oracles on both backends.
+    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep source/compiler handles through the original deletion and no-publication assertions."
+    )]
+    async fn assert_graph_roots_resolve_source_lineage_without_spans(storage: StorageClient) {
+        use elephant_storage::SourceRepository;
+        use elephant_types::records::{Source, SourceType};
+
+        crate::tests::register_space(&storage).await;
+        let sources = SourceRepository::new(storage.clone());
+        let mut original_sources = Vec::new();
+        for label in ["definition input", "selected root input"] {
+            original_sources.push(
+                sources
+                    .create(Source::new(
+                        BaseFields::new(
+                            RecordId::new_v4(TableName::Source),
+                            "space".into(),
+                            "source-lineage-control".into(),
+                        ),
+                        SourceType::Manual,
+                        label.into(),
+                    ))
+                    .await
+                    .expect("actual original Source"),
+            );
+        }
+        let mut root = entity("Source-backed root", "topic");
+        root.base.provenance.sources = vec![original_sources[1].base.id.clone()];
+        let root = EntityRepository::new(storage.clone())
+            .create(root)
+            .await
+            .expect("actual selected root");
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::KnowledgeViewDefinition),
+            "space".into(),
+            "source-lineage-control".into(),
+        );
+        base.provenance.sources = vec![original_sources[0].base.id.clone()];
+        let definition = KnowledgeViewDefinitionRepository::new(storage.clone())
+            .upsert(KnowledgeViewDefinition {
+                base,
+                title: "Original source lineage".into(),
+                publication_status: KnowledgeViewPublicationStatus::Draft,
+                related_articles: Vec::new(),
+                navigation: None,
+                selector: KnowledgeViewSelector::Topic {
+                    topic: Link::new(root.base.id),
+                    relation_types: Vec::new(),
+                    max_hops: 1,
+                    max_members: 2,
+                },
+            })
+            .await
+            .expect("actual definition");
+        let compiler = GraphViewCompiler::new(storage);
+        let prepared = compiler
+            .prepare_context("space", &definition.base.id, false)
+            .await
+            .expect("original source-backed context without span citations");
+        assert!(!prepared.persisted);
+        assert!(prepared
+            .revision
+            .citations
+            .iter()
+            .all(|citation| citation.evidence_span.is_none()));
+        let source_dependencies = prepared
+            .revision
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.record_type == "source")
+            .collect::<Vec<_>>();
+        assert_eq!(source_dependencies.len(), original_sources.len());
+        for source in &original_sources {
+            let dependency = source_dependencies
+                .iter()
+                .find(|dependency| dependency.record_id == source.base.id.to_string())
+                .expect("both definition and selected-root Source dependencies");
+            assert_eq!(dependency.observed_updated_at, Some(source.base.updated_at));
+            assert!(prepared
+                .revision
+                .base
+                .provenance
+                .sources
+                .contains(&source.base.id));
+        }
+        assert_eq!(prepared.revision.compiler.version, GRAPH_COMPILER_VERSION);
+        // Neither definition provenance nor a visible selected root can bypass
+        // the actual Source envelope when there are no span citations.
+        for source in &original_sources {
+            let mut denied = source.clone();
+            denied.base.security.policy_id = "different-source-policy".into();
+            sources
+                .update("space", &source.base.id, denied)
+                .await
+                .expect("changed raw policy");
+            let result = compiler
+                .prepare_context("space", &definition.base.id, true)
+                .await;
+            sources
+                .update("space", &source.base.id, source.clone())
+                .await
+                .expect("restore raw source");
+            assert!(matches!(result, Err(StorageError::Conflict(message))
+                if message == "Projection source is not currently published"));
+        }
+        sources
+            .delete("space", &original_sources[1].base.id)
+            .await
+            .expect("remove selected-root source");
+        assert!(matches!(
+            compiler.prepare_context("space", &definition.base.id, true).await,
+            Err(StorageError::Conflict(message)) if message == "Projection input Source is absent"
+        ));
+        assert!(compiler
+            .repository()
+            .list_views("space", 10)
+            .await
+            .expect("no implicit publication")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Preserve original graph fixture ownership and cleanup across traversal/trigger assertions."
+    )]
     async fn topic_view_traverses_approved_graph_and_registers_trigger() {
         let storage = StorageClient::new_embedded().await.expect("storage");
+        crate::tests::register_space(&storage).await;
         let entities = EntityRepository::new(storage.clone());
         let relations = RelRepository::new(storage.clone());
         let definitions = KnowledgeViewDefinitionRepository::new(storage.clone());
@@ -1137,8 +1726,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Preserve original saved-query fixture ownership through bounds and dependency assertions."
+    )]
     async fn saved_query_uses_exact_approved_attributes_and_discloses_bounds() {
         let storage = StorageClient::new_embedded().await.expect("storage");
+        crate::tests::register_space(&storage).await;
         let entities = EntityRepository::new(storage.clone());
         let attributes = AttributeRepository::new(storage.clone());
         let definitions = KnowledgeViewDefinitionRepository::new(storage.clone());
@@ -1211,6 +1805,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the migrated graph repositories through the complete original round-trip assertions."
+    )]
     async fn graph_definition_and_revision_round_trip_through_migrated_surreal_store() {
         let storage = StorageClient::new(elephant_storage::StorageConfig {
             url: "mem://".to_string(),
@@ -1222,6 +1820,7 @@ mod tests {
         elephant_migrations::apply_schema(&storage)
             .await
             .expect("schema");
+        crate::tests::register_space(&storage).await;
         let topic = entity("Knowledge graphs", "topic");
         let topic_id = topic.base.id.clone();
         EntityRepository::new(storage.clone())

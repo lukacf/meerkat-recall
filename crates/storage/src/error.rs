@@ -25,6 +25,10 @@ pub enum StorageError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    /// A durable erasure reservation temporarily blocks writes in this space.
+    #[error("Source erasure is in progress; retry after cleanup")]
+    ErasureInProgress,
+
     /// Serialization/deserialization error.
     #[error("Serialization error: {0}")]
     SerializationError(String),
@@ -48,7 +52,11 @@ pub enum StorageError {
 
 impl From<surrealdb::Error> for StorageError {
     fn from(err: surrealdb::Error) -> Self {
-        Self::Surreal(Box::new(err))
+        if is_erasure_in_progress(&err) {
+            Self::ErasureInProgress
+        } else {
+            Self::Surreal(Box::new(err))
+        }
     }
 }
 
@@ -62,11 +70,40 @@ impl StorageError {
     /// the spec.
     #[must_use]
     pub fn classify_query_error(message: String) -> Self {
+        if is_erasure_reservation_message(&message) {
+            return Self::ErasureInProgress;
+        }
         if is_conflict_message(&message) {
             return Self::Conflict(message);
         }
         Self::QueryError(message)
     }
+}
+
+/// Recognizes only the native typed reservation refusal or its remote query wrapper.
+///
+/// The remote SDK preserves a `THROW` as an `Api::Query` string. Other error
+/// variants and messages containing the sentinel as incidental text remain errors
+/// of their original kind; no query text or generic conflict is reclassified.
+#[must_use]
+pub fn is_erasure_in_progress(error: &surrealdb::Error) -> bool {
+    match error {
+        surrealdb::Error::Db(surrealdb::error::Db::Thrown(message)) => {
+            message == "publication:erasure_space_reserved"
+        }
+        surrealdb::Error::Api(surrealdb::error::Api::Query(message)) => {
+            message == "An error occurred: publication:erasure_space_reserved"
+        }
+        _ => false,
+    }
+}
+
+fn is_erasure_reservation_message(message: &str) -> bool {
+    matches!(
+        message,
+        "publication:erasure_space_reserved"
+            | "An error occurred: publication:erasure_space_reserved"
+    )
 }
 
 fn is_conflict_message(message: &str) -> bool {
@@ -101,6 +138,70 @@ mod tests {
         clippy::cognitive_complexity
     )]
     use super::*;
+
+    #[test]
+    fn reservation_classification_preserves_unrelated_errors() {
+        for message in [
+            "publication:erasure_space_reserved",
+            "An error occurred: publication:erasure_space_reserved",
+        ] {
+            assert!(matches!(
+                StorageError::classify_query_error(message.into()),
+                StorageError::ErasureInProgress
+            ));
+        }
+        for message in [
+            "ordinary failure mentioning publication:erasure_space_reserved",
+            "An error occurred: publication:erasure_space_reserved trailing data",
+            "publication:erasure_space_reserved\n",
+            "Source erasure is in progress; retry after cleanup",
+        ] {
+            assert!(matches!(
+                StorageError::classify_query_error(message.into()),
+                StorageError::QueryError(preserved) if preserved == message
+            ));
+        }
+        assert!(matches!(
+            StorageError::classify_query_error("record conflict".into()),
+            StorageError::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn typed_and_remote_reservations_convert_without_leaking_details() {
+        let native = surrealdb::Error::Db(surrealdb::error::Db::Thrown(
+            "publication:erasure_space_reserved".into(),
+        ));
+        let remote = surrealdb::Error::Api(surrealdb::error::Api::Query(
+            "An error occurred: publication:erasure_space_reserved".into(),
+        ));
+        for error in [native, remote] {
+            assert!(is_erasure_in_progress(&error));
+            let storage = StorageError::from(error);
+            assert!(matches!(storage, StorageError::ErasureInProgress));
+            assert_eq!(
+                storage.to_string(),
+                "Source erasure is in progress; retry after cleanup"
+            );
+        }
+        for error in [
+            surrealdb::Error::Db(surrealdb::error::Db::Thrown(
+                "An error occurred: publication:erasure_space_reserved".into(),
+            )),
+            surrealdb::Error::Api(surrealdb::error::Api::Query(
+                "publication:erasure_space_reserved".into(),
+            )),
+            surrealdb::Error::Api(surrealdb::error::Api::Query(
+                "unrelated query failed: publication:erasure_space_reserved".into(),
+            )),
+        ] {
+            assert!(!is_erasure_in_progress(&error));
+            assert!(matches!(
+                StorageError::from(error),
+                StorageError::Surreal(_)
+            ));
+        }
+    }
 
     #[test]
     fn test_error_display() {

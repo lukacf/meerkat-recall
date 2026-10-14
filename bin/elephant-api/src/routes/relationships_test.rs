@@ -369,6 +369,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture ownership, future layout, and oracle sequence."
+    )]
     async fn test_restore_relationship_requires_read_authorization() {
         let authz = Arc::new(AuthzService::new());
         let state = Arc::new(RelationshipsState::new_with_repo(

@@ -22,9 +22,8 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
-use elephant_outbox::{EventOperation, OutboxPayload, OutboxWriter, RecordRef};
+use elephant_storage::public_mutation::PublicMutation;
 use elephant_storage::{
     parse_id, EntityRepository, EntityWithRelations, PaginatedResult, RelRepository,
     SearchCriteria, StorageClient, StorageError, StorageResult, SystemEventRepository,
@@ -246,14 +245,16 @@ impl RelRepo for elephant_storage::MockRelRepository {
 /// Shared application state for entity handlers.
 #[derive(Clone)]
 pub struct AppState {
+    /// Current source support authority; absent only for repository unit fixtures.
+    pub storage: Option<StorageClient>,
     /// Entity repository.
     pub entity_repo: Arc<dyn EntityRepo>,
     /// Relationship repository.
     pub rel_repo: Arc<dyn RelRepo>,
     /// Event repository.
     pub event_repo: Arc<dyn EventRepo>,
-    /// Durable change publisher used by downstream projections and workers.
-    pub outbox: Option<OutboxWriter>,
+    /// Canonical mutation client. Absent only in isolated repository mocks.
+    pub mutation_storage: Option<StorageClient>,
     /// Authorization service.
     pub authz: AuthzState,
 }
@@ -263,10 +264,11 @@ impl AppState {
     #[must_use]
     pub fn new(client: StorageClient, authz: AuthzState) -> Self {
         Self {
+            storage: Some(client.clone()),
             entity_repo: Arc::new(EntityRepository::new(client.clone())),
             rel_repo: Arc::new(RelRepository::new(client.clone())),
             event_repo: Arc::new(SystemEventRepository::new(client.clone())),
-            outbox: Some(OutboxWriter::new(client)),
+            mutation_storage: Some(client),
             authz,
         }
     }
@@ -281,41 +283,56 @@ impl AppState {
         authz: AuthzState,
     ) -> Self {
         Self {
+            storage: None,
             entity_repo,
             rel_repo,
             event_repo,
-            outbox: None,
+            mutation_storage: None,
             authz,
         }
     }
 }
 
-async fn publish_entity_change(
+async fn begin_entity_mutation(
     state: &AppState,
-    entity: &Entity,
-    operation: EventOperation,
-    event_type: &str,
+    space: &str,
+) -> StorageResult<Option<PublicMutation>> {
+    match &state.mutation_storage {
+        Some(storage) => PublicMutation::begin(storage.clone(), space)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+async fn create_entity_atomic(
+    state: &AppState,
+    mutation: Option<&PublicMutation>,
+    proposed: Entity,
     actor: &str,
-) {
-    let Some(outbox) = state.outbox.as_ref() else {
-        return;
-    };
-    let payload = OutboxPayload::new(
-        entity.base.space_id.clone(),
-        event_type.to_string(),
-        actor.to_string(),
-    )
-    .with_record(RecordRef {
-        id: entity.base.id.clone(),
-        table: TableName::Entity.as_str().to_string(),
-        op: operation,
-    });
-    if let Err(error) = outbox.write(payload).await {
-        warn!(
-            entity_id = %entity.base.id,
-            event_type,
-            "Entity mutation succeeded but outbox publication failed: {error}"
-        );
+) -> StorageResult<Entity> {
+    match mutation {
+        Some(mutation) => mutation.create(proposed, actor).await,
+        None => state.entity_repo.create(proposed).await,
+    }
+}
+
+async fn replace_entity_atomic(
+    state: &AppState,
+    mutation: Option<&PublicMutation>,
+    observed: &Entity,
+    proposed: Entity,
+    restore: bool,
+    actor: &str,
+) -> StorageResult<Entity> {
+    match mutation {
+        Some(mutation) => mutation.replace(observed, proposed, restore, actor).await,
+        None => {
+            state
+                .entity_repo
+                .replace_authorized(observed, proposed, restore)
+                .await
+        }
     }
 }
 
@@ -360,7 +377,7 @@ pub struct EntitySearchResponse {
 }
 
 /// Error response body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ApiError {
     /// Error code.
     pub code: String,
@@ -368,6 +385,34 @@ pub struct ApiError {
     pub message: String,
     /// Optional structured details.
     pub details: Option<serde_json::Value>,
+}
+
+impl Serialize for ApiError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use elephant_types::public_error::ErrorCode;
+        use serde::ser::SerializeStruct;
+        let code = match self.code.as_str() {
+            "ACCESS_DENIED" | "FORBIDDEN" => ErrorCode::ForbiddenSpace,
+            "UNAUTHORIZED" => ErrorCode::Unauthorized,
+            "NOT_FOUND" => ErrorCode::NotFound,
+            "UNKNOWN_SPACE" => ErrorCode::UnknownSpace,
+            "CONFLICT" => ErrorCode::ConflictGeneration,
+            "RUNTIME_READ_ONLY" | "CAPABILITY_DISABLED" => ErrorCode::CapabilityDisabled,
+            "RUNTIME_NOT_READY" | "NOT_READY" => ErrorCode::NotReady,
+            "PAYLOAD_TOO_LARGE" => ErrorCode::PayloadTooLarge,
+            "PROVIDER_UNAPPROVED" => ErrorCode::ProviderUnapproved,
+            "RATE_LIMITED" => ErrorCode::RateLimited,
+            "INTERNAL_ERROR" | "STORAGE_ERROR" => ErrorCode::Unavailable,
+            _ => ErrorCode::InvalidRequest,
+        };
+        let mut output = serializer.serialize_struct("ApiError", 5)?;
+        output.serialize_field("error_code", &code)?;
+        output.serialize_field("retryable", &code.retryable())?;
+        output.serialize_field("message", &self.message)?;
+        output.serialize_field("code", &self.code)?;
+        output.serialize_field("details", &self.details)?;
+        output.end()
+    }
 }
 
 impl ApiError {
@@ -390,11 +435,18 @@ impl ApiError {
         }
     }
 
+    /// Project a typed storage failure through the shared public error mapper.
+    #[must_use = "Use the status and public error together in the HTTP response"]
+    pub fn storage(error: &StorageError) -> (StatusCode, Json<Self>) {
+        crate::public_error::legacy_storage_failure_ref(error)
+    }
+
     /// Creates a new internal error.
     pub fn internal(message: impl Into<String>) -> Self {
+        tracing::warn!(error = %message.into(), "API storage operation failed");
         Self {
             code: "INTERNAL_ERROR".to_string(),
-            message: message.into(),
+            message: "Storage operation unavailable".into(),
             details: None,
         }
     }
@@ -583,9 +635,14 @@ async fn search_entities(
                 )
             })?;
 
-        let filtered = state
-            .authz
-            .filter_records(&principal, result.results, "read:entity");
+        let filtered = super::current_read::filter(
+            state.storage.as_ref(),
+            &state.authz,
+            &principal,
+            result.results,
+            "read:entity",
+        )
+        .await?;
         total_authorized += filtered.len();
 
         if collected.len() < req.limit {
@@ -653,7 +710,16 @@ async fn get_entity(
                         }),
                     )
                 })?;
-            Ok(Json(entity))
+            Ok(Json(
+                super::current_read::require(
+                    state.storage.as_ref(),
+                    &state.authz,
+                    &principal,
+                    entity,
+                    "read:entity",
+                )
+                .await?,
+            ))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -701,6 +767,14 @@ async fn batch_get_entities(
                 Json(ApiError::internal(e.to_string())),
             )
         })?;
+    let entities = super::current_read::filter(
+        state.storage.as_ref(),
+        &state.authz,
+        &principal,
+        entities,
+        "read:entity",
+    )
+    .await?;
     let mut by_id: HashMap<RecordId, Entity> = entities
         .into_iter()
         .map(|entity| (entity.base.id.clone(), entity))
@@ -761,14 +835,22 @@ async fn get_entity_with_relations(
                 })?;
 
             // Filter relationships
-            ewr.outgoing_relations =
-                state
-                    .authz
-                    .filter_records(&principal, ewr.outgoing_relations, "read:relationship");
-            ewr.incoming_relations =
-                state
-                    .authz
-                    .filter_records(&principal, ewr.incoming_relations, "read:relationship");
+            ewr.outgoing_relations = super::current_read::filter(
+                state.storage.as_ref(),
+                &state.authz,
+                &principal,
+                ewr.outgoing_relations,
+                "read:relationship",
+            )
+            .await?;
+            ewr.incoming_relations = super::current_read::filter(
+                state.storage.as_ref(),
+                &state.authz,
+                &principal,
+                ewr.incoming_relations,
+                "read:relationship",
+            )
+            .await?;
 
             Ok(Json(ewr))
         }
@@ -803,7 +885,7 @@ async fn get_entity_context(
     let event_limit = req.event_limit.unwrap_or(50);
 
     // 1. Get base entity with depth-1 relations.
-    let entity_with_rels = match state.entity_repo.get_with_relations(&space_id, &rid).await {
+    let mut entity_with_rels = match state.entity_repo.get_with_relations(&space_id, &rid).await {
         Ok(Some(ewr)) => ewr,
         Ok(None) => {
             return Err((
@@ -819,6 +901,14 @@ async fn get_entity_context(
         }
     };
 
+    entity_with_rels.entity = super::current_read::require(
+        state.storage.as_ref(),
+        &state.authz,
+        &principal,
+        entity_with_rels.entity,
+        "read:entity",
+    )
+    .await?;
     // Authorize base entity.
     state
         .authz
@@ -834,16 +924,22 @@ async fn get_entity_context(
             )
         })?;
 
-    let outgoing_relations = state.authz.filter_records(
+    let outgoing_relations = super::current_read::filter(
+        state.storage.as_ref(),
+        &state.authz,
         &principal,
         entity_with_rels.outgoing_relations.clone(),
         "read:relationship",
-    );
-    let incoming_relations = state.authz.filter_records(
+    )
+    .await?;
+    let incoming_relations = super::current_read::filter(
+        state.storage.as_ref(),
+        &state.authz,
         &principal,
         entity_with_rels.incoming_relations.clone(),
         "read:relationship",
-    );
+    )
+    .await?;
 
     // 2. Traversal for depth > 1.
     let relations = if depth <= 1 {
@@ -886,14 +982,22 @@ async fn get_entity_context(
                         )
                     })?;
 
-                let outgoing =
-                    state
-                        .authz
-                        .filter_records(&principal, outgoing, "read:relationship");
-                let incoming =
-                    state
-                        .authz
-                        .filter_records(&principal, incoming, "read:relationship");
+                let outgoing = super::current_read::filter(
+                    state.storage.as_ref(),
+                    &state.authz,
+                    &principal,
+                    outgoing,
+                    "read:relationship",
+                )
+                .await?;
+                let incoming = super::current_read::filter(
+                    state.storage.as_ref(),
+                    &state.authz,
+                    &principal,
+                    incoming,
+                    "read:relationship",
+                )
+                .await?;
 
                 for rel in outgoing.iter().chain(incoming.iter()) {
                     if seen_rel_ids.insert(rel.base.id.clone()) {
@@ -927,21 +1031,24 @@ async fn get_entity_context(
 
     // Fetch recent events involving this entity (defaults: window=30d, limit=50).
     let since = chrono::Utc::now() - chrono::Duration::days(window_days);
-    let recent_events = state
+    let recent_events = match state
         .event_repo
         .find_by_entity_since(&space_id, &rid, since, event_limit)
         .await
-        .map_or_else(
-            |_| vec![],
-            |events| {
-                state
-                    .authz
-                    .filter_records(&principal, events, "read:event")
-                    .into_iter()
-                    .map(|e| serde_json::to_value(&e).unwrap_or_default())
-                    .collect()
-            },
-        );
+    {
+        Err(_) => vec![],
+        Ok(events) => super::current_read::filter(
+            state.storage.as_ref(),
+            &state.authz,
+            &principal,
+            events,
+            "read:event",
+        )
+        .await?
+        .into_iter()
+        .map(|e| serde_json::to_value(&e).unwrap_or_default())
+        .collect(),
+    };
 
     Ok(Json(EntityContext {
         entity: entity_with_rels.entity,
@@ -998,7 +1105,10 @@ async fn create_entity(
             )
         })?;
 
-    match state.entity_repo.create(entity).await {
+    let mutation = begin_entity_mutation(&state, &entity.base.space_id)
+        .await
+        .map_err(|e| entity_write_error(&e))?;
+    match create_entity_atomic(&state, mutation.as_ref(), entity, &principal.subject).await {
         Ok(entity) => {
             state
                 .authz
@@ -1014,24 +1124,9 @@ async fn create_entity(
                     )
                 })?;
 
-            publish_entity_change(
-                &state,
-                &entity,
-                EventOperation::Create,
-                "entity.created",
-                &principal.subject,
-            )
-            .await;
-
             Ok((StatusCode::CREATED, Json(entity)))
         }
-        Err(e) => {
-            let status = match e {
-                StorageError::Conflict(_) => StatusCode::CONFLICT,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            Err((status, Json(ApiError::internal(e.to_string()))))
-        }
+        Err(e) => Err(entity_write_error(&e)),
     }
 }
 
@@ -1079,12 +1174,7 @@ fn entity_authz_error(error: AuthzError) -> (StatusCode, Json<ApiError>) {
 }
 
 fn entity_write_error(error: &StorageError) -> (StatusCode, Json<ApiError>) {
-    let status = if matches!(error, StorageError::Conflict(_)) {
-        StatusCode::CONFLICT
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
-    (status, Json(ApiError::internal(error.to_string())))
+    ApiError::storage(error)
 }
 
 /// PUT /v1/entities/{id} - Update entity without reclassifying it.
@@ -1101,6 +1191,9 @@ async fn update_entity(
             Json(ApiError::validation(e.to_string())),
         )
     })?;
+    let mutation = begin_entity_mutation(&state, &space_id)
+        .await
+        .map_err(|e| entity_write_error(&e))?;
     let existing = state
         .entity_repo
         .get(&space_id, &rid)
@@ -1114,23 +1207,24 @@ async fn update_entity(
         })?;
     authorize_entity_replacement(&state, &principal, &existing, &req.entity)
         .map_err(entity_authz_error)?;
-    let updated = state
-        .entity_repo
-        .replace_authorized(&existing, req.entity, false)
-        .await
-        .map_err(|error| entity_write_error(&error))?;
-    publish_entity_change(
+    let updated = replace_entity_atomic(
         &state,
-        &updated,
-        EventOperation::Update,
-        "entity.updated",
+        mutation.as_ref(),
+        &existing,
+        req.entity,
+        false,
         &principal.subject,
     )
-    .await;
+    .await
+    .map_err(|error| entity_write_error(&error))?;
     Ok(Json(updated))
 }
 
 /// DELETE /v1/entities/{id} - Soft delete entity.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Retain guard, repository and runtime owners through the original response or state transition scope"
+)]
 async fn delete_entity(
     State(state): State<Arc<AppState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -1143,6 +1237,9 @@ async fn delete_entity(
             Json(ApiError::validation(e.to_string())),
         )
     })?;
+    let mutation = begin_entity_mutation(&state, &space_id)
+        .await
+        .map_err(|e| entity_write_error(&e))?;
     match state.entity_repo.get(&space_id, &rid).await {
         Ok(Some(existing)) => {
             state
@@ -1159,36 +1256,30 @@ async fn delete_entity(
                     )
                 })?;
 
-            match state.entity_repo.delete(&space_id, &rid).await {
-                Ok(()) => {
-                    publish_entity_change(
-                        &state,
-                        &existing,
-                        EventOperation::Delete,
-                        "entity.deleted",
-                        &principal.subject,
-                    )
-                    .await;
-                    Ok(StatusCode::NO_CONTENT)
-                }
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
-            }
+            let result = match &mutation {
+                Some(mutation) => mutation
+                    .delete(&existing, &principal.subject)
+                    .await
+                    .map(|_| ()),
+                None => state.entity_repo.delete(&space_id, &rid).await,
+            };
+            result
+                .map(|()| StatusCode::NO_CONTENT)
+                .map_err(|e| entity_write_error(&e))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ApiError::not_found("Entity", &id)),
         )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 
 /// POST /v1/entities/{id}/restore - Restore soft-deleted entity.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Retain guard, repository and runtime owners through the original response or state transition scope"
+)]
 async fn restore_entity(
     State(state): State<Arc<AppState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -1201,6 +1292,9 @@ async fn restore_entity(
             Json(ApiError::validation(e.to_string())),
         )
     })?;
+    let mutation = begin_entity_mutation(&state, &space_id)
+        .await
+        .map_err(|e| entity_write_error(&e))?;
     match state.entity_repo.get_with_deleted(&space_id, &rid).await {
         Ok(Some(existing)) => {
             state
@@ -1231,22 +1325,17 @@ async fn restore_entity(
                     )
                 })?;
 
-            match state
-                .entity_repo
-                .restore_guarded(&space_id, &rid, &existing)
-                .await
-            {
-                Ok(restored) => {
-                    publish_entity_change(
-                        &state,
-                        &restored,
-                        EventOperation::Restore,
-                        "entity.restored",
-                        &principal.subject,
-                    )
-                    .await;
-                    Ok(Json(restored))
+            let result = match &mutation {
+                Some(mutation) => mutation.restore(&existing, &principal.subject).await,
+                None => {
+                    state
+                        .entity_repo
+                        .restore_guarded(&space_id, &rid, &existing)
+                        .await
                 }
+            };
+            match result {
+                Ok(restored) => Ok(Json(restored)),
                 Err(elephant_storage::StorageError::Conflict(_)) => Err((
                     StatusCode::CONFLICT,
                     Json(ApiError {
@@ -1255,20 +1344,14 @@ async fn restore_entity(
                         details: None,
                     }),
                 )),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
+                Err(e) => Err(ApiError::storage(&e)),
             }
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ApiError::not_found("Entity", &id)),
         )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 
@@ -1281,36 +1364,30 @@ async fn upsert_entity(
     let space_id = require_space_id(&principal)?;
     authorize_entity_write(&state, &principal, &entity).map_err(entity_authz_error)?;
     let rid = entity.base.id.clone();
+    let mutation = begin_entity_mutation(&state, &space_id)
+        .await
+        .map_err(|e| entity_write_error(&e))?;
     let existing = state
         .entity_repo
         .get_with_deleted(&space_id, &rid)
         .await
         .map_err(|error| entity_write_error(&error))?;
-    let (updated, operation, event_type) = if let Some(existing) = existing {
+    let updated = if let Some(existing) = existing {
         authorize_entity_replacement(&state, &principal, &existing, &entity)
             .map_err(entity_authz_error)?;
-        (
-            state
-                .entity_repo
-                .replace_authorized(&existing, entity, true)
-                .await
-                .map_err(|error| entity_write_error(&error))?,
-            EventOperation::Update,
-            "entity.updated",
+        replace_entity_atomic(
+            &state,
+            mutation.as_ref(),
+            &existing,
+            entity,
+            true,
+            &principal.subject,
         )
+        .await
     } else {
-        // CREATE must fail on a collision, never replace a record we did not authorize.
-        (
-            state
-                .entity_repo
-                .create(entity)
-                .await
-                .map_err(|error| entity_write_error(&error))?,
-            EventOperation::Create,
-            "entity.created",
-        )
-    };
-    publish_entity_change(&state, &updated, operation, event_type, &principal.subject).await;
+        create_entity_atomic(&state, mutation.as_ref(), entity, &principal.subject).await
+    }
+    .map_err(|error| entity_write_error(&error))?;
     Ok(Json(updated))
 }
 
@@ -1323,62 +1400,65 @@ async fn batch_entities(
     let space_id = require_space_id(&principal)?;
     let mut succeeded = Vec::new();
     let mut failed = Vec::new();
-
     for (index, entity) in req.items.into_iter().enumerate() {
+        let mutation = match begin_entity_mutation(&state, &space_id).await {
+            Ok(mutation) => mutation,
+            Err(error @ elephant_storage::StorageError::ErasureInProgress) => {
+                return Err(ApiError::storage(&error));
+            }
+            Err(error) => {
+                failed.push(BatchError {
+                    index,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
         let rid = entity.base.id.clone();
-
-        let (result, operation) = match state.entity_repo.get_with_deleted(&space_id, &rid).await {
+        let result = match state.entity_repo.get_with_deleted(&space_id, &rid).await {
             Ok(Some(existing)) => {
-                if let Err(e) = authorize_entity_replacement(&state, &principal, &existing, &entity)
+                if let Err(error) =
+                    authorize_entity_replacement(&state, &principal, &existing, &entity)
                 {
                     failed.push(BatchError {
                         index,
-                        error: e.message,
+                        error: error.message,
                     });
                     continue;
                 }
-                (
-                    state
-                        .entity_repo
-                        .replace_authorized(&existing, entity, true)
-                        .await,
-                    EventOperation::Update,
+                replace_entity_atomic(
+                    &state,
+                    mutation.as_ref(),
+                    &existing,
+                    entity,
+                    true,
+                    &principal.subject,
                 )
+                .await
             }
             Ok(None) => {
-                if let Err(e) = authorize_entity_write(&state, &principal, &entity) {
+                if let Err(error) = authorize_entity_write(&state, &principal, &entity) {
                     failed.push(BatchError {
                         index,
-                        error: e.message,
+                        error: error.message,
                     });
                     continue;
                 }
-                (
-                    state.entity_repo.create(entity).await,
-                    EventOperation::Create,
-                )
+                create_entity_atomic(&state, mutation.as_ref(), entity, &principal.subject).await
             }
-            Err(e) => (Err(e), EventOperation::Update),
+            Err(error) => Err(error),
         };
-
         match result {
-            Ok(entity) => {
-                let event_type = if operation == EventOperation::Create {
-                    "entity.created"
-                } else {
-                    "entity.updated"
-                };
-                publish_entity_change(&state, &entity, operation, event_type, &principal.subject)
-                    .await;
-                succeeded.push(entity);
+            Ok(entity) => succeeded.push(entity),
+            Err(error @ StorageError::ErasureInProgress) => {
+                return Err(ApiError::storage(&error));
             }
-            Err(e) => failed.push(BatchError {
+            Err(error) => failed.push(BatchError {
                 index,
-                error: e.to_string(),
+                error: error.to_string(),
             }),
         }
     }
-
     Ok(Json(BatchResponse { succeeded, failed }))
 }
 
@@ -1439,34 +1519,46 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn entity_change_publication_writes_a_semantic_outbox_record() {
         let storage = StorageClient::new_embedded().await.expect("storage");
+        let config: elephant_types::records::SpaceConfig = serde_json::from_value(serde_json::json!({
+            "id":RecordId::new_v4(TableName::SpaceConfig),"space_id":"default", "created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now(),"created_by":"test",
+            "security":{"policy_id":"default","level":0,"labels":[],"handling":[]},"provenance":{},"subjects":[],"subjects_state":"complete", "embedding_provider":"fake","embedding_model":"test","embedding_dims":8
+        })).expect("space fixture");
+        elephant_storage::Repository::create(
+            &elephant_storage::SpaceConfigRepository::new(storage.clone()),
+            config,
+        )
+        .await
+        .expect("space");
         let state = AppState::new(storage.clone(), Arc::new(crate::authz::AuthzService::new()));
         let entity = Entity::new(
             elephant_types::records::base::BaseFields::new(
                 RecordId::new_v4(TableName::Entity),
-                "space".to_string(),
+                "default".to_string(),
                 "test".to_string(),
             ),
             EntityType::new("topic"),
             "A topic".to_string(),
         );
 
-        publish_entity_change(
-            &state,
-            &entity,
-            EventOperation::Update,
-            "entity.updated",
-            "test",
-        )
-        .await;
+        let mutation = begin_entity_mutation(&state, "default")
+            .await
+            .expect("begin");
+        create_entity_atomic(&state, mutation.as_ref(), entity.clone(), "test")
+            .await
+            .expect("atomic create");
 
         let events = SystemEventRepository::new(storage)
-            .get_after_seq("space", 0, 10)
+            .get_after_seq("default", 0, 10)
             .await
             .expect("events");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "entity.updated");
+        assert_eq!(events[0].event_type, "entity.created");
         let entity_id = entity.base.id.to_string();
         assert_eq!(
             events[0].payload["records"][0]["id"].as_str(),

@@ -1,0 +1,2 @@
+# Preserve exact PDF offsets, stream lengths and required xref record padding.
+fixtures/*.pdf binary

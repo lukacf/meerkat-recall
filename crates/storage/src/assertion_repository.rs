@@ -306,6 +306,12 @@ impl AssertionRepository {
         Self { client }
     }
 
+    /// Shares the client for preparation through the canonical transaction owner.
+    #[must_use]
+    pub fn storage_client(&self) -> StorageClient {
+        self.client.clone()
+    }
+
     /// Restores an assertion only if it is unchanged since `authorized`.
     ///
     /// `authorized` is the row the caller's authorization was decided on. The
@@ -555,7 +561,7 @@ impl AssertionRepository {
 
     /// Converts an Assertion to a SurrealDB value for insertion.
     #[allow(clippy::too_many_lines)]
-    fn assertion_to_value(item: &Assertion) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn assertion_to_value(item: &Assertion) -> StorageResult<surrealdb::sql::Value> {
         use surrealdb::sql::{Object, Value};
 
         let mut obj = crate::surreal::base_fields_to_object(&item.base)?;
@@ -1718,6 +1724,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_assertion() {
         let repo = setup_test_repo().await;
         let item = create_test_assertion();
@@ -1729,6 +1739,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_assertion() {
         let repo = setup_test_repo().await;
         let item = create_test_assertion();
@@ -1856,7 +1870,9 @@ mod tests {
     }
 
     /// A guarded resolution writes only the resolution fields, and only while
-    /// the row still has the authorized envelope: a stale snapshot never
+    /// the row still has the authorized envelope:
+    ///
+    /// a stale snapshot never
     /// writes back an older classification, subject set or entity link.
     async fn assert_guarded_resolution(repo: &AssertionRepository) {
         let space = "test_space";
@@ -1995,6 +2011,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_and_restore_assertion() {
         let repo = setup_test_repo().await;
         let item = create_test_assertion();
@@ -2016,6 +2036,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_ranked_search_scopes_every_query_term() {
         let repo = setup_test_repo().await;
 
@@ -2068,6 +2092,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_ranked_search_cursor_uses_offset_pagination() {
         let repo = setup_test_repo().await;
 
@@ -2136,6 +2164,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_non_ranked_cursor_total_is_stable_across_cursor_pages() {
         let repo = setup_embedded_repo().await;
 
@@ -2189,6 +2221,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_ranked_search_zero_limit_has_no_cursor() {
         let repo = setup_test_repo().await;
 
@@ -2226,6 +2262,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_assertion_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_assertion();
@@ -2243,6 +2283,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_assertion() {
         let repo = setup_test_repo().await;
         let item = create_test_assertion();
@@ -2258,6 +2302,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_if_resolution_status_returns_none_when_status_already_changed() {
         let repo = setup_test_repo().await;
         let created = repo.create(create_test_assertion()).await.unwrap();
@@ -2291,6 +2339,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_create_rejects_duplicate_assertion_key() {
         let repo = setup_embedded_repo().await;
         let first = create_test_assertion();
@@ -2308,6 +2360,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_update_rejects_duplicate_assertion_key() {
         let repo = setup_embedded_repo().await;
         let first = repo.create(create_test_assertion()).await.unwrap();
@@ -2326,6 +2382,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_assertion() {
         let repo = setup_test_repo().await;
         let item = create_test_assertion();
@@ -2339,6 +2399,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_by_assertion_key() {
         let repo = setup_test_repo().await;
         let item = create_test_assertion();
@@ -2355,6 +2419,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_assertion_lifecycle_defaults_to_active() {
         let repo = setup_test_repo().await;
         let item = create_test_assertion();
@@ -2364,6 +2432,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_archive_old_resolved_assertions() {
         let repo = setup_test_repo().await;
 
@@ -2393,6 +2465,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_archive_skips_pending_assertions() {
         let repo = setup_test_repo().await;
 

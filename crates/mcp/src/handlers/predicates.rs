@@ -11,6 +11,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use elephant_storage::canonical_commit::CanonicalRecord;
+use elephant_storage::public_mutation::{inherit_public_envelope, PublicMutation};
 use elephant_storage::{
     PredicateAliasRepository, PredicateRegistryRepository, Repository, StorageClient,
     WorkArtifactRepository,
@@ -98,6 +100,21 @@ const fn default_confidence() -> f32 {
 
 fn authorize_predicate_scope(ctx: &ToolContext, required_scope: &str) -> Result<(), String> {
     crate::authz::authorize_preflight_scope(&ctx.authz, &ctx.principal, required_scope)
+}
+
+fn predicate_denial(message: String) -> McpResult<Value> {
+    serde_json::to_value(ToolResponse::<()>::error(message))
+        .map_err(|e| McpError::ExecutionError(e.to_string()))
+}
+
+fn authorize_predicate_record(
+    ctx: &ToolContext,
+    record: &impl elephant_types::records::HasSecurity,
+) -> Result<(), String> {
+    ctx.authz
+        .authorize_record_read(&ctx.principal, record, "read:predicate")?;
+    ctx.authz
+        .authorize_record_write(&ctx.principal, record, "write:predicate")
 }
 
 // ============================================================================
@@ -278,17 +295,13 @@ impl ToolHandler for ListPredicatesHandler {
 }
 
 /// Handler for `propose_predicate_alias` tool.
-pub struct ProposePredAliasHandler {
-    alias_repo: PredicateAliasRepository,
-}
+pub struct ProposePredAliasHandler;
 
 impl ProposePredAliasHandler {
     /// Creates a new handler.
     #[must_use]
-    pub const fn new(storage: StorageClient) -> Self {
-        Self {
-            alias_repo: PredicateAliasRepository::new(storage),
-        }
+    pub fn new(_storage: StorageClient) -> Self {
+        Self
     }
 }
 
@@ -330,6 +343,10 @@ impl ToolHandler for ProposePredAliasHandler {
         })
     }
 
+    #[expect(
+        clippy::assigning_clones,
+        reason = "Keep the original owned field replacement and mutation ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
         let input: ProposePredAliasInput = serde_json::from_value(params)
@@ -342,9 +359,26 @@ impl ToolHandler for ProposePredAliasHandler {
         }
         let space_id = ctx.principal.space_id.clone();
 
+        let mut mutation = PublicMutation::begin(ctx.storage.clone(), &space_id)
+            .await
+            .map_err(McpError::StorageError)?;
+        let predicate = PredicateRegistryRepository::new(ctx.storage.clone())
+            .find_by_predicate_id(&space_id, &input.canonical_predicate_id)
+            .await
+            .map_err(McpError::StorageError)?
+            .ok_or_else(|| McpError::ExecutionError("Canonical predicate not found".into()))?;
+        if let Err(message) = authorize_predicate_record(ctx, &predicate) {
+            return predicate_denial(message);
+        }
+        mutation.depend_on(CanonicalRecord::PredicateRegistry(Box::new(
+            predicate.clone(),
+        )));
         // Create the alias record
         let id = RecordId::new_v4(TableName::PredicateAlias);
-        let base = BaseFields::new(id, space_id, "mcp_tool".to_string());
+        let mut base = BaseFields::new(id, space_id, "mcp_tool".to_string());
+        base.security.policy_id = predicate.base.security.policy_id.clone();
+        inherit_public_envelope(&mut base, &predicate.base)
+            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
 
         let alias = PredicateAlias {
             base,
@@ -368,12 +402,12 @@ impl ToolHandler for ProposePredAliasHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        match self.alias_repo.create(alias).await {
+        match mutation.create(alias, "mcp_tool").await {
             Ok(created) => {
                 let response = ToolResponse::success(created);
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
@@ -571,21 +605,19 @@ impl ToolHandler for RegisterPredicateHandler {
         }
         let space_id = ctx.principal.space_id.clone();
 
-        // Check if predicate already exists
-        let existing = self
-            .predicate_repo
-            .list(&space_id, 1000, None)
+        let mutation = PublicMutation::begin(ctx.storage.clone(), &space_id)
             .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-
-        if existing
-            .iter()
-            .any(|p| p.predicate_id == input.predicate_id)
+            .map_err(McpError::StorageError)?;
+        if let Some(existing) = self
+            .predicate_repo
+            .find_by_predicate_id(&space_id, &input.predicate_id)
+            .await
+            .map_err(McpError::StorageError)?
         {
-            let response: ToolResponse<()> =
-                ToolResponse::error(format!("Predicate already exists: {}", input.predicate_id));
-            return serde_json::to_value(response)
-                .map_err(|e| McpError::ExecutionError(e.to_string()));
+            if let Err(message) = authorize_predicate_record(ctx, &existing) {
+                return predicate_denial(message);
+            }
+            return predicate_denial(format!("Predicate already exists: {}", input.predicate_id));
         }
 
         // Create the predicate registry record
@@ -613,12 +645,12 @@ impl ToolHandler for RegisterPredicateHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        match self.predicate_repo.create(predicate).await {
+        match mutation.create(predicate, "mcp_tool").await {
             Ok(created) => {
                 let response = ToolResponse::success(created);
                 serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
             }
-            Err(e) => Err(McpError::ExecutionError(e.to_string())),
+            Err(e) => Err(McpError::StorageError(e)),
         }
     }
 }
@@ -715,6 +747,10 @@ impl ToolHandler for ValidatePredicateProposalHandler {
         })
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
         let input: ValidatePredicateProposalInput = serde_json::from_value(params)
@@ -731,14 +767,21 @@ impl ToolHandler for ValidatePredicateProposalHandler {
             elephant_storage::parse_id(&input.proposal_id, TableName::WorkArtifact)
                 .map_err(|e| McpError::InvalidParameters(format!("Invalid proposal_id: {e}")))?;
 
+        let mut mutation = PublicMutation::begin(ctx.storage.clone(), &space_id)
+            .await
+            .map_err(McpError::StorageError)?;
         let artifact = self
             .artifact_repo
             .get(&space_id, &artifact_id)
             .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?
+            .map_err(McpError::StorageError)?
             .ok_or_else(|| {
                 McpError::ExecutionError(format!("Proposal not found: {}", input.proposal_id))
             })?;
+
+        if let Err(message) = authorize_predicate_record(ctx, &artifact.base) {
+            return predicate_denial(message);
+        }
 
         if artifact.artifact_type != "predicate_proposal" {
             let response: ToolResponse<()> = ToolResponse::error(format!(
@@ -769,29 +812,42 @@ impl ToolHandler for ValidatePredicateProposalHandler {
 
         let mut validation_errors = Vec::new();
 
-        let predicate_exists = self
+        if let Some(predicate) = self
             .predicate_repo
             .find_by_predicate_id(&space_id, &proposal.predicate_id)
             .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?
-            .is_some();
-
-        if !predicate_exists {
+            .map_err(McpError::StorageError)?
+        {
+            if let Err(message) = authorize_predicate_record(ctx, &predicate) {
+                return predicate_denial(message);
+            }
+            mutation.depend_on(CanonicalRecord::PredicateRegistry(Box::new(predicate)));
+        } else {
             validation_errors.push(format!(
                 "Canonical predicate '{}' does not exist in registry",
                 proposal.predicate_id
             ));
         }
-
+        if proposal.proposed_aliases.is_empty() || proposal.predicate_id.trim().is_empty() {
+            validation_errors.push("Proposal must name a predicate and at least one alias".into());
+        }
+        let mut proposed_names = std::collections::BTreeSet::new();
         for proposed_alias in &proposal.proposed_aliases {
-            let duplicate_exists = self
+            if proposed_alias.alias.trim().is_empty()
+                || !proposed_names.insert(proposed_alias.alias.to_ascii_lowercase())
+            {
+                validation_errors.push("Proposal contains an empty or duplicate alias".into());
+            }
+            if let Some(alias) = self
                 .alias_repo
                 .find_active_by_raw(&space_id, &proposed_alias.alias)
                 .await
-                .map_err(|e| McpError::ExecutionError(e.to_string()))?
-                .is_some();
-
-            if duplicate_exists {
+                .map_err(McpError::StorageError)?
+            {
+                if let Err(message) = authorize_predicate_record(ctx, &alias) {
+                    return predicate_denial(message);
+                }
+                mutation.depend_on(CanonicalRecord::PredicateAlias(Box::new(alias)));
                 validation_errors.push(format!(
                     "Active alias already exists for '{}'",
                     proposed_alias.alias
@@ -809,12 +865,16 @@ impl ToolHandler for ValidatePredicateProposalHandler {
             updated.validation_errors = Some(validation_errors);
         }
 
-        let updated = self
-            .artifact_repo
-            .update_if_status(&space_id, &artifact_id, updated, ArtifactStatus::Draft)
+        if let Err(message) =
+            ctx.authz
+                .authorize_record_write(&ctx.principal, &updated.base, "write:predicate")
+        {
+            return predicate_denial(message);
+        }
+        let updated = mutation
+            .replace(&artifact, updated, false, "mcp_tool")
             .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?
-            .ok_or_else(|| McpError::ExecutionError("Artifact already validated".to_string()))?;
+            .map_err(McpError::StorageError)?;
 
         let response = ToolResponse::success(updated);
         serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
@@ -824,16 +884,18 @@ impl ToolHandler for ValidatePredicateProposalHandler {
 /// Handler for `approve_predicate_proposal` tool.
 pub struct ApprovePredicateProposalHandler {
     artifact_repo: WorkArtifactRepository,
-    alias_repo: PredicateAliasRepository,
 }
 
 impl ApprovePredicateProposalHandler {
     /// Creates a new handler.
     #[must_use]
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "Preserve the existing runtime constructor signature."
+    )]
     pub fn new(storage: StorageClient) -> Self {
         Self {
-            artifact_repo: WorkArtifactRepository::new(storage.clone()),
-            alias_repo: PredicateAliasRepository::new(storage),
+            artifact_repo: WorkArtifactRepository::new(storage),
         }
     }
 }
@@ -872,6 +934,12 @@ impl ToolHandler for ApprovePredicateProposalHandler {
         })
     }
 
+    #[expect(
+        clippy::items_after_statements,
+        clippy::large_futures,
+        clippy::significant_drop_tightening,
+        reason = "Preserve the original handler ownership, future shape, and call ordering."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
         let input: ApprovePredicateProposalInput = serde_json::from_value(params)
@@ -889,16 +957,22 @@ impl ToolHandler for ApprovePredicateProposalHandler {
             elephant_storage::parse_id(&input.proposal_id, TableName::WorkArtifact)
                 .map_err(|e| McpError::InvalidParameters(format!("Invalid proposal_id: {e}")))?;
 
+        let mutation = PublicMutation::begin(ctx.storage.clone(), &space_id)
+            .await
+            .map_err(McpError::StorageError)?;
         // Find the work artifact
         let artifact = self
             .artifact_repo
             .get(&space_id, &artifact_id)
             .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?
+            .map_err(McpError::StorageError)?
             .ok_or_else(|| {
                 McpError::ExecutionError(format!("Proposal not found: {}", input.proposal_id))
             })?;
 
+        if let Err(message) = authorize_predicate_record(ctx, &artifact.base) {
+            return predicate_denial(message);
+        }
         // Verify artifact type is predicate_proposal
         if artifact.artifact_type != "predicate_proposal" {
             let response: ToolResponse<()> = ToolResponse::error(format!(
@@ -919,72 +993,45 @@ impl ToolHandler for ApprovePredicateProposalHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        let proposal: PredicateProposalData = serde_json::from_value(artifact.data.clone())
-            .map_err(|e| McpError::ExecutionError(format!("Invalid proposal data: {e}")))?;
-
-        if proposal.space_id != space_id {
-            return Err(McpError::ExecutionError(
-                "Proposal space_id does not match request space_id".to_string(),
-            ));
+        use elephant_pipeline::public_predicate_proposal::{
+            PublicPredicateProposal, PublicProposalOptions,
+        };
+        let observed = PublicPredicateProposal::load(
+            ctx.storage.clone(),
+            mutation,
+            artifact,
+            PublicProposalOptions {
+                allow_draft: false,
+                ensure_registry: false,
+                check_work_run_budget: false,
+                confidence: Some(input.confidence),
+            },
+        )
+        .await
+        .map_err(McpError::from)?;
+        if let Some(registry) = &observed.registry {
+            if let Err(message) = authorize_predicate_record(ctx, registry) {
+                return predicate_denial(message);
+            }
         }
-
-        if proposal.proposed_aliases.is_empty() {
-            return Err(McpError::ExecutionError(
-                "Proposal has no proposed_aliases".to_string(),
-            ));
+        for alias in &observed.aliases {
+            if let Err(message) = authorize_predicate_record(ctx, alias) {
+                return predicate_denial(message);
+            }
         }
-
-        let mut created_alias = None;
-        for proposed_alias in &proposal.proposed_aliases {
-            let alias_id = RecordId::new_v4(TableName::PredicateAlias);
-            let base = BaseFields::new(alias_id, space_id.clone(), "mcp_tool".to_string());
-
-            let alias = PredicateAlias {
-                base,
-                alias: proposed_alias.alias.clone(),
-                alias_type: AliasType::RawString,
-                source_plugin: Some(proposed_alias.source.clone()),
-                confidence: input.confidence,
-                status: AliasStatus::Active,
-                scope: AliasScope::Global,
-                predicate_id: proposal.predicate_id.clone(),
-                confidence_version: 1,
-                usage_count: 0,
-            };
-
+        let prepared = observed.prepare("mcp_tool").map_err(McpError::from)?;
+        for base in std::iter::once(&prepared.artifact.base)
+            .chain(prepared.aliases.iter().map(|alias| &alias.base))
+            .chain(std::iter::once(&prepared.reprocess_job.base))
+        {
             if let Err(message) =
                 ctx.authz
-                    .authorize_record_write(&ctx.principal, &alias, "write:predicate")
+                    .authorize_record_write(&ctx.principal, base, "write:predicate")
             {
-                let response: ToolResponse<()> = ToolResponse::error(message);
-                return serde_json::to_value(response)
-                    .map_err(|e| McpError::ExecutionError(e.to_string()));
-            }
-
-            let created = self
-                .alias_repo
-                .create(alias)
-                .await
-                .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-
-            if created_alias.is_none() {
-                created_alias = Some(created);
+                return predicate_denial(message);
             }
         }
-
-        let created_alias = created_alias.ok_or_else(|| {
-            McpError::ExecutionError("No aliases created for proposal".to_string())
-        })?;
-
-        // Update artifact to Committed status
-        let mut updated_artifact = artifact.clone();
-        updated_artifact.status = ArtifactStatus::Committed;
-        updated_artifact.committed_at = Some(chrono::Utc::now());
-
-        self.artifact_repo
-            .update(&space_id, &artifact_id, updated_artifact)
-            .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+        let created_alias = prepared.commit("mcp_tool").await.map_err(McpError::from)?;
 
         let response = ToolResponse::success(created_alias);
         serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
@@ -1080,10 +1127,6 @@ mod tests {
     use elephant_types::Link;
     use std::collections::HashSet;
 
-    const WORK_ARTIFACT_SCHEMA: &str = "DEFINE TABLE work_artifact SCHEMALESS;";
-    const PREDICATE_ALIAS_SCHEMA: &str = "DEFINE TABLE predicate_alias SCHEMALESS;";
-    const PREDICATE_REGISTRY_SCHEMA: &str = "DEFINE TABLE predicate_registry SCHEMALESS;";
-
     fn make_test_principal(space_id: &str) -> Principal {
         Principal {
             space_id: space_id.to_string(),
@@ -1109,13 +1152,26 @@ mod tests {
             ..StorageConfig::default()
         };
         let storage = StorageClient::new(config).await.expect("storage");
-        storage.query(WORK_ARTIFACT_SCHEMA).await.expect("schema");
-        storage.query(PREDICATE_ALIAS_SCHEMA).await.expect("schema");
-        storage
-            .query(PREDICATE_REGISTRY_SCHEMA)
+        elephant_migrations::apply_schema(&storage)
             .await
-            .expect("schema");
+            .expect("complete native schema before fixture writes");
+        seed_predicate_test_space(&storage).await;
         storage
+    }
+
+    async fn seed_predicate_test_space(storage: &StorageClient) {
+        let config: elephant_types::records::SpaceConfig = serde_json::from_value(json!({
+            "id":RecordId::new_v4(TableName::SpaceConfig),"space_id":"test_space",
+            "created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now(),"created_by":"test",
+            "security":{"policy_id":"default","level":0,"labels":[],"handling":[]},
+            "provenance":{},"subjects":[],"subjects_state":"complete",
+            "embedding_provider":"fake","embedding_model":"test","embedding_dims":8
+        }))
+        .expect("space config");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(config)
+            .await
+            .expect("space");
     }
 
     fn create_test_work_artifact(
@@ -1152,12 +1208,34 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_approve_predicate_proposal_creates_active_alias() {
         use crate::handlers::ToolContext;
         use elephant_storage::Repository;
 
         let storage = setup_test_storage().await;
         let space_id = "test_space";
+        PredicateRegistryRepository::new(storage.clone())
+            .create(PredicateRegistry {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::PredicateRegistry),
+                    space_id.into(),
+                    "test".into(),
+                ),
+                predicate_id: "works_at".into(),
+                description: None,
+                status: "active".into(),
+                semantics: None,
+                semantics_status: SemanticsStatus::Default,
+                first_seen_at: None,
+                usage_count: 0,
+                last_used_at: None,
+            })
+            .await
+            .expect("registry");
 
         // Create a predicate proposal work artifact with Validated status
         let artifact =
@@ -1203,6 +1281,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_validate_predicate_proposal_accepts_valid_draft() {
         use crate::handlers::ToolContext;
         use elephant_storage::Repository;
@@ -1262,6 +1344,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_validate_predicate_proposal_rejects_missing_predicate() {
         use crate::handlers::ToolContext;
         use elephant_storage::Repository;
@@ -1296,6 +1382,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_approve_predicate_proposal_rejects_non_validated() {
         use crate::handlers::ToolContext;
         use elephant_storage::Repository;
@@ -1335,6 +1425,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_approve_predicate_proposal_rejects_wrong_type() {
         use crate::handlers::ToolContext;
         use elephant_storage::Repository;
@@ -1388,6 +1482,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_register_predicate_requires_write_predicate_scope() {
         use crate::handlers::ToolContext;
 
@@ -1425,6 +1523,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
     async fn test_get_predicate_filters_records_by_security() {
         use elephant_storage::Repository;
 
@@ -1482,5 +1584,208 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("Predicate not found"));
+    }
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn validation_authorizes_original_classification_before_changing_artifact() {
+        for embedded in [true, false] {
+            let storage = if embedded {
+                let storage = StorageClient::new_embedded().await.expect("embedded");
+                seed_predicate_test_space(&storage).await;
+                storage
+            } else {
+                setup_test_storage().await
+            };
+            let artifact_repo = WorkArtifactRepository::new(storage.clone());
+            let mut artifact = create_test_work_artifact(
+                "test_space",
+                "private alias",
+                "private predicate",
+                WaStatus::Draft,
+            );
+            artifact.base.security.level = 5;
+            artifact_repo
+                .create(artifact.clone())
+                .await
+                .expect("artifact");
+            let handler = ValidatePredicateProposalHandler::new(storage.clone());
+            let mut ctx = ToolContext::new(storage.clone(), make_test_principal("test_space"));
+            let input = json!({"proposal_id":artifact.base.id.to_string()});
+            let response: ToolResponse<WorkArtifact> = serde_json::from_value(
+                handler
+                    .execute(&ctx, input.clone())
+                    .await
+                    .expect("response"),
+            )
+            .expect("decode");
+            assert!(!response.ok);
+            let unchanged = artifact_repo
+                .get("test_space", &artifact.base.id)
+                .await
+                .expect("read")
+                .expect("artifact");
+            assert_eq!(
+                serde_json::to_value(&artifact).expect("before"),
+                serde_json::to_value(unchanged).expect("after")
+            );
+            assert!(elephant_storage::AuditLogRepository::new(storage.clone())
+                .list("test_space", 100, None)
+                .await
+                .expect("audit")
+                .is_empty());
+            ctx.principal.clearances[0].max_level = 5;
+            let response: ToolResponse<WorkArtifact> = serde_json::from_value(
+                handler
+                    .execute(&ctx, input)
+                    .await
+                    .expect("authorized response"),
+            )
+            .expect("decode");
+            assert!(response.ok);
+            let rejected = response.data.expect("artifact");
+            assert_eq!(rejected.status, WaStatus::Rejected);
+            assert_eq!(rejected.base.security.level, 5);
+        }
+    }
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn approval_authorizes_original_artifact_and_preserves_classification() {
+        for embedded in [true, false] {
+            let storage = if embedded {
+                let storage = StorageClient::new_embedded().await.expect("embedded");
+                seed_predicate_test_space(&storage).await;
+                storage
+            } else {
+                setup_test_storage().await
+            };
+            let artifacts = WorkArtifactRepository::new(storage.clone());
+            let mut artifact = create_test_work_artifact(
+                "test_space",
+                "confidential alias",
+                "works_at",
+                WaStatus::Validated,
+            );
+            artifact.base.security.level = 5;
+            artifacts.create(artifact.clone()).await.expect("artifact");
+            let mut base = artifact.base.clone();
+            base.id = RecordId::new_v4(TableName::PredicateRegistry);
+            PredicateRegistryRepository::new(storage.clone())
+                .create(PredicateRegistry {
+                    base,
+                    predicate_id: "works_at".into(),
+                    description: None,
+                    status: "active".into(),
+                    semantics: None,
+                    semantics_status: SemanticsStatus::Default,
+                    first_seen_at: None,
+                    usage_count: 0,
+                    last_used_at: None,
+                })
+                .await
+                .expect("registry");
+            let handler = ApprovePredicateProposalHandler::new(storage.clone());
+            let mut ctx = ToolContext::new(storage.clone(), make_test_principal("test_space"));
+            let input = json!({"proposal_id":artifact.base.id.to_string()});
+            let response: ToolResponse<PredicateAlias> = serde_json::from_value(
+                handler
+                    .execute(&ctx, input.clone())
+                    .await
+                    .expect("response"),
+            )
+            .expect("decode");
+            assert!(!response.ok);
+            assert_eq!(
+                artifacts
+                    .get("test_space", &artifact.base.id)
+                    .await
+                    .expect("read")
+                    .expect("artifact")
+                    .status,
+                WaStatus::Validated
+            );
+            assert!(PredicateAliasRepository::new(storage.clone())
+                .list("test_space", 100, None)
+                .await
+                .expect("aliases")
+                .is_empty());
+            assert!(
+                elephant_storage::ReprocessJobRepository::new(storage.clone())
+                    .list("test_space", 100, None)
+                    .await
+                    .expect("jobs")
+                    .is_empty()
+            );
+            ctx.principal.clearances[0].max_level = 5;
+            let response: ToolResponse<PredicateAlias> = serde_json::from_value(
+                handler
+                    .execute(&ctx, input)
+                    .await
+                    .expect("authorized response"),
+            )
+            .expect("decode");
+            assert!(response.ok);
+            let alias = response.data.expect("alias");
+            assert_eq!(alias.status, AliasStatus::Active);
+            assert_eq!(alias.base.security.level, 5);
+            let jobs = elephant_storage::ReprocessJobRepository::new(storage.clone())
+                .list("test_space", 100, None)
+                .await
+                .expect("jobs");
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].base.security.level, 5);
+        }
+    }
+
+    #[test]
+    fn approval_pipeline_error_preserves_typed_erasure_barrier() {
+        let error = McpError::from(elephant_pipeline::PipelineError::StorageError(
+            elephant_storage::StorageError::ErasureInProgress,
+        ));
+        assert!(matches!(
+            error,
+            McpError::StorageError(elephant_storage::StorageError::ErasureInProgress)
+        ));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture, ownership, and assertion scope intact."
+    )]
+    async fn registry_handler_returns_typed_erasure_barrier_and_rolls_back() {
+        let storage = setup_test_storage().await;
+        storage.query_checked("DEFINE EVENT test_erasure_barrier ON TABLE predicate_registry WHEN $event = 'CREATE' THEN { THROW 'publication:erasure_space_reserved'; };").await.expect("barrier event");
+        let ctx = ToolContext::new(storage.clone(), make_test_principal("test_space"));
+        let handler = RegisterPredicateHandler::new(storage.clone());
+        let result = handler
+            .execute(&ctx, json!({"predicate_id":"retained-predicate"}))
+            .await;
+        assert!(matches!(
+            result,
+            Err(McpError::StorageError(
+                elephant_storage::StorageError::ErasureInProgress
+            ))
+        ));
+        assert!(PredicateRegistryRepository::new(storage.clone())
+            .list("test_space", 100, None)
+            .await
+            .expect("registry")
+            .is_empty());
+        assert!(elephant_storage::AuditLogRepository::new(storage.clone())
+            .list("test_space", 100, None)
+            .await
+            .expect("audits")
+            .is_empty());
+        assert!(elephant_storage::SystemEventRepository::new(storage)
+            .get_after_seq("test_space", 0, 100)
+            .await
+            .expect("outbox")
+            .is_empty());
     }
 }

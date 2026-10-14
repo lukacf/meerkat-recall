@@ -35,6 +35,8 @@ fn legacy_claims() -> Claims {
         iss: Some("meerkat-issuer".into()),
         aud: Some(vec!["elephant-service".into()]),
         space_id: Some("space-a".into()),
+        spaces: None,
+        bootstrap_space: None,
         scopes: vec!["read:entities".into()],
         security_level: 0,
         security_labels: vec![],
@@ -546,4 +548,17 @@ fn qualified_principal_binding_conforms_to_pinned_canonical_schema() {
     let legacy = json!({"kind":"human","id":"alice"});
     assert!(validator.is_valid(&legacy));
     assert!(serde_json::from_value::<PrincipalClaim>(legacy).is_err());
+}
+
+#[test]
+fn granted_space_claim_preserves_absent_empty_and_explicit_ceiling() {
+    let mut claims = legacy_claims();
+    assert!(claims.permits_space("space-a"));
+    assert!(!claims.permits_space("space-b"));
+    claims.spaces = Some(vec![]);
+    assert!(!claims.permits_space("space-a"));
+    claims.spaces = Some(vec!["space-a".into(), "space-b".into()]);
+    assert!(claims.permits_space("space-b"));
+    assert!(!claims.permits_space(""));
+    assert!(!claims.permits_space("space-c"));
 }

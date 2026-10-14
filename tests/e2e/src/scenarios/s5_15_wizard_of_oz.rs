@@ -235,6 +235,7 @@ fn fiction_space_config() -> SpaceConfig {
         "scenario".to_string(),
     );
     SpaceConfig {
+        processing: None,
         base,
         embedding_provider: "fake".to_string(),
         embedding_model: "test-model".to_string(),

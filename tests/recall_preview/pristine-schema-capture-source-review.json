@@ -1,0 +1,28 @@
+{
+  "format": "recall-pristine-schema-capture-source-review/v1",
+  "source_commit": "9532c56341f4c927f877881cdf1a42e876cfa600",
+  "source_review_only": true,
+  "execution_authorized": false,
+  "executed_by_qualification": false,
+  "product_acceptance": false,
+  "source_blockers_in_reviewed_scope": [],
+  "reviewed_properties": [
+    "Two separate native stores with exclusively created private journal directories and actual ordered migration registry001 through043; no product/user/source/config fixture insertion.",
+    "Fresh schema plus ordinary same-journal restore-refreshed schema are captured for each independent instance; original INFO definitions and export SQL remain separate inventories with original statements and hashes.",
+    "Unexpected INFO categories, nonempty sensitive categories, live queries, non-control physical rows, missing statement bytes, excess definitions and differing independent instances fail.",
+    "Output is explicitly an unreviewed proposal. Optional capture requires clean source, current commit/tree/engine identity, compiled-source and actual migration byte equality; no candidate inventory becomes an allowed-schema verdict.",
+    "Optional output is create_new0600 in a canonical parent outside checkout, bounded16MiB, file and parent fsync; duplicate and symlink output, checkout location and excess bytes have authored negative controls.",
+    "Only schema definitions and source identities are emitted; source_erasure_membership is explicitly excluded in INFO as matching the intended offline export boundary. No row/journal/key capture is asserted."
+  ],
+  "evidence_limits": [
+    "No capture was executed by qualification and no actual schema profile exists from this review.",
+    "The source_erasure_membership omission is explicit, not a general exemption for unknown native tables or payload. Its product export omission and reconstruction remain separately reviewed prerequisites.",
+    "Every actual emitted definition must still be mapped to pinned migration/engine source and independently reviewed before any allowed profile is frozen.",
+    "The physical export oracle reviewed schema set remains empty; arbitrary or merely identical native schema still returns UNMET.",
+    "Central execution must compose final043, current offline inspector and exact source dependencies first; this source review is not runtime authorization or proof of erasure/restore behavior."
+  ],
+  "source_hashes": {
+    "crates/migrations/src/native_schema_profile_tests.rs": "c8d5df7d5cd784de9265817c82ea579cd6f1a43cef36c56227a218f2c346d65a",
+    "crates/migrations/src/lib.rs": "303028c69b6e737c7500fad926fad22bcadf64122785b4cb25db85865e2adc5d"
+  }
+}

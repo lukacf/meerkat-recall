@@ -718,7 +718,7 @@ DEFINE FIELD usage_count ON TABLE predicate_alias TYPE number DEFAULT 0;
 -- Freshness Table Fields (v0.8 Ranking)
 -- =============================================================================
 
-DEFINE TABLE freshness SCHEMAFULL;
+-- Table already defined in the core table block.
 
 -- Base fields
 DEFINE FIELD space_id ON TABLE freshness TYPE string;
@@ -759,7 +759,7 @@ DEFINE FIELD demotion_threshold ON TABLE freshness TYPE option<number>;
 -- Reprocess Job Table Fields (v0.8 Backfill)
 -- =============================================================================
 
-DEFINE TABLE reprocess_job SCHEMAFULL;
+-- Table already defined in the core table block.
 
 -- Base fields
 DEFINE FIELD space_id ON TABLE reprocess_job TYPE string;

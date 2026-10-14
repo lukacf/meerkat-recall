@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1@sha256:7b32114e84ca21aeb2d6f871a0b62b3a0762193f75d9afd048ee4cbe889f3148
+# Context: the reviewed prepare.py output, with no live database or secrets.
+ARG BUILDER_IMAGE
+FROM ${BUILDER_IMAGE} AS build
+ARG BUILDER_IMAGE
+ARG RECALL_SOURCE_COMMIT
+ARG RECALL_PAIRED_CACHE_ID
+ARG CARGO_BUILD_JOBS=8
+ARG RECALL_PAIRED_MAX_GROWTH_GIB=150
+ENV RECALL_PAIRED_BUILDER_IMAGE=${BUILDER_IMAGE} \
+    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} \
+    RECALL_PAIRED_MAX_GROWTH_GIB=${RECALL_PAIRED_MAX_GROWTH_GIB} \
+    CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+    BINARYEN_CORES=8 TLC_WORKERS=8 LZMA_API_STATIC=1 \
+    PYTHONDONTWRITEBYTECODE=1
+RUN test "$(dpkg --print-architecture)" = amd64 \
+    && . /etc/os-release && test "$VERSION_ID" = 12 \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    clang libclang-dev cmake make g++ pkg-config libssl-dev liblzma-dev \
+    python3 binutils util-linux \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /source
+COPY . .
+# A distinct paired-only cache for this reviewed source, never Recall's target.
+RUN --mount=type=cache,id=${RECALL_PAIRED_CACHE_ID},target=/root/.cache/rust-workspaces,sharing=locked \
+    test -n "$RECALL_PAIRED_CACHE_ID" \
+    && RECALL_SOURCE_COMMIT="$RECALL_SOURCE_COMMIT" python3 -c \
+    'import json,os,re; v=os.environ["RECALL_SOURCE_COMMIT"]; assert re.fullmatch("[a-f0-9]{40}",v); assert json.load(open("RECALL_SOURCE_PROVENANCE.json"))["recall_commit"]==v' \
+    && chrt --idle 0 ionice -c3 python3 .recall/build.py --prepared /source --bundle /paired-bundle
+FROM scratch AS artifact
+COPY --from=build /paired-bundle/ /

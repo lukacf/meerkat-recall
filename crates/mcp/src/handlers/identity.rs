@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use elephant_extensions::load_runtime_reference_registry_from_env;
-use elephant_identity::apply_entity_merge_rewrites;
+use elephant_storage::canonical_commit::CanonicalRecord;
+use elephant_storage::public_mutation::{inherit_public_envelope, PublicMutation};
 use elephant_storage::{
     parse_id, AssertionRepository, AttributeRepository, EntityRepository, EventRepository,
-    FreshnessRepository, IdentityCandidateRepository, RelRepository, Repository, StorageClient,
+    FreshnessRepository, IdentityCandidateRepository, Repository, StorageClient,
     TruthSlotRepository,
 };
 use elephant_types::ids::TableName;
@@ -277,7 +278,7 @@ impl ToolHandler for GetEntityContextBundleHandler {
             .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
 
         // Get entity with relations
-        let entity_with_rels = match self.entities.get_with_relations(&space_id, &rid).await {
+        let mut entity_with_rels = match self.entities.get_with_relations(&space_id, &rid).await {
             Ok(Some(e)) => e,
             Ok(None) => {
                 let response: ToolResponse<()> =
@@ -298,17 +299,21 @@ impl ToolHandler for GetEntityContextBundleHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
+        entity_with_rels.entity =
+            crate::current_read::require(ctx, entity_with_rels.entity, "read:entity").await?;
         let cutoff = Utc::now() - Duration::days(input.window);
-        let mut outgoing_relations = ctx.authz.filter_records(
-            &ctx.principal,
+        let mut outgoing_relations = crate::current_read::filter(
+            ctx,
             entity_with_rels.outgoing_relations,
             "read:relationship",
-        );
-        let mut incoming_relations = ctx.authz.filter_records(
-            &ctx.principal,
+        )
+        .await?;
+        let mut incoming_relations = crate::current_read::filter(
+            ctx,
             entity_with_rels.incoming_relations,
             "read:relationship",
-        );
+        )
+        .await?;
         outgoing_relations.retain(|relation| {
             relation
                 .validity_window
@@ -331,9 +336,7 @@ impl ToolHandler for GetEntityContextBundleHandler {
             .find_by_subject_entity(&space_id, &rid)
             .await
             .map_err(|error| McpError::ExecutionError(error.to_string()))?;
-        attributes = ctx
-            .authz
-            .filter_records(&ctx.principal, attributes, "read:relationship");
+        attributes = crate::current_read::filter(ctx, attributes, "read:relationship").await?;
         attributes.retain(|attribute| {
             attribute
                 .validity_window
@@ -348,9 +351,7 @@ impl ToolHandler for GetEntityContextBundleHandler {
             .find_by_subject_entity(&space_id, &rid.to_string())
             .await
             .map_err(|error| McpError::ExecutionError(error.to_string()))?;
-        truth_slots = ctx
-            .authz
-            .filter_records(&ctx.principal, truth_slots, "read:relationship");
+        truth_slots = crate::current_read::filter(ctx, truth_slots, "read:relationship").await?;
         truth_slots.truncate(input.limit);
 
         let mut events = self
@@ -358,9 +359,7 @@ impl ToolHandler for GetEntityContextBundleHandler {
             .find_by_subject_entity(&space_id, &rid, input.limit.saturating_mul(2))
             .await
             .map_err(|error| McpError::ExecutionError(error.to_string()))?;
-        events = ctx
-            .authz
-            .filter_records(&ctx.principal, events, "read:event");
+        events = crate::current_read::filter(ctx, events, "read:event").await?;
         events.retain(|event| event.time_start.unwrap_or(event.base.created_at) >= cutoff);
         events.truncate(input.limit);
 
@@ -369,9 +368,7 @@ impl ToolHandler for GetEntityContextBundleHandler {
             .find_by_resolved_entity(&space_id, &rid, input.limit.saturating_mul(2))
             .await
             .map_err(|error| McpError::ExecutionError(error.to_string()))?;
-        assertions = ctx
-            .authz
-            .filter_records(&ctx.principal, assertions, "read:assertion");
+        assertions = crate::current_read::filter(ctx, assertions, "read:assertion").await?;
         assertions.retain(|assertion| {
             assertion.source_event_time.unwrap_or(assertion.observed_at) >= cutoff
         });
@@ -436,17 +433,13 @@ impl ToolHandler for GetEntityContextBundleHandler {
 }
 
 /// Handler for `propose_identity_candidate` tool.
-pub struct ProposeIdentityCandidateHandler {
-    identity: IdentityCandidateRepository,
-}
+pub struct ProposeIdentityCandidateHandler {}
 
 impl ProposeIdentityCandidateHandler {
-    /// Creates a new handler.
+    /// Creates a new handler. Request context supplies the canonical client.
     #[must_use]
-    pub const fn new(storage: StorageClient) -> Self {
-        Self {
-            identity: IdentityCandidateRepository::new(storage),
-        }
+    pub fn new(_storage: StorageClient) -> Self {
+        Self {}
     }
 }
 
@@ -501,6 +494,10 @@ impl ToolHandler for ProposeIdentityCandidateHandler {
         })
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the identity mutation plan through candidate authorization, commit and response construction."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         use elephant_types::records::IdentityCandidateStatus;
         use elephant_types::Link;
@@ -519,7 +516,8 @@ impl ToolHandler for ProposeIdentityCandidateHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        let mut base = BaseFields::new(id, space_id, "mcp_tool".to_string());
+        let mut mutation = PublicMutation::begin(ctx.storage.clone(), &space_id).await?;
+        let mut base = BaseFields::new(id, space_id.clone(), "mcp_tool".to_string());
         base.security = Security {
             policy_id: "default".to_string(),
             level: 0,
@@ -546,6 +544,29 @@ impl ToolHandler for ProposeIdentityCandidateHandler {
         let rid_b = RecordId::from_str(&second_id_string)
             .map_err(|e| McpError::InvalidParameters(format!("Invalid entity_b ID: {e}")))?;
 
+        for (index, entity_id) in [&rid_a, &rid_b].into_iter().enumerate() {
+            if entity_id.table() != TableName::Entity {
+                return Err(McpError::InvalidParameters(
+                    "identity target must be an entity".into(),
+                ));
+            }
+            let entity = EntityRepository::new(ctx.storage.clone())
+                .get(&space_id, entity_id)
+                .await?
+                .ok_or_else(|| {
+                    McpError::InvalidParameters(
+                        "identity target does not exist in selected space".into(),
+                    )
+                })?;
+            ctx.authz
+                .authorize_record_read(&ctx.principal, &entity, "read:entity")
+                .map_err(McpError::ExecutionError)?;
+            if index == 0 {
+                base.security = entity.base.security.clone();
+            }
+            inherit_public_envelope(&mut base, &entity.base)?;
+            mutation.depend_on(CanonicalRecord::Entity(Box::new(entity)));
+        }
         let candidate = IdentityCandidate {
             base,
             entity_a: Link::new(rid_a),
@@ -580,11 +601,13 @@ impl ToolHandler for ProposeIdentityCandidateHandler {
                 .map_err(|e| McpError::ExecutionError(e.to_string()));
         }
 
-        let created = self
-            .identity
-            .create(candidate)
+        let actor = ctx
+            .verified_caller()
+            .map_or("trusted:mcp", |caller| caller.claims().sub.as_str());
+        let created = mutation
+            .create(candidate, actor)
             .await
-            .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+            .map_err(McpError::StorageError)?;
 
         if let Err(reason) =
             ctx.authz
@@ -713,19 +736,13 @@ impl ToolHandler for ListIdentityCandidatesHandler {
 /// Handler for `merge_entities` tool.
 pub struct MergeEntitiesHandler {
     storage: StorageClient,
-    entities: EntityRepository,
-    rels: RelRepository,
 }
 
 impl MergeEntitiesHandler {
     /// Creates a new handler.
     #[must_use]
-    pub fn new(storage: StorageClient) -> Self {
-        Self {
-            storage: storage.clone(),
-            entities: EntityRepository::new(storage.clone()),
-            rels: RelRepository::new(storage),
-        }
+    pub const fn new(storage: StorageClient) -> Self {
+        Self { storage }
     }
 }
 
@@ -766,147 +783,86 @@ impl ToolHandler for MergeEntitiesHandler {
         })
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the prepared merge through all dependent-record authorizations and commit handling."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
+        use elephant_storage::entity_merge_repository::MergeSelection;
         let params = coerce_params(params, &self.input_schema());
         let input: MergeEntitiesInput = serde_json::from_value(params)
-            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
-
-        let space_id = ctx.principal.space_id.clone();
-        if space_id.is_empty() {
-            let response: ToolResponse<()> = ToolResponse::error("Access denied: missing space_id");
-            return serde_json::to_value(response)
-                .map_err(|e| McpError::ExecutionError(e.to_string()));
+            .map_err(|error| McpError::InvalidParameters(error.to_string()))?;
+        if ctx.principal.space_id.trim().is_empty() {
+            return Err(McpError::InvalidParameters(
+                "selected space is required".into(),
+            ));
         }
-
-        let rid_a = parse_id(&input.entity_a, TableName::Entity)
-            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
-        let rid_b = parse_id(&input.entity_b, TableName::Entity)
-            .map_err(|e| McpError::InvalidParameters(e.to_string()))?;
-
-        // Get both entities
-        let entity_a = match self.entities.get(&space_id, &rid_a).await {
-            Ok(Some(e)) => e,
-            Ok(None) => {
-                let response: ToolResponse<()> =
-                    ToolResponse::error(format!("Entity A not found: {}", input.entity_a));
-                return serde_json::to_value(response)
-                    .map_err(|e| McpError::ExecutionError(e.to_string()));
-            }
-            Err(e) => return Err(McpError::ExecutionError(e.to_string())),
+        let a = parse_id(&input.entity_a, TableName::Entity)
+            .map_err(|error| McpError::InvalidParameters(error.to_string()))?;
+        let b = parse_id(&input.entity_b, TableName::Entity)
+            .map_err(|error| McpError::InvalidParameters(error.to_string()))?;
+        let selection = match input.strategy.as_str() {
+            "prefer_a" => MergeSelection::KeepA,
+            "prefer_b" => MergeSelection::KeepB,
+            "prefer_older" => MergeSelection::PreferOlder,
+            "prefer_newer" => MergeSelection::PreferNewer,
+            _ => return Err(McpError::InvalidParameters("unknown merge strategy".into())),
         };
-
-        let entity_b = match self.entities.get(&space_id, &rid_b).await {
-            Ok(Some(e)) => e,
-            Ok(None) => {
-                let response: ToolResponse<()> =
-                    ToolResponse::error(format!("Entity B not found: {}", input.entity_b));
-                return serde_json::to_value(response)
-                    .map_err(|e| McpError::ExecutionError(e.to_string()));
-            }
-            Err(e) => return Err(McpError::ExecutionError(e.to_string())),
-        };
-
-        for entity in [&entity_a, &entity_b] {
-            if let Err(reason) =
-                ctx.authz
-                    .authorize_record_write(&ctx.principal, entity, "write:entity")
-            {
-                let response: ToolResponse<()> =
-                    ToolResponse::error(format!("Access denied: {reason}"));
-                return serde_json::to_value(response)
-                    .map_err(|e| McpError::ExecutionError(e.to_string()));
-            }
-            if let Err(reason) =
-                ctx.authz
-                    .authorize_record_read(&ctx.principal, entity, "read:entity")
-            {
-                let response: ToolResponse<()> =
-                    ToolResponse::error(format!("Access denied: {reason}"));
-                return serde_json::to_value(response)
-                    .map_err(|e| McpError::ExecutionError(e.to_string()));
-            }
-        }
-
-        // Determine survivor based on strategy
-        let (survivor, merged) = match input.strategy.as_str() {
-            "prefer_a" => (entity_a, entity_b),
-            "prefer_b" => (entity_b, entity_a),
-            "prefer_older" => {
-                if entity_a.base.created_at <= entity_b.base.created_at {
-                    (entity_a, entity_b)
-                } else {
-                    (entity_b, entity_a)
-                }
-            }
-            _ => {
-                // prefer_newer (default)
-                if entity_a.base.updated_at >= entity_b.base.updated_at {
-                    (entity_a, entity_b)
-                } else {
-                    (entity_b, entity_a)
-                }
-            }
-        };
-
-        let merged_id = merged.base.id.clone();
-        let survivor_id = survivor.base.id.clone();
-
-        let mut relationships_to_repoint = self
-            .rels
-            .find_outgoing(&space_id, &merged_id)
-            .await
-            .unwrap_or_default();
-        relationships_to_repoint.extend(
-            self.rels
-                .find_incoming(&space_id, &merged_id)
-                .await
-                .unwrap_or_default(),
-        );
-        for rel in &relationships_to_repoint {
-            if let Err(reason) =
-                ctx.authz
-                    .authorize_record_write(&ctx.principal, rel, "write:relationship")
-            {
-                let response: ToolResponse<()> =
-                    ToolResponse::error(format!("Access denied: {reason}"));
-                return serde_json::to_value(response)
-                    .map_err(|e| McpError::ExecutionError(e.to_string()));
-            }
-        }
-
-        let extension_registry = load_runtime_reference_registry_from_env().map_err(|e| {
-            McpError::ExecutionError(format!("Failed to load extension reference registry: {e}"))
-        })?;
-        apply_entity_merge_rewrites(
+        let registry = load_runtime_reference_registry_from_env()
+            .map_err(|error| McpError::ExecutionError(error.to_string()))?;
+        let prepared = elephant_identity::prepare_entity_merge(
             &self.storage,
-            &space_id,
-            &survivor_id,
-            std::slice::from_ref(&merged_id),
-            chrono::Utc::now(),
-            &extension_registry,
+            &ctx.principal.space_id,
+            &a,
+            &b,
+            selection,
+            "mcp.merge_entities",
+            &registry,
         )
         .await
-        .map_err(|e| McpError::ExecutionError(format!("Merge transaction failed: {e}")))?;
-        let relations_updated = relationships_to_repoint.len();
-
-        if let Err(reason) =
-            ctx.authz
-                .authorize_record_read(&ctx.principal, &survivor, "read:entity")
+        .map_err(|error| match error {
+            elephant_identity::IdentityError::StorageError(error) => {
+                super::source_intake::storage_error(error)
+            }
+            other => McpError::ExecutionError(other.to_string()),
+        })?;
+        for envelope in prepared
+            .authorizations()
+            .map_err(super::source_intake::storage_error)?
         {
-            let response: ToolResponse<Entity> =
-                ToolResponse::error(format!("Access denied: {reason}"));
-            return serde_json::to_value(response)
-                .map_err(|e| McpError::ExecutionError(e.to_string()));
+            let authorization = ctx
+                .authz
+                .authorize_record_read(&ctx.principal, &envelope, envelope.read_scope)
+                .and_then(|()| {
+                    ctx.authz.authorize_record_write(
+                        &ctx.principal,
+                        &envelope,
+                        envelope.write_scope,
+                    )
+                });
+            if let Err(reason) = authorization {
+                return serde_json::to_value(ToolResponse::<()>::error(format!(
+                    "Access denied: {reason}"
+                )))
+                .map_err(|error| McpError::ExecutionError(error.to_string()));
+            }
         }
-
+        let outcome = prepared
+            .commit()
+            .await
+            .map_err(super::source_intake::storage_error)?;
+        let merged_id = outcome
+            .merged
+            .first()
+            .ok_or_else(|| McpError::ExecutionError("merge has no redirected input".into()))?
+            .to_string();
         let output = MergeEntitiesOutput {
-            survivor,
-            merged_id: merged_id.to_string(),
-            relations_updated,
+            survivor: outcome.survivor,
+            merged_id,
+            relations_updated: outcome.relationships_repointed,
         };
-
-        let response = ToolResponse::success(output);
-        serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+        serde_json::to_value(ToolResponse::success(output))
+            .map_err(|error| McpError::ExecutionError(error.to_string()))
     }
 }
 
@@ -927,6 +883,7 @@ mod tests {
         clippy::cognitive_complexity
     )]
     use super::*;
+    use elephant_storage::RelRepository;
     use std::sync::OnceLock;
 
     use elephant_policy::{Clearance, Principal};
@@ -937,6 +894,25 @@ mod tests {
     use elephant_types::records::Entity;
     use elephant_types::RecordId;
     use tokio::sync::Mutex;
+
+    async fn register_merge_space(storage: &StorageClient, space: &str) {
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: elephant_types::records::base::BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    space.into(),
+                    "fixture".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .unwrap();
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -991,9 +967,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_merge_entities_rewrites_extension_rows_in_embedded_mode() {
         let _guard = env_lock().lock().await;
         let storage = StorageClient::new_embedded().await.expect("storage");
+        register_merge_space(&storage, "default").await;
         let entity_repo = EntityRepository::new(storage.clone());
 
         let entity_a = entity_repo
@@ -1037,6 +1018,9 @@ mod tests {
         let row = serde_json::json!({
             "id": "sampleapp_todo:todo-1",
             "space_id": "default",
+            "security": entity_b.base.security,
+            "subjects": [],
+            "subjects_state": "complete",
             "owner": entity_b.base.id.to_string(),
             "secondary": [
                 entity_b.base.id.to_string(),
@@ -1089,5 +1073,87 @@ mod tests {
         std::env::remove_var("ELEPHANT_EXTENSIONS");
         std::env::remove_var("ELEPHANT_EXTENSION_MANIFEST_DIR");
         let _ = std::fs::remove_dir_all(manifest_dir);
+    }
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
+    async fn merge_denied_dependent_record_leaves_all_inputs_unchanged() {
+        let _guard = env_lock().lock().await;
+        let storage = StorageClient::new_embedded().await.unwrap();
+        register_merge_space(&storage, "default").await;
+        let entities = EntityRepository::new(storage.clone());
+        let a = entities
+            .create(create_test_entity("default", "A"))
+            .await
+            .unwrap();
+        let b = entities
+            .create(create_test_entity("default", "B"))
+            .await
+            .unwrap();
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::Rel),
+            "default".into(),
+            "test".into(),
+        );
+        base.security.level = 5;
+        let rel = Rel {
+            base,
+            subject: elephant_types::Link::new(b.base.id.clone()),
+            object: elephant_types::Link::new(a.base.id.clone()),
+            rel_type: "knows".into(),
+            status: elephant_types::records::rel::ClaimStatus::Approved,
+            confidence: 1.0,
+            validity_window: None,
+            evidence: vec![],
+            temporal_audit: None,
+        };
+        let rel = RelRepository::new(storage.clone())
+            .create(rel)
+            .await
+            .unwrap();
+        let mut principal = test_principal("default");
+        principal.clearances[0].max_level = 0;
+        let context = ToolContext::new(storage.clone(), principal);
+        let response = MergeEntitiesHandler::new(storage.clone())
+            .execute(
+                &context,
+                json!({
+                    "entity_a": a.base.id, "entity_b":b.base.id, "strategy":"prefer_a"
+                }),
+            )
+            .await
+            .unwrap();
+        let response: ToolResponse<()> = serde_json::from_value(response).unwrap();
+        assert!(!response.ok);
+        assert_eq!(
+            entities.get("default", &a.base.id).await.unwrap().unwrap(),
+            a
+        );
+        assert_eq!(
+            entities.get("default", &b.base.id).await.unwrap().unwrap(),
+            b
+        );
+        assert_eq!(
+            RelRepository::new(storage.clone())
+                .get("default", &rel.base.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            rel
+        );
+        assert!(
+            elephant_storage::SystemEventRepository::new(storage.clone())
+                .list("default", 100, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(elephant_storage::EntityMergeRepository::new(storage)
+            .list("default", 100, None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

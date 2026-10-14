@@ -10,6 +10,9 @@
 //! `WorkArtifact` proposals for review; active aliases must come from explicit
 //! predicate governance.
 
+mod atomic;
+pub(crate) use atomic::prepare_predicate_hygiene_sweep;
+
 use elephant_embeddings::EmbeddingProvider;
 use elephant_storage::predicate_alias_repository::PredicateAliasRepository;
 use elephant_storage::predicate_registry_repository::PredicateRegistryRepository;
@@ -22,13 +25,13 @@ use elephant_types::records::predicate::{
 };
 use elephant_types::records::work::{ArtifactStatus, WorkArtifact};
 use elephant_types::{Link, RecordId};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use tracing::{debug, info};
 
 use crate::error::PipelineError;
 
 /// Configuration for predicate hygiene sweeps.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PredicateHygieneConfig {
     /// Similarity threshold for auto-aliasing (default 0.9).
     pub auto_alias_threshold: f64,
@@ -91,7 +94,7 @@ impl PredicateHygieneConfig {
 }
 
 /// Result of a predicate hygiene sweep.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HygieneResult {
     /// Number of aliases auto-created.
     pub aliases_created: usize,
@@ -202,127 +205,6 @@ fn predicate_embed_text(predicate: &PredicateRegistry) -> String {
         .to_string()
 }
 
-async fn active_hygiene_proposal_pairs(
-    artifact_repo: &WorkArtifactRepository,
-    space_id: &str,
-) -> Result<std::collections::HashSet<(String, String)>, PipelineError> {
-    let artifacts = artifact_repo.list(space_id, 1000, None).await?;
-    Ok(artifacts
-        .into_iter()
-        .filter(|artifact| {
-            artifact.artifact_type == HYGIENE_PROPOSAL_ARTIFACT_TYPE
-                && artifact.status != ArtifactStatus::Rejected
-        })
-        .filter_map(|artifact| {
-            let alias = artifact
-                .data
-                .get("alias_predicate_id")
-                .and_then(serde_json::Value::as_str)?;
-            let canonical = artifact
-                .data
-                .get("canonical_predicate_id")
-                .and_then(serde_json::Value::as_str)?;
-            Some((alias.to_string(), canonical.to_string()))
-        })
-        .collect())
-}
-
-async fn create_hygiene_proposal(
-    artifact_repo: &WorkArtifactRepository,
-    space_id: &str,
-    alias_predicate_id: &str,
-    canonical_predicate_id: &str,
-    similarity: f64,
-    reason: &str,
-) -> Result<(), PipelineError> {
-    let artifact_id = RecordId::new_v4(TableName::WorkArtifact);
-    let base = BaseFields::new(
-        artifact_id,
-        space_id.to_string(),
-        "predicate_hygiene_worker".to_string(),
-    );
-
-    // We create a work artifact without a work_run link since this is a
-    // background worker, not a pipeline work item. Use a sentinel link.
-    let sentinel_run_id = RecordId::new_v4(TableName::WorkRun);
-
-    let proposal_data = serde_json::json!({
-        "type": "predicate_hygiene_proposal",
-        "alias_predicate_id": alias_predicate_id,
-        "canonical_predicate_id": canonical_predicate_id,
-        "similarity": similarity,
-        "reason": reason,
-    });
-
-    let artifact = WorkArtifact {
-        base,
-        work_run: Link::new(sentinel_run_id),
-        artifact_type: HYGIENE_PROPOSAL_ARTIFACT_TYPE.to_string(),
-        data: proposal_data,
-        status: ArtifactStatus::Draft,
-        validation_errors: None,
-        validated_at: None,
-        committed_at: None,
-    };
-
-    artifact_repo.create(artifact).await?;
-    Ok(())
-}
-
-async fn deactivate_active_hygiene_aliases(
-    alias_repo: &PredicateAliasRepository,
-    artifact_repo: &WorkArtifactRepository,
-    space_id: &str,
-) -> Result<(usize, usize), PipelineError> {
-    let mut existing_proposals = active_hygiene_proposal_pairs(artifact_repo, space_id).await?;
-    let mut cursor: Option<RecordId> = None;
-    let mut aliases_deactivated = 0;
-    let mut proposals_created = 0;
-
-    loop {
-        let aliases = alias_repo.list(space_id, 1000, cursor.as_ref()).await?;
-        if aliases.is_empty() {
-            break;
-        }
-        cursor = aliases.last().map(|alias| alias.base.id.clone());
-
-        for mut alias in aliases {
-            if alias.status != AliasStatus::Active
-                || alias.source_plugin.as_deref() != Some("predicate_hygiene")
-            {
-                continue;
-            }
-
-            let proposal_key = (alias.alias.clone(), alias.predicate_id.clone());
-            if existing_proposals.insert(proposal_key) {
-                create_hygiene_proposal(
-                    artifact_repo,
-                    space_id,
-                    &alias.alias,
-                    &alias.predicate_id,
-                    f64::from(alias.confidence),
-                    "active predicate_hygiene alias deactivated for review",
-                )
-                .await?;
-                proposals_created += 1;
-            }
-
-            let alias_id = alias.base.id.clone();
-            let alias_name = alias.alias.clone();
-            let canonical_predicate_id = alias.predicate_id.clone();
-            alias.status = AliasStatus::Deprecated;
-            alias_repo.update(space_id, &alias_id, alias).await?;
-            aliases_deactivated += 1;
-            info!(
-                "Deprecated predicate_hygiene active alias '{}' -> '{}' for review",
-                alias_name, canonical_predicate_id
-            );
-        }
-    }
-
-    Ok((aliases_deactivated, proposals_created))
-}
-
 fn predicate_syntax_key(predicate_id: &str) -> Option<String> {
     let normalized = predicate_id
         .trim()
@@ -356,81 +238,6 @@ fn predicate_syntax_canonical_score(predicate_id: &str) -> (u8, u8, usize) {
     )
 }
 
-async fn create_syntax_equivalence_aliases(
-    alias_repo: &PredicateAliasRepository,
-    space_id: &str,
-    predicates: &[PredicateRegistry],
-) -> Result<usize, PipelineError> {
-    let mut groups: BTreeMap<String, Vec<&PredicateRegistry>> = BTreeMap::new();
-    for predicate in predicates {
-        if predicate.status != "active" {
-            continue;
-        }
-        let Some(key) = predicate_syntax_key(&predicate.predicate_id) else {
-            continue;
-        };
-        groups.entry(key).or_default().push(predicate);
-    }
-
-    let mut aliases_created = 0;
-    for group in groups.values() {
-        if group.len() < 2 {
-            continue;
-        }
-        let Some(canonical) = group.iter().max_by(|left, right| {
-            left.usage_count
-                .cmp(&right.usage_count)
-                .then_with(|| {
-                    predicate_syntax_canonical_score(&left.predicate_id)
-                        .cmp(&predicate_syntax_canonical_score(&right.predicate_id))
-                })
-                .then_with(|| right.predicate_id.cmp(&left.predicate_id))
-        }) else {
-            continue;
-        };
-
-        for predicate in group {
-            if predicate.predicate_id == canonical.predicate_id {
-                continue;
-            }
-            if alias_repo
-                .find_active_by_raw(space_id, &predicate.predicate_id)
-                .await?
-                .is_some()
-            {
-                continue;
-            }
-
-            let alias_id = RecordId::new_v4(TableName::PredicateAlias);
-            let base = BaseFields::new(
-                alias_id,
-                space_id.to_string(),
-                "predicate_syntax_hygiene".to_string(),
-            );
-            let alias = PredicateAlias {
-                base,
-                alias: predicate.predicate_id.clone(),
-                alias_type: AliasType::RawString,
-                source_plugin: Some("predicate_syntax".to_string()),
-                confidence: 1.0,
-                status: AliasStatus::Active,
-                scope: AliasScope::Global,
-                predicate_id: canonical.predicate_id.clone(),
-                confidence_version: 1,
-                usage_count: 0,
-            };
-            alias_repo.create(alias).await?;
-            aliases_created += 1;
-            info!(
-                "Syntax-aliased predicate '{}' -> '{}'",
-                predicate.predicate_id, canonical.predicate_id
-            );
-        }
-    }
-
-    Ok(aliases_created)
-}
-
 /// Runs a predicate hygiene sweep for the given space.
 ///
 /// Loads active predicates, embeds their descriptions, computes pairwise
@@ -446,142 +253,31 @@ pub async fn execute_predicate_hygiene_sweep(
     config: &PredicateHygieneConfig,
     embedding_provider: &dyn EmbeddingProvider,
 ) -> Result<HygieneResult, PipelineError> {
-    let registry_repo = PredicateRegistryRepository::new(storage.clone());
-    let alias_repo = PredicateAliasRepository::new(storage.clone());
-    let artifact_repo = WorkArtifactRepository::new(storage.clone());
-
-    // 1. Load all active predicates for the space
-    let predicates = registry_repo
-        .list(space_id, config.max_predicates, None)
+    let planning = crate::maintenance_commit::PlanningTruthMaintenanceStorage::new(
+        storage.clone(),
+        space_id,
+        None,
+    )
+    .await?;
+    let result = prepare_predicate_hygiene_sweep(
+        &planning,
+        storage,
+        space_id,
+        config,
+        embedding_provider,
+        None,
+    )
+    .await?;
+    planning.audit_pending_effects("predicate_hygiene").await?;
+    planning
+        .commit(
+            "predicate_hygiene",
+            space_id,
+            &serde_json::json!({"config":config}),
+            &result,
+        )
         .await?;
-
-    let predicates_scanned = predicates.len();
-    let mut aliases_created = 0;
-    let mut proposals_created = 0;
-
-    if !config.auto_alias_enabled {
-        let (aliases_deactivated, review_proposals_created) =
-            deactivate_active_hygiene_aliases(&alias_repo, &artifact_repo, space_id).await?;
-        if aliases_deactivated > 0 {
-            info!(
-                "Deprecated {aliases_deactivated} active predicate_hygiene aliases; \
-                 created {review_proposals_created} review proposals"
-            );
-        }
-        proposals_created += review_proposals_created;
-    }
-
-    aliases_created +=
-        create_syntax_equivalence_aliases(&alias_repo, space_id, &predicates).await?;
-
-    if predicates_scanned < 2 {
-        debug!("Fewer than 2 predicates in space {space_id}, skipping hygiene sweep");
-        return Ok(HygieneResult {
-            aliases_created,
-            proposals_created,
-            predicates_scanned,
-        });
-    }
-
-    // 2. Embed predicate descriptions (or names if no description)
-    let texts: Vec<String> = predicates.iter().map(predicate_embed_text).collect();
-    let embeddings = embedding_provider.embed(&texts).await?;
-
-    if embeddings.len() != predicates.len() {
-        return Err(PipelineError::ExtractionError(format!(
-            "Embedding count mismatch: expected {}, got {}",
-            predicates.len(),
-            embeddings.len()
-        )));
-    }
-
-    // 3. Group predicates above proposal_threshold
-    let groups =
-        group_predicates_by_similarity(&predicates, &embeddings, config.proposal_threshold);
-
-    let mut existing_proposals = active_hygiene_proposal_pairs(&artifact_repo, space_id).await?;
-
-    // 4. For each group, create aliases or proposals
-    for group in &groups {
-        for (member_predicate_id, similarity) in &group.members {
-            // Check if an alias already exists
-            let existing = alias_repo
-                .find_active_by_raw(space_id, member_predicate_id)
-                .await?;
-            if existing.is_some() {
-                debug!("Alias already exists for '{member_predicate_id}' -> skipping");
-                continue;
-            }
-
-            if config.auto_alias_enabled && *similarity >= config.auto_alias_threshold {
-                // Auto-create alias
-                let alias_id = RecordId::new_v4(TableName::PredicateAlias);
-                let base = BaseFields::new(
-                    alias_id,
-                    space_id.to_string(),
-                    "predicate_hygiene_worker".to_string(),
-                );
-
-                #[allow(clippy::cast_possible_truncation)]
-                let confidence = *similarity as f32;
-
-                let alias = PredicateAlias {
-                    base,
-                    alias: member_predicate_id.clone(),
-                    alias_type: AliasType::RawString,
-                    source_plugin: Some("predicate_hygiene".to_string()),
-                    confidence,
-                    status: AliasStatus::Active,
-                    scope: AliasScope::Global,
-                    predicate_id: group.canonical.clone(),
-                    confidence_version: 1,
-                    usage_count: 0,
-                };
-
-                alias_repo.create(alias).await?;
-                aliases_created += 1;
-                info!(
-                    "Auto-aliased '{}' -> '{}' (similarity: {:.3})",
-                    member_predicate_id, group.canonical, similarity
-                );
-            } else {
-                let proposal_key = (member_predicate_id.clone(), group.canonical.clone());
-                if existing_proposals.contains(&proposal_key) {
-                    debug!(
-                        "Predicate hygiene proposal already exists for '{}' -> '{}' -> skipping",
-                        member_predicate_id, group.canonical
-                    );
-                    continue;
-                }
-                create_hygiene_proposal(
-                    &artifact_repo,
-                    space_id,
-                    member_predicate_id,
-                    &group.canonical,
-                    *similarity,
-                    "embedding similarity review",
-                )
-                .await?;
-                existing_proposals.insert(proposal_key);
-                proposals_created += 1;
-                info!(
-                    "Proposed alias '{}' -> '{}' (similarity: {:.3})",
-                    member_predicate_id, group.canonical, similarity
-                );
-            }
-        }
-    }
-
-    info!(
-        "Predicate hygiene sweep complete: scanned={predicates_scanned}, \
-         aliases_created={aliases_created}, proposals_created={proposals_created}"
-    );
-
-    Ok(HygieneResult {
-        aliases_created,
-        proposals_created,
-        predicates_scanned,
-    })
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -799,16 +495,36 @@ mod tests {
         }
     }
 
-    const HYGIENE_SCHEMA: &str = r"
-        DEFINE TABLE predicate_registry SCHEMALESS;
-        DEFINE TABLE predicate_alias SCHEMALESS;
-        DEFINE TABLE work_artifact SCHEMALESS;
-    ";
-
-    async fn setup_hygiene_storage() -> StorageClient {
-        let storage = StorageClient::new_memory().await.expect("storage");
-        storage.query(HYGIENE_SCHEMA).await.expect("schema");
+    async fn setup_hygiene_backend(embedded: bool) -> StorageClient {
+        let storage = if embedded {
+            StorageClient::new_embedded().await.expect("storage")
+        } else {
+            let client = StorageClient::new_memory().await.expect("storage");
+            elephant_migrations::apply_schema(&client)
+                .await
+                .expect("schema");
+            client
+        };
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    "test_space".into(),
+                    "test".into(),
+                ),
+                embedding_provider: "unconfigured".into(),
+                embedding_model: "unconfigured".into(),
+                embedding_dims: 3,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .expect("space config");
         storage
+    }
+    async fn setup_hygiene_storage() -> StorageClient {
+        setup_hygiene_backend(false).await
     }
 
     async fn insert_predicate(
@@ -1203,5 +919,476 @@ mod tests {
             result.aliases_created, 0,
             "Should not create duplicate alias"
         );
+    }
+    struct IncompleteEmbeddingProvider;
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for IncompleteEmbeddingProvider {
+        fn model(&self) -> &str {
+            "incomplete-offline-fixture"
+        }
+        fn dimensions(&self) -> usize {
+            3
+        }
+        async fn embed(&self, _: &[String]) -> elephant_embeddings::EmbeddingResult<Vec<Vec<f32>>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn later_provider_failure_keeps_prepared_syntax_aliases_unpublished() {
+        for embedded in [true, false] {
+            let storage = setup_hygiene_backend(embedded).await;
+            insert_predicate(&storage, "scheduled for", "Schedule", 100).await;
+            insert_predicate(&storage, "scheduled_for", "Schedule", 20).await;
+            assert!(execute_predicate_hygiene_sweep(
+                &storage,
+                "test_space",
+                &PredicateHygieneConfig::default(),
+                &IncompleteEmbeddingProvider
+            )
+            .await
+            .is_err());
+            assert!(PredicateAliasRepository::new(storage.clone())
+                .list("test_space", 10, None)
+                .await
+                .expect("aliases")
+                .is_empty());
+            assert!(WorkArtifactRepository::new(storage.clone())
+                .list("test_space", 10, None)
+                .await
+                .expect("artifacts")
+                .is_empty());
+            assert!(elephant_storage::AuditLogRepository::new(storage)
+                .list("test_space", 10, None)
+                .await
+                .expect("audit")
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn proposal_uses_real_pair_and_rejects_changed_operational_read_dependency() {
+        use crate::maintenance_commit::PlanningTruthMaintenanceStorage;
+        use elephant_storage::canonical_commit::{CanonicalRecord, CanonicalRepository};
+        for embedded in [true, false] {
+            for change_item in [false, true] {
+                let storage = setup_hygiene_backend(embedded).await;
+                insert_predicate(&storage, "works_at", "Employment", 100).await;
+                insert_predicate(&storage, "employed_by", "Employment", 20).await;
+                let planning =
+                    PlanningTruthMaintenanceStorage::new(storage.clone(), "test_space", None)
+                        .await
+                        .expect("capture");
+                let provider =
+                    ControlledEmbeddingProvider::new(vec![("Employment", vec![1.0, 0.0, 0.0])]);
+                let result = prepare_predicate_hygiene_sweep(
+                    &planning,
+                    &storage,
+                    "test_space",
+                    &PredicateHygieneConfig::default(),
+                    &provider,
+                    None,
+                )
+                .await
+                .expect("prepare");
+                assert_eq!(result.proposals_created, 1);
+                let plan = planning.prepared_plan().expect("plan");
+                let mut run = plan
+                    .dependencies
+                    .iter()
+                    .find_map(|record| match record {
+                        CanonicalRecord::WorkRun(row) => Some((**row).clone()),
+                        _ => None,
+                    })
+                    .expect("actual run");
+                let item = plan
+                    .dependencies
+                    .iter()
+                    .find_map(|record| match record {
+                        CanonicalRecord::WorkItem(row) => Some((**row).clone()),
+                        _ => None,
+                    })
+                    .expect("actual item");
+                assert_eq!(run.work_item.id(), &item.base.id);
+                assert!(plan.effects.iter().all(|effect| !matches!(
+                    &effect.after,
+                    Some(CanonicalRecord::WorkRun(_) | CanonicalRecord::WorkItem(_))
+                )));
+                assert!(WorkArtifactRepository::new(storage.clone())
+                    .list("test_space", 10, None)
+                    .await
+                    .expect("before")
+                    .is_empty());
+                planning
+                    .audit_pending_effects("predicate_hygiene")
+                    .await
+                    .expect("audit");
+                let request = planning
+                    .prepare_request(
+                        "predicate_hygiene",
+                        "test_space",
+                        &serde_json::json!({}),
+                        &result,
+                    )
+                    .await
+                    .expect("request");
+                let key = request.commit_id.clone();
+                if change_item {
+                    elephant_storage::WorkItemRepository::new(storage.clone())
+                        .delete("test_space", &item.base.id)
+                        .await
+                        .expect("delete observed item");
+                } else {
+                    run.worker_id = "changed-after-capture".into();
+                    let id = run.base.id.clone();
+                    elephant_storage::WorkRunRepository::new(storage.clone())
+                        .update("test_space", &id, run)
+                        .await
+                        .expect("change observed run");
+                }
+                assert!(CanonicalRepository::new(storage.clone())
+                    .commit(request)
+                    .await
+                    .is_err());
+                assert!(WorkArtifactRepository::new(storage.clone())
+                    .list("test_space", 10, None)
+                    .await
+                    .expect("after")
+                    .is_empty());
+                assert!(elephant_storage::AuditLogRepository::new(storage.clone())
+                    .list("test_space", 10, None)
+                    .await
+                    .expect("audit")
+                    .is_empty());
+                assert!(CanonicalRepository::new(storage)
+                    .receipt("test_space", &key)
+                    .await
+                    .expect("receipt")
+                    .is_none());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn actual_proposal_context_survives_archive_without_resurrection() {
+        use crate::maintenance_commit::PlanningTruthMaintenanceStorage;
+        use elephant_storage::canonical_commit::{CanonicalRecord, CanonicalRepository};
+        for embedded in [true, false] {
+            let storage = setup_hygiene_backend(embedded).await;
+            insert_predicate(&storage, "works_at", "Employment", 100).await;
+            insert_predicate(&storage, "employed_by", "Employment", 20).await;
+            let provider =
+                ControlledEmbeddingProvider::new(vec![("Employment", vec![1.0, 0.0, 0.0])]);
+            let planning =
+                PlanningTruthMaintenanceStorage::new(storage.clone(), "test_space", None)
+                    .await
+                    .expect("capture");
+            let result = prepare_predicate_hygiene_sweep(
+                &planning,
+                &storage,
+                "test_space",
+                &PredicateHygieneConfig::default(),
+                &provider,
+                None,
+            )
+            .await
+            .expect("prepare");
+            let plan = planning.prepared_plan().expect("plan");
+            let run = plan
+                .dependencies
+                .iter()
+                .find_map(|record| match record {
+                    CanonicalRecord::WorkRun(row) => Some((**row).clone()),
+                    _ => None,
+                })
+                .expect("run");
+            let cutoff = chrono::Utc::now() + chrono::Duration::seconds(1);
+            let archived =
+                elephant_storage::work_retention::archive_terminal_work(&storage, cutoff, 10)
+                    .await
+                    .expect("archive");
+            assert_eq!(archived.items_archived, 1);
+            assert_eq!(archived.runs_archived, 1);
+            // A second preparation at the same canonical epoch reuses the real
+            // archived context; it cannot resurrect hot records or invent a run.
+            let retry = PlanningTruthMaintenanceStorage::new(storage.clone(), "test_space", None)
+                .await
+                .expect("retry capture");
+            prepare_predicate_hygiene_sweep(
+                &retry,
+                &storage,
+                "test_space",
+                &PredicateHygieneConfig::default(),
+                &provider,
+                None,
+            )
+            .await
+            .expect("archive replay");
+            assert!(retry
+                .prepared_plan()
+                .expect("retry plan")
+                .dependencies
+                .iter()
+                .any(
+                    |record| matches!(record, CanonicalRecord::WorkRun(row) if row.as_ref() == &run)
+                ));
+            planning
+                .audit_pending_effects("predicate_hygiene")
+                .await
+                .expect("audit");
+            let request = planning
+                .prepare_request(
+                    "predicate_hygiene",
+                    "test_space",
+                    &serde_json::json!({}),
+                    &result,
+                )
+                .await
+                .expect("request");
+            CanonicalRepository::new(storage.clone())
+                .commit(request)
+                .await
+                .expect("commit archived readset");
+            assert_eq!(
+                WorkArtifactRepository::new(storage.clone())
+                    .list("test_space", 10, None)
+                    .await
+                    .expect("artifacts")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                elephant_storage::WorkRunRepository::new(storage.clone())
+                    .get("test_space", &run.base.id)
+                    .await
+                    .expect("original run"),
+                Some(run)
+            );
+            let second_archive =
+                elephant_storage::work_retention::archive_terminal_work(&storage, cutoff, 10)
+                    .await
+                    .expect("no resurrection");
+            assert_eq!(second_archive.items_archived, 0);
+            assert_eq!(second_archive.runs_archived, 0);
+        }
+    }
+
+    struct PartitionBatchProvider {
+        requests: std::sync::Mutex<Vec<Vec<String>>>,
+        malformed: Option<&'static str>,
+    }
+    impl PartitionBatchProvider {
+        fn new(malformed: Option<&'static str>) -> Self {
+            Self {
+                requests: std::sync::Mutex::new(vec![]),
+                malformed,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for PartitionBatchProvider {
+        fn model(&self) -> &str {
+            "partition-batch-offline-fixture"
+        }
+        fn dimensions(&self) -> usize {
+            3
+        }
+        async fn embed(
+            &self,
+            texts: &[String],
+        ) -> elephant_embeddings::EmbeddingResult<Vec<Vec<f32>>> {
+            self.requests.lock().expect("requests").push(texts.to_vec());
+            let mut rows: Vec<_> = texts
+                .iter()
+                .map(|text| match text.as_str() {
+                    "A" => vec![1.0, 0.0, 0.0],
+                    "B" => vec![0.0, 1.0, 0.0],
+                    "C" => vec![0.0, 0.0, 1.0],
+                    "D" => vec![0.0, 1.0, 1.0],
+                    _ => vec![1.0, 0.0, 0.0],
+                })
+                .collect();
+            match self.malformed {
+                Some("missing") => {
+                    rows.pop();
+                }
+                Some("extra") => rows.push(vec![1.0, 0.0, 0.0]),
+                Some("dimension") => rows[0] = vec![1.0, 0.0],
+                Some("nonfinite") => rows[0][0] = f32::NAN,
+                _ => {}
+            }
+            Ok(rows)
+        }
+    }
+
+    #[tokio::test]
+    async fn predicate_partition_batch_preserves_vector_mapping_and_omits_singletons() {
+        let groups = vec![
+            vec![
+                make_predicate("a", Some("A"), 1),
+                make_predicate("b", Some("B"), 1),
+            ],
+            vec![make_predicate("single", Some("never-dispatched"), 1)],
+            vec![
+                make_predicate("c", Some("C"), 1),
+                make_predicate("d", Some("D"), 1),
+            ],
+        ];
+        let provider = PartitionBatchProvider::new(None);
+        let vectors = atomic::embed_partition_inputs(&groups, &provider)
+            .await
+            .expect("batch");
+        assert_eq!(
+            vectors,
+            vec![
+                vec![1.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+                vec![0.0, 1.0, 1.0]
+            ]
+        );
+        assert_eq!(
+            *provider.requests.lock().expect("requests"),
+            vec![vec!["A", "B", "C", "D"]]
+        );
+        let mut reversed = groups.clone();
+        reversed.reverse();
+        for group in &mut reversed {
+            group.reverse();
+        }
+        let reverse_provider = PartitionBatchProvider::new(None);
+        let reversed_vectors = atomic::embed_partition_inputs(&reversed, &reverse_provider)
+            .await
+            .expect("reverse batch");
+        assert_eq!(
+            reversed_vectors,
+            vectors.into_iter().rev().collect::<Vec<_>>()
+        );
+        let no_pairs = PartitionBatchProvider::new(None);
+        assert!(
+            atomic::embed_partition_inputs(&[groups[1].clone(), vec![]], &no_pairs)
+                .await
+                .expect("singletons")
+                .is_empty()
+        );
+        assert!(no_pairs.requests.lock().expect("requests").is_empty());
+    }
+
+    #[tokio::test]
+    async fn predicate_partition_batch_keeps_distinct_envelope_proposals_on_both_backends() {
+        for embedded in [true, false] {
+            let storage = setup_hygiene_backend(embedded).await;
+            let repo = PredicateRegistryRepository::new(storage.clone());
+            for (label, canonical, alias) in [
+                ("one", "works_at", "employed_by"),
+                ("two", "located_at", "situated_in"),
+            ] {
+                for (name, usage) in [(canonical, 100), (alias, 1)] {
+                    let mut predicate =
+                        make_predicate(name, Some("Identical provider vector"), usage);
+                    predicate.base.security.labels = vec![label.into()];
+                    repo.create(predicate).await.expect("predicate");
+                }
+            }
+            let provider = PartitionBatchProvider::new(None);
+            let result = execute_predicate_hygiene_sweep(
+                &storage,
+                "test_space",
+                &PredicateHygieneConfig::default(),
+                &provider,
+            )
+            .await
+            .expect("sweep");
+            assert_eq!(provider.requests.lock().expect("requests").len(), 1);
+            assert_eq!(result.proposals_created, 2);
+            assert_eq!(result.aliases_created, 0);
+            let proposals = WorkArtifactRepository::new(storage.clone())
+                .list("test_space", 10, None)
+                .await
+                .expect("proposals");
+            assert_eq!(proposals.len(), 2);
+            let pairs: std::collections::BTreeSet<_> = proposals
+                .into_iter()
+                .map(|artifact| {
+                    assert_eq!(artifact.status, ArtifactStatus::Draft);
+                    (
+                        artifact.base.security.labels,
+                        artifact.data["alias_predicate_id"]
+                            .as_str()
+                            .expect("alias")
+                            .to_owned(),
+                        artifact.data["canonical_predicate_id"]
+                            .as_str()
+                            .expect("canonical")
+                            .to_owned(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                pairs,
+                std::collections::BTreeSet::from([
+                    (
+                        vec!["one".to_owned()],
+                        "employed_by".to_owned(),
+                        "works_at".to_owned()
+                    ),
+                    (
+                        vec!["two".to_owned()],
+                        "situated_in".to_owned(),
+                        "located_at".to_owned()
+                    ),
+                ])
+            );
+            assert!(PredicateAliasRepository::new(storage)
+                .list("test_space", 10, None)
+                .await
+                .expect("aliases")
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn predicate_partition_batch_rejects_malformed_complete_response_before_effects() {
+        use crate::maintenance_commit::PlanningTruthMaintenanceStorage;
+        for malformed in ["missing", "extra", "dimension", "nonfinite"] {
+            let storage = setup_hygiene_storage().await;
+            let repo = PredicateRegistryRepository::new(storage.clone());
+            for (label, names) in [
+                ("one", ["scheduled for", "scheduled_for"]),
+                ("two", ["works at", "works_at"]),
+            ] {
+                for name in names {
+                    let mut predicate = make_predicate(name, Some("Identical provider vector"), 1);
+                    predicate.base.security.labels = vec![label.into()];
+                    repo.create(predicate).await.expect("predicate");
+                }
+            }
+            let planning =
+                PlanningTruthMaintenanceStorage::new(storage.clone(), "test_space", None)
+                    .await
+                    .expect("capture");
+            let provider = PartitionBatchProvider::new(Some(malformed));
+            assert!(prepare_predicate_hygiene_sweep(
+                &planning,
+                &storage,
+                "test_space",
+                &PredicateHygieneConfig::default(),
+                &provider,
+                None
+            )
+            .await
+            .is_err());
+            assert_eq!(provider.requests.lock().expect("requests").len(), 1);
+            assert!(planning.prepared_plan().expect("plan").effects.is_empty());
+            assert!(PredicateAliasRepository::new(storage.clone())
+                .list("test_space", 10, None)
+                .await
+                .expect("aliases")
+                .is_empty());
+            assert!(WorkArtifactRepository::new(storage)
+                .list("test_space", 10, None)
+                .await
+                .expect("artifacts")
+                .is_empty());
+        }
     }
 }

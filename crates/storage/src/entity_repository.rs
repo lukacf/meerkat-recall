@@ -66,32 +66,25 @@ pub struct EntitySearchHit {
     pub score: f32,
 }
 
-/// How long a cached entity-vector snapshot serves searches before reload.
-pub const ENTITY_VECTOR_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Compatibility constant: entity vectors are reloaded for every query.
+pub const ENTITY_VECTOR_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::ZERO;
 
-/// Entity vectors of one space and dimension, loaded at `loaded_at`.
+/// One current, profile-filtered vector read. Reusing this across restoration or
+/// erasure requires both database incarnation and canonical epoch tokens.
 struct EntityVectorSnapshot {
-    loaded_at: std::time::Instant,
     rows: Vec<(RecordId, Vec<f32>)>,
 }
 
-/// Snapshot cache for [`EntityRepository::vector_search_entities_cached`].
-///
-/// Owned by a long-lived search handler; clones share the snapshots.
+/// Compatibility handle for entity-vector search callers. Governed reads fetch
+/// current vectors rather than retain payload snapshots across erase/restore.
 #[derive(Clone, Default)]
-pub struct EntityVectorCache {
-    snapshots: std::sync::Arc<tokio::sync::Mutex<EntityVectorSnapshots>>,
-}
-
-/// Snapshots keyed by space and vector dimension.
-type EntityVectorSnapshots =
-    std::collections::HashMap<(String, usize), std::sync::Arc<EntityVectorSnapshot>>;
+pub struct EntityVectorCache;
 
 impl EntityVectorCache {
     /// Creates an empty cache.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self
     }
 }
 
@@ -276,6 +269,12 @@ pub struct EntityRepository<B = SurrealStorageBackend> {
 }
 
 impl EntityRepository {
+    /// Access the owning storage client when preparing a cross-repository bundle.
+    #[must_use]
+    pub const fn storage_client(&self) -> &StorageClient {
+        self.backend.client()
+    }
+
     /// Restores a entity only if it is unchanged since `authorized`, the row
     /// the caller's authorization was decided on.
     ///
@@ -1382,50 +1381,68 @@ impl EntityRepository {
         hits.into_iter().map(EntitySearchHit::try_from).collect()
     }
 
-    /// [`Self::vector_search_entities`] for read-only search callers, ranked
-    /// in process against a snapshot of the space's entity vectors.
-    ///
-    /// The `SurrealDB` path computes `vector::similarity::cosine` for every
-    /// entity in the space on every call (entity vectors have no index: their
-    /// dimensions vary by provider, see migration 020). At ~1.5k entities of
-    /// 3,072 dims that is about 2 s per search. The snapshot is reloaded once
-    /// it is older than [`ENTITY_VECTOR_SNAPSHOT_TTL`], so results can lag
-    /// entity writes by that long. Entity resolution must keep using the
-    /// exact path: a just-created entity has to be a candidate immediately.
+    /// Compatibility search entry point. Each invocation loads current rows;
+    /// the former TTL snapshot could outlive physical erasure or restoration.
+    /// Governed callers use `vector_search_entities_for_policy`.
     ///
     /// # Errors
-    ///
-    /// Returns an error if loading the snapshot fails.
+    /// Returns an error if loading current storage fails.
     pub async fn vector_search_entities_cached(
         &self,
-        cache: &EntityVectorCache,
+        _cache: &EntityVectorCache,
         space_id: &str,
         embedding: &[f32],
         limit: usize,
     ) -> StorageResult<Vec<EntitySearchHit>> {
-        if self.backend.embedded_store().is_some() {
-            return self
-                .vector_search_entities(space_id, embedding, limit)
-                .await;
+        let snapshot = EntityVectorSnapshot {
+            rows: self
+                .load_entity_vectors(space_id, embedding.len(), None)
+                .await?,
+        };
+        Ok(rank_entity_vectors(&snapshot, embedding, limit))
+    }
+
+    /// Profile-exact semantic retrieval.
+    ///
+    /// The full approved partition identity is
+    /// compared even when old/new models share dimensions. Every call enters
+    /// storage, so restore and physical erasure cannot leave cached vector hits.
+    pub async fn vector_search_entities_for_policy(
+        &self,
+        _cache: &EntityVectorCache,
+        space_id: &str,
+        policy: &elephant_embeddings::EmbeddingPolicy,
+        embedding: &[f32],
+        limit: usize,
+    ) -> StorageResult<Vec<EntitySearchHit>> {
+        if embedding.len() != policy.dims {
+            return Err(StorageError::DataIntegrityError(
+                "query vector does not match approved dimensions".into(),
+            ));
         }
-        let key = (space_id.to_string(), embedding.len());
-        let fresh = cache
-            .snapshots
-            .lock()
-            .await
-            .get(&key)
-            .filter(|snapshot| snapshot.loaded_at.elapsed() < ENTITY_VECTOR_SNAPSHOT_TTL)
-            .cloned();
-        if let Some(snapshot) = fresh {
-            return Ok(rank_entity_vectors(&snapshot, embedding, limit));
+        if let Some(encoded) = policy.model.strip_prefix("recall:") {
+            let identity: elephant_types::provider_binding::VectorPartition =
+                serde_json::from_str(encoded).map_err(|_| {
+                    StorageError::DataIntegrityError("invalid governed vector identity".into())
+                })?;
+            if identity.space_id != space_id
+                || identity.dimensions != policy.dims
+                || identity.provider != policy.provider
+            {
+                return Err(StorageError::DataIntegrityError(
+                    "query profile belongs to another space".into(),
+                ));
+            }
+        } else {
+            return Err(StorageError::DataIntegrityError(
+                "governed entity query requires approved profile identity".into(),
+            ));
         }
-        // Loaded without holding the lock: a concurrent miss may load twice,
-        // which is cheaper than serialising every search behind the load.
-        let snapshot = std::sync::Arc::new(EntityVectorSnapshot {
-            loaded_at: std::time::Instant::now(),
-            rows: self.load_entity_vectors(space_id, embedding.len()).await?,
-        });
-        cache.snapshots.lock().await.insert(key, snapshot.clone());
+        let vectors = crate::entity_profile_embedding_repository::EntityProfileEmbeddingRepository::new_with_backend(self.backend.clone());
+        let snapshot = EntityVectorSnapshot {
+            rows: vectors.load(space_id, &policy.model, policy.dims).await?,
+        };
+        drop(vectors);
         Ok(rank_entity_vectors(&snapshot, embedding, limit))
     }
 
@@ -1434,7 +1451,32 @@ impl EntityRepository {
         &self,
         space_id: &str,
         dimensions: usize,
+        model: Option<&str>,
     ) -> StorageResult<Vec<(RecordId, Vec<f32>)>> {
+        if let Some(store) = self.backend.embedded_store() {
+            return Ok(store
+                .scan::<Entity>()
+                .await?
+                .into_iter()
+                .filter(|entity| {
+                    entity.base.space_id == space_id
+                        && entity.base.deleted_at.is_none()
+                        && entity.status != EntityStatus::Merged
+                        && !is_source_inventory_entity(entity)
+                        && model.is_none_or(|model| {
+                            entity
+                                .metadata
+                                .get("name_embedding_model")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(model)
+                        })
+                })
+                .filter_map(|entity| {
+                    entity_name_embedding(&entity, dimensions)
+                        .map(|vector| (entity.base.id, vector))
+                })
+                .collect());
+        }
         #[derive(Deserialize)]
         struct EntityVectorDb {
             id: surrealdb::sql::Thing,
@@ -1443,11 +1485,11 @@ impl EntityRepository {
         let query = format!(
             "SELECT id, name_embedding FROM entity \
              WHERE space_id = $space_id AND deleted_at IS NONE AND name_embedding IS NOT NONE \
-             AND array::len(name_embedding) = {dimensions}"
+             AND array::len(name_embedding) = {dimensions} AND ($model IS NONE OR name_embedding_model = $model)"
         );
         let mut response = self
             .backend
-            .query_bind(&query, crate::bindings! { "space_id" => space_id })
+            .query_bind(&query, crate::bindings! { "space_id" => space_id, "model" => model.map_or(surrealdb::sql::Value::None, |model| surrealdb::sql::Value::from(model.to_string())) })
             .await?;
         let rows: Vec<EntityVectorDb> = response.take(0).map_err(|e| {
             StorageError::QueryError(format!("Failed to parse entity vectors: {e}"))
@@ -1482,6 +1524,26 @@ impl EntityRepository {
         model: &str,
         text_hash: &str,
     ) -> StorageResult<()> {
+        if model.starts_with("recall:") {
+            let entity = self
+                .get(space_id, id)
+                .await?
+                .ok_or_else(|| StorageError::NotFound(id.to_string()))?;
+            let expected_hash =
+                crate::entity_profile_embedding_repository::entity_input_hash(&entity);
+            if expected_hash != text_hash {
+                return Err(StorageError::Conflict(
+                    "entity embedding text changed before publication".into(),
+                ));
+            }
+            let profiles = crate::entity_profile_embedding_repository::EntityProfileEmbeddingRepository::new_with_backend(self.backend.clone());
+            let config = profiles.current_config(space_id).await?;
+            let result = profiles
+                .store(&config, &entity, model, text_hash, embedding.to_vec())
+                .await;
+            drop(profiles);
+            return result;
+        }
         if let Some(store) = self.backend.embedded_store() {
             let target_space_id = space_id.to_string();
             let target_id = id.clone();
@@ -1531,6 +1593,55 @@ impl EntityRepository {
             .await?;
 
         Ok(())
+    }
+
+    /// Walks all pages until `limit` stale entries are found. A covered prefix
+    /// cannot starve entities beyond the first maintenance candidate window.
+    pub async fn list_embedding_candidates_for_policy(
+        &self,
+        space: &str,
+        model: &str,
+        dims: usize,
+        limit: usize,
+    ) -> StorageResult<Vec<EntityEmbeddingCandidate>> {
+        use crate::entity_profile_embedding_repository::{
+            entity_input_hash, EntityProfileEmbeddingRepository,
+        };
+        let profiles = EntityProfileEmbeddingRepository::new_with_backend(self.backend.clone());
+        let hashes = profiles.text_hashes(space, model, dims).await?;
+        drop(profiles);
+        let mut cursor = None;
+        let mut candidates = Vec::new();
+        while candidates.len() < limit {
+            let page = self.list(space, 256, cursor.as_ref()).await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|entity| entity.base.id.clone());
+            for entity in page {
+                if entity.status == EntityStatus::Merged
+                    || is_source_inventory_entity(&entity)
+                    || hashes
+                        .get(&entity.base.id.to_string())
+                        .is_some_and(|hash| hash == &entity_input_hash(&entity))
+                {
+                    continue;
+                }
+                candidates.push(EntityEmbeddingCandidate {
+                    entity_id: entity.base.id,
+                    display_name: entity.display_name,
+                    aliases: entity.aliases,
+                    summary: entity.summary,
+                    embedding_model: None,
+                    embedding_text_hash: None,
+                    embedding_dims: None,
+                });
+                if candidates.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(candidates)
     }
 
     /// Lists active entities as embedding-sweep candidates: the text to
@@ -1882,7 +1993,7 @@ pub fn is_source_inventory_entity(entity: &Entity) -> bool {
     is_source_inventory_label(&entity.display_name)
 }
 
-fn is_source_inventory_label(display_name: &str) -> bool {
+pub(crate) fn is_source_inventory_label(display_name: &str) -> bool {
     let normalized = normalize_inventory_entity_label(display_name);
     [
         "email message ",
@@ -2088,6 +2199,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client, repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_fake_embedding_purge_clears_ramp_name_embeddings_only() {
         use elephant_embeddings::{EmbeddingProvider, FakeEmbeddingProvider};
 
@@ -2147,6 +2262,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedding_candidates_put_unembedded_entities_first() {
         let repo = setup_test_repo().await;
         let mut ids = Vec::new();
@@ -2170,6 +2289,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_entity() {
         let repo = setup_test_repo().await;
         let entity = create_test_entity("John Doe");
@@ -2181,6 +2304,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_entity() {
         let repo = setup_test_repo().await;
         let entity = create_test_entity("Jane Doe");
@@ -2194,6 +2321,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_nonexistent_entity() {
         let repo = setup_test_repo().await;
         let id = RecordId::new_v4(TableName::Entity);
@@ -2203,6 +2334,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_entity() {
         let repo = setup_test_repo().await;
         let entity = create_test_entity("Original Name");
@@ -2442,6 +2577,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_soft_delete_entity() {
         let repo = setup_test_repo().await;
         let entity = create_test_entity("To Delete");
@@ -2459,6 +2598,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_restore_entity() {
         let repo = setup_test_repo().await;
         let entity = create_test_entity("To Restore");
@@ -2477,6 +2620,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_list_entities() {
         let repo = setup_test_repo().await;
 
@@ -2490,6 +2637,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_search_by_space_id() {
         let repo = setup_test_repo().await;
 
@@ -2509,6 +2660,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_search_by_query() {
         let repo = setup_test_repo().await;
 
@@ -2533,6 +2688,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_source_inventory_wrapper_entities_are_hidden_by_default() {
         let repo = setup_test_repo().await;
 
@@ -2557,6 +2716,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_list_paginates_past_source_inventory_rows() {
         let repo = setup_test_repo().await;
         for index in 0..501_u128 {
@@ -2579,6 +2742,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_search_by_alias_and_identity_keys() {
         let repo = setup_test_repo().await;
 
@@ -2774,6 +2941,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_find_by_identity_key_all_returns_all_matches() {
         let repo = setup_test_repo().await;
 
@@ -2825,6 +2996,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_find_by_identity_key_all_returns_all_matches() {
         let repo = setup_embedded_test_repo().await;
 
@@ -2852,6 +3027,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_search_ranks_alias_and_identity_keys_before_shell_names() {
         let repo = setup_embedded_test_repo().await;
 
@@ -2899,6 +3078,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_search_zero_limit_has_no_cursor() {
         let repo = setup_test_repo().await;
 
@@ -2926,6 +3109,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_hard_delete() {
         let repo = setup_test_repo().await;
         let entity = create_test_entity("To Hard Delete");
@@ -2984,6 +3171,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_many_batches_in_requested_order() {
         let repo = setup_test_repo().await;
         let mut ids = Vec::new();
@@ -3040,6 +3231,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_cached_vector_search_matches_exact_ranking() {
         let repo = setup_test_repo().await;
         let vectors: [(&str, [f32; 3]); 4] = [

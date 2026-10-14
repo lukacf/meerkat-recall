@@ -119,23 +119,29 @@ impl WorkDeadletterRepository {
 
     /// Converts a WorkDeadletter to a SurrealDB value for insertion.
     fn work_deadletter_to_value(item: &WorkDeadletter) -> StorageResult<surrealdb::sql::Value> {
-        crate::surreal::json_to_surreal(serde_json::json!({
-            "space_id": item.base.space_id,
-            "created_at": item.base.created_at,
-            "updated_at": item.base.updated_at,
-            "created_by": item.base.created_by,
-            "deleted_at": item.base.deleted_at,
-            "provenance": item.base.provenance,
-            "security": item.base.security,
-            "subjects": item.base.subjects,
-            "subjects_state": item.base.subjects_state,
-            "work_item": item.work_item,
-            "runs": item.runs,
-            "final_error": item.final_error,
-            "deadlettered_at": item.deadlettered_at,
-            "acknowledged": item.acknowledged,
-            "notes": item.notes,
-        }))
+        use surrealdb::sql::Value;
+        let mut object = crate::surreal::base_fields_to_object(&item.base)?;
+        object.insert(
+            "work_item".into(),
+            crate::surreal::thing_from_record_id(item.work_item.id()).into(),
+        );
+        object.insert(
+            "runs".into(),
+            Value::Array(crate::surreal::things_from_links(item.runs.clone())),
+        );
+        object.insert("final_error".into(), Value::from(item.final_error.clone()));
+        object.insert(
+            "deadlettered_at".into(),
+            crate::surreal::datetime_from_chrono(item.deadlettered_at).into(),
+        );
+        object.insert("acknowledged".into(), Value::from(item.acknowledged));
+        object.insert(
+            "notes".into(),
+            item.notes
+                .as_ref()
+                .map_or(Value::None, |value| Value::from(value.clone())),
+        );
+        Ok(Value::Object(object))
     }
 }
 
@@ -391,6 +397,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_create_work_deadletter() {
         let repo = setup_test_repo().await;
         let item = create_test_work_deadletter();
@@ -402,6 +412,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_get_work_deadletter() {
         let repo = setup_test_repo().await;
         let item = create_test_work_deadletter();
@@ -414,6 +428,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_work_deadletter_roundtrip() {
         let repo = setup_test_repo().await;
         let mut item = create_test_work_deadletter();
@@ -427,6 +445,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_update_work_deadletter() {
         let repo = setup_test_repo().await;
         let item = create_test_work_deadletter();
@@ -444,6 +466,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_delete_work_deadletter() {
         let repo = setup_test_repo().await;
         let item = create_test_work_deadletter();

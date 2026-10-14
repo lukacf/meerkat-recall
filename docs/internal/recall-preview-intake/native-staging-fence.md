@@ -1,0 +1,7 @@
+# Native source staging head fence
+
+The native accepted-document staging transaction compares the original captured head payload before writing the immutable Doc/asset projection. Its former same-value payload UPDATE was optimized away by pinned SurrealDB and therefore provided no head-only write conflict. Staging now changes a private `canonical_read_nonce` on that already-present SCHEMALESS head row. The payload, domain timestamps, original publication fence, Source and receipts are unchanged. No new table, schema field, absent row or authority is introduced.
+
+The source-authored native regression calls real acceptance and the real staging entry point. It verifies a fresh private nonce even when the immutable Doc already exists, unchanged semantic head/Source/Doc/receipt, and rejection of actual stale G1 recovery after a real G2 acceptance without recreating missing historical evidence. It does not fabricate publication or an attempt. Controlled concurrent native qualification remains with the independent validation lane; this source checkpoint does not claim that test has executed.
+
+This bounded core repair is independent of the standing delegation family. That later family instead invokes A's full original Doc/head guards and migration 043 physical-key fences and guards current Source authorization; retain those stronger guards when composing it. Direct rustfmt and diff checks pass. No Cargo, Rust tests or provider probes ran in this lane.

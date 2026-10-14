@@ -172,7 +172,7 @@ impl MediaAssetRepository {
         item.map(MediaAsset::try_from).transpose()
     }
 
-    fn media_asset_to_value(asset: &MediaAsset) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn media_asset_to_value(asset: &MediaAsset) -> StorageResult<surrealdb::sql::Value> {
         let mut obj = crate::surreal::base_fields_to_object(&asset.base)?;
         obj.insert(
             "kind".to_string(),
@@ -524,6 +524,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_media_asset_repository_roundtrip_in_memory() {
         let client = StorageClient::new_memory().await.expect("memory client");
         let repo = MediaAssetRepository::new(client);
@@ -531,6 +535,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_media_asset_repository_roundtrip_embedded() {
         let client = StorageClient::new_embedded()
             .await
@@ -540,6 +548,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_media_asset_cross_space_get_is_none_in_memory() {
         let client = StorageClient::new_memory().await.expect("memory client");
         let repo = MediaAssetRepository::new(client);
@@ -547,6 +559,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_media_asset_cross_space_get_is_none_embedded() {
         let client = StorageClient::new_embedded()
             .await
@@ -556,6 +572,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_media_asset_deleted_get_is_none_in_memory() {
         let client = StorageClient::new_memory().await.expect("memory client");
         let repo = MediaAssetRepository::new(client);
@@ -563,6 +583,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep client in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_media_asset_deleted_get_is_none_embedded() {
         let client = StorageClient::new_embedded()
             .await

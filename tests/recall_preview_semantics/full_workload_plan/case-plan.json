@@ -1,0 +1,259 @@
+{
+  "format": "recall-full-workload-plan-package/v1",
+  "execution_authorized": false,
+  "provider_dispatch_authorized": false,
+  "product_acceptance": false,
+  "review_status": "candidate_pending_independent_qualification",
+  "inputs": {
+    "contract": {
+      "root": "qualification",
+      "path": "tests/recall_preview/full-workload-contract.json",
+      "sha256": "44a91b9f0ae4c2ae32d2f8aec9eb783a48ccca63eeee010ff2427ef1ec4a0c0b",
+      "bytes": 10652
+    },
+    "corpus": {
+      "root": "qualification",
+      "path": "tests/recall_preview/workload-corpus.json",
+      "sha256": "2192437954109fc17ebbea5b3960eb6b398a2ee91a725ce70666b119e86179dc",
+      "bytes": 138934
+    },
+    "rendered": {
+      "root": "qualification",
+      "path": "tests/recall_preview/workload-rendered-map.json",
+      "sha256": "9dbcade15daa3fb504838c2fe4f743b4b5fc37da20b2c0f29e2e3aea49ad57ab",
+      "bytes": 43131
+    },
+    "preparation": {
+      "root": "qualification",
+      "path": "tests/recall_preview/workload-preparation-contract.json",
+      "sha256": "b1fd4c43e1c8c506ca13e261a29d65a7d06246bf11ef53c02e97945cd3ef56d1",
+      "bytes": 3508
+    },
+    "graph_manifest": {
+      "root": "recipes",
+      "path": "tests/recall_preview/graph-recipes/manifest.json",
+      "sha256": "1676812ec959f62700f46e38158143f07f00a317e79b64f616d7ab0391695da8",
+      "bytes": 23758
+    }
+  },
+  "components": {
+    "fixtures": {
+      "root": "components",
+      "path": "tests/recall_preview/fixtures.py",
+      "sha256": "ffb15f35c3ad295234284c74c6022cfda2ad1b69a998018b9a8a55db0013be87",
+      "bytes": 2039,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "matrix": {
+      "root": "components",
+      "path": "tests/recall_preview/matrix.py",
+      "sha256": "2abfbc474b5598e5d82190bd47ad554b1899ba8c5b002b1b9f1a0dd1ca30c306",
+      "bytes": 28819,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "oracle": {
+      "root": "components",
+      "path": "tests/recall_preview/oracle.py",
+      "sha256": "57ffffe9ca1dfbe98e984494611d6de07239dd5fff3ffe8454c3dff7ea3dfbbf",
+      "bytes": 22040,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "installed_d_capture": {
+      "root": "components",
+      "path": "scripts/qualification/recall_preview.py",
+      "sha256": "63b6afe0f2024e4405e6df5ed46b41acf941532ac62d45138c8fde220eb3abdb",
+      "bytes": 14574,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "installed_release_artifact": {
+      "root": "components",
+      "path": "scripts/release/artifact.py",
+      "sha256": "d8f62a2b3fae39e00b086774d6b0351e550c5298876a1fea6fc00d56f5bdfc6b",
+      "bytes": 25767,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "installed_original_process_capture": {
+      "root": "components",
+      "path": "scripts/qualification/installed_process_capture.py",
+      "sha256": "731d7c85db8729a6d6f6e7b3757e501f985871d0cf4b6ed77d034f6283a370be",
+      "bytes": 19340,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "full_workload_installed_helpers": {
+      "root": "components",
+      "path": "scripts/qualification/installed_linux_offline.py",
+      "sha256": "9884b82c857da367e63e23cb9609eee54340e1a0264c96f1668b98fe9ffc4331",
+      "bytes": 68982,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "snapshot_inspection_capture": {
+      "root": "components",
+      "path": "scripts/qualification/snapshot_inspection_capture.py",
+      "sha256": "4fd25528d1df53c6fa4840f7e12b5947a463dbf921c3e4bc4f63ecff4c7be2e4",
+      "bytes": 5010,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "runtime_package_bootstrap_contract": {
+      "root": "components",
+      "path": "scripts/qualification/runtime_package_bootstrap_contract.py",
+      "sha256": "460e08d9cbfbbe2890c6aa486b4256d4c2bdd9af0966d6c4193398d44fabee09",
+      "bytes": 19628,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "full_workload_runtime_inspection": {
+      "root": "components",
+      "path": "scripts/qualification/full_workload_runtime_inspection.py",
+      "sha256": "79ce2148bb76f67c0f12e03c223c1ca138af1e4d5504b2be3a4fdc2c2a5fe9c4",
+      "bytes": 17085,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "transport": {
+      "root": "components",
+      "path": "tests/recall_preview_semantics/full_workload_transport.py",
+      "sha256": "308ee747a86a99bb9e6427c34677bfc42845862fcd18fe662d013a75b119554a",
+      "bytes": 22543,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "spy": {
+      "root": "components",
+      "path": "tests/recall_preview_semantics/full_workload_spy.py",
+      "sha256": "604086b12a5cc349121d25bbccebeec13ae2c6e318ae25617abcce5344828284",
+      "bytes": 21797,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "graph": {
+      "root": "components",
+      "path": "tests/recall_preview_semantics/full_workload_graph.py",
+      "sha256": "a2b04bfc33eb065aa7cd77f10362d8da92f7f28e4da4a8e89ff353184d3b45b9",
+      "bytes": 17275,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "load": {
+      "root": "components",
+      "path": "tests/recall_preview_semantics/full_workload_load.py",
+      "sha256": "a6d97ca6c86e8a0c9e2415910d553e3082da07b97eb0389998cc896580680364",
+      "bytes": 10989,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "ob3_oracle": {
+      "root": "components",
+      "path": "scripts/qualification/ob3_outage_oracle.py",
+      "sha256": "b3263d6cec8880929c769b24397975bdc1683123612492cee71324e58bdc5bbf",
+      "bytes": 10839,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "full_workload_owned_runtime": {
+      "root": "components",
+      "path": "scripts/qualification/full_workload_owned_runtime.py",
+      "sha256": "f81ce0d1d021361b20d235ba431b6b7cf22865a286824b11100ad3b196ac0757",
+      "bytes": 46709,
+      "source_commit": "ce8c0ba846eafa47c550fc99addedd1a7fa8a615"
+    },
+    "driver": {
+      "root": "components",
+      "path": "tests/recall_preview_semantics/full_workload_driver.py",
+      "sha256": "57a2c66f8973fcbee2c7fa6e4c512edaa3153e27a9d36b261e35bf5cce44324d",
+      "bytes": 81082,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    },
+    "cli": {
+      "root": "components",
+      "path": "scripts/qualification/full_workload.py",
+      "sha256": "82c23312efb684ef8678e44a5251ee4e53edfc788bc0cc34f2ec39cc023de13f",
+      "bytes": 33101,
+      "source_commit": "464bb1e2ede08cf8e60adfd7c71debf642b7e2bd"
+    }
+  },
+  "recipe_directory": "tests/recall_preview/graph-recipes",
+  "graph_recipe_ids": [
+    "household-fw04-a",
+    "household-fw04-b",
+    "household-fw06",
+    "household-fw07",
+    "household-fw08-a",
+    "household-fw08-b",
+    "household-fw09-running",
+    "household-fw09-pending",
+    "household-fw09-retryable",
+    "household-fw09-intake",
+    "household-fw11",
+    "household-large-graph",
+    "business-fw04-a",
+    "business-fw04-b",
+    "business-fw06",
+    "business-fw07",
+    "business-fw08-a",
+    "business-fw08-b",
+    "business-fw09-running",
+    "business-fw09-pending",
+    "business-fw09-retryable",
+    "business-fw09-intake",
+    "business-fw11",
+    "business-large-graph"
+  ],
+  "large_graph_recipe_ids": [
+    "household-large-graph",
+    "business-large-graph"
+  ],
+  "controlled_fixture_limits": {
+    "backends": [
+      "elephant-db",
+      "surreal-db"
+    ],
+    "backend_order": "sequential",
+    "seconds_per_backend": 1800,
+    "seconds_total": 3600,
+    "public_http_calls_per_backend": 8000,
+    "mutation_concurrency": 1,
+    "search_callers": 140,
+    "requests_per_caller": 2,
+    "load_requests_per_backend": 280,
+    "query_warmups": 0,
+    "harness_retries": 0,
+    "request_seconds": 10,
+    "load_seconds": 180,
+    "raw_source_response_bytes": 3145728,
+    "search_response_bytes": 262144,
+    "request_body_bytes": 3145728,
+    "capture_bytes_per_backend": 1073741824,
+    "owned_spy_dispatches_per_backend": 4096,
+    "owned_spy_request_bytes": 8388608,
+    "owned_spy_response_bytes": 8388608,
+    "owned_spy_concurrency": 160,
+    "held_response_seconds": 120,
+    "external_provider_sends": 0,
+    "paid_model_calls": 0
+  },
+  "required_runtime_inputs": [
+    "independent D expectation file and externally approved file SHA256",
+    "independent D review of exact plan/package/Graph recipes/component pins",
+    "original isolated execution allocation identity and absolute start/expiry",
+    "actual backend and unique original run nonce",
+    "owned loopback service and spy endpoints with verified zero external egress",
+    "actual approved space/config/profile/binding/credential generations",
+    "original capture directory, byte reservation, HTTP/spy count custody",
+    "actual original public Source/operation/generation/immutable revision identities",
+    "original export/compact capacity capture owner",
+    "actual FW10 MCP revoked-principal capture owner",
+    "actual FW13/FW14 consumer receipts and separately authorized service-stop owner",
+    "FW13/FW14 original external receipt descriptors matched by whole original allocation; separate independently approved OB3 expectation bytes binding actual run/commit/workers/POR baseline/original interval/read cap",
+    "original pre-start runtime_plan file/hash: actual archive/binary/source/target, new run directory, both endpoints, paired executable when required; no future startup receipt or token input",
+    "independently reviewed source worker/config/data/manage/revocable inputs; actual owned startup must issue original signed tokens and retain real clean persistent startup evidence"
+  ],
+  "limits_scope": "Source package only; these constants do not allocate a runtime or qualify any result.",
+  "candidate_expectations": {
+    "root": "assembly",
+    "path": "tests/recall_preview_semantics/full_workload_plan/candidate-expectations.json",
+    "sha256": "455d14e8d77ba76c0064e70f403a4b24be2c1ff212dd566a3ea142f76c40f9de",
+    "bytes": 390467
+  },
+  "external_consumer_descriptor_schema": "external-consumer-input.schema.json",
+  "component_source_checkpoint": "ce8c0ba846eafa47c550fc99addedd1a7fa8a615",
+  "independent_runtime_input_review": {
+    "root": "qualification",
+    "path": "tests/recall_preview/full-workload-runtime-input-review.json",
+    "sha256": "8a0ed407ffbb3b1607f7f6d595b753ee1199450778eccee2d8b2430ffde3f111",
+    "bytes": 4702,
+    "source_commit": "7ca07c214128221f4fb3decb90cbdb481de0237d"
+  }
+}

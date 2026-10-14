@@ -154,7 +154,8 @@ impl DagExecutor {
     ///
     /// # Errors
     ///
-    /// Returns an error if the transition fails.
+    /// Returns an error if the transition fails or touches Running work. Claim
+    /// through the queue, then use `transition_attempt` with that captured claim.
     pub async fn transition(
         &self,
         space_id: &str,
@@ -167,6 +168,12 @@ impl DagExecutor {
             .await
             .map_err(PipelineError::StorageError)?
             .ok_or_else(|| PipelineError::NotFound(item_id.to_string()))?;
+
+        if item.status == WorkItemStatus::Running || new_status == WorkItemStatus::Running {
+            return Err(PipelineError::InvalidInput(
+                "Running work requires claim_with_lease and transition_attempt with its original claim".into(),
+            ));
+        }
 
         // Validate transition
         self.validate_transition(item.status, new_status)?;
@@ -186,6 +193,30 @@ impl DagExecutor {
                 "Work item {item_id} status changed before transition"
             ))
         })
+    }
+
+    /// Finish or fail exactly the original claimed attempt. Never pass a claim
+    /// reconstructed by fetching a newer Running work item after execution.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid transition, stale token, or expired lease.
+    pub async fn transition_attempt(
+        &self,
+        claimed: &WorkItem,
+        new_status: WorkItemStatus,
+    ) -> Result<WorkItem, PipelineError> {
+        let fence = elephant_storage::work_attempt_repository::fence_from_claim(claimed)?;
+        self.validate_transition(WorkItemStatus::Running, new_status)?;
+        self.item_repo
+            .update_running_for_worker(
+                &claimed.base.space_id,
+                &claimed.base.id,
+                &fence.lease_token,
+                new_status,
+                None,
+            )
+            .await?
+            .ok_or_else(|| PipelineError::LeaseConflict(claimed.base.id.to_string()))
     }
 
     async fn promote_if_dependencies_done(
@@ -501,19 +532,34 @@ mod tests {
             .expect("to runnable");
         assert_eq!(runnable.status, WorkItemStatus::Runnable);
 
-        // Runnable → Running
-        let running = dag
+        assert!(dag
             .transition(TEST_SPACE, &created.base.id, WorkItemStatus::Running)
             .await
-            .expect("to running");
+            .is_err());
+        let running = item_repo
+            .claim_with_lease(
+                TEST_SPACE,
+                &created.base.id,
+                "fixture",
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+            )
+            .await
+            .expect("claim")
+            .expect("runnable");
         assert_eq!(running.status, WorkItemStatus::Running);
-
-        // Running → Done
-        let done = dag
+        assert!(dag
             .transition(TEST_SPACE, &created.base.id, WorkItemStatus::Done)
             .await
-            .expect("to done");
+            .is_err());
+        let done = dag
+            .transition_attempt(&running, WorkItemStatus::Done)
+            .await
+            .expect("captured attempt completion");
         assert_eq!(done.status, WorkItemStatus::Done);
+        assert!(dag
+            .transition_attempt(&running, WorkItemStatus::Failed)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

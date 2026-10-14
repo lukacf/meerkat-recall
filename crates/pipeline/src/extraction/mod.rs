@@ -11,14 +11,20 @@
 mod allowed_tools;
 mod extractor;
 mod plan;
+mod support;
 mod validator;
 
 #[cfg(feature = "meerkat-extraction")]
 mod agentic_extractor;
 
 pub use allowed_tools::*;
+pub(crate) use extractor::ExtractionRepairContext;
 pub use extractor::*;
 pub use plan::*;
+pub use support::{
+    verify_assertion_support, AssertionSupportVerifier, SupportCandidate, SupportVerdict,
+    SupportVerification, SUPPORT_VERIFIER_VERSION,
+};
 pub use validator::*;
 
 #[cfg(feature = "meerkat-extraction")]

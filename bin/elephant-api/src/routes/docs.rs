@@ -4,15 +4,19 @@
 //! - POST /v1/docs/search - Search documents
 //! - POST /v1/docs/ingest - Ingest a new document
 //! - GET /v1/docs/{id} - Get document by ID
+//! - GET `/v1/docs/{id}/revisions/{revision_id}` - Read an exact current revision
 //! - PUT /v1/docs/{id} - Update document
 //! - DELETE /v1/docs/{id} - Soft delete document
 //! - POST /v1/docs/{id}/restore - Restore soft-deleted document
 //! - GET /v1/docs/collections - Get distinct collections
 //! - POST /v1/docs/batch - Batch create/update documents
 
+#[cfg(test)]
+use elephant_storage::MediaAssetRepository;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::source_intake::accept_intake;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -21,7 +25,9 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use elephant_storage::source_intake::IntakeControl;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 use uuid::Uuid;
@@ -31,7 +37,6 @@ use elephant_embeddings::{
     PartitionKey,
 };
 use elephant_pipeline::scheduler::ingest_work_kinds::{
-    enqueue_triage_source_work_item as enqueue_triage_source_work_item_for_source,
     INGEST_METADATA_KIND, TRIAGE_SOURCE_KIND, UPGRADE_INGEST_MODE_KIND,
 };
 use elephant_pipeline::scheduler::{
@@ -40,12 +45,9 @@ use elephant_pipeline::scheduler::{
 };
 use elephant_policy::RecordAttributes;
 use elephant_storage::{
-    find_existing_doc_for_doc, find_existing_source_for_doc, parse_id,
-    persist_manual_doc_for_source_detailed, preview_persisted_manual_doc_for_source,
-    rollback_persisted_manual_doc, rollback_persisted_source, update_existing_source_for_reingest,
-    AssertionRepository, DocNodeRepository, DocRepository, DocRevisionRepository,
-    MediaAssetRepository, NodeEmbeddingRepository, PersistedManualDoc, Repository, SearchCriteria,
-    SearchRepository, SourceRepository, SpaceConfigRepository, StorageClient, WorkItemRepository,
+    find_existing_doc_for_doc, parse_id, AssertionRepository, DocNodeRepository, DocRepository,
+    DocRevisionRepository, NodeEmbeddingRepository, Repository, SearchCriteria, SearchRepository,
+    SourceRepository, SpaceConfigRepository, StorageClient, WorkItemRepository,
 };
 use elephant_types::ids::TableName;
 use elephant_types::mcp_simple::ExtractionGuidanceInput;
@@ -57,8 +59,7 @@ use elephant_types::records::doc_node::DocNode;
 use elephant_types::records::ingest::IngestMode;
 use elephant_types::records::media_asset::{inline_media_max_bytes, managed_asset_relative_path};
 use elephant_types::records::source::{
-    apply_manual_doc_to_source, manual_doc_template_from_doc, prepare_source_for_reingest,
-    ManualDocTemplate, SourceLifecycleStatus,
+    manual_doc_template_from_doc, ManualDocTemplate, SourceLifecycleStatus,
 };
 use elephant_types::records::work::WorkItemStatus;
 use elephant_types::records::{Doc, Source, SourceType};
@@ -69,7 +70,7 @@ use elephant_types::{BaseFieldsBuilder, RecordId};
 
 use crate::auth::Principal as AuthPrincipal;
 use crate::authz::AuthzState;
-use crate::routes::entities::{ApiError, BatchError, BatchRequest, BatchResponse};
+use crate::routes::entities::{ApiError, BatchError, BatchRequest};
 use crate::routes::ingest_guard::ensure_semantic_ingest_ready;
 use crate::routes::require_space_id;
 use crate::runtime::RuntimeManager;
@@ -156,6 +157,9 @@ pub enum IngestRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizedIngestRequest {
+    /// Explicit immutable revision and desired-head comparison.
+    #[serde(default)]
+    pub intake: IntakeControl,
     /// Document title.
     pub title: String,
     /// Optional document text content or sidecar metadata for media docs.
@@ -185,6 +189,9 @@ pub struct NormalizedIngestRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyIngestRequest {
+    /// Explicit immutable revision and desired-head comparison.
+    #[serde(default)]
+    pub intake: IntakeControl,
     /// Document data.
     pub doc: Doc,
     /// Optional collection override.
@@ -210,6 +217,9 @@ pub enum BatchDocItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizedBatchDocItem {
+    /// Explicit immutable revision and desired-head comparison.
+    #[serde(default)]
+    pub intake: IntakeControl,
     /// Document title.
     pub title: String,
     /// Optional document text content or sidecar metadata for media docs.
@@ -431,55 +441,6 @@ fn build_media_attachments(
     })
 }
 
-async fn persist_prepared_media_assets(
-    storage: &StorageClient,
-    assets: &[MediaAsset],
-) -> Result<(), ApiError> {
-    let repo = MediaAssetRepository::new(storage.clone());
-    let mut persisted_ids = Vec::with_capacity(assets.len());
-    for asset in assets {
-        match repo.create(asset.clone()).await {
-            Ok(_) => persisted_ids.push(asset.base.id.clone()),
-            Err(error) => {
-                rollback_media_assets_by_ids(storage, &asset.base.space_id, &persisted_ids).await;
-                return Err(ApiError::internal(format!(
-                    "failed to persist media asset metadata: {error}"
-                )));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn rollback_media_assets_by_ids(
-    storage: &StorageClient,
-    space_id: &str,
-    asset_ids: &[RecordId],
-) {
-    let repo = MediaAssetRepository::new(storage.clone());
-    for asset_id in asset_ids {
-        if let Err(err) = repo.delete(space_id, asset_id).await {
-            warn!(
-                asset_id = %asset_id,
-                error = %err,
-                "failed to roll back staged media asset after ingest failure"
-            );
-        }
-    }
-}
-
-async fn rollback_prepared_media_assets(storage: &StorageClient, assets: &[MediaAsset]) {
-    let Some(first_asset) = assets.first() else {
-        return;
-    };
-    let asset_ids = assets
-        .iter()
-        .map(|asset| asset.base.id.clone())
-        .collect::<Vec<_>>();
-    rollback_media_assets_by_ids(storage, &first_asset.base.space_id, &asset_ids).await;
-}
-
 impl NormalizedIngestRequest {
     fn into_doc(self, principal: &AuthPrincipal) -> Result<PreparedDoc, ApiError> {
         let normalized_text = normalize_optional_text(self.text.clone());
@@ -533,6 +494,13 @@ impl NormalizedIngestRequest {
 }
 
 impl IngestRequest {
+    fn intake(&self) -> IntakeControl {
+        match self {
+            Self::Normalized(req) => req.intake.clone(),
+            Self::Legacy(req) => req.intake.clone(),
+        }
+    }
+
     const fn sync(&self) -> bool {
         match self {
             Self::Normalized(req) => req.sync,
@@ -545,6 +513,7 @@ impl IngestRequest {
             Self::Normalized(req) => req.into_doc(principal),
             Self::Legacy(req) => {
                 let LegacyIngestRequest {
+                    intake: _,
                     mut doc,
                     collection,
                     sync: _,
@@ -587,6 +556,7 @@ impl BatchDocItem {
                 })
             }
             Self::Normalized(item) => NormalizedIngestRequest {
+                intake: IntakeControl::default(),
                 title: item.title,
                 text: item.text,
                 media: item.media,
@@ -802,9 +772,14 @@ async fn rerun_text_search_after_authz_filter(
             break;
         };
 
-        let allowed = state
-            .authz
-            .filter_records(principal, vec![doc], DOC_SEARCH_SCOPE);
+        let allowed = super::current_read::filter(
+            Some(&state.storage),
+            &state.authz,
+            principal,
+            vec![doc],
+            DOC_SEARCH_SCOPE,
+        )
+        .await?;
         if let Some(doc) = allowed.into_iter().next() {
             if visible.len() < limit {
                 visible.push(doc);
@@ -880,10 +855,15 @@ async fn count_visible_text_search_results(
             break;
         };
 
-        if !state
-            .authz
-            .filter_records(principal, vec![doc], DOC_SEARCH_SCOPE)
-            .is_empty()
+        if !super::current_read::filter(
+            Some(&state.storage),
+            &state.authz,
+            principal,
+            vec![doc],
+            DOC_SEARCH_SCOPE,
+        )
+        .await?
+        .is_empty()
         {
             total_visible += 1;
         }
@@ -1063,9 +1043,25 @@ fn graph_ingest_is_still_pending(source: Option<&Source>, assertions_count: usiz
     )
 }
 
+/// POST /v1/docs/search - Search authorized document metadata and content.
+async fn search_docs(
+    State(state): State<Arc<DocsState>>,
+    axum::Extension(principal): axum::Extension<AuthPrincipal>,
+    Json(req): Json<DocSearchRequest>,
+) -> ApiResult<DocSearchResponse> {
+    let Json(mut response) =
+        search_docs_unredacted(State(state), axum::Extension(principal.clone()), Json(req)).await?;
+    response.results = response
+        .results
+        .into_iter()
+        .map(|doc| crate::redact_doc(&principal, doc).data)
+        .collect();
+    Ok(Json(response))
+}
+
 /// POST /v1/docs/search - Search documents.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-async fn search_docs(
+async fn search_docs_unredacted(
     State(state): State<Arc<DocsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(req): Json<DocSearchRequest>,
@@ -1106,15 +1102,21 @@ async fn search_docs(
         let requested_visible = semantic_offset.saturating_add(page_limit);
         let mut candidate_limit =
             semantic_candidate_limit(requested_visible.max(page_limit).max(1));
-        let policy = resolve_embedding_policy(state.as_ref(), &space_id).await?;
-        let provider = state
-            .provider_cache
-            .get_or_create(policy.clone(), build_embedding_provider)
-            .await;
+        let (policy, provider) = resolve_query_embedding(state.as_ref(), &space_id).await?;
 
         let embeddings = match provider.embed(std::slice::from_ref(&query)).await {
             Ok(embeddings) => embeddings,
             Err(err) => {
+                if err.to_string().contains("provider_authorization") {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(ApiError {
+                            code: "provider_unapproved".into(),
+                            message: "Query provider approval is no longer current".into(),
+                            details: None,
+                        }),
+                    ));
+                }
                 warn!("Embedding provider failed, falling back to text search: {err}");
                 return run_text_search_for_semantic_fallback(
                     state.as_ref(),
@@ -1254,9 +1256,14 @@ async fn search_docs(
                 .filter_map(|id| doc_map.remove(&id))
                 .collect();
 
-            let filtered = state
-                .authz
-                .filter_records(&principal, ordered_docs, DOC_SEARCH_SCOPE);
+            let filtered = super::current_read::filter(
+                Some(&state.storage),
+                &state.authz,
+                &principal,
+                ordered_docs,
+                DOC_SEARCH_SCOPE,
+            )
+            .await?;
 
             // The page needs `offset + limit` documents, plus one more to know
             // whether a next page exists.
@@ -1351,9 +1358,14 @@ async fn run_text_search(
     })?;
 
     let raw_page_len = result.results.len();
-    let filtered = state
-        .authz
-        .filter_records(principal, result.results, DOC_SEARCH_SCOPE);
+    let filtered = super::current_read::filter(
+        Some(&state.storage),
+        &state.authz,
+        principal,
+        result.results,
+        DOC_SEARCH_SCOPE,
+    )
+    .await?;
 
     if should_rerun_text_search_after_authz(
         raw_page_len,
@@ -1383,33 +1395,27 @@ async fn run_text_search(
     }))
 }
 
-async fn resolve_embedding_policy(
+async fn resolve_query_embedding(
     state: &DocsState,
     space_id: &str,
-) -> Result<EmbeddingPolicy, (StatusCode, Json<ApiError>)> {
-    let policy = match state.space_config_repo.get_by_space_id(space_id).await {
-        Ok(Some(config)) => EmbeddingPolicy::from_space_config(&config),
-        Ok(None) => EmbeddingPolicy::from_env(),
-        Err(err) => {
-            warn!("Failed to load space_config, falling back to env: {err}");
-            EmbeddingPolicy::from_env()
-        }
-    };
-
-    if policy.dims == 0 {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(
-                "Embedding policy has invalid dimensions".to_string(),
-            )),
-        ));
-    }
-
-    Ok(policy)
-}
-
-fn build_embedding_provider(policy: &EmbeddingPolicy) -> Arc<dyn EmbeddingProvider> {
-    elephant_embeddings::provider_for_policy(policy)
+) -> Result<(EmbeddingPolicy, Arc<dyn EmbeddingProvider>), (StatusCode, Json<ApiError>)> {
+    let (policy, provider, _) = elephant_pipeline::provider_dispatch::ProviderDispatchContext::new(
+        state.space_config_repo.clone(),
+        space_id.to_owned(),
+    )
+    .embedding(elephant_types::provider_binding::ModelOperation::QueryEmbedding)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(ApiError {
+                code: "provider_unapproved".into(),
+                message: "No current approved query embedding binding".into(),
+                details: None,
+            }),
+        )
+    })?;
+    Ok((policy, provider))
 }
 
 async fn build_partition_keys(
@@ -1455,6 +1461,8 @@ const fn semantic_candidate_limit(k: usize) -> usize {
 /// Ingest result returned by the API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestResult {
+    /// Durable acceptance receipt, distinct from completed publication.
+    pub operation: elephant_types::publication::OperationReceipt,
     /// The document ID.
     pub doc_id: String,
     /// The source ID driving the source-first lifecycle.
@@ -1469,7 +1477,9 @@ pub struct IngestResult {
     pub enqueued: bool,
 }
 
-fn build_manual_source_for_doc(doc: &Doc) -> Result<(Source, ManualDocTemplate), ApiError> {
+pub(super) fn build_manual_source_for_doc(
+    doc: &Doc,
+) -> Result<(Source, ManualDocTemplate), ApiError> {
     let mut source_base = BaseFields::new(
         RecordId::new_v4(TableName::Source),
         doc.base.space_id.clone(),
@@ -1498,347 +1508,38 @@ fn build_manual_source_for_doc(doc: &Doc) -> Result<(Source, ManualDocTemplate),
     Ok((source, template))
 }
 
-async fn stage_source_for_manual_doc(
-    state: &DocsState,
-    principal: &AuthPrincipal,
+async fn prepare_manual_source_for_doc(
+    storage: &StorageClient,
     doc: &Doc,
-) -> Result<(Source, Option<Source>), (StatusCode, Json<ApiError>)> {
-    stage_source_for_manual_doc_with_authz(state, principal, doc, true).await
-}
-
-async fn stage_source_for_manual_doc_with_authz(
-    state: &DocsState,
-    principal: &AuthPrincipal,
-    doc: &Doc,
-    require_source_write: bool,
-) -> Result<(Source, Option<Source>), (StatusCode, Json<ApiError>)> {
-    if let Some(existing_doc) = find_existing_doc_for_doc(&state.storage, doc)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
-    {
-        state
-            .authz
-            .authorize_record_write(principal, &existing_doc, "write:doc")
-            .map_err(|e| {
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(ApiError {
-                        code: e.code,
-                        message: e.message,
-                        details: None,
-                    }),
-                )
-            })?;
-    }
-
-    if let Some(existing_source) = find_existing_source_for_doc(&state.storage, doc)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?
-    {
-        if require_source_write {
-            state
-                .authz
-                .authorize_record_write(principal, &existing_source, "write:source")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-        }
-        let mut updated_source = existing_source.clone();
-        apply_manual_doc_to_source(&mut updated_source, doc).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiError::validation(e.to_string())),
-            )
-        })?;
-        updated_source.external_id = Some(doc.base.id.to_string());
-        updated_source.set_requested_ingest_mode(IngestMode::Graph);
-        let updated_source = prepare_source_for_reingest(&existing_source, updated_source);
-        if require_source_write {
-            state
-                .authz
-                .authorize_record_write(principal, &updated_source, "write:source")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-        }
-        return Ok((updated_source, Some(existing_source)));
-    }
-
-    let (source, _template) =
-        build_manual_source_for_doc(doc).map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
-    if require_source_write {
-        state
-            .authz
-            .authorize_record_write(principal, &source, "write:source")
-            .map_err(|e| {
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(ApiError {
-                        code: e.code,
-                        message: e.message,
-                        details: None,
-                    }),
-                )
-            })?;
-    }
-    Ok((source, None))
-}
-
-async fn authorize_persisted_manual_doc_write(
-    state: &DocsState,
-    principal: &AuthPrincipal,
-    source: &Source,
-    doc: &Doc,
-) -> Result<(), (StatusCode, Json<ApiError>)> {
-    let preview = preview_persisted_manual_doc_for_source(&state.storage, source, doc)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-    state
-        .authz
-        .authorize_record_write(principal, &preview, "write:doc")
-        .map_err(|e| {
-            (
-                StatusCode::FORBIDDEN,
-                Json(ApiError {
-                    code: e.code,
-                    message: e.message,
-                    details: None,
-                }),
-            )
-        })
-}
-
-async fn rollback_staged_source_and_doc(
-    state: &DocsState,
-    source: &Source,
-    previous_source: Option<&Source>,
-    staged_doc: &PersistedManualDoc,
-) {
-    if let Err(err) = rollback_persisted_manual_doc(&state.storage, staged_doc).await {
-        warn!(
-            doc_id = %staged_doc.doc.base.id,
-            source_id = %source.base.id,
-            rollback_error = %err,
-            "failed to roll back staged manual doc after ingest failure"
-        );
-    }
-
-    match previous_source {
-        Some(previous_source) => {
-            if let Err(err) =
-                rollback_persisted_source(&state.storage, source, Some(previous_source)).await
-            {
-                warn!(
-                    source_id = %previous_source.base.id,
-                    rollback_error = %err,
-                    "failed to roll back staged source after ingest failure"
-                );
-            }
-        }
-        None => {
-            if let Err(err) = rollback_persisted_source(&state.storage, source, None).await {
-                warn!(
-                    source_id = %source.base.id,
-                    rollback_error = %err,
-                    "failed to delete staged source after ingest failure"
-                );
-            }
-        }
-    }
-}
-
-async fn persist_staged_manual_source_and_doc(
-    state: &DocsState,
-    source_candidate: Source,
-    previous_source: Option<Source>,
-    doc: Doc,
-) -> Result<(Source, PersistedManualDoc), (StatusCode, Json<ApiError>)> {
-    if let Some(previous_source) = previous_source {
-        let updated_source = update_existing_source_for_reingest(
-            &state.source_repo,
-            &previous_source,
-            source_candidate,
-        )
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            )
-        })?;
-        match persist_manual_doc_for_source_detailed(&state.storage, &updated_source, doc).await {
-            Ok(staged_doc) => Ok((updated_source, staged_doc)),
-            Err(err) => {
-                if let Err(rollback_err) = rollback_persisted_source(
-                    &state.storage,
-                    &updated_source,
-                    Some(&previous_source),
-                )
-                .await
-                {
-                    warn!(
-                        source_id = %previous_source.base.id,
-                        error = %err,
-                        rollback_error = %rollback_err,
-                        "failed to roll back source after manual doc persistence error"
-                    );
-                }
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(err.to_string())),
-                ))
-            }
-        }
-    } else {
-        let created_source = state
-            .source_repo
-            .create(source_candidate)
+) -> Result<(Source, ManualDocTemplate), (StatusCode, Json<ApiError>)> {
+    let (proposed, template) =
+        build_manual_source_for_doc(doc).map_err(|error| (StatusCode::BAD_REQUEST, Json(error)))?;
+    let Some(mut source) =
+        elephant_storage::source_intake::existing_source_for_manual_document(storage, doc)
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )
-            })?;
-        match persist_manual_doc_for_source_detailed(&state.storage, &created_source, doc).await {
-            Ok(staged_doc) => Ok((created_source, staged_doc)),
-            Err(err) => {
-                if let Err(cleanup_err) =
-                    rollback_persisted_source(&state.storage, &created_source, None).await
-                {
-                    warn!(
-                        source_id = %created_source.base.id,
-                        error = %err,
-                        cleanup_error = %cleanup_err,
-                        "failed to roll back source after manual doc persistence error"
-                    );
-                }
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(err.to_string())),
-                ))
-            }
-        }
-    }
-}
-
-async fn stage_and_enqueue_manual_doc(
-    state: &DocsState,
-    principal: &AuthPrincipal,
-    doc: Doc,
-) -> Result<(Source, PersistedManualDoc, RecordId), (StatusCode, Json<ApiError>)> {
-    let (source_candidate, previous_source) =
-        stage_source_for_manual_doc(state, principal, &doc).await?;
-    authorize_persisted_manual_doc_write(state, principal, &source_candidate, &doc).await?;
-    let rollback_source = previous_source.clone();
-    let (staged_source, staged_doc) = Box::pin(persist_staged_manual_source_and_doc(
-        state,
-        source_candidate,
-        previous_source,
-        doc,
-    ))
-    .await?;
-    let work_item_id = match enqueue_triage_source_work_item_for_source(
-        &state.storage,
-        &staged_source,
-        &principal.subject,
-        5,
-    )
-    .await
-    {
-        Ok(work_item_id) => work_item_id,
-        Err(e) => {
-            rollback_staged_source_and_doc(
-                state,
-                &staged_source,
-                rollback_source.as_ref(),
-                &staged_doc,
-            )
-            .await;
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            ));
-        }
+            .map_err(super::source_intake::storage_error)?
+    else {
+        return Ok((proposed, template));
     };
-
-    Ok((staged_source, staged_doc, work_item_id))
-}
-
-async fn stage_and_enqueue_manual_doc_doc_surface(
-    state: &DocsState,
-    principal: &AuthPrincipal,
-    doc: Doc,
-) -> Result<(Source, PersistedManualDoc, RecordId), (StatusCode, Json<ApiError>)> {
-    let (source_candidate, previous_source) =
-        stage_source_for_manual_doc_with_authz(state, principal, &doc, false).await?;
-    authorize_persisted_manual_doc_write(state, principal, &source_candidate, &doc).await?;
-    let rollback_source = previous_source.clone();
-    let (staged_source, staged_doc) = Box::pin(persist_staged_manual_source_and_doc(
-        state,
-        source_candidate,
-        previous_source,
-        doc,
-    ))
-    .await?;
-    let work_item_id = match enqueue_triage_source_work_item_for_source(
-        &state.storage,
-        &staged_source,
-        &principal.subject,
-        5,
-    )
-    .await
-    {
-        Ok(work_item_id) => work_item_id,
-        Err(e) => {
-            rollback_staged_source_and_doc(
-                state,
-                &staged_source,
-                rollback_source.as_ref(),
-                &staged_doc,
-            )
-            .await;
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError::internal(e.to_string())),
-            ));
-        }
-    };
-
-    Ok((staged_source, staged_doc, work_item_id))
+    source.base.security.clone_from(&proposed.base.security);
+    source.base.provenance.clone_from(&proposed.base.provenance);
+    source.base.subjects.clone_from(&proposed.base.subjects);
+    source.base.subjects_state = proposed.base.subjects_state;
+    source.author = proposed.author;
+    source.hash = proposed.hash;
+    source
+        .set_manual_doc_template(&template)
+        .map_err(|error| super::source_intake::storage_error(error.into()))?;
+    source.set_requested_ingest_mode(IngestMode::Graph);
+    Ok((source, template))
 }
 
 /// POST /v1/docs/ingest - Ingest a new document.
 #[allow(clippy::similar_names, clippy::too_many_lines)]
+#[expect(
+    clippy::large_futures,
+    reason = "Retain the existing dispatch future layout and ownership across the original await"
+)]
 async fn ingest_doc(
     State(state): State<Arc<DocsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -1854,10 +1555,31 @@ async fn ingest_doc(
         ));
     }
     let space_id = require_space_id(&principal)?;
-    let mut prepared = req
+    let intake = req.intake();
+    let create_id = if matches!(&req, IngestRequest::Normalized(_)) {
+        Some(
+            elephant_storage::source_intake::create_document_id(
+                &space_id,
+                &serde_json::to_value(&req).map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiError::validation(error.to_string())),
+                    )
+                })?,
+                &intake,
+            )
+            .map_err(super::source_intake::storage_error)?,
+        )
+    } else {
+        None
+    };
+    let prepared = req
         .into_doc(&principal)
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(error)))?;
     let mut doc = prepared.doc;
+    if let Some(id) = create_id {
+        doc.base.id = id;
+    }
     doc.base.space_id.clone_from(&space_id);
     if let Some(existing_doc) = find_existing_doc_for_doc(&state.storage, &doc)
         .await
@@ -1895,31 +1617,35 @@ async fn ingest_doc(
         ));
     }
 
-    let rollback_assets = prepared.pending_assets.clone();
-    persist_prepared_media_assets(&state.storage, &prepared.pending_assets)
-        .await
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, Json(error)))?;
-    prepared.pending_assets.clear();
-
-    let doc_id = doc.base.id.to_string();
-    let result = stage_and_enqueue_manual_doc(&state, &principal, doc.clone()).await;
-    let (staged_source, _staged_doc, work_item_id) = match result {
-        Ok(value) => value,
-        Err(err) => {
-            rollback_prepared_media_assets(&state.storage, &rollback_assets).await;
-            return Err(err);
-        }
-    };
-
+    let (source, _) = prepare_manual_source_for_doc(&state.storage, &doc).await?;
+    let (accepted, work_item_id) = accept_intake(
+        &state.storage,
+        &state.authz,
+        &principal,
+        source,
+        Some(&doc),
+        intake,
+        &prepared.pending_assets,
+    )
+    .await?;
+    let accepted_doc = accepted.document.ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::internal(
+                "accepted document input has no document",
+            )),
+        )
+    })?;
     Ok((
-        StatusCode::CREATED,
+        StatusCode::ACCEPTED,
         Json(IngestResult {
-            doc_id,
-            source_id: staged_source.base.id.to_string(),
-            lifecycle_status: staged_source.lifecycle_status,
-            current_ingest_mode: staged_source.current_ingest_mode,
-            work_item_id: Some(work_item_id.to_string()),
-            enqueued: true,
+            doc_id: accepted_doc.base.id.to_string(),
+            source_id: accepted.source.base.id.to_string(),
+            lifecycle_status: accepted.source.lifecycle_status,
+            current_ingest_mode: accepted.source.current_ingest_mode,
+            enqueued: work_item_id.is_some(),
+            work_item_id: work_item_id.map(|id| id.to_string()),
+            operation: accepted.operation,
         }),
     ))
 }
@@ -1965,7 +1691,15 @@ async fn get_doc(
                         }),
                     )
                 })?;
-            Ok(Json(doc))
+            let doc = super::current_read::require(
+                Some(&state.storage),
+                &state.authz,
+                &principal,
+                doc,
+                "read:doc:metadata",
+            )
+            .await?;
+            Ok(Json(crate::redact_doc(&principal, doc).data))
         }
         Ok(None) => Err((StatusCode::NOT_FOUND, Json(ApiError::not_found("Doc", &id)))),
         Err(e) => Err((
@@ -1975,63 +1709,126 @@ async fn get_doc(
     }
 }
 
+/// Retained document replacement input; control fields are not document metadata.
+#[derive(Debug, Deserialize)]
+pub struct DocWriteRequest {
+    /// Complete document proposal.
+    #[serde(flatten)]
+    pub doc: Doc,
+    /// Explicit source revision intent.
+    #[serde(default)]
+    pub intake: IntakeControl,
+}
+
 /// PUT /v1/docs/{id} - Update document.
+#[expect(
+    clippy::large_futures,
+    clippy::significant_drop_tightening,
+    reason = "Retain the existing dispatch future layout and ownership across the original await; Retain guard, repository and runtime owners through the original response or state transition scope"
+)]
 async fn update_doc(
     State(state): State<Arc<DocsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(id): Path<String>,
-    Json(doc): Json<Doc>,
+    Json(request): Json<DocWriteRequest>,
 ) -> ApiResult<Doc> {
+    ensure_semantic_ingest_ready(state.runtime.as_ref()).await?;
     let space_id = require_space_id(&principal)?;
-    let rid = parse_id(&id, TableName::Doc).map_err(|e| {
-        (
+    let rid = parse_id(&id, TableName::Doc).map_err(super::source_intake::storage_error)?;
+    let mutation =
+        elephant_storage::public_mutation::PublicMutation::begin(state.storage.clone(), &space_id)
+            .await
+            .map_err(super::source_intake::storage_error)?;
+    let existing = state
+        .doc_repo
+        .get(&space_id, &rid)
+        .await
+        .map_err(super::source_intake::storage_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ApiError::not_found("Doc", &id))))?;
+    let doc = request.doc;
+    if doc.base.id != rid || doc.base.space_id != space_id {
+        return Err((
             StatusCode::BAD_REQUEST,
-            Json(ApiError::validation(e.to_string())),
+            Json(ApiError::validation(
+                "document identity differs from selected route",
+            )),
+        ));
+    }
+    if existing.source != doc.source {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError::validation(
+                "document source lineage cannot be reassigned",
+            )),
+        ));
+    }
+    if existing.source.is_none() {
+        let denied = |error: crate::authz::AuthzError| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError {
+                    code: error.code,
+                    message: error.message,
+                    details: None,
+                }),
+            )
+        };
+        state
+            .authz
+            .authorize_record_read(&principal, &existing, "read:doc:metadata")
+            .map_err(denied)?;
+        state
+            .authz
+            .authorize_record_write(&principal, &existing, "write:doc")
+            .map_err(denied)?;
+        state
+            .authz
+            .authorize_record_read(&principal, &doc, "read:doc:metadata")
+            .map_err(denied)?;
+        state
+            .authz
+            .authorize_record_write(&principal, &doc, "write:doc")
+            .map_err(denied)?;
+        let updated = mutation
+            .replace(&existing, doc, false, &principal.subject)
+            .await
+            .map_err(super::source_intake::storage_error)?;
+        return Ok(Json(crate::redact_doc(&principal, updated).data));
+    }
+    let source = if let Some(link) = &existing.source {
+        state
+            .source_repo
+            .get(&space_id, link.id())
+            .await
+            .map_err(super::source_intake::storage_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiError::not_found("Source", &link.id().to_string())),
+                )
+            })?
+    } else {
+        build_manual_source_for_doc(&doc)
+            .map_err(|error| (StatusCode::BAD_REQUEST, Json(error)))?
+            .0
+    };
+    let (accepted, _) = accept_intake(
+        &state.storage,
+        &state.authz,
+        &principal,
+        source,
+        Some(&doc),
+        request.intake,
+        &[],
+    )
+    .await?;
+    let doc = accepted.document.ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::internal("accepted input has no document")),
         )
     })?;
-    match state.doc_repo.get(&space_id, &rid).await {
-        Ok(Some(existing)) => {
-            state
-                .authz
-                .authorize_record_write(&principal, &existing, "write:doc")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-            state
-                .authz
-                .authorize_record_write(&principal, &doc, "write:doc")
-                .map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ApiError {
-                            code: e.code,
-                            message: e.message,
-                            details: None,
-                        }),
-                    )
-                })?;
-
-            match state.doc_repo.update(&space_id, &rid, doc).await {
-                Ok(updated) => Ok(Json(updated)),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
-            }
-        }
-        Ok(None) => Err((StatusCode::NOT_FOUND, Json(ApiError::not_found("Doc", &id)))),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
-    }
+    Ok(Json(crate::redact_doc(&principal, doc).data))
 }
 
 /// DELETE /v1/docs/{id} - Soft delete document.
@@ -2039,7 +1836,8 @@ async fn delete_doc(
     State(state): State<Arc<DocsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(id): Path<String>,
-) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    Query(intake): Query<IntakeControl>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<ApiError>)> {
     let space_id = require_space_id(&principal)?;
     let rid = parse_id(&id, TableName::Doc).map_err(|e| {
         (
@@ -2047,7 +1845,11 @@ async fn delete_doc(
             Json(ApiError::validation(e.to_string())),
         )
     })?;
-    match state.doc_repo.get(&space_id, &rid).await {
+    let mutation =
+        elephant_storage::public_mutation::PublicMutation::begin(state.storage.clone(), &space_id)
+            .await
+            .map_err(super::source_intake::storage_error)?;
+    match state.doc_repo.get_with_deleted(&space_id, &rid).await {
         Ok(Some(existing)) => {
             state
                 .authz
@@ -2063,12 +1865,48 @@ async fn delete_doc(
                     )
                 })?;
 
-            match state.doc_repo.delete(&space_id, &rid).await {
-                Ok(()) => Ok(StatusCode::NO_CONTENT),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
+            state
+                .authz
+                .authorize_record_read(&principal, &existing, "read:doc:metadata")
+                .map_err(|error| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(ApiError {
+                            code: error.code,
+                            message: error.message,
+                            details: None,
+                        }),
+                    )
+                })?;
+            if let Some(source_link) = &existing.source {
+                let source = state
+                    .source_repo
+                    .get_with_deleted(&space_id, source_link.id())
+                    .await
+                    .map_err(super::source_intake::storage_error)?
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(ApiError::not_found("Source", &source_link.id().to_string())),
+                        )
+                    })?;
+                let operation = super::source_intake::retract_intake(
+                    &state.storage,
+                    &state.authz,
+                    &principal,
+                    &source,
+                    intake,
+                    Some(&existing),
+                )
+                .await?;
+                return Ok((
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({"operation":operation})),
+                ));
+            }
+            match mutation.delete(&existing, &principal.subject).await {
+                Ok(_) => Ok((StatusCode::OK, Json(serde_json::json!({"deleted":true})))),
+                Err(error) => Err(super::source_intake::storage_error(error)),
             }
         }
         Ok(None) => Err((StatusCode::NOT_FOUND, Json(ApiError::not_found("Doc", &id)))),
@@ -2080,10 +1918,15 @@ async fn delete_doc(
 }
 
 /// POST /v1/docs/{id}/restore - Restore soft-deleted document.
+#[expect(
+    clippy::large_futures,
+    reason = "Retain the existing dispatch future layout and ownership across the original await"
+)]
 async fn restore_doc(
     State(state): State<Arc<DocsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Path(id): Path<String>,
+    Query(intake): Query<IntakeControl>,
 ) -> ApiResult<Doc> {
     let space_id = require_space_id(&principal)?;
     let rid = parse_id(&id, TableName::Doc).map_err(|e| {
@@ -2092,6 +1935,10 @@ async fn restore_doc(
             Json(ApiError::validation(e.to_string())),
         )
     })?;
+    let mutation =
+        elephant_storage::public_mutation::PublicMutation::begin(state.storage.clone(), &space_id)
+            .await
+            .map_err(super::source_intake::storage_error)?;
     match state.doc_repo.get_with_deleted(&space_id, &rid).await {
         Ok(Some(existing)) => {
             state
@@ -2122,12 +1969,37 @@ async fn restore_doc(
                     )
                 })?;
 
-            match state
-                .doc_repo
-                .restore_guarded(&space_id, &rid, &existing)
-                .await
-            {
-                Ok(restored) => Ok(Json(restored)),
+            if let Some(source_link) = &existing.source {
+                let source = state
+                    .source_repo
+                    .get_with_deleted(&space_id, source_link.id())
+                    .await
+                    .map_err(super::source_intake::storage_error)?
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(ApiError::not_found("Source", &source_link.id().to_string())),
+                        )
+                    })?;
+                let (accepted, _) = super::source_intake::restore_intake(
+                    &state.storage,
+                    &state.authz,
+                    &principal,
+                    source,
+                    intake,
+                    Some(&existing),
+                )
+                .await?;
+                let doc = accepted.document.ok_or_else(|| {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(ApiError::validation("source has no document")),
+                    )
+                })?;
+                return Ok(Json(crate::redact_doc(&principal, doc).data));
+            }
+            match mutation.restore(&existing, &principal.subject).await {
+                Ok(restored) => Ok(Json(crate::redact_doc(&principal, restored).data)),
                 Err(elephant_storage::StorageError::Conflict(_)) => Err((
                     StatusCode::CONFLICT,
                     Json(ApiError {
@@ -2136,10 +2008,7 @@ async fn restore_doc(
                         details: None,
                     }),
                 )),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
+                Err(error) => Err(super::source_intake::storage_error(error)),
             }
         }
         Ok(None) => Err((StatusCode::NOT_FOUND, Json(ApiError::not_found("Doc", &id)))),
@@ -2170,16 +2039,51 @@ async fn get_collections(
 }
 
 /// POST /v1/docs/batch - Batch create/update documents.
+/// Accepted documents and their original operation receipts in matching order.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BatchDocIntakeResponse {
+    pub succeeded: Vec<Doc>,
+    pub operations: Vec<elephant_types::publication::OperationReceipt>,
+    pub failed: Vec<BatchError>,
+}
+
+#[expect(
+    clippy::large_futures,
+    reason = "Retain the existing dispatch future layout and ownership across the original await"
+)]
 async fn batch_docs(
     State(state): State<Arc<DocsState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(req): Json<BatchRequest<BatchDocItem>>,
-) -> ApiResult<BatchResponse<Doc>> {
+) -> ApiResult<BatchDocIntakeResponse> {
+    ensure_semantic_ingest_ready(state.runtime.as_ref()).await?;
     let space_id = require_space_id(&principal)?;
     let mut succeeded = Vec::new();
+    let mut operations = Vec::new();
     let mut failed = Vec::new();
 
     for (index, item) in req.items.into_iter().enumerate() {
+        let intake = match &item {
+            BatchDocItem::Normalized(item) => item.intake.clone(),
+            BatchDocItem::Legacy(_) => IntakeControl::default(),
+        };
+        let create_id = if matches!(&item, BatchDocItem::Normalized(_)) {
+            Some(
+                elephant_storage::source_intake::create_document_id(
+                    &space_id,
+                    &serde_json::to_value(&item).map_err(|error| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(ApiError::validation(error.to_string())),
+                        )
+                    })?,
+                    &intake,
+                )
+                .map_err(super::source_intake::storage_error)?,
+            )
+        } else {
+            None
+        };
         let prepared = match item.into_doc(&principal) {
             Ok(doc) => doc,
             Err(error) => {
@@ -2191,32 +2095,58 @@ async fn batch_docs(
             }
         };
         let mut doc = prepared.doc;
+        if let Some(id) = create_id {
+            doc.base.id = id;
+        }
         doc.base.space_id = space_id.clone();
 
-        let pending_assets = prepared.pending_assets;
-        let result = match persist_prepared_media_assets(&state.storage, &pending_assets).await {
-            Ok(()) => match stage_and_enqueue_manual_doc_doc_surface(&state, &principal, doc).await
-            {
-                Ok((_, staged_doc, _)) => Ok(staged_doc.doc),
-                Err((_, error)) => Err(error.0),
-            },
-            Err(error) => Err(error),
-        };
+        let result = async {
+            let (source, _) = prepare_manual_source_for_doc(&state.storage, &doc).await?;
+            let (accepted, _) = accept_intake(
+                &state.storage,
+                &state.authz,
+                &principal,
+                source,
+                Some(&doc),
+                intake,
+                &prepared.pending_assets,
+            )
+            .await?;
+            let operation = accepted.operation;
+            accepted
+                .document
+                .map(|doc| (doc, operation))
+                .ok_or_else(|| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiError::internal("accepted input has no document")),
+                    )
+                })
+        }
+        .await;
         match result {
-            Ok(doc) => {
-                succeeded.push(doc);
+            Ok((doc, operation)) => {
+                succeeded.push(crate::redact_doc(&principal, doc).data);
+                operations.push(operation);
             }
-            Err(e) => {
-                rollback_prepared_media_assets(&state.storage, &pending_assets).await;
-                failed.push(BatchError {
-                    index,
-                    error: e.message,
-                });
+            Err(failure)
+                if failure.0 == StatusCode::SERVICE_UNAVAILABLE
+                    && failure.1 .0.code == "NOT_READY" =>
+            {
+                return Err(failure)
             }
+            Err((_, error)) => failed.push(BatchError {
+                index,
+                error: error.0.message,
+            }),
         }
     }
 
-    Ok(Json(BatchResponse { succeeded, failed }))
+    Ok(Json(BatchDocIntakeResponse {
+        succeeded,
+        operations,
+        failed,
+    }))
 }
 
 /// GET /v1/docs/{id}/chunks - Get document nodes (structural chunks).
@@ -2248,7 +2178,7 @@ async fn get_doc_chunks(
 
     state
         .authz
-        .authorize_record_read(&principal, &doc, "read:doc")
+        .authorize_record_read(&principal, &doc, "read:doc:raw")
         .map_err(|e| {
             (
                 StatusCode::FORBIDDEN,
@@ -2270,13 +2200,71 @@ async fn get_doc_chunks(
     let Some(revision) = revisions.first() else {
         return Ok(Json(vec![]));
     };
+    if revision.doc.id() != &rid || revision.base.space_id != space_id {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError::not_found("Doc revision", &id)),
+        ));
+    }
+    state
+        .authz
+        .authorize_record_read(&principal, revision, "read:doc:raw")
+        .map_err(|e| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError {
+                    code: e.code,
+                    message: e.message,
+                    details: None,
+                }),
+            )
+        })?;
     match state.node_repo.find_by_revision(&revision.base.id).await {
-        Ok(nodes) => Ok(Json(nodes)),
+        Ok(nodes) => Ok(Json(
+            super::current_read::filter(
+                Some(&state.storage),
+                &state.authz,
+                &principal,
+                nodes
+                    .into_iter()
+                    .filter(|node| {
+                        node.base.space_id == space_id && node.revision.id() == &revision.base.id
+                    })
+                    .collect(),
+                "read:doc:raw",
+            )
+            .await?,
+        )),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError::internal(e.to_string())),
         )),
     }
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Retain the shared status and public JSON error representation at the route boundary"
+)]
+fn authorize_pipeline_status_record(
+    authz: &AuthzState,
+    principal: &AuthPrincipal,
+    record: &impl elephant_types::records::HasSecurity,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    // Aggregate diagnostics require the same metadata scope as the document,
+    // while each contributing record keeps its own classification and subjects.
+    authz
+        .authorize_record_read(principal, record, "read:doc")
+        .map_err(|error| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiError {
+                    code: error.code,
+                    message: error.message,
+                    details: None,
+                }),
+            )
+        })
 }
 
 /// GET /v1/docs/{id}/pipeline-status - Get document pipeline status.
@@ -2337,6 +2325,16 @@ async fn get_doc_pipeline_status(
         .or_else(|| revisions.first());
     let (chunks_total, chunks_embedded, revision, nodes) = if let Some(revision) = selected_revision
     {
+        if revision.base.space_id != space_id
+            || revision.doc.id() != &doc_id
+            || revision.base.deleted_at.is_some()
+        {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ApiError::not_found("Doc revision", &id)),
+            ));
+        }
+        authorize_pipeline_status_record(&state.authz, &principal, revision)?;
         let nodes = state
             .node_repo
             .find_by_revision(&revision.base.id)
@@ -2347,6 +2345,15 @@ async fn get_doc_pipeline_status(
                     Json(ApiError::internal(e.to_string())),
                 )
             })?;
+        let nodes: Vec<_> = nodes
+            .into_iter()
+            .filter(|node| {
+                node.base.space_id == space_id
+                    && node.revision.id() == &revision.base.id
+                    && node.base.deleted_at.is_none()
+                    && authorize_pipeline_status_record(&state.authz, &principal, node).is_ok()
+            })
+            .collect();
         let embeddable: Vec<_> = nodes
             .iter()
             .filter(|n| {
@@ -2409,6 +2416,12 @@ async fn get_doc_pipeline_status(
     } else {
         None
     };
+    if let Some(config) = &space_config {
+        authorize_pipeline_status_record(&state.authz, &principal, config)?;
+    }
+    if let Some(source) = &source {
+        authorize_pipeline_status_record(&state.authz, &principal, source)?;
+    }
     status.extraction_guidance = Some(resolve_extraction_guidance_status(
         space_config.as_ref(),
         Some(&doc),
@@ -2431,6 +2444,15 @@ async fn get_doc_pipeline_status(
                     Json(ApiError::internal(e.to_string())),
                 )
             })?;
+        let assertions: Vec<_> = assertions
+            .into_iter()
+            .filter(|assertion| {
+                assertion.base.space_id == space_id
+                    && assertion.evidence.revision.id() == revision_id
+                    && assertion.base.deleted_at.is_none()
+                    && authorize_pipeline_status_record(&state.authz, &principal, assertion).is_ok()
+            })
+            .collect();
         status.assertions_count = assertions.len();
 
         // Count unique entities
@@ -2443,7 +2465,18 @@ async fn get_doc_pipeline_status(
                 entities.insert(link.id().clone());
             }
         }
-        status.entities_created = entities.len();
+        let entity_repo = elephant_storage::EntityRepository::new(state.storage.clone());
+        for entity_id in entities {
+            if let Some(entity) = entity_repo
+                .get(&space_id, &entity_id)
+                .await
+                .map_err(super::source_intake::storage_error)?
+            {
+                if authorize_pipeline_status_record(&state.authz, &principal, &entity).is_ok() {
+                    status.entities_created += 1;
+                }
+            }
+        }
     }
 
     // Extraction state from work items
@@ -2470,6 +2503,11 @@ async fn get_doc_pipeline_status(
     let source_id_str = doc.source.as_ref().map(|source| source.id().to_string());
     let relevant_statuses: Vec<WorkItemStatus> = work_items
         .into_iter()
+        .filter(|item| {
+            item.base.space_id == space_id
+                && item.base.deleted_at.is_none()
+                && authorize_pipeline_status_record(&state.authz, &principal, item).is_ok()
+        })
         .filter(|item| {
             revision_str
                 .as_deref()
@@ -2505,6 +2543,10 @@ pub fn doc_routes() -> Router<Arc<DocsState>> {
         .route("/v1/docs/{id}", delete(delete_doc))
         .route("/v1/docs/{id}/restore", post(restore_doc))
         .route("/v1/docs/{id}/chunks", get(get_doc_chunks))
+        .route(
+            "/v1/docs/{id}/revisions/{revision_id}",
+            get(super::doc_revisions::get_doc_revision),
+        )
         .route(
             "/v1/docs/{id}/pipeline-status",
             get(get_doc_pipeline_status),
@@ -2557,6 +2599,29 @@ mod tests {
             run_after: None,
             last_error: None,
         }
+    }
+
+    async fn intake_test_storage() -> StorageClient {
+        let storage = StorageClient::new_embedded()
+            .await
+            .expect("embedded storage");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(elephant_types::records::SpaceConfig {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::SpaceConfig),
+                    "default".into(),
+                    "fixture".into(),
+                ),
+                embedding_provider: "fake".into(),
+                embedding_model: "fixture".into(),
+                embedding_dims: 8,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .expect("named space");
+        storage
     }
 
     #[test]
@@ -2635,6 +2700,7 @@ mod tests {
         ApiPrincipal {
             subject: "tester".to_string(),
             space_id: Some(space_id.to_string()),
+            spaces: None,
             scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
             security_level: 0,
             security_labels: Vec::new(),
@@ -2652,6 +2718,7 @@ mod tests {
 
     fn legacy_ingest_request(doc: Doc, collection: Option<&str>, sync: bool) -> IngestRequest {
         IngestRequest::Legacy(Box::new(LegacyIngestRequest {
+            intake: IntakeControl::default(),
             doc,
             collection: collection.map(std::borrow::ToOwned::to_owned),
             sync,
@@ -2666,6 +2733,7 @@ mod tests {
         sync: bool,
     ) -> IngestRequest {
         IngestRequest::Normalized(Box::new(NormalizedIngestRequest {
+            intake: IntakeControl::default(),
             title: title.to_string(),
             text: text.map(std::borrow::ToOwned::to_owned),
             media,
@@ -2678,6 +2746,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_authorize_doc_search_requires_read_scope() {
         let storage = StorageClient::new_embedded()
             .await
@@ -2722,12 +2794,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_doc_persists_doc_before_returning() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source", "read:doc"]);
+        let principal = make_api_principal(
+            "default",
+            &["write:doc", "write:source", "read:doc", "read:source"],
+        );
         let doc_id = RecordId::new_v4(TableName::Doc);
         let mut doc = Doc {
             base: BaseFields::new(doc_id.clone(), "default".to_string(), "tester".to_string()),
@@ -2754,10 +2831,13 @@ mod tests {
         .await
         .expect("ingest doc");
 
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::ACCEPTED);
         let persisted = state
             .doc_repo
-            .get("default", &doc_id)
+            .get(
+                "default",
+                &RecordId::from_str(&result.doc_id).expect("accepted doc id"),
+            )
             .await
             .expect("load doc")
             .expect("persisted doc");
@@ -2769,12 +2849,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_doc_preserves_doc_author_on_created_source() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source", "read:doc"]);
+        let principal = make_api_principal(
+            "default",
+            &["write:doc", "write:source", "read:doc", "read:source"],
+        );
         let doc_id = RecordId::new_v4(TableName::Doc);
         let doc = Doc {
             base: BaseFields::new(doc_id, "default".to_string(), "original-author".to_string()),
@@ -2807,10 +2892,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_restore_doc_requires_read_authorization() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
         let doc_id = RecordId::new_v4(TableName::Doc);
         let doc = Doc {
@@ -2835,6 +2922,7 @@ mod tests {
             State(state.clone()),
             axum::Extension(make_api_principal("default", &["write:doc"])),
             Path(doc_id.to_string()),
+            Query(IntakeControl::default()),
         )
         .await;
         assert_eq!(
@@ -2857,18 +2945,24 @@ mod tests {
             State(state.clone()),
             axum::Extension(make_api_principal("default", &["write:doc", "read:doc"])),
             Path(doc_id.to_string()),
+            Query(IntakeControl::default()),
         )
         .await;
         assert!(allowed.is_ok());
     }
 
     #[tokio::test]
-    async fn test_ingest_doc_restores_soft_deleted_doc() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
+    async fn test_ingest_doc_creates_evidence_without_reviving_old_tombstone() {
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source", "read:doc"]);
+        let principal = make_api_principal(
+            "default",
+            &["write:doc", "write:source", "read:doc", "read:source"],
+        );
         let doc_id = RecordId::new_v4(TableName::Doc);
 
         let existing = Doc {
@@ -2893,7 +2987,7 @@ mod tests {
             .expect("soft-delete conflicting doc");
 
         let mut doc = Doc {
-            base: BaseFields::new(doc_id, "default".to_string(), "tester".to_string()),
+            base: BaseFields::new(doc_id.clone(), "default".to_string(), "tester".to_string()),
             title: "Persist me".to_string(),
             text: "This will conflict with deleted doc".to_string(),
             sidecar_text: None,
@@ -2917,7 +3011,7 @@ mod tests {
         .await
         .expect("ingest doc should restore deleted doc");
 
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::ACCEPTED);
         let restored = state
             .doc_repo
             .get(
@@ -2927,6 +3021,16 @@ mod tests {
             .await
             .expect("load doc")
             .expect("restored doc");
+        assert_ne!(restored.base.id, doc_id);
+        assert!(state
+            .doc_repo
+            .get_with_deleted("default", &doc_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .base
+            .deleted_at
+            .is_some());
         assert_eq!(restored.title, "Persist me");
         assert!(restored.base.deleted_at.is_none());
         let sources = state
@@ -2938,12 +3042,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_doc_reuses_existing_source_for_same_doc_id() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:source",
+            ],
+        );
         let doc_id = RecordId::new_v4(TableName::Doc);
 
         let mut doc = Doc {
@@ -2971,33 +3085,7 @@ mod tests {
         .await
         .expect("first ingest");
 
-        let existing_doc = state
-            .doc_repo
-            .get("default", &doc_id)
-            .await
-            .expect("load doc")
-            .expect("persisted doc");
-        state
-            .doc_repo
-            .update("default", &doc_id, existing_doc)
-            .await
-            .expect("update doc security");
-
-        let source_id = RecordId::from_str(&first_result.source_id).expect("parse source id");
-        let mut existing_source = state
-            .source_repo
-            .get("default", &source_id)
-            .await
-            .expect("load source")
-            .expect("persisted source");
-        existing_source.lifecycle_status = SourceLifecycleStatus::GraphReady;
-        existing_source.current_ingest_mode = Some(IngestMode::Graph);
-        state
-            .source_repo
-            .update("default", &source_id, existing_source)
-            .await
-            .expect("promote source state");
-
+        let source_id = RecordId::from_str(&first_result.source_id).expect("source id");
         doc.title = "Updated".to_string();
         doc.text = "Updated body".to_string();
         doc.metadata = serde_json::json!({"revision": 2});
@@ -3006,12 +3094,32 @@ mod tests {
         let (_, Json(second_result)) = ingest_doc(
             State(state.clone()),
             axum::Extension(principal),
-            Json(legacy_ingest_request(doc, None, false)),
+            Json(IngestRequest::Legacy(Box::new(LegacyIngestRequest {
+                doc,
+                collection: None,
+                sync: false,
+                intake: IntakeControl {
+                    revision_id: Some("v2".into()),
+                    idempotency_key: Some("v2".into()),
+                    expected_generation: Some(first_result.operation.source_generation.clone()),
+                },
+            }))),
         )
         .await
         .expect("second ingest");
 
         assert_eq!(first_result.source_id, second_result.source_id);
+        assert_ne!(first_result.doc_id, second_result.doc_id);
+        let old = state
+            .doc_repo
+            .get(
+                "default",
+                &RecordId::from_str(&first_result.doc_id).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.text, "Original body");
         assert_eq!(
             second_result.lifecycle_status,
             SourceLifecycleStatus::Discovered
@@ -3019,7 +3127,10 @@ mod tests {
         assert_eq!(second_result.current_ingest_mode, None);
         let persisted = state
             .doc_repo
-            .get("default", &doc_id)
+            .get(
+                "default",
+                &RecordId::from_str(&second_result.doc_id).expect("new evidence"),
+            )
             .await
             .expect("load doc")
             .expect("persisted doc");
@@ -3052,12 +3163,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_batch_docs_preserves_doc_surface_authorization() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:source",
+            ],
+        );
 
         let first_doc = Doc {
             base: BaseFields::new(
@@ -3127,12 +3248,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_doc_accepts_normalized_media_request_shape() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:source",
+            ],
+        );
 
         let (status, Json(result)) = ingest_doc(
             State(state.clone()),
@@ -3155,7 +3286,7 @@ mod tests {
         .await
         .expect("normalized ingest");
 
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::ACCEPTED);
         let persisted = state
             .doc_repo
             .get(
@@ -3180,12 +3311,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_doc_rejects_zero_duration_inline_video() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:source",
+            ],
+        );
 
         let err = ingest_doc(
             State(state),
@@ -3217,9 +3358,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ingest_doc_rolls_back_media_assets_when_authorization_fails() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
         let principal = make_api_principal("default", &["write:source"]);
 
@@ -3257,12 +3396,23 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_batch_docs_accepts_normalized_request_shape() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:doc:raw",
+                "read:source",
+            ],
+        );
 
         let Json(response) = batch_docs(
             State(state.clone()),
@@ -3270,6 +3420,7 @@ mod tests {
             Json(BatchRequest {
                 items: vec![
                     BatchDocItem::Normalized(Box::new(NormalizedBatchDocItem {
+                        intake: IntakeControl::default(),
                         title: "Frame A".to_string(),
                         text: Some("Observed terminal".to_string()),
                         media: vec![DocMediaInput {
@@ -3286,6 +3437,7 @@ mod tests {
                         extraction_guidance: ExtractionGuidanceInput::default(),
                     })),
                     BatchDocItem::Normalized(Box::new(NormalizedBatchDocItem {
+                        intake: IntakeControl::default(),
                         title: "Transcript".to_string(),
                         text: Some("plain text doc".to_string()),
                         media: Vec::new(),
@@ -3332,12 +3484,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_legacy_batch_docs_use_source_first_doc_surface() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:source",
+            ],
+        );
 
         let legacy_doc = Doc {
             base: BaseFieldsBuilder::new("default")
@@ -3385,18 +3547,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_text_only_batch_docs_enqueue_triage_with_doc_only_scope() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
+    async fn test_text_only_batch_docs_enqueue_triage_with_explicit_intake_scopes() {
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:source",
+            ],
+        );
 
         let Json(response) = batch_docs(
             State(state.clone()),
             axum::Extension(principal),
             Json(BatchRequest {
                 items: vec![BatchDocItem::Normalized(Box::new(NormalizedBatchDocItem {
+                    intake: IntakeControl::default(),
                     title: "Plain batch doc".to_string(),
                     text: Some("plain batch text".to_string()),
                     media: Vec::new(),
@@ -3432,12 +3605,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_legacy_ingest_doc_preserves_top_level_collection() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:source",
+            ],
+        );
 
         let doc = Doc {
             base: BaseFieldsBuilder::new("default")
@@ -3481,12 +3664,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_legacy_ingest_doc_preserves_scalar_metadata_when_merging_collection() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:source",
+            ],
+        );
 
         let doc = Doc {
             base: BaseFieldsBuilder::new("default")
@@ -3531,11 +3724,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_doc_pipeline_status_reports_pending_when_triage_source_is_runnable() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source", "read:doc"]);
+        let principal = make_api_principal(
+            "default",
+            &["write:doc", "write:source", "read:doc", "read:source"],
+        );
 
         let (_, Json(result)) = ingest_doc(
             State(state.clone()),
@@ -3570,12 +3764,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_doc_rejects_path_or_uri_media_transports() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:source",
+            ],
+        );
 
         let err = ingest_doc(
             State(state),
@@ -3603,12 +3807,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_legacy_ingest_doc_rejects_path_or_uri_media_attachments() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:source",
+            ],
+        );
 
         let doc = Doc {
             base: BaseFields::new(
@@ -3649,10 +3863,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_legacy_batch_docs_rejects_path_or_uri_media_attachments() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
         let principal = make_api_principal("default", &["write:doc"]);
 
@@ -3702,10 +3918,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_doc_rejects_missing_space_id() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
@@ -3743,10 +3961,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_doc_rejects_empty_space_id() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
         let principal = AuthPrincipal {
             subject: "tester".to_string(),
@@ -3784,12 +4004,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_doc_rejects_sync_mode() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:source",
+            ],
+        );
 
         let doc = Doc {
             base: BaseFields::new(
@@ -3819,12 +4049,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original test fixture and route-state owners alive through the complete assertion scope"
+    )]
     async fn test_ingest_doc_rejects_overwrite_of_secured_existing_doc() {
-        let storage = StorageClient::new_embedded()
-            .await
-            .expect("embedded storage");
+        let storage = intake_test_storage().await;
         let state = Arc::new(DocsState::new(&storage, Arc::new(AuthzService::new())));
-        let principal = make_api_principal("default", &["write:doc", "write:source"]);
+        let principal = make_api_principal(
+            "default",
+            &[
+                "write:doc",
+                "write:source",
+                "read:doc:metadata",
+                "read:source",
+            ],
+        );
         let doc_id = RecordId::new_v4(TableName::Doc);
 
         let mut doc = Doc {
@@ -3852,6 +4092,7 @@ mod tests {
         .await
         .expect("first ingest");
 
+        let doc_id = RecordId::from_str(&first_result.doc_id).expect("accepted doc id");
         let source_id = RecordId::from_str(&first_result.source_id).expect("parse source id");
         let mut existing_doc = state
             .doc_repo

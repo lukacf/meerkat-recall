@@ -99,7 +99,9 @@ impl SystemEventRepository {
         Self { client }
     }
 
-    fn system_event_to_value(event: &SystemEvent) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn system_event_to_value(
+        event: &SystemEvent,
+    ) -> StorageResult<surrealdb::sql::Value> {
         use surrealdb::sql::Value;
 
         let mut obj = crate::surreal::base_fields_to_object(&event.base)?;
@@ -362,7 +364,9 @@ impl SystemEventRepository {
     }
 
     /// Finds events of a given type created at or after `since`, across ALL
-    /// spaces, newest first. Used by global health surfaces (`get_health`
+    /// spaces, newest first.
+    ///
+    /// Used by global health surfaces (`get_health`
     /// runs with a global principal, so it must see every space's signals).
     ///
     /// # Errors
@@ -689,7 +693,7 @@ impl Repository<SystemEvent> for SystemEventRepository {
         if let Some(store) = self.client.embedded_store() {
             return store
                 .mutate(|mutation| {
-                    let Some(_existing) =
+                    let Some(existing) =
                         mutation.get::<SystemEvent>(&target_space_id, &target_id, false)?
                     else {
                         return Err(StorageError::NotFound(target_id.to_string()));
@@ -707,25 +711,32 @@ impl Repository<SystemEvent> for SystemEventRepository {
                         )));
                     }
 
+                    if normalized.seq < existing.seq {
+                        crate::event_sequence::preserve_tx(mutation, &target_space_id)?;
+                    }
+
                     Ok(mutation.replace(normalized.clone())?)
                 })
                 .await;
         }
 
-        let response = self
-            .client
-            .query_bind(
-                "UPDATE $id CONTENT $record WHERE space_id = $space_id AND deleted_at IS NONE",
-                crate::bindings! {
-                    "id" => crate::surreal::thing_from_record_id(id),
-                    "space_id" => space_id,
-                    "record" => Self::system_event_to_value(&normalized)?,
-                },
-            )
-            .await
-            .map_err(|e| {
-                StorageError::classify_query_error(format!("Failed to update system_event: {e}"))
-            })?;
+        let mut bindings = crate::bindings! {
+            "id" => crate::surreal::thing_from_record_id(id),
+            "space_id" => space_id,
+            "record" => Self::system_event_to_value(&normalized)?,
+            "updated_sequence" => normalized.seq,
+        };
+        let mut sql = String::from("BEGIN TRANSACTION;\nLET $original_event = SELECT * FROM ONLY $id;\nIF $original_event != NONE AND $original_event.space_id = $space_id AND $original_event.deleted_at = NONE {\nIF $updated_sequence < $original_event.seq {\n");
+        crate::event_sequence::append_preserve_sql(
+            &mut sql,
+            &mut bindings,
+            space_id,
+            "event_update_floor",
+        )?;
+        sql.push_str("};\nUPDATE $id CONTENT $record WHERE space_id = $space_id AND deleted_at IS NONE;\n};\nCOMMIT TRANSACTION;\n");
+        let response = self.client.query_bind(&sql, bindings).await.map_err(|e| {
+            StorageError::classify_query_error(format!("Failed to update system_event: {e}"))
+        })?;
         response.check().map_err(|e| {
             StorageError::classify_query_error(format!("Failed to update system_event: {e}"))
         })?;
@@ -968,6 +979,42 @@ impl SearchRepository<SystemEvent> for SystemEventRepository {
         let total = counts.first().map_or(0, |c| c.total);
 
         Ok(PaginatedResult::new(items, next_cursor, has_more, total))
+    }
+}
+
+impl SystemEventRepository {
+    /// Reads physical row state for atomic source lifecycle inverse preparation.
+    pub(crate) async fn get_including_deleted(
+        &self,
+        space_id: &str,
+        id: &RecordId,
+    ) -> StorageResult<Option<SystemEvent>> {
+        if let Some(store) = self.client.embedded_store() {
+            return store.get::<SystemEvent>(space_id, id, true).await;
+        }
+
+        let mut response = self
+            .client
+            .query_bind(
+                &format!(
+                    "SELECT {SYSTEM_EVENT_PROJECTION} FROM system_event WHERE id = $id AND space_id = $space_id"
+                ),
+                crate::bindings! {
+                    "id" => crate::surreal::thing_from_record_id(id),
+                    "space_id" => space_id,
+                },
+            )
+            .await?;
+
+        let items: Vec<SystemEventDb> = response
+            .take(0)
+            .map_err(|e| StorageError::QueryError(format!("Failed to parse system event: {e}")))?;
+
+        items
+            .into_iter()
+            .next()
+            .map(SystemEvent::try_from)
+            .transpose()
     }
 }
 
@@ -1218,6 +1265,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_get_after_seq_includes_soft_deleted_events() {
         let repo = setup_embedded_test_repo().await;
         let event = make_test_event("space_a", 3, "event_3");
@@ -1232,6 +1283,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_list_recent_includes_soft_deleted_events() {
         let repo = setup_embedded_test_repo().await;
         let event = make_test_event("space_a", 7, "event_7");
@@ -1246,6 +1301,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_create_rejects_duplicate_seq() {
         let repo = setup_embedded_test_repo().await;
         let first = make_test_event("space_a", 9, "event_9");
@@ -1262,6 +1321,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep repo in the original fixture scope through assertions and cleanup."
+    )]
     async fn test_embedded_update_rejects_duplicate_seq() {
         let repo = setup_embedded_test_repo().await;
         let first = repo

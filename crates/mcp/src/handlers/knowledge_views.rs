@@ -507,6 +507,10 @@ fn selector_subjects(selector: &KnowledgeViewSelector) -> (Vec<Link<Entity>>, Su
     }
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the entity repository through the complete definition-entity validation pass."
+)]
 async fn validate_definition_entities(
     storage: &StorageClient,
     space_id: &str,
@@ -570,7 +574,7 @@ impl GetKnowledgeViewHandler {
         else {
             return Ok(None);
         };
-        authorize_projection(ctx, &view, &revision, "read:entity")?;
+        authorize_projection(ctx, &view, &revision, "read:entity").await?;
         Ok(Some(KnowledgeViewResponse {
             view,
             revision,
@@ -600,7 +604,7 @@ impl GetKnowledgeViewHandler {
         else {
             return Ok(None);
         };
-        authorize_projection(ctx, &view, &revision, "read:source")?;
+        authorize_projection(ctx, &view, &revision, "read:source").await?;
         Ok(Some(KnowledgeViewResponse {
             view,
             revision,
@@ -630,7 +634,7 @@ impl GetKnowledgeViewHandler {
         else {
             return Ok(None);
         };
-        authorize_projection(ctx, &view, &revision, "read:entity")?;
+        authorize_projection(ctx, &view, &revision, "read:entity").await?;
         Ok(Some(KnowledgeViewResponse {
             view,
             revision,
@@ -698,6 +702,10 @@ impl ToolHandler for GetKnowledgeViewHandler {
         ToolProfile::Agent
     }
 
+    #[expect(
+        clippy::large_futures,
+        reason = "Keep the original unboxed source projection future and root-dispatch await order."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         let params = coerce_params(params, &self.input_schema());
         let input: GetKnowledgeViewInput = serde_json::from_value(params)
@@ -730,6 +738,10 @@ impl ToolHandler for GetKnowledgeViewHandler {
 }
 
 impl GetKnowledgeViewHandler {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the repository scope through authorization, compilation and stale-fallback handling."
+    )]
     async fn execute_entity(
         &self,
         ctx: &ToolContext,
@@ -765,9 +777,10 @@ impl GetKnowledgeViewHandler {
             .await
         {
             Ok(compiled) => {
-                let response = compiled_entity_response(ctx, compiled)?;
+                let response = compiled_entity_response(ctx, compiled).await?;
                 response_success(response)
             }
+            Err(error @ elephant_storage::StorageError::ErasureInProgress) => Err(error.into()),
             Err(error) if input.freshness == FreshnessMode::PreferFresh => {
                 let Some(mut response) = self.existing_response(ctx, &entity).await? else {
                     return Err(error.into());
@@ -780,6 +793,10 @@ impl GetKnowledgeViewHandler {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the repository scope through authorization, compilation and stale-fallback handling."
+    )]
     async fn execute_source(
         &self,
         ctx: &ToolContext,
@@ -813,9 +830,10 @@ impl GetKnowledgeViewHandler {
             .await
         {
             Ok(compiled) => {
-                let response = compiled_source_response(ctx, compiled)?;
+                let response = compiled_source_response(ctx, compiled).await?;
                 response_success(response)
             }
+            Err(error @ elephant_storage::StorageError::ErasureInProgress) => Err(error.into()),
             Err(error) if input.freshness == FreshnessMode::PreferFresh => {
                 let Some(mut response) = self.existing_source_response(ctx, &source).await? else {
                     return Err(error.into());
@@ -828,6 +846,10 @@ impl GetKnowledgeViewHandler {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the repository scope through definition authorization, compilation and fallback handling."
+    )]
     async fn execute_definition(
         &self,
         ctx: &ToolContext,
@@ -856,7 +878,8 @@ impl GetKnowledgeViewHandler {
             .compile(&ctx.principal.space_id, &definition_id, false)
             .await
         {
-            Ok(compiled) => response_success(compiled_graph_response(ctx, compiled)?),
+            Ok(compiled) => response_success(compiled_graph_response(ctx, compiled).await?),
+            Err(error @ elephant_storage::StorageError::ErasureInProgress) => Err(error.into()),
             Err(error) if input.freshness == FreshnessMode::PreferFresh => {
                 let Some(mut response) = self.existing_graph_response(ctx, &definition).await?
                 else {
@@ -889,6 +912,115 @@ impl RebuildKnowledgeViewHandler {
             graph_compiler: GraphViewCompiler::new(storage.clone()),
             storage,
         }
+    }
+
+    // Keep each selected branch and its large child futures out of the shared
+    // dispatch poll frame. Authorization and publication order stay local to
+    // the original branch; no task, thread, or execution context is introduced.
+    #[inline(never)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the repository scope through entity authorization and rebuild completion."
+    )]
+    async fn rebuild_entity(
+        &self,
+        ctx: &ToolContext,
+        entity_id: RecordId,
+        limit: usize,
+    ) -> McpResult<Value> {
+        let entities = EntityRepository::new(self.storage.clone());
+        let Some(entity) = Box::pin(entities.get(&ctx.principal.space_id, &entity_id)).await?
+        else {
+            return response_error(format!("Entity not found: {entity_id}"));
+        };
+        if let Err(reason) =
+            ctx.authz
+                .authorize_record_write(&ctx.principal, &entity, "write:entity")
+        {
+            return response_error(format!("Access denied: {reason}"));
+        }
+        let limits = EntityViewLimits {
+            outgoing_relations: limit,
+            incoming_relations: limit,
+            attributes: limit,
+            events: limit,
+        };
+        let compiled = Box::pin(self.entity_compiler.compile(
+            &ctx.principal.space_id,
+            &entity_id,
+            limits,
+            true,
+        ))
+        .await?;
+        response_success(Box::pin(compiled_entity_response(ctx, compiled)).await?)
+    }
+
+    #[inline(never)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the repository scope through source authorization and rebuild completion."
+    )]
+    async fn rebuild_source(
+        &self,
+        ctx: &ToolContext,
+        source_id: RecordId,
+        limit: usize,
+    ) -> McpResult<Value> {
+        let sources = SourceRepository::new(self.storage.clone());
+        let Some(source) = Box::pin(sources.get(&ctx.principal.space_id, &source_id)).await? else {
+            return response_error(format!("Source not found: {source_id}"));
+        };
+        if let Err(reason) =
+            ctx.authz
+                .authorize_record_write(&ctx.principal, &source, "write:source")
+        {
+            return response_error(format!("Access denied: {reason}"));
+        }
+        let limits = SourceViewLimits {
+            documents: limit,
+            revisions_per_document: limit,
+        };
+        let compiled = Box::pin(self.source_compiler.compile(
+            &ctx.principal.space_id,
+            &source_id,
+            limits,
+            true,
+        ))
+        .await?;
+        response_success(Box::pin(compiled_source_response(ctx, compiled)).await?)
+    }
+
+    #[inline(never)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the repository scope through definition authorization and rebuild completion."
+    )]
+    async fn rebuild_definition(
+        &self,
+        ctx: &ToolContext,
+        definition_id: RecordId,
+    ) -> McpResult<Value> {
+        let definitions = KnowledgeViewDefinitionRepository::new(self.storage.clone());
+        let Some(definition) =
+            Box::pin(definitions.get(&ctx.principal.space_id, &definition_id)).await?
+        else {
+            return response_error(format!(
+                "Knowledge-view definition not found: {definition_id}"
+            ));
+        };
+        if let Err(reason) =
+            ctx.authz
+                .authorize_record_write(&ctx.principal, &definition, "write:entity")
+        {
+            return response_error(format!("Access denied: {reason}"));
+        }
+        let compiled = Box::pin(self.graph_compiler.compile(
+            &ctx.principal.space_id,
+            &definition_id,
+            true,
+        ))
+        .await?;
+        response_success(Box::pin(compiled_graph_response(ctx, compiled)).await?)
     }
 }
 
@@ -962,74 +1094,21 @@ impl ToolHandler for RebuildKnowledgeViewHandler {
         )?;
         match root {
             KnowledgeViewRoot::Entity(entity_id) => {
-                let entities = EntityRepository::new(self.storage.clone());
-                let Some(entity) = entities.get(&ctx.principal.space_id, &entity_id).await? else {
-                    return response_error(format!("Entity not found: {entity_id}"));
-                };
-                if let Err(reason) =
-                    ctx.authz
-                        .authorize_record_write(&ctx.principal, &entity, "write:entity")
-                {
-                    return response_error(format!("Access denied: {reason}"));
-                }
-                let limits = EntityViewLimits {
-                    outgoing_relations: input.limit,
-                    incoming_relations: input.limit,
-                    attributes: input.limit,
-                    events: input.limit,
-                };
-                let compiled = self
-                    .entity_compiler
-                    .compile(&ctx.principal.space_id, &entity_id, limits, true)
-                    .await?;
-                response_success(compiled_entity_response(ctx, compiled)?)
+                Box::pin(self.rebuild_entity(ctx, entity_id, input.limit)).await
             }
             KnowledgeViewRoot::Source(source_id) => {
-                let sources = SourceRepository::new(self.storage.clone());
-                let Some(source) = sources.get(&ctx.principal.space_id, &source_id).await? else {
-                    return response_error(format!("Source not found: {source_id}"));
-                };
-                if let Err(reason) =
-                    ctx.authz
-                        .authorize_record_write(&ctx.principal, &source, "write:source")
-                {
-                    return response_error(format!("Access denied: {reason}"));
-                }
-                let limits = SourceViewLimits {
-                    documents: input.limit,
-                    revisions_per_document: input.limit,
-                };
-                let compiled = self
-                    .source_compiler
-                    .compile(&ctx.principal.space_id, &source_id, limits, true)
-                    .await?;
-                response_success(compiled_source_response(ctx, compiled)?)
+                Box::pin(self.rebuild_source(ctx, source_id, input.limit)).await
             }
             KnowledgeViewRoot::Definition(definition_id) => {
-                let definitions = KnowledgeViewDefinitionRepository::new(self.storage.clone());
-                let Some(definition) = definitions
-                    .get(&ctx.principal.space_id, &definition_id)
-                    .await?
-                else {
-                    return response_error(format!(
-                        "Knowledge-view definition not found: {definition_id}"
-                    ));
-                };
-                if let Err(reason) =
-                    ctx.authz
-                        .authorize_record_write(&ctx.principal, &definition, "write:entity")
-                {
-                    return response_error(format!("Access denied: {reason}"));
-                }
-                let compiled = self
-                    .graph_compiler
-                    .compile(&ctx.principal.space_id, &definition_id, true)
-                    .await?;
-                response_success(compiled_graph_response(ctx, compiled)?)
+                Box::pin(self.rebuild_definition(ctx, definition_id)).await
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "knowledge_view_rebuild_frame_tests.rs"]
+mod rebuild_frame_tests;
 
 /// Materializes bounded pages of existing Elephant data into derived views.
 pub struct MaterializeKnowledgeViewsHandler {
@@ -1051,6 +1130,10 @@ impl MaterializeKnowledgeViewsHandler {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the repository scope through the complete authorized entity materialization pass."
+    )]
     async fn materialize_entities(
         &self,
         ctx: &ToolContext,
@@ -1105,6 +1188,7 @@ impl MaterializeKnowledgeViewsHandler {
                 Ok(compiled) => {
                     if let Err(error) =
                         authorize_projection(ctx, &compiled.view, &compiled.revision, "read:entity")
+                            .await
                     {
                         push_materialization_failure(
                             &mut report.entities,
@@ -1116,6 +1200,9 @@ impl MaterializeKnowledgeViewsHandler {
                     } else {
                         record_materialization_success(&mut report.entities, compiled.changed);
                     }
+                }
+                Err(error @ elephant_storage::StorageError::ErasureInProgress) => {
+                    return Err(error.into());
                 }
                 Err(error) => push_materialization_failure(
                     &mut report.entities,
@@ -1129,6 +1216,10 @@ impl MaterializeKnowledgeViewsHandler {
         Ok(())
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the repository scope through the complete authorized source materialization pass."
+    )]
     async fn materialize_sources(
         &self,
         ctx: &ToolContext,
@@ -1181,6 +1272,7 @@ impl MaterializeKnowledgeViewsHandler {
                 Ok(compiled) => {
                     if let Err(error) =
                         authorize_projection(ctx, &compiled.view, &compiled.revision, "read:source")
+                            .await
                     {
                         push_materialization_failure(
                             &mut report.sources,
@@ -1192,6 +1284,9 @@ impl MaterializeKnowledgeViewsHandler {
                     } else {
                         record_materialization_success(&mut report.sources, compiled.changed);
                     }
+                }
+                Err(error @ elephant_storage::StorageError::ErasureInProgress) => {
+                    return Err(error.into());
                 }
                 Err(error) => push_materialization_failure(
                     &mut report.sources,
@@ -1205,6 +1300,10 @@ impl MaterializeKnowledgeViewsHandler {
         Ok(())
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the repository scope through the complete authorized definition materialization pass."
+    )]
     async fn materialize_definitions(
         &self,
         ctx: &ToolContext,
@@ -1254,6 +1353,7 @@ impl MaterializeKnowledgeViewsHandler {
                 Ok(compiled) => {
                     if let Err(error) =
                         authorize_projection(ctx, &compiled.view, &compiled.revision, "read:entity")
+                            .await
                     {
                         push_materialization_failure(
                             &mut report.definitions,
@@ -1265,6 +1365,9 @@ impl MaterializeKnowledgeViewsHandler {
                     } else {
                         record_materialization_success(&mut report.definitions, compiled.changed);
                     }
+                }
+                Err(error @ elephant_storage::StorageError::ErasureInProgress) => {
+                    return Err(error.into());
                 }
                 Err(error) => push_materialization_failure(
                     &mut report.definitions,
@@ -1459,6 +1562,10 @@ impl ToolHandler for CompileWikiArticleHandler {
         ToolProfile::Maintenance
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the editorial compiler scope through the existing wiki compilation and publication handling."
+    )]
     async fn execute(&self, ctx: &ToolContext, params: Value) -> McpResult<Value> {
         if let Err(reason) = authorize_wiki_management(ctx) {
             return response_error(reason);
@@ -1498,15 +1605,17 @@ impl ToolHandler for CompileWikiArticleHandler {
             }
             let compiler = elephant_pipeline::wiki_editorial::WikiEditorialCompiler::with_meerkat(
                 self.storage.clone(),
+                &ctx.principal.space_id,
                 config,
-            );
+            )
+            .await?;
             return match compiler
                 .compile(&ctx.principal.space_id, &definition_id, input.publish)
                 .await
             {
                 Ok(article) => serde_json::to_value(ToolResponse::success(article))
                     .map_err(|error| McpError::ExecutionError(error.to_string())),
-                Err(error) => response_error(error.to_string()),
+                Err(error) => pipeline_response_error(error),
             };
         }
 
@@ -1681,13 +1790,15 @@ impl CreateWikiFromGraphHandler {
         Ok(match work_item {
             Ok(item) => (Some(item.base.id.to_string()), item.run_after),
             Err(error) => {
-                if payload
-                    .authority
-                    .is_active(&self.storage, space_id)
-                    .await
-                    .map_err(|error| McpError::ExecutionError(error.to_string()))?
-                {
-                    return Err(McpError::ExecutionError(error.to_string()));
+                let error = McpError::from(error);
+                if matches!(
+                    error,
+                    McpError::StorageError(elephant_storage::StorageError::ErasureInProgress)
+                ) {
+                    return Err(error);
+                }
+                if payload.authority.is_active(&self.storage, space_id).await? {
+                    return Err(error);
                 }
                 (None, None)
             }
@@ -1695,6 +1806,11 @@ impl CreateWikiFromGraphHandler {
     }
 
     #[cfg(feature = "meerkat-extraction")]
+    #[expect(
+        clippy::large_futures,
+        clippy::significant_drop_tightening,
+        reason = "Keep the planner scope and original unboxed reconciliation future through managed-wiki handling."
+    )]
     async fn execute_full_graph_reconciliation(
         &self,
         ctx: &ToolContext,
@@ -1703,8 +1819,10 @@ impl CreateWikiFromGraphHandler {
         let editorial_config = Self::editorial_config(&input);
         let planner = elephant_pipeline::wiki_editorial::WikiGraphPlanner::with_meerkat(
             self.storage.clone(),
+            &ctx.principal.space_id,
             editorial_config.clone(),
-        );
+        )
+        .await?;
         let previous_graph_fingerprint = self
             .reusable_graph_fingerprint(&ctx.principal.space_id, &input, &editorial_config)
             .await?;
@@ -1743,7 +1861,7 @@ impl CreateWikiFromGraphHandler {
             .await
         {
             Ok(result) => result,
-            Err(error) => return response_error(error.to_string()),
+            Err(error) => return pipeline_response_error(error),
         };
         let (next_reconciliation_work_item, next_reconciliation_at) =
             if let Some(grant_id) = grant_id {
@@ -1933,11 +2051,11 @@ fn push_materialization_failure(
     });
 }
 
-fn compiled_entity_response(
+async fn compiled_entity_response(
     ctx: &ToolContext,
     compiled: CompiledEntityView,
 ) -> McpResult<KnowledgeViewResponse> {
-    authorize_projection(ctx, &compiled.view, &compiled.revision, "read:entity")?;
+    authorize_projection(ctx, &compiled.view, &compiled.revision, "read:entity").await?;
     Ok(KnowledgeViewResponse {
         view: compiled.view,
         revision: compiled.revision,
@@ -1947,11 +2065,11 @@ fn compiled_entity_response(
     })
 }
 
-fn compiled_source_response(
+async fn compiled_source_response(
     ctx: &ToolContext,
     compiled: CompiledSourceView,
 ) -> McpResult<KnowledgeViewResponse> {
-    authorize_projection(ctx, &compiled.view, &compiled.revision, "read:source")?;
+    authorize_projection(ctx, &compiled.view, &compiled.revision, "read:source").await?;
     Ok(KnowledgeViewResponse {
         view: compiled.view,
         revision: compiled.revision,
@@ -1961,11 +2079,11 @@ fn compiled_source_response(
     })
 }
 
-fn compiled_graph_response(
+async fn compiled_graph_response(
     ctx: &ToolContext,
     compiled: CompiledGraphView,
 ) -> McpResult<KnowledgeViewResponse> {
-    authorize_projection(ctx, &compiled.view, &compiled.revision, "read:entity")?;
+    authorize_projection(ctx, &compiled.view, &compiled.revision, "read:entity").await?;
     Ok(KnowledgeViewResponse {
         view: compiled.view,
         revision: compiled.revision,
@@ -1975,7 +2093,7 @@ fn compiled_graph_response(
     })
 }
 
-fn authorize_projection(
+async fn authorize_projection(
     ctx: &ToolContext,
     view: &KnowledgeView,
     revision: &KnowledgeViewRevision,
@@ -1999,7 +2117,9 @@ fn authorize_projection(
         .map_err(|reason| McpError::ExecutionError(format!("Access denied: {reason}")))?;
     ctx.authz
         .authorize_record_read(&ctx.principal, revision, scope)
-        .map_err(|reason| McpError::ExecutionError(format!("Access denied: {reason}")))
+        .map_err(|reason| McpError::ExecutionError(format!("Access denied: {reason}")))?;
+    crate::current_read::require(ctx, revision.clone(), scope).await?;
+    Ok(())
 }
 
 enum KnowledgeViewRoot {
@@ -2039,6 +2159,17 @@ fn response_success(response: KnowledgeViewResponse) -> McpResult<Value> {
         .map_err(|error| McpError::ExecutionError(error.to_string()))
 }
 
+#[cfg(feature = "meerkat-extraction")]
+fn pipeline_response_error(error: elephant_pipeline::PipelineError) -> McpResult<Value> {
+    let message = error.to_string();
+    match McpError::from(error) {
+        error @ McpError::StorageError(elephant_storage::StorageError::ErasureInProgress) => {
+            Err(error)
+        }
+        _ => response_error(message),
+    }
+}
+
 fn response_error(message: impl Into<String>) -> McpResult<Value> {
     let response: ToolResponse<()> = ToolResponse::error(message);
     serde_json::to_value(response).map_err(|error| McpError::ExecutionError(error.to_string()))
@@ -2075,6 +2206,29 @@ mod tests {
         )
     }
 
+    async fn create_test_space(storage: &StorageClient) {
+        let config: elephant_types::records::SpaceConfig = serde_json::from_value(json!({
+            "id": RecordId::new_v4(TableName::SpaceConfig),
+            "space_id": "wiki-space",
+            "created_at": chrono::Utc::now(), "updated_at": chrono::Utc::now(),
+            "created_by": "test", "provenance": {},
+            "security": {"policy_id": "default", "level": 0, "labels": [], "handling": []},
+            "subjects": [], "subjects_state": "complete",
+            "embedding_provider": "fake", "embedding_model": "test", "embedding_dims": 8
+        }))
+        .expect("space configuration");
+        elephant_storage::SpaceConfigRepository::new(storage.clone())
+            .create(config)
+            .await
+            .expect("create space");
+    }
+
+    async fn embedded_storage() -> StorageClient {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        create_test_space(&storage).await;
+        storage
+    }
+
     async fn create_entity(storage: &StorageClient, entity_type: &str, name: &str) -> RecordId {
         let entity = Entity::new(
             BaseFields::new(
@@ -2108,8 +2262,198 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        clippy::too_many_lines,
+        reason = "Keep the complete native reservation-error control and fixture lifetimes through publication assertions."
+    )]
+    async fn native_wiki_writers_preserve_reservation_errors_without_publication() {
+        let storage = StorageClient::new_memory().await.expect("native storage");
+        storage
+            .query_checked(include_str!(
+                "../../../migrations/sql/031_source_publication.surql"
+            ))
+            .await
+            .expect("publication schema");
+        storage
+            .query_checked(include_str!(
+                "../../../migrations/sql/039_private_reference_fence.surql"
+            ))
+            .await
+            .expect("native reference guards");
+        create_test_space(&storage).await;
+        let entity_id = create_entity(&storage, "topic", "Reserved wiki topic").await;
+        let source = Source::new(
+            BaseFields::new(
+                RecordId::new_v4(TableName::Source),
+                "wiki-space".into(),
+                "test".into(),
+            ),
+            SourceType::Manual,
+            "wiki-reservation-source".into(),
+        );
+        let source_id = source.base.id.clone();
+        SourceRepository::new(storage.clone())
+            .create(source)
+            .await
+            .expect("source");
+        let ctx = context(storage.clone());
+        let upsert = UpsertKnowledgeViewDefinitionHandler::new(storage.clone());
+        let selector = json!({
+            "type": "query", "entity_types": ["topic"], "name_contains": null,
+            "attributes": [], "scan_limit": 100, "max_members": 10
+        });
+        let created = upsert
+            .execute(
+                &ctx,
+                json!({"title": "Existing definition", "selector": selector}),
+            )
+            .await
+            .expect("unreserved definition write");
+        assert_eq!(created["ok"], true);
+        let definition_id = created["data"]["id"].as_str().expect("definition id");
+        let materialize = MaterializeKnowledgeViewsHandler::new(storage.clone());
+        let first = materialize
+            .execute(&ctx, json!({"concurrency": 1}))
+            .await
+            .expect("unreserved materialization");
+        assert_eq!(first["data"]["failures"], json!([]));
+        for kind in ["entities", "sources", "definitions"] {
+            assert_eq!(first["data"][kind]["compiled"], 1, "{kind}");
+        }
+        KnowledgeViewRepository::new(storage.clone())
+            .mark_dirty_for_dependencies(
+                "wiki-space",
+                &[
+                    entity_id.to_string(),
+                    source_id.to_string(),
+                    definition_id.to_owned(),
+                ],
+                "reservation regression requires actual publication",
+            )
+            .await
+            .expect("invalidate cached projections");
+
+        // Hold the real database admission boundary. The handlers retain their
+        // ordinary query context, without the private original erasure permit.
+        storage
+            .query_checked(
+                "UPDATE type::thing('source_erasure_guard', 'wiki-space') SET erasure_reservation='wiki-adapter-reservation';",
+            )
+            .await
+            .expect("reserve existing native guard");
+        let snapshot_sql = r"
+RETURN {
+    definitions: (SELECT * FROM knowledge_view_definition WHERE space_id='wiki-space' ORDER BY id),
+    views: (SELECT * FROM knowledge_view WHERE space_id='wiki-space' ORDER BY id),
+    revisions: (SELECT * FROM knowledge_view_revision WHERE space_id='wiki-space' ORDER BY id),
+    dependencies: (SELECT * FROM knowledge_view_dependency WHERE space_id='wiki-space' ORDER BY id),
+    events: (SELECT * FROM system_event WHERE space_id='wiki-space' ORDER BY id),
+    epoch: (SELECT * FROM ONLY type::thing('canonical_epoch', 'wiki-space'))
+};";
+        let before: surrealdb::Value = storage
+            .query_checked(snapshot_sql)
+            .await
+            .expect("before snapshot")
+            .take(0)
+            .expect("before snapshot value");
+        let update = upsert
+            .execute(
+                &ctx,
+                json!({"definition_id": definition_id, "title": "Must not publish", "selector": selector}),
+            )
+            .await;
+        assert!(matches!(
+            update,
+            Err(McpError::StorageError(
+                elephant_storage::StorageError::ErasureInProgress
+            ))
+        ));
+        let rebuild = RebuildKnowledgeViewHandler::new(storage.clone());
+        for params in [
+            json!({"entity_id": entity_id.to_string()}),
+            json!({"source_id": source_id.to_string()}),
+            json!({"definition_id": definition_id}),
+        ] {
+            assert!(matches!(
+                rebuild.execute(&ctx, params).await,
+                Err(McpError::StorageError(
+                    elephant_storage::StorageError::ErasureInProgress
+                ))
+            ));
+        }
+        let get = GetKnowledgeViewHandler::new(storage.clone());
+        for params in [
+            json!({"entity_id": entity_id.to_string(), "freshness": "prefer_fresh"}),
+            json!({"source_id": source_id.to_string(), "freshness": "prefer_fresh"}),
+            json!({"definition_id": definition_id, "freshness": "prefer_fresh"}),
+        ] {
+            assert!(
+                matches!(
+                    get.execute(&ctx, params).await,
+                    Err(McpError::StorageError(
+                        elephant_storage::StorageError::ErasureInProgress
+                    ))
+                ),
+                "refresh reservations must not become successful stale responses"
+            );
+        }
+        for kind in ["entities", "sources", "definitions"] {
+            let mut params = json!({
+                "include_entities": false, "include_sources": false,
+                "include_definitions": false, "concurrency": 1
+            });
+            params[format!("include_{kind}")] = json!(true);
+            assert!(
+                matches!(
+                    materialize.execute(&ctx, params).await,
+                    Err(McpError::StorageError(
+                        elephant_storage::StorageError::ErasureInProgress
+                    ))
+                ),
+                "{kind} must preserve the typed reservation"
+            );
+        }
+        let after: surrealdb::Value = storage
+            .query_checked(snapshot_sql)
+            .await
+            .expect("after snapshot")
+            .take(0)
+            .expect("after snapshot value");
+        assert_eq!(
+            after, before,
+            "refused writers must leave publication unchanged"
+        );
+    }
+
+    #[cfg(feature = "meerkat-extraction")]
+    #[test]
+    fn wiki_pipeline_response_preserves_typed_reservation_and_validation_text() {
+        use elephant_pipeline::PipelineError;
+        use elephant_storage::StorageError;
+        for error in [
+            PipelineError::StorageError(StorageError::ErasureInProgress),
+            PipelineError::OutboxError(StorageError::ErasureInProgress.into()),
+        ] {
+            assert!(matches!(
+                pipeline_response_error(error),
+                Err(McpError::StorageError(StorageError::ErasureInProgress))
+            ));
+        }
+        let validation = PipelineError::InvalidInput("keep the exact validation reason".into());
+        let expected = validation.to_string();
+        let response = pipeline_response_error(validation).expect("ordinary response");
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"], expected);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn manual_definition_edit_preserves_organizer_subject_scope() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = embedded_storage().await;
         let root = create_entity(&storage, "person", "Allowed root").await;
         let other = create_entity(&storage, "person", "Secret project").await;
         let mut ctx = enforcing_context(storage.clone());
@@ -2153,11 +2497,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn source_projection_requires_raw_document_scope_for_fresh_and_cached_reads() {
         use elephant_storage::{DocRepository, DocRevisionRepository};
         use elephant_types::records::doc_revision::RendererMetadata;
         use elephant_types::records::{Doc, DocRevision, RevisionStatus};
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = embedded_storage().await;
         let source = Source::new(
             BaseFields::new(
                 RecordId::new_v4(TableName::Source),
@@ -2200,7 +2548,9 @@ mod tests {
                 ),
                 doc: Link::new(doc_id),
                 text: "Private document text".to_string(),
-                text_hash: "sha256:test".to_string(),
+                text_hash:
+                    "sha256:2181faf3c1fa0d09a3fafce572dfbcd5c4387677c880ad4cfe1d5c79140b9cbf"
+                        .to_string(),
                 renderer: RendererMetadata {
                     name: "test".to_string(),
                     version: "1".to_string(),
@@ -2241,10 +2591,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn entity_projection_enforces_all_contributing_subjects_on_fresh_and_cached_reads() {
         use elephant_storage::RelRepository;
         use elephant_types::records::{ClaimStatus, Rel};
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = embedded_storage().await;
         let root = create_entity(&storage, "person", "Allowed root").await;
         let counterpart = create_entity(&storage, "person", "Restricted counterpart").await;
         let relation = Rel {
@@ -2297,8 +2651,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn wiki_service_requires_explicit_unrestricted_management_grant() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = embedded_storage().await;
         let mut ctx = enforcing_context(storage.clone());
         let handler = CreateWikiFromGraphHandler::new(storage);
         let denied = handler.execute(&ctx, json!({})).await.expect("denial");
@@ -2318,8 +2676,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn create_wiki_from_graph_exposes_llm_planning_contract() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = embedded_storage().await;
         let handler = CreateWikiFromGraphHandler::new(storage);
         assert_eq!(handler.name(), "create_wiki_from_graph");
         let schema = handler.input_schema();
@@ -2340,8 +2702,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn get_knowledge_view_routes_entity_reuse_and_source_projection() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = embedded_storage().await;
         let entity = Entity::new(
             BaseFields::new(
                 RecordId::new_v4(TableName::Entity),
@@ -2413,8 +2779,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn governed_topic_definition_round_trips_and_compiles() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = embedded_storage().await;
         let topic_id = create_entity(&storage, "topic", "Knowledge graphs").await;
         let related_id = create_entity(&storage, "concept", "Graph databases").await;
         let ctx = context(storage.clone());
@@ -2498,8 +2868,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn materialize_existing_data_compiles_and_then_reuses_all_root_kinds() {
-        let storage = StorageClient::new_embedded().await.expect("storage");
+        let storage = embedded_storage().await;
         let entity = Entity::new(
             BaseFields::new(
                 RecordId::new_v4(TableName::Entity),

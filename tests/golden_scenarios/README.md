@@ -1,3 +1,7 @@
+> Before any live run, read [the qualification boundary](QUALIFICATION_BOUNDARY.md).
+> Model calls require separate authorization and `--allow-paid-providers`; default
+> acceptance is strict. Missing prerequisites cannot pass.
+
 # Golden Scenarios
 
 This suite runs **20 escalating, deliberately convoluted end-to-end scenarios** against a live Elephant stack:
@@ -23,33 +27,33 @@ From repo root:
 ```bash
 export ANTHROPIC_API_KEY=...
 export OPENAI_API_KEY=...
-./tests/golden_scenarios/run_golden_scenarios.sh
+./tests/golden_scenarios/run_golden_scenarios.sh --allow-paid-providers
 ```
 
 Useful options:
 
 ```bash
 # Quick smoke (first 3 scenarios)
-./tests/golden_scenarios/run_golden_scenarios.sh --limit 3
+./tests/golden_scenarios/run_golden_scenarios.sh --allow-paid-providers --limit 3
 
 # Fail CI if any scenario fails thresholds
-./tests/golden_scenarios/run_golden_scenarios.sh --strict
+./tests/golden_scenarios/run_golden_scenarios.sh --allow-paid-providers --strict
 
 # Use already-running services
-./tests/golden_scenarios/run_golden_scenarios.sh --no-docker
+./tests/golden_scenarios/run_golden_scenarios.sh --allow-paid-providers --no-docker
 
 # Tear down docker services when finished
-./tests/golden_scenarios/run_golden_scenarios.sh --teardown
+./tests/golden_scenarios/run_golden_scenarios.sh --allow-paid-providers --teardown
 ```
 
 Judge configuration:
 
 ```bash
-# Disable judge (not recommended for quality checks)
-JUDGE_ENABLED=false ./tests/golden_scenarios/run_golden_scenarios.sh
+# Explicit diagnostic-only mode with no semantic acceptance
+JUDGE_ENABLED=false ./tests/golden_scenarios/run_golden_scenarios.sh --allow-paid-providers --exploratory
 
 # Override judge model and minimum passing score
-JUDGE_MODEL=gpt-4o-mini JUDGE_MIN_OVERALL=0.70 ./tests/golden_scenarios/run_golden_scenarios.sh --strict
+JUDGE_MODEL=gpt-4o-mini JUDGE_MIN_OVERALL=0.70 ./tests/golden_scenarios/run_golden_scenarios.sh --allow-paid-providers --strict
 ```
 
 ## Outputs

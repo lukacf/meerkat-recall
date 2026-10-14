@@ -1,0 +1,10 @@
+# Central artifact preparation supplies an existing pinned local toolchain layer
+# containing Python 3.11+. This fixture is separate from the product image.
+ARG FIXTURE_BASE
+FROM ${FIXTURE_BASE}
+WORKDIR /opt/recall-graph-fixture
+COPY scripts/qualification/container_graph_helper.py scripts/qualification/container_graph_budget.py ./
+COPY tests/recall_preview_semantics/full_workload_transport.py tests/recall_preview_semantics/full_workload_spy.py ./
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ENTRYPOINT ["python3", "/opt/recall-graph-fixture/container_graph_helper.py"]
+CMD ["inventory"]

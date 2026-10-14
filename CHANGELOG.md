@@ -7,8 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Changes prepared for the first release. A workspace version or candidate build
-does not by itself establish a published release.
+Changes prepared for Recall 0.9.0.
+
+### Meerkat 0.9 integration
+- Exact-pin the published Meerkat 0.9.0 family and align Recall workspace and
+  helper package versions to 0.9.0.
+- Retire the three active provider HTTP backports in favor of upstream native
+  redirect refusal and fail-closed client construction; preserve their historical
+  source evidence and record the replacement registry checksums.
+
+### Security and correctness
+- Upgrade the Ammonia HTML sanitizer to 4.1.7. Retain the documented,
+  advisory-specific `unsafe-libyaml` maintenance exception because the published
+  Meerkat 0.9 SDK still depends on that unmaintained parser.
+- Identity merge audit records retain the authorization restrictions of both
+  the original and replacement identities, including subject references removed
+  from the live row but preserved in the audit's before image.
+- Scope secret-scanner fixture exceptions to both the reviewed exact value and
+  its file path; different values in those paths remain subject to detection.
+
+### Release tooling
+- Include all six active patched dependency source trees in native and container
+  distributions, including the Tokenizers and rav1e maintenance patches.
+- Check helper manifest and lockfile version parity alongside Rust workspace
+  packages, and require a single exact version across direct Meerkat SDK pins.
+
+## [0.1.0] - 2026-10-13
 
 ### Runtime and licensing
 - Governed Living Wiki generation, revision visibility, and durable cancellation.

@@ -21,6 +21,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use elephant_policy::RecordAttributes;
+use elephant_storage::public_mutation::PublicMutation;
+
+#[path = "timeline_mutation.rs"]
+mod mutation;
 #[cfg(test)]
 use elephant_storage::MockEventRepository;
 use elephant_storage::{
@@ -37,6 +41,8 @@ use crate::routes::require_space_id;
 
 /// Shared state for timeline handlers.
 pub struct TimelineState {
+    /// Current source authority; absent only in repository unit fixtures.
+    pub storage: Option<StorageClient>,
     /// Event repository.
     pub event_repo: Arc<dyn TimelineEventRepo>,
     /// Authorization service.
@@ -218,6 +224,7 @@ impl TimelineState {
     #[must_use]
     pub fn new(client: StorageClient, authz: AuthzState) -> Self {
         Self {
+            storage: Some(client.clone()),
             event_repo: Arc::new(EventRepository::new(client)),
             authz,
         }
@@ -227,7 +234,11 @@ impl TimelineState {
     #[must_use]
     #[cfg(test)]
     pub fn new_with_repo(event_repo: Arc<dyn TimelineEventRepo>, authz: AuthzState) -> Self {
-        Self { event_repo, authz }
+        Self {
+            storage: None,
+            event_repo,
+            authz,
+        }
     }
 }
 
@@ -304,21 +315,20 @@ fn authorize_event(
         })
 }
 
-fn filter_authorized_events(
+async fn filter_authorized_events(
     state: &TimelineState,
     principal: &AuthPrincipal,
     events: Vec<Event>,
     scope: &str,
-) -> Vec<Event> {
-    events
-        .into_iter()
-        .filter(|event| {
-            state
-                .authz
-                .evaluate(principal, &event_record_attributes(event), scope)
-                .is_ok()
-        })
-        .collect()
+) -> Result<Vec<Event>, (StatusCode, Json<ApiError>)> {
+    super::current_read::filter(
+        state.storage.as_ref(),
+        &state.authz,
+        principal,
+        events,
+        scope,
+    )
+    .await
 }
 
 /// POST /v1/timeline/search - Search events.
@@ -369,7 +379,8 @@ async fn search_events(
     if !include_candidates {
         results.retain(|event| event.status != EventStatus::Candidate);
     }
-    let filtered = filter_authorized_events(state.as_ref(), &principal, results, "read:event");
+    let filtered =
+        filter_authorized_events(state.as_ref(), &principal, results, "read:event").await?;
     let total = filtered.len();
 
     Ok(Json(EventSearchResponse {
@@ -392,16 +403,10 @@ async fn create_event(
     // Override space_id with principal's space to prevent cross-space writes
     event.base.space_id.clone_from(&space_id);
 
-    authorize_event(state.as_ref(), &principal, &event, "write:event")
-        .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
-
-    match state.event_repo.create(event).await {
-        Ok(created) => Ok((StatusCode::CREATED, Json(created))),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
-    }
+    let mutation = mutation::begin(&state, &principal, &space_id).await?;
+    mutation::save(&state, &principal, mutation, None, event, false)
+        .await
+        .map(|Json(event)| (StatusCode::CREATED, Json(event)))
 }
 
 /// GET /v1/timeline/{id} - Get event by ID.
@@ -421,16 +426,22 @@ async fn get_event(
         Ok(Some(event)) => {
             authorize_event(state.as_ref(), &principal, &event, "read:event")
                 .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
-            Ok(Json(event))
+            Ok(Json(
+                super::current_read::require(
+                    state.storage.as_ref(),
+                    &state.authz,
+                    &principal,
+                    event,
+                    "read:event",
+                )
+                .await?,
+            ))
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ApiError::not_found("Event", &id)),
         )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 
@@ -448,58 +459,32 @@ async fn update_event(
             Json(ApiError::validation(e.to_string())),
         )
     })?;
-    match state.event_repo.get(&space_id, &rid).await {
-        Ok(Some(existing)) => {
-            authorize_event(state.as_ref(), &principal, &existing, "write:event")
-                .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
-            authorize_event(state.as_ref(), &principal, &event, "write:event")
-                .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
-            // Ordinary edits keep the event's classification: being cleared for
-            // both envelopes is not a grant to declassify.
-            if existing.base.security != event.base.security {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    Json(ApiError {
-                        code: "ACCESS_DENIED".to_string(),
-                        message: "ordinary event updates cannot change security metadata"
-                            .to_string(),
-                        details: None,
-                    }),
-                ));
-            }
-
-            match state
-                .event_repo
-                .update_preserving_security(&space_id, &rid, event)
-                .await
-            {
-                Ok(updated) => Ok(Json(updated)),
-                Err(elephant_storage::StorageError::Conflict(message)) => Err((
-                    StatusCode::CONFLICT,
-                    Json(ApiError {
-                        code: "CONFLICT".to_string(),
-                        message,
-                        details: None,
-                    }),
-                )),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
-            }
-        }
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError::not_found("Event", &id)),
-        )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+    let mutation = mutation::begin(&state, &principal, &space_id).await?;
+    let observed = state
+        .event_repo
+        .get(&space_id, &rid)
+        .await
+        .map_err(|error| ApiError::storage(&error))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::not_found("Event", &id)),
+            )
+        })?;
+    if event.base.id != rid {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::validation("Event identity differs from URL")),
+        ));
     }
+    mutation::save(&state, &principal, mutation, Some(&observed), event, false).await
 }
 
 /// DELETE /v1/timeline/{id} - Soft delete event.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn delete_event(
     State(state): State<Arc<TimelineState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -512,31 +497,37 @@ async fn delete_event(
             Json(ApiError::validation(e.to_string())),
         )
     })?;
+    let mutation = mutation::begin(&state, &principal, &space_id).await?;
     match state.event_repo.get(&space_id, &rid).await {
         Ok(Some(existing)) => {
             authorize_event(state.as_ref(), &principal, &existing, "write:event")
                 .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
 
-            match state.event_repo.delete(&space_id, &rid).await {
+            let result = match mutation {
+                Some(mutation) => mutation
+                    .delete(&existing, &principal.subject)
+                    .await
+                    .map(|_| ()),
+                None => state.event_repo.delete(&space_id, &rid).await,
+            };
+            match result {
                 Ok(()) => Ok(StatusCode::NO_CONTENT),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
+                Err(e) => Err(ApiError::storage(&e)),
             }
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ApiError::not_found("Event", &id)),
         )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 
 /// POST /v1/timeline/{id}/restore - Restore soft-deleted event.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep the reviewed route body, guard lifetimes, and public contract intact."
+)]
 async fn restore_event(
     State(state): State<Arc<TimelineState>>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
@@ -549,6 +540,7 @@ async fn restore_event(
             Json(ApiError::validation(e.to_string())),
         )
     })?;
+    let mut mutation = mutation::begin(&state, &principal, &space_id).await?;
     match state.event_repo.get_with_deleted(&space_id, &rid).await {
         Ok(Some(existing)) => {
             authorize_event(state.as_ref(), &principal, &existing, "write:event")
@@ -557,11 +549,22 @@ async fn restore_event(
             authorize_event(state.as_ref(), &principal, &existing, "read:event")
                 .map_err(|e| (StatusCode::FORBIDDEN, Json(e)))?;
 
-            match state
-                .event_repo
-                .restore_guarded(&space_id, &rid, &existing)
-                .await
-            {
+            if let Some(mutation) = &mut mutation {
+                let mut proposed = existing.clone();
+                proposed.base.deleted_at = None;
+                mutation::authorize_inputs(&state, &principal, mutation, &mut proposed, false)
+                    .await?;
+            }
+            let result = match mutation {
+                Some(mutation) => mutation.restore(&existing, &principal.subject).await,
+                None => {
+                    state
+                        .event_repo
+                        .restore_guarded(&space_id, &rid, &existing)
+                        .await
+                }
+            };
+            match result {
                 Ok(restored) => Ok(Json(restored)),
                 Err(elephant_storage::StorageError::Conflict(_)) => Err((
                     StatusCode::CONFLICT,
@@ -571,20 +574,14 @@ async fn restore_event(
                         details: None,
                     }),
                 )),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::internal(e.to_string())),
-                )),
+                Err(e) => Err(ApiError::storage(&e)),
             }
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ApiError::not_found("Event", &id)),
         )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(e.to_string())),
-        )),
+        Err(e) => Err(ApiError::storage(&e)),
     }
 }
 
@@ -601,7 +598,7 @@ async fn get_recent(
                 events.retain(|event| event.status != EventStatus::Candidate);
             }
             let filtered =
-                filter_authorized_events(state.as_ref(), &principal, events, "read:event");
+                filter_authorized_events(state.as_ref(), &principal, events, "read:event").await?;
             Ok(Json(filtered))
         }
         Err(e) => Err((
@@ -639,7 +636,7 @@ async fn get_upcoming(
                 events.retain(|event| event.status != EventStatus::Candidate);
             }
             let filtered =
-                filter_authorized_events(state.as_ref(), &principal, events, "read:event");
+                filter_authorized_events(state.as_ref(), &principal, events, "read:event").await?;
             Ok(Json(filtered))
         }
         Err(e) => Err((
@@ -669,58 +666,26 @@ async fn batch_events(
     let mut succeeded = Vec::new();
     let mut failed = Vec::new();
 
-    for (index, event) in req.items.into_iter().enumerate() {
-        let mut event = event;
+    for (index, mut event) in req.items.into_iter().enumerate() {
         event.base.space_id.clone_from(&space_id);
-        let rid = event.base.id.clone();
-
-        let result = match state.event_repo.get_with_deleted(&space_id, &rid).await {
-            Ok(Some(existing)) => {
-                if let Err(e) =
-                    authorize_event(state.as_ref(), &principal, &existing, "write:event")
-                {
-                    failed.push(BatchError {
-                        index,
-                        error: e.message,
-                    });
-                    continue;
-                }
-                if let Err(e) = authorize_event(state.as_ref(), &principal, &event, "write:event") {
-                    failed.push(BatchError {
-                        index,
-                        error: e.message,
-                    });
-                    continue;
-                }
-                if existing.base.deleted_at.is_some() {
-                    if let Err(e) = state.event_repo.restore(&space_id, &rid).await {
-                        failed.push(BatchError {
-                            index,
-                            error: format!("restore failed: {e}"),
-                        });
-                        continue;
-                    }
-                }
-                state.event_repo.update(&space_id, &rid, event).await
-            }
-            Ok(None) => {
-                if let Err(e) = authorize_event(state.as_ref(), &principal, &event, "write:event") {
-                    failed.push(BatchError {
-                        index,
-                        error: e.message,
-                    });
-                    continue;
-                }
-                state.event_repo.create(event).await
-            }
-            Err(e) => Err(e),
-        };
-
+        let result = async {
+            let mutation = mutation::begin(&state, &principal, &space_id).await?;
+            let observed = state
+                .event_repo
+                .get_with_deleted(&space_id, &event.base.id)
+                .await
+                .map_err(|error| ApiError::storage(&error))?;
+            mutation::save(&state, &principal, mutation, observed.as_ref(), event, true).await
+        }
+        .await;
         match result {
-            Ok(d) => succeeded.push(d),
-            Err(e) => failed.push(BatchError {
+            Ok(Json(event)) => succeeded.push(event),
+            Err((status, Json(error))) if error.code == "NOT_READY" => {
+                return Err((status, Json(error)))
+            }
+            Err((_, Json(error))) => failed.push(BatchError {
                 index,
-                error: e.to_string(),
+                error: error.message,
             }),
         }
     }

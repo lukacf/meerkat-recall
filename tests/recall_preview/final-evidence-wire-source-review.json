@@ -1,0 +1,43 @@
+{
+  "format": "recall-independent-source-review/v1",
+  "authority": "qualification",
+  "reviewed_source": "eaefde70859023e10c5078f266948b03586ba697",
+  "renderer_document_source": "07a5154670acaf1804f4e34479e59b8b83e648cf",
+  "scope": "required ninth Doc route identifier, original immutable DTO, actual renderer and response cap layers",
+  "verdict": "selected source ACK",
+  "execution_authorized": false,
+  "product_acceptance": false,
+  "file_sha256": {
+    "crates/mcp/src/scoped_search.rs": "ff40a473c6c7800b044a3f74fed1866d9998603b15da00826a8f520f14600bd1",
+    "tests/recall_preview_semantics/render_coordinates_http.rs": "eaa671bf0995f0baff9fe4b5747b998bbef5e440a92de107942a6b02be99a9b8",
+    "crates/storage/src/source_intake.rs": "d0b066d4bca77958b3df76251908e37136cb0e562c74f91136d70eb622cac580",
+    "crates/types/src/records/doc_revision.rs": "bc76cefc665ed0c27dc2c7a532e052cb5d853a1494845eebb561ff8a3d2582e4",
+    "crates/types/src/ids.rs": "1aa32b89eec5c7457a35a382be2db8ef1a7d54e62b908ae842c3a5be41689a24",
+    "crates/pipeline/src/renderer/mod.rs": "41691961b2fce37814c1623df0aa75b7d3582f6bbe8697501fffdbe6f85d8ac9",
+    "crates/types/src/rendered_text.rs": "b1feff7e2860062032095f85c6aacd8dad07e791db38033dcdea78f40eb668de",
+    "bin/elephant-api/src/routes/doc_revisions.rs": "9994c692b389fa441e607ee57bc8f92f55898041945ee41d70b5c0bbaea732e9",
+    "crates/mcp/src/handlers/mod.rs": "9ffcb7c6fce32cc234c32424588eba60b8bd39c6a5db460051601c7e4d36dc5a",
+    "bin/elephant-api/src/mcp_output.rs": "841d70c9f5fbd8a490de2dcaffd78b9c2ba59fc04c0036973b6025b40bb77129",
+    "bin/elephant-api/src/mcp.rs": "0a27f89b89c2e4478fb2af4ae6abf6103d510f35451e5f7ee8702867b0b6df14"
+  },
+  "renderer_document": {
+    "path": "docs/text-renderer-evidence-coordinates.md",
+    "sha256": "6a91c1d239a84ddee1d3ac1d7450f363975fdff4da906fb433db4b5d4e1d50bb"
+  },
+  "predicates": [
+    "SearchEvidence.doc_id is REQUIRED String, sourced from the same resolved.doc.base.id as the completed publication/current raw authorization proof. No external source/revision substring derivation.",
+    "Accepted Doc projection constructs UUIDv5 from original PublicationFence+originalDoc identity; canonical doc:<UUID> has40ASCIIbytes. Existing synthetic serialization-only shorter fixtures are not observed route identifiers.",
+    "All evidence origins use the same evidence assembly: exact mapping.doc_id equality, original Source accepted fingerprint reread, exact original mapping reread, same Doc/Revision/Source/Node/quote reread and final verify_current remain unchanged.",
+    "Actual mounted HTTP coordinate regression now checks returned doc_id equals original accepted Doc and uses BOTH returned identifiers in immutable revision route. All7 raw/rendered fixture bytes remain unchanged.",
+    "Full DocRevision serializes flattened BaseFields.id at top level; doc Link serializes RecordId directly; renderer has name/version/config_hash with null|string. Current RenderResult hashes exact full UTF8 bytes to64lowercasehex withoutprefix.",
+    "G07a normative algorithm matches actual scanner+trim_end mapping and active empty renderer refusal; exactUnicodeWhite_Space/CRLF/CR/LF/trailingblank/terminalLF/repeatedoccurrence rules independently checked.",
+    "Consumer requires original raw pushed input bound to source/externalrevision to prove raw span/wrong occurrence/stale raw. Rendered-only bytes/hashes/metadata cannot replace current publication or original source authority.",
+    "Whole HTTP SearchResponse JSON capped262144. MCP serialized inner ToolResponse/Value capped262144 before Content JSON escaping; outerJSONRPC/SSE may exceed262144. Originalcollector270336 and fullimmutableGET12065536 are separate bounds."
+  ],
+  "limits": [
+    "No Rust, HTTP/MCP, renderer, provider, consumer or installed artifact executed by qualification.",
+    "ParentDoc serializer addition does not qualify real retained source lifecycle/artifacts or signed consumer middleware.",
+    "C future delivered nine-field packet and E finalmanifest pin require exact-byte checks; previous eight-field originals remain historical.",
+    "CB07 controlled arithmetic independently updated in D bbe379b; actual selection/framing remains future."
+  ]
+}

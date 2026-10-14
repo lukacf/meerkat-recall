@@ -9,9 +9,12 @@ pub mod events;
 pub mod identity;
 pub mod knowledge_views;
 pub mod predicates;
+pub mod processing;
+pub mod public_sources;
 pub mod relationships;
 pub mod reprocess;
 pub mod search;
+mod source_intake;
 pub mod source_watches;
 pub mod sources;
 pub mod spaces;
@@ -95,6 +98,7 @@ pub struct ToolContext {
     /// Retained authentication evidence, distinct from the ABAC projection.
     /// Absent for explicitly trusted embedding and skip-auth development mode.
     verified_caller: Option<elephant_auth::VerifiedCallerContext>,
+    snapshot_coordinator: Option<Arc<dyn crate::snapshot_control::SnapshotCoordinator>>,
 }
 
 impl ToolContext {
@@ -106,6 +110,7 @@ impl ToolContext {
             authz: Arc::new(AuthzService::new()),
             principal,
             verified_caller: None,
+            snapshot_coordinator: None,
         }
     }
 
@@ -121,6 +126,7 @@ impl ToolContext {
             authz,
             principal,
             verified_caller: None,
+            snapshot_coordinator: None,
         }
     }
     /// Carry an already verified ingress context. Raw public policy principals
@@ -132,6 +138,23 @@ impl ToolContext {
     ) -> Self {
         self.verified_caller = caller;
         self
+    }
+
+    /// Connect online snapshot tools to their hosting runtime's worker drain.
+    #[must_use]
+    pub fn with_snapshot_coordinator(
+        mut self,
+        coordinator: Arc<dyn crate::snapshot_control::SnapshotCoordinator>,
+    ) -> Self {
+        self.snapshot_coordinator = Some(coordinator);
+        self
+    }
+    /// Host drain coordinator, when this dispatcher runs inside a managed service.
+    #[must_use]
+    pub fn snapshot_coordinator(
+        &self,
+    ) -> Option<&Arc<dyn crate::snapshot_control::SnapshotCoordinator>> {
+        self.snapshot_coordinator.as_ref()
     }
 
     /// Authentication evidence retained for trusted enforcement and attribution.
@@ -204,8 +227,38 @@ impl ToolDispatcher {
             .handlers
             .get(name)
             .ok_or_else(|| McpError::ToolNotFound(name.to_string()))?;
-        let mut result = handler.execute(&self.context, params).await?;
+        let read = name.starts_with("search_")
+            || name.starts_with("get_")
+            || name.starts_with("list_")
+            || name == "query_timeline";
+        let mut result = if read {
+            elephant_storage::read_eligibility::with_read_fence(
+                self.context.storage.clone(),
+                handler.execute(&self.context, params),
+            )
+            .await
+            .map_err(|_| {
+                McpError::Public(elephant_types::public_error::PublicError::new(
+                    elephant_types::public_error::ErrorCode::NotReady,
+                    "Source publication changed during read; retry",
+                ))
+            })??
+        } else {
+            handler.execute(&self.context, params).await?
+        };
         strip_embedding_vectors(&mut result);
+        if serde_json::to_vec(&result)
+            .map_err(|error| McpError::ExecutionError(error.to_string()))?
+            .len()
+            > crate::scoped_search::MAX_SEARCH_RESPONSE_BYTES
+        {
+            return Err(McpError::Public(
+                elephant_types::public_error::PublicError::new(
+                    elephant_types::public_error::ErrorCode::PayloadTooLarge,
+                    "Tool response exceeds 262144 bytes; request a smaller page",
+                ),
+            ));
+        }
         Ok(result)
     }
 
@@ -420,6 +473,7 @@ pub fn create_dispatcher_with_context(context: ToolContext) -> ToolDispatcher {
 
     // Register unified search tool
     dispatcher.register(search::UnifiedSearchHandler::new(storage.clone()));
+    dispatcher.register(crate::scoped_search::ScopedSearchHandler);
 
     // Register system tools
     dispatcher.register(system::RevertAuditHandler::new(storage.clone()));
@@ -437,6 +491,38 @@ pub fn create_dispatcher_with_context(context: ToolContext) -> ToolDispatcher {
     dispatcher.register(spaces::ListSpacesHandler::new(storage.clone()));
     dispatcher.register(spaces::GetSpaceHandler::new(storage.clone()));
     dispatcher.register(spaces::UpdateSpaceHandler::new(storage.clone()));
+    dispatcher.register(public_sources::SourceControlHandler::new(
+        storage.clone(),
+        public_sources::SourceAction::Head,
+    ));
+    dispatcher.register(public_sources::SourceControlHandler::new(
+        storage.clone(),
+        public_sources::SourceAction::Operation,
+    ));
+    dispatcher.register(public_sources::SourceControlHandler::new(
+        storage.clone(),
+        public_sources::SourceAction::Retract,
+    ));
+    dispatcher.register(public_sources::SourceControlHandler::new(
+        storage.clone(),
+        public_sources::SourceAction::Erase,
+    ));
+    dispatcher.register(processing::ReindexHandler::new(
+        storage.clone(),
+        processing::ReindexAction::Start,
+    ));
+    dispatcher.register(processing::ReindexHandler::new(
+        storage.clone(),
+        processing::ReindexAction::Status,
+    ));
+    dispatcher.register(processing::ReindexHandler::new(
+        storage.clone(),
+        processing::ReindexAction::Activate,
+    ));
+    dispatcher.register(processing::ReindexHandler::new(
+        storage.clone(),
+        processing::ReindexAction::Cancel,
+    ));
 
     // Register assertion tools
     dispatcher.register(assertions::ListAssertionsHandler::new(storage.clone()));
@@ -497,6 +583,14 @@ pub fn create_default_dispatcher_with_context(context: ToolContext) -> ToolDispa
     let storage = context.storage.clone();
     let mut dispatcher = ToolDispatcher::new(context);
 
+    dispatcher.register(public_sources::SourceControlHandler::new(
+        storage.clone(),
+        public_sources::SourceAction::Head,
+    ));
+    dispatcher.register(public_sources::SourceControlHandler::new(
+        storage.clone(),
+        public_sources::SourceAction::Operation,
+    ));
     // Ingest tools (file ingestion handled by elephant-local-helper via stdio)
     dispatcher.register(docs::IngestDocHandler::new(storage.clone()));
     dispatcher.register(docs::IngestDocSimpleHandler::new(storage.clone()));
@@ -506,6 +600,7 @@ pub fn create_default_dispatcher_with_context(context: ToolContext) -> ToolDispa
 
     // Discover tools
     dispatcher.register(search::UnifiedSearchHandler::new(storage.clone()));
+    dispatcher.register(crate::scoped_search::ScopedSearchHandler);
 
     // Navigate tools
     dispatcher.register(entities::GetEntityHandler::new(storage.clone()));
@@ -600,6 +695,14 @@ pub fn create_agent_dispatcher_with_context(context: ToolContext) -> ToolDispatc
 
     // Register Agent-profile source tools (read-only)
     dispatcher.register(sources::GetSourceHandler::new(storage.clone()));
+    dispatcher.register(public_sources::SourceControlHandler::new(
+        storage.clone(),
+        public_sources::SourceAction::Head,
+    ));
+    dispatcher.register(public_sources::SourceControlHandler::new(
+        storage.clone(),
+        public_sources::SourceAction::Operation,
+    ));
 
     // Register Agent-profile assertion tools (read-only)
     dispatcher.register(assertions::ListAssertionsHandler::new(storage.clone()));
@@ -617,6 +720,7 @@ pub fn create_agent_dispatcher_with_context(context: ToolContext) -> ToolDispatc
 
     // Register Agent-profile unified search tool
     dispatcher.register(search::UnifiedSearchHandler::new(storage.clone()));
+    dispatcher.register(crate::scoped_search::ScopedSearchHandler);
 
     // Register Agent-profile system tools (read-only)
     dispatcher.register(system::GetHealthHandler::new(storage.clone()));
@@ -680,6 +784,14 @@ pub fn create_maintenance_dispatcher_with_context(context: ToolContext) -> ToolD
 
     // Source tools (read-only)
     dispatcher.register(sources::GetSourceHandler::new(storage.clone()));
+    dispatcher.register(public_sources::SourceControlHandler::new(
+        storage.clone(),
+        public_sources::SourceAction::Head,
+    ));
+    dispatcher.register(public_sources::SourceControlHandler::new(
+        storage.clone(),
+        public_sources::SourceAction::Operation,
+    ));
 
     // Assertion tools (read-only)
     dispatcher.register(assertions::ListAssertionsHandler::new(storage.clone()));
@@ -700,6 +812,7 @@ pub fn create_maintenance_dispatcher_with_context(context: ToolContext) -> ToolD
 
     // Unified search
     dispatcher.register(search::UnifiedSearchHandler::new(storage.clone()));
+    dispatcher.register(crate::scoped_search::ScopedSearchHandler);
 
     // System tools (read-only)
     dispatcher.register(system::GetHealthHandler::new(storage.clone()));
@@ -816,6 +929,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_dispatcher_registers_extract_doc() {
         let storage = elephant_storage::StorageClient::new_memory()
             .await
@@ -836,6 +953,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_snapshot_tools_hidden_on_surreal_backend() {
         let storage = elephant_storage::StorageClient::new_memory()
             .await
@@ -858,6 +979,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_snapshot_tools_exposed_on_embedded_backend() {
         let storage = elephant_storage::StorageClient::new_embedded()
             .await
@@ -880,6 +1005,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_agent_dispatcher_capabilities_only_advertise_agent_tools() {
         let storage = elephant_storage::StorageClient::new_memory()
             .await
@@ -967,6 +1096,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_schemas_have_required_fields() {
         let storage = elephant_storage::StorageClient::new_memory()
             .await
@@ -997,6 +1130,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_tool_descriptions_have_no_uuid_placeholders() {
         let storage = elephant_storage::StorageClient::new_memory()
             .await
@@ -1026,6 +1163,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_tool_descriptions_include_examples() {
         let storage = elephant_storage::StorageClient::new_memory()
             .await
@@ -1059,6 +1200,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_key_payload_schemas_require_core_fields() {
         let storage = elephant_storage::StorageClient::new_memory()
             .await

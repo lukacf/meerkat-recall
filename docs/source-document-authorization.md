@@ -1,0 +1,15 @@
+# Caller and accepted document authorization
+
+An external caller document ID can differ from the immutable physical document produced by source acceptance. Authorizing only the caller document or only the Source envelope misses changes to the currently accepted document.
+
+`source_document_guards::PreparedDocGuards::from_authorized_documents(space, source_id, original_head, documents)` retains deduplicated full snapshots of every authorized document and the original head used to locate the physical accepted document. Foreign sources/spaces and inconsistent duplicates are rejected. An absent head means a real observed legacy source, not an invitation to bind a newer head.
+
+`SourcePublicationRepository::accept_with_document_guards(request, guards, contact)` compares that complete read set inside the same source/head/revision/operation transaction on both backends, in addition to any existing `authorized_document` field. The wrapper is ephemeral; it neither persists copied document payloads nor defines a second source authority. An identical accepted request returns its historical receipt before checking stale document observations because replay performs no mutation.
+
+Intake owns current physical-document lookup from the original immutable mapping and policy checks for all caller/current/proposed envelopes. Lifecycle owns consumption of the same transaction guard during retraction. These consumer joins are required before this storage seam closes the complete retained surface.
+
+Both-backend regression source changes only the second/current document, requires no acceptance side effects, permits freshly authorized complete read sets, preserves original receipt replay, and refuses a new intent with refreshed source CAS but stale document/head observations. Pure tests reject foreign and contradictory inputs. No tests were run locally; central integration owns execution.
+
+`with_absent_documents(&[RecordId])` also fences physical IDs which were absent during preflight, including a desired document whose staging failed. Concurrent appearance refuses a fresh acceptance. Present source-less caller documents are allowed after full adapter authorization; a document explicitly bound to another source is rejected. These extra observations are not copied into the legacy single-document field, which has its existing source-binding contract.
+
+`with_manifest_observation(original_fence, observed_manifest)` retains the same complete present/absent manifest observation used to enumerate physical documents. The acceptance/retraction transaction checks that exact payload under the original fence, so a manifest appearing or changing while a processing head stays unchanged cannot evade document authorization. A conflicting second builder call refuses instead of replacing the original observation. The source guard tests exercise actual storage payload races without claiming those fixtures are completed worker publications. F owns the existing manifest representation/key and its end-to-end worker qualification.

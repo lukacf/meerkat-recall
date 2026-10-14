@@ -198,9 +198,7 @@ impl ToolHandler for ListTruthSlotsHandler {
             .list(&space_id, input.limit + 1, cursor.as_ref())
             .await
             .map_err(|e| McpError::ExecutionError(e.to_string()))?;
-        let slots = ctx
-            .authz
-            .filter_records(&ctx.principal, slots, "read:entity");
+        let slots = crate::current_read::filter(ctx, slots, "read:entity").await?;
 
         // Get all conflict groups for the space
         let conflict_groups = self
@@ -460,6 +458,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_list_truth_slots_requires_read_entity_scope() {
         let storage = StorageClient::new_memory().await.expect("storage");
         let handler = ListTruthSlotsHandler::new(storage.clone());
@@ -489,6 +491,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original fixture owners through all authorization, result and state assertions in this control."
+    )]
     async fn test_list_truth_slots_filters_records_by_security() {
         let storage = StorageClient::new_memory().await.expect("storage");
         let handler = ListTruthSlotsHandler::new(storage.clone());

@@ -64,6 +64,7 @@ pub struct CompiledSourceView {
 /// Compiler and publication service for source-rooted knowledge views.
 #[derive(Clone, Debug)]
 pub struct SourceViewCompiler {
+    storage: StorageClient,
     views: KnowledgeViewRepository,
     sources: SourceRepository,
     docs: DocRepository,
@@ -76,6 +77,7 @@ impl SourceViewCompiler {
     #[must_use]
     pub fn new(storage: StorageClient) -> Self {
         Self {
+            storage: storage.clone(),
             views: KnowledgeViewRepository::new(storage.clone()),
             sources: SourceRepository::new(storage.clone()),
             docs: DocRepository::new(storage.clone()),
@@ -105,6 +107,10 @@ impl SourceViewCompiler {
     /// Compiles and atomically publishes a source view unless its exact input
     /// receipt already matches the current revision.
     #[allow(clippy::too_many_lines)] // Coordinates lineage reads and atomic publication.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Retain the reader's captured lineage observations through final projection checks and epoch publication."
+    )]
     pub async fn compile(
         &self,
         space_id: &str,
@@ -112,38 +118,41 @@ impl SourceViewCompiler {
         limits: SourceViewLimits,
         force: bool,
     ) -> StorageResult<CompiledSourceView> {
+        let observed_epoch =
+            elephant_storage::canonical_commit::CanonicalRepository::new(self.storage.clone())
+                .epoch(space_id)
+                .await?;
+
         let source = self
             .sources
             .get(space_id, source_id)
             .await?
             .ok_or_else(|| StorageError::NotFound(source_id.to_string()))?;
+        let reader = elephant_storage::read_eligibility::ReadEligibility::new(self.storage.clone());
+        let source = reader
+            .project(source, &|base| {
+                base.space_id == space_id && !base.is_deleted()
+            })
+            .await?
+            .ok_or_else(|| {
+                StorageError::Conflict("Source has no current published projection".into())
+            })?;
         let security = source.base.security.clone();
         let fingerprint = security_fingerprint(&security)?;
         let key = source_view_key(source_id, &fingerprint);
         let existing = self.views.find_by_key(space_id, &key).await?;
-        if !force {
-            if let Some(existing_view) = existing.as_ref() {
-                if let Some(current) = self.views.get_current_revision(existing_view).await? {
-                    if super::reusable_current_revision(
-                        existing_view,
-                        &current,
-                        SOURCE_COMPILER_VERSION,
-                    ) {
-                        return Ok(CompiledSourceView {
-                            view: existing_view.clone(),
-                            revision: current,
-                            changed: false,
-                        });
-                    }
-                }
-            }
-        }
+        // Recompute the bounded selection before cache reuse: an old dependency
+        // list cannot prove that no new matching relation or document appeared.
 
         let mut docs = self
             .docs
             .find_by_source(space_id, source_id, limits.documents)
             .await?;
-        docs.retain(|doc| doc.base.security == security);
+        docs = reader
+            .filter(docs, &|base| {
+                base.space_id == space_id && base.security == security && !base.is_deleted()
+            })
+            .await?;
         docs.sort_by(|left, right| {
             right
                 .base
@@ -156,9 +165,11 @@ impl SourceViewCompiler {
         let mut revisions = BTreeMap::new();
         for doc in &docs {
             let mut items = self.revisions.find_by_doc(&doc.base.id).await?;
-            items.retain(|revision| {
-                revision.base.space_id == space_id && revision.base.security == security
-            });
+            items = reader
+                .filter(items, &|base| {
+                    base.space_id == space_id && base.security == security && !base.is_deleted()
+                })
+                .await?;
             items.truncate(limits.revisions_per_document);
             revisions.insert(doc.base.id.clone(), items);
         }
@@ -197,7 +208,10 @@ impl SourceViewCompiler {
                         && (!freshness_due || current.freshness.expired_claims > 0)
                         && current.compiler.dependency_hash == draft.dependency_hash
                         && current.compiler.version == SOURCE_COMPILER_VERSION
+                        && super::projection_is_current(&self.storage, &current).await?
                     {
+                        super::verify_projection_epoch(&self.storage, space_id, &observed_epoch)
+                            .await?;
                         return Ok(CompiledSourceView {
                             view: existing_view.clone(),
                             revision: current,
@@ -310,7 +324,15 @@ impl SourceViewCompiler {
             compiled_at: now,
             supersedes: existing.and_then(|view| view.current_revision),
         };
-        let (view, revision) = self.views.publish(view, revision).await?;
+        if !super::projection_is_current(&self.storage, &revision).await? {
+            return Err(StorageError::Conflict(
+                "Projection has invalid or withdrawn evidence".into(),
+            ));
+        }
+        let (view, revision) = self
+            .views
+            .publish_at_epoch(view, revision, &observed_epoch)
+            .await?;
         Ok(CompiledSourceView {
             view,
             revision,
@@ -542,7 +564,7 @@ fn build_source_revision_draft(
                     &check.base.id,
                     "source_watch_check",
                     "latest_remote_observation",
-                    Some(check.completed_at),
+                    Some(check.base.updated_at),
                 );
                 let citation = super::push_record_citation(
                     &mut citations,
@@ -881,8 +903,13 @@ mod tests {
         clippy::too_many_lines,
         reason = "the test builds and verifies the complete source revision lineage"
     )]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Preserve original source-watch/compiler ownership through complete revision-lineage assertions."
+    )]
     async fn source_view_tracks_document_revision_lineage() {
         let storage = StorageClient::new_embedded().await.expect("storage");
+        crate::tests::register_space(&storage).await;
         let source = Source::new(
             BaseFields::new(
                 RecordId::new_v4(TableName::Source),
@@ -890,7 +917,7 @@ mod tests {
                 "test".to_string(),
             ),
             SourceType::Web,
-            "sha256:source".to_string(),
+            hex::encode(Sha256::digest(b"A factual source document.")),
         );
         let source_id = source.base.id.clone();
         SourceRepository::new(storage.clone())
@@ -925,7 +952,7 @@ mod tests {
             ),
             doc: Link::new(doc_id),
             text: "A factual source document.".to_string(),
-            text_hash: "sha256:revision".to_string(),
+            text_hash: hex::encode(Sha256::digest(b"A factual source document.")),
             renderer: RendererMetadata {
                 name: "test".to_string(),
                 version: "1".to_string(),
@@ -958,7 +985,7 @@ mod tests {
             last_changed_at: None,
             etag: Some("\"v1\"".to_string()),
             last_modified: None,
-            observed_hash: Some("sha256:source".to_string()),
+            observed_hash: Some(hex::encode(Sha256::digest(b"A factual source document."))),
             consecutive_failures: 0,
             last_error: None,
             latest_check: None,
@@ -1021,6 +1048,7 @@ mod tests {
         assert!(result.revision.dependencies.iter().any(|dependency| {
             dependency.record_id == check.base.id.to_string()
                 && dependency.record_type == "source_watch_check"
+                && dependency.observed_updated_at == Some(check.base.updated_at)
         }));
         assert!(result
             .revision

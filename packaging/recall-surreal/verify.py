@@ -15,10 +15,12 @@ MAX_RESPONSE_BYTES = 65536
 
 def capability_sql(lock: dict) -> str:
     vector = lock["capability"]
+    # SurrealDB 2.6.5 decodes unpadded base64 into its native Bytes value.
+    key = base64.b64encode(bytes.fromhex(vector["key_hex"])).decode().rstrip("=")
     return (
         'RETURN recall::reference_token_version();\n'
         f'RETURN recall::reference_tokens("{vector["journal"]}", "{vector["space"]}", '
-        f'encoding::hex::decode("{vector["key_hex"]}"), [], [type::thing("recall_probe", 42), '
+        f'encoding::base64::decode("{key}"), [], [type::thing("recall_probe", 42), '
         'type::thing("recall_probe", "42")]);\n'
     )
 

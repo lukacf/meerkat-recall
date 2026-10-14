@@ -1,9 +1,11 @@
 """Offline source/provenance and response parsing tests; no Rust/server/network."""
+import base64
 import copy
 import hashlib
 import hmac
 import io
 import json
+import re
 from pathlib import Path
 import struct
 import sys
@@ -228,6 +230,20 @@ checksum = "{spec['vart']['upstream_checksum']}"
         self.assertNotIn("CREATE", sql)
         self.assertIn('type::thing("recall_probe", 42)', sql)
         self.assertIn('type::thing("recall_probe", "42")', sql)
+
+    def test_capability_key_uses_supported_native_bytes_decoder(self):
+        lock = prepare.read_lock()
+        sql = verify.capability_sql(lock)
+        match = re.search(r'encoding::base64::decode\("([A-Za-z0-9+/]+)"\)', sql)
+        self.assertIsNotNone(match)
+        encoded = match.group(1)
+        decoded = base64.b64decode(encoded + "=" * (-len(encoded) % 4), validate=True)
+        self.assertEqual(decoded, bytes.fromhex(lock["capability"]["key_hex"]))
+        core = ROOT.parents[1] / "vendor/surrealdb-core-2.6.5/src"
+        self.assertIn('"encoding::base64::decode"', (core / "syn/parser/builtin.rs").read_text())
+        decoder = (core / "fnc/encoding.rs").read_text()
+        self.assertIn("STANDARD_NO_PAD.decode(arg)", decoder)
+        self.assertIn("Value::from(Bytes(", decoder)
 
 
 if __name__ == "__main__":

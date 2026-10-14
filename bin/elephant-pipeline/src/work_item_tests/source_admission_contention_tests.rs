@@ -204,6 +204,10 @@ async fn competing_replacements(
     clippy::too_many_lines,
     reason = "Keep the complete concurrent admission, idempotency, rollback and epoch contract in one backend fixture"
 )]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn concurrent_admission_contract(embedded: bool) {
     let storage = if embedded {
         StorageClient::new_embedded().await.unwrap()

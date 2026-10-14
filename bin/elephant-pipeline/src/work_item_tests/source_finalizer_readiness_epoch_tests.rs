@@ -49,6 +49,10 @@ fn planned_entity(epoch: &str, label: &str) -> (Entity, CanonicalCommit) {
     clippy::too_many_lines,
     reason = "Keep deterministic readiness interleaving, stale-plan refusal and actual source completion together"
 )]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn readiness_does_not_invalidate_prepared_work(embedded: bool) {
     let storage = if embedded {
         StorageClient::new_embedded().await.unwrap()

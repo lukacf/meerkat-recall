@@ -71,11 +71,12 @@ impl ProgressTrace {
     }
 
     fn work(&self, item: &WorkItem, phase: &'static str, details: serde_json::Value) {
-        let event = serde_json::json!({
+        let mut event = serde_json::json!({
             "at_ms": self.started.elapsed().as_millis(),
             "id": item.base.id, "kind": item.kind,
-            "attempt": item.attempts, "phase": phase, "details": details,
+            "attempt": item.attempts, "phase": phase,
         });
+        event["details"] = details;
         if phase == "completed" {
             *self.last_completion.lock().unwrap() = event.clone();
             if item.kind == FINALIZE {
@@ -97,20 +98,24 @@ impl ProgressTrace {
             events.pop_front();
         }
         events.push_back(event);
+        drop(events);
         self.total_events.fetch_add(1, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> serde_json::Value {
         let elapsed = self.started.elapsed();
-        let timing = self.driver_phase.lock().unwrap();
-        serde_json::json!({
-            "elapsed_ms": elapsed.as_millis(),
-            "driver": {
+        let driver = {
+            let timing = self.driver_phase.lock().unwrap();
+            serde_json::json!({
                 "phase": timing.current, "since_ms": timing.changed_at.as_millis(),
                 "duration_ms": elapsed.saturating_sub(timing.changed_at).as_millis(),
                 "longest_finished_phase": timing.longest,
                 "longest_finished_phase_ms": timing.longest_duration.as_millis(),
-            },
+            })
+        };
+        serde_json::json!({
+            "elapsed_ms": elapsed.as_millis(),
+            "driver": driver,
             "last_work_completion": self.last_completion.lock().unwrap().clone(),
             "last_publication_completion": self.last_publication.lock().unwrap().clone(),
             "active": self.active.lock().unwrap().clone(),
@@ -141,6 +146,10 @@ fn safe_failure(error: &anyhow::Error) -> serde_json::Value {
 
 /// A separate three-second read-only diagnostic budget starts only after the
 /// existing progress bound fails. It cannot turn a timeout into a passing run.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn fail_progress(
     storage: &StorageClient,
     publications: &[PublicationFence],
@@ -153,8 +162,9 @@ async fn fail_progress(
         let items = WorkItemRepository::new(storage.clone())
             .list(SPACE, 96, None)
             .await;
-        stored["items"] = match items {
-            Ok(items) => serde_json::json!({
+        stored["items"] = items.map_or_else(
+            |_| serde_json::json!({"query_failed": true}),
+            |items| serde_json::json!({
                 "at_limit": items.len() == 96,
                 "rows": items.iter().map(|item| serde_json::json!({
                     "id": item.base.id, "kind": item.kind, "status": item.status,
@@ -164,20 +174,19 @@ async fn fail_progress(
                     "publication": elephant_pipeline::source_queue::publication_from_work(item).ok().flatten(),
                 })).collect::<Vec<_>>(),
             }),
-            Err(_) => serde_json::json!({"query_failed": true}),
-        };
+        );
         let edges = elephant_storage::WorkEdgeRepository::new(storage.clone())
             .list(SPACE, 96, None)
             .await;
-        stored["edges"] = match edges {
-            Ok(edges) => serde_json::json!({
+        stored["edges"] = edges.map_or_else(
+            |_| serde_json::json!({"query_failed": true}),
+            |edges| serde_json::json!({
                 "at_limit": edges.len() == 96,
                 "rows": edges.iter().map(|edge| serde_json::json!({
                     "from": edge.from.id(), "to": edge.to.id(), "type": edge.edge_type,
                 })).collect::<Vec<_>>(),
             }),
-            Err(_) => serde_json::json!({"query_failed": true}),
-        };
+        );
         let sources = SourcePublicationRepository::new(storage.clone());
         let manifests = SourcePublicationManifestRepository::new(storage.clone());
         let mut source_rows = Vec::new();
@@ -190,7 +199,7 @@ async fn fail_progress(
                 "publication": publication,
                 "head": head.as_ref().ok(), "head_query_failed": head.is_err(),
                 "operation": operation.as_ref().ok(), "operation_query_failed": operation.is_err(),
-                "manifest": manifest.as_ref().ok().and_then(|value| value.as_ref()).map(|value| {
+                "manifest": manifest.as_ref().ok().and_then(Option::as_ref).map(|value| {
                     serde_json::json!({"mode": value.mode, "bundles": value.bundles.len(),
                         "embeddings": value.embeddings.len(), "documents": value.documents.len(),
                         "metadata_artifacts": value.metadata_artifact_ids,
@@ -198,7 +207,7 @@ async fn fail_progress(
                         "embedding_work_items": value.embedding_work_item_ids})
                 }),
                 "manifest_query_failed": manifest.is_err(),
-                "completion_present": completion.as_ref().is_ok_and(|value| value.is_some()),
+                "completion_present": completion.as_ref().is_ok_and(Option::is_some),
                 "completion_query_failed": completion.is_err(),
             }));
             stored["sources"] = serde_json::json!(source_rows);
@@ -206,8 +215,9 @@ async fn fail_progress(
         let runs = WorkRunRepository::new(storage.clone())
             .list(SPACE, 96, None)
             .await;
-        stored["runs"] = match runs {
-            Ok(runs) => serde_json::json!({
+        stored["runs"] = runs.map_or_else(
+            |_| serde_json::json!({"query_failed": true}),
+            |runs| serde_json::json!({
                 "at_limit": runs.len() == 96,
                 "rows": runs.iter().map(|run| serde_json::json!({
                     "id": run.base.id, "item": run.work_item.id(), "attempt": run.attempt,
@@ -217,8 +227,7 @@ async fn fail_progress(
                         .and_then(|value| serde_json::from_value::<FailureClass>(value).ok()),
                 })).collect::<Vec<_>>(),
             }),
-            Err(_) => serde_json::json!({"query_failed": true}),
-        };
+        );
     })
     .await;
     panic!(
@@ -341,6 +350,10 @@ async fn ready_to_prepare(storage: &StorageClient, item: &WorkItem) -> bool {
 #[allow(
     clippy::significant_drop_tightening,
     reason = "Keep fixture owners and the controlled provider alive through the final accounting assertions"
+)]
+#[expect(
+    clippy::future_not_send,
+    reason = "The fixture deliberately polls boxed_local dispatch futures on one task; it never spawns or transfers this driver"
 )]
 async fn overlapping_graph_progress(backend: provider_spy::Backend) {
     let storage = Box::pin(provider_spy::storage(backend)).await.unwrap();
@@ -587,6 +600,14 @@ async fn overlapping_graph_progress(backend: provider_spy::Backend) {
 #[allow(
     clippy::too_many_lines,
     reason = "Check the original publication, graph effects and exact immutable evidence together"
+)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
+#[expect(
+    clippy::suspicious_operation_groupings,
+    reason = "Each support row must match both the source ID and that source publication's distinct revision ID"
 )]
 async fn verify_graph_receipts(storage: &StorageClient, publications: &[PublicationFence]) {
     let sources = SourcePublicationRepository::new(storage.clone());

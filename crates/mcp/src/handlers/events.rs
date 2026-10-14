@@ -1404,6 +1404,10 @@ mod tests {
     /// Seeds `visible` events readable at clearance level 1 and `hidden` events at level 5,
     /// all starting in the next few hours. Hidden rows come first in time order so a
     /// cap-before-filter would starve the visible page.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture storage and repository owners alive through all authorization and pagination assertions"
+    )]
     async fn seed_upcoming(storage: &StorageClient, visible: usize, hidden: usize) {
         let repo = EventRepository::new(storage.clone());
         let source = SourceRepository::new(storage.clone())
@@ -1465,6 +1469,10 @@ mod tests {
         )
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture storage and repository owners alive through all authorization and pagination assertions"
+    )]
     async fn list_upcoming(storage: &StorageClient, params: Value) -> ListUpcomingEventsOutput {
         let handler = ListUpcomingEventsHandler::new(storage.clone());
         let response = handler
@@ -1478,6 +1486,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture storage and repository owners alive through all authorization and pagination assertions"
+    )]
     async fn test_list_upcoming_caps_after_authorization() {
         let storage = StorageClient::new_embedded().await.expect("storage");
         seed_upcoming(&storage, 40, 20).await;
@@ -1488,6 +1500,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture storage and repository owners alive through all authorization and pagination assertions"
+    )]
     async fn test_list_upcoming_reports_truncation() {
         let storage = StorageClient::new_embedded().await.expect("storage");
         seed_upcoming(&storage, 55, 5).await;
@@ -1509,6 +1525,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture storage and repository owners alive through all authorization and pagination assertions"
+    )]
     async fn test_list_upcoming_exact_fit_is_not_truncated() {
         let storage = StorageClient::new_embedded().await.expect("storage");
         seed_upcoming(&storage, 12, 3).await;

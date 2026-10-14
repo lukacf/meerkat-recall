@@ -186,6 +186,10 @@ async fn claimed(storage: &StorageClient) -> WorkItem {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn original_expiry_is_not_extended_by_a_newer_lease_snapshot() {
     let storage = StorageClient::new_embedded()
         .await
@@ -207,6 +211,10 @@ async fn original_expiry_is_not_extended_by_a_newer_lease_snapshot() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn real_queue_successor_cannot_receive_original_settlement() {
     let storage = StorageClient::new_embedded()
         .await
@@ -255,6 +263,10 @@ async fn real_queue_successor_cannot_receive_original_settlement() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn one_continuation_deadline_covers_every_persistence_phase() {
     let storage = StorageClient::new_embedded()
         .await
@@ -283,6 +295,10 @@ async fn one_continuation_deadline_covers_every_persistence_phase() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn successful_run_survives_settlement_conflicts_and_completes_once() {
     use elephant_pipeline::scheduler::work_queue::WorkQueueConfig;
     use elephant_pipeline::scheduler::{BudgetEnforcer, WorkQueue};
@@ -393,6 +409,10 @@ async fn successful_run_survives_settlement_conflicts_and_completes_once() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn failed_bookkeeping_retries_keep_original_cause_time_and_disposition() {
     use elephant_pipeline::scheduler::execution_contract::RetryAction;
     use elephant_pipeline::scheduler::BudgetEnforcer;

@@ -66,6 +66,10 @@ async fn expire_original(storage: &StorageClient, original: &WorkItem) {
     tokio::time::sleep(remaining + std::time::Duration::from_millis(10)).await;
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn dispatch(storage: &StorageClient, item: &WorkItem) -> anyhow::Result<WorkRunMetrics> {
     let items = WorkItemRepository::new(storage.clone());
     let mut due = items.get(SPACE, &item.base.id).await?.unwrap();
@@ -84,6 +88,10 @@ async fn dispatch(storage: &StorageClient, item: &WorkItem) -> anyhow::Result<Wo
 
 /// Exact interruption boundary: producer result and successful original run
 /// exist, while the queue still owns the live claim. No forged second result.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn save_success_without_ack(storage: &StorageClient, item: &WorkItem) -> WorkRun {
     let fence = elephant_storage::work_attempt_repository::fence_from_claim(item).unwrap();
     let id = create_work_run(storage, SPACE, ACTOR, &item.base.id).await;
@@ -268,6 +276,10 @@ async fn commit_item(fixture: &Fixture, index: usize) -> WorkItem {
         .unwrap()
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn both_orderings(embedded: bool, first: usize) {
     let fixture = Box::pin(fixture(embedded)).await;
     let other = 1 - first;
@@ -417,6 +429,10 @@ async fn replay(
     .await
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn prepared_pair(embedded: bool) -> (Fixture, WorkArtifact, WorkArtifact, WorkArtifact) {
     let fixture = Box::pin(fixture(embedded)).await;
     Box::pin(dispatch(&fixture.storage, &fixture.validators[0]))
@@ -445,6 +461,10 @@ async fn prepared_pair(embedded: bool) -> (Fixture, WorkArtifact, WorkArtifact, 
     (fixture, candidate, proposed, selected)
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn create_race_and_states(embedded: bool) {
     let (fixture, candidate, proposed, selected) = Box::pin(prepared_pair(embedded)).await;
     // Both validators may have observed absence. Winner is now durable; invoke
@@ -498,6 +518,10 @@ async fn create_race_and_states(embedded: bool) {
     assert_eq!(self::selected(&fixture).await, committed);
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn missing_commit_handoff(embedded: bool) {
     let fixture = Box::pin(fixture(embedded)).await;
     let staged = StagedCommit::new(fixture.storage.clone());
@@ -611,6 +635,10 @@ async fn missing_commit_handoff(embedded: bool) {
     assert_eq!(selected(&fixture).await.data, bundle.data);
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn negative_proofs(embedded: bool) {
     let (fixture, candidate, proposed, selected) = Box::pin(prepared_pair(embedded)).await;
     let artifacts = WorkArtifactRepository::new(fixture.storage.clone());
@@ -626,15 +654,15 @@ async fn negative_proofs(embedded: bool) {
         match case {
             "source" => {
                 changed.payload["source_id"] =
-                    serde_json::json!(RecordId::new_v4(TableName::Source).to_string())
+                    serde_json::json!(RecordId::new_v4(TableName::Source).to_string());
             }
             "run" => {
                 changed.payload["work_run_id"] =
-                    serde_json::json!(fixture.runs[1].base.id.to_string())
+                    serde_json::json!(fixture.runs[1].base.id.to_string());
             }
             "predecessor" => {
                 changed.payload[source_runtime::PREDECESSOR] =
-                    serde_json::json!(fixture.producer.base.id.to_string())
+                    serde_json::json!(fixture.producer.base.id.to_string());
             }
             "policy" => changed.base.security.policy_id.push_str("-foreign"),
             "plan" => changed.payload["_source_plan"] = serde_json::json!("foreign"),
@@ -680,12 +708,12 @@ async fn negative_proofs(embedded: bool) {
                 .subjects
                 .push(Link::new(RecordId::new_v4(TableName::Entity))),
             "subjects_state" => {
-                bad.base.subjects_state = elephant_types::records::base::SubjectsState::Complete
+                bad.base.subjects_state = elephant_types::records::base::SubjectsState::Complete;
             }
             "provenance" => bad.base.provenance.run_id = Some("foreign".into()),
             "generation" => bad.data["_publication"]["generation"] = serde_json::json!("foreign"),
             "configuration" => {
-                bad.data["_source_configuration"]["generation"] = serde_json::json!(99)
+                bad.data["_source_configuration"]["generation"] = serde_json::json!(99);
             }
             "plan" => bad.data["_source_plan"] = serde_json::json!("foreign"),
             "nonmetadata" => bad.artifact_type = "knowledge_candidates".into(),
@@ -744,7 +772,7 @@ async fn negative_proofs(embedded: bool) {
         let mut bad_run = fixture.runs[1].clone();
         match case {
             "foreign_producer" => {
-                bad_run.work_item = Link::new(RecordId::new_v4(TableName::WorkItem))
+                bad_run.work_item = Link::new(RecordId::new_v4(TableName::WorkItem));
             }
             "failed" => bad_run.success = false,
             "unfinished" => bad_run.completed_at = None,
@@ -753,7 +781,7 @@ async fn negative_proofs(embedded: bool) {
             }
             "foreign_generation" => {
                 bad_run.metrics.custom.get_mut("attempt_fence").unwrap()["generation"] =
-                    serde_json::json!(999)
+                    serde_json::json!(999);
             }
             _ => unreachable!(),
         }
@@ -822,6 +850,10 @@ async fn negative_proofs(embedded: bool) {
     assert!(source.published_revision.is_none());
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn changed_authority_refuses_dispatch(embedded: bool, change: &str) {
     let (fixture, _, _, selected) = Box::pin(prepared_pair(embedded)).await;
     let sources = SourcePublicationRepository::new(fixture.storage.clone());
@@ -898,6 +930,10 @@ async fn changed_authority_refuses_dispatch(embedded: bool, change: &str) {
     assert!(operation.published_revision.is_none(), "{change}");
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 async fn erased_input_refuses_replay(embedded: bool) {
     let (fixture, _, _, _) = Box::pin(prepared_pair(embedded)).await;
     let repository = SourcePublicationRepository::new(fixture.storage.clone());

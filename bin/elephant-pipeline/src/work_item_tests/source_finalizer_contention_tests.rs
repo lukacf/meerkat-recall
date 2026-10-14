@@ -227,6 +227,10 @@ pub(super) async fn dispatch_claimed(
 }
 
 /// Close actual metadata producers while retaining their original finalizers.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep fixture storage and repository owners alive through the complete fault sequence and final assertions"
+)]
 pub(super) async fn stage_finalizers(
     storage: &StorageClient,
     count: usize,

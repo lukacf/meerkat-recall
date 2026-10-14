@@ -28,6 +28,10 @@ const CONTEXT_KEYS: [&str; 3] = ["_publication", "_source_configuration", "_sour
 /// Keep the existing commit child's actual validator predecessor. Authenticate
 /// that parent against the selected producer run before comparing the complete
 /// child intent; only its per-claim fence is excluded, as in queue idempotence.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep repository clones alive through the full replay proof; the borrowed StorageClient retains the same shared owners, and these handles own no per-query transaction"
+)]
 pub(super) async fn original_commit_child(
     storage: &StorageClient,
     expected: &WorkItem,
@@ -235,6 +239,10 @@ fn run_fence(run: &WorkRun, producer: &WorkItem) -> Option<AttemptFence> {
 /// Prove that a conflicting run-local candidate is an exact metadata replay.
 /// Returns the selected bundle's original run, never a rewritten candidate or
 /// refreshed publication authority. All other conflicts retain normal refusal.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "Keep repository clones alive through the full replay proof; the borrowed StorageClient retains the same shared owners, and these handles own no per-query transaction"
+)]
 pub(super) async fn original_run(
     storage: &StorageClient,
     validator: &WorkItem,

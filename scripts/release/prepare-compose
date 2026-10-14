@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Create a private, digest-pinned Compose installation; never contacts Docker."""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+
+ROOT = Path(__file__).resolve().parents[2]
+IMAGE = re.compile(r"ghcr\.io/lukacf/(meerkat-recall|recall-surreal)@sha256:[0-9a-f]{64}")
+
+
+def prepare(output, recall_image, paired_image, port=3000):
+    for image, role in ((recall_image, 'meerkat-recall'), (paired_image, 'recall-surreal')):
+        match = IMAGE.fullmatch(image)
+        if not match or match.group(1) != role:
+            raise ValueError('use the correct canonical GHCR repository and immutable digest')
+    if not 1024 <= port <= 65535:
+        raise ValueError('use an unprivileged TCP port from 1024 through 65535')
+    output = Path(output).absolute()
+    if output.resolve() != output or output.is_symlink():
+        raise ValueError('deployment directory must have canonical parents')
+    output.mkdir(mode=0o700)  # Refuse existing installations, including partial ones.
+    (output / 'secrets').mkdir(mode=0o700)
+    generated = {}
+    for name in ('signing-key', 'database-password'):
+        path = output / 'secrets' / name
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            generated[name] = secrets.token_hex(48)
+            stream.write(generated[name] + '\n')
+    # token_hex is deliberately TOML-safe; no arbitrary secret interpolation.
+    config = '''[runtime]
+mode = "shared_memory"
+ingest_enabled = true
+
+[storage]
+backend = "surreal-db"
+
+[storage.surreal_db]
+url = "ws://database:8000"
+namespace = "recall"
+database = "main"
+username = "recall"
+password = "%s"
+
+[extractor]
+provider = "meerkat-agentic"
+required = true
+mcp_url = "http://127.0.0.1:3000/mcp/agent"
+model = "claude-opus-4-6"
+timeout_secs = 30
+''' % generated['database-password']
+    path = output / 'secrets' / 'runtime.toml'
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(config)
+    for name in ('compose.yaml', 'init.sh', 'README.md', 'semantic.override.example.yaml'):
+        shutil.copyfile(ROOT / 'deploy/compose' / name, output / name)
+    (output / '.env').write_text(f'RECALL_IMAGE={recall_image}\nRECALL_PAIRED_IMAGE={paired_image}\nRECALL_PORT={port}\n')
+    (output / '.env').chmod(0o600)
+    (output / '.gitignore').write_text('secrets/\n.env\n*.token\n')
+    return {'directory': str(output), 'images': [recall_image, paired_image],
+            'port': port, 'started': False, 'secrets_printed': False}
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--recall-image', required=True)
+    parser.add_argument('--paired-image', required=True)
+    parser.add_argument('--port', type=int, default=3000)
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        print(json.dumps(prepare(args.output, args.recall_image, args.paired_image, args.port)))
+    except (ValueError, OSError):
+        parser.exit(1, 'prepare-compose: invalid inputs or existing/unwritable destination; no secrets printed\n')

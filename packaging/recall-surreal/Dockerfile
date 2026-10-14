@@ -3,6 +3,13 @@
 ARG RUNTIME_IMAGE
 FROM ${RUNTIME_IMAGE}
 ARG RUNTIME_IMAGE
+ARG RECALL_SOURCE_COMMIT
+LABEL org.opencontainers.image.title="Recall paired SurrealDB server" \
+      org.opencontainers.image.source="https://github.com/lukacf/meerkat-recall" \
+      org.opencontainers.image.revision="$RECALL_SOURCE_COMMIT" \
+      org.opencontainers.image.licenses="BUSL-1.1" \
+      org.meerkat.recall.paired-upstream="8afd2ba0b6c0e232f19f42070e8811b323324c4c" \
+      org.meerkat.recall.reference-token-version="1"
 USER 0:0
 RUN case "$RUNTIME_IMAGE" in *@sha256:*) ;; *) exit 1 ;; esac \
     && test "$(dpkg --print-architecture)" = amd64 \
@@ -11,6 +18,7 @@ RUN case "$RUNTIME_IMAGE" in *@sha256:*) ;; *) exit 1 ;; esac \
     ca-certificates libssl3 liblzma5 libstdc++6 libgomp1 zlib1g \
     && rm -rf /var/lib/apt/lists/*
 COPY --chmod=0755 recall-surreal /usr/local/bin/recall-surreal
+COPY --chmod=0755 entrypoint.sh /usr/local/bin/recall-surreal-entrypoint
 COPY LICENSE.* RECALL_SOURCE_PROVENANCE.json BUILD_PROVENANCE.json CONTAINER_INPUTS.json /usr/share/recall-surreal/
 RUN ldd /usr/local/bin/recall-surreal > /usr/share/recall-surreal/runtime-dependencies.txt \
     && ! grep -q 'not found' /usr/share/recall-surreal/runtime-dependencies.txt \
@@ -20,7 +28,7 @@ RUN mkdir -p /data && chown 65532:65532 /data
 USER 65532:65532
 WORKDIR /data
 EXPOSE 8000
-ENTRYPOINT ["/usr/local/bin/recall-surreal"]
+ENTRYPOINT ["/usr/local/bin/recall-surreal-entrypoint"]
 CMD ["--help"]
 
 # Retain the reviewed storage fork repair and its source identity with the image.

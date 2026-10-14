@@ -58,7 +58,7 @@ def check_disk_budget(initial: dict[Path, int], maximum_growth: int) -> None:
         free = shutil.disk_usage(path).free
         if free < MIN_FREE_BYTES:
             raise RuntimeError("less than 250 GiB free; stopping owned paired build")
-        if baseline - free > maximum_growth:
+        if os.environ.get("RECALL_BUILD_RESOURCE_MODE", "legacy-allocation") != "current-capacity" and baseline - free > maximum_growth:
             raise RuntimeError("assigned incremental disk allocation exceeded; stopping owned paired build")
 
 
@@ -89,8 +89,9 @@ def build(source: Path, bundle: Path) -> None:
     if shutil.disk_usage(source).free < MIN_FREE_BYTES:
         raise ValueError("less than 250 GiB free; heavy build refused")
     jobs = int(os.environ.get("CARGO_BUILD_JOBS", "8"))
-    if not 1 <= jobs <= 16:
-        raise ValueError("paired server build requires 1..16 centrally scheduled jobs")
+    maximum_jobs = 32 if os.environ.get("RECALL_BUILD_RESOURCE_MODE") == "current-capacity" else 16
+    if not 1 <= jobs <= maximum_jobs:
+        raise ValueError("paired server build exceeds selected mode job limit")
     env = os.environ.copy()
     env.update({
         "CARGO_BUILD_JOBS": str(jobs), "CARGO_PROFILE_DEV_DEBUG": "0",
@@ -142,6 +143,7 @@ def build(source: Path, bundle: Path) -> None:
     check_disk_budget(initial_free, maximum_growth)
     bundle.mkdir(parents=True)
     shutil.copy2(binary, bundle / "recall-surreal")
+    shutil.copy2(source / ".recall/entrypoint.sh", bundle / "entrypoint.sh")
     shutil.copy2(source / "LICENSE", bundle / "LICENSE.upstream")
     shutil.copy2(source / "crates/core/LICENSE", bundle / "LICENSE.core")
     shutil.copy2(source / "crates/sdk/LICENSE", bundle / "LICENSE.sdk")
@@ -160,7 +162,8 @@ def build(source: Path, bundle: Path) -> None:
         "elf": elf, "builder_packages": sorted(packages.splitlines()),
         "container_inputs": inputs, "actual_builder_image": os.environ.get("RECALL_PAIRED_BUILDER_IMAGE"),
         "elf_inspector_sha256": digest(source / ".recall/artifact.py"),
-        "maximum_incremental_bytes": maximum_growth,
+        "maximum_incremental_bytes": maximum_growth if os.environ.get("RECALL_BUILD_RESOURCE_MODE") != "current-capacity" else None,
+        "resource_mode": os.environ.get("RECALL_BUILD_RESOURCE_MODE", "legacy-allocation"),
         "command": command, "features": "upstream defaults, no default feature removed",
         "qualification": "Version/capability, HTTP/WS/query/import, recovery and actual packaged-host checks pending",
     }

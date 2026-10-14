@@ -1,0 +1,122 @@
+name: meerkat-recall
+
+x-recall: &recall
+  image: ${RECALL_IMAGE:?Use prepare-compose with a qualified registry digest}
+  platform: linux/amd64
+  pull_policy: if_not_present
+  user: "10001:10001"
+  init: true
+  read_only: true
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  environment: &recall-env
+    SKIP_AUTH: "false"
+    JWT_SECRET_FILE: /run/recall-auth/signing-key
+    JWT_ALGORITHM: HS256
+    JWT_ISSUER: recall-local
+    JWT_AUDIENCE: recall
+    ELEPHANT_HOST: 0.0.0.0
+    ELEPHANT_PORT: "3000"
+    ELEPHANT_DB: surreal-db
+    ELEPHANT_CONFIG: /var/lib/meerkat-recall/config/runtime.toml
+    SURREALDB_URL: ws://database:8000
+    SURREALDB_NAMESPACE: recall
+    SURREALDB_DATABASE: main
+    SURREALDB_USER: recall
+    SURREALDB_PASS_FILE: /run/recall-auth/database-password
+    ELEPHANT_DURABILITY_PATH: /var/lib/meerkat-recall/recovery
+    ELEPHANT_SNAPSHOT_DIR: /var/lib/meerkat-recall/backups
+    FASTEMBED_CACHE_DIR: /var/lib/meerkat-recall/model-cache
+    TMPDIR: /var/lib/meerkat-recall/tmp
+    RUST_LOG: info
+  volumes:
+    - state:/var/lib/meerkat-recall
+    - recall_auth:/run/recall-auth:ro
+  tmpfs: [/tmp]
+  networks: [recall]
+
+services:
+  init:
+    image: ${RECALL_IMAGE:?Use prepare-compose with a qualified registry digest}
+    platform: linux/amd64
+    pull_policy: if_not_present
+    user: "0:0"
+    entrypoint: [/bin/sh, /deployment/init.sh]
+    network_mode: none
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    volumes:
+      - ./init.sh:/deployment/init.sh:ro
+      - ./secrets:/input:ro
+      - recall_auth:/recall-auth
+      - database_auth:/database-auth
+      - state:/state
+      - database_data:/database-data
+    restart: "no"
+
+  database:
+    image: ${RECALL_PAIRED_IMAGE:?Use prepare-compose with a qualified paired registry digest}
+    platform: linux/amd64
+    pull_policy: if_not_present
+    user: "65532:65532"
+    depends_on:
+      init: {condition: service_completed_successfully}
+    environment:
+      SURREAL_USER: recall
+      SURREAL_PASS_FILE: /run/database-auth/database-password
+    command: [start, --bind=0.0.0.0:8000, --log=info, --query-timeout=30s, file:/data/database.db]
+    volumes:
+      - database_data:/data
+      - database_auth:/run/database-auth:ro
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    networks: [recall]
+    healthcheck:
+      test: [CMD, /usr/local/bin/recall-surreal, is-ready]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+  migrate:
+    <<: *recall
+    depends_on:
+      database: {condition: service_healthy}
+    command: [meerkat-recall, migrate]
+    restart: "no"
+
+  recall:
+    <<: *recall
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    command: [meerkat-recall, serve, --shutdown-timeout-seconds, "60"]
+    ports: ["127.0.0.1:${RECALL_PORT:-3000}:3000"]
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --max-time, "4", http://127.0.0.1:3000/v1/health]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 75s
+
+  operator:
+    <<: *recall
+    profiles: [tools]
+    command: [meerkat-recall, --help]
+    depends_on:
+      init: {condition: service_completed_successfully}
+    restart: "no"
+
+networks:
+  recall: {}
+volumes:
+  state: {}
+  database_data: {}
+  recall_auth: {}
+  database_auth: {}

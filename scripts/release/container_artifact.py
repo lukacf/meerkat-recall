@@ -12,6 +12,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import tomllib
 
 import artifact
 
@@ -28,19 +29,156 @@ def build_limits() -> tuple[int, int, int]:
     """Use 150 GiB by default; a scheduler-approved caller may request up to 1280."""
     jobs = int(os.environ.get("CARGO_BUILD_JOBS", "8"))
     minimum = int(os.environ.get("RECALL_BUILD_MIN_FREE_GIB", "250")) * GIB
+    if resource_mode() == 'current-capacity':
+        if not 1 <= jobs <= 32 or minimum < MIN_FREE_BYTES:
+            raise ValueError('require 1..32 jobs and >=250 GiB target free floor')
+        return jobs, minimum, 0  # No cumulative limit in this mode.
     allocation = int(os.environ.get("RECALL_ARTIFACT_MAX_GIB", "150")) * GIB
     if not 1 <= jobs <= 16 or minimum < MIN_FREE_BYTES or not 0 < allocation <= MAX_ALLOCATION_BYTES:
         raise ValueError("require 1..16 build jobs, >=250 GiB free floor and <=1280 GiB artifact allocation")
     return jobs, minimum, allocation
 
 
+def resource_mode() -> str:
+    mode = os.environ.get('RECALL_BUILD_RESOURCE_MODE', 'legacy-allocation')
+    if mode not in ('legacy-allocation', 'current-capacity'):
+        raise ValueError('unknown build resource mode')
+    return mode
+
+
+def cache_contract(root: Path) -> dict:
+    """Compatibility only; Cargo fingerprints source and dependency changes."""
+    dockerfile = (root / 'Dockerfile').read_text()
+    # Compiler installation and native environment only: later source COPY/RUN
+    # and runtime image metadata are not compiler compatibility identities.
+    compiler_recipe = dockerfile.split('FROM ${BUILDER_IMAGE} AS builder\n', 1)[1].split('COPY Cargo.toml Cargo.lock', 1)[0]
+    compiler_recipe = re.sub(r'ARG SOURCE_[A-Z0-9_]+=.*\n|ARG CARGO_BUILD_JOBS=.*\n|ARG RECALL_BUILD_CACHE_ID=.*\n', '', compiler_recipe)
+    profiles = tomllib.loads((root / 'Cargo.toml').read_text())['profile']
+    return {'format': 'recall-build-cache-compatibility/v1', 'rustc': '1.94.0',
+            'target': TARGET, 'profile': 'deploy', 'features': artifact.FEATURES,
+            'default_features': True, 'package': 'meerkat-recall-bin',
+            'inputs': load_inputs(root), 'native_static_ort': artifact.digest(root / 'scripts/release/linux-static-ort.lock.json'),
+            'profile_config': {key: profiles[key] for key in ('release', 'deploy')},
+            'native_environment': {'LZMA_API_STATIC': '1', 'ORT_PREFER_DYNAMIC_LINK': '0'},
+            'wrapper_sha256': artifact.digest(root / 'scripts/repo-cargo'),
+            'native_helper_sha256': artifact.digest(root / 'scripts/release/linux_static_ort.py'),
+            'compiler_recipe_sha256': hashlib.sha256(compiler_recipe.encode()).hexdigest()}
+
+
 def cache_identity(root: Path, identity: dict) -> str:
     """Reuse retries of one reviewed build, isolating other checkout/feature graphs."""
-    graph = {**identity, "checkout": str(root.resolve()), "rustc": "1.94.0",
+    graph = cache_contract(root) if resource_mode() == 'current-capacity' else {**identity, "checkout": str(root.resolve()), "rustc": "1.94.0",
              "target": TARGET, "profile": "deploy", "features": artifact.FEATURES,
              "default_features": True}
     digest = hashlib.sha256(json.dumps(graph, sort_keys=True).encode()).hexdigest()
     return "recall-bookworm-rust194-" + digest
+
+
+class CurrentCapacity:
+    """Fresh v2 receipts preserve actual observations; no legacy ledger mutation."""
+    def __init__(self, receipt: Path, paths: tuple[Path, ...], minimum: int = MIN_FREE_BYTES):
+        if not receipt.is_absolute() or minimum < MIN_FREE_BYTES or receipt.is_symlink():
+            raise ValueError('absolute current-capacity receipt and target floor required')
+        self.receipt, self.minimum = receipt, minimum
+        self.paths = tuple(dict.fromkeys((Path('/'), *(path.resolve() for path in paths))))
+
+    def build_environment(self) -> dict:
+        directory = self.receipt.parent / (self.receipt.stem + '-buildx')
+        directory.mkdir(mode=0o700, exist_ok=True)
+        if directory.is_symlink():
+            raise ValueError('private BuildKit attribution directory required')
+        self.buildx_directory = directory
+        env = os.environ.copy()
+        env.update(BUILDX_CONFIG=str(directory), BUILDX_BUILDER='default')
+        return env
+
+    def confirm_build_terminal(self, source_commit: str) -> None:
+        """Retained observer pattern: private refs plus actual daemon history.
+
+        Client exit alone is not cleanup evidence. Never signal the daemon or a
+        foreign compiler. An unresolved owned job blocks this build's closure.
+        """
+        deadline = time.monotonic() + 90
+        record = {'source_commit': source_commit, 'all_owned_history_terminal': False, 'refs': {}}
+        try:
+            while time.monotonic() < deadline:
+                refs = []
+                root = self.buildx_directory / 'refs'
+                for path in root.rglob('*') if root.exists() else []:
+                    if path.is_symlink(): raise ValueError('aliased private build ref')
+                    if path.is_dir(): continue
+                    rel = path.relative_to(root)
+                    if (len(rel.parts) != 3 or rel.parts[:2] != ('default', 'default')
+                            or not re.fullmatch('[a-z0-9]{20,64}', rel.parts[2])
+                            or path.stat().st_size > 16384 or len(refs) >= 2):
+                        raise ValueError('unexpected private build reference')
+                    refs.append(rel.parts[2])
+                for ref in refs:
+                    raw = subprocess.check_output(['docker', 'buildx', 'history', 'inspect',
+                        '--builder', 'default', '--format', 'json', ref],
+                        env=self.build_environment(), timeout=10)
+                    if len(raw) > 1024**2: raise ValueError('oversize history record')
+                    value = json.loads(raw)
+                    args = {item['Name']: item['Value'] for item in value.get('BuildArgs', [])}
+                    if value.get('Ref') != ref or source_commit not in (args.get('SOURCE_COMMIT'), args.get('RECALL_SOURCE_COMMIT')):
+                        raise ValueError('owned history source identity differs')
+                    status = value.get('Status')
+                    if status not in ('running', 'completed', 'failed', 'canceled'):
+                        raise ValueError('unknown owned build status')
+                    record['refs'][ref] = status
+                if refs and all(record['refs'][ref] != 'running' for ref in refs):
+                    record['all_owned_history_terminal'] = True
+                    return
+                time.sleep(min(2, max(0, deadline-time.monotonic())))
+            raise RuntimeError('owned BuildKit closure unresolved; do not begin the next build')
+        finally:
+            destination = self.receipt.with_suffix('.buildkit-cleanup.json')
+            destination.write_text(json.dumps(record, indent=2) + '\n')
+            destination.chmod(0o600)
+
+    def check(self) -> dict:
+        self.receipt.parent.mkdir(parents=True, exist_ok=True)
+        with self.receipt.with_suffix(self.receipt.suffix + '.lock').open('a+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            previous = json.loads(self.receipt.read_text()) if self.receipt.exists() else None
+            if previous and (previous.get('format') != 'meerkat-recall-current-capacity/v1'
+                             or previous.get('refused')):
+                raise ValueError('use a fresh current-capacity receipt; never reuse a legacy or refused record')
+            memory = next(int(line.split()[1]) * 1024 for line in Path('/proc/meminfo').read_text().splitlines()
+                          if line.startswith('MemAvailable:'))
+            filesystems = {str(path): {'device': path.stat().st_dev, 'free_bytes': shutil.disk_usage(path).free,
+                                      'floor_bytes': max(self.minimum, 265 * GIB) if path == Path('/') else self.minimum}
+                           for path in self.paths}
+            if previous:
+                prior = previous['filesystems']
+                if (set(prior) != set(filesystems) or previous['mem_floor_bytes'] > 120 * GIB
+                        or any(prior[path]['device'] != value['device']
+                               or prior[path]['floor_bytes'] > value['floor_bytes']
+                               for path, value in filesystems.items())):
+                    raise ValueError('capacity paths/devices changed or floors lowered; use a fresh record')
+            state = {'format': 'meerkat-recall-current-capacity/v1', 'sample_unix': time.time(),
+                     'checks': (previous['checks'] if previous else 0) + 1, 'filesystems': filesystems,
+                     'mem_available_bytes': memory, 'mem_floor_bytes': 120 * GIB,
+                     'refused': memory < 120 * GIB or any(v['free_bytes'] < v['floor_bytes'] for v in filesystems.values())}
+            descriptor, name = tempfile.mkstemp(prefix=self.receipt.name + '.', dir=self.receipt.parent)
+            try:
+                with os.fdopen(descriptor, 'w') as stream:
+                    json.dump(state, stream, indent=2); stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
+                os.replace(name, self.receipt)
+                directory = os.open(self.receipt.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try: os.fsync(directory)
+                finally: os.close(directory)
+            finally:
+                if os.path.exists(name): os.unlink(name)
+            if state['refused']:
+                raise RuntimeError('actual free disk or MemAvailable floor reached; stop owned build')
+            return state
+
+
+def resource_monitor(receipt: Path, paths: tuple[Path, ...], minimum: int, allocation: int):
+    if resource_mode() == 'current-capacity':
+        return CurrentCapacity(receipt, paths, minimum)
+    return ResourceBudget(receipt, paths, minimum, allocation)
 
 
 class ResourceBudget:
@@ -226,7 +364,7 @@ def package_image(root: Path, image_id: str, expected_source: str, output: Path)
         return result
 
 
-def build_image(root: Path, tag: str, output: Path, *, cache_id: str | None = None) -> dict:
+def build_image(root: Path, tag: str, output: Path, *, cache_id: str | None = None, cache_evidence: Path | None = None) -> dict:
     """One scheduled build; an explicit reviewed cache may carry warm compiler outputs.
 
     The cache is an optimization, never the source identity or acceptance record.
@@ -235,15 +373,37 @@ def build_image(root: Path, tag: str, output: Path, *, cache_id: str | None = No
     if cache_id is not None and (not isinstance(cache_id, str) or
                                  not re.fullmatch(r"recall-bookworm-rust194-[a-f0-9]{64}", cache_id)):
         raise ValueError("invalid reviewed Recall BuildKit cache identity")
+    if cache_id is not None and resource_mode() == 'current-capacity':
+        evidence = json.loads(cache_evidence.read_text()) if cache_evidence else {}
+        if evidence.get('cache_id') != cache_id or evidence.get('compatibility') != cache_contract(root):
+            raise ValueError('existing cache requires exact current compatibility evidence')
+        retained = Path(evidence['retained_build_receipt'])
+        if artifact.digest(retained) != evidence['retained_build_receipt_sha256']:
+            raise ValueError('retained cache compiler receipt changed')
+        retained_receipt = json.loads(retained.read_text())
+        retained_build = retained_receipt['build_provenance']
+        if (retained_build['build_resources']['cache_id'] != cache_id
+                or retained_build['target'] != TARGET
+                or retained_build['features'] != artifact.FEATURES
+                or retained_build['build_profile'] != 'deploy'
+                or retained_build['default_features'] is not True
+                or not retained_build['rustc'].startswith('rustc 1.94.0 ')):
+            raise ValueError('retained cache target/profile/compiler identity differs')
+        packages = retained_build['builder_packages']
+        package_inventory(packages, {'libc6', 'gcc', 'g++', 'clang', 'cmake', 'libssl-dev', 'liblzma-dev'})
+        if hashlib.sha256(packages.encode()).hexdigest() != evidence['retained_builder_packages_sha256']:
+            raise ValueError('retained native compiler package inventory differs')
     identity = artifact.source_identity(root)
     inputs = load_inputs(root)
     jobs, minimum, allocation = build_limits()
     budget_path = os.environ.get("RECALL_ARTIFACT_BUDGET_FILE")
     if not budget_path:
-        raise ValueError("set the same absolute RECALL_ARTIFACT_BUDGET_FILE for Recall and paired server builds")
+        raise ValueError("set an absolute RECALL_ARTIFACT_BUDGET_FILE: fresh per-build in current-capacity; shared in legacy mode")
     docker_root = Path(subprocess.check_output(["docker", "info", "--format", "{{.DockerRootDir}}"], text=True).strip())
-    output.mkdir(parents=True, exist_ok=True)
-    budget = ResourceBudget(Path(budget_path), (root, docker_root, output, Path(tempfile.gettempdir())), minimum, allocation)
+    if output.exists():
+        raise ValueError('fresh output directory required')
+    output.mkdir(parents=True)
+    budget = resource_monitor(Path(budget_path), (root, docker_root, output, Path(tempfile.gettempdir())), minimum, allocation)
     budget.check()
     cache = cache_identity(root, identity) if cache_id is None else cache_id
     subprocess.run(["docker", "buildx", "version"], check=True, stdout=subprocess.DEVNULL)
@@ -266,7 +426,8 @@ def build_image(root: Path, tag: str, output: Path, *, cache_id: str | None = No
             command.extend(["--build-arg", f"{name}={value}"])
         command.append("-")
         with source.open("rb") as stream:
-            process = subprocess.Popen(command, cwd=root, stdin=stream, start_new_session=True)
+            environment = budget.build_environment() if isinstance(budget, CurrentCapacity) else None
+            process = subprocess.Popen(command, cwd=root, stdin=stream, start_new_session=True, env=environment)
             try:
                 while process.poll() is None:
                     budget.check()
@@ -281,6 +442,8 @@ def build_image(root: Path, tag: str, output: Path, *, cache_id: str | None = No
                     except subprocess.TimeoutExpired:
                         os.killpg(process.pid, signal.SIGKILL)
                         process.wait()
+                if isinstance(budget, CurrentCapacity):
+                    budget.confirm_build_terminal(identity['source_commit'])
         # Resolve the immutable local image ID, never trust the caller's tag at
         # the later extraction boundary. BuildKit metadata records its output.
         image_id = subprocess.check_output(["docker", "image", "inspect", "--format", "{{.Id}}",
@@ -291,7 +454,8 @@ def build_image(root: Path, tag: str, output: Path, *, cache_id: str | None = No
         with (output / "container-build-metadata.json").open("x") as stream:
             json.dump({"command": command, "metadata": json.loads((scratch / "build-metadata.json").read_text()),
                        "input_lock": inputs, "image_id": image_id, "cache_id": cache,
-                       "resource_budget_file": str(budget.receipt), "resource_budget": resources}, stream, indent=2)
+                       "resource_budget_file": str(budget.receipt), "resource_budget": resources,
+                       "resource_mode": resource_mode(), "cache_compatibility": cache_contract(root)}, stream, indent=2)
             stream.write("\n")
         return result
 
@@ -307,10 +471,12 @@ if __name__ == "__main__":
     build = commands.add_parser("build")
     build.add_argument("--tag", required=True)
     build.add_argument("--output-dir", type=Path, required=True)
+    build.add_argument('--cache-id')
+    build.add_argument('--cache-evidence', type=Path)
     args = parser.parse_args()
     try:
         if args.command == "build":
-            result = build_image(args.root.resolve(), args.tag, args.output_dir)
+            result = build_image(args.root.resolve(), args.tag, args.output_dir, cache_id=args.cache_id, cache_evidence=args.cache_evidence)
         else:
             result = package_image(args.root.resolve(), args.image_id, args.expected_source, args.output_dir)
         print(json.dumps(result, indent=2))

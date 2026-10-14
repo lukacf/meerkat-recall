@@ -2,7 +2,7 @@
 
 This directory prepares the **upstream server package `surreal`**, distinct from the `surrealdb` SDK and `surrealdb-core` crates. It retains the upstream server's HTTP, WebSocket/RPC, SQL query, export/import and default storage features. It uses server version 2.6.5 at commit `8afd2ba0b6c0e232f19f42070e8811b323324c4c`, with the **same byte-exact reviewed Recall core, SDK and repaired SurrealKV 0.9.3** used by embedded/native Recall. Vanilla SurrealDB does not provide Recall's private reference-fence capability and cannot pass the paired readiness contract.
 
-Status: source preparation and offline test source. No paired binary/container has been built or executed by this lane. No transport, restore, concurrent erasure, native platform, release or deployment acceptance is claimed. Heavy builds and running servers remain separately scheduled qualification work.
+This recipe prepares and builds a source-pinned paired server. Qualification belongs to the exact version's artifact receipts; source preparation alone does not establish transport, restore, erasure or deployment acceptance. Ready-to-pull release images and authenticated installation use [qualified delivery](../../scripts/release/CONTAINER_DELIVERY.md) and [Compose](../../deploy/compose/README.md).
 
 ## Source and license identity
 
@@ -25,50 +25,50 @@ The output includes `RECALL_SOURCE_PROVENANCE.json` with all prepared file hashe
 
 ## Explicit scheduled build and container
 
-The centrally scheduled host entry point is `portable.py`. It uses the same
-reviewed `scripts/release/container_artifact.py::ResourceBudget` as Recall's
-container build. Both sequential builds **must use the exact same absolute**
-`RECALL_ARTIFACT_BUDGET_FILE` and filesystem set. There is no automatic second
-allocation, reset or cache pruning. The shared receipt is locked, atomically
-persisted and synchronized; positive observed disk increments accumulate without
-refund after deletion. It applies the hard 250 GiB floor and a 150 GiB default
-aggregate allocation across source, Docker, output and temporary filesystems;
-an explicit central allocation may raise that shared ceiling up to 300 GiB.
-The paired compiler retains its separate 150 GiB maximum growth ceiling. The
-launcher passes the smaller of the shared allowance and that inner ceiling,
-while all source, Docker and output growth still counts against the original
-shared ledger. A larger shared allowance neither resets its counters nor raises
-the inner compiler limit.
-
-After source review and central allocation, with no load-sensitive Meerkat gate:
+The host entry point is `portable.py`. For a fresh build, select current host
+capacity checks and a fresh receipt path:
 
 ```sh
-export RECALL_ARTIFACT_BUDGET_FILE=/owned/shared/recall-artifact-allocation.json
-CARGO_BUILD_JOBS=8 python3 packaging/recall-surreal/portable.py \
-  --recall-root "$PWD" \
-  --prepared /owned/this-worktree/paired-surreal-source \
-  --bundle /owned/this-worktree/paired-surreal-bundle \
-  --tag recall-surreal:REVIEWED_SOURCE
+export RECALL_BUILD_RESOURCE_MODE=current-capacity
+export RECALL_ARTIFACT_BUDGET_FILE=/owned/release/paired-current-capacity.json
+CARGO_BUILD_JOBS=16 python3 packaging/recall-surreal/portable.py \
+  --recall-root "$PWD" --prepared /owned/release/paired-source \
+  --bundle /owned/release/paired-bundle --tag recall-surreal:REVIEWED_SOURCE
 ```
+
+This mode samples actual root free space (at least265GiB), each selected
+source/cache/output filesystem (at least250GiB), and host MemAvailable (at
+least120GiB); jobs are bounded to32. Shared host scheduling can choose fewer
+jobs. Use a separate fresh receipt for Recall and the paired build: each keeps its
+own immutable monitored path/device set. Receipts record actual samples; no obsolete cumulative allocation limits
+apply and no previous receipt is reset or refunded. The paired compiler keeps
+its independent250GiB free-space check. Sampling cannot prevent between-sample
+growth. The launcher cancels only its own CLI process group on failure; verify
+BuildKit activity has stopped before reusing that lane.
+
+Omitting `RECALL_BUILD_RESOURCE_MODE` retains the historical `legacy-allocation`
+mode and its original cumulative ledger/limits, for reproducibility of old
+recipes. A legacy or refused record cannot be repurposed as current capacity.
+A fresh current-capacity path is operational state, not another infrastructure
+allocation or a requirement for an additional approval.
 
 The shared `container-inputs.lock.json` pins the reviewed Linux/amd64 Bookworm
 builder, runtime and Dockerfile frontend. Preparation copies that exact lock,
 the release lane's unchanged `artifact.py` ELF inspector, and the internal build
 recipe into the source manifest. The host launcher checks the clean reviewed
-checkout, prepared commit, source/binary/ELF joins and immutable image ID. The
-paired cache binds the full prepared provenance digest, canonical prepared path,
-compiler, target, package and feature graph. Retries reuse that exact cache;
-separate prepared contexts do not share targets even at the same commit.
+checkout, prepared commit, source/binary/ELF joins and immutable image ID. In current-capacity mode the paired cache binds compiler, target, profile,
+package/features, pinned container/native inputs and Cargo wrapper compatibility.
+Source-only changes and checkout paths do not force a cold cache; Cargo still
+fingerprints source changes. Legacy mode retains its old source/path cache keys.
 
 Inside the pinned builder, `build.py` uses the copied `scripts/repo-cargo` wrapper,
 `chrt --idle 0 ionice -c3`, upstream defaults and
 `--locked --release -p surreal --bin surreal`. The default is eight jobs, with a
-hard maximum of 16 under central scheduling; incremental compilation is off and
+maximum of32 in current-capacity mode (16 in legacy mode); incremental compilation is off and
 both worker limits are eight. No default backend/server feature is removed.
 The internal disk monitor is additional protection, not another allocation.
-Do not invoke the internal build or either Dockerfile directly to bypass the
-host allocation monitor. No artifact build is authorized during another
-load-sensitive gate without the scheduler's agreement.
+Use the host launcher so actual disk and memory remain monitored. Coordinate
+heavy work on shared hosts; no separate historical slot/ACK gate is introduced.
 
 The build records the actual verbose compiler identity, host libc, installed
 builder packages and binary ELF imports. It refuses a host ABI newer than Debian
@@ -93,15 +93,15 @@ source/build receipts and image-input lock. The upstream version incorporates
 `+recall.reference-v1.<Recall-SHA-prefix>`. The container runs as UID/GID 65532 and
 defaults to `--help`, with an owned writable `/data` directory for new volumes.
 An operator explicitly supplies `start`, binding and persistent store location.
-Supply `SURREAL_USER`/`SURREAL_PASS` through the secret mechanism, never image
+Supply `SURREAL_USER` and `SURREAL_PASS_FILE` through the image secret adapter, never image
 layers, checked-in files or receipts. TLS and listener exposure remain explicit.
 
 Resource checks are sampled before/during/after both builds and bundle export.
 They cannot prevent between-sample growth. On refusal the launcher cancels only
 its owned Docker CLI process group; the scheduler must confirm the associated
 builder has stopped before allocating another job. No unrelated cache, image or
-process is deleted. All instructions and tests here are source-only; this lane
-has not built or started either image.
+process is deleted. Pure tests below do not build or start either image. Exact executed artifact
+receipts establish each release's actual qualification scope.
 
 ## Capability and readiness
 

@@ -114,6 +114,59 @@ the service subjects afterwards. Retire the bootstrap token after setup; its
 maximum lifetime is one hour. Neither token issuance nor grant creation approves
 provider work by itself.
 
+## Configure extractor MCP access
+
+The managed extractor calls Recall through `/mcp/agent`. Give it a separate
+read-only identity for exactly the spaces it serves. This example uses `research`
+and `planning`; repeat `--space` only for authorized spaces and provide explicit
+clearances for each space's policy in the private clearance file:
+
+```sh
+meerkat-recall service-token issue --secret-file /run/recall/signing.key \
+  --subject recall-extractor --space research --space planning \
+  --read-only --expires-in 86400 \
+  --scope read:entity --scope read:predicate --scope read:doc:metadata \
+  --scope read:doc:raw --scope read:source --scope read:assertion \
+  --clearances-file /private/recall/extractor-clearances.json \
+  --output /private/recall/extractor.token
+```
+
+Using the authorized management credential for each space, create an active
+`recall-extractor` grant at `PUT /v1/spaces/{space}/grants/recall-extractor`:
+
+```json
+{"active":true,"scopes":["read:entity","read:predicate","read:doc:metadata","read:doc:raw","read:source","read:assertion"],"expected_generation":null}
+```
+
+Read each grant back and retain its generation. Both token and grant must include
+any additional read scopes required by your selected tools. `read:predicate` is
+required for predicate discovery. Keep ordinary client credentials separate;
+global management and named-space bootstrap tokens cannot serve as extractor
+data credentials.
+
+Supply the token value privately to the service or worker as `MCP_BEARER_TOKEN`
+using its protected environment configuration. The variable takes the bearer,
+not a token-file path. Arrange rotation before expiry. The extractor supplies the
+current `X-Space-Id` on its MCP requests, so the same worker subject needs a
+current grant in every selected space.
+
+Set the extractor URL to the reachable listener plus `/mcp/agent`. For example,
+a listener on port `3100` needs `http://127.0.0.1:3100/mcp/agent`; changing
+`ELEPHANT_PORT` does not change the default extractor URL. In config-backed
+bootstrap mode, pass `extractor_mcp_url` to `initialize_runtime` or
+`configure_runtime` and verify it with `get_runtime_config`. Alternatively,
+`PIPELINE_AGENTIC_MCP_URL` configures the environment-backed runtime; setting it
+before launch selects configured mode instead of the unconfigured bootstrap
+path. If maintenance is enabled, its separate `PIPELINE_MAINTENANCE_MCP_URL`
+should reach `/mcp/maintenance` on the intended service.
+
+Before admitting sources, connect an authenticated MCP client to `/mcp/agent`
+with the worker bearer and each space's `X-Space-Id`. Complete the protocol
+handshake and inspect `tools/list`: `get_doc`, `get_doc_chunk`, `get_entity`,
+`search_entities`, `list_predicates`, `get_predicate` and `get_source` must be
+available. Initialization or listener readiness alone does not establish this
+worker authority. See [MCP transport and authentication](/mcp/overview).
+
 ## Approve processing
 
 A space configuration's `processing.connections` selects an account, provider,

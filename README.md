@@ -12,9 +12,8 @@ lifecycle; Recall adds shared, evidence-backed knowledge. It is an optional,
 independently released component. See the
 [Meerkat introduction](https://docs.rkat.ai/introduction) to choose your starting point.
 
-This branch targets Recall 0.9.0 with the published Meerkat 0.9.0 SDK.
-The latest published Recall release is
-[v0.1.0](https://github.com/lukacf/meerkat-recall/releases/tag/v0.1.0).
+Recall 0.9.0 is available with the Meerkat 0.9.0 SDK.
+Download the [v0.9.0 release](https://github.com/lukacf/meerkat-recall/releases/tag/v0.9.0).
 Find source, native downloads, supported platforms and known limits in the
 [release notes](https://github.com/lukacf/meerkat-recall/releases).
 
@@ -24,6 +23,9 @@ setup, HTTP and MCP integration, deployment, and the knowledge model.
 ## Installation paths
 
 Native releases target Linux x86-64 and macOS ARM64.
+The macOS ARM64 archive has a conservative static minimum of macOS 13.4;
+isolated installation, help and version were verified on macOS 26.5.2. Older macOS
+versions and macOS inference were not exercised.
 [Binary installation](docs/installation.mdx) covers the archive layout,
 checksums, and model-provider prerequisites. Use each archive with its matching
 release record. The source demo below is a separate build without model extraction.
@@ -114,6 +116,7 @@ Call `get_runtime_status` first. In an unconfigured runtime, loopback clients
 can use `initialize_runtime`. Ingest tools become available only when storage,
 workers, and a real semantic extractor are ready. Self-referential extraction
 through `/mcp/agent` is retried after the listener binds.
+Configure the worker's [MCP endpoint, bearer and per-space read grants](docs/operations/service-setup.mdx#configure-extractor-mcp-access), including predicate reads.
 
 The default profile supports common ingest, search, navigation, and inspection
 operations. `/mcp/agent` is read-only, `/mcp/maintenance` adds maintenance

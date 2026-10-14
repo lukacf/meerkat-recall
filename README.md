@@ -35,9 +35,9 @@ release provides source and native downloads, without a registry-published
 Rust library.
 
 For a persistent native service, follow [service setup](docs/operations/service-setup.mdx).
-Version 0.1.0 uses the pinned Meerkat 0.8.51 dependencies. After Meerkat 0.9
-ships, Recall will upgrade to it and release as Recall 0.9 to match. That upgrade
-is upcoming; the current release does not claim Meerkat 0.9 compatibility.
+Version 0.1.0 uses the pinned Meerkat 0.8.51 dependencies. Meerkat 0.9 is now
+available, and the Recall upgrade is in progress. Recall 0.9 will use Meerkat 0.9
+and match its version; the currently published Recall release remains 0.1.0.
 Consult the release notes for tested behavior and remaining limits.
 
 ## Try the Living Wiki demo

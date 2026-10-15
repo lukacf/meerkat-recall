@@ -12,9 +12,8 @@ lifecycle; Recall adds shared, evidence-backed knowledge. It is an optional,
 independently released component. See the
 [Meerkat introduction](https://docs.rkat.ai/introduction) to choose your starting point.
 
-This branch targets Recall 0.9.1 with the Meerkat 0.9.0 SDK.
-The latest published release is Recall 0.9.0.
-Download the [v0.9.0 release](https://github.com/lukacf/meerkat-recall/releases/tag/v0.9.0).
+Recall 0.9.1 is available with the exact-pinned Meerkat 0.9.0 SDK.
+Download the [v0.9.1 release](https://github.com/lukacf/meerkat-recall/releases/tag/v0.9.1).
 Find source, native downloads, supported platforms and known limits in the
 [release notes](https://github.com/lukacf/meerkat-recall/releases).
 
@@ -24,21 +23,25 @@ setup, HTTP and MCP integration, deployment, and the knowledge model.
 ## Installation paths
 
 Native releases target Linux x86-64 and macOS ARM64.
-The macOS ARM64 archive has a conservative static minimum of macOS 13.4;
-isolated installation, help and version were verified on macOS 26.5.2. Older macOS
-versions and macOS inference were not exercised.
+Recall 0.9.1 passed archive verification, isolated installation and a local-model
+inference case on macOS 26.5.2 (Apple Silicon): one document, two semantic queries
+and stored 384-dimensional vectors. Older macOS versions were not exercised. See the
+release qualification record for the model, source mapping and test scope.
 [Binary installation](docs/installation.mdx) covers the archive layout,
 checksums, and model-provider prerequisites. Use each archive with its matching
 release record. The source demo below is a separate build without model extraction.
 
 The command is `meerkat-recall`; native archives retain an `elephant` alias
 for existing deployments. Existing `.elephant` configuration, `ELEPHANT_*` variables,
-database names and HTTP/MCP wire identifiers remain unchanged. The first
-release provides source and native downloads, without a registry-published
-Rust library.
+database names and HTTP/MCP wire identifiers remain unchanged. Recall 0.9.1
+provides source and native archives plus Linux container images. A published
+Rust library is not part of this release.
 
 For a persistent native service, follow [service setup](docs/operations/service-setup.mdx).
-Recall 0.9.0 exact-pins the published Meerkat 0.9.0 family. The SDK now includes
+Select its TOML explicitly with `serve --config /absolute/runtime.toml` and use
+the same file for `migrate`; `ELEPHANT_CONFIG` provides the service environment
+equivalent. Missing or malformed selected files fail without fallback.
+Recall 0.9.1 exact-pins the published Meerkat 0.9.0 family. The SDK now includes
 the native provider transport protections previously carried as Recall patches.
 The v0.1.0 artifacts continue using their original Meerkat 0.8.51 dependencies.
 Consult the release notes for tested behavior and remaining limits.
@@ -60,6 +63,25 @@ store. It needs no database server or model credentials and binds to loopback.
 The article wiki at `/wiki` stays empty in this build. To generate articles with
 a configured model, see the [full demo](docs/architecture/living-wiki.mdx#runnable-projection-demo).
 The first source build can take several minutes. Press Ctrl-C to stop it.
+
+## Deploy with release containers
+
+For Linux AMD64, use the [authenticated Compose installation](deploy/compose/README.md)
+with both immutable image digests from the selected release record. The Recall
+image runs HTTP/MCP and managed workers; the paired database image supplies the
+required reference-fence capability. The recipe creates private configuration,
+retains persistent state and runs migrations before serving. Complete worker
+credentials, space grants and provider approvals before requiring semantic readiness.
+
+The [deployment guide](docs/operations/deployment.mdx) covers readiness, storage,
+service roles and Kubernetes. Before bulk imports, check the authorized
+[daily budget view](docs/operations/service-setup.mdx#inspect-budget-before-an-import).
+For long documents, configure an approved
+[complete-input embedding profile](docs/operations/service-setup.mdx#long-documents-and-embedding-profiles)
+and follow the guarded reindex and failed-source retry guidance.
+
+The development Compose example below retains
+its local-build workflow and authentication bypass.
 
 ## Run a persistent local server
 

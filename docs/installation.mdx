@@ -6,7 +6,7 @@ icon: download
 
 Download native releases for Linux x86-64 and macOS ARM64 from
 [the canonical Meerkat Recall repository](https://github.com/lukacf/meerkat-recall/releases).
-Recall `0.9.0` uses Meerkat `0.9.0`. Use each archive with its matching
+Recall `0.9.1` uses Meerkat `0.9.0`. Use each archive with its matching
 release record. Existing `0.1.0` archives retain their original dependencies and receipts. See
 [release binaries](/operations/deployment#release-binaries) for the promotion process
 and build provenance requirements.
@@ -18,11 +18,12 @@ and build provenance requirements.
 | Linux x86-64 | `meerkat-recall-VERSION-x86_64-unknown-linux-gnu.tar.gz` |
 | macOS ARM64 (Apple Silicon) | `meerkat-recall-VERSION-aarch64-apple-darwin.tar.gz` |
 
-The macOS ARM64 archive has a conservative static minimum of **macOS 13.4**,
-set by its linked ONNX Runtime objects. Archive verification, isolated
-installation, `--help` and `--version` passed on **macOS 26.5.2**. Older macOS
-versions and macOS inference were not exercised; the executable's own macOS 11.0
-load command does not establish compatibility for the complete runtime.
+Recall 0.9.1 passed archive verification, isolated installation, `--version` and a
+local-model inference case on **macOS 26.5.2** (Apple Silicon): one document, two
+semantic queries and stored finite, nonzero 384-dimensional vectors. The release
+qualification record identifies the model and native build source. Older macOS
+versions were not exercised. The executable's macOS 11.0 load command alone does not
+establish the minimum supported OS for its statically linked runtime.
 
 Check each release's actual host and dynamic-library results before treating
 another OS version as supported. No Windows, Linux ARM64, or Intel macOS binary
@@ -77,12 +78,13 @@ symlink, licenses, `provenance.json`, `artifact.py`, `service/`, `third-party/`,
 `docs/` and `skills/`. Keep these together. Model weights and provider credentials
 are separate. The source release also retains the patched dependency sources.
 
-The original build commit and selected public source snapshot can differ.
-`public_derivation` records that mapping and the unchanged executable digest;
-it does not claim a rebuild or third-party build attestation. The canonical
-release preserves the original artifact identities even if earlier derivation
-metadata names its original staging repository. Use the canonical release URL
-for current downloads. `--version` alone does not identify an exact build.
+The native build commit and release source can differ. The archive's embedded
+`provenance.json` retains its actual build source. For the 0.9.1 macOS archive,
+the separate release provenance asset records `actual_build_source`,
+`release_source` and `source_mapping`; `metadata_derivation` identifies the
+metadata-only archive change and preserved executable. These records do not
+claim a rebuild at the release commit. Use each archive with its matching
+release provenance and checksum. `--version` alone does not identify an exact build.
 
 ## Run the model-backed demo
 

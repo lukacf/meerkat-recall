@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-15
+
 ### Deployment and diagnostics
 - Select runtime TOML explicitly with `serve --config`, `migrate --config` or
   `ELEPHANT_CONFIG`; a missing or malformed selected file fails without fallback.
@@ -21,11 +23,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   headroom through an authorized, selected-space `GET /api/v1/budget`.
 - Document complete-input `text-full-v2` profile selection, staged reindex
   activation and fresh revision/generation retries for terminal failed sources.
-
+- Return typed oversized-input guidance without truncating or relabeling `text-v1`;
+  retain complete-input segmentation and pooling in explicitly selected `text-full-v2`.
+- Preserve safe typed extraction causes and actions in worker diagnostics and
+  failed-run summaries without copying provider output into those diagnostics.
 - Preserve typed per-source budget and missing-publication wait reasons, and
   increase the bounded worker transient retry default to 10 attempts.
-- Fix filtered HNSW candidate selection so foreign or deleted identical vectors
-  do not consume eligible result slots; the paired server carries the same fix.
+- Persist duplicate-vector bitmap insertions and removals, and fix filtered HNSW
+  candidate selection so foreign or deleted vectors do not consume eligible
+  result slots. The paired server carries the same engine corrections.
+- Document recovery from existing missing vector membership through original
+  document intake with fresh revision/key and current-generation guards; an
+  upgrade or redacted source GET response alone cannot restore missing members.
+
+### Security
+- Upgrade Rustls from 0.23.45 to 0.23.46 for RUSTSEC-2026-0346,
+  RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349. Keep
+  dependency auditing enabled and retain the exact Meerkat 0.9.0 SDK pins.
 
 ### CI reliability
 - Use a conservative reader-prose path while preserving required check names,

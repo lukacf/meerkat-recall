@@ -94,8 +94,13 @@ example does not imply an available qualified image.
 
 For semantic ingestion, copy [.env.example](.env.example) to `.env` and configure
 credentials plus explicit approved per-space processing bindings. The retained
-environment defaults select OpenAI embeddings and Anthropic extraction; they
-do not approve a provider for a space. Model calls can incur provider charges.
+environment defaults select OpenAI `gpt-6.1-sol` for extraction, multimodal
+rendering and wiki writing, with `claude-sonnet-5-5` for the auxiliary Anthropic
+roles (summaries, conflict adjudication and promotion disambiguation). Pipeline
+embeddings remain `text-embedding-3-large` at 3072 dimensions. Explicit model
+settings and approved per-space profiles remain authoritative; defaults do not
+approve a provider or migrate existing profiles. Model calls can incur provider
+charges.
 
 ```bash
 cp .env.example .env

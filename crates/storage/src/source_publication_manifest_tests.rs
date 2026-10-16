@@ -70,6 +70,7 @@ fn processing() -> SpaceProcessingConfig {
                 model_version: "fixture-v1".into(),
                 dimensions: Some(3),
                 preprocessing: "text-v1".into(),
+                summary: None,
             },
         )]),
         bindings: [
@@ -90,6 +91,7 @@ fn processing() -> SpaceProcessingConfig {
         .collect(),
         active_embedding_profile_id: Some("profile".into()),
         pending_reindex: None,
+        completed_embedding_reindex: None,
     }
 }
 
@@ -107,7 +109,11 @@ async fn client(embedded: bool) -> StorageClient {
     // never mutate schema, and source acceptance/finalization needs real control
     // records and the same reference guards used by the retained runtime.
     for migration in [
-        include_str!("../../migrations/sql/031_source_publication.surql"),
+        concat!(
+            include_str!("../../migrations/sql/031_source_publication.surql"),
+            "\n",
+            include_str!("../../migrations/sql/046_source_support_index_fence.surql")
+        ),
         include_str!("../../migrations/sql/035_source_publication_manifest.surql"),
         include_str!("../../migrations/sql/037_source_publication_manifest_history.surql"),
         include_str!("../../migrations/sql/039_private_reference_fence.surql"),
@@ -287,6 +293,7 @@ async fn fixture_with_embedding_waits(
         .vector_partition()
         .unwrap();
     let mut manifest = SourcePublicationManifest {
+        historical_adoption: None,
         space_id: space.into(),
         publication: publication.clone(),
         mode,
@@ -3013,6 +3020,7 @@ async fn actual_erasure_removes_current_and_superseded_plan_payloads() {
             .await
             .unwrap();
         let mut original = SourcePublicationManifest {
+            historical_adoption: None,
             space_id: space.into(),
             publication: PublicationFence {
                 source_id: accepted.source_id.clone(),
@@ -3700,6 +3708,7 @@ async fn stage_actual_metadata_acceptance(
     configuration: SpaceConfigToken,
 ) -> SourcePublicationManifest {
     let mut manifest = SourcePublicationManifest {
+        historical_adoption: None,
         space_id: accepted.space_id.clone(),
         publication: PublicationFence {
             source_id: accepted.source_id.clone(),

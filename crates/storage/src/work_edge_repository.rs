@@ -16,7 +16,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 use crate::require::required_field;
 
-const WORK_EDGE_PROJECTION: &str = r"
+pub(crate) const WORK_EDGE_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -42,7 +42,7 @@ const WORK_EDGE_PROJECTION: &str = r"
 
 /// Database-only proxy for WorkEdge.
 #[derive(Deserialize)]
-struct WorkEdgeDb {
+pub(crate) struct WorkEdgeDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,
@@ -118,7 +118,7 @@ impl WorkEdgeRepository {
     }
 
     /// Converts a WorkEdge to a SurrealDB value for insertion.
-    fn work_edge_to_value(item: &WorkEdge) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn work_edge_to_value(item: &WorkEdge) -> StorageResult<surrealdb::sql::Value> {
         use std::collections::BTreeMap;
         use surrealdb::sql::{Array, Object, Value};
 

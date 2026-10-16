@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parent
 PATCHED = {
     'surrealdb-core-2.6.5': {
         'Cargo.toml',
+        'Cargo.toml.orig',
         'README.md',
         'src/ctx/context.rs',
         'src/dbs/iterator.rs',
@@ -24,6 +25,7 @@ PATCHED = {
         'src/idx/index.rs',
         'src/idx/planner/checker.rs',
         'src/idx/trees/hnsw/docs.rs',
+        'src/idx/trees/hnsw/mod.rs',
         'src/idx/trees/hnsw/index.rs',
         'src/idx/trees/knn.rs',
         'src/idx/trees/store/hnsw.rs',
@@ -58,7 +60,10 @@ PATCHED = {
     },
     'surrealdb-2.6.5': {
         'Cargo.toml',
+        'Cargo.toml.orig',
         'src/api/conn/cmd.rs',
+        'src/api/conn/mod.rs',
+        'src/api/engine/any/native.rs',
         'src/api/engine/local/mod.rs',
         'src/api/engine/local/native.rs',
         'src/api/engine/local/wasm.rs',
@@ -74,6 +79,8 @@ PATCHED = {
 ADDED = {
     'surrealdb-core-2.6.5': {
         'RECALL_PROVENANCE.json',
+        'src/idx/trees/hnsw/coverage.rs',
+        'src/fnc/completion_coverage_projection.rs',
         'src/fnc/recall.rs',
         'src/fnc/recall_hmac_tests.rs',
         'src/kvs/physical_generation.rs',
@@ -101,6 +108,7 @@ ADDED = {
     },
     'surrealdb-2.6.5': {
         'RECALL_PROVENANCE.json',
+        'src/api/conn/local_close.rs',
         'src/api/method/recall_history_inventory.rs',
         'src/api/method/recall_physical_checkpoint.rs',
         'src/api/method/recall_physical_history_checkpoint.rs',

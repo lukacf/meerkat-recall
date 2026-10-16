@@ -12,7 +12,36 @@
 //! by `set_name_embedding`.
 //!
 //! The target must be EMPTY (fresh rocksdb path or empty database); the tool
-//! refuses a non-empty target rather than guessing about merges.
+//! refuses a non-empty target rather than guessing about merges. Supported
+//! operational rows retain their typed copy/readback paths; none are skipped.
+//! The one recognized legacy maintenance receipt is preserved in the required
+//! transfer report, never installed as destination schema or purge authority.
+
+mod archive_copy;
+mod archive_disposition;
+mod historical_adopt;
+#[cfg(test)]
+mod representative_native_tests;
+mod source_spool;
+mod streaming;
+
+/// Finish a command-owned local connection on success and failure. Reports and
+/// recovery markers describe the operation; shutdown cannot change their state.
+pub async fn finish_owned_connection<T>(
+    client: elephant_storage::StorageClient,
+    result: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let closed = client.close_owned_command_connection(60_000).await;
+    match (result, closed) {
+        (Err(error), Err(close)) => {
+            Err(error.context(format!("native connection shutdown also failed: {close}")))
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(close)) => Err(anyhow::Error::from(close)
+            .context("operation completed, but native connection shutdown is incomplete")),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -40,6 +69,8 @@ use elephant_types::records::{
     ReprocessJob, Source, SpaceConfig, SystemEvent, TruthSlot, WorkArtifact, WorkDeadletter,
     WorkEdge, WorkItem, WorkRun,
 };
+
+pub mod historical_delta;
 
 const EMBEDDING_CHUNK: usize = 500;
 
@@ -84,11 +115,22 @@ const SUPPORTED_TABLES: &[&str] = &[
 #[derive(Args, Debug, Clone)]
 pub struct DataMigrateArgs {
     /// Path to the elephant-db JSON snapshot to migrate.
-    #[arg(long)]
-    pub snapshot: PathBuf,
+    #[arg(
+        long,
+        required_unless_present = "preservation_plan",
+        conflicts_with = "preservation_plan"
+    )]
+    pub snapshot: Option<PathBuf>,
+    /// Verified offline plan with a bounded original lexical-row `SQLite` spool.
+    #[arg(long, conflicts_with = "snapshot", requires = "report")]
+    pub preservation_plan: Option<PathBuf>,
+    /// Explicit original target-space create request for historical adoption.
+    #[arg(long, requires = "preservation_plan")]
+    pub historical_config: Option<PathBuf>,
     #[command(flatten)]
     pub target: TransferTarget,
     /// Write a JSON report to a new file; existing paths are never overwritten.
+    /// Required when the snapshot contains a recognized legacy maintenance receipt.
     #[arg(long)]
     pub report: Option<PathBuf>,
 }
@@ -120,7 +162,7 @@ pub struct TransferTarget {
 }
 
 impl TransferTarget {
-    async fn connect(self) -> anyhow::Result<StorageClient> {
+    pub(crate) async fn connect(self) -> anyhow::Result<StorageClient> {
         let config = StorageConfig {
             backend: StorageBackendKind::SurrealDb,
             url: self
@@ -157,14 +199,20 @@ pub async fn discard(args: DataMigrateDiscardArgs) -> anyhow::Result<()> {
                 .all(|byte| byte.is_ascii_hexdigit()),
         "--source-sha256 must be the 64-hex original input digest"
     );
-    args.target
-        .connect()
-        .await?
-        .discard_incomplete_transfer(&args.source_sha256.to_ascii_lowercase())
-        .await
-        .context("target was not discarded; incomplete transfer identity must match")?;
+    discard_owned_connection(args.target.connect().await?, &args.source_sha256).await?;
     println!("incomplete target discarded; source snapshot untouched");
     Ok(())
+}
+
+async fn discard_owned_connection(
+    client: StorageClient,
+    source_sha256: &str,
+) -> anyhow::Result<()> {
+    let result = client
+        .discard_incomplete_transfer(&source_sha256.to_ascii_lowercase())
+        .await
+        .context("target was not discarded; incomplete transfer identity must match");
+    finish_owned_connection(client, result).await
 }
 
 /// Refuse transformations of immutable text, identifiers, metadata or evidence.
@@ -186,6 +234,46 @@ fn validate_row<T: serde::Serialize>(row: &T, label: &str) -> anyhow::Result<()>
         "{label} contains NUL; refusing an immutable-content transformation"
     );
     Ok(())
+}
+
+/// Accept only numeric values exactly representable by the destination f32.
+/// Legacy native export expands persisted f32 values to f64 JSON numbers; its
+/// full value, including signed zero, must survive. Short arbitrary decimals or
+/// large integers are never silently rounded into a different vector.
+fn exact_f32_vector(value: &serde_json::Value) -> anyhow::Result<Vec<f32>> {
+    let array = value.as_array().context("vector must be an array")?;
+    array
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let number = value
+                .as_f64()
+                .context("vector contains a nonnumeric element")?;
+            #[allow(clippy::cast_possible_truncation)]
+            let converted = number as f32;
+            anyhow::ensure!(
+                number.is_finite() && converted.is_finite(),
+                "vector element {index} is not finite f32"
+            );
+            // Check integers in their original domain: as_f64 alone could already
+            // round u64/i64 values above 2^53 before the f32 comparison.
+            #[allow(clippy::cast_possible_truncation)]
+            let exact = value.as_i64().map_or_else(
+                || {
+                    value.as_u64().map_or_else(
+                        || f64::from(converted).to_bits() == number.to_bits(),
+                        |integer| converted as i128 == i128::from(integer),
+                    )
+                },
+                |integer| converted as i128 == i128::from(integer),
+            );
+            anyhow::ensure!(
+                exact,
+                "vector element {index} requires unsupported f64/integer to f32 precision loss"
+            );
+            Ok(converted)
+        })
+        .collect()
 }
 
 fn entity_embedding(entity: &Entity) -> anyhow::Result<Option<(Vec<f32>, String, String)>> {
@@ -222,18 +310,8 @@ fn entity_embedding(entity: &Entity) -> anyhow::Result<Option<(Vec<f32>, String,
         .filter(|value| !value.is_empty())
         .context("entity name embedding text hash missing")?;
     anyhow::ensure!(!array.is_empty(), "entity name embedding vector is empty");
-    let mut vector = Vec::with_capacity(array.len());
-    for value in array {
-        let number = value
-            .as_f64()
-            .context("entity name embedding contains a nonnumeric element")?;
-        anyhow::ensure!(
-            number.is_finite() && number.abs() <= f64::from(f32::MAX),
-            "entity name embedding is not a finite f32 vector"
-        );
-        #[allow(clippy::cast_possible_truncation)]
-        vector.push(number as f32);
-    }
+    let vector =
+        exact_f32_vector(&entity.metadata[fields[0]]).context("entity name embedding precision")?;
     if let Some(dimensions) = entity.metadata.get("name_embedding_dims") {
         anyhow::ensure!(
             dimensions.as_u64() == Some(u64::try_from(vector.len())?),
@@ -262,11 +340,10 @@ async fn validate_typed_table<T: elephant_storage::embedded::EmbeddedRecord>(
             .and_then(serde_json::Value::as_str)
             .context("source identity missing")?;
         let mut original = row.clone();
-        // The kernel's optional compact vector spelling roundtrips through f32.
-        // Only that documented numeric representation mapping is permitted.
+        // Native f64 spelling is accepted only when its exact value survives
+        // the destination f32 representation. Original bytes stay evidence.
         if T::TABLE == elephant_types::TableName::ChunkEmbedding {
-            let vector: Vec<f32> =
-                serde_json::from_value(original.get("vector").cloned().context("vector missing")?)?;
+            let vector = exact_f32_vector(original.get("vector").context("vector missing")?)?;
             original["vector"] = serde_json::to_value(vector)?;
         }
         anyhow::ensure!(
@@ -408,12 +485,149 @@ async fn validate_source(src: &EmbeddedStore) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_transfer_input(path: &Path) -> anyhow::Result<Vec<u8>> {
+/// Only the transfer adapter separates historical maintenance provenance from
+/// tenant data. The ordinary snapshot loader retains its space guard unchanged.
+struct TransferInput {
+    bytes: Vec<u8>,
+    source_sha256: String,
+    retained_controls: Vec<serde_json::Value>,
+}
+
+fn validate_legacy_purge_receipt(row: &serde_json::Value) -> anyhow::Result<()> {
+    use elephant_storage::fake_embedding_repair::{RECEIPT_CHECKSUM, RECEIPT_NAME};
+
+    let fields = row
+        .as_object()
+        .context("migration_history row must be an object")?;
+    anyhow::ensure!(
+        fields.len() == 4
+            && ["id", "name", "checksum", "applied_at"]
+                .iter()
+                .all(|field| fields.contains_key(*field)),
+        "unrecognized migration_history receipt shape; transfer refused"
+    );
+    anyhow::ensure!(
+        row["id"].as_str() == Some(format!("migration_history:{RECEIPT_NAME}").as_str())
+            && row["name"].as_str() == Some(RECEIPT_NAME)
+            && row["checksum"].as_str() == Some(RECEIPT_CHECKSUM),
+        "unrecognized migration_history identity/name/checksum; transfer refused"
+    );
+    let applied_at = row["applied_at"]
+        .as_str()
+        .context("maintenance receipt applied_at must be a string")?;
+    chrono::DateTime::parse_from_rfc3339(applied_at)
+        .context("maintenance receipt applied_at must be an RFC3339 timestamp")?;
+    Ok(())
+}
+
+// Borrow raw table arrays so the adapter cannot round vectors or normalize
+// opaque operational payloads while separating the one known control row.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct TransferEnvelope<'a> {
+    backend: String,
+    version: u32,
+    exported_at: String,
+    #[serde(borrow)]
+    tables: TransferTables<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct TransferTables<'a>(BTreeMap<String, &'a serde_json::value::RawValue>);
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for TransferTables<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct TablesVisitor<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for TablesVisitor<'a> {
+            type Value = TransferTables<'a>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a snapshot table map with unique names")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut tables = BTreeMap::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    if tables.contains_key(&name) {
+                        return Err(serde::de::Error::custom("duplicate snapshot table name"));
+                    }
+                    tables.insert(name, map.next_value::<&serde_json::value::RawValue>()?);
+                }
+                Ok(TransferTables(tables))
+            }
+        }
+        deserializer.deserialize_map(TablesVisitor(std::marker::PhantomData))
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPurgeReceipt {
+    id: String,
+    name: String,
+    checksum: String,
+    applied_at: String,
+}
+
+fn validate_transfer_input(path: &Path, report: Option<&Path>) -> anyhow::Result<TransferInput> {
     anyhow::ensure!(!path.is_dir(), "preview named snapshots require journal-aware snapshot restore; backend transfer is unsupported");
     let bytes = std::fs::read(path)?;
-    let header: serde_json::Value = serde_json::from_slice(&bytes)?;
-    anyhow::ensure!(header.get("format").is_none(), "preview live/named snapshot envelopes require the original journal and snapshot restore; backend transfer refused before target mutation");
-    Ok(bytes)
+    let source_sha256 = hex::encode(Sha256::digest(&bytes));
+    // Derived envelope/control deserializers reject duplicate fields. The table
+    // visitor rejects duplicate table names without decoding ordinary row data.
+    let mut envelope: TransferEnvelope<'_> = serde_json::from_slice(&bytes)
+        .context("expected a plain elephant-db snapshot; preview envelopes require journal-aware snapshot restore")?;
+    anyhow::ensure!(
+        envelope.backend == "elephant-db" && envelope.version == 1,
+        "unsupported snapshot backend/version"
+    );
+    chrono::DateTime::parse_from_rfc3339(&envelope.exported_at)
+        .context("invalid snapshot exported_at")?;
+    for (table, rows) in &envelope.tables.0 {
+        let rows: Vec<&serde_json::value::RawValue> =
+            serde_json::from_str(rows.get()).context("snapshot table must contain a row array")?;
+        anyhow::ensure!(
+            rows.is_empty()
+                || SUPPORTED_TABLES.contains(&table.as_str())
+                || table == "migration_history",
+            "unsupported snapshot table: {table}; no target schema or data was written"
+        );
+    }
+    let mut retained_controls = Vec::new();
+    if let Some(raw) = envelope.tables.0.get("migration_history") {
+        let rows: Vec<&serde_json::value::RawValue> = serde_json::from_str(raw.get())?;
+        anyhow::ensure!(
+            rows.len() <= 1,
+            "duplicate or unknown migration_history receipts; transfer refused"
+        );
+        for row in rows {
+            let receipt: LegacyPurgeReceipt = serde_json::from_str(row.get())
+                .context("unrecognized or duplicate maintenance receipt fields")?;
+            let value = serde_json::json!({"id": receipt.id, "name": receipt.name, "checksum": receipt.checksum, "applied_at": receipt.applied_at});
+            validate_legacy_purge_receipt(&value)?;
+            retained_controls.push(value);
+        }
+    }
+    if retained_controls.is_empty() {
+        return Ok(TransferInput {
+            bytes,
+            source_sha256,
+            retained_controls,
+        });
+    }
+    anyhow::ensure!(report.is_some(), "snapshot maintenance receipt requires --report to retain source provenance; no target writes attempted");
+    // The input digest remains the transfer identity. Every ordinary table's
+    // raw JSON bytes survive unchanged; only report-bound provenance is split.
+    envelope.tables.0.remove("migration_history");
+    let projected_bytes = serde_json::to_vec(&envelope)?;
+    Ok(TransferInput {
+        bytes: projected_bytes,
+        source_sha256,
+        retained_controls,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -458,11 +672,6 @@ async fn source_inventory(
 /// Native write events advance these destination-owned control rows while
 /// copying historical payload. Validate their identity and source-space range
 /// before sealing their final fingerprints; never copy source control authority.
-#[expect(
-    clippy::checked_conversions,
-    clippy::items_after_statements,
-    reason = "retain destination control validation order and its exact persisted revision bound"
-)]
 async fn seal_generated_transfer_controls(
     src: &EmbeddedStore,
     dst: &StorageClient,
@@ -475,7 +684,14 @@ async fn seal_generated_transfer_controls(
         .filter_map(|row| row.get("space_id").and_then(serde_json::Value::as_str))
         .map(str::to_owned)
         .collect();
-    dst.verify_journal_identity().await?;
+    seal_control_spaces(&spaces, dst, fingerprints).await
+}
+
+async fn seal_control_spaces(
+    spaces: &std::collections::BTreeSet<String>,
+    dst: &StorageClient,
+    fingerprints: &mut BTreeMap<String, Vec<RowFingerprint>>,
+) -> anyhow::Result<()> {
     #[derive(serde::Deserialize)]
     #[expect(
         clippy::struct_field_names,
@@ -483,22 +699,10 @@ async fn seal_generated_transfer_controls(
     )]
     struct Epoch {
         space_id: String,
-        epoch: String,
+        epoch: Option<String>,
         id_matches_space: bool,
-    }
-    let mut response = dst
-        .query_checked("SELECT space_id, epoch, id = type::thing('canonical_epoch', space_id) AS id_matches_space FROM canonical_epoch")
-        .await?;
-    let epochs: Vec<Epoch> = response.take(0)?;
-    let mut seen = std::collections::BTreeSet::new();
-    for row in epochs {
-        anyhow::ensure!(
-            spaces.contains(&row.space_id)
-                && seen.insert(row.space_id)
-                && row.id_matches_space
-                && uuid::Uuid::parse_str(&row.epoch).is_ok(),
-            "unexpected destination canonical epoch during transfer"
-        );
+        is_support_index: bool,
+        support_index_valid: bool,
     }
     #[derive(serde::Deserialize)]
     struct Guard {
@@ -511,6 +715,37 @@ async fn seal_generated_transfer_controls(
         reserved: bool,
         id_matches_space: bool,
     }
+    dst.verify_journal_identity().await?;
+    let mut response = dst
+        .query_checked("SELECT space_id, epoch, id = type::thing('canonical_epoch', space_id) AS id_matches_space, id = canonical_epoch:['recall_source_support_index',1] AS is_support_index, fn::recall_support_index_fence_valid($this) AS support_index_valid FROM canonical_epoch")
+        .await?;
+    let epochs: Vec<Epoch> = response.take(0)?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut support_index_seen = false;
+    for row in epochs {
+        if row.is_support_index {
+            anyhow::ensure!(
+                !support_index_seen && row.support_index_valid,
+                "unexpected destination support index fence during transfer"
+            );
+            support_index_seen = true;
+            continue;
+        }
+        anyhow::ensure!(
+            spaces.contains(&row.space_id)
+                && seen.insert(row.space_id)
+                && row.id_matches_space
+                && row
+                    .epoch
+                    .as_deref()
+                    .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok()),
+            "unexpected destination canonical epoch during transfer"
+        );
+    }
+    anyhow::ensure!(
+        support_index_seen,
+        "destination support index fence missing"
+    );
     let mut response = dst.query_checked("SELECT space_id, journal_id, key_fingerprint, version, membership_count, revision, erasure_reservation != NONE AS reserved, id = type::thing('source_erasure_guard', space_id) AS id_matches_space FROM source_erasure_guard").await?;
     let guards: Vec<Guard> = response.take(0)?;
     seen.clear();
@@ -525,7 +760,7 @@ async fn seal_generated_transfer_controls(
                 && row.version == 1
                 && row.membership_count == 0
                 && row.revision > 0
-                && row.revision <= i64::MAX as u64
+                && i64::try_from(row.revision).is_ok()
                 && !row.reserved,
             "unexpected destination erasure guard during transfer"
         );
@@ -727,6 +962,18 @@ async fn preserve_embedding(dst: &StorageClient, source: &NodeEmbedding) -> anyh
 
 macro_rules! copy_table {
     ($src:expr, $dst_repo:expr, $ty:ty, $label:expr, $report:expr, $fingerprints:expr, $client:expr) => {{
+        copy_table!(
+            $src,
+            $dst_repo,
+            $ty,
+            $label,
+            $report,
+            $fingerprints,
+            $client,
+            create
+        )
+    }};
+    ($src:expr, $dst_repo:expr, $ty:ty, $label:expr, $report:expr, $fingerprints:expr, $client:expr, $method:ident) => {{
         let rows: Vec<$ty> = $src
             .scan::<$ty>()
             .await
@@ -737,7 +984,7 @@ macro_rules! copy_table {
             validate_row(&row, $label)?;
             let expected = serde_json::to_value(&row)?;
             let stored = $dst_repo
-                .create(row)
+                .$method(row)
                 .await
                 .with_context(|| format!("create {} row {}/{}", $label, written + 1, total))?;
             anyhow::ensure!(
@@ -765,13 +1012,18 @@ macro_rules! copy_table {
     reason = "retain the destination handle through the original transfer barrier and completion scope"
 )]
 pub async fn run(args: DataMigrateArgs) -> anyhow::Result<()> {
-    let source_bytes = validate_transfer_input(&args.snapshot)?;
-    let source_digest = hex::encode(Sha256::digest(&source_bytes));
-    println!("Loading snapshot {} ...", args.snapshot.display());
+    if args.preservation_plan.is_some() {
+        return streaming::run(args).await;
+    }
+    let snapshot = args.snapshot.as_ref().context("snapshot is required")?;
+    let input = validate_transfer_input(snapshot, args.report.as_deref())?;
+    let source_digest = input.source_sha256;
+    println!("Loading snapshot {} ...", snapshot.display());
     let src = EmbeddedStore::new();
-    src.import_snapshot_bytes(&source_bytes)
+    src.import_snapshot_bytes(&input.bytes)
         .await
-        .context("load fixed input bytes into embedded store")?;
+        .context("load validated tenant projection into embedded store")?;
+    drop(input.bytes);
 
     validate_source(&src).await?;
 
@@ -781,7 +1033,7 @@ pub async fn run(args: DataMigrateArgs) -> anyhow::Result<()> {
     let report_path = args.report;
     let receipt_digest = source_digest.clone();
     dst.with_transfer_barrier(&source_digest, move |privileged| async move {
-        copy_snapshot(&src, &privileged, report_path.as_deref(), &receipt_digest).await
+        copy_snapshot(&src, &privileged, report_path.as_deref(), &receipt_digest, &input.retained_controls).await
             .map_err(|error| elephant_storage::StorageError::DataIntegrityError(format!("transfer reconciliation failed: {error:#}")))
     }).await.context("transfer failed; input unchanged; an incomplete transfer marker blocks readiness and requires explicit digest-matched target discard")?;
     println!("transfer completed; source_sha256={source_digest}");
@@ -869,7 +1121,15 @@ async fn copy_snapshot(
     dst: &StorageClient,
     report_path: Option<&Path>,
     source_digest: &str,
+    retained_controls: &[serde_json::Value],
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        retained_controls.is_empty() || report_path.is_some(),
+        "maintenance provenance requires a transfer report"
+    );
+    for row in retained_controls {
+        validate_legacy_purge_receipt(row)?;
+    }
     println!("Applying target schema ...");
     elephant_migrations::apply_schema(dst)
         .await
@@ -1125,7 +1385,8 @@ async fn copy_snapshot(
         "work_item",
         report,
         fingerprints,
-        dst
+        dst,
+        import_for_transfer
     );
     copy_table!(
         src,
@@ -1252,7 +1513,27 @@ async fn copy_snapshot(
     fingerprints.insert("entity".into(), target_fingerprints(dst, "entity").await?);
     seal_generated_transfer_controls(src, dst, &mut fingerprints).await?;
     reconcile_destination(src, dst, &fingerprints).await?;
-    let source_inventory = source_inventory(src).await?;
+    let mut source_inventory = source_inventory(src).await?;
+    if !retained_controls.is_empty() {
+        source_inventory.insert("migration_history".into(), retained_controls.to_vec());
+        println!(
+            "migration_history: {} source receipt retained in report only",
+            retained_controls.len()
+        );
+    }
+    let source_table_counts: BTreeMap<_, _> = source_inventory
+        .iter()
+        .map(|(table, rows)| (table.clone(), rows.len()))
+        .collect();
+    let retained_source_controls = if retained_controls.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::json!({"migration_history": {
+            "disposition": "source_provenance_only_not_target_authority",
+            "rows": retained_controls,
+            "rows_sha256": hex::encode(Sha256::digest(serde_json::to_vec(retained_controls)?))
+        }})
+    };
     let source_rows_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&source_inventory)?));
     let destination_rows_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&fingerprints)?));
     println!("\n=== VERIFIED TRANSFER REPORT ===");
@@ -1273,7 +1554,7 @@ async fn copy_snapshot(
             .with_context(|| format!("create report {}", path.display()))?;
         output
             .write_all(
-                &serde_json::to_vec_pretty(&serde_json::json!({ "format":"recall-legacy-transfer-v1", "state":"reconciled", "source_sha256":source_digest, "tables": tables, "source_rows_sha256":source_rows_sha256, "destination_rows_sha256":destination_rows_sha256, "destination":fingerprints }))
+                &serde_json::to_vec_pretty(&serde_json::json!({ "format":"recall-legacy-transfer-v1", "state":"reconciled", "source_sha256":source_digest, "tables": tables, "source_rows_sha256":source_rows_sha256, "destination_rows_sha256":destination_rows_sha256, "destination":fingerprints, "source_table_counts":source_table_counts, "retained_source_controls":retained_source_controls }))
                     .context("serialize report")?,
             )
             .with_context(|| format!("write report to {}", path.display()))?;
@@ -1318,6 +1599,504 @@ mod tests {
             .await
             .unwrap();
         fixture
+    }
+
+    fn legacy_receipt() -> serde_json::Value {
+        serde_json::json!({
+            "id": "migration_history:fake_embedding_purge_v1",
+            "name": elephant_storage::fake_embedding_repair::RECEIPT_NAME,
+            "checksum": elephant_storage::fake_embedding_repair::RECEIPT_CHECKSUM,
+            "applied_at": "2026-10-10T15:33:50Z"
+        })
+    }
+
+    fn receipt_snapshot(receipts: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "backend": "elephant-db", "version": 1,
+            "exported_at": "2026-10-10T15:33:50Z",
+            "tables": {"migration_history": receipts}
+        })
+    }
+
+    #[tokio::test]
+    async fn known_maintenance_receipt_requires_report_without_relaxing_snapshot_loader() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("source.json");
+        let report = directory.path().join("report.json");
+        let original =
+            serde_json::to_vec(&receipt_snapshot(&serde_json::json!([legacy_receipt()]))).unwrap();
+        std::fs::write(&snapshot, &original).unwrap();
+        assert!(validate_transfer_input(&snapshot, None)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("--report"));
+        let ordinary = EmbeddedStore::new();
+        assert!(ordinary
+            .import_snapshot_bytes(&original)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("space_id"));
+        let input = validate_transfer_input(&snapshot, Some(&report)).unwrap();
+        assert_eq!(input.source_sha256, hex::encode(Sha256::digest(&original)));
+        assert_eq!(input.retained_controls, vec![legacy_receipt()]);
+        let projection: serde_json::Value = serde_json::from_slice(&input.bytes).unwrap();
+        assert!(projection["tables"].get("migration_history").is_none());
+        ordinary.import_snapshot_bytes(&input.bytes).await.unwrap();
+        assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+        assert!(!report.exists());
+    }
+
+    #[test]
+    fn unknown_or_malformed_receipts_and_controls_are_never_discarded() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("source.json");
+        let report = directory.path().join("report.json");
+        let mut invalid = Vec::new();
+        for (field, value) in [
+            ("id", serde_json::json!("migration_history:001_init")),
+            ("name", serde_json::json!("001_init")),
+            ("checksum", serde_json::json!("wrong")),
+            ("applied_at", serde_json::json!("not-a-timestamp")),
+            ("applied_at", serde_json::Value::Null),
+            ("space_id", serde_json::json!("space")),
+            ("opaque_future_field", serde_json::json!(true)),
+        ] {
+            let mut row = legacy_receipt();
+            row[field] = value;
+            invalid.push(receipt_snapshot(&serde_json::json!([row])));
+        }
+        let mut missing = legacy_receipt();
+        missing.as_object_mut().unwrap().remove("checksum");
+        invalid.push(receipt_snapshot(&serde_json::json!([missing])));
+        invalid.push(receipt_snapshot(&serde_json::json!([
+            legacy_receipt(),
+            legacy_receipt()
+        ])));
+        invalid.push(receipt_snapshot(&serde_json::json!({})));
+        for table in [
+            "canonical_epoch",
+            "source_erasure_guard",
+            "source_erasure_membership",
+            "source_head",
+            "custom_operational_rows",
+        ] {
+            let mut raw = receipt_snapshot(&serde_json::json!([legacy_receipt()]));
+            raw["tables"][table] =
+                serde_json::json!([{"id": format!("{table}:one"), "space_id": "space"}]);
+            invalid.push(raw);
+        }
+        for raw in invalid {
+            let original = serde_json::to_vec(&raw).unwrap();
+            std::fs::write(&snapshot, &original).unwrap();
+            assert!(validate_transfer_input(&snapshot, Some(&report)).is_err());
+            assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+            assert!(!report.exists());
+        }
+    }
+
+    #[test]
+    fn duplicate_envelope_table_and_receipt_fields_are_refused_before_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("source.json");
+        let report = directory.path().join("report.json");
+        let original =
+            serde_json::to_string(&receipt_snapshot(&serde_json::json!([legacy_receipt()])))
+                .unwrap();
+        let mut invalid = Vec::new();
+        for field in ["backend", "version", "exported_at", "tables"] {
+            let parsed: serde_json::Value = serde_json::from_str(&original).unwrap();
+            invalid.push(format!("{{{field:?}:{},{}", parsed[field], &original[1..]));
+        }
+        for field in ["id", "name", "checksum", "applied_at"] {
+            let receipt = serde_json::to_string(&legacy_receipt()).unwrap();
+            let duplicate = format!("{{{field:?}:{},{}", legacy_receipt()[field], &receipt[1..]);
+            invalid.push(original.replace(&receipt, &duplicate));
+        }
+        invalid.push(original.replace("\"tables\":{", "\"tables\":{\"migration_history\":[],"));
+        for raw in invalid {
+            assert_ne!(raw, original, "negative fixture must change input");
+            std::fs::write(&snapshot, raw.as_bytes()).unwrap();
+            assert!(validate_transfer_input(&snapshot, Some(&report)).is_err());
+            assert_eq!(std::fs::read(&snapshot).unwrap(), raw.as_bytes());
+            assert!(!report.exists());
+        }
+    }
+
+    #[test]
+    fn receipt_projection_preserves_raw_operational_and_vector_table_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("source.json");
+        let report = directory.path().join("report.json");
+        let mut raw = receipt_snapshot(&serde_json::json!([legacy_receipt()]));
+        // Deliberately lexical-sensitive numbers, signed zero, Unicode escapes,
+        // nested key ordering and whitespace: none may be reserialized by the adapter.
+        let table_bytes = r#"[ {"id":"fixture", "number":9007199254740993, "vector":[-0.0,1.234567890123456789e-30], "opaque":{"z":"\u00e9","a":true}} ]"#;
+        for table in [
+            "audit_log",
+            "cost_ledger_daily",
+            "work_item",
+            "work_run",
+            "work_artifact",
+            "work_item_archive",
+            "work_run_archive",
+            "chunk_embedding",
+        ] {
+            raw["tables"][table] = serde_json::json!("raw-placeholder");
+        }
+        let original = serde_json::to_string(&raw)
+            .unwrap()
+            .replace("\"raw-placeholder\"", table_bytes);
+        std::fs::write(&snapshot, original.as_bytes()).unwrap();
+        let input = validate_transfer_input(&snapshot, Some(&report)).unwrap();
+        let projected: TransferEnvelope<'_> = serde_json::from_slice(&input.bytes).unwrap();
+        for rows in projected.tables.0.values() {
+            assert_eq!(rows.get(), table_bytes);
+        }
+        assert_eq!(projected.tables.0.len(), 8);
+        assert_eq!(
+            input.source_sha256,
+            hex::encode(Sha256::digest(original.as_bytes()))
+        );
+        assert_eq!(std::fs::read(&snapshot).unwrap(), original.as_bytes());
+        // These adapter-only rows are intentionally not claimed as valid typed
+        // operational records. Existing lossless typed validation still applies.
+    }
+
+    #[tokio::test]
+    async fn receipt_projection_keeps_operational_fields_for_lossless_validation() {
+        use elephant_types::records::BaseFields;
+        use elephant_types::{RecordId, TableName};
+        let src = EmbeddedStore::new();
+        let mut row = serde_json::to_value(BaseFields::new(
+            RecordId::new_v4(TableName::AuditLog),
+            "space".into(),
+            "fixture".into(),
+        ))
+        .unwrap();
+        row["action"] = serde_json::json!("create");
+        row["actor"] = serde_json::json!("fixture");
+        row["record"] = serde_json::to_value(RecordId::new_v4(TableName::Entity)).unwrap();
+        row["timestamp"] = serde_json::json!("2026-10-10T15:33:50Z");
+        row["unknown_evidence"] = serde_json::json!({"must_not_disappear": true});
+        let mut raw = receipt_snapshot(&serde_json::json!([legacy_receipt()]));
+        raw["tables"]["audit_log"] = serde_json::json!([row.clone()]);
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("source.json");
+        std::fs::write(&snapshot, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let input = validate_transfer_input(&snapshot, Some(&directory.path().join("report.json")))
+            .unwrap();
+        let projection: serde_json::Value = serde_json::from_slice(&input.bytes).unwrap();
+        assert_eq!(projection["tables"]["audit_log"][0], row);
+        src.import_snapshot_bytes(&input.bytes).await.unwrap();
+        assert!(
+            validate_source(&src).await.is_err(),
+            "unknown operational fields must fail lossless validation"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original client and producer repository alive through all transfer and provenance assertions."
+    )]
+    async fn transfer_retains_maintenance_provenance_and_operational_rows_without_authority() {
+        use elephant_types::records::{AuditAction, BaseFields, IngestMode, WorkItemStatus};
+        use elephant_types::{RecordId, TableName};
+        let src = EmbeddedStore::new();
+        let mut base = BaseFields::new(
+            RecordId::new_v4(TableName::WorkItem),
+            "space".into(),
+            "fixture".into(),
+        );
+        base.security.level = 3;
+        base.security.labels = vec!["restricted".into()];
+        let work = WorkItem {
+            base,
+            kind: "extract_assertions".into(),
+            payload: serde_json::json!({"retained": true}),
+            status: WorkItemStatus::Done,
+            priority: 2,
+            idempotency_key: "historical-work".into(),
+            attempts: 2,
+            lease_expires_at: None,
+            leased_by: None,
+            run_after: None,
+            last_error: Some("historical retry cause".into()),
+        };
+        let mut pending = work.clone();
+        pending.base.id = RecordId::new_v4(TableName::WorkItem);
+        pending.status = WorkItemStatus::Runnable;
+        pending.idempotency_key = "historical-pending".into();
+        let audit = AuditLog {
+            base: BaseFields::new(
+                RecordId::new_v4(TableName::AuditLog),
+                "space".into(),
+                "fixture".into(),
+            ),
+            action: AuditAction::Create,
+            actor: "fixture".into(),
+            record: work.base.id.clone(),
+            before: None,
+            after: Some(serde_json::json!({"history": "preserved"})),
+            timestamp: work.base.created_at,
+            reason: Some("completed import predecessor".into()),
+        };
+        let cost = CostLedgerDaily {
+            base: BaseFields::new(
+                RecordId::new_v4(TableName::CostLedgerDaily),
+                "space".into(),
+                "fixture".into(),
+            ),
+            date: work.base.created_at.date_naive(),
+            mode: IngestMode::Graph,
+            worker_kind: "extract_assertions".into(),
+            total_euros: 0.5,
+            total_items: 1,
+            total_tokens: 4321,
+            total_runs: 2,
+            total_failures: 1,
+            reserved_euros: 0.0,
+            reconciled_euros: 0.5,
+        };
+        src.create(work.clone()).await.unwrap();
+        src.create(pending.clone()).await.unwrap();
+        src.create(audit.clone()).await.unwrap();
+        src.create(cost.clone()).await.unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&legacy_snapshot_bytes(&src).await).unwrap();
+        raw["tables"]["migration_history"] = serde_json::json!([legacy_receipt()]);
+        let original = serde_json::to_vec(&raw).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("source.json");
+        let report_path = directory.path().join("report.json");
+        std::fs::write(&snapshot, &original).unwrap();
+        let input = validate_transfer_input(&snapshot, Some(&report_path)).unwrap();
+        let src = EmbeddedStore::new();
+        src.import_snapshot_bytes(&input.bytes).await.unwrap();
+        let dst = StorageClient::new_memory().await.unwrap();
+        preflight(&src, &dst, Some(&report_path)).await.unwrap();
+        let digest = input.source_sha256.clone();
+        let output = report_path.clone();
+        dst.with_transfer_barrier(&digest, move |exclusive| async move {
+            copy_snapshot(
+                &src,
+                &exclusive,
+                Some(&output),
+                &input.source_sha256,
+                &input.retained_controls,
+            )
+            .await
+            .map_err(|error| elephant_storage::StorageError::DataIntegrityError(error.to_string()))
+        })
+        .await
+        .unwrap();
+        assert!(dst.recovery_status().ready);
+        assert_eq!(
+            WorkItemRepository::new(dst.clone())
+                .get("space", &work.base.id)
+                .await
+                .unwrap(),
+            Some(work.clone())
+        );
+        assert_eq!(
+            WorkItemRepository::new(dst.clone())
+                .get("space", &pending.base.id)
+                .await
+                .unwrap(),
+            Some(pending.clone())
+        );
+        let producers =
+            elephant_storage::work_producer_repository::WorkProducerRepository::new(dst.clone());
+        for imported in [&work, &pending] {
+            assert_eq!(
+                producers.origin_for_work(imported).await.unwrap(),
+                elephant_storage::work_producer_repository::WorkProducerOrigin::Unknown,
+                "historical payload cannot acquire direct-dispatch provenance"
+            );
+        }
+        assert!(target_fingerprints(&dst, "work_producer_origin")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            AuditLogRepository::new(dst.clone())
+                .get("space", &audit.base.id)
+                .await
+                .unwrap(),
+            Some(audit)
+        );
+        assert_eq!(
+            CostLedgerDailyRepository::new(dst.clone())
+                .get("space", &cost.base.id)
+                .await
+                .unwrap(),
+            Some(cost)
+        );
+        let mut response = dst
+            .query_checked("SELECT * FROM migration_history:fake_embedding_purge_v1")
+            .await
+            .unwrap();
+        assert!(
+            response
+                .take::<Vec<serde_json::Value>>(0)
+                .unwrap()
+                .is_empty(),
+            "source purge receipt must not become destination authority"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+        assert_eq!(report["source_sha256"], digest);
+        assert_eq!(report["source_table_counts"]["migration_history"], 1);
+        for table in ["audit_log", "cost_ledger_daily"] {
+            assert_eq!(report["tables"][table], 1);
+            assert_eq!(report["source_table_counts"][table], 1);
+        }
+        assert_eq!(report["tables"]["work_item"], 2);
+        assert_eq!(report["source_table_counts"]["work_item"], 2);
+        let retained = &report["retained_source_controls"]["migration_history"];
+        assert_eq!(
+            retained["disposition"],
+            "source_provenance_only_not_target_authority"
+        );
+        assert_eq!(retained["rows"], serde_json::json!([legacy_receipt()]));
+        assert_eq!(
+            retained["rows_sha256"],
+            hex::encode(Sha256::digest(
+                serde_json::to_vec(&vec![legacy_receipt()]).unwrap()
+            ))
+        );
+        let mut inventory: BTreeMap<String, Vec<serde_json::Value>> =
+            serde_json::from_value(raw["tables"].clone()).unwrap();
+        for rows in inventory.values_mut() {
+            rows.sort_by_key(|row| row["id"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(
+            report["source_rows_sha256"],
+            hex::encode(Sha256::digest(serde_json::to_vec(&inventory).unwrap()))
+        );
+        assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_in_scrutinee,
+        reason = "Keep both fixture clients alive for the complete native and embedded authority scenario."
+    )]
+    async fn historical_work_import_requires_transfer_and_preserves_identity_guards() {
+        use elephant_storage::work_producer_repository::{
+            WorkProducerOrigin, WorkProducerRepository,
+        };
+        use elephant_types::records::{BaseFields, WorkItemArchive, WorkItemStatus};
+        use elephant_types::{RecordId, TableName};
+
+        for dst in [
+            StorageClient::new_memory().await.unwrap(),
+            StorageClient::new_embedded().await.unwrap(),
+        ] {
+            let item = WorkItem {
+                base: BaseFields::new(
+                    RecordId::new_v4(TableName::WorkItem),
+                    "space".into(),
+                    "fixture".into(),
+                ),
+                kind: "extract_assertions".into(),
+                payload: serde_json::json!({"retained": true}),
+                status: WorkItemStatus::Runnable,
+                priority: 2,
+                idempotency_key: "historical-pending".into(),
+                attempts: 0,
+                lease_expires_at: None,
+                leased_by: None,
+                run_after: None,
+                last_error: None,
+            };
+            assert!(WorkItemRepository::new(dst.clone())
+                .import_for_transfer(item.clone())
+                .await
+                .is_err());
+            assert!(dst.list_tables().await.unwrap().is_empty());
+            let original = item.clone();
+            let stale = dst
+                .with_transfer_barrier(&"a".repeat(64), move |exclusive| async move {
+                    elephant_migrations::apply_schema(&exclusive).await.unwrap();
+                    let repo = WorkItemRepository::new(exclusive.clone());
+                    assert_eq!(repo.import_for_transfer(item.clone()).await.unwrap(), item);
+                    assert!(
+                        repo.import_for_transfer(item.clone()).await.is_err(),
+                        "hot identity cannot be overwritten"
+                    );
+                    assert_eq!(
+                        repo.get("space", &item.base.id).await.unwrap(),
+                        Some(item.clone())
+                    );
+                    let producers = WorkProducerRepository::new(exclusive.clone());
+                    assert_eq!(
+                        producers.origin_for_work(&item).await.unwrap(),
+                        WorkProducerOrigin::Unknown
+                    );
+
+                    let mut archived = item.clone();
+                    archived.base.id = RecordId::new_v4(TableName::WorkItem);
+                    archived.idempotency_key = "archived".into();
+                    let mut archive_base = archived.base.clone();
+                    archive_base.id =
+                        RecordId::new(TableName::WorkItemArchive, archived.base.id.id());
+                    let archive = WorkItemArchive {
+                        base: archive_base,
+                        original_id: archived.base.id.clone(),
+                        archived_at: archived.base.created_at,
+                        record: archived.clone(),
+                    };
+                    elephant_storage::work_retention::import_item_archive(&exclusive, archive)
+                        .await
+                        .unwrap();
+                    assert!(
+                        repo.import_for_transfer(archived.clone()).await.is_err(),
+                        "cold identity cannot be duplicated"
+                    );
+                    assert_eq!(
+                        repo.get("space", &archived.base.id).await.unwrap(),
+                        Some(archived)
+                    );
+
+                    let mut direct = item.clone();
+                    direct.base.id = RecordId::new_v4(TableName::WorkItem);
+                    direct.idempotency_key = "explicit-new-work".into();
+                    repo.create(direct.clone()).await.unwrap();
+                    assert_eq!(
+                        producers.origin_for_work(&direct).await.unwrap(),
+                        WorkProducerOrigin::Direct
+                    );
+                    let mut other = item.clone();
+                    other.base.id = RecordId::new_v4(TableName::WorkItem);
+                    other.idempotency_key = "must-refuse-mixed-authority".into();
+                    assert!(
+                        repo.import_for_transfer(other.clone()).await.is_err(),
+                        "transfer cannot adopt preexisting producer authority"
+                    );
+                    assert!(repo.get("space", &other.base.id).await.unwrap().is_none());
+                    Ok(exclusive)
+                })
+                .await
+                .unwrap();
+            assert!(
+                WorkItemRepository::new(stale.clone())
+                    .import_for_transfer(original.clone())
+                    .await
+                    .is_err(),
+                "expired transfer client cannot keep import authority"
+            );
+            drop(stale);
+            assert_eq!(
+                WorkItemRepository::new(dst)
+                    .get("space", &original.base.id)
+                    .await
+                    .unwrap(),
+                Some(original)
+            );
+        }
     }
 
     #[tokio::test]
@@ -1623,6 +2402,40 @@ mod tests {
         assert_eq!(std::fs::read(snapshot).unwrap(), before);
     }
 
+    async fn assert_generated_transfer_epochs(dst: &StorageClient, report: &serde_json::Value) {
+        #[derive(serde::Deserialize)]
+        struct TransferControl {
+            tenant: bool,
+            support: bool,
+            space_id: String,
+            epoch: Option<String>,
+            support_nonce: Option<String>,
+            fields: usize,
+        }
+        let mut response = dst.query_checked(
+            "SELECT id = canonical_epoch:space AS tenant, id = canonical_epoch:['recall_source_support_index',1] AS support, space_id, epoch, support_nonce, object::len($this) AS fields FROM canonical_epoch",
+        ).await.unwrap();
+        let rows: Vec<TransferControl> = response.take(0).unwrap();
+        assert_eq!(rows.len(), 2);
+        let tenant = rows.iter().find(|row| row.tenant).unwrap();
+        assert!(!tenant.support);
+        assert_eq!(tenant.space_id, "space");
+        assert_eq!(tenant.fields, 3);
+        assert!(uuid::Uuid::parse_str(tenant.epoch.as_deref().unwrap()).is_ok());
+        assert!(tenant.support_nonce.is_none());
+        let support = rows.iter().find(|row| row.support).unwrap();
+        assert!(!support.tenant);
+        assert_eq!(support.space_id, "__recall_source_support_index__");
+        assert_eq!(support.fields, 3);
+        assert!(uuid::Uuid::parse_str(support.support_nonce.as_deref().unwrap()).is_ok());
+        assert!(support.epoch.is_none());
+        assert_eq!(
+            report["destination"]["canonical_epoch"],
+            serde_json::to_value(target_fingerprints(dst, "canonical_epoch").await.unwrap())
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     #[expect(
         clippy::significant_drop_tightening,
@@ -1663,7 +2476,7 @@ mod tests {
         let output = report_path.clone();
         let receipt_digest = digest.clone();
         dst.with_transfer_barrier(&digest, move |exclusive| async move {
-            copy_snapshot(&src, &exclusive, Some(&output), &receipt_digest)
+            copy_snapshot(&src, &exclusive, Some(&output), &receipt_digest, &[])
                 .await
                 .map_err(|error| {
                     elephant_storage::StorageError::DataIntegrityError(error.to_string())
@@ -1678,13 +2491,7 @@ mod tests {
         assert_eq!(report["state"], "reconciled");
         assert_eq!(report["tables"]["entity"], 1);
         assert_eq!(report["destination"]["entity"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            report["destination"]["canonical_epoch"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_generated_transfer_epochs(&dst, &report).await;
         assert_eq!(
             report["destination"]["source_erasure_guard"]
                 .as_array()
@@ -1775,8 +2582,8 @@ mod tests {
             br#"{"format":"recall-live-v1","data":"{}","sha256":"fixture"}"#,
         )
         .unwrap();
-        assert!(validate_transfer_input(&path).is_err());
-        assert!(validate_transfer_input(dir.path()).is_err());
+        assert!(validate_transfer_input(&path, None).is_err());
+        assert!(validate_transfer_input(dir.path(), None).is_err());
     }
     #[tokio::test]
     #[expect(
@@ -1902,6 +2709,7 @@ mod tests {
                     &exclusive,
                     Some(&output),
                     &"d".repeat(64),
+                    &[legacy_receipt()],
                 )
                 .await
                 .map_err(|error| {

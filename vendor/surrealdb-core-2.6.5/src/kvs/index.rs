@@ -17,6 +17,8 @@ use crate::sql::statements::DefineIndexStatement;
 use crate::sql::{Id, Object, Thing, Value};
 use ahash::{HashMap, HashMapExt};
 use futures::channel::oneshot::{channel, Receiver, Sender};
+#[cfg(not(target_family = "wasm"))]
+use futures::FutureExt;
 use reblessive::TreeStack;
 use revision::revisioned;
 use roaring::RoaringBitmap;
@@ -25,10 +27,10 @@ use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(not(target_family = "wasm"))]
-use tokio::spawn;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::sleep;
+#[cfg(not(target_family = "wasm"))]
+use tokio_util::task::TaskTracker;
 use tracing::warn;
 #[cfg(target_family = "wasm")]
 use wasm_bindgen_futures::spawn_local as spawn;
@@ -215,12 +217,26 @@ impl IndexBuilder {
 		for building in &retired {
 			building.abort();
 		}
+		#[cfg(not(target_family = "wasm"))]
+		let mut owner_failed = false;
 		for building in old.values().chain(retired.iter()) {
 			building.wait_for_completion().await;
+			// Completion flags describe index state; joining the owner also
+			// drops its last transaction factory/context before native close.
+			#[cfg(not(target_family = "wasm"))]
+			{
+				building.owners.close();
+				building.owners.wait().await;
+				owner_failed |= building.owner_failed.load(Ordering::Acquire);
+			}
 		}
 		// Drop old contexts/query executors before the exclusive transaction drain.
 		drop(old);
 		drop(retired);
+		#[cfg(not(target_family = "wasm"))]
+		if owner_failed {
+			return Err(Error::Ds("index owner panicked during drain".into()));
+		}
 		Ok(unfinished)
 	}
 
@@ -349,7 +365,7 @@ impl IndexBuilder {
 		let b = building.clone();
 		// Own completion even if the task is dropped before its first poll.
 		let initial_guard = InitialBuildGuard(b.clone());
-		spawn(async move {
+		Self::spawn_owner(&building, async move {
 			let r = b.run().await;
 			if let Err(err) = &r {
 				b.set_status(BuildingStatus::Error(err.to_string())).await;
@@ -400,7 +416,8 @@ impl IndexBuilder {
 			.deferred_daemon_running
 			.store(true, Ordering::Release);
 		let daemon_guard = DeferredDaemonGuard(building.clone());
-		spawn(async move {
+		let owner = building.clone();
+		Self::spawn_owner(&owner, async move {
 			loop {
 				if building.is_aborted().await {
 					building.set_status(BuildingStatus::Aborted).await;
@@ -417,6 +434,33 @@ impl IndexBuilder {
 			}
 			drop(daemon_guard);
 		});
+	}
+
+	#[cfg(not(target_family = "wasm"))]
+	fn spawn_owner(
+		building: &IndexBuilding,
+		future: impl std::future::Future<Output = ()> + Send + 'static,
+	) {
+		let owner = building.clone();
+		building.owners.spawn(async move {
+			if std::panic::AssertUnwindSafe(future)
+				.catch_unwind()
+				.await
+				.is_err()
+			{
+				owner.owner_failed.store(true, Ordering::Release);
+				owner
+					.set_status(BuildingStatus::Error("index owner panicked".into()))
+					.await;
+			}
+		});
+	}
+	#[cfg(target_family = "wasm")]
+	fn spawn_owner(
+		_building: &IndexBuilding,
+		future: impl std::future::Future<Output = ()> + 'static,
+	) {
+		spawn(future);
 	}
 
 	/// Build an index
@@ -667,6 +711,10 @@ struct Building {
 	deferred_daemon_running: AtomicBool,
 	/// Notifier for signaling completion (initial build or daemon shutdown)
 	completion_notify: Notify,
+	#[cfg(not(target_family = "wasm"))]
+	owners: TaskTracker,
+	#[cfg(not(target_family = "wasm"))]
+	owner_failed: AtomicBool,
 }
 
 impl Building {
@@ -692,6 +740,10 @@ impl Building {
 			initial_build_complete: AtomicBool::new(false),
 			deferred_daemon_running: AtomicBool::new(false),
 			completion_notify: Notify::new(),
+			#[cfg(not(target_family = "wasm"))]
+			owners: TaskTracker::new(),
+			#[cfg(not(target_family = "wasm"))]
+			owner_failed: AtomicBool::new(false),
 		})
 	}
 

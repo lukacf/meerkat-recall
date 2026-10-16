@@ -29,10 +29,17 @@ use crate::{
 /// Adapter-provided authorization against the current principal and read scope.
 pub type ReadAuthorization<'a> = dyn Fn(&BaseFields) -> bool + Send + Sync + 'a;
 
+#[path = "read_action_disposition.rs"]
+mod action_disposition;
 #[path = "read_definition.rs"]
 mod definition;
+#[path = "read_historical_transition.rs"]
+mod historical_transition;
+#[path = "read_snapshot_graph.rs"]
+mod snapshot_graph;
 
 type SourceKey = (String, String);
+type ObservedSnapshotEpochs = Arc<Mutex<BTreeMap<String, Option<String>>>>;
 type ObservedHeads = Arc<Mutex<BTreeMap<SourceKey, Option<SourceHead>>>>;
 type ObservedSources = Arc<Mutex<BTreeMap<SourceKey, BaseFields>>>;
 type ObservedDefinitions =
@@ -41,6 +48,7 @@ type ObservedDefinitions =
 /// Read-only access to canonical publication and immutable lineage.
 pub struct ReadEligibility {
     storage: StorageClient,
+    observed_snapshot_epochs: ObservedSnapshotEpochs,
     observed_heads: ObservedHeads,
     observed_sources: ObservedSources,
     observed_definitions: ObservedDefinitions,
@@ -64,6 +72,7 @@ pub async fn with_read_fence<F: std::future::Future>(
             let output = future.await;
             let reader = REQUEST_READER.with(|reader| ReadEligibility {
                 storage: reader.storage.clone(),
+                observed_snapshot_epochs: reader.observed_snapshot_epochs.clone(),
                 observed_heads: reader.observed_heads.clone(),
                 observed_sources: reader.observed_sources.clone(),
                 observed_definitions: reader.observed_definitions.clone(),
@@ -95,6 +104,16 @@ pub trait CurrentRead: Clone + Serialize + Send + Sync {
     /// Root envelope for authorization and source support.
     fn read_base(&self) -> &BaseFields;
 
+    /// Optional action-state response projection. Adapters supply per-table
+    /// evidence scopes separately from the ordinary root-read authorization.
+    async fn project_action_state(
+        &mut self,
+        _reader: &ReadEligibility,
+        _authorize: &ReadAuthorization<'_>,
+    ) -> StorageResult<()> {
+        Ok(())
+    }
+
     /// Check current support and remove references that no longer contribute.
     async fn retain_current(
         &mut self,
@@ -109,6 +128,9 @@ impl ReadEligibility {
     pub fn new(storage: StorageClient) -> Self {
         Self {
             storage,
+            observed_snapshot_epochs: REQUEST_READER
+                .try_with(|reader| reader.observed_snapshot_epochs.clone())
+                .unwrap_or_default(),
             observed_heads: REQUEST_READER
                 .try_with(|reader| reader.observed_heads.clone())
                 .unwrap_or_default(),
@@ -144,6 +166,30 @@ impl ReadEligibility {
         }
         drop(observed);
         Ok(current)
+    }
+
+    // Snapshot certificates also depend on independent rows which have no
+    // source head. Capture before any dependency read and share across all
+    // adapters in the response; the final fence rejects any intervening edit.
+    async fn observe_snapshot_epoch(&self, space: &str) -> StorageResult<()> {
+        let current = crate::canonical_commit::CanonicalRepository::new(self.storage.clone())
+            .observe_epoch(space)
+            .await?;
+        let mut observed = self
+            .observed_snapshot_epochs
+            .lock()
+            .map_err(|_| crate::StorageError::Conflict("Read snapshot fence unavailable".into()))?;
+        if let Some(previous) = observed.get(space) {
+            if previous != &current {
+                return Err(crate::StorageError::Conflict(
+                    "Snapshot dependency changed during read; retry".into(),
+                ));
+            }
+        } else {
+            observed.insert(space.to_owned(), current);
+        }
+        drop(observed);
+        Ok(())
     }
 
     /// Recheck observed publications immediately before returning assembled content.
@@ -204,37 +250,92 @@ impl ReadEligibility {
                 ));
             }
         }
+        let epochs = self
+            .observed_snapshot_epochs
+            .lock()
+            .map_err(|_| crate::StorageError::Conflict("Read snapshot fence unavailable".into()))?
+            .clone();
+        for (space, previous) in epochs {
+            if canonical.observe_epoch(&space).await? != previous {
+                return Err(crate::StorageError::Conflict(
+                    "Snapshot dependency changed during read; retry".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
     /// Project and authorize one record. A denied record discloses no content.
-    pub async fn project<T: CurrentRead>(
-        &self,
+    ///
+    /// Keep composed read futures on the heap: TruthSlot -> Event -> Assertion
+    /// traversals otherwise retain several large debug construction frames at
+    /// once. The non-inlined constructor returns before dependency polling;
+    /// source, authorization and snapshot guards run in their original order.
+    #[inline(never)]
+    pub fn project<'a, T: CurrentRead + 'a>(
+        &'a self,
         mut record: T,
-        authorize: &ReadAuthorization<'_>,
-    ) -> StorageResult<Option<T>> {
-        if record.read_base().deleted_at.is_some() || !authorize(record.read_base()) {
-            return Ok(None);
-        }
-        // Verify the exact stored domain row before projection removes evidence
-        // or rewrites text. A source head and a record ID alone cannot certify
-        // a row that was changed outside the canonical transaction.
-        if record.read_base().id.table() != TableName::Source
-            && !self
-                .matches_content_support(record.read_base(), &record)
-                .await?
-        {
-            return Ok(None);
-        }
-        if crate::canonical_commit::is_derived_graph_table(record.read_base().id.table())
-            && record.read_base().id.table() != TableName::KnowledgeViewDefinition
-            && !self.base_support(record.read_base(), authorize).await?
-        {
-            return Ok(None);
-        }
-        let retained = record.retain_current(self, authorize).await?;
-        self.verify_current().await?;
-        Ok(retained.then_some(record))
+        authorize: &'a ReadAuthorization<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = StorageResult<Option<T>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if record.read_base().deleted_at.is_some() || !authorize(record.read_base()) {
+                return Ok(None);
+            }
+            // Verify the exact stored domain row before projection removes evidence
+            // or rewrites text. A source head and a record ID alone cannot certify
+            // a row that was changed outside the canonical transaction.
+            if record.read_base().id.table() != TableName::Source
+                && !self
+                    .matches_content_support(record.read_base(), &record)
+                    .await?
+            {
+                return Ok(None);
+            }
+            if crate::canonical_commit::is_derived_graph_table(record.read_base().id.table())
+                && record.read_base().id.table() != TableName::KnowledgeViewDefinition
+                && !self.base_support(record.read_base(), authorize).await?
+            {
+                return Ok(None);
+            }
+            if crate::canonical_commit::is_derived_graph_table(record.read_base().id.table()) {
+                for support in self
+                    .current_support(&record.read_base().space_id, &record.read_base().id)
+                    .await?
+                {
+                    if let Some(history) = &support.historical_unknown {
+                        let receipt =
+                            crate::canonical_commit::CanonicalRepository::new(self.storage.clone())
+                                .receipt_read_only(&support.space_id, &history.commit_id)
+                                .await?;
+                        if let Some(publication) = receipt
+                            .as_ref()
+                            .and_then(|receipt| receipt.publication_authority.as_ref())
+                        {
+                            if let Some(manifest) =
+                                SourcePublicationManifestRepository::new(self.storage.clone())
+                                    .get(&support.space_id, publication)
+                                    .await?
+                            {
+                                if manifest
+                                    .historical_adoption
+                                    .as_ref()
+                                    .is_some_and(|proof| proof.snapshot_graph.is_some())
+                                    && !self
+                                        .snapshot_graph_evidence(record.read_base(), authorize)
+                                        .await?
+                                {
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let retained = record.retain_current(self, authorize).await?;
+            self.verify_current().await?;
+            Ok(retained.then_some(record))
+        })
     }
 
     /// Filter a candidate page, preserving ranking among eligible records.
@@ -258,9 +359,7 @@ impl ReadEligibility {
         base: &BaseFields,
         record: &T,
     ) -> StorageResult<bool> {
-        let support = SourcePublicationRepository::new(self.storage.clone())
-            .support_for_record(&base.space_id, &base.id)
-            .await?;
+        let support = self.current_support(&base.space_id, &base.id).await?;
         support_matches_record(base, record, &support)
     }
 
@@ -496,68 +595,119 @@ impl ReadEligibility {
     /// Source-derived records require an eligible ledger entry or verified
     /// pre-preview lineage; missing publication is never silently treated as
     /// independent authority.
-    pub async fn base_support(
-        &self,
-        base: &BaseFields,
-        authorize: &ReadAuthorization<'_>,
-    ) -> StorageResult<bool> {
-        if base.deleted_at.is_some() || !authorize(base) {
-            return Ok(false);
-        }
-        let support = SourcePublicationRepository::new(self.storage.clone())
-            .support_for_record(&base.space_id, &base.id)
-            .await?;
-        // Aggregate semantic fields cannot be reconstructed from record-level
-        // support alone. Until authoritative reconciliation removes a retired
-        // provenance edge, preserve no possibly enriched historical payload.
-        for id in &base.provenance.sources {
-            if id.table() != TableName::Source {
+    #[inline(never)]
+    pub fn base_support<'a>(
+        &'a self,
+        base: &'a BaseFields,
+        authorize: &'a ReadAuthorization<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = StorageResult<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            if base.deleted_at.is_some() || !authorize(base) {
                 return Ok(false);
             }
-            let Some(source) = SourceRepository::new(self.storage.clone())
-                .get(&base.space_id, id)
-                .await?
-            else {
-                return Ok(false);
-            };
-            if !self.source(&source, authorize).await? {
-                return Ok(false);
-            }
-            if let Some(head) = self.head(&base.space_id, id).await? {
-                if !support.iter().any(|entry| {
-                    entry.source_id == *id
-                        && Some(entry.source_revision.as_str())
-                            == head.published_revision.as_deref()
-                }) {
+            let support = self.current_support(&base.space_id, &base.id).await?;
+            // Structural filtering must not erase authorization dependencies on
+            // intermediate retired sources which contributed original graph bytes.
+            let originals = SourcePublicationRepository::new(self.storage.clone())
+                .support_for_record(&base.space_id, &base.id)
+                .await?;
+            for original in &originals {
+                if original.historical_unknown.is_some()
+                    && self
+                        .head(&base.space_id, &original.source_id)
+                        .await?
+                        .is_some_and(|head| head.lifecycle == SourceVisibility::Retracted)
+                    && !self
+                        .historical_regrouped_support(original, &originals, Some(authorize))
+                        .await?
+                {
                     return Ok(false);
                 }
             }
-        }
-        if !support.is_empty() {
-            for entry in support {
+            // Aggregate semantic fields cannot be reconstructed from record-level
+            // support alone. Until authoritative reconciliation removes a retired
+            // provenance edge, preserve no possibly enriched historical payload.
+            for id in &base.provenance.sources {
+                if id.table() != TableName::Source {
+                    return Ok(false);
+                }
                 let Some(source) = SourceRepository::new(self.storage.clone())
-                    .get(&base.space_id, &entry.source_id)
+                    .get(&base.space_id, id)
                     .await?
                 else {
                     return Ok(false);
                 };
                 if !self.source(&source, authorize).await? {
-                    return Ok(false);
+                    if source.base.deleted_at.is_some() || !authorize(&source.base) {
+                        return Ok(false);
+                    }
+                    let original = SourcePublicationRepository::new(self.storage.clone())
+                        .support_for_record(&base.space_id, &base.id)
+                        .await?;
+                    let mut replaced = false;
+                    for entry in original.iter().filter(|entry| entry.source_id == *id) {
+                        if self
+                            .historical_regrouped_support(entry, &original, Some(authorize))
+                            .await?
+                        {
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if !replaced {
+                        return Ok(false);
+                    }
+                    continue;
                 }
-                let Some(head) = self.head(&base.space_id, &entry.source_id).await? else {
-                    return Ok(false);
-                };
-                if head.published_revision.as_deref() != Some(entry.source_revision.as_str()) {
-                    return Ok(false);
+                if let Some(head) = self.head(&base.space_id, id).await? {
+                    if !support.iter().any(|entry| {
+                        entry.source_id == *id
+                            && Some(entry.source_revision.as_str())
+                                == head.published_revision.as_deref()
+                    }) {
+                        return Ok(false);
+                    }
                 }
             }
-            return Ok(true);
-        }
-        if base.provenance.sources.is_empty() {
-            return Ok(base.provenance.extractor.is_none()
-                && base.provenance.work_run_id.is_none()
-                && base.provenance.chain.is_empty());
-        }
+            if !support.is_empty() {
+                for entry in support {
+                    if entry.historical_unknown.is_some()
+                        && !self.historical_support_is_current(&entry).await?
+                    {
+                        return Ok(false);
+                    }
+                    let Some(source) = SourceRepository::new(self.storage.clone())
+                        .get(&base.space_id, &entry.source_id)
+                        .await?
+                    else {
+                        return Ok(false);
+                    };
+                    if !self.source(&source, authorize).await? {
+                        return Ok(false);
+                    }
+                    let Some(head) = self.head(&base.space_id, &entry.source_id).await? else {
+                        return Ok(false);
+                    };
+                    if head.published_revision.as_deref() != Some(entry.source_revision.as_str()) {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+            if base.provenance.sources.is_empty() {
+                return Ok(base.provenance.extractor.is_none()
+                    && base.provenance.work_run_id.is_none()
+                    && base.provenance.chain.is_empty());
+            }
+            self.legacy_source_support(base, authorize).await
+        })
+    }
+
+    async fn legacy_source_support(
+        &self,
+        base: &BaseFields,
+        authorize: &ReadAuthorization<'_>,
+    ) -> StorageResult<bool> {
         // Prior source-first rows have no manifest/ledger. Require live
         // same-space sources, and refuse a preview source whose exact support
         // generation was not recorded.
@@ -580,10 +730,185 @@ impl ReadEligibility {
         Ok(false)
     }
 
+    /// Retained historical evidence may be superseded only by an actual current
+    /// historical certificate for this same source and physical graph record.
+    /// Ordinary stale supports and missing/corrupt history still refuse reads.
+    #[inline(never)]
+    fn current_support<'a>(
+        &'a self,
+        space: &'a str,
+        record: &'a elephant_types::RecordId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = StorageResult<Vec<SourceEffectSupport>>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let all = SourcePublicationRepository::new(self.storage.clone())
+                .support_for_record(space, record)
+                .await?;
+            let mut current = Vec::new();
+            for entry in &all {
+                let head = self.head(space, &entry.source_id).await?;
+                let retired = entry.historical_unknown.is_some()
+                    && head.as_ref().is_some_and(|head| {
+                        head.published_revision
+                            .as_deref()
+                            .is_some_and(|revision| revision != entry.source_revision)
+                    });
+                if !retired {
+                    if self.historical_regrouped_support(entry, &all, None).await? {
+                        continue;
+                    }
+                    current.push(entry.clone());
+                    continue;
+                }
+                let replacement = all.iter().find(|candidate| {
+                    candidate.source_id == entry.source_id
+                        && candidate.record_id == entry.record_id
+                        && candidate.historical_unknown.is_some()
+                        && head
+                            .as_ref()
+                            .and_then(|head| head.published_revision.as_deref())
+                            == Some(candidate.source_revision.as_str())
+                });
+                let Some(replacement) = replacement else {
+                    return Err(crate::StorageError::DataIntegrityError(
+                        "retired support lacks current historical replacement".into(),
+                    ));
+                };
+                if !self.historical_support_is_current(replacement).await?
+                    || !self.historical_support_receipt_is_retained(entry).await?
+                {
+                    return Err(crate::StorageError::DataIntegrityError(
+                        "historical replacement support authority differs".into(),
+                    ));
+                }
+            }
+            if !all.is_empty() && current.is_empty() {
+                return Err(crate::StorageError::DataIntegrityError(
+                    "historical support population has no current authority".into(),
+                ));
+            }
+            Ok(current)
+        })
+    }
+
+    async fn historical_support_receipt_is_retained(
+        &self,
+        support: &SourceEffectSupport,
+    ) -> StorageResult<bool> {
+        let Some(history) = &support.historical_unknown else {
+            return Ok(false);
+        };
+        if support.independent
+            || support.last_commit_id.as_deref() != Some(history.commit_id.as_str())
+        {
+            return Ok(false);
+        }
+        let Some(receipt) = SourcePublicationRepository::new(self.storage.clone())
+            .read_control::<crate::canonical_commit::CanonicalCommitReceipt>(
+                "source_commit_receipt",
+                &crate::source_publication::stable_key(&[&support.space_id, &history.commit_id]),
+                &support.space_id,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        let Some(publication) = &receipt.publication_authority else {
+            return Ok(false);
+        };
+        let publication_revision_matches = publication.revision_id == support.source_revision;
+        if receipt.space_id != support.space_id
+            || receipt.commit_id != history.commit_id
+            || publication.source_id != support.source_id
+            || !publication_revision_matches
+        {
+            return Ok(false);
+        }
+        let Some(manifest) = SourcePublicationManifestRepository::new(self.storage.clone())
+            .get(&support.space_id, publication)
+            .await?
+        else {
+            return Ok(false);
+        };
+        manifest.validate()?;
+        let Some(proof) = &manifest.historical_adoption else {
+            return Ok(false);
+        };
+        Ok(proof.commit_id(&manifest) == history.commit_id
+            && proof.snapshot_sha256 == history.snapshot_sha256
+            && proof.plan_id == history.plan_id
+            && proof.graph_fingerprints.get(&support.record_id)
+                == Some(&support.record_fingerprint)
+            && receipt.historical_import.as_ref()
+                == Some(
+                    &crate::historical_adoption::HistoricalCommitProvenance::for_manifest(
+                        &manifest,
+                    )?,
+                ))
+    }
+
+    async fn historical_support_is_current(
+        &self,
+        support: &SourceEffectSupport,
+    ) -> StorageResult<bool> {
+        let Some(history) = &support.historical_unknown else {
+            return Ok(true);
+        };
+        if support.independent
+            || support.last_commit_id.as_deref() != Some(history.commit_id.as_str())
+        {
+            return Ok(false);
+        }
+        let Some(head) = self.head(&support.space_id, &support.source_id).await? else {
+            return Ok(false);
+        };
+        if head.published_revision.as_deref() != Some(support.source_revision.as_str()) {
+            return Ok(false);
+        }
+        let publication = elephant_types::publication::PublicationFence {
+            source_id: support.source_id.clone(),
+            generation: head.generation,
+            revision_id: support.source_revision.clone(),
+            operation_id: head.operation_id,
+        };
+        let Some(manifest) = SourcePublicationManifestRepository::new(self.storage.clone())
+            .get(&support.space_id, &publication)
+            .await?
+        else {
+            return Ok(false);
+        };
+        manifest.validate()?;
+        let Some(proof) = &manifest.historical_adoption else {
+            return Ok(false);
+        };
+        if proof.snapshot_sha256 != history.snapshot_sha256
+            || proof.plan_id != history.plan_id
+            || proof.commit_id(&manifest) != history.commit_id
+            || proof.graph_fingerprints.get(&support.record_id) != Some(&support.record_fingerprint)
+        {
+            return Ok(false);
+        }
+        let Some(receipt) = crate::canonical_commit::CanonicalRepository::new(self.storage.clone())
+            .receipt_read_only(&support.space_id, &history.commit_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        Ok(receipt.publication_authority.as_ref() == Some(&publication)
+            && receipt.historical_import.as_ref()
+                == Some(
+                    &crate::historical_adoption::HistoricalCommitProvenance::for_manifest(
+                        &manifest,
+                    )?,
+                ))
+    }
+
     async fn retain_evidence(
         &self,
         space: &str,
         evidence: &mut Vec<elephant_types::records::rel::EvidenceRef>,
+        snapshot_certified: bool,
         authorize: &ReadAuthorization<'_>,
     ) -> StorageResult<()> {
         let mut current = Vec::new();
@@ -599,7 +924,12 @@ impl ReadEligibility {
             {
                 continue;
             }
-            if self.evidence(space, &link.span, authorize).await?.is_some() {
+            if (snapshot_certified && link.span.start == 0 && link.span.end == 0)
+                || self.evidence(space, &link.span, authorize).await?.is_some()
+            {
+                // A snapshot-certified root may retain an ungrounded reference
+                // only after its exact linked assertion passed authorization.
+                // The public evidence endpoint still returns no empty quote.
                 current.push(link);
             }
         }
@@ -641,22 +971,7 @@ pub async fn evidence_within_accepted_window(
     node: &DocNode,
     span: &EvidenceSpan,
 ) -> StorageResult<bool> {
-    if revision.base.space_id != space
-        || node.base.space_id != space
-        || node.revision.id() != &revision.base.id
-        || span.revision.id() != &revision.base.id
-        || span.node.as_ref().map(elephant_types::Link::id) != Some(&node.base.id)
-        || span.start >= span.end
-        || node.span.start >= node.span.end
-        || revision
-            .text
-            .get(span.start as usize..span.end as usize)
-            .is_none()
-        || revision
-            .text
-            .get(node.span.start as usize..node.span.end as usize)
-            .is_none()
-    {
+    if !evidence_has_exact_physical_span(space, revision, node, span) {
         return Ok(false);
     }
     let within_node = node.span.start <= span.start && span.end <= node.span.end;
@@ -704,6 +1019,30 @@ pub async fn evidence_within_accepted_window(
     {
         return Ok(false);
     }
+    if let Some(proof) = &manifest.historical_adoption {
+        manifest.validate()?;
+        let Some(receipt) = SourcePublicationRepository::new(storage.clone())
+            .read_control::<crate::canonical_commit::CanonicalCommitReceipt>(
+                "source_commit_receipt",
+                &crate::source_publication::stable_key(&[space, &completion.commit_id]),
+                space,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        return Ok(completion.commit_id == proof.commit_id(&manifest)
+            && receipt.commit_id == completion.commit_id
+            && receipt.publication_authority.as_ref() == Some(&mapping.publication)
+            && receipt.historical_import.as_ref()
+                == Some(
+                    &crate::historical_adoption::HistoricalCommitProvenance::for_manifest(
+                        &manifest,
+                    )?,
+                )
+            && within_node
+            && proof.node_matches(&mapping, node)?);
+    }
     drop(repository);
     let selected = manifest
         .bundles
@@ -722,6 +1061,29 @@ pub async fn evidence_within_accepted_window(
                 .get(bundle.span_start as usize..bundle.span_end as usize)
                 .is_some()
     }))
+}
+
+fn evidence_has_exact_physical_span(
+    space: &str,
+    revision: &DocRevision,
+    node: &DocNode,
+    span: &EvidenceSpan,
+) -> bool {
+    !(revision.base.space_id != space
+        || node.base.space_id != space
+        || node.revision.id() != &revision.base.id
+        || span.revision.id() != &revision.base.id
+        || span.node.as_ref().map(elephant_types::Link::id) != Some(&node.base.id)
+        || span.start >= span.end
+        || node.span.start >= node.span.end
+        || revision
+            .text
+            .get(span.start as usize..span.end as usize)
+            .is_none()
+        || revision
+            .text
+            .get(node.span.start as usize..node.span.end as usize)
+            .is_none())
 }
 
 fn accepted_bundle_contains(
@@ -880,19 +1242,73 @@ impl CurrentRead for Assertion {
             return Ok(self.evidence.start == 0
                 && self.evidence.end == 0
                 && self.base.provenance.sources.is_empty()
-                && self.base.provenance.extractor.is_none()
-                && self.base.provenance.work_run_id.is_none()
-                && self.base.provenance.chain.is_empty());
+                && ((self.base.provenance.extractor.is_none()
+                    && self.base.provenance.work_run_id.is_none()
+                    && self.base.provenance.chain.is_empty())
+                    || reader
+                        .snapshot_graph_evidence(&self.base, authorize)
+                        .await?));
         };
         if let Some(source) = &evidence.source {
             let sources: std::collections::BTreeSet<_> =
                 self.base.provenance.sources.iter().collect();
             if sources != std::collections::BTreeSet::from([&source.base.id]) {
-                return Ok(false);
+                // A snapshot root may cite an independently adopted document.
+                // The original assertion stays source-less: its own import
+                // authority and exact current document evidence are conjunctive.
+                if sources.is_empty()
+                    && reader
+                        .snapshot_graph_evidence(&self.base, authorize)
+                        .await?
+                {
+                    return Ok(true);
+                }
+                // Imported source-less evidence retains its original provenance.
+                // Exact membership comes from the actual historical commit,
+                // never from a fabricated source edge on the assertion itself.
+                let support = reader
+                    .current_support(&self.base.space_id, &self.base.id)
+                    .await?;
+                let mut certified = false;
+                for entry in support.iter().filter(|entry| {
+                    entry.source_id == source.base.id && entry.historical_unknown.is_some()
+                }) {
+                    if !reader.historical_support_is_current(entry).await? {
+                        continue;
+                    }
+                    let Some(head) = reader.head(&entry.space_id, &entry.source_id).await? else {
+                        continue;
+                    };
+                    let publication = elephant_types::publication::PublicationFence {
+                        source_id: entry.source_id.clone(),
+                        generation: head.generation,
+                        revision_id: entry.source_revision.clone(),
+                        operation_id: head.operation_id,
+                    };
+                    let Some(manifest) =
+                        SourcePublicationManifestRepository::new(reader.storage.clone())
+                            .get(&entry.space_id, &publication)
+                            .await?
+                    else {
+                        continue;
+                    };
+                    let Some(proof) = manifest.historical_adoption.as_ref() else {
+                        continue;
+                    };
+                    // Original source rows are retained intact. The grouped
+                    // identity is a declared association, not a rewrite of
+                    // assertion provenance or a union of security envelopes.
+                    certified |= sources
+                        .iter()
+                        .all(|id| proof.original_sources.contains_key(*id));
+                }
+                if !certified {
+                    return Ok(false);
+                }
             }
             if let Some(head) = reader.head(&self.base.space_id, &source.base.id).await? {
-                let support = SourcePublicationRepository::new(reader.storage.clone())
-                    .support_for_record(&self.base.space_id, &self.base.id)
+                let support = reader
+                    .current_support(&self.base.space_id, &self.base.id)
                     .await?;
                 if !support.iter().any(|entry| {
                     entry.source_id == source.base.id
@@ -915,7 +1331,9 @@ macro_rules! claim_record {
             fn read_base(&self) -> &BaseFields { &self.base }
             async fn retain_current(&mut self, reader: &ReadEligibility, authorize: &ReadAuthorization<'_>) -> StorageResult<bool> {
                 let original_len = self.evidence.len();
-                reader.retain_evidence(&self.base.space_id, &mut self.evidence, authorize).await?;
+                let snapshot_certified = self.evidence.iter().any(|link| link.span.start == 0 && link.span.end == 0)
+                    && reader.snapshot_graph_evidence(&self.base, authorize).await?;
+                reader.retain_evidence(&self.base.space_id, &mut self.evidence, snapshot_certified, authorize).await?;
                 if self.evidence.len() != original_len { return Ok(false); }
                 if !self.evidence.is_empty() { return Ok(true); }
                 reader.base_support(&self.base, authorize).await
@@ -927,6 +1345,13 @@ claim_record!(Rel, Attribute);
 
 #[async_trait]
 impl CurrentRead for Event {
+    async fn project_action_state(
+        &mut self,
+        reader: &ReadEligibility,
+        authorize: &ReadAuthorization<'_>,
+    ) -> StorageResult<()> {
+        reader.project_action_dispositions(self, authorize).await
+    }
     fn read_base(&self) -> &BaseFields {
         &self.base
     }
@@ -935,6 +1360,11 @@ impl CurrentRead for Event {
         reader: &ReadEligibility,
         authorize: &ReadAuthorization<'_>,
     ) -> StorageResult<bool> {
+        // A user-provided metadata field cannot impersonate the verified
+        // adapter projection, including callers that do not request it.
+        if let Some(metadata) = self.metadata.as_object_mut() {
+            metadata.remove("recall_action_dispositions");
+        }
         let assertion_count = self.assertion_refs.len();
         let source_count = self.source_refs.len();
         let mut assertions = Vec::new();
@@ -1365,6 +1795,14 @@ impl CurrentRead for elephant_types::records::TruthSlot {
     ) -> StorageResult<bool> {
         use std::str::FromStr;
         let old_len = self.current_values.len();
+        let snapshot_certified = self
+            .current_values
+            .iter()
+            .flat_map(|value| &value.evidence)
+            .any(|link| link.span.start == 0 && link.span.end == 0)
+            && reader
+                .snapshot_graph_evidence(&self.base, authorize)
+                .await?;
         let mut evidence_changed = false;
         let mut current = Vec::new();
         for mut value in self.current_values.drain(..) {
@@ -1391,7 +1829,12 @@ impl CurrentRead for elephant_types::records::TruthSlot {
             if eligible {
                 let before = value.evidence.len();
                 reader
-                    .retain_evidence(&self.base.space_id, &mut value.evidence, authorize)
+                    .retain_evidence(
+                        &self.base.space_id,
+                        &mut value.evidence,
+                        snapshot_certified,
+                        authorize,
+                    )
                     .await?;
                 evidence_changed |= before != value.evidence.len();
                 current.push(value);
@@ -1471,3 +1914,7 @@ impl CurrentRead for elephant_types::records::Freshness {
 #[cfg(test)]
 #[path = "read_eligibility_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "historical_support_read_tests.rs"]
+mod historical_support_tests;

@@ -88,7 +88,8 @@ The extractor receives an `ExtractionContext` containing everything it needs:
 
 The primary extractor, enabled via the `meerkat-extraction` feature flag. It uses [Meerkat](https://github.com/lukacf/meerkat) - a modular LLM agent harness - to orchestrate extraction as a structured conversation with tool access.
 
-- **Model:** configurable via `PIPELINE_AGENTIC_MODEL` (binary default: `gpt-5.6-sol`; Docker Compose selects `claude-opus-4-6`). Supply credentials for the selected provider.
+- **Model:** configurable via `PIPELINE_AGENTIC_MODEL` (binary and Docker Compose default: `gpt-6.1-sol`). Supply credentials and approved per-space profiles for the selected provider; these defaults do not migrate existing profiles. The pinned Meerkat client uses Responses for GPT-6.1 tool calls.
+- **Reasoning:** Governed extraction and support verification clear caller reasoning parameters before dispatch. `EXTRACTION_REASONING_EFFORT` therefore does not select their effective effort, and the current model-profile schema has no reasoning-effort field. [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol) uses its upstream `medium` default in this path; it supports `low`, `medium`, `high`, `xhigh`, and `max`, but not `none` or `minimal`. Selecting an explicit effort for governed extraction or support verification requires a product change.
 - **Structured output:** Meerkat receives a strict assertion schema and a bounded schema-repair retry count. Meerkat Recall parses and validates the result before staging candidates. Invalid output or an incomplete run can still fail the work item; a schema is not a guarantee of factual correctness.
 - **Tool access:** the normal agentic path provides `ReadTextRangeDispatcher` for text-span checks and `ElephantToolBridge` for querying existing entities and predicates. Large text spans use a direct structured extraction path without those tools. An empty result from the agentic path can also trigger one direct structured retry.
 - **Budget enforcement:** the extractor uses the lower token and duration limits from its configuration and extraction context (defaults: 500,000 tokens and 600 seconds). The worker's lifecycle timeout is a separate bound; see [work queue configuration](/operations/deployment#pipeline-work-queue).
@@ -101,6 +102,72 @@ The agentic extractor can resolve ambiguities by querying the knowledge graph du
 Meerkat Recall no longer uses a rule-based semantic fallback in the active runtime. If the real extractor is unavailable, semantic ingest is hidden and extraction work fails loudly with an explicit runtime/work-item error.
 
 Any non-LLM extraction helpers that remain in the codebase are test-only or legacy compatibility scaffolding, not part of the supported product path.
+
+## Summary budgets
+
+The space's approved `summary` operation binding selects an immutable model
+profile. Configure that profile's `summary` policy when appending a new profile:
+
+```json
+{
+  "summary": {
+    "max_output_tokens": 4096,
+    "max_summary_length": 12000,
+    "thinking": "adaptive_low"
+  }
+}
+```
+
+`max_output_tokens` is the provider's total output ceiling, including thinking;
+`max_summary_length` bounds the retained summary text in Unicode characters.
+Accepted ranges are 1-65,536 tokens and 1-262,144 characters. Profiles without a
+summary policy use runtime defaults of 4,096 tokens and 12,000 characters, with
+the model-specific thinking policy described below. The local token estimate
+can reduce the retained character ceiling further. These limits do not
+guarantee that a model will use the full allowance or produce a complete answer.
+
+For `claude-haiku-5-5`, `adaptive_low` sends adaptive thinking with low effort.
+The pinned SDK cannot express Haiku's supported `disabled` thinking mode, so
+this policy does not promise zero thinking or a separate thinking-token cap.
+For tool-free `claude-sonnet-5-5` summaries, `between_tools_low` suppresses
+up-front thinking and sends low effort. These model-specific policies apply
+only to the named model on an Anthropic connection. `provider_default` omits explicit thinking controls. A profile with
+an explicit summary policy may be bound only to the `summary` operation; use
+separate profile IDs for other operations.
+
+Only nonempty text with an SDK-reported end-of-turn completion is accepted as a
+model summary. Empty text, token-limit stops, other known typed incomplete
+completions, and provider errors use a bounded excerpt of the original text. Fallback and output
+truncation are logged and counted, without logging source text. Provider
+approval failures remain errors. The pinned SDK normalizes unknown raw stop
+reasons, including `model_context_window_exceeded`, to end-of-turn; those
+responses can escape incomplete-output detection. Preserving these raw reasons
+is a tracked SDK follow-up. Inspect these counters under
+`WorkRunMetrics.custom.summary_process_totals.totals` on completed work-run
+metrics:
+
+| Counter | Meaning |
+| --- | --- |
+| `empty_output_fallback` | A successful response contained no non-whitespace text |
+| `incomplete_output_fallback` | A successful response had a non-end-of-turn stop reason |
+| `provider_error_fallback` | A provider error or missing terminal outcome triggered local fallback |
+| `local_truncation` | Local length limits reduced retained text |
+
+These are cumulative totals for the current process, not counts attributed to
+one work run. One response can increment multiple counters, such as an empty
+token-limited response followed by truncation of the local excerpt. The read-only Rust function
+`elephant_pipeline::summarizer::summary_metrics_snapshot()` exposes the same
+totals. Successful transport alone does not establish a useful summary.
+
+Append a new profile ID and update the space's `summary` binding through the
+normal authorized processing-configuration replacement. Existing profiles are
+immutable. During a historical migration, preserve the sealed configuration
+through final catch-up; apply new-work model choices afterward. Summary policy
+does not change embeddings or extraction/support-verification reasoning.
+
+The summary trigger remains separate from the output allowance: input at or
+above the configured minimum length (default 1,000 Unicode characters) invokes
+the summarizer. Shorter text still obeys the selected output ceiling.
 
 ## RawAssertion Output
 

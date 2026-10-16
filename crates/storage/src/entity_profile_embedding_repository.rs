@@ -494,6 +494,7 @@ mod tests {
             model_version: "1".into(),
             dimensions: Some(2),
             preprocessing: "text-v1".into(),
+            summary: None,
         };
         let mut target = profile.clone();
         target.id = "v2".into();
@@ -543,6 +544,7 @@ mod tests {
                 ]),
                 active_embedding_profile_id: Some("v1".into()),
                 pending_reindex: None,
+                completed_embedding_reindex: None,
             }),
         }
     }

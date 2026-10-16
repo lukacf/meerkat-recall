@@ -594,16 +594,14 @@ impl Assembly<'_> {
                     "Published source input is unavailable",
                 )
             })?;
-        let input = accepted
-            .source
-            .manual_doc_template()
-            .map_err(|_| {
-                PublicError::new(ErrorCode::Unavailable, "Published source input is invalid")
-            })?
+        let original_text = SourcePublicationManifestRepository::new(self.ctx.storage.clone())
+            .verified_original_document_text(&mapping, &resolved.doc, &resolved.revision, &accepted)
+            .await
+            .map_err(current_read_error)?
             .ok_or_else(|| {
                 PublicError::new(
                     ErrorCode::Unavailable,
-                    "Exact pushed source text is unavailable",
+                    "Exact published source input is unavailable",
                 )
             })?;
         // Source hashes identify the producer's complete deduplication input,
@@ -615,24 +613,14 @@ impl Assembly<'_> {
         let matches_hash = |declared: &str, actual: &str| {
             declared.strip_prefix("sha256:").unwrap_or(declared) == actual
         };
-        if !SourcePublicationManifestRepository::new(self.ctx.storage.clone())
-            .completed_document_revision_is_current(
-                &mapping,
-                &resolved.doc,
-                &resolved.revision,
-                &accepted,
-            )
-            .await
-            .map_err(current_read_error)?
-            || !matches_hash(&resolved.revision.text_hash, &rendered_text_sha256)
-        {
+        if !matches_hash(&resolved.revision.text_hash, &rendered_text_sha256) {
             return Err(PublicError::new(
                 ErrorCode::Unavailable,
                 "Published evidence input proof is invalid",
             ));
         }
         let original_span = elephant_types::rendered_text::original_text_span(
-            &input.text,
+            &original_text,
             &resolved.revision.text,
             &resolved.revision.renderer,
             span.start as usize..span.end as usize,
@@ -643,8 +631,7 @@ impl Assembly<'_> {
                 "Published evidence has no verified original source coordinates",
             )
         })?;
-        let quote = input
-            .text
+        let quote = original_text
             .get(original_span.clone())
             .ok_or_else(|| {
                 PublicError::new(ErrorCode::Unavailable, "Original evidence span is invalid")

@@ -15,7 +15,7 @@ use crate::client::StorageClient;
 use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 
-const TRUTH_SLOT_PROJECTION: &str = r"
+pub(crate) const TRUTH_SLOT_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -52,7 +52,7 @@ const TRUTH_SLOT_PROJECTION: &str = r"
 
 /// Database-only proxy for TruthSlot.
 #[derive(Deserialize)]
-struct TruthSlotDb {
+pub(crate) struct TruthSlotDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

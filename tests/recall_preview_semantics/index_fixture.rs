@@ -412,6 +412,7 @@ async fn publish_with_rendered_input(
         &rendered.base.id,
     );
     let manifest = SourcePublicationManifest {
+        historical_adoption: None,
         space_id: space.into(),
         publication: publication.clone(),
         mode: IngestMode::Retrieval,

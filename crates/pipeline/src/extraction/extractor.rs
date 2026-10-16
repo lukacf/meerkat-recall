@@ -303,6 +303,8 @@ pub struct RawAssertion {
 /// Result of an extraction operation.
 #[derive(Debug, Clone)]
 pub struct ExtractionResult {
+    /// Untrusted exact-action links, never owner permission or factual truth.
+    pub action_disposition_proposals: Vec<super::ActionDispositionProposal>,
     /// Raw assertions extracted from the node.
     pub raw_assertions: Vec<RawAssertion>,
     /// Tokens used during extraction.
@@ -316,16 +318,27 @@ impl ExtractionResult {
     #[must_use]
     pub fn new(raw_assertions: Vec<RawAssertion>, tokens_used: u32, model: String) -> Self {
         Self {
+            action_disposition_proposals: Vec::new(),
             raw_assertions,
             tokens_used,
             model,
         }
     }
 
+    /// Attach untrusted proposals separately from extracted factual assertions.
+    pub fn with_action_disposition_proposals(
+        mut self,
+        proposals: Vec<super::ActionDispositionProposal>,
+    ) -> Self {
+        self.action_disposition_proposals = proposals;
+        self
+    }
+
     /// Creates an empty extraction result.
     #[must_use]
     pub fn empty(model: String) -> Self {
         Self {
+            action_disposition_proposals: Vec::new(),
             raw_assertions: Vec::new(),
             tokens_used: 0,
             model,

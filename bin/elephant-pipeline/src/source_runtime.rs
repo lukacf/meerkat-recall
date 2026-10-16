@@ -812,6 +812,7 @@ pub(super) async fn seal_manifest(
         .into());
     }
     let mut manifest = SourcePublicationManifest {
+        historical_adoption: None,
         space_id: item.base.space_id.clone(),
         publication: publication.clone(),
         mode,
@@ -1074,6 +1075,14 @@ async fn recover_operation(
     }) {
         return Ok(());
     }
+    if elephant_storage::historical_adoption::HistoricalAdoptionRepository::new(storage.clone())
+        .is_historical_publication(&receipt.space_id, &fence)
+        .await?
+    {
+        // Actual historical import remains Processing until embedding-only
+        // coverage is certified. Recovery must never extract its old text.
+        return Ok(());
+    }
     let revision = source_repo
         .revision(&receipt.space_id, &fence.source_id, &fence.revision_id)
         .await?
@@ -1109,6 +1118,17 @@ async fn recover_manifest(
             && head.operation_id == manifest.publication.operation_id
             && head.desired_revision.as_deref() == Some(manifest.publication.revision_id.as_str())
     }) {
+        return Ok(());
+    }
+    if manifest.historical_adoption.is_some() {
+        anyhow::ensure!(
+            elephant_storage::historical_adoption::HistoricalAdoptionRepository::new(
+                storage.clone()
+            )
+            .is_historical_publication(&manifest.space_id, &manifest.publication)
+            .await?,
+            "historical manifest lacks original import authority"
+        );
         return Ok(());
     }
     let revision = source_repo

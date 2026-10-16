@@ -22,6 +22,24 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Install the production native source-support indexes and validation fence.
+/// Embedded fixtures already maintain their support index inside the store.
+///
+/// # Errors
+/// Returns any production schema statement failure.
+pub async fn initialize_source_support(storage: &StorageClient) -> StorageResult<()> {
+    if !storage.is_embedded() {
+        storage
+            .query_checked(concat!(
+                include_str!("../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../migrations/sql/046_source_support_index_fence.surql")
+            ))
+            .await?;
+    }
+    Ok(())
+}
+
 /// Assertion fixtures persist the immutable passage they declare instead of
 /// relying on references to absent revisions or placeholder hashes.
 pub struct FixtureAssertions {
@@ -239,6 +257,7 @@ impl QueryFixture {
                         model_version: "1".into(),
                         dimensions: Some(dims),
                         preprocessing: "text-v1".into(),
+                        summary: None,
                     },
                 )]),
                 bindings: BTreeMap::from([
@@ -263,6 +282,7 @@ impl QueryFixture {
                 ]),
                 active_embedding_profile_id: Some("profile".into()),
                 pending_reindex: None,
+                completed_embedding_reindex: None,
             }),
         };
         SpaceConfigRepository::new(storage.clone())

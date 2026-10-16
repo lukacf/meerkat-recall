@@ -239,6 +239,94 @@ impl SourceStageContext {
     }
 }
 
+/// Read-only verification of an untrusted proposal's actual current producer.
+/// A work artifact is not itself authority to read evidence or close an action.
+///
+/// # Errors
+/// Refuses missing/deleted producer records, changed original plan/configuration,
+/// unfinished or failed extraction, a mismatched deterministic artifact, or an
+/// unpublished/retracted source.
+pub async fn verify_action_proposal_producer(
+    storage: &StorageClient,
+    space: &str,
+    artifact: &WorkArtifact,
+    revision: &RecordId,
+    node: &RecordId,
+    source: &RecordId,
+) -> Result<(), PipelineError> {
+    if artifact.base.space_id != space || artifact.base.deleted_at.is_some() {
+        return Err(invalid("Proposal artifact unavailable"));
+    }
+    let run = WorkRunRepository::new(storage.clone())
+        .get(space, artifact.work_run.id())
+        .await?
+        .ok_or_else(|| invalid("Proposal producer absent"))?;
+    let item = WorkItemRepository::new(storage.clone())
+        .get(space, run.work_item.id())
+        .await?
+        .ok_or_else(|| invalid("Proposal work item absent"))?;
+    if run.base.deleted_at.is_some()
+        || item.base.deleted_at.is_some()
+        || run.base.space_id != space
+        || item.base.space_id != space
+    {
+        return Err(invalid("Proposal producer is deleted or foreign"));
+    }
+    if !run.success
+        || run.completed_at.is_none()
+        || item.status != elephant_types::records::work::WorkItemStatus::Done
+        || item.kind != "extract_assertions"
+    {
+        return Err(invalid(
+            "Proposal producer has not completed extraction successfully",
+        ));
+    }
+    let context = SourceStageContext::load(storage, space, artifact.work_run.id())
+        .await?
+        .ok_or_else(|| invalid("Proposal lacks a versioned producer"))?;
+    context.require_source(source)?;
+    if context.artifact_id(
+        super::extraction_work_kinds::KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE,
+        revision,
+        Some(node),
+        artifact.work_run.id(),
+    )? != artifact.base.id
+        || context
+            .replay(
+                storage,
+                &artifact.base.id,
+                super::extraction_work_kinds::KNOWLEDGE_CANDIDATES_ARTIFACT_TYPE,
+                artifact.work_run.id(),
+            )
+            .await?
+            .as_ref()
+            != Some(artifact)
+    {
+        return Err(invalid("Proposal producer identity differs"));
+    }
+    let head = SourcePublicationRepository::new(storage.clone())
+        .head(space, source)
+        .await?
+        .ok_or_else(|| invalid("Proposal source unavailable"))?;
+    if head.published_revision.as_deref() != Some(context.publication.revision_id.as_str()) {
+        return Err(invalid("Proposal evidence is not published"));
+    }
+    if WorkRunRepository::new(storage.clone())
+        .get(space, artifact.work_run.id())
+        .await?
+        .as_ref()
+        != Some(&run)
+        || WorkItemRepository::new(storage.clone())
+            .get(space, run.work_item.id())
+            .await?
+            .as_ref()
+            != Some(&item)
+    {
+        return Err(invalid("Proposal producer changed during authorization"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]

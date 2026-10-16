@@ -69,7 +69,7 @@ services:
       - ANTHROPIC_API_KEY
       # Agentic extractor config - use 127.0.0.1 for Docker internal networking
       - PIPELINE_AGENTIC_MCP_URL=http://127.0.0.1:3000/mcp/agent
-      - PIPELINE_AGENTIC_MODEL=claude-opus-4-6
+      - PIPELINE_AGENTIC_MODEL=${PIPELINE_AGENTIC_MODEL:-gpt-6.1-sol}
       - PIPELINE_FORCE_DEFAULT_EXTRACTOR=${PIPELINE_FORCE_DEFAULT_EXTRACTOR:-false}
       - PIPELINE_MAINTENANCE_POLL_INTERVAL=30
       - PIPELINE_MAINTENANCE_MCP_URL=http://127.0.0.1:3000/mcp/maintenance

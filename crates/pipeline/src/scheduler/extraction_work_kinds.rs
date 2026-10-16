@@ -1698,6 +1698,15 @@ async fn execute_extract_assertions_inner<E: Extractor + ?Sized>(
     if let Some(context) = &source_stage {
         boxed_extraction_work(|| context.ensure_current(storage)).await?;
     }
+    let action_proposals = boxed_extraction_work(|| {
+        super::action_disposition_proposals::prepare(
+            storage,
+            &lineage,
+            [start, end],
+            &extraction_result.action_disposition_proposals,
+        )
+    })
+    .await?;
     let persistence_started = Instant::now();
     // Persist model/prompt identifiers on the work run for provenance.
     let manifest = extractor.manifest();
@@ -1735,6 +1744,19 @@ async fn execute_extract_assertions_inner<E: Extractor + ?Sized>(
 
     let mut artifact_data = serde_json::to_value(&artifact_data)
         .map_err(|error| PipelineError::ConfigError(error.to_string()))?;
+    if !action_proposals.is_empty() {
+        artifact_data
+            .as_object_mut()
+            .ok_or_else(|| {
+                PipelineError::ValidationError("Extraction payload is not an object".into())
+            })?
+            .insert(
+                "_action_disposition_proposals".into(),
+                serde_json::to_value(action_proposals).map_err(|_| {
+                    PipelineError::ValidationError("Action proposal encoding failed".into())
+                })?,
+            );
+    }
     if let Some(context) = &source_stage {
         context.tag(&mut artifact_data)?;
         artifact_data

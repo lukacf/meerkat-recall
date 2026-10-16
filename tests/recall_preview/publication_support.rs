@@ -72,6 +72,7 @@ impl PublicationFixture {
                 bindings: BTreeMap::new(),
                 active_embedding_profile_id: None,
                 pending_reindex: None,
+                completed_embedding_reindex: None,
             }),
         };
         let configurations = SpaceConfigRepository::new(client.clone());
@@ -173,6 +174,7 @@ impl PublicationFixture {
             artifacts.push((candidate, bundle));
         }
         let manifest = SourcePublicationManifest {
+            historical_adoption: None,
             space_id: space.into(),
             publication: publication.clone(),
             mode: IngestMode::Metadata,

@@ -26,7 +26,7 @@ use crate::require::required_field;
 
 /// Metadata projection: every field except `payload_base64`. The payload is
 /// selected only by `get_with_payload`, which appends it to this projection.
-const MEDIA_ASSET_METADATA_PROJECTION: &str = r"
+pub(crate) const MEDIA_ASSET_METADATA_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -55,7 +55,7 @@ const MEDIA_ASSET_METADATA_PROJECTION: &str = r"
 ";
 
 #[derive(Deserialize)]
-struct MediaAssetDb {
+pub(crate) struct MediaAssetDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

@@ -207,7 +207,7 @@ impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
             mcp_url: "http://127.0.0.1:3000/mcp/maintenance".to_string(),
-            model: "claude-sonnet-4-5".to_string(),
+            model: "claude-sonnet-5-5".to_string(),
             auto_merge_threshold: 0.9,
             max_candidates_per_sweep: 50,
         }

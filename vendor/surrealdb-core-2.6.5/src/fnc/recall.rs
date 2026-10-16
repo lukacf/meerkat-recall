@@ -572,3 +572,74 @@ pub fn original_row_matches(arguments: Vec<Value>) -> Result<Value, Error> {
 #[cfg(test)]
 #[path = "recall_hmac_tests.rs"]
 mod hmac_tests;
+
+/// Pure exact completion-envelope comparison for coverage-only invalidation.
+/// Malformed rows conservatively retain ordinary index invalidation.
+pub fn completion_coverage_only(arguments: Vec<Value>) -> Result<Value, Error> {
+    let [Value::Object(before), Value::Object(after)]: [Value; 2] =
+        arguments.try_into().map_err(|_| Error::InvalidArguments {
+            name: "recall::completion_coverage_only".into(),
+            message: "expected two completion rows".into(),
+        })?
+    else {
+        return Ok(Value::Bool(false));
+    };
+    let (Some(Value::Strand(left)), Some(Value::Strand(right))) =
+        (before.get("payload"), after.get("payload"))
+    else {
+        return Ok(Value::Bool(false));
+    };
+    let same_wrapper = before.len() == after.len()
+        && before.iter().all(|(key, value)| {
+            key == "payload"
+                || after.get(key).is_some_and(|other| {
+                    match (revision::to_vec(value), revision::to_vec(other)) {
+                        (Ok(left), Ok(right)) => left == right,
+                        _ => false,
+                    }
+                })
+        });
+    Ok(Value::Bool(
+        same_wrapper
+            && super::completion_coverage_projection::coverage_only(left.as_str(), right.as_str()),
+    ))
+}
+
+/// Exact completion invalidation, excluding transaction-only fence changes.
+/// Other wrapper changes and unproven payload changes still invalidate.
+pub fn completion_visibility_changed(arguments: Vec<Value>) -> Result<Value, Error> {
+    if arguments.len() != 2 {
+        return Err(Error::InvalidArguments {
+            name: "recall::completion_visibility_changed".into(),
+            message: "expected two completion rows".into(),
+        });
+    }
+    if let [Value::Object(before), Value::Object(after)] = arguments.as_slice() {
+        if completion_fence_only(before, after) { return Ok(Value::Bool(false)); }
+        let exact = revision::to_vec(before).ok().zip(revision::to_vec(after).ok())
+            .is_some_and(|(left, right)| left == right);
+        if exact { return Ok(Value::Bool(false)); }
+    }
+    Ok(Value::Bool(!matches!(completion_coverage_only(arguments)?, Value::Bool(true))))
+}
+
+// Native values retain their exact encoded type and bytes. Only fence_nonce is
+// non-authoritative; no normalization of payload or unknown fields is allowed.
+fn completion_fence_only(before: &Object, after: &Object) -> bool {
+    if !matches!(before.get("payload"), Some(Value::Strand(_)))
+        || !matches!(after.get("payload"), Some(Value::Strand(_)))
+    {
+        return false;
+    }
+    before.keys().filter(|key| key.as_str() != "fence_nonce").count()
+        == after.keys().filter(|key| key.as_str() != "fence_nonce").count()
+        && before.iter().all(|(key, value)| {
+            key == "fence_nonce"
+                || after.get(key).is_some_and(|other| {
+                    match (revision::to_vec(value), revision::to_vec(other)) {
+                        (Ok(left), Ok(right)) => left == right,
+                        _ => false,
+                    }
+                })
+        })
+}

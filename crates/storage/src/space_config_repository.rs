@@ -247,6 +247,8 @@ impl SpaceConfigRepository {
             let next = ordinary.processing.as_mut().ok_or_else(conflict)?;
             next.index_generation = old.index_generation;
             next.pending_reindex.clone_from(&old.pending_reindex);
+            next.completed_embedding_reindex
+                .clone_from(&old.completed_embedding_reindex);
             next.active_embedding_profile_id
                 .clone_from(&old.active_embedding_profile_id);
             old.validate_replacement(next)
@@ -323,6 +325,38 @@ impl SpaceConfigRepository {
         observed: &SpaceConfig,
         target_profile_id: &str,
     ) -> StorageResult<SpaceConfig> {
+        self.start_embedding_reindex_inner(observed, target_profile_id, false)
+            .await
+    }
+
+    /// Explicitly rebuild the current approved profile without assigning legacy
+    /// vectors that identity. The same reindex-purpose and configuration guards
+    /// apply; ordinary profile-change requests retain their existing refusal.
+    pub async fn rebuild_active_embedding_profile(
+        &self,
+        observed: &SpaceConfig,
+        target_profile_id: &str,
+    ) -> StorageResult<SpaceConfig> {
+        if observed
+            .processing
+            .as_ref()
+            .and_then(|p| p.active_embedding_profile_id.as_deref())
+            != Some(target_profile_id)
+        {
+            return Err(StorageError::Conflict(
+                "explicit rebuild must target the current active profile".into(),
+            ));
+        }
+        self.start_embedding_reindex_inner(observed, target_profile_id, true)
+            .await
+    }
+
+    async fn start_embedding_reindex_inner(
+        &self,
+        observed: &SpaceConfig,
+        target_profile_id: &str,
+        rebuild_active: bool,
+    ) -> StorageResult<SpaceConfig> {
         use elephant_types::provider_binding::{EmbeddingReindex, ModelOperation};
         let mut proposed = observed.clone();
         let processing = proposed
@@ -335,7 +369,7 @@ impl SpaceConfigRepository {
             ));
         }
         let from_profile_id = processing.active_embedding_profile_id.clone();
-        if from_profile_id.as_deref() == Some(target_profile_id) {
+        if from_profile_id.as_deref() == Some(target_profile_id) && !rebuild_active {
             return Err(StorageError::Conflict(
                 "target profile is already active".into(),
             ));
@@ -576,9 +610,31 @@ impl SpaceConfigRepository {
                 .profile_id
                 .clone_from(&pending.to_profile_id);
         }
+        let partition = elephant_types::provider_binding::VectorPartition {
+            space_id: observed.base.space_id.clone(),
+            provider: connection.provider.clone(),
+            account_id: connection.account_id.clone(),
+            endpoint: connection.endpoint.clone(),
+            profile_id: profile.id.clone(),
+            model: profile.model.clone(),
+            model_version: profile.model_version.clone(),
+            dimensions: profile
+                .dimensions
+                .ok_or_else(|| StorageError::Conflict("embedding dimensions missing".into()))?,
+            preprocessing: profile.preprocessing.clone(),
+        };
         processing.active_embedding_profile_id = Some(pending.to_profile_id);
         processing.pending_reindex = None;
         advance_config_generation(processing)?;
+        processing.completed_embedding_reindex = Some(
+            elephant_types::provider_binding::CompletedEmbeddingReindex {
+                reindex_id: pending.id,
+                content_generation: pending.content_generation,
+                activated_config_generation: processing.generation,
+                partition,
+                activated_at: Utc::now(),
+            },
+        );
         self.replace_guarded(observed, proposed, true, None).await
     }
 
@@ -889,6 +945,7 @@ fn validate_initial_processing(record: &SpaceConfig) -> StorageResult<()> {
         processing.generation != 1
             || processing.index_generation != 0
             || processing.pending_reindex.is_some()
+            || processing.completed_embedding_reindex.is_some()
     }) {
         return Err(StorageError::Conflict(
             "initial processing authority cannot supply repository-owned progress".into(),
@@ -1221,6 +1278,7 @@ mod tests {
             model_version: "1".into(),
             dimensions: Some(3),
             preprocessing: "text-v1".into(),
+            summary: None,
         };
         let mut target = profile.clone();
         target.id = "v2".into();
@@ -1261,6 +1319,7 @@ mod tests {
             ]),
             active_embedding_profile_id: Some("v1".into()),
             pending_reindex: None,
+            completed_embedding_reindex: None,
         });
         config
     }
@@ -1314,6 +1373,112 @@ mod tests {
                 .replace_authorized(&config, config.clone())
                 .await
                 .is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original native client and repository custody alive through every corruption/refusal/readback assertion and final scenario teardown."
+    )]
+    #[expect(
+        clippy::significant_drop_in_scrutinee,
+        reason = "Construct both backend fixtures before the loop and retain their original teardown order."
+    )]
+    async fn explicit_active_rebuild_keeps_purpose_and_generation_guards() {
+        use elephant_types::provider_binding::ModelOperation;
+        for client in [
+            StorageClient::new_memory().await.unwrap(),
+            StorageClient::new_embedded().await.unwrap(),
+        ] {
+            if client.embedded_store().is_none() {
+                client
+                    .query_checked(include_str!(
+                        "../../migrations/sql/033_space_processing.surql"
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let repository = SpaceConfigRepository::new(client);
+            let mut initial = approved_config("explicit-rebuild");
+            initial
+                .processing
+                .as_mut()
+                .unwrap()
+                .bindings
+                .get_mut(&ModelOperation::ReindexEmbedding)
+                .unwrap()
+                .profile_id = "v1".into();
+            let current = repository.create(initial).await.unwrap();
+            assert!(repository
+                .start_embedding_reindex(&current, "v1")
+                .await
+                .is_err());
+            assert!(repository
+                .rebuild_active_embedding_profile(&current, "v2")
+                .await
+                .is_err());
+            let mut revoked = current.clone();
+            let p = revoked.processing.as_mut().unwrap();
+            p.generation += 1;
+            p.bindings
+                .get_mut(&ModelOperation::ReindexEmbedding)
+                .unwrap()
+                .revoked = true;
+            let revoked = repository
+                .replace_authorized(&current, revoked)
+                .await
+                .unwrap();
+            assert!(repository
+                .rebuild_active_embedding_profile(&revoked, "v1")
+                .await
+                .is_err());
+            assert!(repository
+                .rebuild_active_embedding_profile(&current, "v1")
+                .await
+                .is_err());
+            let mut approved = revoked.clone();
+            let p = approved.processing.as_mut().unwrap();
+            p.generation += 1;
+            p.bindings
+                .get_mut(&ModelOperation::ReindexEmbedding)
+                .unwrap()
+                .revoked = false;
+            let approved = repository
+                .replace_authorized(&revoked, approved)
+                .await
+                .unwrap();
+            let pending = repository
+                .rebuild_active_embedding_profile(&approved, "v1")
+                .await
+                .unwrap();
+            let progress = pending
+                .processing
+                .as_ref()
+                .unwrap()
+                .pending_reindex
+                .as_ref()
+                .unwrap();
+            assert_eq!(progress.from_profile_id.as_deref(), Some("v1"));
+            assert_eq!(progress.to_profile_id, "v1");
+            assert!(!progress.complete);
+            assert!(repository
+                .activate_embedding_reindex(&pending, &progress.id)
+                .await
+                .is_err());
+            assert!(repository
+                .rebuild_active_embedding_profile(&pending, "v1")
+                .await
+                .is_err());
+            assert_eq!(
+                pending
+                    .processing
+                    .as_ref()
+                    .unwrap()
+                    .active_embedding_profile_id
+                    .as_deref(),
+                Some("v1")
+            );
         }
     }
 
@@ -1437,7 +1602,46 @@ mod tests {
             let active = repo.activate_embedding_reindex(&ready, &id).await.unwrap();
             assert_eq!(active.embedding_model, "embed-v2");
             assert_eq!(active.embedding_dims, 4);
-            assert!(active.processing.unwrap().pending_reindex.is_none());
+            let processing = active.processing.as_ref().unwrap();
+            assert!(processing.pending_reindex.is_none());
+            let proof = processing.completed_embedding_reindex.as_ref().unwrap();
+            assert_eq!(proof.reindex_id, id);
+            assert_eq!(proof.content_generation, processing.index_generation);
+            assert_eq!(proof.activated_config_generation, processing.generation);
+            assert_eq!(proof.partition.profile_id, "v2");
+            assert_eq!(proof.partition.space_id, "named-a");
+            assert!(proof.activated_at <= Utc::now());
+            for forged in [false, true] {
+                let mut replacement = active.clone();
+                let p = replacement.processing.as_mut().unwrap();
+                p.generation += 1;
+                if forged {
+                    p.completed_embedding_reindex.as_mut().unwrap().reindex_id = "forged".into();
+                } else {
+                    p.completed_embedding_reindex = None;
+                }
+                assert!(repo.replace_authorized(&active, replacement).await.is_err());
+            }
+            let mut initial_forgery = approved_config("forged-initial");
+            initial_forgery
+                .processing
+                .as_mut()
+                .unwrap()
+                .completed_embedding_reindex = Some(proof.clone());
+            assert!(repo.create(initial_forgery).await.is_err());
+            let mut ordinary = active.clone();
+            ordinary.processing.as_mut().unwrap().generation += 1;
+            ordinary.purpose = Some("updated operator purpose".into());
+            let ordinary = repo.replace_authorized(&active, ordinary).await.unwrap();
+            assert_eq!(
+                ordinary
+                    .processing
+                    .as_ref()
+                    .unwrap()
+                    .completed_embedding_reindex
+                    .as_ref(),
+                Some(proof)
+            );
             assert_eq!(
                 repo.authorize_model_operation("named-a", ModelOperation::QueryEmbedding, None)
                     .await
@@ -1479,7 +1683,11 @@ mod tests {
         ] {
             if client.embedded_store().is_none() {
                 for migration in [
-                    include_str!("../../migrations/sql/031_source_publication.surql"),
+                    concat!(
+                        include_str!("../../migrations/sql/031_source_publication.surql"),
+                        "\n",
+                        include_str!("../../migrations/sql/046_source_support_index_fence.surql")
+                    ),
                     include_str!("../../migrations/sql/032_work_recovery.surql"),
                     include_str!("../../migrations/sql/033_space_processing.surql"),
                 ] {

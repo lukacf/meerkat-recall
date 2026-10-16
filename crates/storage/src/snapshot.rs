@@ -269,6 +269,7 @@ async fn export_owned(
         bytes: bytes.len() as u64,
         sha256: digest(&bytes),
     };
+    crate::historical_archive_lifecycle::backup::write(&privileged, &staging, &manifest).await?;
     if let Some((snapshot, causality)) = native_origins {
         crate::source_history_restore::write_backup(
             journal, &staging, &manifest, &snapshot, causality,
@@ -404,7 +405,12 @@ fn cleanup_at(journal: &ErasureJournal, now: DateTime<Utc>) -> StorageResult<usi
                     fs::remove_file(temporary.path()).map_err(io_error)?;
                 }
             }
-            for name in [DATA, MANIFEST, crate::source_history_restore::SIDECAR] {
+            for name in [
+                DATA,
+                MANIFEST,
+                crate::source_history_restore::SIDECAR,
+                crate::historical_archive_lifecycle::backup::SIDECAR,
+            ] {
                 match fs::remove_file(record.path.join(name)) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -489,6 +495,10 @@ async fn restore_owned(
         return Err(io_error("snapshot backend differs from destination"));
     }
     let _restore_owner = restore_ownership(journal)?;
+    // This payload-free sidecar binds the native archive cut to the exact
+    // snapshot. Archive files remain in the independently retained original
+    // journal; an incompatible cut fails before any destructive replacement.
+    crate::historical_archive_lifecycle::backup::preflight(journal, input, &manifest)?;
     // Authenticate the exact native bundle and original journal before the
     // destructive import is admitted. Missing old proof is never synthesized.
     let origin = if manifest.backend == StorageBackendKind::SurrealDb {
@@ -506,6 +516,16 @@ async fn restore_owned(
         .begin_maintenance(RecoveryPhase::Restoring, remaining)
         .await?;
     let privileged = client.maintenance_client_with_guard(&guard);
+    // Restore ownership excludes restore peers; only this acquired maintenance
+    // barrier excludes a concurrent archive cut or redaction since preflight.
+    if let Err(error) =
+        crate::historical_archive_lifecycle::backup::preflight(journal, input, &manifest)
+    {
+        if journal.restore_marker()?.is_none() {
+            guard.finish();
+        }
+        return Err(error);
+    }
     // An interrupted replacement may already have removed queue state; the durable marker
     // determines whether resumption is legal, never an inference from a partially empty store.
     if journal.restore_marker()?.is_none() {
@@ -530,6 +550,7 @@ async fn restore_owned(
     Box::pin(privileged.replay_erasures()).await?;
     privileged.rotate_restored_epochs().await?;
     privileged.persist_restored_state().await?;
+    crate::historical_archive_lifecycle::verify_native_archive_heads(&privileged).await?;
     cleanup_expired(journal)?;
     journal.finish_restore_checked(&restore_marker)?;
     drop(privileged);

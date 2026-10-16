@@ -575,6 +575,42 @@ mod model {
                 .authorize_model_operation(&self.space_id, operation, None)
                 .await
                 .map_err(resolution_failure)?;
+            self.client_for_binding(binding)
+        }
+
+        /// Resolve summary limits and transport from the same approved profile.
+        ///
+        /// # Errors
+        /// Missing, revoked, invalid or unavailable model authority is refused.
+        pub(crate) async fn summary_client(
+            &self,
+        ) -> PipelineResult<(
+            String,
+            Arc<dyn LlmClient>,
+            elephant_types::summary_policy::SummaryPolicy,
+        )> {
+            let binding = self
+                .repository
+                .authorize_model_operation(&self.space_id, ModelOperation::Summary, None)
+                .await
+                .map_err(resolution_failure)?;
+            let policy = binding.profile.summary.clone().unwrap_or_else(|| {
+                elephant_types::summary_policy::SummaryPolicy::for_model(
+                    &binding.connection.provider,
+                    &binding.profile.model,
+                )
+            });
+            policy
+                .validate(&binding.connection.provider, &binding.profile.model)
+                .map_err(blocked)?;
+            let (model, client, _) = self.client_for_binding(binding)?;
+            Ok((model, client, policy))
+        }
+
+        fn client_for_binding(
+            &self,
+            binding: ResolvedModelBinding,
+        ) -> PipelineResult<(String, Arc<dyn LlmClient>, ModelBindingProvenance)> {
             let projection_client = transport(
                 &binding,
                 Arc::new(ModelHttpGuard::new(self.clone(), binding.clone())),
@@ -620,6 +656,7 @@ mod model {
 
         include!("provider_dispatch_gateway_tests.rs");
         include!("provider_dispatch_admission_tests.rs");
+        include!("provider_dispatch_summary_policy_tests.rs");
 
         #[derive(Debug)]
         struct TestCredentials;

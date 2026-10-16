@@ -41,7 +41,8 @@ impl Connection for Any {
 			};
 
 			let (conn_tx, conn_rx) = async_channel::bounded::<Result<()>>(1);
-			let config = address.config.clone();
+			let mut config = address.config.clone();
+			config.recall_local_close = None;
 			let mut features = HashSet::new();
 
 			match EndpointKind::from(address.url.scheme()) {
@@ -50,7 +51,13 @@ impl Connection for Any {
 					{
 						features.insert(ExtraFeatures::Backup);
 						features.insert(ExtraFeatures::LiveQueries);
-						tokio::spawn(engine::local::native::run_router(address, conn_tx, route_rx));
+						let mut address = address;
+						address.config.recall_local_close =
+							Some(crate::api::conn::local_close::LocalClose::new());
+						config.recall_local_close = address.config.recall_local_close.clone();
+						tokio::spawn(engine::local::native::run_router(
+							address, conn_tx, route_rx,
+						));
 						conn_rx.recv().await??
 					}
 
@@ -65,7 +72,13 @@ impl Connection for Any {
 					{
 						features.insert(ExtraFeatures::Backup);
 						features.insert(ExtraFeatures::LiveQueries);
-						tokio::spawn(engine::local::native::run_router(address, conn_tx, route_rx));
+						let mut address = address;
+						address.config.recall_local_close =
+							Some(crate::api::conn::local_close::LocalClose::new());
+						config.recall_local_close = address.config.recall_local_close.clone();
+						tokio::spawn(engine::local::native::run_router(
+							address, conn_tx, route_rx,
+						));
 						conn_rx.recv().await??
 					}
 
@@ -80,7 +93,13 @@ impl Connection for Any {
 					{
 						features.insert(ExtraFeatures::Backup);
 						features.insert(ExtraFeatures::LiveQueries);
-						tokio::spawn(engine::local::native::run_router(address, conn_tx, route_rx));
+						let mut address = address;
+						address.config.recall_local_close =
+							Some(crate::api::conn::local_close::LocalClose::new());
+						config.recall_local_close = address.config.recall_local_close.clone();
+						tokio::spawn(engine::local::native::run_router(
+							address, conn_tx, route_rx,
+						));
 						conn_rx.recv().await??
 					}
 
@@ -96,7 +115,13 @@ impl Connection for Any {
 					{
 						features.insert(ExtraFeatures::Backup);
 						features.insert(ExtraFeatures::LiveQueries);
-						tokio::spawn(engine::local::native::run_router(address, conn_tx, route_rx));
+						let mut address = address;
+						address.config.recall_local_close =
+							Some(crate::api::conn::local_close::LocalClose::new());
+						config.recall_local_close = address.config.recall_local_close.clone();
+						tokio::spawn(engine::local::native::run_router(
+							address, conn_tx, route_rx,
+						));
 						conn_rx.recv().await??
 					}
 
@@ -111,7 +136,13 @@ impl Connection for Any {
 					{
 						features.insert(ExtraFeatures::Backup);
 						features.insert(ExtraFeatures::LiveQueries);
-						tokio::spawn(engine::local::native::run_router(address, conn_tx, route_rx));
+						let mut address = address;
+						address.config.recall_local_close =
+							Some(crate::api::conn::local_close::LocalClose::new());
+						config.recall_local_close = address.config.recall_local_close.clone();
+						tokio::spawn(engine::local::native::run_router(
+							address, conn_tx, route_rx,
+						));
 						conn_rx.recv().await??
 					}
 
@@ -127,7 +158,13 @@ impl Connection for Any {
 					{
 						features.insert(ExtraFeatures::Backup);
 						features.insert(ExtraFeatures::LiveQueries);
-						tokio::spawn(engine::local::native::run_router(address, conn_tx, route_rx));
+						let mut address = address;
+						address.config.recall_local_close =
+							Some(crate::api::conn::local_close::LocalClose::new());
+						config.recall_local_close = address.config.recall_local_close.clone();
+						tokio::spawn(engine::local::native::run_router(
+							address, conn_tx, route_rx,
+						));
 						conn_rx.recv().await??
 					}
 

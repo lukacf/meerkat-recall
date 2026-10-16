@@ -1550,8 +1550,10 @@ mod tests {
     async fn canonical_test_space(storage: &StorageClient, space: &str) {
         if !storage.is_embedded() {
             storage
-                .query_checked(include_str!(
-                    "../../../migrations/sql/031_source_publication.surql"
+                .query_checked(concat!(
+                    include_str!("../../../migrations/sql/031_source_publication.surql"),
+                    "\n",
+                    include_str!("../../../migrations/sql/046_source_support_index_fence.surql")
                 ))
                 .await
                 .expect("canonical schema");
@@ -1847,6 +1849,9 @@ mod tests {
             .query("DEFINE TABLE entity SCHEMALESS;")
             .await
             .expect("schema");
+        crate::retrieval_test_support::initialize_source_support(&storage)
+            .await
+            .expect("source-support schema");
         let repo = EntityRepository::new(storage.clone());
 
         repo.create(Entity::new(
@@ -1929,6 +1934,9 @@ mod tests {
             .query("DEFINE TABLE entity SCHEMALESS;")
             .await
             .expect("schema");
+        crate::retrieval_test_support::initialize_source_support(&storage)
+            .await
+            .expect("source-support schema");
         let repo = EntityRepository::new(storage.clone());
 
         let canonical_id = RecordId::new_v4(TableName::Entity);
@@ -2221,6 +2229,9 @@ mod tests {
             .query("DEFINE TABLE entity SCHEMALESS;")
             .await
             .expect("schema");
+        crate::retrieval_test_support::initialize_source_support(&storage)
+            .await
+            .expect("source-support schema");
         let repo = EntityRepository::new(storage.clone());
         let fixture = crate::retrieval_test_support::QueryFixture::install(
             &storage,

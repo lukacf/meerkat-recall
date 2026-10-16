@@ -12,6 +12,9 @@ icon: "check-double"
 | POST | `/v1/assertions` | Create manual assertion |
 | GET | `/v1/assertions/{id}` | Get assertion by ID |
 | PATCH | `/v1/assertions/{id}/resolution` | Update resolution status |
+| POST | `/v1/assertions/{id}/disposition` | Record explicit owner closure of one action |
+| GET | `/v1/assertions/{id}/disposition` | Read a currently authorized action disposition |
+| GET | `/v1/assertions/{id}/disposition/proposals/{artifact_id}` | Review one staged proposal for an exact action |
 | DELETE | `/v1/assertions/{id}` | Soft-delete an assertion |
 | POST | `/v1/assertions/{id}/restore` | Restore a soft-deleted assertion |
 
@@ -193,6 +196,74 @@ the claim.
 Delete, restore, and resolution updates can return `409` if authorization
 fields or the soft-deletion marker change before the write. See
 [authorization conflicts](/api/overview#authorization-conflicts).
+
+## Close one action
+
+`POST /v1/assertions/{id}/disposition` records an explicit owner decision for
+one `requires_action` assertion. The supplied subject must match that assertion's
+resolved entity. Closing one action does not close other actions for the same
+subject or change the original assertion, evidence, event status or confidence.
+This source API is undergoing qualification; it is not part of the published
+0.9.1 API.
+
+The caller needs `manage:action`, `read:assertion` and `write:assertion`, with
+current record and subject authorization. Reading the linked evidence also
+requires its applicable scopes, including `read:doc:raw`, `read:entity` and
+`read:source`. Document metadata such as `recorded_by`, an asserted owner name,
+or model output cannot grant permission. The authenticated principal supplies
+the recorded actor.
+
+| Request field | Required value |
+| --- | --- |
+| `subject_entity` | Exact resolved entity record ID |
+| `owner_statement` | Real evidence span: `revision`, byte offsets `start` and `end`, `quote_hash`, and optional `node` |
+| `reason` | Nonempty closure reason, at most 4096 UTF-8 bytes |
+| `effective_at` | Explicit timestamp for the owner's decision |
+| `expected_action_fingerprint` | Optional exact target fingerprint returned with a reviewed proposal |
+
+The JSON body accepts only these fields. The target assertion ID comes from the
+path. Supply verified offsets and the hash of the exact original quote. Stale,
+erased, foreign-space or unauthorized evidence cannot authorize closure.
+
+The response has `state: "closed_by_owner"`, the action and subject IDs, reason,
+effective and recorded timestamps, authenticated actor, original evidence span
+and audit/request/dependency fingerprints. An identical request by the same
+actor returns the original receipt. A different disposition for an already
+closed action conflicts; this endpoint does not overwrite or reopen it.
+
+`GET /v1/assertions/{id}/disposition` returns a currently authorized disposition
+or `null` when none is available. It rechecks the action and evidence rather
+than treating a retained receipt as permanent read permission. Authorized event
+reads can project `recall_action_dispositions` metadata separately from the
+event's truth or promotion status. Permission to read the event alone does not
+disclose the owner's statement or closure reason.
+
+Closure means the exact action is no longer actionable by the recorded owner
+decision. It does not assert that an application was submitted, a task was
+performed, or the original request was false.
+
+### Review an extracted proposal
+
+Extraction can stage at most 16 exact-action proposals in a knowledge-candidates
+artifact, separately from factual assertions. A proposal identifies an existing
+action, its resolved subject and an exact quote from the original document
+revision. Model output cannot supply the authenticated owner or close the action.
+
+`GET /v1/assertions/{id}/disposition/proposals/{artifact_id}` reads one proposal
+from the explicitly named artifact. The caller needs `read:assertion` and
+`read:doc:raw`, plus current authorization for the action, subject, source and
+evidence. The endpoint checks the original versioned producer, published source,
+current target fingerprint and unchanged artifact. Stale or already closed
+actions, unavailable evidence and forged producer metadata are refused.
+
+The result includes `authority: "untrusted_model_proposal"`, `target_action_id`,
+`target_fingerprint`, `subject_entity_id`, `owner_statement` and `reason`. Review
+the exact action and quote before making a separate explicit closure request.
+Use the proposal's `target_fingerprint` as `expected_action_fingerprint`, map
+`subject_entity_id` to `subject_entity`, and supply the owner's `effective_at`.
+A changed target conflicts before closure; a proposal read itself changes no
+action or truth state. This route requires an artifact ID and does not provide
+automatic proposal discovery or approval.
 
 ## Update Resolution Status
 

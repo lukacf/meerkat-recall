@@ -245,8 +245,10 @@ async fn client(embedded: bool) -> StorageClient {
     .unwrap();
     if !embedded {
         client
-            .query_checked(include_str!(
-                "../../migrations/sql/031_source_publication.surql"
+            .query_checked(concat!(
+                include_str!("../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../migrations/sql/046_source_support_index_fence.surql")
             ))
             .await
             .unwrap();

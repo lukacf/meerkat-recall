@@ -1300,6 +1300,63 @@ where
 		}
 	}
 
+	/// Deterministically hold one entered write on this connection's real datastore.
+	/// Available only through the explicit test utility feature. No arbitrary
+	/// task or datastore handle escapes this fixed lifecycle control.
+	#[cfg(all(not(target_family = "wasm"), feature = "recall-close-test-utils"))]
+	pub async fn recall_test_enter_local_write(
+		&self,
+	) -> crate::Result<(
+		tokio::sync::oneshot::Sender<()>,
+		tokio::sync::oneshot::Receiver<crate::Result<()>>,
+	)> {
+		let router = self.inner.router.extract()?;
+		if router.sender.is_closed() {
+			return Err(crate::api::err::Error::InternalError(
+				"test owner admission closed".into(),
+			)
+			.into());
+		}
+		let owners = router.config.recall_local_close.as_ref().ok_or_else(|| {
+			crate::api::err::Error::InternalError("test requires native local connection".into())
+		})?;
+		owners.enter_write().await
+	}
+
+	/// Close this native local connection and await every admitted owner and datastore shutdown.
+	/// All clones reject new requests once close starts. Already queued requests drain.
+	/// A timeout stops waiting, not the router-owned drain; a later call can await it again.
+	/// Export streams must be consumed or dropped: receiver backpressure may
+	/// exhaust this deadline, and never produces a successful close acknowledgment.
+	/// Remote and WebAssembly connections are unsupported and remain open.
+	///
+	/// # Errors
+	/// Returns an error for unsupported connections, invalid timeout, owner panic,
+	/// shutdown failure, or an incomplete drain at the original deadline.
+	#[cfg(not(target_family = "wasm"))]
+	pub async fn recall_close_local(&self, timeout_ms: u64) -> crate::Result<()> {
+		if !(1..=300_000).contains(&timeout_ms) {
+			return Err(crate::api::err::Error::InternalError(
+				"local close timeout must be 1..=300000 milliseconds".into(),
+			)
+			.into());
+		}
+		let router = self.inner.router.extract()?;
+		let owner = router.config.recall_local_close.as_ref().ok_or_else(|| {
+			crate::api::err::Error::InternalError(
+				"awaitable close requires a native local connection".into(),
+			)
+		})?;
+		router.sender.close();
+		tokio::time::timeout(Duration::from_millis(timeout_ms), owner.wait())
+			.await
+			.map_err(|_| {
+				crate::api::err::Error::InternalError(
+					"local shutdown remains incomplete after deadline".into(),
+				)
+			})?
+	}
+
 	/// Reclaim physically deleted data using the Recall-patched engine protocol.
 	///
 	/// Requires a selected namespace/database and remote root-owner credentials.

@@ -223,3 +223,42 @@ impl VecDocs {
 		Ok(())
 	}
 }
+
+/// Read only: prove both identity directions, duplicate-vector membership and
+/// the physical element in the caller's transaction, without a cached graph or ANN.
+pub(super) async fn exact_member(
+    tx: &Transaction,
+    ikb: &IndexKeyBase,
+    id: &Id,
+    vector: &Vector,
+) -> Result<Option<ElementId>, Error> {
+    let Some(bytes) = tx.get(ikb.new_hi_key(id.clone())?, None).await? else {
+        return Ok(None);
+    };
+    let encoded: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| Error::CorruptedIndex("Invalid HNSW coverage doc id"))?;
+    let doc_id = u64::from_be_bytes(encoded);
+    let Some(bytes) = tx.get(ikb.new_hd_key(Some(doc_id))?, None).await? else {
+        return Ok(None);
+    };
+    let reverse: Id = revision::from_slice(&bytes)?;
+    if &reverse != id {
+        return Ok(None);
+    }
+    let Some(bytes) = tx
+        .get(ikb.new_hv_key(Arc::new(vector.into()))?, None)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let element: ElementDocs = VersionedStore::try_from(bytes)?;
+    if !element.docs.contains(doc_id) {
+        return Ok(None);
+    }
+    let Some(bytes) = tx.get(ikb.new_he_key(element.e_id)?, None).await? else {
+        return Ok(None);
+    };
+    let stored: SerializedVector = VersionedStore::try_from(bytes)?;
+    Ok((Vector::from(stored) == *vector).then_some(element.e_id))
+}

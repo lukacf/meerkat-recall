@@ -412,10 +412,6 @@ async fn native_failed_purge_rolls_back_original_event_floor_and_rows() {
 }
 
 #[expect(
-    clippy::large_futures,
-    reason = "Keep the conformance helper's original await and allocation shape."
-)]
-#[expect(
     clippy::significant_drop_tightening,
     reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."
 )]

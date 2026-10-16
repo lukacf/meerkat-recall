@@ -19,7 +19,11 @@ async fn client(embedded: bool) -> StorageClient {
     .unwrap();
     if !embedded {
         for schema in [
-            include_str!("../../migrations/sql/031_source_publication.surql"),
+            concat!(
+                include_str!("../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../migrations/sql/046_source_support_index_fence.surql")
+            ),
             include_str!("../../migrations/sql/039_private_reference_fence.surql"),
             include_str!("../../migrations/sql/040_source_contact_intent.surql"),
         ] {
@@ -547,10 +551,6 @@ async fn retract_request(
     }
 }
 
-#[expect(
-    clippy::large_futures,
-    reason = "Keep the conformance helper's original await and allocation shape."
-)]
 #[expect(
     clippy::significant_drop_tightening,
     reason = "Keep fixture, repository, and mutation owners alive through the original conformance phase."

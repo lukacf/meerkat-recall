@@ -16,7 +16,7 @@ use crate::client::StorageClient;
 use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 
-const DOC_REVISION_PROJECTION: &str = r"
+pub(crate) const DOC_REVISION_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -47,7 +47,7 @@ const DOC_REVISION_PROJECTION: &str = r"
 
 /// Database-only proxy for DocRevision to avoid flatten/native enum issues.
 #[derive(Deserialize)]
-struct DocRevisionDb {
+pub(crate) struct DocRevisionDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

@@ -861,3 +861,238 @@ fn completion_requires_actual_erased_operation_and_matching_source_record() {
 
 #[path = "source_history_control_writer_tests.rs"]
 mod original_writer_shapes;
+
+#[test]
+fn historical_event_baseline_retention_is_exact_and_never_delivery_claim() {
+    for mode in 0..9 {
+        let mut fixture = Fixture::new();
+        let consumer = crate::outbox_checkpoint_repository::HISTORICAL_CONSUMERS[0];
+        let id = control_thing(
+            "outbox_checkpoint",
+            &crate::outbox_checkpoint_repository::key(SPACE, consumer),
+        );
+        let mut proof = object([
+            ("version", 1_i64.into()),
+            ("snapshot_sha256", "a".repeat(64).into()),
+            ("journal_id", fixture.journal.identity().into()),
+            ("through_seq", 17_i64.into()),
+            ("disposition", "historical_preserved_not_delivered".into()),
+        ]);
+        if let Value::Object(ref mut fields) = proof {
+            match mode {
+                1 => {
+                    fields.insert("journal_id".into(), "foreign".into());
+                }
+                2 => {
+                    fields.insert("through_seq".into(), 19_i64.into());
+                }
+                3 => {
+                    fields.insert("disposition".into(), "delivered".into());
+                }
+                4 => {
+                    fields.insert("snapshot_sha256".into(), "A".repeat(64).into());
+                }
+                5 => {
+                    fields.insert("payload".into(), "original event text".into());
+                }
+                6 => {
+                    fields.insert("version".into(), 2_i64.into());
+                }
+                7 => {
+                    fields.remove("snapshot_sha256");
+                }
+                _ => {}
+            }
+        }
+        let mut row = native(
+            id,
+            object([
+                ("space_id", SPACE.into()),
+                ("consumer", consumer.into()),
+                ("seq", 18_i64.into()),
+                (
+                    "updated_at",
+                    Value::Datetime(fixture.intent.recorded_at.into()),
+                ),
+                ("historical_baseline", proof),
+            ]),
+            2,
+            true,
+        );
+        if mode == 8 {
+            edit(&mut row, |fields| {
+                fields.insert("consumer".into(), "unrelated".into());
+            });
+        }
+        fixture.rows.push(row);
+        if mode == 0 {
+            fixture
+                .result()
+                .expect("exact truthful baseline is retained");
+        } else {
+            assert!(fixture.result().is_err(), "baseline mutation {mode}");
+        }
+    }
+}
+
+#[test]
+fn historical_import_migrations_require_exact_receipt_identity_checksum_and_shape() {
+    for name in [
+        "source_support_index_fence",
+        "historical_node_revision_lookup",
+        "historical_coverage_visibility",
+    ] {
+        check_semantic_migration_receipt(name);
+    }
+}
+
+#[test]
+fn current_global_support_nonce_retains_only_exact_disjoint_writer_shape() {
+    let id = Thing::from((
+        "canonical_epoch",
+        Id::Array(
+            vec![
+                Value::from("recall_source_support_index"),
+                Value::from(1i64),
+            ]
+            .into(),
+        ),
+    ));
+    for mode in 0..6 {
+        let mut fixture = Fixture::new();
+        let identity = if mode == 5 {
+            control_thing("canonical_epoch", "recall_source_support_index")
+        } else {
+            id.clone()
+        };
+        let mut row = native(
+            identity,
+            object([
+                ("space_id", "__recall_source_support_index__".into()),
+                ("support_nonce", uuid::Uuid::new_v4().to_string().into()),
+            ]),
+            1,
+            mode != 4,
+        );
+        edit(&mut row, |fields| match mode {
+            1 => {
+                fields.insert("support_nonce".into(), "not-a-uuid".into());
+            }
+            2 => {
+                fields.insert("space_id".into(), SPACE.into());
+            }
+            3 => {
+                fields.insert("hidden_payload".into(), "must-not-survive".into());
+            }
+            _ => {}
+        });
+        let commitment = fixture.authority.version_commitment(&row).unwrap();
+        // A history snapshot requires the inspected current version for each key.
+        // Keep both genuine versions so this tests retention of the old nonce,
+        // rather than rejection of an incomplete snapshot before retention runs.
+        let current_commitment = (mode == 4).then(|| {
+            let current = native(
+                id.clone(),
+                object([
+                    ("space_id", "__recall_source_support_index__".into()),
+                    ("support_nonce", uuid::Uuid::new_v4().to_string().into()),
+                ]),
+                2,
+                true,
+            );
+            let current_commitment = fixture.authority.version_commitment(&current).unwrap();
+            fixture.rows.push(current);
+            current_commitment
+        });
+        fixture.rows.push(row);
+        if let Some(current_commitment) = current_commitment {
+            assert!(fixture.result().unwrap().contains(&current_commitment));
+        }
+        match mode {
+            0 => assert!(fixture.result().unwrap().contains(&commitment)),
+            1..=3 => assert!(fixture.result().is_err()),
+            _ => assert!(!fixture.result().unwrap().contains(&commitment)),
+        }
+    }
+}
+
+#[test]
+fn source_operation_input_hash_domain_stays_uuid_even_after_superseding() {
+    for mode in 0..3 {
+        let mut fixture = Fixture::new();
+        let row = fixture.rows.iter_mut().find(|row| {
+            matches!(row.decoded_key().unwrap(), NativeHistoryKey::Record { identity, .. } if identity.tb == "source_operation")
+        }).unwrap();
+        edit(row, |fields| {
+            let mut operation: StoredOperation = payload(fields).unwrap();
+            operation.receipt.state = OperationState::Superseded;
+            operation.receipt.completed_at = Some(operation.receipt.accepted_at);
+            operation.request_fingerprint = "a".repeat(64);
+            if mode == 1 {
+                operation.input_fingerprint = "b".repeat(64);
+            }
+            if mode == 2 {
+                operation.input_fingerprint = "not-a-uuid".into();
+            }
+            let Value::Object(replacement) = crate::surreal::stored_native_value(
+                crate::source_publication::control_value(
+                    SPACE,
+                    &operation.receipt.source_id,
+                    &operation,
+                )
+                .unwrap(),
+            ) else {
+                panic!("control object required");
+            };
+            let identity = fields["id"].clone();
+            *fields = replacement;
+            fields.insert("id".into(), identity);
+        });
+        if mode == 0 {
+            fixture.result().unwrap();
+        } else {
+            assert!(fixture.result().is_err());
+        }
+    }
+}
+
+#[test]
+fn original_source_publication_receipt_uses_031_writer_bytes_only() {
+    // Independent migration writer domain: 046 is a separate receipt, never
+    // part of the original 031 checksum. Do not derive this from migration_sql.
+    let original = include_str!("../../migrations/sql/031_source_publication.surql");
+    let concatenated = format!(
+        "{}\n{}",
+        original,
+        include_str!("../../migrations/sql/046_source_support_index_fence.surql")
+    );
+    for (sql, accepted) in [(original, true), (concatenated.as_str(), false)] {
+        let mut fixture = Fixture::new();
+        let row = native(
+            control_thing("migration_history", "source_publication"),
+            object([
+                ("name", "source_publication".into()),
+                (
+                    "checksum",
+                    hex::encode(Sha256::digest(sql.as_bytes())).into(),
+                ),
+                (
+                    "applied_at",
+                    Value::Datetime(fixture.intent.recorded_at.into()),
+                ),
+            ]),
+            1,
+            true,
+        );
+        let commitment = fixture.authority.version_commitment(&row).unwrap();
+        fixture.rows.push(row);
+        if accepted {
+            assert!(fixture.result().unwrap().contains(&commitment));
+        } else {
+            assert!(
+                fixture.result().is_err(),
+                "combined migration checksum is not original authority"
+            );
+        }
+    }
+}

@@ -1384,17 +1384,21 @@ mod tests {
         );
     }
 
-    /// In-memory storage with the production assertion search indexes
-    /// (migration 012), so text-path tests run through the index path.
+    /// In-memory storage with production search indexes and source-support
+    /// fences, so assertion reads validate real evidence through indexed paths.
     async fn indexed_memory_storage() -> StorageClient {
         let storage = StorageClient::new_memory().await.expect("storage");
         storage
-            .query(concat!(
+            .query_checked(concat!(
                 "DEFINE ANALYZER simple TOKENIZERS blank, class FILTERS lowercase, ascii;\n",
-                include_str!("../../../migrations/sql/012_assertion_search.surql")
+                include_str!("../../../migrations/sql/012_assertion_search.surql"),
+                "\n",
+                include_str!("../../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../../migrations/sql/046_source_support_index_fence.surql")
             ))
             .await
-            .expect("define assertion search indexes");
+            .expect("define assertion search and source-support indexes");
         storage
     }
 
@@ -1544,7 +1548,7 @@ mod tests {
         reason = "Keep the original fixture, ownership, and assertion scope intact."
     )]
     async fn test_list_assertions_filter_scans_past_first_page() {
-        let storage = StorageClient::new_memory().await.expect("storage");
+        let storage = indexed_memory_storage().await;
         let handler = ListAssertionsHandler::new(storage.clone());
         let repo = FixtureAssertions::new(storage.clone());
 
@@ -1733,6 +1737,9 @@ mod tests {
         // No search indexes here: the index query fails and the bounded scan
         // still serves the query.
         let storage = StorageClient::new_memory().await.expect("storage");
+        crate::retrieval_test_support::initialize_source_support(&storage)
+            .await
+            .expect("source-support schema");
         let handler = SearchAssertionsHandler::new(storage.clone());
         let repo = FixtureAssertions::new(storage.clone());
 

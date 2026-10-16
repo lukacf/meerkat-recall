@@ -599,7 +599,14 @@ impl SourcePublicationManifestRepository {
         {
             return Ok(None);
         }
-        let writer = format!("source-publication:{}", manifest_key(space, publication));
+        let Some(manifest) = self.get(space, publication).await? else {
+            return Ok(None);
+        };
+        manifest.validate()?;
+        let writer = manifest.historical_adoption.as_ref().map_or_else(
+            || format!("source-publication:{}", manifest_key(space, publication)),
+            |proof| proof.commit_id(&manifest),
+        );
         let Some(receipt) = publications
             .read_control::<CanonicalCommitReceipt>(
                 "source_commit_receipt",
@@ -632,6 +639,34 @@ impl SourcePublicationManifestRepository {
         // confer authority independently of the complete immutable certificate.
         if completion != lookup {
             return Ok(None);
+        }
+        if manifest.historical_adoption.is_some() {
+            if completion.manifest_digest != manifest.digest()?
+                || completion.commit_id != writer
+                || completion.accepted_source_fingerprint.as_ref()
+                    != Some(&source_support_fingerprint(accepted)?)
+                || receipt.historical_import.as_ref()
+                    != Some(
+                        &crate::historical_adoption::HistoricalCommitProvenance::for_manifest(
+                            &manifest,
+                        )?,
+                    )
+            {
+                return Ok(None);
+            }
+            let operation = publications
+                .operation(space, &publication.operation_id)
+                .await?;
+            if operation.as_ref().is_none_or(|op| {
+                !matches!(
+                    op.state,
+                    OperationState::Processing | OperationState::Completed
+                ) || op.source_generation != publication.generation
+                    || op.source_id != head.source_id
+            }) {
+                return Ok(None);
+            }
+            return Ok(Some(accepted.source.clone()));
         }
         let expected_commit = format!("source-publication:{}", manifest_key(space, publication));
         let Some(progress) = &completion.published_progress else {

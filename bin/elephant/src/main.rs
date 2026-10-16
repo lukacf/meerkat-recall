@@ -15,7 +15,10 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use walkdir::WalkDir;
 
+mod certify_historical;
 mod data_migrate;
+mod migration_archive;
+mod reindex_continue;
 mod service_token;
 mod snapshot;
 use snapshot::SnapshotCommand;
@@ -60,6 +63,17 @@ enum Commands {
     },
     /// One-time data migration: embedded snapshot -> `SurrealDB` backend.
     DataMigrate(data_migrate::DataMigrateArgs),
+    /// Apply a verified S0/S1 historical delta to an adopted native target.
+    DataMigrateDelta(data_migrate::historical_delta::DataMigrateDeltaArgs),
+    /// Inspect or export current journal-managed operational history.
+    MigrationArchive {
+        #[command(subcommand)]
+        command: migration_archive::MigrationArchiveCommand,
+    },
+    /// Continue an accepted native embedding reindex with immediate bounded pages.
+    ReindexContinue(reindex_continue::ReindexContinueArgs),
+    /// Certify exact imported publications after explicit reindex activation.
+    CertifyHistorical(certify_historical::CertifyHistoricalArgs),
     /// Explicitly erase a partial target left by a failed data-migrate command.
     DataMigrateDiscard(data_migrate::DataMigrateDiscardArgs),
     /// Show health and managed runtime status for a running Meerkat Recall API.
@@ -120,7 +134,7 @@ struct DemoWikiArgs {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<std::process::ExitCode> {
     init_tracing()?;
 
     let cli = Cli::parse();
@@ -132,6 +146,10 @@ async fn main() -> Result<()> {
         Commands::Status(args) => status::run(&cli.api, args).await,
         Commands::ServiceToken { command } => service_token::run(command),
         Commands::DataMigrate(args) => data_migrate::run(args).await,
+        Commands::DataMigrateDelta(args) => data_migrate::historical_delta::run(args).await,
+        Commands::MigrationArchive { command } => migration_archive::run(command).await,
+        Commands::ReindexContinue(args) => reindex_continue::run(args).await,
+        Commands::CertifyHistorical(args) => Box::pin(certify_historical::run(args)).await,
         Commands::DataMigrateDiscard(args) => data_migrate::discard(args).await,
         Commands::DemoWiki(args) => {
             Box::pin(wiki_demo::run(args.port, args.processing_config)).await
@@ -140,13 +158,19 @@ async fn main() -> Result<()> {
 
     if let Err(err) = result {
         error!("{err:#}");
-        std::process::exit(
-            err.downcast_ref::<status::StatusFailure>()
-                .map_or(1, |error| error.0),
-        );
+        // Return through the Tokio runtime so native database/router owners are
+        // dropped before process termination, including on failed transfers.
+        let code = err
+            .downcast_ref::<status::StatusFailure>()
+            .and_then(|error| u8::try_from(error.0).ok())
+            .map_or(
+                std::process::ExitCode::FAILURE,
+                std::process::ExitCode::from,
+            );
+        return Ok(code);
     }
 
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 fn init_tracing() -> Result<()> {

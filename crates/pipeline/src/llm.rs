@@ -15,6 +15,8 @@ pub struct LlmRunResult {
     pub text: String,
     /// Normalized total usage for the prompt, including cached input.
     pub usage: Usage,
+    /// Exact terminal reason, retained for callers that require complete text.
+    pub stop_reason: meerkat::StopReason,
 }
 
 /// Run a single prompt using the injected, governed provider client.
@@ -37,6 +39,46 @@ pub async fn run_model_prompt(
     collect_prompt_response(client.stream(&request)).await
 }
 
+/// Run a tool-free summary with its approved immutable limits and thinking policy.
+pub(crate) async fn run_summary_prompt(
+    client: std::sync::Arc<dyn LlmClient>,
+    model: String,
+    prompt: String,
+    policy: &elephant_types::summary_policy::SummaryPolicy,
+) -> Result<LlmRunResult, PipelineError> {
+    use elephant_types::summary_policy::SummaryThinking;
+    use meerkat_core::lifecycle::run_primitive::{
+        AnthropicEffort, AnthropicProviderTag, AnthropicThinkingConfig, ProviderTag,
+    };
+
+    policy
+        .validate(client.provider().as_str(), &model)
+        .map_err(|error| PipelineError::ConfigError(format!("provider_authorization: {error}")))?;
+    let mut request = LlmRequest::new(
+        &model,
+        vec![
+            Message::System(SystemMessage::new(
+                "You are a concise summarizer. Produce clear, accurate summaries.",
+            )),
+            Message::User(UserMessage::text(prompt)),
+        ],
+    );
+    request.max_tokens = policy.max_output_tokens;
+    let thinking = match policy.thinking {
+        SummaryThinking::ProviderDefault => None,
+        SummaryThinking::AdaptiveLow => Some(AnthropicThinkingConfig::Adaptive),
+        SummaryThinking::BetweenToolsLow => Some(AnthropicThinkingConfig::BetweenTools),
+    };
+    if let Some(thinking) = thinking {
+        request.provider_params = Some(ProviderTag::Anthropic(AnthropicProviderTag {
+            thinking: Some(thinking),
+            effort: Some(AnthropicEffort::Low),
+            ..Default::default()
+        }));
+    }
+    collect_prompt_response(client.stream(&request)).await
+}
+
 async fn collect_prompt_response(
     mut stream: impl futures::Stream<Item = Result<LlmEvent, LlmError>> + Unpin,
 ) -> Result<LlmRunResult, PipelineError> {
@@ -55,11 +97,12 @@ async fn collect_prompt_response(
                 usage = total.into_inner();
             }
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { .. },
+                outcome: LlmDoneOutcome::Success { stop_reason },
             } => {
                 return Ok(LlmRunResult {
                     text: content,
                     usage,
+                    stop_reason,
                 });
             }
             LlmEvent::Done {

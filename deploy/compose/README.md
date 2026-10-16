@@ -108,12 +108,13 @@ docker compose config --quiet
 docker compose up -d recall
 ```
 
-The example override selects Anthropic because the generated extractor model is
-`claude-opus-4-6`. Set the exact matching account, immutable profiles and approved
-operation bindings in your space, with `credential_ref: ANTHROPIC_API_KEY`. If
-using OpenAI, change the override to `OPENAI_API_KEY_FILE`, the loaded TOML
-extractor model, and the space's provider bindings together. Embedding approval
-is separate: provision your pinned local FastEmbed assets or its own explicitly
+The example override selects OpenAI because the generated extractor model is
+`gpt-6.1-sol`. Set the exact matching account, immutable profiles and approved
+operation bindings in your space, with `credential_ref: OPENAI_API_KEY`. If
+using Anthropic, change the override to `ANTHROPIC_API_KEY_FILE`, the loaded TOML
+extractor model, and the space's provider bindings together. Existing loaded
+configurations and approved profiles are not migrated by this default change.
+Embedding approval is separate: provision your pinned local FastEmbed assets or its own explicitly
 approved remote embedding account. The override supplies the worker token via
 `MCP_BEARER_TOKEN_FILE` and selects `research` for discovery; edit that named space
 to one the worker actually has authority to read. Discovery does not grant access

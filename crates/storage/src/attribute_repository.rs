@@ -17,7 +17,7 @@ use crate::client::StorageClient;
 use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 
-const ATTRIBUTE_PROJECTION: &str = r"
+pub(crate) const ATTRIBUTE_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -48,7 +48,7 @@ const ATTRIBUTE_PROJECTION: &str = r"
 
 /// Database-only proxy for Attribute to avoid flatten/native enum issues.
 #[derive(Deserialize)]
-struct AttributeDb {
+pub(crate) struct AttributeDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

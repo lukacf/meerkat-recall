@@ -58,6 +58,29 @@ struct OriginEnvelope {
     intent_fingerprint: String,
     source_ids: Vec<RecordId>,
     origin: WorkProducerOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    historical_transfer: Option<HistoricalTransferProof>,
+}
+
+/// New transfer evidence, never a claim about the original producer execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalTransferProof {
+    version: u32,
+    snapshot_sha256: String,
+    original_row_sha256: String,
+    hash_domain: String,
+    source_space_id: String,
+    target_space_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_hold_sha256: Option<String>,
+}
+
+fn valid_transfer_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Deserialize)]
@@ -148,9 +171,40 @@ impl OriginEnvelope {
             intent_fingerprint: work_intent_fingerprint(work)?,
             source_ids,
             origin,
+            historical_transfer: None,
         })
     }
+    fn verify_identity(&self, work: &WorkItem) -> StorageResult<()> {
+        if self.version != 1
+            || self.space_id != work.base.space_id
+            || self.work_item_id != work.base.id
+        {
+            return Err(changed());
+        }
+        if let Some(proof) = &self.historical_transfer {
+            let original = proof.version == 1
+                && proof.hash_domain == "homecore-python-json-v1"
+                && proof.previous_hold_sha256.is_none();
+            let catchup = proof.version == 2
+                && proof.hash_domain == "recall-historical-runtime-row/v1"
+                && proof
+                    .previous_hold_sha256
+                    .as_ref()
+                    .is_none_or(|hash| valid_transfer_digest(hash));
+            if !(original || catchup)
+                || proof.source_space_id.trim().is_empty()
+                || proof.target_space_id != self.space_id
+                || !valid_transfer_digest(&proof.snapshot_sha256)
+                || !valid_transfer_digest(&proof.original_row_sha256)
+                || !matches!(self.origin, WorkProducerOrigin::Unknown)
+            {
+                return Err(invalid("Invalid historical transfer hold"));
+            }
+        }
+        Ok(())
+    }
     fn verify(&self, work: &WorkItem) -> StorageResult<()> {
+        self.verify_identity(work)?;
         if self.version != 1
             || self.space_id != work.base.space_id
             || self.work_item_id != work.base.id
@@ -241,7 +295,10 @@ impl OriginEnvelope {
     }
 }
 
-fn read_tx(tx: &EmbeddedMutation<'_>, work: &WorkItem) -> StorageResult<Option<OriginEnvelope>> {
+fn read_tx_origin(
+    tx: &EmbeddedMutation<'_>,
+    work: &WorkItem,
+) -> StorageResult<Option<OriginEnvelope>> {
     tx.scan_extension_rows(TABLE)?
         .into_iter()
         .find(|(key, _)| key == &origin_key(&work.base.id))
@@ -257,10 +314,108 @@ fn read_tx(tx: &EmbeddedMutation<'_>, work: &WorkItem) -> StorageResult<Option<O
                     .ok_or_else(|| invalid("Missing producer payload"))?,
             )
             .map_err(invalid)?;
-            envelope.verify(work)?;
+            envelope.verify_identity(work)?;
             Ok(envelope)
         })
         .transpose()
+}
+
+fn read_tx(tx: &EmbeddedMutation<'_>, work: &WorkItem) -> StorageResult<Option<OriginEnvelope>> {
+    let row = read_tx_origin(tx, work)?;
+    if let Some(envelope) = &row {
+        envelope.verify(work)?;
+    }
+    Ok(row)
+}
+
+/// Unknown historical work remains inert even before dispatch admission.
+pub(crate) fn may_claim_or_recover_tx(
+    tx: &EmbeddedMutation<'_>,
+    work: &WorkItem,
+) -> StorageResult<bool> {
+    // This gate only prevents invented historical execution. Current authority
+    // and producer-intent validation remain the dispatcher's separate contract.
+    Ok(read_tx_origin(tx, work)?
+        .is_some_and(|row| !matches!(row.origin, WorkProducerOrigin::Unknown)))
+}
+
+#[derive(Deserialize)]
+struct QueueOrigin {
+    work_item_id: Thing,
+    space_id: String,
+    payload: String,
+}
+
+/// Read one bounded queue page's immutable origins without one native query per row.
+/// Claims repeat the check with a mutation fence; this read grants no authority.
+pub(crate) async fn schedulable_ids(
+    client: &StorageClient,
+    work: &[WorkItem],
+) -> StorageResult<std::collections::BTreeSet<RecordId>> {
+    let mut allowed = std::collections::BTreeSet::new();
+    if work.is_empty() {
+        return Ok(allowed);
+    }
+    if client.embedded_store().is_some() {
+        let repository = WorkProducerRepository::new(client.clone());
+        for item in work {
+            if repository
+                .read_origin_envelope(item)
+                .await?
+                .is_some_and(|row| !matches!(row.origin, WorkProducerOrigin::Unknown))
+            {
+                allowed.insert(item.base.id.clone());
+            }
+        }
+        return Ok(allowed);
+    }
+    let ids: Vec<Value> = work
+        .iter()
+        .map(|item| Value::Thing(origin_id(&item.base.id)))
+        .collect();
+    let mut response = client
+        .query_bind_checked(
+            "SELECT work_item_id, space_id, payload FROM work_producer_origin WHERE id IN $origins",
+            crate::bindings! { "origins" => Value::Array(ids.into()) },
+        )
+        .await?;
+    let rows: Vec<QueueOrigin> = response.take(0).map_err(invalid)?;
+    let by_id: BTreeMap<_, _> = work.iter().map(|item| (&item.base.id, item)).collect();
+    for row in rows {
+        let id = crate::surreal::record_id_from_thing(&row.work_item_id).map_err(invalid)?;
+        let item = by_id.get(&id).ok_or_else(changed)?;
+        if row.space_id != item.base.space_id {
+            return Err(changed());
+        }
+        let envelope: OriginEnvelope = serde_json::from_str(&row.payload).map_err(invalid)?;
+        envelope.verify_identity(item)?;
+        if !matches!(envelope.origin, WorkProducerOrigin::Unknown) {
+            allowed.insert(id);
+        }
+    }
+    Ok(allowed)
+}
+
+/// Prepare the exact immutable producer fence for a claim or lease recovery.
+/// Missing history never creates a new origin or changes the original work.
+pub(crate) async fn append_claim_or_recovery_guard(
+    client: &StorageClient,
+    sql: &mut String,
+    bindings: &mut BTreeMap<String, Value>,
+    prefix: &str,
+    work: &WorkItem,
+) -> StorageResult<bool> {
+    let Some(envelope) = WorkProducerRepository::new(client.clone())
+        .read_origin_envelope(work)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if matches!(envelope.origin, WorkProducerOrigin::Unknown) {
+        return Ok(false);
+    }
+    append_origin_guard(sql, bindings, prefix, &envelope)?;
+    Ok(true)
 }
 
 fn insert_tx(tx: &mut EmbeddedMutation<'_>, envelope: &OriginEnvelope) -> StorageResult<()> {
@@ -296,7 +451,10 @@ fn append_insert(
         origin_id(&envelope.work_item_id).into(),
     );
     bindings.insert(format!("{prefix}_origin"), envelope.native()?);
-    let _ = writeln!(sql,"LET ${prefix}_old_origin = SELECT * FROM ONLY ${prefix}_origin_id;\nIF ${prefix}_old_origin = NONE {{ CREATE ${prefix}_origin_id CONTENT ${prefix}_origin; }} ELSE {{ IF ${prefix}_old_origin.space_id != ${prefix}_origin.space_id OR ${prefix}_old_origin.work_item_id != ${prefix}_origin.work_item_id OR ${prefix}_old_origin.payload != ${prefix}_origin.payload {{ THROW 'work_producer_origin_changed_or_unknown'; }}; }};");
+    let _ = writeln!(
+        sql,
+        "LET ${prefix}_old_origin = SELECT * FROM ONLY ${prefix}_origin_id;\nIF ${prefix}_old_origin = NONE {{ CREATE ${prefix}_origin_id CONTENT ${prefix}_origin; }} ELSE {{ IF ${prefix}_old_origin.space_id != ${prefix}_origin.space_id OR ${prefix}_old_origin.work_item_id != ${prefix}_origin.work_item_id OR ${prefix}_old_origin.payload != ${prefix}_origin.payload {{ THROW 'work_producer_origin_changed_or_unknown'; }}; }};"
+    );
     Ok(())
 }
 
@@ -311,16 +469,360 @@ pub(crate) fn verify_original_control_payload(
     Ok(envelope.origin)
 }
 
+/// Original typed hot/archive row plus its independently verified snapshot hash.
+#[derive(Debug, Clone)]
+pub struct HistoricalWorkHoldInput {
+    /// Complete original hot or archived work row.
+    pub original: crate::transfer_batch::TransferRecord,
+    /// SHA-256 of the original lexical snapshot row.
+    pub original_row_sha256: String,
+    /// Original snapshot namespace.
+    pub source_space_id: String,
+    /// Declared destination namespace after relocation.
+    pub target_space_id: String,
+}
+
+/// Exact committed private control inventory in native `type::string` SHA256 domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoricalHoldEffect {
+    /// Physical table changed while registering the hold.
+    pub table: String,
+    /// Exact native control record identity.
+    pub id: String,
+    /// Original native row digest, absent when the control did not exist.
+    pub before_sha256: Option<String>,
+    /// Resulting native row digest, including the complete control wrapper.
+    pub after_sha256: String,
+}
+
+/// Ordered payload identities plus full native control row changes.
+#[derive(Debug, Clone)]
+pub struct HistoricalWorkHoldRegistration {
+    /// Registered origin payload digests in the input row order.
+    pub payload_sha256: Vec<String>,
+    /// Exact native control and guard changes for final inventory reconciliation.
+    pub native_effects: Vec<HistoricalHoldEffect>,
+}
+
 /// Private origin lookup. This repository has no public HTTP/MCP projection.
 #[derive(Clone, Debug)]
 pub struct WorkProducerRepository {
     client: StorageClient,
 }
+type PreparedHistoricalHold<'a> = (&'a WorkItem, bool, OriginEnvelope, Value);
+
+fn prepare_historical_holds<'a>(
+    snapshot_sha256: &str,
+    originals: &[HistoricalWorkHoldInput],
+    projected: &'a [crate::transfer_batch::TransferRecord],
+) -> StorageResult<Vec<PreparedHistoricalHold<'a>>> {
+    use crate::transfer_batch::TransferRecord;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut prepared = Vec::with_capacity(originals.len());
+    let mut byte_count = 0usize;
+    for (input, projected) in originals.iter().zip(projected) {
+        let (work, archived) = match projected {
+            TransferRecord::WorkItem(work) => (work, false),
+            TransferRecord::WorkItemArchive(archive) => (&archive.record, true),
+            _ => {
+                return Err(invalid(
+                    "Historical work hold requires work or work archive",
+                ))
+            }
+        };
+        if !seen.insert(&work.base.id) || !valid_transfer_digest(&input.original_row_sha256) {
+            return Err(invalid("Historical hold duplicate or original hash"));
+        }
+        let mut envelope = OriginEnvelope::new(work, WorkProducerOrigin::Unknown, &[])?;
+        envelope.historical_transfer = Some(HistoricalTransferProof {
+            version: 1,
+            snapshot_sha256: snapshot_sha256.into(),
+            original_row_sha256: input.original_row_sha256.clone(),
+            hash_domain: "homecore-python-json-v1".into(),
+            source_space_id: input.source_space_id.clone(),
+            target_space_id: input.target_space_id.clone(),
+            previous_hold_sha256: None,
+        });
+        envelope.verify_identity(work)?;
+        let Value::Object(mut native) = projected.native()? else {
+            return Err(invalid("Historical work is not an object"));
+        };
+        native.insert(
+            "id".into(),
+            crate::surreal::thing_from_record_id(input.original.id()).into(),
+        );
+        let native = crate::surreal::stored_native_value(Value::Object(native));
+        let payload_len = envelope.payload()?.len();
+        byte_count = byte_count
+            .checked_add(native.to_string().len())
+            .and_then(|n| n.checked_add(payload_len))
+            .ok_or_else(|| invalid("Historical hold bytes overflow"))?;
+        if byte_count > 256 * 1024 * 1024 {
+            return Err(invalid("Historical hold encoded bytes bound"));
+        }
+        prepared.push((work, archived, envelope, native));
+    }
+    Ok(prepared)
+}
+
+fn append_historical_hold_rows(
+    sql: &mut String,
+    bindings: &mut BTreeMap<String, Value>,
+    originals: &[HistoricalWorkHoldInput],
+    prepared: &[PreparedHistoricalHold<'_>],
+) -> StorageResult<()> {
+    for (index, (input, (work, archived, envelope, native))) in
+        originals.iter().zip(prepared).enumerate()
+    {
+        bindings.insert(
+            format!("work_{index}"),
+            crate::surreal::thing_from_record_id(input.original.id()).into(),
+        );
+        let other = if *archived {
+            work.base.id.clone()
+        } else {
+            crate::work_retention::archive_id(&work.base.id)
+        };
+        bindings.insert(
+            format!("other_{index}"),
+            crate::surreal::thing_from_record_id(&other).into(),
+        );
+        bindings.insert(format!("expected_{index}"), native.clone());
+        writeln!(sql, "IF (SELECT * FROM ONLY $work_{index}) != $expected_{index} OR (SELECT VALUE id FROM ONLY $other_{index}) != NONE {{ THROW 'historical_work_changed'; }};").map_err(invalid)?;
+        bindings.insert(
+            format!("origin_inventory_{index}"),
+            origin_id(&work.base.id).into(),
+        );
+        writeln!(sql, "LET $origin_before_{index} = (SELECT VALUE crypto::sha256(type::string($this)) FROM ONLY $origin_inventory_{index});").map_err(invalid)?;
+        append_insert(sql, bindings, &format!("historical_{index}"), envelope)?;
+    }
+    Ok(())
+}
+
+fn validate_historical_hold_effects(
+    effects: &[HistoricalHoldEffect],
+    prepared: &[PreparedHistoricalHold<'_>],
+    spaces: &[String],
+) -> StorageResult<()> {
+    if effects.len() != prepared.len() + spaces.len()
+        || effects
+            .iter()
+            .zip(prepared)
+            .any(|(effect, (work, _, _, _))| {
+                effect.table != TABLE
+                    || effect.id != origin_id(&work.base.id).to_string()
+                    || !valid_transfer_digest(&effect.after_sha256)
+                    || effect
+                        .before_sha256
+                        .as_ref()
+                        .is_some_and(|hash| !valid_transfer_digest(hash))
+            })
+    {
+        return Err(invalid("Historical hold native inventory differs"));
+    }
+    if effects[prepared.len()..]
+        .iter()
+        .zip(spaces)
+        .any(|(effect, space)| {
+            effect.table != "source_erasure_guard"
+                || effect.id
+                    != crate::source_publication::control_thing("source_erasure_guard", space)
+                        .to_string()
+                || !valid_transfer_digest(&effect.after_sha256)
+                || effect
+                    .before_sha256
+                    .as_ref()
+                    .is_some_and(|hash| !valid_transfer_digest(hash))
+        })
+    {
+        return Err(invalid("Historical hold guard inventory differs"));
+    }
+    Ok(())
+}
+
 impl WorkProducerRepository {
     /// Bind original producer evidence to an existing storage client.
     #[must_use]
     pub const fn new(client: StorageClient) -> Self {
         Self { client }
+    }
+
+    /// Bind an imported row to an inert historical hold after complete input
+    /// reconciliation, while exclusive transfer custody is still active.
+    /// Returns the exact private payload SHA for final control reconciliation.
+    ///
+    /// # Errors
+    /// Refuses wrong custody/input, changed original work or an existing producer.
+    pub async fn register_historical_hold(
+        &self,
+        work: &WorkItem,
+        snapshot_sha256: &str,
+        original_row_sha256: &str,
+    ) -> StorageResult<String> {
+        self.register_historical_holds(
+            snapshot_sha256,
+            &[HistoricalWorkHoldInput {
+                original: crate::transfer_batch::TransferRecord::WorkItem(work.clone()),
+                original_row_sha256: original_row_sha256.into(),
+                source_space_id: work.base.space_id.clone(),
+                target_space_id: work.base.space_id.clone(),
+            }],
+        )
+        .await?
+        .payload_sha256
+        .into_iter()
+        .next()
+        .ok_or_else(changed)
+    }
+
+    /// Register at most 256 reconciled original hot/archive work rows atomically.
+    /// No origin is inserted until every original payload in the batch matches.
+    /// Inputs retain the original source namespace; this method applies only the
+    /// declared typed namespace relocation. Payload hashes retain supplied order.
+    /// Native effects capture complete actual origin rows and their exact per-space
+    /// erasure-guard revision effects in the same transaction.
+    ///
+    /// # Errors
+    /// Refuses custody, duplicate identities, bounds, typed row mismatch or changed producers.
+    pub async fn register_historical_holds(
+        &self,
+        snapshot_sha256: &str,
+        originals: &[HistoricalWorkHoldInput],
+    ) -> StorageResult<HistoricalWorkHoldRegistration> {
+        use crate::transfer_batch::TransferRecord;
+        use elephant_types::records::WorkItemArchive;
+        use sha2::Digest as _;
+        self.client.require_transfer_custody()?;
+        let marker = self
+            .client
+            .erasure_journal()?
+            .transfer_marker()?
+            .ok_or_else(changed)?;
+        if marker.source_sha256 != snapshot_sha256
+            || !valid_transfer_digest(snapshot_sha256)
+            || originals.is_empty()
+            || originals.len() > 256
+        {
+            return Err(invalid("Historical transfer binding or row bound"));
+        }
+        let projected = originals
+            .iter()
+            .map(|input| {
+                if input.source_space_id.trim().is_empty()
+                    || input.target_space_id.trim().is_empty()
+                    || input.original.base().space_id != input.source_space_id
+                {
+                    return Err(invalid("Historical hold source mapping differs"));
+                }
+                let mut row = input.original.clone();
+                row.relocate_space(&input.source_space_id, &input.target_space_id)?;
+                Ok(row)
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        let prepared = prepare_historical_holds(snapshot_sha256, originals, &projected)?;
+        let native_effects = if let Some(store) = self.client.embedded_store() {
+            store
+                .mutate(|tx| {
+                    self.client.require_transfer_custody()?;
+                    for (projected, (work, archived, envelope, _)) in
+                        projected.iter().zip(&prepared)
+                    {
+                        let hot = tx.get::<WorkItem>(&work.base.space_id, &work.base.id, true)?;
+                        let cold = tx.get::<WorkItemArchive>(
+                            &work.base.space_id,
+                            &crate::work_retention::archive_id(&work.base.id),
+                            true,
+                        )?;
+                        match projected {
+                            TransferRecord::WorkItem(original)
+                                if !*archived
+                                    && cold.is_none()
+                                    && hot.as_ref() == Some(original) => {}
+                            TransferRecord::WorkItemArchive(original)
+                                if *archived
+                                    && hot.is_none()
+                                    && cold.as_ref() == Some(original) => {}
+                            _ => return Err(changed()),
+                        }
+                        insert_tx(tx, envelope)?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            Vec::new()
+        } else {
+            self.register_native_historical_holds(originals, &prepared)
+                .await?
+        };
+        let payload_sha256 = prepared
+            .iter()
+            .map(|(_, _, envelope, _)| {
+                Ok(hex::encode(sha2::Sha256::digest(
+                    envelope.payload()?.as_bytes(),
+                )))
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        Ok(HistoricalWorkHoldRegistration {
+            payload_sha256,
+            native_effects,
+        })
+    }
+
+    async fn register_native_historical_holds(
+        &self,
+        originals: &[HistoricalWorkHoldInput],
+        prepared: &[PreparedHistoricalHold<'_>],
+    ) -> StorageResult<Vec<HistoricalHoldEffect>> {
+        let mut sql = "BEGIN TRANSACTION;".to_string();
+        let mut bindings = BTreeMap::new();
+        let spaces = prepared
+            .iter()
+            .map(|(work, _, _, _)| work.base.space_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        sql.push_str("LET $hold_key_tokens = recall::reference_tokens($__recall_journal_identity, '__recall_custody__', $__recall_reference_key, [], type::thing('recall_reference_key', $__recall_journal_identity)); LET $hold_key_fingerprint = $hold_key_tokens[0];");
+        for (index, space) in spaces.iter().enumerate() {
+            bindings.insert(
+                format!("hold_guard_{index}_id"),
+                crate::source_publication::control_thing("source_erasure_guard", space).into(),
+            );
+            bindings.insert(format!("hold_space_{index}"), space.clone().into());
+            writeln!(sql, "LET $hold_guard_before_{index} = SELECT * FROM ONLY $hold_guard_{index}_id; IF $hold_guard_before_{index} != NONE AND ($hold_guard_before_{index}.space_id != $hold_space_{index} OR $hold_guard_before_{index}.journal_id != $__recall_journal_identity OR $hold_guard_before_{index}.key_fingerprint != $hold_key_fingerprint OR $hold_guard_before_{index}.version != 1 OR $hold_guard_before_{index}.membership_count != 0 OR $hold_guard_before_{index}.erasure_reservation != NONE OR !type::is::int($hold_guard_before_{index}.revision) OR $hold_guard_before_{index}.revision < 0) {{ THROW 'historical_hold_guard_changed'; }}; IF array::len(SELECT VALUE id FROM source_erasure_membership WHERE space_id = $hold_space_{index}) != 0 {{ THROW 'historical_hold_memberships_present'; }};").map_err(invalid)?;
+        }
+        append_historical_hold_rows(&mut sql, &mut bindings, originals, prepared)?;
+        for (index, space) in spaces.iter().enumerate() {
+            let increments = prepared
+                .iter()
+                .enumerate()
+                .filter(|(_, (work, _, _, _))| &work.base.space_id == space)
+                .map(|(i, _)| format!("(IF $origin_before_{i} = NONE THEN 1 ELSE 0 END)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Each array element has fixed expression depth even at the 256-row bound.
+            let increments = format!("math::sum([{increments}])");
+            writeln!(sql, "LET $hold_guard_base_{index} = IF $hold_guard_before_{index} = NONE THEN {{id:$hold_guard_{index}_id,space_id:$hold_space_{index},journal_id:$__recall_journal_identity,key_fingerprint:$hold_key_fingerprint,version:1,membership_count:0,revision:0}} ELSE $hold_guard_before_{index} END; LET $hold_guard_expected_{index} = object::from_entries(array::concat(array::filter(object::entries($hold_guard_base_{index}), |$entry| $entry[0] != 'revision'), [['revision', $hold_guard_base_{index}.revision + {increments}]])); IF (SELECT * FROM ONLY $hold_guard_{index}_id) != $hold_guard_expected_{index} {{ THROW 'historical_hold_guard_effect_differs'; }};").map_err(invalid)?;
+        }
+        sql.push_str("RETURN [");
+        for index in 0..prepared.len() {
+            if index > 0 {
+                sql.push(',');
+            }
+            write!(sql, "{{table:'work_producer_origin',id:type::string($origin_inventory_{index}),before_sha256:$origin_before_{index},after_sha256:(SELECT VALUE crypto::sha256(type::string($this)) FROM ONLY $origin_inventory_{index})}}").map_err(invalid)?;
+        }
+        for index in 0..spaces.len() {
+            write!(sql, ",{{table:'source_erasure_guard',id:type::string($hold_guard_{index}_id),before_sha256:IF $hold_guard_before_{index} = NONE THEN NONE ELSE crypto::sha256(type::string($hold_guard_before_{index})) END,after_sha256:(SELECT VALUE crypto::sha256(type::string($this)) FROM ONLY $hold_guard_{index}_id)}}").map_err(invalid)?;
+        }
+        sql.push_str("]; COMMIT TRANSACTION;");
+        self.client.require_transfer_custody()?;
+        let mut response = self.client.query_bind_checked(&sql, bindings).await?;
+        let result_index = response
+            .num_statements()
+            .checked_sub(1)
+            .ok_or_else(changed)?;
+        let effects: Vec<HistoricalHoldEffect> = response.take(result_index).map_err(invalid)?;
+        validate_historical_hold_effects(&effects, prepared, &spaces)?;
+        Ok(effects)
     }
 
     /// Read the exact actual hot/archive work's immutable origin. Missing is Unknown.
@@ -366,6 +868,17 @@ impl WorkProducerRepository {
     }
 
     async fn read_envelope(&self, observed: &WorkItem) -> StorageResult<Option<OriginEnvelope>> {
+        let row = self.read_origin_envelope(observed).await?;
+        if let Some(envelope) = &row {
+            envelope.verify(observed)?;
+        }
+        Ok(row)
+    }
+
+    async fn read_origin_envelope(
+        &self,
+        observed: &WorkItem,
+    ) -> StorageResult<Option<OriginEnvelope>> {
         if let Some(store) = self.client.embedded_store() {
             return crate::private_control_read::payload(
                 &store,
@@ -376,7 +889,7 @@ impl WorkProducerRepository {
             .await?
             .map(|payload| {
                 let envelope: OriginEnvelope = serde_json::from_str(&payload).map_err(invalid)?;
-                envelope.verify(observed)?;
+                envelope.verify_identity(observed)?;
                 Ok(envelope)
             })
             .transpose();
@@ -389,7 +902,7 @@ impl WorkProducerRepository {
             return Ok(None);
         };
         let envelope: OriginEnvelope = serde_json::from_str(&row.payload).map_err(invalid)?;
-        envelope.verify(observed)?;
+        envelope.verify_identity(observed)?;
         Ok(Some(envelope))
     }
 }
@@ -488,7 +1001,10 @@ fn append_origin_check(
         format!("{prefix}_origin_space"),
         envelope.space_id.clone().into(),
     );
-    let _ = writeln!(sql,"LET ${prefix}_origin_read = SELECT * FROM ONLY ${prefix}_origin_id; IF !recall::original_row_matches(${prefix}_origin_read, ${prefix}_origin_space, {{payload:${prefix}_origin_payload}}) {{ THROW 'work_producer_origin_changed_or_unknown'; }};");
+    let _ = writeln!(
+        sql,
+        "LET ${prefix}_origin_read = SELECT * FROM ONLY ${prefix}_origin_id; IF !recall::original_row_matches(${prefix}_origin_read, ${prefix}_origin_space, {{payload:${prefix}_origin_payload}}) {{ THROW 'work_producer_origin_changed_or_unknown'; }};"
+    );
     Ok(())
 }
 
@@ -617,6 +1133,10 @@ mod enqueue;
 #[path = "work_producer_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "historical_work_hold_tests.rs"]
+mod historical_work_hold_tests;
+
 /// Retained queue reactivation must retain actual private origin evidence.
 pub(crate) fn check_existing_work_origin_tx(
     tx: &EmbeddedMutation<'_>,
@@ -654,3 +1174,83 @@ pub(crate) use parent::{
 pub use parent::{
     verify_reprocess_execution_parent, PreparedReprocessParent, ReprocessExecutionOrigin,
 };
+
+/// Prepare an S1 Unknown envelope while retaining a cryptographic link to the
+/// original held payload. The caller must CAS the full origin and work images.
+#[cfg(test)]
+pub(crate) fn historical_catchup_envelope(
+    before: Option<&WorkItem>,
+    after: Option<&WorkItem>,
+    original_payload: Option<&str>,
+    spaces: (&str, &str),
+    snapshots: (&str, &str),
+    after_original_hash: Option<&str>,
+) -> StorageResult<Option<(String, Vec<RecordId>)>> {
+    historical_catchup_envelope_with_lineage(
+        before,
+        after,
+        original_payload,
+        spaces,
+        snapshots,
+        after_original_hash,
+        None,
+    )
+}
+
+/// Preserve a truthfully older hold only with storage-verified exact predecessor
+/// evidence. The proof never changes the Unknown producer or dispatch admission.
+pub(crate) fn historical_catchup_envelope_with_lineage(
+    before: Option<&WorkItem>,
+    after: Option<&WorkItem>,
+    original_payload: Option<&str>,
+    spaces: (&str, &str),
+    snapshots: (&str, &str),
+    after_original_hash: Option<&str>,
+    inherited: Option<&crate::client::historical_catchup::completion::VerifiedHistoricalControl>,
+) -> StorageResult<Option<(String, Vec<RecordId>)>> {
+    use sha2::Digest as _;
+    let (source_space, target_space) = spaces;
+    let (before_snapshot, after_snapshot) = snapshots;
+    let previous = match (before, original_payload) {
+        (Some(work), Some(payload)) => {
+            let old: OriginEnvelope = serde_json::from_str(payload).map_err(invalid)?;
+            old.verify_identity(work)?;
+            let proof = old.historical_transfer.as_ref().ok_or_else(changed)?;
+            if old.origin != WorkProducerOrigin::Unknown
+                || old.intent_fingerprint != work_intent_fingerprint(work)?
+                || proof.source_space_id != source_space
+                || proof.target_space_id != target_space
+                || (proof.snapshot_sha256 != before_snapshot
+                    && !inherited
+                        .is_some_and(|proof| proof.matches_work_payload(&work.base.id, payload)))
+            {
+                return Err(changed());
+            }
+            Some(hex::encode(sha2::Sha256::digest(payload.as_bytes())))
+        }
+        (None, None) => None,
+        _ => return Err(changed()),
+    };
+    let Some(work) = after else {
+        return Ok(None);
+    };
+    let hash = after_original_hash.ok_or_else(changed)?;
+    if !valid_transfer_digest(hash)
+        || !valid_transfer_digest(after_snapshot)
+        || work.base.space_id != target_space
+    {
+        return Err(changed());
+    }
+    let mut envelope = OriginEnvelope::new(work, WorkProducerOrigin::Unknown, &[])?;
+    envelope.historical_transfer = Some(HistoricalTransferProof {
+        version: 2,
+        snapshot_sha256: after_snapshot.into(),
+        original_row_sha256: hash.into(),
+        hash_domain: "recall-historical-runtime-row/v1".into(),
+        source_space_id: source_space.into(),
+        target_space_id: target_space.into(),
+        previous_hold_sha256: previous,
+    });
+    envelope.verify_identity(work)?;
+    Ok(Some((envelope.payload()?, envelope.source_ids)))
+}

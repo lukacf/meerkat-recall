@@ -15,7 +15,7 @@ use crate::client::StorageClient;
 use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 
-const WORK_ARTIFACT_PROJECTION: &str = r"
+pub(crate) const WORK_ARTIFACT_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -45,7 +45,7 @@ const WORK_ARTIFACT_PROJECTION: &str = r"
 
 /// Database-only proxy for WorkArtifact.
 #[derive(Deserialize)]
-struct WorkArtifactDb {
+pub(crate) struct WorkArtifactDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

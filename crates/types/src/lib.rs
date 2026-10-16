@@ -16,6 +16,7 @@ pub mod publication_wire;
 pub mod records;
 pub mod rendered_text;
 pub mod space_grant;
+pub mod summary_policy;
 pub mod validation;
 
 pub use base_fields::BaseFieldsBuilder;

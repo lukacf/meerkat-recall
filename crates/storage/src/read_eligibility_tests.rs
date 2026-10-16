@@ -53,6 +53,7 @@ fn proof<T: Serialize>(base: &BaseFields, record: &T, independent: bool) -> Sour
         source_id: RecordId::new_v4(TableName::Source),
         source_revision: "pure-comparison-only".into(),
         record_id: base.id.clone(),
+        historical_unknown: None,
         independent,
         record_fingerprint: source_support_fingerprint(record).unwrap(),
     }
@@ -148,6 +149,12 @@ async fn client(embedded: bool) -> StorageClient {
         client
             .query_checked(include_str!(
                 "../../migrations/sql/031_source_publication.surql"
+            ))
+            .await
+            .unwrap();
+        client
+            .query_checked(include_str!(
+                "../../migrations/sql/046_source_support_index_fence.surql"
             ))
             .await
             .unwrap();

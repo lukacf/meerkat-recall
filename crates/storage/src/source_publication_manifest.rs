@@ -108,6 +108,9 @@ pub struct RequiredSourceEmbedding {
 /// enqueued. A conflicting retry cannot shrink, grow, or replace the set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourcePublicationManifest {
+    /// Explicit offline import proof; absent for every worker-produced plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_adoption: Option<crate::historical_adoption::HistoricalAdoptionProof>,
     /// Owning named space.
     pub space_id: String,
     /// Original acceptance authority.
@@ -158,6 +161,10 @@ pub struct SourcePublicationCompletion {
     /// Missing older proof is not equivalent to certified decision absence.
     #[serde(default)]
     pub published_progress: Option<PublishedSourceProgress>,
+    /// Current embedding coverage, separate from the original historical import.
+    #[serde(default)]
+    pub historical_embedding_coverage:
+        Option<crate::historical_embedding_coverage::HistoricalEmbeddingCoverage>,
     /// Time the canonical transaction completed all required effects.
     pub completed_at: DateTime<Utc>,
 }
@@ -202,6 +209,52 @@ impl SourcePublicationRequirements {
     }
 }
 
+fn set_operation_plan_tx(
+    tx: &mut EmbeddedMutation<'_>,
+    manifest: SourcePublicationManifest,
+    standing_watch: Option<&PreparedStandingSourceAuthority>,
+) -> StorageResult<SourcePublicationManifest> {
+    if let Some(authority) = standing_watch {
+        authority.check_tx(tx)?;
+    }
+    check_source_tx(tx, &manifest)?;
+    check_configuration_tx(tx, &manifest)?;
+    let key = manifest_key(&manifest.space_id, &manifest.publication);
+    if let Some(existing) =
+        read_control_tx::<SourcePublicationManifest>(tx, MANIFEST_TABLE, &key, &manifest.space_id)?
+    {
+        if existing != manifest {
+            return Err(conflict("source_manifest_conflict"));
+        }
+        return Ok(existing);
+    }
+    check_plan_tx(tx, &manifest)?;
+    for id in &manifest.planning_artifact_ids {
+        let mut plan = tx
+            .get::<WorkArtifact>(&manifest.space_id, id, false)?
+            .ok_or_else(|| incomplete("extraction_plan_missing"))?;
+        if plan.status == ArtifactStatus::Draft {
+            plan.status = ArtifactStatus::Validated;
+            plan.validated_at = Some(Utc::now());
+            plan.base.updated_at = Utc::now();
+            tx.replace(plan)?;
+        }
+    }
+    for mapping in &manifest.documents {
+        write_mapping_tx(tx, mapping)?;
+    }
+    write_control_tx(
+        tx,
+        MANIFEST_TABLE,
+        &key,
+        &manifest.space_id,
+        &manifest.publication.source_id,
+        &manifest,
+    )?;
+    tx.advance_canonical_epoch(&manifest.space_id)?;
+    Ok(manifest)
+}
+
 /// Repository for durable fanout and historical source/evidence mapping.
 #[derive(Debug, Clone)]
 pub struct SourcePublicationManifestRepository {
@@ -223,6 +276,11 @@ impl SourcePublicationManifestRepository {
     ) -> StorageResult<SourcePublicationManifest> {
         manifest.normalize();
         manifest.validate()?;
+        if manifest.historical_adoption.is_some() {
+            return Err(integrity(
+                "historical adoption requires exclusive offline import",
+            ));
+        }
         let mut standing_watch = Box::pin(
             PreparedStandingWatchAuthority::capture_for_source_operation(
                 &self.client,
@@ -242,50 +300,7 @@ impl SourcePublicationManifestRepository {
         .await?;
         if let Some(store) = self.client.embedded_store() {
             return store
-                .mutate(|tx| {
-                    if let Some(authority) = &standing_watch {
-                        authority.check_tx(tx)?;
-                    }
-                    check_source_tx(tx, &manifest)?;
-                    check_configuration_tx(tx, &manifest)?;
-                    let key = manifest_key(&manifest.space_id, &manifest.publication);
-                    if let Some(existing) = read_control_tx::<SourcePublicationManifest>(
-                        tx,
-                        MANIFEST_TABLE,
-                        &key,
-                        &manifest.space_id,
-                    )? {
-                        if existing != manifest {
-                            return Err(conflict("source_manifest_conflict"));
-                        }
-                        return Ok(existing);
-                    }
-                    check_plan_tx(tx, &manifest)?;
-                    for id in &manifest.planning_artifact_ids {
-                        let mut plan = tx
-                            .get::<WorkArtifact>(&manifest.space_id, id, false)?
-                            .ok_or_else(|| incomplete("extraction_plan_missing"))?;
-                        if plan.status == ArtifactStatus::Draft {
-                            plan.status = ArtifactStatus::Validated;
-                            plan.validated_at = Some(Utc::now());
-                            plan.base.updated_at = Utc::now();
-                            tx.replace(plan)?;
-                        }
-                    }
-                    for mapping in &manifest.documents {
-                        write_mapping_tx(tx, mapping)?;
-                    }
-                    write_control_tx(
-                        tx,
-                        MANIFEST_TABLE,
-                        &key,
-                        &manifest.space_id,
-                        &manifest.publication.source_id,
-                        &manifest,
-                    )?;
-                    tx.advance_canonical_epoch(&manifest.space_id)?;
-                    Ok(manifest)
-                })
+                .mutate(|tx| set_operation_plan_tx(tx, manifest, standing_watch.as_ref()))
                 .await;
         }
 
@@ -774,6 +789,11 @@ impl SourcePublicationManifestRepository {
             .await?
             .ok_or_else(|| incomplete("manifest_missing"))?;
         manifest.validate()?;
+        if manifest.historical_adoption.is_some() {
+            return Err(integrity(
+                "historical adoption is not a worker finalization plan",
+            ));
+        }
         if manifest.space_id != space || manifest.publication != *publication {
             return Err(conflict("source_manifest_identity_mismatch"));
         }
@@ -998,6 +1018,9 @@ impl SourcePublicationManifest {
             .any(|s| s.trim().is_empty())
         {
             return Err(integrity("invalid source manifest identity"));
+        }
+        if let Some(proof) = &self.historical_adoption {
+            return proof.validate_manifest(self);
         }
         self.validate_unique_ids()?;
         self.validate_artifact_document_ids()?;
@@ -2779,6 +2802,7 @@ fn completion_for(
                 .ok_or_else(|| incomplete("original_published_progress_missing"))?
                 .certificate(manifest.mode)?,
         ),
+        historical_embedding_coverage: None,
         completed_at: Utc::now(),
     })
 }

@@ -18,7 +18,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 use crate::require::required_field;
 
-const CONFLICT_GROUP_PROJECTION: &str = r"
+pub(crate) const CONFLICT_GROUP_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -50,7 +50,7 @@ const CONFLICT_GROUP_PROJECTION: &str = r"
 
 /// Database-only proxy for ConflictGroup.
 #[derive(Deserialize)]
-struct ConflictGroupDb {
+pub(crate) struct ConflictGroupDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

@@ -40,6 +40,7 @@ pub struct Datastore {
 	db: NativeOwner,
 	options: Arc<Options>,
 	physical: Arc<physical_checkpoint::PhysicalState>,
+	background_flush: std::sync::Mutex<Option<BackgroundFlush>>,
 }
 /// Manages disk space monitoring and enforces space limits for the RocksDB datastore.
 ///
@@ -382,19 +383,22 @@ impl Datastore {
 			disk_space_manager: std::sync::RwLock::new(disk_space_manager),
 			_physical: physical.clone(),
 		});
-		if *cnf::ROCKSDB_BACKGROUND_FLUSH {
-			spawn_background_flush(
+		let background_flush = if *cnf::ROCKSDB_BACKGROUND_FLUSH {
+			Some(spawn_background_flush(
 				&db,
 				Duration::from_millis(*cnf::ROCKSDB_BACKGROUND_FLUSH_INTERVAL),
 				*cnf::SYNC_DATA,
-			);
-		}
+			))
+		} else {
+			None
+		};
 
 		// Return the datastore
 		Ok(Datastore {
 			db,
 			options: Arc::new(opts),
 			physical,
+			background_flush: std::sync::Mutex::new(background_flush),
 		})
 	}
 
@@ -453,6 +457,16 @@ impl Datastore {
 
 	/// Shutdown the database
 	pub(crate) async fn shutdown(&self) -> Result<(), Error> {
+		let background = self
+			.background_flush
+			.lock()
+			.map_err(|_| Error::Ds("native flush owner poisoned".into()))?
+			.take();
+		if let Some(background) = background {
+			tokio::task::spawn_blocking(move || background.stop())
+				.await
+				.map_err(|_| Error::Ds("native flush join owner failed".into()))??;
+		}
 		let current = self
 			.db
 			.current
@@ -466,13 +480,11 @@ impl Datastore {
 		// Wait for the sync to finish
 		opts.set_wait(true);
 		// Flush the WAL to storage
-		if let Err(e) = db.flush_wal(true) {
-			error!("An error occured flushing the WAL buffer to disk: {e}");
-		}
-		// Flush the memtables to SST
-		if let Err(e) = db.flush_opt(&opts) {
-			error!("An error occured flushing memtables to SST files: {e}");
-		}
+		db.flush_wal(true)
+			.map_err(|e| Error::Ds(format!("native shutdown WAL flush failed: {e}")))?;
+		// Flush the memtables to SST. A close acknowledgment must include this result.
+		db.flush_opt(&opts)
+			.map_err(|e| Error::Ds(format!("native shutdown memtable flush failed: {e}")))?;
 		// All good
 		Ok(())
 	}
@@ -609,14 +621,37 @@ impl Datastore {
 	}
 }
 
-fn spawn_background_flush(
-	native: &NativeOwner,
-	interval: Duration,
-	sync: bool,
-) -> thread::JoinHandle<()> {
+struct BackgroundFlush {
+	stop: std::sync::mpsc::Sender<()>,
+	join: Option<thread::JoinHandle<()>>,
+}
+impl BackgroundFlush {
+	fn stop(mut self) -> Result<(), Error> {
+		let _ = self.stop.send(());
+		if self.join.take().is_some_and(|join| join.join().is_err()) {
+			return Err(Error::Ds("native flush thread panicked".into()));
+		}
+		Ok(())
+	}
+}
+impl Drop for BackgroundFlush {
+	fn drop(&mut self) {
+		let _ = self.stop.send(());
+		// Fallback for failed initialization/ordinary drop. Awaitable close
+		// takes and joins this handle on a blocking owner before acknowledgment.
+		if self.join.take().is_some_and(|join| join.join().is_err()) {
+			error!("Native flush thread panicked during drop");
+		}
+	}
+}
+fn spawn_background_flush(native: &NativeOwner, interval: Duration, sync: bool) -> BackgroundFlush {
 	let current = Arc::downgrade(native);
-	thread::spawn(move || loop {
-		thread::sleep(interval);
+	let (stop, stopped) = std::sync::mpsc::channel();
+	let join = thread::spawn(move || loop {
+		match stopped.recv_timeout(interval) {
+			Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+		}
 		let Some(current) = current.upgrade() else {
 			break;
 		};
@@ -629,7 +664,11 @@ fn spawn_background_flush(
 		if let Err(err) = db.flush_wal(sync) {
 			error!("Failed to flush WAL: {err}");
 		}
-	})
+	});
+	BackgroundFlush {
+		stop,
+		join: Some(join),
+	}
 }
 
 impl Transaction {

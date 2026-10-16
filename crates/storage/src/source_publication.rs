@@ -124,8 +124,8 @@ pub struct SourceMutation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SourceIdentity {
-    source_id: RecordId,
+pub(crate) struct SourceIdentity {
+    pub(crate) source_id: RecordId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,10 +147,10 @@ pub(crate) struct StoredOperation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredRevision {
-    revision: SourceRevision,
-    operation_id: String,
-    input_fingerprint: String,
+pub(crate) struct StoredRevision {
+    pub(crate) revision: SourceRevision,
+    pub(crate) operation_id: String,
+    pub(crate) input_fingerprint: String,
 }
 
 /// Ephemeral result of the actual acceptance transaction, not operation state.
@@ -1268,21 +1268,6 @@ pub(crate) fn publication_error(error: StorageError) -> StorageError {
 }
 
 impl SourcePublicationRepository {
-    /// Reads provenance support without creating a second visibility authority.
-    pub async fn support_for_record(
-        &self,
-        space: &str,
-        record_id: &RecordId,
-    ) -> StorageResult<Vec<crate::canonical_commit::SourceEffectSupport>> {
-        let rows: Vec<crate::canonical_commit::SourceEffectSupport> = self
-            .list_controls("source_effect_support", Some(space))
-            .await?;
-        Ok(rows
-            .into_iter()
-            .filter(|row| row.record_id == *record_id)
-            .collect())
-    }
-
     /// Trusted all-space recovery discovery, including accepted-but-never-enqueued work.
     pub async fn recoverable_operations(
         &self,
@@ -1340,7 +1325,28 @@ impl SourcePublicationRepository {
                 })
                 .await;
         }
-        self.client.query_checked("BEGIN TRANSACTION; UPDATE canonical_epoch SET epoch = <string>rand::uuid(); FOR $config IN (SELECT space_id FROM space_config) { UPSERT type::thing('canonical_epoch', $config.space_id) SET space_id = $config.space_id, epoch = <string>rand::uuid(); }; COMMIT TRANSACTION;").await?;
+        // The array-key global support fence has a distinct three-field shape.
+        // Rotate its nonce to invalidate pre-restore validation caches without
+        // adding a tenant epoch field or accepting a malformed original row.
+        self.client
+            .query_checked(
+                r"BEGIN TRANSACTION;
+LET $support_id = canonical_epoch:['recall_source_support_index',1];
+LET $support = (SELECT * FROM ONLY $support_id);
+IF $support != NONE {
+    IF !fn::recall_support_index_fence_valid($support) {
+        THROW 'source support index fence invalid before restore rotation';
+    };
+    UPDATE $support_id SET support_nonce = <string>rand::uuid();
+};
+UPDATE canonical_epoch SET epoch = <string>rand::uuid() WHERE id != $support_id;
+FOR $config IN (SELECT space_id FROM space_config) {
+    UPSERT type::thing('canonical_epoch', $config.space_id)
+        SET space_id = $config.space_id, epoch = <string>rand::uuid();
+};
+COMMIT TRANSACTION;",
+            )
+            .await?;
         Ok(())
     }
 
@@ -1453,6 +1459,12 @@ mod tests {
                 ))
                 .await
                 .expect("publication schema");
+            client
+                .query_checked(include_str!(
+                    "../../migrations/sql/046_source_support_index_fence.surql"
+                ))
+                .await
+                .expect("support lookup schema");
         }
         let config: SpaceConfig = serde_json::from_value(serde_json::json!({
             "id": RecordId::new_v4(TableName::SpaceConfig), "space_id":"business-a",
@@ -1765,6 +1777,7 @@ mod tests {
             bindings: std::collections::BTreeMap::default(),
             active_embedding_profile_id: None,
             pending_reindex: None,
+            completed_embedding_reindex: None,
         });
         let configured = config_repo
             .replace_authorized(&observed, configured)
@@ -2686,3 +2699,6 @@ mod producer_tests;
 #[cfg(test)]
 #[path = "source_document_guards_tests.rs"]
 mod document_guard_tests;
+
+#[path = "source_publication_support.rs"]
+mod support;

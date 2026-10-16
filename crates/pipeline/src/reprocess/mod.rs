@@ -1365,6 +1365,7 @@ mod tests {
                     bindings: Default::default(),
                     active_embedding_profile_id: None,
                     pending_reindex: None,
+                    completed_embedding_reindex: None,
                 }),
                 purpose: None,
                 skill: None,

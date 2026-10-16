@@ -2287,6 +2287,44 @@ impl SearchRepository<IdentityCandidate> for MockIdentityCandidateRepository {
     }
 }
 
+/// Hold one entered native write on this storage client's real router datastore.
+/// The explicit feature enables a fixed vendor control, never arbitrary tasks.
+///
+/// # Errors
+/// Returns an error when no local SDK connection exists, admission is closed,
+/// or the fixed write owner fails before entering its transaction.
+#[cfg(feature = "test-utils")]
+pub async fn enter_local_close_write(
+    client: &crate::StorageClient,
+) -> StorageResult<(
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<surrealdb::Result<()>>,
+)> {
+    client
+        .db()
+        .ok_or_else(|| {
+            StorageError::Conflict("native close control requires local SurrealDB".into())
+        })?
+        .recall_test_enter_local_write()
+        .await
+        .map_err(Into::into)
+}
+
+/// Retain the native SDK handle independently of the storage ownership lock.
+/// Available only in the explicit test utility feature.
+///
+/// # Errors
+/// Returns an error for an embedded storage client without an SDK connection.
+#[cfg(feature = "test-utils")]
+pub fn local_close_sdk_handle(
+    client: &crate::StorageClient,
+) -> StorageResult<surrealdb::Surreal<surrealdb::engine::any::Any>> {
+    client
+        .db()
+        .cloned()
+        .ok_or_else(|| StorageError::Conflict("local close fixture requires SurrealDB".into()))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]

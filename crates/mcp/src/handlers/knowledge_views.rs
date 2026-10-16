@@ -1548,7 +1548,7 @@ impl ToolHandler for CompileWikiArticleHandler {
                 },
                 "writer_model": {
                     "type": "string",
-                    "description": "Optional Meerkat model override; defaults to ELEPHANT_WIKI_WRITER_MODEL, PIPELINE_AGENTIC_MODEL, then gpt-5.6-sol"
+                    "description": "Optional Meerkat model override; defaults to ELEPHANT_WIKI_WRITER_MODEL, PIPELINE_AGENTIC_MODEL, then gpt-6.1-sol"
                 },
                 "verifier_model": {
                     "type": "string",
@@ -2270,8 +2270,10 @@ mod tests {
     async fn native_wiki_writers_preserve_reservation_errors_without_publication() {
         let storage = StorageClient::new_memory().await.expect("native storage");
         storage
-            .query_checked(include_str!(
-                "../../../migrations/sql/031_source_publication.surql"
+            .query_checked(concat!(
+                include_str!("../../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../../migrations/sql/046_source_support_index_fence.surql")
             ))
             .await
             .expect("publication schema");

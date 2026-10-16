@@ -211,6 +211,7 @@ async fn publish_contact(
     accepted: &OperationReceipt,
 ) -> CanonicalCommitReceipt {
     let mut manifest = SourcePublicationManifest {
+        historical_adoption: None,
         space_id: SPACE.into(),
         publication: PublicationFence {
             source_id: accepted.source_id.clone(),
@@ -428,6 +429,7 @@ async fn corrupt_survivor_rolls_back_physical_purge_and_recovers_original_intent
                 bindings: BTreeMap::new(),
                 active_embedding_profile_id: None,
                 pending_reindex: None,
+                completed_embedding_reindex: None,
             }),
             purpose: None,
             skill: None,

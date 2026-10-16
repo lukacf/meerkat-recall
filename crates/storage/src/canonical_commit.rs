@@ -435,6 +435,9 @@ pub struct CanonicalCommit {
 /// Complete artifact receipt, distinct from a fully searchable source operation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalCommitReceipt {
+    /// Present only for an actual custody-owned historical import transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_import: Option<crate::historical_adoption::HistoricalCommitProvenance>,
     /// Owning space.
     pub space_id: String,
     /// Stable complete-bundle identity.
@@ -686,6 +689,11 @@ pub struct SourceEffectSupport {
     pub source_revision: String,
     /// Canonical row supported by this revision.
     pub record_id: RecordId,
+    /// Imported payload has unknown independent/source ownership. Its exact
+    /// bytes may be read through the historical receipt, but destructive
+    /// replacement/erasure requires a separately proved baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_unknown: Option<crate::historical_adoption::HistoricalUnknownOwnership>,
     /// The row already had independently authoritative content before this source.
     pub independent: bool,
     /// Verified canonical content; a direct unverified mutation invalidates this proof.
@@ -850,6 +858,7 @@ impl CanonicalRepository {
             .as_ref()
             .map(|publication| publication.source.source_id.clone());
         let receipt = CanonicalCommitReceipt {
+            historical_import: None,
             space_id: request.space_id.clone(),
             commit_id: request.commit_id.clone(),
             input_fingerprint: request.input_fingerprint.clone(),
@@ -1780,6 +1789,12 @@ fn write_support_tx(
                 .and_then(crate::source_publication::decode_payload)
         })
         .collect::<StorageResult<_>>()?;
+    if prior
+        .iter()
+        .any(|support| support.historical_unknown.is_some())
+    {
+        return Err(conflict("source_write_historical_baseline_unresolved"));
+    }
     let created_by_decision = tx
         .scan_extension_rows(crate::source_decision::DECISION_TABLE)?
         .iter()
@@ -1820,6 +1835,7 @@ fn write_support_tx(
         source_id: source_id.clone(),
         source_revision: revision_id.to_owned(),
         record_id: row.base().id.clone(),
+        historical_unknown: None,
         independent,
         record_fingerprint: row.fingerprint()?,
         last_commit_id: Some(commit_id.to_owned()),
@@ -1858,6 +1874,7 @@ fn append_support(
         source_id: source_id.clone(),
         source_revision: revision_id.to_owned(),
         record_id: row.base().id.clone(),
+        historical_unknown: None,
         independent: false,
         record_fingerprint: row.fingerprint()?,
         last_commit_id: Some(commit_id.to_owned()),
@@ -1896,7 +1913,7 @@ fn append_support(
         .before
         .as_ref()
         .is_some_and(|row| row.base().deleted_at.is_none());
-    writeln!(sql, "LET ${prefix}_supports = SELECT * FROM source_effect_support WHERE space_id = $space AND record_id = ${prefix}_support_record;\nLET ${prefix}_decision_owners = SELECT id FROM source_decision_receipt WHERE space_id = $space AND ${prefix}_support_record IN array::map(state.effects, |$effect| IF $effect.before = NULL THEN $effect.after.record.id ELSE NONE END);\nLET ${prefix}_independent = (array::len(${prefix}_supports) = 0 AND array::len(${prefix}_decision_owners) = 0 AND {was_existing}) OR array::any(array::map(${prefix}_supports, |$support| $support.independent));\nUPSERT ${prefix}_support_id SET space_id = $space, source_id = ${prefix}_support_source, record_id = ${prefix}_support_record, source_revision = ${prefix}_support_revision, independent = ${prefix}_independent, payload = IF ${prefix}_independent THEN ${prefix}_support_independent_payload ELSE ${prefix}_support_dependent_payload END;").map_err(|error| crate::StorageError::DataIntegrityError(error.to_string()))?;
+    writeln!(sql, "LET ${prefix}_supports = SELECT * FROM source_effect_support WHERE space_id = $space AND record_id = ${prefix}_support_record;\nIF array::any(array::map(${prefix}_supports, |$support| $support.historical_unknown != NONE AND $support.historical_unknown != NULL)) {{ THROW 'source_write_historical_baseline_unresolved'; }};\nLET ${prefix}_decision_owners = SELECT id FROM source_decision_receipt WHERE space_id = $space AND ${prefix}_support_record IN array::map(state.effects, |$effect| IF $effect.before = NULL THEN $effect.after.record.id ELSE NONE END);\nLET ${prefix}_independent = (array::len(${prefix}_supports) = 0 AND array::len(${prefix}_decision_owners) = 0 AND {was_existing}) OR array::any(array::map(${prefix}_supports, |$support| $support.independent));\nUPSERT ${prefix}_support_id SET space_id = $space, source_id = ${prefix}_support_source, record_id = ${prefix}_support_record, source_revision = ${prefix}_support_revision, independent = ${prefix}_independent, payload = IF ${prefix}_independent THEN ${prefix}_support_independent_payload ELSE ${prefix}_support_dependent_payload END;").map_err(|error| crate::StorageError::DataIntegrityError(error.to_string()))?;
     Ok(())
 }
 
@@ -2104,7 +2121,7 @@ impl CanonicalRepository {
     }
 }
 
-fn canonical_plan_fingerprint(request: &CanonicalCommit) -> StorageResult<String> {
+pub(crate) fn canonical_plan_fingerprint(request: &CanonicalCommit) -> StorageResult<String> {
     let semantic = serde_json::json!({
         "source": request.publication.as_ref().map(|context| &context.source),
         "published_support": request.maintenance.as_ref().map(|context| &context.sources),
@@ -3021,7 +3038,7 @@ pub(crate) fn write_existing_support_tx(
         &support.source_revision,
         &support.record_id,
     );
-    tx.upsert_extension_row("source_effect_support",serde_json::json!({"id":format!("source_effect_support:{key}"),"space_id":support.space_id,"source_id":support.source_id.to_string(),"source_revision":support.source_revision,"record_id":support.record_id.to_string(),"independent":support.independent,"record_fingerprint":support.record_fingerprint,"payload":encode_payload(support)?}))?;
+    tx.upsert_extension_row("source_effect_support",serde_json::json!({"id":format!("source_effect_support:{key}"),"space_id":support.space_id,"source_id":support.source_id.to_string(),"source_revision":support.source_revision,"record_id":support.record_id.to_string(),"independent":support.independent,"record_fingerprint":support.record_fingerprint,"historical_unknown":support.historical_unknown,"payload":encode_payload(support)?}))?;
     Ok(())
 }
 
@@ -3041,7 +3058,7 @@ pub(crate) fn append_existing_support_sql(
         format!("{prefix}_id"),
         control_thing("source_effect_support", &key).into(),
     );
-    bindings.insert(format!("{prefix}_value"),crate::surreal::json_to_surreal(serde_json::json!({"space_id":support.space_id,"source_id":support.source_id.to_string(),"source_revision":support.source_revision,"record_id":support.record_id.to_string(),"independent":support.independent,"record_fingerprint":support.record_fingerprint,"payload":encode_payload(support)?}))?);
+    bindings.insert(format!("{prefix}_value"),crate::surreal::json_to_surreal(serde_json::json!({"space_id":support.space_id,"source_id":support.source_id.to_string(),"source_revision":support.source_revision,"record_id":support.record_id.to_string(),"independent":support.independent,"record_fingerprint":support.record_fingerprint,"historical_unknown":support.historical_unknown,"payload":encode_payload(support)?}))?);
     writeln!(sql, "UPSERT ${prefix}_id CONTENT ${prefix}_value;")
         .map_err(|error| crate::StorageError::DataIntegrityError(error.to_string()))?;
     Ok(())
@@ -3063,6 +3080,15 @@ impl CanonicalRepository {
             SourcePublicationRepository::new(self.client.clone())
                 .list_controls("source_effect_support", Some(&request.space_id))
                 .await?;
+        if request.plan.effects.iter().any(|effect| {
+            effect.row().is_ok_and(|row| {
+                supports.iter().any(|support| {
+                    support.record_id == row.base().id && support.historical_unknown.is_some()
+                })
+            })
+        }) {
+            return Err(conflict("source_write_historical_baseline_unresolved"));
+        }
         for observed in request.plan.dependencies.iter().chain(
             request
                 .plan

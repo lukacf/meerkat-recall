@@ -42,6 +42,8 @@ struct Input {
     expected_processing_generation: Option<u64>,
     target_profile_id: Option<String>,
     reindex_id: Option<String>,
+    #[serde(default)]
+    rebuild_current_profile: bool,
 }
 fn public(code: ErrorCode, message: &str) -> McpError {
     McpError::Public(PublicError::new(code, message))
@@ -78,14 +80,14 @@ impl ToolHandler for ReindexHandler {
     }
     fn description(&self) -> &'static str {
         match self.action {
-            ReindexAction::Start => "Start staged embedding reindex for an approved target profile in the selected space. The old profile stays active. Requires read/write:space_config, explicit manage:provider, and the current processing generation.\n\nExample:\n{\"space_id\":\"home\",\"expected_processing_generation\":1,\"target_profile_id\":\"local-384-v2\"}",
+            ReindexAction::Start => "Start staged embedding reindex for an approved target profile in the selected space. The old profile stays active. Use rebuild_current_profile:true only to explicitly rebuild the active profile; existing vectors keep their original identity. Requires read/write:space_config, explicit manage:provider, and the current processing generation.\n\nExample:\n{\"space_id\":\"home\",\"expected_processing_generation\":1,\"target_profile_id\":\"local-384-v2\"}",
             ReindexAction::Status => "Read the selected space's active embedding profile, processing generation, and pending reindex status. Requires read:space_config.\n\nExample:\n{\"space_id\":\"home\"}",
             ReindexAction::Activate => "Activate the pending embedding reindex only after complete coverage. Use the reindex_id and current processing generation returned by get_embedding_reindex. Requires read/write:space_config and explicit manage:provider.\n\nExample:\n{\"space_id\":\"home\",\"expected_processing_generation\":2,\"reindex_id\":\"reindex-from-status\"}",
             ReindexAction::Cancel => "Cancel the selected space's pending embedding reindex while retaining the active profile. Use the reindex_id and current processing generation returned by get_embedding_reindex. Requires read/write:space_config and explicit manage:provider.\n\nExample:\n{\"space_id\":\"home\",\"expected_processing_generation\":2,\"reindex_id\":\"reindex-from-status\"}",
         }
     }
     fn input_schema(&self) -> Value {
-        json!({"type":"object","required":["space_id"],"properties":{"space_id":{"type":"string"},"expected_processing_generation":{"type":"integer","minimum":0},"target_profile_id":{"type":"string"},"reindex_id":{"type":"string"}}})
+        json!({"type":"object","required":["space_id"],"properties":{"space_id":{"type":"string"},"expected_processing_generation":{"type":"integer","minimum":0},"target_profile_id":{"type":"string"},"reindex_id":{"type":"string"},"rebuild_current_profile":{"type":"boolean","default":false}}})
     }
     #[expect(
         clippy::significant_drop_tightening,
@@ -99,6 +101,12 @@ impl ToolHandler for ReindexHandler {
             return Err(public(
                 ErrorCode::ForbiddenSpace,
                 "Select this named space explicitly",
+            ));
+        }
+        if input.rebuild_current_profile && !matches!(self.action, ReindexAction::Start) {
+            return Err(public(
+                ErrorCode::InvalidRequest,
+                "rebuild_current_profile applies only to start",
             ));
         }
         let write = !matches!(self.action, ReindexAction::Status);
@@ -173,10 +181,14 @@ impl ToolHandler for ReindexHandler {
                     .ok_or_else(|| {
                         public(ErrorCode::InvalidRequest, "target_profile_id is required")
                     })?;
-                repository
-                    .start_embedding_reindex(&config, target)
-                    .await
-                    .map_err(storage_error)?
+                if input.rebuild_current_profile {
+                    repository
+                        .rebuild_active_embedding_profile(&config, target)
+                        .await
+                } else {
+                    repository.start_embedding_reindex(&config, target).await
+                }
+                .map_err(storage_error)?
             }
             ReindexAction::Activate => repository
                 .activate_embedding_reindex(

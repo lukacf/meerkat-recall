@@ -406,6 +406,7 @@ mod tests {
             model_version: "1".into(),
             dimensions: Some(3),
             preprocessing: "text-v1".into(),
+            summary: None,
         };
         Approval {
             space: ResolvedSpaceConfig {
@@ -431,6 +432,7 @@ mod tests {
                     )]),
                     active_embedding_profile_id: Some("p".into()),
                     pending_reindex: None,
+                    completed_embedding_reindex: None,
                 },
                 purpose: None,
                 skill: None,

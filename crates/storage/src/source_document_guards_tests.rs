@@ -363,6 +363,7 @@ async fn actual_manifest_observation_guard(embedded: bool) {
     // completed or registered a valid publication plan. The real source head
     // remains unchanged while this private observed payload appears/changes.
     let mut manifest = SourcePublicationManifest {
+        historical_adoption: None,
         space_id: "business-a".into(),
         publication: publication.clone(),
         mode: elephant_types::records::ingest::IngestMode::Metadata,

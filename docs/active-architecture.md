@@ -218,12 +218,12 @@ Key behavior:
   incoming type on reuse). Ambiguous or type-incompatible matches route to an
   LLM disambiguator (prompt `crates/pipeline/prompts/promotion_disambiguation.txt`,
   model from `PIPELINE_PROMOTION_DISAMBIGUATION_MODEL`, default
-  `claude-sonnet-4-5`, active when `ANTHROPIC_API_KEY` is set). Without an
+  `claude-sonnet-5-5`, active when `ANTHROPIC_API_KEY` is set). Without an
   adjudicating LLM the guard never false-merges: incompatible types create a
   new entity; multiple compatible matches reuse the earliest-created match
   with a warning.
 - Doc-tree section summaries use a real summarizer model
-  (`PIPELINE_SUMMARIZER_MODEL`, default `claude-sonnet-4-5`); summarization
+  (`PIPELINE_SUMMARIZER_MODEL`, default `claude-sonnet-5-5`); summarization
   failure falls back to truncation with a logged warning.
 - Legacy `commit_assertions -> resolve_assertions -> synthesize_rels_attrs`
   remains removed from the active worker.
@@ -447,7 +447,7 @@ Resolution (LLM adjudication is the primary path for real conflicts):
 - `TmContext` is the injection seam, constructed once in
   `bin/elephant-pipeline` and threaded through the TM entry points; library
   code reads no env vars. The adjudicator exists when `ANTHROPIC_API_KEY` is
-  set; model from `PIPELINE_TM_MODEL` (default `claude-sonnet-4-5`); prompt
+  set; model from `PIPELINE_TM_MODEL` (default `claude-sonnet-5-5`); prompt
   `crates/pipeline/prompts/tm_adjudication.txt`; meerkat structured output
   with a strict schema and retries.
 - Verdict decisions: `corroborate`, `single_winner`, `coexist`, `supersede`

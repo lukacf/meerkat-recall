@@ -22,6 +22,7 @@ license-file = "../../LICENSE"
 resolver = "2"
 
 [features]
+recall-close-test-utils = []
 # Public features
 default = ["protocol-ws", "rustls"]
 allocator = ["surrealdb-core/allocator"]
@@ -103,7 +104,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio-util = { workspace = true, features = ["compat"] }
+tokio-util = { workspace = true, features = ["compat", "rt"] }
 url.workspace = true
 
 # Optional crates

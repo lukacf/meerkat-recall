@@ -30,13 +30,12 @@ use recipe::ManagedWorkerRecipe;
 const CONFIG_DIR: &str = ".elephant";
 const CONFIG_FILE: &str = "elephant_config.toml";
 const DEFAULT_SNAPSHOT_PATH: &str = ".elephant/state.snapshot";
-// gpt-5.6-sol requires meerkat >= 0.8.11 (first catalog that carries it);
-// on older pins agent builds fail with "Cannot infer provider from model".
-// crates/pipeline/tests/model_catalog_pin.rs pins that resolution. Vision
-// capable (text+image input), 1.05M context, 128k max output - safe for both
-// the agentic extractor and the multimodal renderer.
-const DEFAULT_AGENTIC_MODEL: &str = "gpt-5.6-sol";
-const DEFAULT_MULTIMODAL_RENDER_MODEL: &str = "gpt-5.6-sol";
+// The pinned Meerkat 0.9.0 catalog resolves this model and its text/image
+// capabilities. Its OpenAI client uses Responses, required for GPT-6.1 tools.
+// crates/pipeline/tests/model_catalog_pin.rs checks these default capabilities.
+// Approved per-space profiles remain authoritative for actual model calls.
+const DEFAULT_AGENTIC_MODEL: &str = "gpt-6.1-sol";
+const DEFAULT_MULTIMODAL_RENDER_MODEL: &str = "gpt-6.1-sol";
 const DEFAULT_MULTIMODAL_RENDER_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_MULTIMODAL_INLINE_IMAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MULTIMODAL_INLINE_VIDEO_MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -2217,6 +2216,11 @@ timeout_secs = 30
         );
         assert_eq!(config.storage.backend, StorageBackendKind::ElephantDb);
         assert_eq!(config.budget, Budget::default());
+        assert_eq!(config.extractor.model, "fixture");
+        assert_eq!(config.multimodal.model, "gpt-6.1-sol");
+        assert_eq!(ExtractorSection::default().model, "gpt-6.1-sol");
+        let restored: ElephantConfig = toml::from_str(&toml::to_string(&config)?)?;
+        assert_eq!(restored.extractor.model, "fixture");
         Ok(())
     }
 
@@ -3443,6 +3447,7 @@ timeout_secs = 30
                     bindings: Default::default(),
                     active_embedding_profile_id: None,
                     pending_reindex: None,
+                    completed_embedding_reindex: None,
                 }),
                 purpose: None,
                 skill: None,

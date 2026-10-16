@@ -312,7 +312,18 @@ async fn native_read_nonces_populated_044_requires_explicit_upgrade() -> TestRes
     Box::pin(super::apply_schema(&client)).await?;
     super::verify_schema(&client).await?;
     let receipts = super::schema_receipts(&client).await?;
-    assert_eq!(receipts.len(), old_receipts.len() + 1);
+    assert_eq!(
+        receipts.len(),
+        files.len(),
+        "every registered migration applied"
+    );
+    for (name, sql) in &files[index..] {
+        assert_eq!(
+            receipts.get(*name),
+            Some(&super::checksum(sql)),
+            "each pending migration has its exact registered checksum"
+        );
+    }
     for (name, checksum) in old_receipts {
         assert_eq!(
             receipts.get(&name),

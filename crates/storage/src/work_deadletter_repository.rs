@@ -16,7 +16,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 use crate::require::required_field;
 
-const WORK_DEADLETTER_PROJECTION: &str = r"
+pub(crate) const WORK_DEADLETTER_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -45,7 +45,7 @@ const WORK_DEADLETTER_PROJECTION: &str = r"
 
 /// Database-only proxy for WorkDeadletter.
 #[derive(Deserialize)]
-struct WorkDeadletterDb {
+pub(crate) struct WorkDeadletterDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,
@@ -118,7 +118,9 @@ impl WorkDeadletterRepository {
     }
 
     /// Converts a WorkDeadletter to a SurrealDB value for insertion.
-    fn work_deadletter_to_value(item: &WorkDeadletter) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn work_deadletter_to_value(
+        item: &WorkDeadletter,
+    ) -> StorageResult<surrealdb::sql::Value> {
         use surrealdb::sql::Value;
         let mut object = crate::surreal::base_fields_to_object(&item.base)?;
         object.insert(

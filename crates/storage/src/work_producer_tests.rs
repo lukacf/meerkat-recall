@@ -172,7 +172,11 @@ async fn delete_origin(storage: &StorageClient, work: &WorkItem) {
 async fn producer_contract(storage: StorageClient) {
     if !storage.is_embedded() {
         for schema in [
-            include_str!("../../migrations/sql/031_source_publication.surql"),
+            concat!(
+                include_str!("../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../migrations/sql/046_source_support_index_fence.surql")
+            ),
             include_str!("../../migrations/sql/032_work_recovery.surql"),
             include_str!("../../migrations/sql/041_work_producer_origin.surql"),
         ] {
@@ -495,7 +499,11 @@ async fn native_standing_origin_guard_changes_nonce_without_rotating_semantic_ep
     use crate::standing_watch_repository::PreparedStandingSourceAuthority;
     let storage = Box::pin(StorageClient::new_memory()).await.expect("native");
     for schema in [
-        include_str!("../../migrations/sql/031_source_publication.surql"),
+        concat!(
+            include_str!("../../migrations/sql/031_source_publication.surql"),
+            "\n",
+            include_str!("../../migrations/sql/046_source_support_index_fence.surql")
+        ),
         include_str!("../../migrations/sql/032_work_recovery.surql"),
         include_str!("../../migrations/sql/039_private_reference_fence.surql"),
         include_str!("../../migrations/sql/041_work_producer_origin.surql"),

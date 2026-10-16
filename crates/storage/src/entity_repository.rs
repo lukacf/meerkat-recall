@@ -22,7 +22,7 @@ use crate::repository::{PaginatedResult, Repository, SearchCriteria, SearchRepos
 /// Metadata key carrying Angel protectee attribution on entities.
 const ANGEL_PROTECTEES_METADATA_KEY: &str = "angel_protectees";
 
-const ENTITY_PROJECTION: &str = r"
+pub(crate) const ENTITY_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -181,7 +181,7 @@ impl TryFrom<EntitySearchHitDb> for EntitySearchHit {
 
 /// Database-only proxy for Entity to avoid flatten/native enum issues.
 #[derive(Deserialize)]
-struct EntityDb {
+pub(crate) struct EntityDb {
     id: surrealdb::sql::Thing,
     space_id: String,
     created_at: chrono::DateTime<Utc>,

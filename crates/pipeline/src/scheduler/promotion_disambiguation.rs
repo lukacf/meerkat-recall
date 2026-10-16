@@ -84,7 +84,7 @@ pub struct PromotionDisambiguationConfig {
 impl Default for PromotionDisambiguationConfig {
     fn default() -> Self {
         Self {
-            model: "claude-sonnet-4-5".to_string(),
+            model: "claude-sonnet-5-5".to_string(),
         }
     }
 }
@@ -508,11 +508,11 @@ mod tests {
     fn test_config_with_model_override() {
         assert_eq!(
             PromotionDisambiguationConfig::with_model_override(None).model,
-            "claude-sonnet-4-5"
+            "claude-sonnet-5-5"
         );
         assert_eq!(
             PromotionDisambiguationConfig::with_model_override(Some("   ".to_string())).model,
-            "claude-sonnet-4-5"
+            "claude-sonnet-5-5"
         );
         assert_eq!(
             PromotionDisambiguationConfig::with_model_override(Some("claude-opus-4-8".to_string()))

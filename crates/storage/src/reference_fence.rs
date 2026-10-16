@@ -333,6 +333,12 @@ pub async fn install_native_reference_guards(
             "../../migrations/sql/043_native_read_fence.surql"
         ))
         .await?;
+    // Restored event definitions and cached validation must not survive restore.
+    client
+        .query_checked(include_str!(
+            "../../migrations/sql/046_source_support_index_fence.surql"
+        ))
+        .await?;
     let mut sql = String::new();
     let mut unique_tables = BTreeSet::new();
     unique_tables.extend(tables.iter());

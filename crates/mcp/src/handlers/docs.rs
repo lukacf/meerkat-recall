@@ -6757,6 +6757,9 @@ mod tests {
         // A common term must not walk every match: each extra page re-runs the
         // ranked query at a larger offset. 60 matches, k = 5: one page of 25.
         let storage = StorageClient::new_memory().await.expect("storage");
+        crate::retrieval_test_support::initialize_source_support(&storage)
+            .await
+            .expect("source-support schema");
         let doc_repo = DocRepository::new(storage.clone());
         for index in 0..60 {
             doc_repo

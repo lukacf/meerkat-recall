@@ -615,7 +615,7 @@ fn env_list(name: &str) -> Vec<String> {
 }
 
 fn default_disambiguation_model() -> String {
-    "claude-3-5-sonnet".to_string()
+    "claude-sonnet-5-5".to_string()
 }
 
 const fn default_disambiguation_max_tokens() -> usize {
@@ -694,7 +694,7 @@ fn default_maintenance_mcp_url() -> String {
 }
 
 fn default_multimodal_render_model() -> String {
-    "gpt-5.6-sol".to_string()
+    "gpt-6.1-sol".to_string()
 }
 
 const fn default_multimodal_render_timeout_secs() -> u64 {
@@ -718,7 +718,7 @@ const fn default_multimodal_inline_video_max_bytes() -> u64 {
 }
 
 fn default_maintenance_model() -> String {
-    "gpt-5.6-sol".to_string()
+    "gpt-6.1-sol".to_string()
 }
 
 const fn default_maintenance_poll_interval() -> u64 {
@@ -899,7 +899,11 @@ mod tests {
         assert!(config.promote.enabled);
         assert_eq!(config.embed.batch_size, 100);
         assert!((config.promote.confidence_threshold - 0.90).abs() < f64::EPSILON);
-        assert_eq!(config.multimodal.model, "gpt-5.6-sol");
+        assert_eq!(config.multimodal.model, "gpt-6.1-sol");
+        assert_eq!(config.maintenance.model, "gpt-6.1-sol");
+        assert_eq!(default_disambiguation_model(), "claude-sonnet-5-5");
+        assert_eq!(config.embed.model, "text-embedding-3-large");
+        assert_eq!(config.embed.dims, 3072);
         assert_eq!(config.multimodal.timeout_secs, 300);
         assert_eq!(config.multimodal.max_render_concurrent, 4);
     }

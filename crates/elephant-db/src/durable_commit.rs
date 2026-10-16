@@ -140,6 +140,8 @@ impl ElephantDb {
                         } else {
                             rows.remove(key)
                         };
+                        tx.state
+                            .refresh_source_support_index(table, key, previous.as_ref());
                         tx.undo_log.push(UndoEntry::ExtensionRow {
                             table_name: table.clone(),
                             row_key: key.clone(),

@@ -229,6 +229,7 @@ async fn authority(embedded: bool) {
     let key = crate::source_publication::head_key(space, &source.base.id);
     control(&client, "source_head", &key, space, &head).await;
     let receipt = CanonicalCommitReceipt {
+        historical_import: None,
         space_id: space.into(),
         commit_id: "original-commit".into(),
         input_fingerprint: "input".into(),
@@ -373,6 +374,7 @@ fn completion_requires_selected_document_and_revision_not_just_nonempty_maps() {
         doc_revision_id: RecordId::new_v4(TableName::DocRevision),
     };
     let mut completion = SourcePublicationCompletion {
+        historical_embedding_coverage: None,
         space_id: SPACES[0].into(),
         publication: selection.publication.clone(),
         manifest_digest: "original-manifest".into(),

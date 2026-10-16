@@ -383,20 +383,7 @@ impl Context<'_> {
                         && integer(fields, "sequence")? > 0,
                 )?;
             }
-            "outbox_checkpoint" => {
-                fields_exact(fields, &["id", "space_id", "consumer", "seq", "updated_at"])?;
-                let consumer = text(fields, "consumer")?;
-                require(
-                    !consumer.is_empty()
-                        && integer(fields, "seq")? >= 0
-                        && matches!(fields.get("updated_at"), Some(Value::Datetime(_)))
-                        && row.identity
-                            == control_thing(
-                                "outbox_checkpoint",
-                                &crate::outbox_checkpoint_repository::key(self.space, consumer),
-                            ),
-                )?;
-            }
+            "outbox_checkpoint" => return self.outbox_checkpoint(row),
             "space_grant" => {
                 fields_exact(fields, &["id", "space_id", "subject", "payload"])?;
                 let grant = payload::<elephant_types::space_grant::SpaceGrant>(fields)?;
@@ -416,6 +403,66 @@ impl Context<'_> {
             }
             _ => return Ok(false),
         }
+        Ok(true)
+    }
+
+    fn outbox_checkpoint(&self, row: &Row<'_>) -> StorageResult<bool> {
+        let fields = &row.fields;
+        if text(fields, "consumer")?
+            == crate::historical_archive_lifecycle::RESERVED_ARCHIVE_CONSUMER
+        {
+            crate::historical_archive_lifecycle::verify_retained_native_anchor(
+                self.journal,
+                self.space,
+                &row.identity,
+                fields,
+            )?;
+            return Ok(true);
+        }
+        let mut names = vec!["id", "space_id", "consumer", "seq", "updated_at"];
+        let consumer = text(fields, "consumer")?;
+        if let Some(proof) = fields.get("historical_baseline") {
+            names.push("historical_baseline");
+            require(crate::outbox_checkpoint_repository::HISTORICAL_CONSUMERS.contains(&consumer))?;
+            let Value::Object(proof) = proof else {
+                return Err(invalid());
+            };
+            fields_exact(
+                proof,
+                &[
+                    "version",
+                    "snapshot_sha256",
+                    "journal_id",
+                    "through_seq",
+                    "disposition",
+                ],
+            )?;
+            require(
+                integer(proof, "version")? == 1
+                    && text(proof, "journal_id")? == self.journal.identity()
+                    && integer(proof, "through_seq")? >= 0
+                    && integer(proof, "through_seq")? <= integer(fields, "seq")?
+                    && text(proof, "disposition")? == "historical_preserved_not_delivered",
+            )?;
+            let sha = text(proof, "snapshot_sha256")?;
+            require(
+                sha.len() == 64
+                    && sha
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            )?;
+        }
+        fields_exact(fields, &names)?;
+        require(
+            !consumer.is_empty()
+                && integer(fields, "seq")? >= 0
+                && matches!(fields.get("updated_at"), Some(Value::Datetime(_)))
+                && row.identity
+                    == control_thing(
+                        "outbox_checkpoint",
+                        &crate::outbox_checkpoint_repository::key(self.space, consumer),
+                    ),
+        )?;
         Ok(true)
     }
 
@@ -590,6 +637,31 @@ fn system(row: &Row<'_>, journal: &ErasureJournal) -> StorageResult<bool> {
     let fields = &row.fields;
     let table = row.identity.tb.as_str();
     match table {
+        "canonical_epoch"
+            if row.identity
+                == Thing::from((
+                    "canonical_epoch",
+                    Id::Array(
+                        vec![
+                            Value::from("recall_source_support_index"),
+                            Value::from(1i64),
+                        ]
+                        .into(),
+                    ),
+                )) =>
+        {
+            // This derived global index control is physically disjoint from
+            // every tenant epoch. Only the actual current 046 writer shape
+            // grants retention; historical versions receive no control proof.
+            if !row.native.current {
+                return Ok(false);
+            }
+            fields_exact(fields, &["id", "space_id", "support_nonce"])?;
+            require(
+                text(fields, "space_id")? == "__recall_source_support_index__"
+                    && canonical_uuid(text(fields, "support_nonce")?),
+            )?;
+        }
         "recall_durability" => {
             fields_exact(fields, &["id", "journal_id", "reference_key_fingerprint"])?;
             require(
@@ -904,6 +976,15 @@ fn migration_sql(name: &str) -> Option<&'static str> {
         )),
         "canonical_read_semantic_epoch" => Some(include_str!(
             "../../migrations/sql/045_canonical_read_semantic_epoch.surql"
+        )),
+        "source_support_index_fence" => Some(include_str!(
+            "../../migrations/sql/046_source_support_index_fence.surql"
+        )),
+        "historical_node_revision_lookup" => Some(include_str!(
+            "../../migrations/sql/047_historical_node_revision_lookup.surql"
+        )),
+        "historical_coverage_visibility" => Some(include_str!(
+            "../../migrations/sql/048_historical_coverage_visibility.surql"
         )),
         _ => None,
     }

@@ -807,6 +807,7 @@ fn approval(endpoint: String, revoked: Arc<AtomicBool>) -> Approval {
                 model_version: "fixed-control-v1".into(),
                 dimensions: Some(2),
                 preprocessing: "text-full-v2".into(),
+                summary: None,
             },
         },
         revoked,

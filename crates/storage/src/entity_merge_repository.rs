@@ -15,7 +15,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::{PaginatedResult, Repository, SearchCriteria, SearchRepository};
 use crate::require::required_field;
 
-const ENTITY_MERGE_PROJECTION: &str = r"
+pub(crate) const ENTITY_MERGE_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -44,7 +44,7 @@ const ENTITY_MERGE_PROJECTION: &str = r"
 
 /// Database-only proxy for `EntityMerge` to avoid flatten/native enum issues.
 #[derive(Deserialize)]
-struct EntityMergeDb {
+pub(crate) struct EntityMergeDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,
@@ -1398,8 +1398,10 @@ mod canonical_merge_tests {
         .unwrap();
         if !embedded {
             client
-                .query_checked(include_str!(
-                    "../../migrations/sql/031_source_publication.surql"
+                .query_checked(concat!(
+                    include_str!("../../migrations/sql/031_source_publication.surql"),
+                    "\n",
+                    include_str!("../../migrations/sql/046_source_support_index_fence.surql")
                 ))
                 .await
                 .unwrap();

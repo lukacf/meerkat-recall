@@ -14,6 +14,21 @@ use crate::canonical_commit::{source_support_fingerprint, CanonicalCommitReceipt
 use elephant_types::publication::SourceRevision;
 use std::fmt::Write as _;
 
+fn render_identity_matches(
+    mapping: &SourceDocumentMapping,
+    document: &Doc,
+    revision: &DocRevision,
+) -> bool {
+    let space = &mapping.space_id;
+    !(document.base.space_id != *space
+        || revision.base.space_id != *space
+        || document.base.id != mapping.doc_id
+        || revision.base.id != mapping.doc_revision_id
+        || revision.doc.id() != &mapping.doc_id
+        || document.source.as_ref().map(elephant_types::Link::id)
+            != Some(&mapping.publication.source_id))
+}
+
 fn source_control_key(manifest: &SourcePublicationManifest) -> String {
     stable_key(&[
         &manifest.space_id,
@@ -141,14 +156,7 @@ impl SourcePublicationManifestRepository {
         accepted: &SourceRevision,
     ) -> StorageResult<bool> {
         let space = &mapping.space_id;
-        if document.base.space_id != *space
-            || revision.base.space_id != *space
-            || document.base.id != mapping.doc_id
-            || revision.base.id != mapping.doc_revision_id
-            || revision.doc.id() != &mapping.doc_id
-            || document.source.as_ref().map(elephant_types::Link::id)
-                != Some(&mapping.publication.source_id)
-        {
+        if !render_identity_matches(mapping, document, revision) {
             return Ok(false);
         }
         let Some(manifest) = self.get(space, &mapping.publication).await? else {
@@ -170,9 +178,14 @@ impl SourcePublicationManifestRepository {
         let Some(completion) = self.completion(space, &mapping.publication).await? else {
             return Ok(false);
         };
-        let expected_commit = format!(
-            "source-publication:{}",
-            manifest_key(space, &mapping.publication)
+        let expected_commit = manifest.historical_adoption.as_ref().map_or_else(
+            || {
+                format!(
+                    "source-publication:{}",
+                    manifest_key(space, &mapping.publication)
+                )
+            },
+            |proof| proof.commit_id(&manifest),
         );
         let expected_documents: BTreeSet<_> =
             manifest.documents.iter().map(|item| &item.doc_id).collect();
@@ -219,11 +232,54 @@ impl SourcePublicationManifestRepository {
         else {
             return Ok(false);
         };
+        match &manifest.historical_adoption {
+            Some(proof) => {
+                if receipt.historical_import.as_ref()
+                    != Some(
+                        &crate::historical_adoption::HistoricalCommitProvenance::for_manifest(
+                            &manifest,
+                        )?,
+                    )
+                    || !proof.document_matches(mapping, document, revision, accepted)?
+                {
+                    return Ok(false);
+                }
+            }
+            None if receipt.historical_import.is_some() => return Ok(false),
+            None => {}
+        }
         Ok(receipt.space_id == *space
             && receipt.commit_id == completion.commit_id
             && receipt.publication_authority.as_ref() == Some(&mapping.publication)
             && receipt.source_id.as_ref() == Some(&mapping.publication.source_id)
             && receipt.source_revision.as_ref() == Some(&mapping.publication.revision_id))
+    }
+    /// Return original input only after verifying the exact publication proof.
+    /// Historical groups bind original input separately for each document.
+    pub async fn verified_original_document_text(
+        &self,
+        mapping: &SourceDocumentMapping,
+        document: &Doc,
+        revision: &DocRevision,
+        accepted: &SourceRevision,
+    ) -> StorageResult<Option<String>> {
+        if !self
+            .completed_document_revision_is_current(mapping, document, revision, accepted)
+            .await?
+        {
+            return Ok(None);
+        }
+        let Some(manifest) = self.get(&mapping.space_id, &mapping.publication).await? else {
+            return Ok(None);
+        };
+        if manifest.historical_adoption.is_some() {
+            return Ok(Some(document.text.clone()));
+        }
+        accepted
+            .source
+            .manual_doc_template()
+            .map(|template| template.map(|input| input.text))
+            .map_err(|_| integrity("invalid accepted original document input"))
     }
 }
 

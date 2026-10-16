@@ -10,6 +10,8 @@
 //! - Budget enforcement (§6.2, §17)
 //! - Progressive ingestion triage (§6.3)
 
+mod action_disposition_proposals;
+pub use action_disposition_proposals::StagedActionDispositionProposal;
 pub mod budget;
 pub mod dag_executor;
 pub mod deadletter;
@@ -132,3 +134,5 @@ pub mod work_kinds {
 }
 
 mod ops;
+
+pub use source_stage::verify_action_proposal_producer;

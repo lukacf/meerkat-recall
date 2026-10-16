@@ -556,6 +556,7 @@ mod tests {
                 model_version: format!("sha256:{digest}"),
                 dimensions: Some(384),
                 preprocessing: preprocessing.into(),
+                summary: None,
             },
         };
         Fixture { root, binding }

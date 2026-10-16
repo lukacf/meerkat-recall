@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::fmt::Write as _;
 
 use elephant_types::records::base::{BaseFields, Provenance, Security, SubjectsState};
 use elephant_types::records::entity::Entity;
@@ -31,10 +32,14 @@ mod queue_index_tests;
 // An OR expression forces SurrealDB 2.6.5 to scan the whole table even
 // with an indexed status predicate. array::any preserves the same boolean
 // condition while letting the planner use the selective queue index.
+#[cfg(test)]
 const RUNNABLE_WORK_FILTER: &str = "status = $status AND deleted_at IS NONE AND array::any([run_after IS NONE, run_after <= time::now()])";
+#[cfg(test)]
 const RUNNING_COUNT_QUERY: &str = "SELECT count() AS count FROM work_item WHERE space_id = $space_id AND kind = $kind AND status = 'running' AND deleted_at IS NONE GROUP ALL";
+#[cfg(test)]
 const RUNNABLE_COUNT_QUERY: &str = "SELECT count() AS count FROM work_item WHERE status = 'runnable' AND deleted_at IS NONE AND array::any([run_after IS NONE, run_after <= time::now()]) GROUP ALL";
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct WorkCount {
     count: u64,
@@ -167,6 +172,15 @@ impl WorkItemRepository {
     #[must_use]
     pub const fn new(client: StorageClient) -> Self {
         Self { client }
+    }
+
+    /// Preserve historical work without inventing its original producer.
+    ///
+    /// # Errors
+    /// Requires exclusive backend-transfer custody and refuses existing hot,
+    /// archived or producer identities. The caller must reconcile the transfer.
+    pub async fn import_for_transfer(&self, record: WorkItem) -> StorageResult<WorkItem> {
+        crate::work_retention::import_item_for_transfer(&self.client, record).await
     }
 
     /// Converts a WorkItem to a SurrealDB value for insertion.
@@ -314,28 +328,138 @@ impl WorkItemRepository {
     ///
     /// Returns an error if the query fails.
     pub async fn get_runnable(&self, space_id: &str, limit: usize) -> StorageResult<Vec<WorkItem>> {
+        Ok(self
+            .schedulable_work(Some(space_id), None, WorkItemStatus::Runnable, limit, true)
+            .await?
+            .0)
+    }
+
+    /// Filter inert history before applying queue limits. Native keyset pages
+    /// preserve priority ordering without an ever-growing OFFSET or first-page starvation.
+    async fn schedulable_work(
+        &self,
+        space: Option<&str>,
+        kind: Option<&str>,
+        status: WorkItemStatus,
+        limit: usize,
+        collect: bool,
+    ) -> StorageResult<(Vec<WorkItem>, usize)> {
+        let mut selected = Vec::new();
+        let mut count = 0usize;
+        if limit == 0 {
+            return Ok((selected, count));
+        }
         let now = Utc::now();
         if let Some(store) = self.client.embedded_store() {
-            return store
-                .work_items_by_status(space_id, WorkItemStatus::Runnable, None, limit, Some(now))
-                .await;
+            let mut candidates: Vec<_> = store
+                .scan::<WorkItem>()
+                .await?
+                .into_iter()
+                .filter(|item| {
+                    item.base.deleted_at.is_none()
+                        && item.status == status
+                        && space.is_none_or(|value| item.base.space_id == value)
+                        && kind.is_none_or(|value| item.kind == value)
+                        && (status != WorkItemStatus::Runnable || Self::is_runnable_now(item, now))
+                })
+                .collect();
+            sort_work_items(&mut candidates);
+            for chunk in candidates.chunks(256) {
+                let allowed =
+                    crate::work_producer_repository::schedulable_ids(&self.client, chunk).await?;
+                for item in chunk {
+                    if allowed.contains(&item.base.id) {
+                        count = count.checked_add(1).ok_or_else(|| {
+                            StorageError::QueryError("Work count overflow".into())
+                        })?;
+                        if collect {
+                            selected.push(item.clone());
+                        }
+                        if count == limit {
+                            return Ok((selected, count));
+                        }
+                    }
+                }
+            }
+            return Ok((selected, count));
         }
+        let mut cursor: Option<(i32, DateTime<Utc>, RecordId)> = None;
+        loop {
+            let (filter, bindings) =
+                Self::schedulable_page_filter(space, kind, status, now, cursor.as_ref());
+            let mut response = self.client.query_bind_checked(&format!(
+                "SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE {filter} ORDER BY priority DESC, created_at ASC, id ASC LIMIT 256"
+            ), bindings).await?;
+            let page: Vec<WorkItemDb> = response.take(0).map_err(|error| {
+                StorageError::QueryError(format!("Invalid queue page: {error}"))
+            })?;
+            let more = page.len() == 256;
+            let page: Vec<WorkItem> = page
+                .into_iter()
+                .map(WorkItem::try_from)
+                .collect::<StorageResult<_>>()?;
+            let allowed =
+                crate::work_producer_repository::schedulable_ids(&self.client, &page).await?;
+            for item in page {
+                cursor = Some((item.priority, item.base.created_at, item.base.id.clone()));
+                if allowed.contains(&item.base.id) {
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| StorageError::QueryError("Work count overflow".into()))?;
+                    if collect {
+                        selected.push(item);
+                    }
+                    if count == limit {
+                        return Ok((selected, count));
+                    }
+                }
+            }
+            if !more {
+                return Ok((selected, count));
+            }
+        }
+    }
 
-        let mut response = self
-            .client
-            .query_bind_checked(
-                &format!(
-                    "SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE space_id = $space_id AND status = 'runnable' AND deleted_at IS NONE AND array::any([run_after IS NONE, run_after <= time::now()]) ORDER BY priority DESC, created_at ASC LIMIT {limit}"
-                ),
-                crate::bindings! { "space_id" => space_id },
-            )
-            .await?;
-
-        let items: Vec<WorkItemDb> = response
-            .take(0)
-            .map_err(|e| StorageError::QueryError(format!("Failed to parse work_items: {e}")))?;
-
-        items.into_iter().map(WorkItem::try_from).collect()
+    fn schedulable_page_filter(
+        space: Option<&str>,
+        kind: Option<&str>,
+        status: WorkItemStatus,
+        now: DateTime<Utc>,
+        cursor: Option<&(i32, DateTime<Utc>, RecordId)>,
+    ) -> (
+        String,
+        std::collections::BTreeMap<String, surrealdb::sql::Value>,
+    ) {
+        let mut filter = "status = $status AND deleted_at IS NONE".to_string();
+        let mut bindings = crate::bindings! { "status" => status.to_string() };
+        if status == WorkItemStatus::Runnable {
+            filter.push_str(" AND array::any([run_after IS NONE, run_after <= $now])");
+            bindings.insert(
+                "now".into(),
+                crate::surreal::datetime_from_chrono(now).into(),
+            );
+        }
+        if let Some(space) = space {
+            filter.push_str(" AND space_id = $space");
+            bindings.insert("space".into(), space.into());
+        }
+        if let Some(kind) = kind {
+            filter.push_str(" AND kind = $kind");
+            bindings.insert("kind".into(), kind.into());
+        }
+        if let Some((priority, created, id)) = cursor {
+            filter.push_str(" AND array::any([priority < $priority, priority = $priority AND created_at > $created, priority = $priority AND created_at = $created AND id > $after])");
+            bindings.insert("priority".into(), (*priority).into());
+            bindings.insert(
+                "created".into(),
+                crate::surreal::datetime_from_chrono(*created).into(),
+            );
+            bindings.insert(
+                "after".into(),
+                crate::surreal::thing_from_record_id(id).into(),
+            );
+        }
+        (filter, bindings)
     }
 
     /// Updates the status of a work item.
@@ -524,36 +648,10 @@ impl WorkItemRepository {
     ///
     /// Returns an error if the query fails.
     pub async fn find_runnable_all_spaces(&self, limit: usize) -> StorageResult<Vec<WorkItem>> {
-        let now = Utc::now();
-        if let Some(store) = self.client.embedded_store() {
-            let mut items: Vec<_> = store
-                .scan::<WorkItem>()
-                .await?
-                .into_iter()
-                .filter(|item| item.base.deleted_at.is_none() && Self::is_runnable_now(item, now))
-                .collect();
-            sort_work_items(&mut items);
-            if items.len() > limit {
-                items.truncate(limit);
-            }
-            return Ok(items);
-        }
-
-        let mut response = self
-            .client
-            .query_bind_checked(
-                &format!(
-                    "SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE {RUNNABLE_WORK_FILTER} ORDER BY priority DESC, created_at ASC LIMIT {limit}"
-                ),
-                crate::bindings! { "status" => WorkItemStatus::Runnable.to_string() },
-            )
-            .await?;
-
-        let items: Vec<WorkItemDb> = response
-            .take(0)
-            .map_err(|e| StorageError::QueryError(format!("Failed to parse work_items: {e}")))?;
-
-        items.into_iter().map(WorkItem::try_from).collect()
+        Ok(self
+            .schedulable_work(None, None, WorkItemStatus::Runnable, limit, true)
+            .await?
+            .0)
     }
 
     /// Finds runnable work items for a specific kind across all spaces, ordered by priority.
@@ -566,47 +664,10 @@ impl WorkItemRepository {
         kind: &str,
         limit: usize,
     ) -> StorageResult<Vec<WorkItem>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let now = Utc::now();
-        if let Some(store) = self.client.embedded_store() {
-            let mut items: Vec<_> = store
-                .scan::<WorkItem>()
-                .await?
-                .into_iter()
-                .filter(|item| {
-                    item.base.deleted_at.is_none()
-                        && item.kind == kind
-                        && Self::is_runnable_now(item, now)
-                })
-                .collect();
-            sort_work_items(&mut items);
-            if items.len() > limit {
-                items.truncate(limit);
-            }
-            return Ok(items);
-        }
-
-        let mut response = self
-            .client
-            .query_bind_checked(
-                &format!(
-                    "SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE status = $status AND kind = $kind AND deleted_at IS NONE AND array::any([run_after IS NONE, run_after <= time::now()]) ORDER BY priority DESC, created_at ASC LIMIT {limit}"
-                ),
-                crate::bindings! {
-                    "status" => WorkItemStatus::Runnable.to_string(),
-                    "kind" => kind,
-                },
-            )
-            .await?;
-
-        let items: Vec<WorkItemDb> = response
-            .take(0)
-            .map_err(|e| StorageError::QueryError(format!("Failed to parse work_items: {e}")))?;
-
-        items.into_iter().map(WorkItem::try_from).collect()
+        Ok(self
+            .schedulable_work(None, Some(kind), WorkItemStatus::Runnable, limit, true)
+            .await?
+            .0)
     }
 
     /// Finds work items by status and kind.
@@ -771,6 +832,9 @@ impl WorkItemRepository {
                                 WorkItemStatus::Runnable | WorkItemStatus::Pending
                             )
                             || !payload_matches_mode(&item.payload, mode)
+                            || !crate::work_producer_repository::may_claim_or_recover_tx(
+                                mutation, &item,
+                            )?
                         {
                             continue;
                         }
@@ -785,33 +849,53 @@ impl WorkItemRepository {
                 .await;
         }
 
-        let mut response = self
-            .client
-            .query_bind_checked(
-                r"UPDATE work_item SET run_after = $run_after, updated_at = time::now()
-                  WHERE space_id = $space_id
-                    AND deleted_at IS NONE
-                    AND (status = 'runnable' OR status = 'pending')
-                    AND (
-                        payload.mode = $mode
-                        OR payload.target_mode = $mode
-                        OR payload.ingest_mode = $mode
-                        OR payload.decided_mode = $mode
-                    )
-                  RETURN AFTER",
-                crate::bindings! {
-                    "space_id" => space_id,
-                    "run_after" => resume_at.to_rfc3339(),
-                    "mode" => mode.to_string(),
-                },
-            )
-            .await?;
-
-        let items: Vec<WorkItemDb> = response.take(0).map_err(|e| {
-            StorageError::QueryError(format!("Failed to parse paused work_items: {e}"))
-        })?;
-
-        Ok(items.len())
+        let mut after: Option<RecordId> = None;
+        let mut count = 0usize;
+        loop {
+            let cursor = if after.is_some() {
+                " AND id > $after"
+            } else {
+                ""
+            };
+            let mut bindings = crate::bindings! { "space" => space_id, "mode" => mode.to_string() };
+            if let Some(id) = &after {
+                bindings.insert(
+                    "after".into(),
+                    crate::surreal::thing_from_record_id(id).into(),
+                );
+            }
+            let mut response = self.client.query_bind_checked(&format!(
+                "SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE space_id=$space AND deleted_at IS NONE AND status IN ['runnable','pending'] AND array::any([payload.mode=$mode,payload.target_mode=$mode,payload.ingest_mode=$mode,payload.decided_mode=$mode]){cursor} ORDER BY id ASC LIMIT 256"
+            ), bindings).await?;
+            let page: Vec<WorkItemDb> = response.take(0).map_err(|error| {
+                StorageError::QueryError(format!("Invalid pause page: {error}"))
+            })?;
+            let has_next_page = page.len() == 256;
+            for row in page {
+                let original = WorkItem::try_from(row)?;
+                after = Some(original.base.id.clone());
+                let mut next = original.clone();
+                next.run_after = Some(resume_at);
+                if crate::work_retention::update_item_guarded(
+                    &self.client,
+                    space_id,
+                    &original.base.id,
+                    next,
+                    Some(original.status),
+                    Some(&original),
+                )
+                .await?
+                .is_some()
+                {
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| StorageError::QueryError("Pause count overflow".into()))?;
+                }
+            }
+            if !has_next_page {
+                return Ok(count);
+            }
+        }
     }
 
     /// Returns the most recently updated active work item of one kind,
@@ -922,41 +1006,18 @@ impl WorkItemRepository {
     ///
     /// Returns an error if the query fails or the count is missing.
     pub async fn count_running_by_kind(&self, space_id: &str, kind: &str) -> StorageResult<u32> {
-        if let Some(store) = self.client.embedded_store() {
-            let count = store
-                .scan::<WorkItem>()
-                .await?
-                .into_iter()
-                .filter(|item| {
-                    item.base.space_id == space_id
-                        && item.base.deleted_at.is_none()
-                        && item.kind == kind
-                        && item.status == WorkItemStatus::Running
-                })
-                .count();
-            return u32::try_from(count).map_err(|_| {
-                StorageError::QueryError("Running count exceeds u32 range".to_string())
-            });
-        }
-
-        let mut response = self
-            .client
-            .query_bind_checked(
-                RUNNING_COUNT_QUERY,
-                crate::bindings! { "space_id" => space_id, "kind" => kind },
+        let count = self
+            .schedulable_work(
+                Some(space_id),
+                Some(kind),
+                WorkItemStatus::Running,
+                usize::MAX,
+                false,
             )
-            .await?;
-
-        let rows: Vec<WorkCount> = response.take(0).map_err(|e| {
-            StorageError::QueryError(format!("Failed to parse work_item count: {e}"))
-        })?;
-
-        let Some(row) = rows.into_iter().next() else {
-            return Ok(0);
-        };
-
-        u32::try_from(row.count)
-            .map_err(|_| StorageError::QueryError("Running count exceeds u32 range".to_string()))
+            .await?
+            .1;
+        u32::try_from(count)
+            .map_err(|_| StorageError::QueryError("Running count exceeds u32 range".into()))
     }
 
     /// Counts all currently runnable work without the claim candidate limit.
@@ -966,23 +1027,10 @@ impl WorkItemRepository {
     ///
     /// Returns an error if the query fails or the count exceeds `usize`.
     pub async fn count_runnable(&self) -> StorageResult<usize> {
-        if let Some(store) = self.client.embedded_store() {
-            let now = Utc::now();
-            return Ok(store
-                .scan::<WorkItem>()
-                .await?
-                .into_iter()
-                .filter(|item| item.base.deleted_at.is_none() && Self::is_runnable_now(item, now))
-                .count());
-        }
-
-        let mut response = self.client.query_checked(RUNNABLE_COUNT_QUERY).await?;
-        let rows: Vec<WorkCount> = response.take(0).map_err(|error| {
-            StorageError::QueryError(format!("Failed to parse runnable work count: {error}"))
-        })?;
-        let count = rows.first().map_or(0, |row| row.count);
-        usize::try_from(count)
-            .map_err(|_| StorageError::QueryError("Runnable count exceeds usize range".to_string()))
+        Ok(self
+            .schedulable_work(None, None, WorkItemStatus::Runnable, usize::MAX, false)
+            .await?
+            .1)
     }
 
     /// Updates a work item only if it matches the expected status.
@@ -1036,6 +1084,9 @@ impl WorkItemRepository {
                         return Ok(None);
                     };
                     if existing.status != expected_status
+                        || !crate::work_producer_repository::may_claim_or_recover_tx(
+                            mutation, &existing,
+                        )?
                         || has_pending_dependencies(mutation, space_id, id)?
                     {
                         return Ok(None);
@@ -1057,11 +1108,28 @@ impl WorkItemRepository {
         // correlated WHERE on the archive table scans cold history in SurrealDB.
         // Pass the whole Thing to type::thing so native UUID identity survives;
         // meta::id would convert the UUID to a different string record ID.
-        let mut response = self
-            .client
-            .query_bind_checked(
-                &format!(
-                    "BEGIN TRANSACTION;
+        let Some(original) = self.get(space_id, id).await? else {
+            return Ok(None);
+        };
+        let mut sql = "BEGIN TRANSACTION;".to_string();
+        let mut bindings = crate::bindings! {
+            "id" => crate::surreal::thing_from_record_id(id), "space_id" => space_id, "space" => space_id,
+            "archive" => crate::surreal::thing_from_record_id(&crate::work_retention::archive_id(id)),
+            "status" => expected_status.to_string(), "dependency_status" => WorkItemStatus::Done.to_string(),
+            "record" => Self::work_item_to_value(&record)?,
+        };
+        if !crate::work_producer_repository::append_claim_or_recovery_guard(
+            &self.client,
+            &mut sql,
+            &mut bindings,
+            "promotion",
+            &original,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        write!(sql, "
                      LET $parents = SELECT VALUE from_item FROM work_edge
                          WHERE space_id = $space_id AND to_item = $id AND deleted_at IS NONE;
                      LET $archives = SELECT VALUE type::thing('work_item_archive', from_item)
@@ -1079,20 +1147,8 @@ impl WorkItemRepository {
                          RETURN {WORK_ITEM_PROJECTION};
                      IF array::len($updated) > 0 {{ {retire_archive} }};
                      RETURN $updated;
-                     COMMIT TRANSACTION;",
-                    retire_archive = crate::work_retention::RETIRE_ARCHIVE_SQL
-                ),
-                crate::bindings! {
-                    "id" => crate::surreal::thing_from_record_id(id),
-                    "space_id" => space_id,
-                    "space" => space_id,
-                    "archive" => crate::surreal::thing_from_record_id(&crate::work_retention::archive_id(id)),
-                    "status" => expected_status.to_string(),
-                    "dependency_status" => WorkItemStatus::Done.to_string(),
-                    "record" => Self::work_item_to_value(&record)?,
-                },
-            )
-            .await?;
+                     COMMIT TRANSACTION;", retire_archive = crate::work_retention::RETIRE_ARCHIVE_SQL).map_err(|error| StorageError::QueryError(error.to_string()))?;
+        let mut response = self.client.query_bind_checked(&sql, bindings).await?;
 
         let items: Vec<WorkItemDb> = response.take(response.num_statements() - 1).map_err(|e| {
             StorageError::QueryError(format!("Failed to parse work_item update: {e}"))
@@ -1359,8 +1415,9 @@ impl WorkItemRepository {
         .await
     }
 
-    /// Atomically releases every expired Running lease, independent of space
-    /// activity. Missing expiry is malformed ownership and is recoverable too.
+    /// Releases expired Running leases with known original producer evidence.
+    /// Each native row is fenced independently; imported historical rows remain
+    /// unchanged. Missing expiry is recoverable only for known producers.
     pub async fn recover_expired_leases_all_spaces(&self) -> StorageResult<usize> {
         if let Some(store) = self.client.embedded_store() {
             return store
@@ -1374,6 +1431,11 @@ impl WorkItemRepository {
                         {
                             continue;
                         }
+                        if !crate::work_producer_repository::may_claim_or_recover_tx(
+                            mutation, &item,
+                        )? {
+                            continue;
+                        }
                         crate::work_attempt_repository::recover_embedded(mutation, item, now)?;
                         recovered += 1;
                     }
@@ -1381,19 +1443,30 @@ impl WorkItemRepository {
                 })
                 .await;
         }
-        let mut response = self.client.query_checked(
-            "BEGIN TRANSACTION;
-             LET $expired = SELECT VALUE id FROM work_item WHERE status = 'running' AND deleted_at IS NONE AND array::any([lease_expires_at IS NONE, lease_expires_at <= time::now()]);
-             UPDATE work_attempt SET status = 'runnable', lease_expires_at = NONE WHERE work_item_id IN $expired;
-             UPDATE $expired SET status = 'runnable', leased_by = NONE, lease_expires_at = NONE, last_error = 'lease_expired: recovered abandoned attempt', updated_at = time::now();
-             RETURN $expired; COMMIT TRANSACTION;"
-        ).await?;
-        let recovered: Vec<surrealdb::sql::Thing> = response
-            .take(response.num_statements() - 1)
-            .map_err(|error| {
-                StorageError::DataIntegrityError(format!("Invalid lease recovery result: {error}"))
-            })?;
-        Ok(recovered.len())
+        let mut cursor = surrealdb::sql::Value::None;
+        let mut recovered = 0;
+        loop {
+            let mut response = self.client.query_bind_checked(
+                &format!("SELECT {WORK_ITEM_PROJECTION} FROM work_item WHERE status = 'running' AND deleted_at IS NONE AND array::any([lease_expires_at IS NONE, lease_expires_at <= time::now()]) AND ($cursor = NONE OR id > $cursor) ORDER BY id LIMIT 256;"),
+                crate::bindings! { "cursor" => cursor.clone() },
+            ).await?;
+            let rows: Vec<WorkItemDb> = response.take(0)?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let item = WorkItem::try_from(row)?;
+                cursor = crate::surreal::thing_from_record_id(&item.base.id).into();
+                if self
+                    .release_expired_lease(&item.base.space_id, &item.base.id)
+                    .await?
+                    .is_some()
+                {
+                    recovered += 1;
+                }
+            }
+        }
+        Ok(recovered)
     }
 
     /// Releases an expired lease, returning the item to runnable state.
@@ -1416,6 +1489,9 @@ impl WorkItemRepository {
                     if item.status != WorkItemStatus::Running || !lease_expired {
                         return Ok(None);
                     }
+                    if !crate::work_producer_repository::may_claim_or_recover_tx(mutation, &item)? {
+                        return Ok(None);
+                    }
 
                     Ok(Some(crate::work_attempt_repository::recover_embedded(
                         mutation,
@@ -1426,20 +1502,32 @@ impl WorkItemRepository {
                 .await;
         }
 
-        let mut response = self
-            .client
-            .query_bind_checked(
-                &format!("BEGIN TRANSACTION;
-                LET $updated = UPDATE $id SET status = 'runnable', leased_by = NONE, lease_expires_at = NONE, updated_at = time::now() WHERE space_id = $space_id AND status = 'running' AND deleted_at IS NONE AND array::any([lease_expires_at IS NONE, lease_expires_at <= time::now()]) RETURN {WORK_ITEM_PROJECTION};
+        let Some(original) = self.get(space_id, id).await? else {
+            return Ok(None);
+        };
+        let mut sql = "BEGIN TRANSACTION;\n".to_string();
+        let mut bindings = crate::bindings! {
+            "id" => crate::surreal::thing_from_record_id(id),
+            "space_id" => space_id,
+            "attempt_id" => crate::work_attempt_repository::attempt_id(id),
+            "observed" => crate::canonical_commit::native_expected_fields(Self::work_item_to_value(&original)?),
+        };
+        if !crate::work_producer_repository::append_claim_or_recovery_guard(
+            &self.client,
+            &mut sql,
+            &mut bindings,
+            "recover",
+            &original,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        write!(sql, "
+                LET $updated = UPDATE $id SET status = 'runnable', leased_by = NONE, lease_expires_at = NONE, last_error = 'lease_expired: recovered abandoned attempt', updated_at = time::now() WHERE space_id = $space_id AND status = 'running' AND deleted_at IS NONE AND array::any([lease_expires_at IS NONE, lease_expires_at <= time::now()]) AND updated_at = $observed.updated_at AND security = $observed.security AND subjects = $observed.subjects AND subjects_state = $observed.subjects_state AND created_by = $observed.created_by AND provenance = $observed.provenance AND kind = $observed.kind AND payload = $observed.payload AND idempotency_key = $observed.idempotency_key RETURN {WORK_ITEM_PROJECTION};
                 IF array::len($updated) > 0 {{ UPDATE $attempt_id SET status = 'runnable', lease_expires_at = NONE; }};
-                RETURN $updated; COMMIT TRANSACTION;"),
-                crate::bindings! {
-                    "id" => crate::surreal::thing_from_record_id(id),
-                    "space_id" => space_id,
-                    "attempt_id" => crate::work_attempt_repository::attempt_id(id),
-                },
-            )
-            .await?;
+                RETURN $updated; COMMIT TRANSACTION;").map_err(|error| StorageError::QueryError(error.to_string()))?;
+        let mut response = self.client.query_bind_checked(&sql, bindings).await?;
 
         let items: Vec<WorkItemDb> = response.take(response.num_statements() - 1).map_err(|e| {
             StorageError::QueryError(format!("Failed to parse work_item lease release: {e}"))
@@ -1462,6 +1550,7 @@ fn sort_work_items(items: &mut [WorkItem]) {
             .priority
             .cmp(&left.priority)
             .then_with(|| left.base.created_at.cmp(&right.base.created_at))
+            .then_with(|| left.base.id.cmp(&right.base.id))
     });
 }
 

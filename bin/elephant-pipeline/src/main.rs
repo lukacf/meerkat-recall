@@ -100,6 +100,17 @@ use elephant_types::{Link, RecordId};
 
 pub mod config;
 
+// These are cumulative process totals, not usage attributed to this work item.
+fn record_summary_process_totals(metrics: &mut WorkRunMetrics) {
+    metrics.custom.insert(
+        "summary_process_totals".to_owned(),
+        serde_json::json!({
+            "scope": "process",
+            "totals": elephant_pipeline::summarizer::summary_metrics_snapshot(),
+        }),
+    );
+}
+
 fn validate_backend_env() -> anyhow::Result<()> {
     if let Ok(value) = env::var("ELEPHANT_DB") {
         value
@@ -134,7 +145,7 @@ fn build_semantic_extractor(extractor_id: Option<&str>) -> anyhow::Result<Box<dy
             let mcp_url = std::env::var("PIPELINE_AGENTIC_MCP_URL")
                 .unwrap_or_else(|_| "http://localhost:3000/mcp/agent".to_string());
             let model = std::env::var("PIPELINE_AGENTIC_MODEL")
-                .unwrap_or_else(|_| "gpt-5.6-sol".to_string());
+                .unwrap_or_else(|_| "gpt-6.1-sol".to_string());
             return Ok(Box::new(AgenticExtractor::new(
                 AgenticExtractorConfig::new(mcp_url, model),
             )));
@@ -527,6 +538,7 @@ mod work_item_tests {
                         bindings: Default::default(),
                         active_embedding_profile_id: None,
                         pending_reindex: None,
+                        completed_embedding_reindex: None,
                     }),
                 })
                 .await
@@ -706,6 +718,7 @@ mod work_item_tests {
             .summarize(AttemptUsage::reserved(0, 0.0))
             .await?
             .write_metrics(&mut run.metrics)?;
+        super::record_summary_process_totals(&mut run.metrics);
         runs.update(&item.base.space_id, run_id, run).await?;
         let queue =
             WorkQueue::new(storage.clone(), WorkQueueConfig::default()).for_attempt(&claimed)?;
@@ -5539,13 +5552,13 @@ async fn execute_work_item_with_extractor(
 
             if ingest_mode == IngestMode::Retrieval {
                 if publication.is_some() {
-                    source_runtime::seal_manifest(
+                    Box::pin(source_runtime::seal_manifest(
                         &storage,
                         item,
                         ingest_mode,
                         Some(&render_result.revision_id),
                         None,
-                    )
+                    ))
                     .await?;
                     source_runtime::enqueue_finalizer(&storage, item).await?;
                 }
@@ -5686,13 +5699,13 @@ async fn execute_work_item_with_extractor(
             };
 
             if publication.is_some() {
-                let manifest = source_runtime::seal_manifest(
+                let manifest = Box::pin(source_runtime::seal_manifest(
                     &storage,
                     item,
                     ingest_mode,
                     Some(&revision_id),
                     Some(&result),
-                )
+                ))
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Source manifest not persisted"))?;
                 source_runtime::enqueue_manifest_children(&storage, item, &manifest).await?;
@@ -6127,13 +6140,13 @@ async fn execute_work_item_with_extractor(
                         successor_parent.payload[source_runtime::METADATA_IDS] =
                             serde_json::json!([artifact.base.id.to_string()]);
                         if matches!(ingest_mode, IngestMode::Metadata | IngestMode::Skip) {
-                            source_runtime::seal_manifest(
+                            Box::pin(source_runtime::seal_manifest(
                                 &storage,
                                 &successor_parent,
                                 ingest_mode,
                                 None,
                                 None,
-                            )
+                            ))
                             .await?;
                         }
                     }
@@ -7184,6 +7197,7 @@ async fn run_work_queue_loop(
                                             error!(%error, "Cannot persist usage receipt");
                                             return;
                                         }
+                                        record_summary_process_totals(&mut run_metrics);
                                         run_metrics.custom.insert("attempt_fence".to_string(), item.payload["_attempt_fence"].clone());
                                         run_metrics.custom.insert("cost_ledger_id".to_string(), serde_json::json!(ledger_id.to_string()));
                                         let frozen_key = elephant_pipeline::scheduler::extraction_repair::EXTRACTION_BUDGET_KEY;

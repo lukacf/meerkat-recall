@@ -1434,6 +1434,46 @@ impl Datastore {
 		Ok(())
 	}
 
+	/// Close an isolated native SDK connection after its request and maintenance
+	/// owners have drained. Unlike server shutdown, this also joins deferred
+	/// index descendants before dropping the native generation.
+	#[cfg(not(target_family = "wasm"))]
+	pub async fn recall_close_local(&self) -> Result<(), Error> {
+		let _serial = self.transaction_factory.recall_physical.owner.lock().await;
+		self.index_builder.pause_for_physical().await?;
+		self.delete_node(self.id).await?;
+		let _exclusive = self
+			.transaction_factory
+			.recall_physical
+			.transactions
+			.write()
+			.await;
+		self.transaction_factory
+			.recall_physical
+			.failed
+			.store(true, Ordering::Release);
+		self.index_stores.clear_for_physical().await;
+		self.cache.clear();
+		match self.transaction_factory.flavor.as_ref() {
+			#[cfg(feature = "kv-mem")]
+			DatastoreFlavor::Mem(store) => store.shutdown().await,
+			#[cfg(feature = "kv-rocksdb")]
+			DatastoreFlavor::RocksDB(store) => store.shutdown().await,
+			#[cfg(feature = "kv-indxdb")]
+			DatastoreFlavor::IndxDB(store) => store.shutdown().await,
+			#[cfg(feature = "kv-tikv")]
+			DatastoreFlavor::TiKV(store) => store.shutdown().await,
+			#[cfg(feature = "kv-fdb")]
+			DatastoreFlavor::FoundationDB(store) => store.shutdown().await,
+			#[cfg(feature = "kv-surrealkv")]
+			DatastoreFlavor::SurrealKV(store) => store.shutdown().await,
+			#[cfg(feature = "kv-surrealcs")]
+			DatastoreFlavor::SurrealCS(store) => store.shutdown().await,
+			#[allow(unreachable_patterns)]
+			_ => unreachable!(),
+		}
+	}
+
 	/// Run the datastore shutdown tasks, perfoming any necessary cleanup
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::ds", skip(self))]
 	pub async fn shutdown(&self) -> Result<(), Error> {

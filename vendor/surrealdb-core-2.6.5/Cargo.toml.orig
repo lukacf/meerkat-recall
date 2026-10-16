@@ -223,6 +223,7 @@ wasmtimer = { workspace = true, default-features = false, features = ["tokio"] }
 ws_stream_wasm.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio-util = { version = "0.7.10", features = ["rt"] }
 tokio = { workspace = true, default-features = false, features = [
     "macros",
     "io-util",

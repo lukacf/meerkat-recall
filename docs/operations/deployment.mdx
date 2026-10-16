@@ -416,7 +416,10 @@ be reviewed before reuse; this example does not reset or migrate old volumes.
 
 ## Environment Variable Reference
 
-The tables describe binary defaults unless a Compose override is stated.
+The tables describe defaults in the current source checkout unless a Compose
+override is stated. The GPT-6.1 Sol and Claude Sonnet 5.5 defaults, and the
+summary output and thinking policy, require the newer source; published
+0.9.1 binaries retain their original defaults and summary behavior.
 Compose reads its `.env` file for substitution; running the binary directly
 does not automatically source that file. Set variables in the environment
 actually inherited by the process or use the managed runtime configuration.

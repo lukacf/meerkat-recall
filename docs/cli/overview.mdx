@@ -318,7 +318,7 @@ unqualified. Keep the original store stopped from the final cut through switch
 and preserve its store-file manifest as freeze evidence. New-document backlog
 stays outside the historical baseline and enters ordinary ingestion only after
 activation and certification; consumer writes remain stopped until certification.
-For HomeCore, W1 agent writes fail closed, W2 retains only new documents in
+For a consuming host, W1 agent writes fail closed, W2 retains only new documents in
 `semantic_backlog.jsonl`, and W3-W6 stay stopped. Keeping Elephant stopped covers
 its own pipeline and other local writers. Retain store-file manifest equality
 from final S1 through switch; backlog replay is ordinary new ingestion afterward.

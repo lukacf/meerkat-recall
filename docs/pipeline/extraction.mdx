@@ -86,6 +86,10 @@ The extractor receives an `ExtractionContext` containing everything it needs:
 
 ### Agentic Extractor (Meerkat-based)
 
+The model defaults and summary policy on this page describe the current source
+checkout. Published 0.9.1 binaries retain their original defaults and summary
+behavior; using the newer defaults and policy requires the newer source.
+
 The primary extractor, enabled via the `meerkat-extraction` feature flag. It uses [Meerkat](https://github.com/lukacf/meerkat) - a modular LLM agent harness - to orchestrate extraction as a structured conversation with tool access.
 
 - **Model:** configurable via `PIPELINE_AGENTIC_MODEL` (binary and Docker Compose default: `gpt-6.1-sol`). Supply credentials and approved per-space profiles for the selected provider; these defaults do not migrate existing profiles. The pinned Meerkat client uses Responses for GPT-6.1 tool calls.

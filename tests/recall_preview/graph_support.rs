@@ -74,6 +74,7 @@ pub fn configuration(space: &str) -> SpaceConfig {
                     model_version: "deterministic-storage-only-v1".into(),
                     dimensions: Some(3),
                     preprocessing: "text-v1".into(),
+                    summary: None,
                 },
             )]),
             bindings: [
@@ -94,6 +95,7 @@ pub fn configuration(space: &str) -> SpaceConfig {
             .collect(),
             active_embedding_profile_id: Some("fixture-profile".into()),
             pending_reindex: None,
+            completed_embedding_reindex: None,
         }),
     }
 }
@@ -222,6 +224,7 @@ impl GraphFixture {
             .await?
             .ok_or_else(|| anyhow::anyhow!("graph finalizer claim absent"))?;
         let manifest = SourcePublicationManifest {
+            historical_adoption: None,
             space_id: space.into(),
             publication: publication.clone(),
             mode: IngestMode::Graph,

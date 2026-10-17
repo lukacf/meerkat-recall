@@ -6,6 +6,7 @@ use crate::{StorageClient, StorageError, StorageResult};
 use chrono::{DateTime, Utc};
 use elephant_types::records::{WorkItem, WorkItemArchive, WorkItemStatus, WorkRun, WorkRunArchive};
 use elephant_types::{RecordId, TableName};
+use std::fmt::Write as _;
 
 /// Stable archive identity; public references retain the original table.
 #[must_use]
@@ -94,6 +95,40 @@ pub(crate) async fn create_run(client: &StorageClient, record: WorkRun) -> Stora
     Ok(record)
 }
 
+/// Copy historical payload under transfer custody, without queue provenance.
+pub(crate) async fn import_item_for_transfer(
+    client: &StorageClient,
+    record: WorkItem,
+) -> StorageResult<WorkItem> {
+    client.require_transfer_custody()?;
+    if record.base.id.table() != TableName::WorkItem || record.base.space_id.is_empty() {
+        return Err(StorageError::DataIntegrityError(
+            "historical work has invalid identity or space".into(),
+        ));
+    }
+    if let Some(store) = client.embedded_store() {
+        return store
+            .mutate(|tx| {
+                if tx
+                    .get_by_id::<WorkItemArchive>(&archive_id(&record.base.id), true)?
+                    .is_some()
+                    || !tx.scan_extension_rows("work_producer_origin")?.is_empty()
+                {
+                    return Err(StorageError::Conflict(
+                        "historical work identity or producer already exists".into(),
+                    ));
+                }
+                tx.create(record).map_err(Into::into)
+            })
+            .await;
+    }
+    client.query_bind_checked(
+        "BEGIN TRANSACTION; LET $cold = SELECT VALUE id FROM ONLY $archive; IF $cold != NONE { THROW 'work_identity_already_archived'; }; LET $origins = SELECT VALUE id FROM work_producer_origin LIMIT 1; IF array::len($origins) != 0 { THROW 'historical_work_producer_already_exists'; }; CREATE $id CONTENT $record; COMMIT TRANSACTION;",
+        crate::bindings! { "id" => crate::surreal::thing_from_record_id(&record.base.id), "archive" => crate::surreal::thing_from_record_id(&archive_id(&record.base.id)), "record" => WorkItemRepository::work_item_to_value(&record)? },
+    ).await?;
+    Ok(record)
+}
+
 pub(crate) async fn get_item(
     client: &StorageClient,
     space: &str,
@@ -166,8 +201,7 @@ pub(crate) async fn get_run(
 // concurrent archive conflicts on the surviving cold row, and a concurrent
 // update conflicts on the surviving hot row. This temporary archive is deleted
 // in the same transaction and is never committed as another history owner.
-pub(crate) const RETIRE_ARCHIVE_SQL: &str =
-    "UPSERT $archive CONTENT { space_id: $space, original_id: $id, archived_at: time::now(), record: $record }; DELETE $archive;";
+pub(crate) const RETIRE_ARCHIVE_SQL: &str = "UPSERT $archive CONTENT { space_id: $space, original_id: $id, archived_at: time::now(), record: $record }; DELETE $archive;";
 
 /// Restore and replace in the same transaction, including conditional retries.
 pub(crate) async fn update_item(
@@ -205,7 +239,8 @@ pub(crate) async fn update_item_guarded(
                 else {
                     return Ok(None);
                 };
-                if existing.base.deleted_at.is_some()
+                if !crate::work_producer_repository::may_claim_or_recover_tx(tx, existing)?
+                    || existing.base.deleted_at.is_some()
                     || expected.is_some_and(|status| existing.status != status)
                     || observed.is_some_and(|old| {
                         old.base.updated_at != existing.base.updated_at
@@ -237,10 +272,24 @@ pub(crate) async fn update_item_guarded(
             })
             .await;
     }
-    let mut response = client.query_bind_checked(
-        &format!("BEGIN TRANSACTION; LET $hot = (SELECT * FROM ONLY $id WHERE space_id = $space); LET $cold = (SELECT * FROM ONLY $archive WHERE space_id = $space); LET $old = IF $hot != NONE {{ $hot }} ELSE {{ $cold.record }}; LET $changed = IF $old != NONE AND $old.deleted_at IS NONE AND ($expected = NONE OR $old.status = $expected) AND ($observed = NONE OR ($old.updated_at = $observed.updated_at AND $old.security = $observed.security AND $old.subjects = $observed.subjects AND $old.subjects_state = $observed.subjects_state AND $old.kind = $observed.kind AND $old.payload = $observed.payload AND $old.idempotency_key = $observed.idempotency_key)) {{ IF $old.status = 'running' {{ THROW 'work_attempt_required'; }}; UPSERT $id CONTENT $record; {RETIRE_ARCHIVE_SQL} RETURN true; }} ELSE {{ RETURN false; }}; RETURN $changed; COMMIT TRANSACTION;"),
-        crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "archive" => crate::surreal::thing_from_record_id(&archive_id(id)), "space" => space, "expected" => expected.map_or(surrealdb::sql::Value::None, |v| v.to_string().into()), "record" => WorkItemRepository::work_item_to_value(&record)?, "observed" => observed.map(WorkItemRepository::work_item_to_value).transpose()?.unwrap_or(surrealdb::sql::Value::None) }
-    ).await?;
+    let Some(original) = get_item(client, space, id).await? else {
+        return Ok(None);
+    };
+    let mut sql = "BEGIN TRANSACTION;".to_string();
+    let mut bindings = crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "archive" => crate::surreal::thing_from_record_id(&archive_id(id)), "space" => space, "expected" => expected.map_or(surrealdb::sql::Value::None, |v| v.to_string().into()), "record" => WorkItemRepository::work_item_to_value(&record)?, "observed" => observed.map(WorkItemRepository::work_item_to_value).transpose()?.unwrap_or(surrealdb::sql::Value::None) };
+    if !crate::work_producer_repository::append_claim_or_recovery_guard(
+        client,
+        &mut sql,
+        &mut bindings,
+        "transition",
+        &original,
+    )
+    .await?
+    {
+        return Ok(None);
+    }
+    let _ = write!(sql, "LET $hot = (SELECT * FROM ONLY $id WHERE space_id = $space); LET $cold = (SELECT * FROM ONLY $archive WHERE space_id = $space); LET $old = IF $hot != NONE {{ $hot }} ELSE {{ $cold.record }}; LET $changed = IF $old != NONE AND $old.deleted_at IS NONE AND ($expected = NONE OR $old.status = $expected) AND ($observed = NONE OR ($old.updated_at = $observed.updated_at AND $old.security = $observed.security AND $old.subjects = $observed.subjects AND $old.subjects_state = $observed.subjects_state AND $old.kind = $observed.kind AND $old.payload = $observed.payload AND $old.idempotency_key = $observed.idempotency_key)) {{ IF $old.status = 'running' {{ THROW 'work_attempt_required'; }}; UPSERT $id CONTENT $record; {RETIRE_ARCHIVE_SQL} RETURN true; }} ELSE {{ RETURN false; }}; RETURN $changed; COMMIT TRANSACTION;");
+    let mut response = client.query_bind_checked(&sql, bindings).await?;
     let changed: Option<bool> = response
         .take(response.num_statements() - 1)
         .map_err(|e| StorageError::QueryError(format!("Restore item result: {e}")))?;
@@ -495,7 +544,9 @@ pub(crate) async fn list_items(
     } else {
         ""
     };
-    let query = format!("SELECT {WORK_ITEM_PROJECTION} FROM array::concat((SELECT * FROM work_item WHERE space_id = $space AND deleted_at IS NONE{cursor_clause} ORDER BY id LIMIT {limit}), (SELECT * FROM work_item_archive WHERE space_id = $space AND deleted_at IS NONE{cold_cursor} ORDER BY original_id LIMIT {limit}).record) ORDER BY id LIMIT {limit}");
+    let query = format!(
+        "SELECT {WORK_ITEM_PROJECTION} FROM array::concat((SELECT * FROM work_item WHERE space_id = $space AND deleted_at IS NONE{cursor_clause} ORDER BY id LIMIT {limit}), (SELECT * FROM work_item_archive WHERE space_id = $space AND deleted_at IS NONE{cold_cursor} ORDER BY original_id LIMIT {limit}).record) ORDER BY id LIMIT {limit}"
+    );
     let mut response = client.query_bind_checked(&query, crate::bindings! { "space" => space, "cursor" => cursor.map_or(surrealdb::sql::Value::None, |v| crate::surreal::thing_from_record_id(v).into()) }).await?;
     let rows: Vec<WorkItemDb> = response
         .take(0)
@@ -542,7 +593,9 @@ pub(crate) async fn list_runs(
     } else {
         ""
     };
-    let query = format!("SELECT {WORK_RUN_PROJECTION} FROM array::concat((SELECT * FROM work_run WHERE space_id = $space AND deleted_at IS NONE{cursor_clause} ORDER BY id LIMIT {limit}), (SELECT * FROM work_run_archive WHERE space_id = $space AND deleted_at IS NONE{cold_cursor} ORDER BY original_id LIMIT {limit}).record) ORDER BY id LIMIT {limit}");
+    let query = format!(
+        "SELECT {WORK_RUN_PROJECTION} FROM array::concat((SELECT * FROM work_run WHERE space_id = $space AND deleted_at IS NONE{cursor_clause} ORDER BY id LIMIT {limit}), (SELECT * FROM work_run_archive WHERE space_id = $space AND deleted_at IS NONE{cold_cursor} ORDER BY original_id LIMIT {limit}).record) ORDER BY id LIMIT {limit}"
+    );
     let mut response = client.query_bind_checked(&query, crate::bindings! { "space" => space, "cursor" => cursor.map_or(surrealdb::sql::Value::None, |v| crate::surreal::thing_from_record_id(v).into()) }).await?;
     let rows: Vec<WorkRunDb> = response
         .take(0)
@@ -662,7 +715,9 @@ pub(crate) async fn terminal_items(
     let hot_kind = kind.map_or("", |_| " AND kind = $kind");
     let cold_kind = kind.map_or("", |_| " AND record.kind = $kind");
     let bound = limit.map_or_else(String::new, |v| format!(" LIMIT {v}"));
-    let query = format!("SELECT {WORK_ITEM_PROJECTION} FROM array::concat((SELECT * FROM work_item WHERE space_id = $space AND status = $status AND deleted_at IS NONE{hot_kind} ORDER BY priority DESC, created_at ASC{bound}), (SELECT * FROM work_item_archive WHERE space_id = $space AND record.status = $status AND deleted_at IS NONE{cold_kind} ORDER BY record.priority DESC, record.created_at ASC{bound}).record) ORDER BY priority DESC, created_at ASC{bound}");
+    let query = format!(
+        "SELECT {WORK_ITEM_PROJECTION} FROM array::concat((SELECT * FROM work_item WHERE space_id = $space AND status = $status AND deleted_at IS NONE{hot_kind} ORDER BY priority DESC, created_at ASC{bound}), (SELECT * FROM work_item_archive WHERE space_id = $space AND record.status = $status AND deleted_at IS NONE{cold_kind} ORDER BY record.priority DESC, record.created_at ASC{bound}).record) ORDER BY priority DESC, created_at ASC{bound}"
+    );
     let mut response = client.query_bind_checked(&query, crate::bindings! { "space" => space, "status" => status.to_string(), "kind" => kind.map_or(surrealdb::sql::Value::None, |v| v.to_string().into()) }).await?;
     let rows: Vec<WorkItemDb> = response
         .take(0)

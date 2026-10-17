@@ -2,7 +2,10 @@
 //! No Source, document, space configuration, provider or erased fixture is seeded.
 use super::{apply_schema, schema_files, verify_schema};
 use elephant_storage::snapshot::{export_named, restore_named, SnapshotRetention};
-use elephant_storage::snapshot_inspection::{inspect_snapshot, SnapshotInspectionLimits};
+use elephant_storage::snapshot_inspection::{
+    inspect_snapshot, InspectedSnapshotIdentity, InspectedSnapshotRow, NativeInspectionValue,
+    SnapshotInspectionLimits,
+};
 use elephant_storage::{StorageClient, StorageConfig};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -176,6 +179,55 @@ async fn canonical_definitions(client: &StorageClient) -> Result<Vec<Definition>
     Ok(definitions)
 }
 
+// Migration 046 creates one global support control even in a pristine store.
+// Admit only its exact native shape; no tenant epoch or payload is profile input.
+fn pristine_support_control(row: &InspectedSnapshotRow) -> bool {
+    let expected_id = InspectedSnapshotIdentity {
+        table: "canonical_epoch".into(),
+        id: NativeInspectionValue::Array(vec![
+            NativeInspectionValue::String("recall_source_support_index".into()),
+            NativeInspectionValue::Int(1),
+        ]),
+    };
+    let space = "__recall_source_support_index__";
+    let Some(NativeInspectionValue::Map(fields)) = &row.record else {
+        return false;
+    };
+    let Some(NativeInspectionValue::String(nonce)) = fields.get("support_nonce") else {
+        return false;
+    };
+    // The migration writes rand::uuid() as a canonical UUID string. Its value
+    // stays private and is excluded from the deterministic emitted profile.
+    let canonical_uuid = nonce.len() == 36
+        && nonce.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+    row.identity == expected_id
+        && row.space_id.as_deref() == Some(space)
+        && fields.len() == 3
+        && fields.get("id") == Some(&NativeInspectionValue::Thing(Box::new(expected_id)))
+        && fields.get("space_id") == Some(&NativeInspectionValue::String(space.into()))
+        && canonical_uuid
+}
+
+fn pristine_table_rows(table: &str, count: u64, rows: &[InspectedSnapshotRow]) -> bool {
+    if table == "canonical_epoch" {
+        let mut controls = rows.iter().filter(|row| row.identity.table == table);
+        return count == 1
+            && controls.next().is_some_and(pristine_support_control)
+            && controls.next().is_none();
+    }
+    count == 0
+        || matches!(
+            table,
+            "migration_history" | "recall_durability" | "publication_schema"
+        )
+}
+
 async fn stage(client: &StorageClient, path: &Path, name: &str) -> Result<Stage> {
     let definitions = canonical_definitions(client).await?;
     export_named(client, path, name, &SnapshotRetention::default()).await?;
@@ -186,13 +238,13 @@ async fn stage(client: &StorageClient, path: &Path, name: &str) -> Result<Stage>
             ..SnapshotInspectionLimits::default()
         },
     )?;
+    require(
+        inspection.table_counts.get("canonical_epoch") == Some(&1),
+        "pristine_schema_support_control_missing_or_extra",
+    )?;
     for (table, count) in &inspection.table_counts {
         require(
-            *count == 0
-                || matches!(
-                    table.as_str(),
-                    "migration_history" | "recall_durability" | "publication_schema"
-                ),
+            pristine_table_rows(table, *count, &inspection.rows),
             "pristine_schema_user_row_present",
         )?;
     }
@@ -236,11 +288,11 @@ async fn capture_pristine() -> Result<Vec<Stage>> {
         .await
         .map_err(Error::other)?;
     require(
-        schema_files().len() == 45,
-        "pristine_schema_requires_final_001_through_045_registry",
+        schema_files().len() == 48,
+        "pristine_schema_requires_final_001_through_048_registry",
     )?;
     let original = directory.0.join("original");
-    let before = stage(&client, &original, "fresh-migrations-001-through-045").await?;
+    let before = stage(&client, &original, "fresh-migrations-001-through-048").await?;
     // Ordinary restore performs the standard dynamic reference-guard refresh.
     // It uses this same pristine store's original journal; no key is synthesized.
     restore_named(&client, &original, client.erasure_journal()?).await?;
@@ -349,7 +401,7 @@ fn migration_inventory(root: &Path) -> Result<Vec<serde_json::Value>> {
     });
     paths.sort();
     require(
-        paths.len() == 45 && paths.len() == schema_files().len(),
+        paths.len() == 48 && paths.len() == schema_files().len(),
         "pristine_schema_runtime_migration_set_differs",
     )?;
     let mut inventory = Vec::new();
@@ -412,6 +464,96 @@ fn pristine_profile_output_is_exclusive_private_and_outside_checkout() -> Result
         "pristine_schema_oversized_output_allowed",
     )?;
     Ok(())
+}
+
+#[test]
+fn pristine_profile_rejects_tenant_and_malformed_support_rows() {
+    let identity = InspectedSnapshotIdentity {
+        table: "canonical_epoch".into(),
+        id: NativeInspectionValue::Array(vec![
+            NativeInspectionValue::String("recall_source_support_index".into()),
+            NativeInspectionValue::Int(1),
+        ]),
+    };
+    let space = "__recall_source_support_index__";
+    let fields = BTreeMap::from([
+        (
+            "id".into(),
+            NativeInspectionValue::Thing(Box::new(identity.clone())),
+        ),
+        (
+            "space_id".into(),
+            NativeInspectionValue::String(space.into()),
+        ),
+        (
+            "support_nonce".into(),
+            NativeInspectionValue::String("00000000-0000-4000-8000-000000000001".into()),
+        ),
+    ]);
+    let original = InspectedSnapshotRow {
+        identity,
+        space_id: Some(space.into()),
+        sha256: String::new(),
+        references: Vec::new(),
+        record: Some(NativeInspectionValue::Map(fields.clone())),
+    };
+    assert!(pristine_table_rows(
+        "canonical_epoch",
+        1,
+        std::slice::from_ref(&original)
+    ));
+    assert!(!pristine_table_rows("canonical_epoch", 0, &[]));
+    assert!(!pristine_table_rows("canonical_epoch", 1, &[]));
+    assert!(!pristine_table_rows(
+        "canonical_epoch",
+        2,
+        &[original.clone(), original.clone()]
+    ));
+    assert!(!pristine_table_rows(
+        "source",
+        1,
+        std::slice::from_ref(&original)
+    ));
+    for (key, value) in [
+        (
+            "epoch",
+            NativeInspectionValue::String("tenant-epoch".into()),
+        ),
+        ("space_id", NativeInspectionValue::String("tenant".into())),
+        (
+            "support_nonce",
+            NativeInspectionValue::String("not-a-uuid".into()),
+        ),
+        ("support_nonce", NativeInspectionValue::Null),
+        (
+            "support_nonce",
+            NativeInspectionValue::Uuid("00000000-0000-4000-8000-000000000001".into()),
+        ),
+        (
+            "id",
+            NativeInspectionValue::String("canonical_epoch:tenant".into()),
+        ),
+    ] {
+        let mut changed = original.clone();
+        let mut payload = fields.clone();
+        payload.insert(key.into(), value);
+        changed.record = Some(NativeInspectionValue::Map(payload));
+        assert!(
+            !pristine_table_rows("canonical_epoch", 1, &[changed]),
+            "{key}"
+        );
+    }
+    let mut missing = original.clone();
+    let mut payload = fields;
+    payload.remove("support_nonce");
+    missing.record = Some(NativeInspectionValue::Map(payload));
+    assert!(!pristine_table_rows("canonical_epoch", 1, &[missing]));
+    let mut tenant = original.clone();
+    tenant.identity.id = NativeInspectionValue::String("tenant".into());
+    assert!(!pristine_table_rows("canonical_epoch", 1, &[tenant]));
+    let mut wrong_space = original;
+    wrong_space.space_id = Some("tenant".into());
+    assert!(!pristine_table_rows("canonical_epoch", 1, &[wrong_space]));
 }
 
 #[tokio::test]

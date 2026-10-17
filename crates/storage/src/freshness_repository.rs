@@ -17,7 +17,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 use crate::require::required_field;
 
-const FRESHNESS_PROJECTION: &str = r"
+pub(crate) const FRESHNESS_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -51,7 +51,7 @@ const FRESHNESS_PROJECTION: &str = r"
 
 /// Database-only proxy for Freshness.
 #[derive(Deserialize)]
-struct FreshnessDb {
+pub(crate) struct FreshnessDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

@@ -8,6 +8,9 @@ use surrealdb_core::{dbs::Capabilities as CoreCapabilities, iam::Level};
 /// Configuration for server connection, including: strictness, notifications, query_timeout, transaction_timeout
 #[derive(Debug, Clone, Default)]
 pub struct Config {
+	#[cfg(not(target_family = "wasm"))]
+	pub(crate) recall_local_close:
+		Option<std::sync::Arc<crate::api::conn::local_close::LocalClose>>,
 	pub(crate) recall_background_gate: Option<std::sync::Arc<tokio::sync::RwLock<()>>>,
 	pub(crate) strict: bool,
 	pub(crate) ast_payload: bool,

@@ -1,4 +1,5 @@
 pub(in crate::idx) mod docs;
+pub(crate) mod coverage;
 mod elements;
 mod flavor;
 mod heuristic;

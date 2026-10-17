@@ -379,7 +379,7 @@ fn proposal_assertion(predicate: &str, value: &str, quote: &str) -> Value {
 }
 
 fn rejected_proposal() -> Value {
-    json!({"assertions":[
+    json!({"action_disposition_proposals":[],"assertions":[
         proposal_assertion(ARRIVAL_PREDICATE,"07:20",ARRIVAL_QUOTE),
         proposal_assertion(DEPARTURE_PREDICATE,"08:05",DEPARTURE_QUOTE),
         proposal_assertion(ARRIVAL_PREDICATE,"08:05",ARRIVAL_QUOTE)
@@ -387,7 +387,7 @@ fn rejected_proposal() -> Value {
 }
 
 fn repaired_proposal() -> Value {
-    json!({"assertions":[
+    json!({"action_disposition_proposals":[],"assertions":[
         proposal_assertion(ARRIVAL_PREDICATE,"07:20",ARRIVAL_QUOTE),
         proposal_assertion(DEPARTURE_PREDICATE,"08:05",DEPARTURE_QUOTE)
     ]})
@@ -1465,7 +1465,7 @@ async fn repair_case_router(embedded: bool, case: &'static str) {
         Box::pin(unknown_usage_retains_real_reservation(embedded)).await;
         return;
     }
-    let empty = json!({"assertions":[]});
+    let empty = json!({"action_disposition_proposals":[],"assertions":[]});
     let outputs = match case {
         "first_pass_empty" => vec![empty.clone()],
         "same_live_run_replay" => vec![repaired_proposal()],

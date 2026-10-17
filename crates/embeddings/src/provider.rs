@@ -1395,6 +1395,7 @@ mod tests {
                 model_version: "test-revision".into(),
                 dimensions: Some(3),
                 preprocessing: "text-full-v2".into(),
+                summary: None,
             },
         };
         for operation in [

@@ -19,7 +19,11 @@ async fn contract(embedded: bool, cancel: bool) {
     };
     if !embedded {
         for sql in [
-            include_str!("../../migrations/sql/031_source_publication.surql"),
+            concat!(
+                include_str!("../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../migrations/sql/046_source_support_index_fence.surql")
+            ),
             include_str!("../../migrations/sql/032_work_recovery.surql"),
             include_str!("../../migrations/sql/039_private_reference_fence.surql"),
             include_str!("../../migrations/sql/041_work_producer_origin.surql"),

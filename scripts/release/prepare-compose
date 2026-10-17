@@ -50,7 +50,7 @@ password = "%s"
 provider = "meerkat-agentic"
 required = true
 mcp_url = "http://127.0.0.1:3000/mcp/agent"
-model = "claude-opus-4-6"
+model = "gpt-6.1-sol"
 timeout_secs = 30
 ''' % generated['database-password']
     path = output / 'secrets' / 'runtime.toml'

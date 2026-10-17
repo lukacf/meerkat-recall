@@ -691,7 +691,7 @@ impl AgenticTriage {
             },
             source_types: vec!["*".to_string()],
             fallback: RuleBasedTriage::new(),
-            model: "claude-3-5-sonnet".to_string(),
+            model: "claude-sonnet-5-5".to_string(),
             llm_enabled: true,
         }
     }

@@ -19,7 +19,7 @@ use crate::repository::{PaginatedResult, Repository, SearchCriteria, SearchRepos
 use crate::require::required_field;
 use crate::EntityRepository;
 
-const EVENT_PROJECTION: &str = r"
+pub(crate) const EVENT_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -48,7 +48,8 @@ const EVENT_PROJECTION: &str = r"
     time_confidence,
     IF assertion_refs IS NOT NONE THEN array::map(assertion_refs, |$r| IF type::is::record($r) THEN string::concat(meta::tb($r), ':', meta::id($r)) ELSE $r END) ELSE [] END AS assertion_refs,
     IF source_refs IS NOT NONE THEN array::map(source_refs, |$r| IF type::is::record($r) THEN string::concat(meta::tb($r), ':', meta::id($r)) ELSE $r END) ELSE [] END AS source_refs,
-    metadata
+    metadata,
+    metadata IS NOT NONE AS metadata_present
 ";
 
 /// Default (and maximum) page size for upcoming-event listings.
@@ -105,7 +106,7 @@ impl Default for EventWindowQuery {
 
 /// Database-only proxy for Event to avoid flatten/native enum issues.
 #[derive(Deserialize)]
-struct EventDb {
+pub(crate) struct EventDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<DateTime<Utc>>,
@@ -127,6 +128,9 @@ struct EventDb {
     assertion_refs: Option<Vec<Link<Assertion>>>,
     source_refs: Option<Vec<Link<Source>>>,
     metadata: Option<serde_json::Value>,
+    // Option alone conflates explicit JSON null with an absent native field.
+    // This computed projection is never read from a same-named stored value.
+    metadata_present: Option<bool>,
 }
 
 impl TryFrom<EventDb> for Event {
@@ -157,7 +161,11 @@ impl TryFrom<EventDb> for Event {
             time_confidence: required_field(db.time_confidence, "time_confidence")?,
             assertion_refs: required_field(db.assertion_refs, "assertion_refs")?,
             source_refs: required_field(db.source_refs, "source_refs")?,
-            metadata: required_field(db.metadata, "metadata")?,
+            metadata: if required_field(db.metadata_present, "metadata presence")? {
+                db.metadata.unwrap_or(serde_json::Value::Null)
+            } else {
+                return Err(StorageError::QueryError("Missing metadata".into()));
+            },
         })
     }
 }
@@ -1387,6 +1395,91 @@ mod tests {
     async fn test_update_preserving_security_embedded() {
         let repo = EventRepository::new(StorageClient::new_embedded().await.unwrap());
         Box::pin(assert_update_preserves_security(&repo)).await;
+    }
+
+    async fn assert_legacy_metadata_roundtrip(repo: &EventRepository) {
+        let space = "legacy-event-metadata";
+        let mut original = make_event(space, "Original", EventStatus::Candidate, None);
+        original.metadata = serde_json::Value::Null;
+        let mut saved = repo.create(original).await.unwrap();
+        assert_eq!(saved.metadata, serde_json::Value::Null);
+        for metadata in [
+            serde_json::Value::Null,
+            serde_json::json!("original scalar"),
+            serde_json::json!([null, "original", 7, {"nested": [false, 0.125]}]),
+            serde_json::json!({"nullable": null, "empty": {}, "array": []}),
+            serde_json::json!(false),
+            serde_json::json!(0.125),
+        ] {
+            let mut edit = saved.clone();
+            edit.metadata = metadata.clone();
+            saved = repo
+                .update_preserving_security(space, &edit.base.id, edit.clone())
+                .await
+                .unwrap();
+            assert_eq!(saved.metadata, metadata);
+            assert_eq!(saved.base.security, edit.base.security);
+            assert_eq!(
+                repo.get(space, &saved.base.id).await.unwrap(),
+                Some(saved.clone())
+            );
+            assert_eq!(
+                repo.list_recent(space, 10).await.unwrap(),
+                vec![saved.clone()]
+            );
+            assert_eq!(
+                repo.list(space, 10, None).await.unwrap(),
+                vec![saved.clone()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the original native client and repository custody alive through every corruption/refusal/readback assertion and final scenario teardown."
+    )]
+    async fn legacy_event_metadata_native_exact_json_and_missing_field_refusal() {
+        let repo = setup_test_repo().await;
+        Box::pin(assert_legacy_metadata_roundtrip(&repo)).await;
+        let space = "legacy-event-metadata";
+        let saved = repo.list(space, 10, None).await.unwrap().remove(0);
+        // A stored projection alias cannot manufacture presence for an absent
+        // metadata value; the query computes this bit from the actual field.
+        repo.client
+            .query_bind_checked(
+                "UPDATE $id SET metadata = NONE, metadata_present = true;",
+                ("id", crate::surreal::thing_from_record_id(&saved.base.id)),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.get(space, &saved.base.id).await,
+            Err(StorageError::QueryError(message)) if message == "Missing metadata"
+        ));
+        assert!(repo.list_recent(space, 10).await.is_err());
+        assert!(repo.list(space, 10, None).await.is_err());
+        repo.client
+            .query_bind_checked(
+                "UPDATE $id SET metadata = NULL, metadata_present = false;",
+                ("id", crate::surreal::thing_from_record_id(&saved.base.id)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get(space, &saved.base.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata,
+            serde_json::Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_event_metadata_embedded_exact_json_roundtrip() {
+        let repo = EventRepository::new(StorageClient::new_embedded().await.unwrap());
+        Box::pin(assert_legacy_metadata_roundtrip(&repo)).await;
     }
 
     #[tokio::test]

@@ -6,8 +6,10 @@ use elephant_types::publication::AttemptFence;
 use elephant_types::records::{WorkItem, WorkItemStatus};
 use elephant_types::RecordId;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 
 use crate::work_item_repository::{WorkItemDb, WORK_ITEM_PROJECTION};
+use crate::Repository;
 use crate::{EmbeddedMutation, StorageClient, StorageError, StorageResult};
 
 /// Durable authority table, retained across queue retries and archival.
@@ -191,10 +193,88 @@ fn observed_unchanged(current: &WorkItem, observed: &WorkItem) -> bool {
     current.base.id == observed.base.id
         && current.base.space_id == observed.base.space_id
         && current.base.updated_at == observed.base.updated_at
+        && current.base.created_by == observed.base.created_by
+        && current.base.provenance == observed.base.provenance
         && crate::lifecycle_guard::base_envelope_unchanged(&current.base, &observed.base)
         && current.kind == observed.kind
         && current.payload == observed.payload
         && current.idempotency_key == observed.idempotency_key
+}
+
+fn claim_observed_tx(
+    tx: &mut EmbeddedMutation<'_>,
+    space: &str,
+    id: &RecordId,
+    token: String,
+    expires: DateTime<Utc>,
+    observed: Option<&WorkItem>,
+) -> StorageResult<Option<WorkItem>> {
+    let now = Utc::now();
+    let Some(mut item) = tx.get::<WorkItem>(space, id, false)? else {
+        return Ok(None);
+    };
+    if observed.is_some_and(|old| !observed_unchanged(&item, old))
+        || item.status != WorkItemStatus::Runnable
+        || item.run_after.is_some_and(|after| after > now)
+        || expires <= now
+    {
+        return Ok(None);
+    }
+    if !crate::work_producer_repository::may_claim_or_recover_tx(tx, &item)? {
+        return Ok(None);
+    }
+    let prior = read_attempt(tx, id)?;
+    if prior
+        .as_ref()
+        .is_some_and(|prior| prior.space_id != space || prior.work_item_id != *id)
+    {
+        return Err(StorageError::DataIntegrityError(
+            "Attempt space mismatch".to_string(),
+        ));
+    }
+    let generation = prior
+        .map_or(0, |row| row.generation)
+        .checked_add(1)
+        .filter(|value| i64::try_from(*value).is_ok())
+        .ok_or_else(|| {
+            StorageError::DataIntegrityError("Attempt generation exhausted".to_string())
+        })?;
+    let fence = AttemptFence {
+        space_id: space.to_string(),
+        work_item_id: id.clone(),
+        generation,
+        lease_token: token.clone(),
+    };
+    let payload = item.payload.as_object_mut().ok_or_else(|| {
+        StorageError::DataIntegrityError("Work payload must be an object".to_string())
+    })?;
+    payload.insert(
+        ATTEMPT_PAYLOAD_KEY.to_string(),
+        serde_json::to_value(&fence)
+            .map_err(|error| StorageError::SerializationError(error.to_string()))?,
+    );
+    item.status = WorkItemStatus::Running;
+    item.leased_by = Some(token.clone());
+    item.lease_expires_at = Some(expires);
+    item.attempts = item
+        .attempts
+        .checked_add(1)
+        .ok_or_else(|| StorageError::DataIntegrityError("Retry counter exhausted".to_string()))?;
+    item.base.updated_at = now;
+    write_attempt(
+        tx,
+        &WorkAttempt {
+            id: embedded_id(id),
+            space_id: space.to_string(),
+            work_item_id: id.clone(),
+            generation,
+            lease_token: token,
+            status: "running".to_string(),
+            lease_expires_at: Some(expires),
+            commit_nonce: String::new(),
+        },
+    )?;
+    Ok(Some(tx.replace(item)?))
 }
 
 pub(crate) async fn claim_observed(
@@ -208,76 +288,40 @@ pub(crate) async fn claim_observed(
     let token = format!("{worker}:{}", uuid::Uuid::new_v4());
     if let Some(store) = client.embedded_store() {
         return store
-            .mutate(|tx| {
-                let now = Utc::now();
-                let Some(mut item) = tx.get::<WorkItem>(space, id, false)? else {
-                    return Ok(None);
-                };
-                if observed.is_some_and(|old| !observed_unchanged(&item, old))
-                    || item.status != WorkItemStatus::Runnable
-                    || item.run_after.is_some_and(|after| after > now)
-                    || expires <= now
-                {
-                    return Ok(None);
-                }
-                let prior = read_attempt(tx, id)?;
-                if prior
-                    .as_ref()
-                    .is_some_and(|prior| prior.space_id != space || prior.work_item_id != *id)
-                {
-                    return Err(StorageError::DataIntegrityError(
-                        "Attempt space mismatch".to_string(),
-                    ));
-                }
-                let generation = prior
-                    .map_or(0, |row| row.generation)
-                    .checked_add(1)
-                    .filter(|value| i64::try_from(*value).is_ok())
-                    .ok_or_else(|| {
-                        StorageError::DataIntegrityError("Attempt generation exhausted".to_string())
-                    })?;
-                let fence = AttemptFence {
-                    space_id: space.to_string(),
-                    work_item_id: id.clone(),
-                    generation,
-                    lease_token: token.clone(),
-                };
-                let payload = item.payload.as_object_mut().ok_or_else(|| {
-                    StorageError::DataIntegrityError("Work payload must be an object".to_string())
-                })?;
-                payload.insert(
-                    ATTEMPT_PAYLOAD_KEY.to_string(),
-                    serde_json::to_value(&fence)
-                        .map_err(|error| StorageError::SerializationError(error.to_string()))?,
-                );
-                item.status = WorkItemStatus::Running;
-                item.leased_by = Some(token.clone());
-                item.lease_expires_at = Some(expires);
-                item.attempts = item.attempts.checked_add(1).ok_or_else(|| {
-                    StorageError::DataIntegrityError("Retry counter exhausted".to_string())
-                })?;
-                item.base.updated_at = now;
-                write_attempt(
-                    tx,
-                    &WorkAttempt {
-                        id: embedded_id(id),
-                        space_id: space.to_string(),
-                        work_item_id: id.clone(),
-                        generation,
-                        lease_token: token,
-                        status: "running".to_string(),
-                        lease_expires_at: Some(expires),
-                        commit_nonce: String::new(),
-                    },
-                )?;
-                Ok(Some(tx.replace(item)?))
-            })
+            .mutate(|tx| claim_observed_tx(tx, space, id, token, expires, observed))
             .await;
     }
-    let sql = format!("BEGIN TRANSACTION;
+    let Some(original) = crate::WorkItemRepository::new(client.clone())
+        .get(space, id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if observed.is_some_and(|old| !observed_unchanged(&original, old)) {
+        return Ok(None);
+    }
+    let mut sql = "BEGIN TRANSACTION;\n".to_string();
+    let mut bindings = crate::bindings! {
+        "id" => crate::surreal::thing_from_record_id(id), "id_string" => id.to_string(),
+        "attempt_id" => attempt_id(id), "space" => space, "work_lease_token" => token,
+        "expires" => crate::surreal::datetime_from_chrono(expires),
+        "observed" => crate::canonical_commit::native_expected_fields(crate::WorkItemRepository::work_item_to_value(&original)?),
+    };
+    if !crate::work_producer_repository::append_claim_or_recovery_guard(
+        client,
+        &mut sql,
+        &mut bindings,
+        "claim",
+        &original,
+    )
+    .await?
+    {
+        return Ok(None);
+    }
+    let _ = write!(sql, "
         LET $item = SELECT * FROM ONLY $id;
         LET $prior = SELECT * FROM ONLY $attempt_id;
-        LET $updated = IF $item IS NOT NONE AND $item.space_id = $space AND $item.deleted_at IS NONE AND $item.status = 'runnable' AND ($item.run_after IS NONE OR $item.run_after <= time::now()) AND $expires > time::now() AND ($observed = NONE OR ($item.updated_at = $observed.updated_at AND $item.security = $observed.security AND $item.subjects = $observed.subjects AND $item.subjects_state = $observed.subjects_state AND $item.kind = $observed.kind AND $item.payload = $observed.payload AND $item.idempotency_key = $observed.idempotency_key)) {{
+        LET $updated = IF $item IS NOT NONE AND $item.space_id = $space AND $item.deleted_at IS NONE AND $item.status = 'runnable' AND ($item.run_after IS NONE OR $item.run_after <= time::now()) AND $expires > time::now() AND $item.updated_at = $observed.updated_at AND $item.security = $observed.security AND $item.subjects = $observed.subjects AND $item.subjects_state = $observed.subjects_state AND $item.created_by = $observed.created_by AND $item.provenance = $observed.provenance AND $item.kind = $observed.kind AND $item.payload = $observed.payload AND $item.idempotency_key = $observed.idempotency_key {{
           IF $prior IS NOT NONE AND ($prior.space_id != $space OR $prior.work_item_id != $id) {{ THROW 'attempt_space_mismatch'; }};
           LET $generation = IF $prior IS NONE {{ 1 }} ELSE {{ $prior.generation + 1 }};
           IF $generation < 1 OR $item.attempts >= 4294967295 {{ THROW 'attempt_counter_exhausted'; }};
@@ -286,17 +330,7 @@ pub(crate) async fn claim_observed(
           RETURN (SELECT {WORK_ITEM_PROJECTION} FROM $id);
         }} ELSE {{ RETURN []; }};
         RETURN $updated; COMMIT TRANSACTION;");
-    let mut response = client
-        .query_bind_checked(
-            &sql,
-            crate::bindings! {
-                "id" => crate::surreal::thing_from_record_id(id), "id_string" => id.to_string(),
-                "attempt_id" => attempt_id(id), "space" => space, "work_lease_token" => token,
-                "expires" => crate::surreal::datetime_from_chrono(expires),
-                "observed" => observed.map(crate::WorkItemRepository::work_item_to_value).transpose()?.unwrap_or(surrealdb::sql::Value::None),
-            },
-        )
-        .await?;
+    let mut response = client.query_bind_checked(&sql, bindings).await?;
     let rows: Vec<WorkItemDb> = response
         .take(response.num_statements() - 1)
         .map_err(|error| {
@@ -401,7 +435,7 @@ pub(crate) async fn transition_observed(
       LET $item = SELECT * FROM ONLY $id;
       LET $attempt = SELECT * FROM ONLY $attempt_id;
       LET $updated = IF $item IS NOT NONE AND $item.space_id = $space AND $item.deleted_at IS NONE AND $item.status = 'running' AND $item.leased_by = $work_lease_token AND $item.lease_expires_at > time::now()
-      AND $attempt IS NOT NONE AND $attempt.space_id = $space AND $attempt.work_item_id = $id AND $attempt.status = 'running' AND $attempt.lease_token = $work_lease_token AND $attempt.lease_expires_at > time::now() AND ($observed = NONE OR ($item.updated_at = $observed.updated_at AND $item.security = $observed.security AND $item.subjects = $observed.subjects AND $item.subjects_state = $observed.subjects_state AND $item.kind = $observed.kind AND $item.payload = $observed.payload AND $item.idempotency_key = $observed.idempotency_key)) {{
+      AND $attempt IS NOT NONE AND $attempt.space_id = $space AND $attempt.work_item_id = $id AND $attempt.status = 'running' AND $attempt.lease_token = $work_lease_token AND $attempt.lease_expires_at > time::now() AND ($observed = NONE OR ($item.updated_at = $observed.updated_at AND $item.security = $observed.security AND $item.subjects = $observed.subjects AND $item.subjects_state = $observed.subjects_state AND $item.created_by = $observed.created_by AND $item.provenance = $observed.provenance AND $item.kind = $observed.kind AND $item.payload = $observed.payload AND $item.idempotency_key = $observed.idempotency_key)) {{
         IF $status = 'running' AND ($expires IS NONE OR $expires <= time::now()) {{ THROW 'invalid_lease_expiry'; }};
         UPDATE $attempt_id SET status = $status, lease_expires_at = $expires;
         UPDATE $id SET attempts = IF $refund_retry {{ math::max([attempts - 1, 0]) }} ELSE {{ attempts }}, status = $status, leased_by = IF $status = 'running' {{ $work_lease_token }} ELSE {{ NONE }}, lease_expires_at = $expires, run_after = $run_after, last_error = $error, updated_at = time::now();
@@ -417,7 +451,7 @@ pub(crate) async fn transition_observed(
         "id" => crate::surreal::thing_from_record_id(id), "attempt_id" => attempt_id(id), "space" => space,
         "work_lease_token" => token, "status" => status.to_string(), "expires" => optional_time(expires),
         "run_after" => optional_time(run_after), "error" => error, "refund_retry" => refund_retry,
-        "observed" => observed.map(crate::WorkItemRepository::work_item_to_value).transpose()?.unwrap_or(surrealdb::sql::Value::None),
+        "observed" => observed.map(crate::WorkItemRepository::work_item_to_value).transpose()?.map_or(surrealdb::sql::Value::None, crate::canonical_commit::native_expected_fields),
     }).await?;
     let rows: Vec<WorkItemDb> = response
         .take(response.num_statements() - 1)

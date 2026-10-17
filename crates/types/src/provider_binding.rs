@@ -112,6 +112,9 @@ pub struct ModelProfile {
     /// `OpenAI`/`FastEmbed`, `text-full-v2`. English BGE `FastEmbed` models also support
     /// `bge-en-retrieval-v1`; changing preprocessing requires a new profile.
     pub preprocessing: String,
+    /// Optional immutable policy for a summary-only generative profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<crate::summary_policy::SummaryPolicy>,
 }
 
 impl ModelProfile {
@@ -122,6 +125,12 @@ impl ModelProfile {
     pub fn validate_preprocessing(&self, provider: &str) -> Result<(), ProviderAuthorizationError> {
         let invalid =
             |message: &str| ProviderAuthorizationError::InvalidConfiguration(message.into());
+        if let Some(policy) = &self.summary {
+            if self.dimensions.is_some() {
+                return Err(invalid("summary policy requires a generative profile"));
+            }
+            policy.validate(provider, &self.model)?;
+        }
         if let Some(dimensions) = self.dimensions {
             let supported = match self.preprocessing.as_str() {
                 "text-v1" => true,
@@ -199,6 +208,22 @@ pub struct EmbeddingReindex {
     pub complete: bool,
 }
 
+/// Repository-owned evidence of a completed scan and guarded activation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletedEmbeddingReindex {
+    /// Exact completed reindex operation identity.
+    pub reindex_id: String,
+    /// Indexed-content generation covered by the completed scan.
+    pub content_generation: u64,
+    /// Configuration generation written by activation.
+    pub activated_config_generation: u64,
+    /// Complete activated vector identity.
+    pub partition: VectorPartition,
+    /// Actual activation time, distinct from historical import time.
+    pub activated_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Single per-space authority owned by the space config repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -220,6 +245,9 @@ pub struct SpaceProcessingConfig {
     pub active_embedding_profile_id: Option<String>,
     /// Storage-owned progress for a staged replacement vector partition, if any.
     pub pending_reindex: Option<EmbeddingReindex>,
+    /// Repository-owned last activation evidence; ordinary writes must preserve it.
+    #[serde(default)]
+    pub completed_embedding_reindex: Option<CompletedEmbeddingReindex>,
 }
 
 /// Safe snapshot used by ingestion, discovery and publication preconditions.
@@ -469,7 +497,15 @@ impl SpaceProcessingConfig {
                 .ok_or_else(|| invalid("model profile has no connection"))?;
             profile.validate_preprocessing(&connection.provider)?;
         }
-        for binding in self.bindings.values() {
+        for (operation, binding) in &self.bindings {
+            if self
+                .profiles
+                .get(&binding.profile_id)
+                .is_some_and(|profile| profile.summary.is_some())
+                && *operation != ModelOperation::Summary
+            {
+                return Err(invalid("summary policy requires the summary operation"));
+            }
             if binding.id.is_empty() || !self.profiles.contains_key(&binding.profile_id) {
                 return Err(invalid("binding has no profile"));
             }
@@ -527,6 +563,7 @@ impl SpaceProcessingConfig {
         }
         if self.index_generation != next.index_generation
             || self.pending_reindex != next.pending_reindex
+            || self.completed_embedding_reindex != next.completed_embedding_reindex
         {
             return Err(ProviderAuthorizationError::InvalidConfiguration(
                 "reindex progress and content epoch are storage-owned".into(),
@@ -561,6 +598,7 @@ mod tests {
             model_version: "v1".into(),
             dimensions: Some(3),
             preprocessing: "text-v1".into(),
+            summary: None,
         };
         let processing = SpaceProcessingConfig {
             generation: 1,
@@ -578,6 +616,7 @@ mod tests {
             )]),
             active_embedding_profile_id: Some("embed-v1".into()),
             pending_reindex: None,
+            completed_embedding_reindex: None,
         };
         ResolvedSpaceConfig {
             token: SpaceConfigToken {

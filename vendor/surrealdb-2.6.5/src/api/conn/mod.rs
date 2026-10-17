@@ -16,6 +16,8 @@ use std::sync::atomic::Ordering;
 use surrealdb_core::sql::{from_value as from_core_value, Value as CoreValue};
 
 mod cmd;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod local_close;
 pub(crate) use cmd::Command;
 #[cfg(feature = "protocol-http")]
 pub(crate) use cmd::RouterRequest;

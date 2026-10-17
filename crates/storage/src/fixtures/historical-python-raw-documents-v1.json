@@ -1,0 +1,92 @@
+{
+  "format": "recall-python-raw-document-fixture-v1",
+  "synthetic": true,
+  "hash_contract": {
+    "id": "homecore-python-json-v1",
+    "encoding": "UTF-8; json.dumps(sort_keys=True,separators=(',',':'),ensure_ascii=False,allow_nan=False)",
+    "numbers": "Python arbitrary precision integers and finite IEEE754 binary64 floats with Python JSON rendering; distinguish 1, 1.0 and negative zero",
+    "runtime": "Offline evidence hashes only. Do not compare against Rust canonical hashes without an explicit compatible adapter; input file hashes bind original lexical bytes."
+  },
+  "snapshot_sha256": "9159ce3eddc46d51cb0ebd3684f9b68f7f344b2dfaa76acae3d00d905c7d8502",
+  "idmap_sha256": "e14079098a1585b988a36e5a44590d1cdfd3f648d975ed608e2329d057358e1b",
+  "documents_sha256": "2a79f8c26dfbf56315034fddb87e77435eb6a8546411bd9c811ddd1197d332a0",
+  "cases": [
+    {
+      "name": "omitted_optional_fields",
+      "original": {
+        "id": "doc:00000000-0000-4000-8000-000000000001",
+        "space_id": "history-test",
+        "created_at": "2026-10-10T00:00:00Z",
+        "updated_at": "2026-10-10T00:00:00Z",
+        "created_by": "synthetic-fixture",
+        "provenance": {},
+        "security": {
+          "policy_id": "fixture-policy",
+          "level": 0
+        },
+        "title": "Original αβ",
+        "text": " exact UTF-8 🐘\nno headers\n",
+        "rendition_key": "original",
+        "metadata": {}
+      },
+      "original_lexical": "{\"created_at\":\"2026-10-10T00:00:00Z\",\"created_by\":\"synthetic-fixture\",\"id\":\"doc:00000000-0000-4000-8000-000000000001\",\"metadata\":{},\"provenance\":{},\"rendition_key\":\"original\",\"security\":{\"level\":0,\"policy_id\":\"fixture-policy\"},\"space_id\":\"history-test\",\"text\":\" exact UTF-8 🐘\\nno headers\\n\",\"title\":\"Original αβ\",\"updated_at\":\"2026-10-10T00:00:00Z\"}",
+      "original_lexical_sha256": "869e622ae02123d27c1dfa9c876972e2895f1bd82c769cabfdf47668b5bcb84d",
+      "declaration": {
+        "accepted_request_fingerprint": null,
+        "accepted_revision": null,
+        "doc_content_sha256": "ff9b2f00c4a998cbf0f68ff4b1681adaf23cfd706817c8795b4541d4953eaf4c",
+        "external_source_id": "hc-legacy-sha256-9ea845c2541d9c3e482fa52628e63755757dcd45",
+        "legacy_doc_id": "doc:00000000-0000-4000-8000-000000000001",
+        "original_row_sha256": "869e622ae02123d27c1dfa9c876972e2895f1bd82c769cabfdf47668b5bcb84d",
+        "original_text_sha256": "30e1bfea7505f9c22e3e7e61cae2f883db0593580ce785f46714c28534cf7b3f",
+        "original_text_utf8_bytes": 29,
+        "provenance_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "security_sha256": "b7d135b078b66e6704976235033952e805e7068cb0da6770d2340af632406757",
+        "title_sha256": "c9c99303ac3b22fb22071302b8004c64e5e56b871628d432ea5e1d89efdf8ad7"
+      }
+    },
+    {
+      "name": "explicit_null_optional_fields",
+      "original": {
+        "id": "doc:00000000-0000-4000-8000-000000000002",
+        "space_id": "history-test",
+        "created_at": "2026-10-10T00:00:00Z",
+        "updated_at": "2026-10-10T00:00:00Z",
+        "created_by": "synthetic-fixture",
+        "provenance": {
+          "extractor": null,
+          "work_run_id": null,
+          "run_id": null,
+          "prompt_id": null,
+          "config_id": null
+        },
+        "security": {
+          "policy_id": "fixture-policy",
+          "level": 0
+        },
+        "title": "Original αβ",
+        "text": " exact UTF-8 🐘\nno headers\n",
+        "rendition_key": "original",
+        "metadata": {},
+        "source": null,
+        "deleted_at": null,
+        "sidecar_text": null
+      },
+      "original_lexical": "{\"created_at\":\"2026-10-10T00:00:00Z\",\"created_by\":\"synthetic-fixture\",\"deleted_at\":null,\"id\":\"doc:00000000-0000-4000-8000-000000000002\",\"metadata\":{},\"provenance\":{\"config_id\":null,\"extractor\":null,\"prompt_id\":null,\"run_id\":null,\"work_run_id\":null},\"rendition_key\":\"original\",\"security\":{\"level\":0,\"policy_id\":\"fixture-policy\"},\"sidecar_text\":null,\"source\":null,\"space_id\":\"history-test\",\"text\":\" exact UTF-8 🐘\\nno headers\\n\",\"title\":\"Original αβ\",\"updated_at\":\"2026-10-10T00:00:00Z\"}",
+      "original_lexical_sha256": "f174c93b7c9dcd8d3330e5b8e4cb2295a8fe7390c0451b6a7bde53d4daacd30a",
+      "declaration": {
+        "accepted_request_fingerprint": null,
+        "accepted_revision": null,
+        "doc_content_sha256": "ff9b2f00c4a998cbf0f68ff4b1681adaf23cfd706817c8795b4541d4953eaf4c",
+        "external_source_id": "hc-legacy-sha256-1c8b094aa007a8e0b3c331b344b328a609a16de4",
+        "legacy_doc_id": "doc:00000000-0000-4000-8000-000000000002",
+        "original_row_sha256": "f174c93b7c9dcd8d3330e5b8e4cb2295a8fe7390c0451b6a7bde53d4daacd30a",
+        "original_text_sha256": "30e1bfea7505f9c22e3e7e61cae2f883db0593580ce785f46714c28534cf7b3f",
+        "original_text_utf8_bytes": 29,
+        "provenance_sha256": "100f0ccd379f641e70f14dadd9f950014439cd4f191b92dd6548480356a47662",
+        "security_sha256": "b7d135b078b66e6704976235033952e805e7068cb0da6770d2340af632406757",
+        "title_sha256": "c9c99303ac3b22fb22071302b8004c64e5e56b871628d432ea5e1d89efdf8ad7"
+      }
+    }
+  ]
+}

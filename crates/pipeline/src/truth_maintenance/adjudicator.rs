@@ -162,7 +162,7 @@ pub struct AdjudicationConfig {
 impl Default for AdjudicationConfig {
     fn default() -> Self {
         Self {
-            model: "claude-sonnet-4-5".to_string(),
+            model: "claude-sonnet-5-5".to_string(),
             max_tokens: 2000,
             max_wall_time_secs: 120,
         }
@@ -1439,7 +1439,7 @@ mod tests {
     #[test]
     fn default_config_matches_contract() {
         let config = AdjudicationConfig::default();
-        assert_eq!(config.model, "claude-sonnet-4-5");
+        assert_eq!(config.model, "claude-sonnet-5-5");
         assert_eq!(config.max_tokens, 2000);
         assert_eq!(config.max_wall_time_secs, 120);
     }

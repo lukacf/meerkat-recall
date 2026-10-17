@@ -33,6 +33,9 @@ use crate::source_publication::{
 };
 use crate::{EmbeddedMutation, StorageResult};
 
+#[path = "source_lifecycle_archive.rs"]
+mod operational_archive;
+
 /// Deliberate failures at durable erasure boundaries. They exercise the active path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ErasureFault {
@@ -201,6 +204,7 @@ impl InventoryRow {
 #[derive(Default)]
 struct LifecyclePlan {
     observed_epoch: String,
+    archive_deletes: operational_archive::ArchiveSelection,
     deletes: Vec<InventoryRow>,
     replacements: Vec<CanonicalRecord>,
     removed: BTreeSet<Uuid>,
@@ -393,7 +397,7 @@ impl SourcePublicationRepository {
 
     /// Withdraws current support with source-head CAS and the authorized old envelope.
     pub async fn retract(&self, request: SourceMutation) -> StorageResult<OperationReceipt> {
-        self.retract_inner(request, None).await
+        Box::pin(self.retract_inner(request, None)).await
     }
 
     /// Retracts only while the original head and all authorized documents match.
@@ -403,7 +407,7 @@ impl SourcePublicationRepository {
         request: SourceMutation,
         documents: &crate::source_document_guards::PreparedDocGuards,
     ) -> StorageResult<OperationReceipt> {
-        self.retract_inner(request, Some(documents)).await
+        Box::pin(self.retract_inner(request, Some(documents))).await
     }
 
     async fn retract_inner(
@@ -1268,6 +1272,17 @@ impl SourcePublicationRepository {
                 inverse_survivors.insert(record.base().id.clone());
             }
         }
+        if supports
+            .iter()
+            .any(|support| support.source_id == *source && support.historical_unknown.is_some())
+        {
+            return Err(conflict("source_erasure_historical_baseline_unresolved"));
+        }
+        let archives = if physical {
+            operational_archive::open_registered(&self.client).await?
+        } else {
+            Vec::new()
+        };
         let mut selected = BTreeSet::new();
         let mut shared = BTreeMap::new();
         for support in supports
@@ -1404,6 +1419,18 @@ impl SourcePublicationRepository {
                         changed |= plan.removed.insert(asset.id());
                     }
                 }
+            }
+            // Both inventories participate in the same fixed point. An archived
+            // run selected from a source can select a native document on the next
+            // iteration; a native inverse can likewise select archived artifacts.
+            if physical {
+                changed |= operational_archive::extend_selection(
+                    &archives,
+                    journal,
+                    space,
+                    &historical_membership,
+                    &mut plan,
+                )?;
             }
             if !changed {
                 break;
@@ -2362,6 +2389,22 @@ impl SourcePublicationRepository {
             }
             ordered.push(intent);
         }
+        // Native purge may have released its reference reservation before an
+        // archive rewrite was interrupted. Its durable archive denial remains
+        // an original owner and must finish before unrelated replay intents.
+        for entry in journal.operational_archive_entries()? {
+            if let crate::erasure_journal::ArchiveGenerationState::Redacting { intent_id, .. } =
+                &entry.state
+            {
+                let intent = intents
+                    .iter()
+                    .find(|i| &i.intent_id == intent_id)
+                    .ok_or_else(|| integrity("archive reservation has no original intent"))?;
+                if selected.insert(intent.intent_id.clone()) {
+                    ordered.push(intent);
+                }
+            }
+        }
         for intent in &intents {
             if selected.insert(intent.intent_id.clone()) {
                 ordered.push(intent);
@@ -2444,7 +2487,7 @@ impl SourcePublicationRepository {
                 break;
             }
         }
-        if head.is_none() && !has_payload {
+        if head.is_none() && !has_payload && journal.operational_archive_entries()?.is_empty() {
             // A backup can predate this source entirely. Keep the independently
             // durable physical-incarnation fence even without a head or payload,
             // otherwise a delayed producer could reintroduce data after Ready.
@@ -2488,6 +2531,8 @@ impl SourcePublicationRepository {
                 &observed_reference_generation,
             )
             .await?;
+            operational_archive::redact_selected(&self.client, intent, &plan.archive_deletes)
+                .await?;
             self.remove_managed_erasure_files(space, source).await?;
             return Ok(None);
         }
@@ -2505,6 +2550,7 @@ impl SourcePublicationRepository {
         if fault == ErasureFault::AfterPurge {
             return Err(injected_fault());
         }
+        operational_archive::redact_selected(&self.client, intent, &plan.archive_deletes).await?;
         self.remove_managed_erasure_files(space, source).await?;
         Ok(Some(plan.event_records))
     }
@@ -2577,6 +2623,7 @@ impl SourcePublicationRepository {
                 identities.push(effect.id.clone());
             }
         }
+        identities.extend(plan.archive_deletes.identities());
         // Tokenize identities, never whole payloads: an erased row may cite a
         // surviving independently supported record that must remain writable.
         let memberships = identities
@@ -3374,3 +3421,12 @@ fn normalized_native_key(id: &Thing) -> String {
 #[cfg(test)]
 #[path = "source_lifecycle_tests.rs"]
 mod tests;
+
+// Shared exact row gate for administrative managed archive readers. Ordinary
+// source/record ABAC remains the caller's responsibility.
+pub(crate) fn verify_archive_erasure_access(
+    journal: &crate::erasure_journal::ErasureJournal,
+    archive: &crate::historical_operational_archive::VerifiedArchive,
+) -> StorageResult<()> {
+    operational_archive::verify_erasure_access(journal, archive)
+}

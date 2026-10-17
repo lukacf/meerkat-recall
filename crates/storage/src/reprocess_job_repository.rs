@@ -27,7 +27,7 @@ pub use reprocess_creation::PreparedReprocessJobCreation;
 pub(crate) use reprocess_queue::intended_work;
 pub use reprocess_queue::verify_reprocess_handoff;
 
-const REPROCESS_JOB_PROJECTION: &str = r"
+pub(crate) const REPROCESS_JOB_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -62,7 +62,7 @@ const REPROCESS_JOB_PROJECTION: &str = r"
 
 /// Database-only proxy for ReprocessJob.
 #[derive(Deserialize)]
-struct ReprocessJobDb {
+pub(crate) struct ReprocessJobDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

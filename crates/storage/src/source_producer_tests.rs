@@ -60,6 +60,7 @@ async fn fixture(embedded: bool) -> ProducerFixture {
         bindings: std::collections::BTreeMap::default(),
         active_embedding_profile_id: None,
         pending_reindex: None,
+        completed_embedding_reindex: None,
     });
     let config = configs.replace_authorized(&old, config).await.unwrap();
     let configuration = elephant_types::provider_binding::SpaceConfigToken {

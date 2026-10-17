@@ -416,7 +416,10 @@ be reviewed before reuse; this example does not reset or migrate old volumes.
 
 ## Environment Variable Reference
 
-The tables describe binary defaults unless a Compose override is stated.
+The tables describe defaults in the current source checkout unless a Compose
+override is stated. The GPT-6.1 Sol and Claude Sonnet 5.5 defaults, and the
+summary output and thinking policy, require the newer source; published
+0.9.1 binaries retain their original defaults and summary behavior.
 Compose reads its `.env` file for substitution; running the binary directly
 does not automatically source that file. Set variables in the environment
 actually inherited by the process or use the managed runtime configuration.
@@ -570,16 +573,18 @@ See the [snapshot reference](/api/system#managed-snapshots).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PIPELINE_RESOLUTION_DISAMBIGUATION_ENABLED` | `true` | Enable LLM disambiguation for multiple entity candidates |
-| `PIPELINE_RESOLUTION_DISAMBIGUATION_MODEL` | `claude-3-5-sonnet` | Compatibility-path model default; configure a model available to your provider |
+| `PIPELINE_RESOLUTION_DISAMBIGUATION_MODEL` | `claude-sonnet-5-5` | Compatibility-path model default; configure a model available to your provider |
 | `PIPELINE_RESOLUTION_DISAMBIGUATION_MAX_TOKENS` | `800` | Max tokens per disambiguation call |
 | `PIPELINE_RESOLUTION_DISAMBIGUATION_TIMEOUT_SECS` | `15` | Wall time limit for disambiguation (seconds) |
-| `PIPELINE_PROMOTION_DISAMBIGUATION_MODEL` | `claude-sonnet-4-5` | LLM model for entity-reuse disambiguation at promotion (active when `ANTHROPIC_API_KEY` is set; without a key, type-incompatible matches create a new entity instead of merging) |
+| `PIPELINE_PROMOTION_DISAMBIGUATION_MODEL` | `claude-sonnet-5-5` | LLM model for entity-reuse disambiguation at promotion (active when `ANTHROPIC_API_KEY` is set; without a key, type-incompatible matches create a new entity instead of merging) |
 
 ### Pipeline: Summarization
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PIPELINE_SUMMARIZER_MODEL` | `claude-sonnet-4-5` | LLM model for doc-tree section summaries; failure falls back to truncation with a logged warning |
+| `PIPELINE_SUMMARIZER_MODEL` | `claude-sonnet-5-5` | Default option for doc-tree section summaries; governed dispatch uses the space's approved summary profile |
+
+The approved profile also selects the [summary output and thinking policy](/pipeline/extraction#summary-budgets). The model environment variable does not override that binding. Empty output or known typed incomplete completions use a bounded source excerpt with logged counters; missing or revoked provider authority remains an error.
 
 ### Pipeline: Truth Maintenance
 
@@ -588,7 +593,7 @@ See the [snapshot reference](/api/system#managed-snapshots).
 | `PIPELINE_TRUTH_MAINTENANCE_ENABLED` | `true` | Enable truth maintenance worker |
 | `PIPELINE_TRUTH_MAINTENANCE_POLL_INTERVAL` | `5` | Poll interval in seconds |
 | `PIPELINE_TRUTH_MAINTENANCE_BATCH_SIZE` | `100` | Max events per batch |
-| `PIPELINE_TM_MODEL` | `claude-sonnet-4-5` | LLM model for conflict adjudication. Adjudication is active only when `ANTHROPIC_API_KEY` is set; without a key, TM falls back to deterministic conflict policies and never supersedes without configured semantics |
+| `PIPELINE_TM_MODEL` | `claude-sonnet-5-5` | LLM model for conflict adjudication. Adjudication is active only when `ANTHROPIC_API_KEY` is set; without a key, TM falls back to deterministic conflict policies and never supersedes without configured semantics |
 
 ### Pipeline: Maintenance (Identity Resolution)
 
@@ -597,7 +602,7 @@ See the [snapshot reference](/api/system#managed-snapshots).
 | `PIPELINE_MAINTENANCE_ENABLED` | `true` | Enable maintenance worker |
 | `PIPELINE_MAINTENANCE_POLL_INTERVAL` | `300` | Poll interval in seconds (default: 5 minutes) |
 | `PIPELINE_MAINTENANCE_MCP_URL` | `http://127.0.0.1:3000/mcp/maintenance` | MCP URL for maintenance agent |
-| `PIPELINE_MAINTENANCE_MODEL` | `gpt-5.6-sol` | LLM model for maintenance decisions |
+| `PIPELINE_MAINTENANCE_MODEL` | `gpt-6.1-sol` | LLM model for maintenance decisions |
 | `PIPELINE_MAINTENANCE_AUTO_MERGE_THRESHOLD` | `0.9` | Confidence threshold for auto-merging entities |
 | `PIPELINE_MAINTENANCE_MAX_CANDIDATES` | `50` | Max candidate pairs per sweep |
 
@@ -606,7 +611,7 @@ See the [snapshot reference](/api/system#managed-snapshots).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PIPELINE_AGENTIC_MCP_URL` | `http://127.0.0.1:3000/mcp/agent` | MCP URL for the agentic extractor |
-| `PIPELINE_AGENTIC_MODEL` | `gpt-5.6-sol` | Binary model default; Compose overrides with `claude-opus-4-6` |
+| `PIPELINE_AGENTIC_MODEL` | `gpt-6.1-sol` | Binary and Compose default; explicit model settings and approved per-space profiles take precedence |
 | `PIPELINE_SKILLS_DIR` | `./skills` | Extraction skill directory; Compose mounts and selects `/skills` |
 
 The extractor and maintenance URL defaults do not follow `ELEPHANT_PORT`.
@@ -621,7 +626,7 @@ for token, grant and per-space tool checks.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ELEPHANT_WIKI_WRITER_MODEL` | `PIPELINE_AGENTIC_MODEL`, then `gpt-5.6-sol` | Meerkat model used to write structured, citation-bearing wiki articles |
+| `ELEPHANT_WIKI_WRITER_MODEL` | `PIPELINE_AGENTIC_MODEL`, then `gpt-6.1-sol` | Meerkat model used to write structured, citation-bearing wiki articles |
 | `ELEPHANT_WIKI_VERIFIER_MODEL` | writer model | Meerkat model used in a separate call to verify every article statement for evidence entailment and subject relevance |
 | `ELEPHANT_WIKI_MAX_OUTPUT_TOKENS` | `32000` | Maximum output tokens for one wiki model call, clamped to 4000-64000 so evidence-rich core articles can complete their structured response |
 | `ELEPHANT_WIKI_STRUCTURED_OUTPUT_RETRIES` | `5` | In-session schema-repair retries, clamped to 1-8, before a malformed structured response is returned to the outer editorial loop |
@@ -678,8 +683,8 @@ complete any required reindex activation. See the
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENAI_API_KEY` | _(none)_ | OpenAI API key (required for `openai` embed provider) |
-| `ANTHROPIC_API_KEY` | _(none)_ | Required for Compose's Anthropic extractor; also enables truth-maintenance adjudication, promotion disambiguation, and doc-tree summarization |
+| `OPENAI_API_KEY` | _(none)_ | OpenAI API key for the default extractor and `openai` embed provider; each requires its own approved binding |
+| `ANTHROPIC_API_KEY` | _(none)_ | Required for an explicitly selected Anthropic extractor; also enables truth-maintenance adjudication, promotion disambiguation, and doc-tree summarization |
 
 ## Migrations
 

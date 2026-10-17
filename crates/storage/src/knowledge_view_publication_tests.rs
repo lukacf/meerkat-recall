@@ -23,8 +23,10 @@ async fn fixture(embedded: bool) -> (StorageClient, Entity, KnowledgeView, Knowl
     .unwrap();
     if !embedded {
         client
-            .query_checked(include_str!(
-                "../../migrations/sql/031_source_publication.surql"
+            .query_checked(concat!(
+                include_str!("../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../migrations/sql/046_source_support_index_fence.surql")
             ))
             .await
             .unwrap();
@@ -373,10 +375,6 @@ both_backends!(
     revision_progression_cannot_overwrite_current
 );
 
-#[expect(
-    clippy::large_futures,
-    reason = "Poll the original conformance future directly without changing its allocation or await shape."
-)]
 #[expect(
     clippy::significant_drop_tightening,
     reason = "Keep canonical, publication, repository in the original fixture scope through assertions and cleanup."

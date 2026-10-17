@@ -255,6 +255,7 @@ fn support(
         source_id: source,
         source_revision: "original-revision".into(),
         record_id: row.base().id.clone(),
+        historical_unknown: None,
         independent: true,
         record_fingerprint: row.fingerprint().unwrap(),
         last_commit_id: commit.map(str::to_owned),

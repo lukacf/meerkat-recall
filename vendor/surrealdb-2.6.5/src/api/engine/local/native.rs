@@ -12,7 +12,7 @@ use crate::{
 	Action,
 };
 use async_channel::{Receiver, Sender};
-use futures::{stream::poll_fn, StreamExt};
+use futures::{stream::poll_fn, FutureExt, StreamExt};
 use std::{
 	collections::{BTreeMap, HashMap, HashSet},
 	sync::{atomic::AtomicI64, Arc},
@@ -25,7 +25,10 @@ use tokio_util::sync::CancellationToken;
 impl crate::api::Connection for Db {}
 
 impl Connection for Db {
-	fn connect(address: Endpoint, capacity: usize) -> BoxFuture<'static, Result<Surreal<Self>>> {
+	fn connect(
+		mut address: Endpoint,
+		capacity: usize,
+	) -> BoxFuture<'static, Result<Surreal<Self>>> {
 		Box::pin(async move {
 			let (route_tx, route_rx) = match capacity {
 				0 => async_channel::unbounded(),
@@ -33,6 +36,8 @@ impl Connection for Db {
 			};
 
 			let (conn_tx, conn_rx) = async_channel::bounded(1);
+			address.config.recall_local_close =
+				Some(crate::api::conn::local_close::LocalClose::new());
 			let config = address.config.clone();
 
 			tokio::spawn(run_router(address, conn_tx, route_rx));
@@ -61,6 +66,34 @@ pub(crate) async fn run_router(
 	conn_tx: Sender<Result<()>>,
 	route_rx: Receiver<Route>,
 ) {
+	let Some(owners) = address.config.recall_local_close.clone() else {
+		let _ = conn_tx
+			.send(Err(crate::api::err::Error::InternalError(
+				"local connection close owner missing".into(),
+			)
+			.into()))
+			.await;
+		return;
+	};
+	let result =
+		std::panic::AssertUnwindSafe(run_router_owned(address, conn_tx, route_rx, owners.clone()))
+			.catch_unwind()
+			.await
+			.unwrap_or_else(|_| {
+				Err(crate::api::err::Error::InternalError(
+					"local router panicked during shutdown".into(),
+				)
+				.into())
+			});
+	owners.complete(result);
+}
+
+async fn run_router_owned(
+	address: Endpoint,
+	conn_tx: Sender<Result<()>>,
+	route_rx: Receiver<Route>,
+	owners: Arc<crate::api::conn::local_close::LocalClose>,
+) -> Result<()> {
 	let configured_root = match address.config.auth {
 		Level::Root => Some(Root {
 			username: &address.config.username,
@@ -78,17 +111,20 @@ pub(crate) async fn run_router(
 		Ok(kvs) => {
 			if let Err(error) = kvs.check_version().await {
 				conn_tx.send(Err(error.into())).await.ok();
-				return;
+				return Ok(());
 			};
 			if let Err(error) = kvs.bootstrap().await {
 				conn_tx.send(Err(error.into())).await.ok();
-				return;
+				return Ok(());
 			}
 			// If a root user is specified, setup the initial datastore credentials
 			if let Some(root) = configured_root {
-				if let Err(error) = kvs.initialise_credentials(root.username, root.password).await {
+				if let Err(error) = kvs
+					.initialise_credentials(root.username, root.password)
+					.await
+				{
 					conn_tx.send(Err(error.into())).await.ok();
-					return;
+					return Ok(());
 				}
 			}
 			conn_tx.send(Ok(())).await.ok();
@@ -96,11 +132,15 @@ pub(crate) async fn run_router(
 		}
 		Err(error) => {
 			conn_tx.send(Err(error.into())).await.ok();
-			return;
+			return Ok(());
 		}
 	};
 
-	let kvs = match address.config.capabilities.allows_live_query_notifications() {
+	let kvs = match address
+		.config
+		.capabilities
+		.allows_live_query_notifications()
+	{
 		true => kvs.with_notifications(),
 		false => kvs,
 	};
@@ -115,6 +155,8 @@ pub(crate) async fn run_router(
 	let kvs = kvs.with_temporary_directory(address.config.temporary_directory);
 
 	let kvs = Arc::new(kvs);
+	#[cfg(feature = "recall-close-test-utils")]
+	owners.attach_datastore(&kvs);
 	let vars = Arc::new(RwLock::new(BTreeMap::default()));
 	let live_queries = Arc::new(RwLock::new(HashMap::new()));
 	let session = Arc::new(RwLock::new(Session::default().with_rt(true)));
@@ -160,8 +202,9 @@ pub(crate) async fn run_router(
 				let Ok(route) = route else {
 					break
 				};
-				tokio::spawn(async move {
-					match super::router(route.request, &kvs, &session, &vars, &live_queries)
+				let child_owners = owners.clone();
+				owners.spawn(async move {
+					match super::router(route.request, &kvs, &session, &vars, &live_queries, &child_owners)
 						.await
 					{
 						Ok(value) => {
@@ -188,12 +231,17 @@ pub(crate) async fn run_router(
 
 				let background_gate = background_gate.clone();
 				let canceller = canceller.clone();
-				tokio::spawn(async move {
+				owners.spawn(async move {
 					let id = notification.query_id;
 					let sender = live_queries.read().await.get(&id).cloned();
 					if let Some(sender) = sender {
 
-						if sender.send(Ok(notification)).await.is_err() {
+						let delivered = tokio::select! {
+							biased;
+							_ = canceller.cancelled() => return,
+							result = sender.send(Ok(notification)) => result,
+						};
+						if delivered.is_err() {
 							live_queries.write().await.remove(&id);
 							let _maintenance = tokio::select! {
 								biased;
@@ -211,10 +259,20 @@ pub(crate) async fn run_router(
 			}
 		}
 	}
-	// Shutdown and stop closed tasks
+	// All accepted routes have been dispatched; close rejects new sends.
+	// Cancel maintenance before it can enter another write, then finish all
+	// entered request/notification/export owners without aborting them.
 	canceller.cancel();
-	// Wait for background tasks to finish
-	tasks.resolve().await.ok();
-	// Delete this node from the cluster
-	kvs.shutdown().await.ok();
+	let requests = owners.drain().await;
+	let background = tasks.resolve().await;
+	let shutdown = kvs.recall_close_local().await;
+	drop(notification_stream);
+	drop(live_queries);
+	drop(session);
+	drop(vars);
+	drop(kvs);
+	requests?;
+	background?;
+	shutdown?;
+	Ok(())
 }

@@ -740,6 +740,9 @@ mod tests {
             .query("DEFINE TABLE entity SCHEMALESS;")
             .await
             .expect("schema");
+        crate::retrieval_test_support::initialize_source_support(&storage)
+            .await
+            .expect("source-support schema");
         let repo = EntityRepository::new(storage.clone());
         let fixture = crate::retrieval_test_support::QueryFixture::install(
             &storage,
@@ -935,6 +938,9 @@ mod tests {
         };
         let storage = StorageClient::new(config).await.expect("storage");
         storage.query(ENTITY_SCHEMA).await.expect("schema");
+        crate::retrieval_test_support::initialize_source_support(&storage)
+            .await
+            .expect("source-support schema");
 
         let principal = elephant_policy::Principal {
             space_id: "test_space".to_string(),
@@ -1030,6 +1036,9 @@ mod tests {
         let storage = StorageClient::new(config).await.expect("storage");
         storage.query(DOC_SCHEMA).await.expect("schema");
         storage.query(ENTITY_SCHEMA).await.expect("schema");
+        crate::retrieval_test_support::initialize_source_support(&storage)
+            .await
+            .expect("source-support schema");
 
         let principal = elephant_policy::Principal {
             space_id: "test_space".to_string(),

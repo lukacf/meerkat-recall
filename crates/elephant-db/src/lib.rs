@@ -21,9 +21,13 @@ mod erasure_guard;
 mod erasure_guard_tests;
 pub use durable_commit::KernelMutation;
 pub use erasure_guard::ReferenceTokenNormalizer;
+mod completion_coverage_projection;
 mod index_generation;
+#[doc(hidden)]
+pub use index_generation::control_visibility_changed;
 #[cfg(test)]
 mod publication_tests;
+mod support_index;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -169,6 +173,7 @@ struct IndexState {
     docs_by_space: HashMap<String, DocSpaceIndex>,
     vector_partitions: HashMap<String, VectorPartitionIndex>,
     unique: UniqueIndexState,
+    source_support: support_index::SourceSupportIndex,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -911,6 +916,34 @@ impl ElephantDb {
             .cloned())
     }
 
+    /// Reads bounded source-support rows through a derived exact-space/record index.
+    /// The repository must validate payload identity and authority before use.
+    pub fn source_support_rows(
+        &self,
+        space: &str,
+        record: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, serde_json::Value)>> {
+        let state = self.read_state();
+        let keys = state.indexes.source_support.keys(space, record, limit)?;
+        let rows = keys
+            .into_iter()
+            .map(|key| {
+                state
+                    .extension_tables
+                    .get("source_effect_support")
+                    .and_then(|rows| rows.get(key))
+                    .cloned()
+                    .map(|row| (key.clone(), row))
+                    .ok_or_else(|| {
+                        ElephantDbError::DataIntegrity("support index row missing".into())
+                    })
+            })
+            .collect();
+        drop(state);
+        rows
+    }
+
     /// Scans an opaque extension table, returning stable row-key/value pairs.
     pub fn scan_extension_rows(
         &self,
@@ -918,6 +951,81 @@ impl ElephantDb {
     ) -> Result<Vec<(String, serde_json::Value)>> {
         let state = self.read_state();
         Ok(state.scan_extension_table(table_name))
+    }
+
+    /// One bounded lineage-only scan for historical custody. Original payloads
+    /// are neither cloned nor rewritten; typed row equality is checked at commit.
+    pub fn historical_population(
+        &self,
+        table: TableName,
+        space: &str,
+        limit: usize,
+    ) -> Result<Vec<(RecordId, RecordId, bool, bool)>> {
+        if !matches!(table, TableName::DocRevision | TableName::DocNode)
+            || limit == 0
+            || limit > 2_000_000
+        {
+            return Err(ElephantDbError::DataIntegrity(
+                "historical population bound".into(),
+            ));
+        }
+        let state = self.read_state();
+        let mut result = Vec::new();
+        if let Some(rows) = state.tables.get(&table) {
+            if rows.len() > limit {
+                return Err(ElephantDbError::DataIntegrity(
+                    "historical physical population exceeds bound".into(),
+                ));
+            }
+            for (id, row) in rows {
+                let row_space = row
+                    .get("space_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ElephantDbError::DataIntegrity("historical population space absent".into())
+                    })?;
+                if row_space != space {
+                    continue;
+                }
+                if result.len() == limit {
+                    return Err(ElephantDbError::DataIntegrity(
+                        "historical population exceeds bound".into(),
+                    ));
+                }
+                let parent_key = if table == TableName::DocRevision {
+                    "doc"
+                } else {
+                    "revision"
+                };
+                let parent: RecordId =
+                    serde_json::from_value(row.get(parent_key).cloned().ok_or_else(|| {
+                        ElephantDbError::DataIntegrity("historical parent absent".into())
+                    })?)
+                    .map_err(|_| {
+                        ElephantDbError::DataIntegrity("historical parent invalid".into())
+                    })?;
+                let active = if table == TableName::DocRevision {
+                    serde_json::from_value::<elephant_types::records::doc_revision::RevisionStatus>(
+                        row.get("status").cloned().ok_or_else(|| {
+                            ElephantDbError::DataIntegrity("historical status absent".into())
+                        })?,
+                    )
+                    .map_err(|_| {
+                        ElephantDbError::DataIntegrity("historical status invalid".into())
+                    })? == elephant_types::records::doc_revision::RevisionStatus::Active
+                } else {
+                    true
+                };
+                result.push((
+                    id.clone(),
+                    parent,
+                    !row.get("deleted_at").is_none_or(serde_json::Value::is_null),
+                    active,
+                ));
+            }
+        }
+        drop(state);
+        Ok(result)
     }
 
     /// Physical typed IDs, including deletion markers, in stable ID order.
@@ -1105,6 +1213,36 @@ impl ElephantDb {
             )
         };
         Ok(EntityRelations { outgoing, incoming })
+    }
+
+    /// Bounded indexed identities for a revision across every tenant bucket.
+    /// The caller must reject foreign-space references; no node text is cloned.
+    pub fn historical_node_ids_for_revision(
+        &self,
+        revision_id: &RecordId,
+        limit: usize,
+    ) -> Result<Vec<(String, RecordId)>> {
+        if limit == 0 || limit > 100_000 {
+            return Err(ElephantDbError::DataIntegrity(
+                "historical node bound".into(),
+            ));
+        }
+        let state = self.read_state();
+        let mut rows = Vec::new();
+        for (space, docs) in &state.indexes.docs_by_space {
+            if let Some(entries) = docs.nodes_by_revision.get(revision_id) {
+                for entry in entries {
+                    if rows.len() == limit {
+                        return Err(ElephantDbError::DataIntegrity(
+                            "historical node population exceeds bound".into(),
+                        ));
+                    }
+                    rows.push((space.clone(), entry.node_id.clone()));
+                }
+            }
+        }
+        drop(state);
+        Ok(rows)
     }
 
     /// Returns all active nodes for the revision ordered by depth and position.
@@ -1326,6 +1464,17 @@ impl ElephantDbTx<'_> {
         self.state.scan_table::<T>()
     }
 
+    /// Reads one complete physical row, including deleted rows and extra fields.
+    /// The caller must validate its exact space and payload before mutation.
+    #[must_use]
+    pub fn raw_row_by_id(&self, table: TableName, id: &RecordId) -> Option<serde_json::Value> {
+        self.state
+            .tables
+            .get(&table)
+            .and_then(|rows| rows.get(id))
+            .cloned()
+    }
+
     /// Scans physical typed rows for coordinated erasure, including deleted rows.
     pub fn scan_raw_rows(&self, table: TableName) -> Result<Vec<(RecordId, serde_json::Value)>> {
         let mut rows = self.state.tables.get(&table).map_or_else(Vec::new, |rows| {
@@ -1399,12 +1548,54 @@ impl ElephantDbTx<'_> {
         Ok(())
     }
 
+    /// Confirms this exact stored vector has a live physical index member.
+    /// The caller must separately validate the canonical node and authorization.
+    pub fn node_embedding_index_contains(&self, embedding: &NodeEmbedding) -> Result<bool> {
+        let partition = vector_partition_name(
+            &embedding.base.security.policy_id,
+            embedding.base.security.level,
+            &embedding.model,
+            embedding.vector.len(),
+        );
+        let Some(index) = self.state.indexes.vector_partitions.get(&partition) else {
+            return Ok(false);
+        };
+        let Some(space) = index.spaces.get(&embedding.base.space_id) else {
+            return Ok(false);
+        };
+        let Some(position) = space.entry_index_by_embedding_id.get(&embedding.base.id) else {
+            return Ok(false);
+        };
+        let Some(entry) = space.entries.get(*position) else {
+            return Ok(false);
+        };
+        Ok(index.dims == embedding.vector.len()
+            && !entry.deleted
+            && entry.doc_id.is_some()
+            && entry.node_id == *embedding.node.id()
+            && entry.normalized_vector.as_ref() == normalize_vector(&embedding.vector).as_slice())
+    }
+
     /// Scans an opaque extension table inside the transaction.
     pub fn scan_extension_rows(
         &self,
         table_name: &str,
     ) -> Result<Vec<(String, serde_json::Value)>> {
         Ok(self.state.scan_extension_table(table_name))
+    }
+
+    /// Exact physical control observation under the existing transaction lock.
+    pub fn extension_row_by_key(
+        &self,
+        table: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(self
+            .state
+            .extension_tables
+            .get(table)
+            .and_then(|rows| rows.get(key))
+            .cloned())
     }
 
     /// Lists opaque extension tables that currently contain rows.
@@ -1464,6 +1655,8 @@ impl ElephantDbTx<'_> {
             .entry(table_name.clone())
             .or_default()
             .insert(row_key.clone(), row);
+        self.state
+            .refresh_source_support_index(&table_name, &row_key, previous.as_ref());
         let old_space = previous
             .as_ref()
             .and_then(|row| row.get("space_id"))
@@ -1538,6 +1731,8 @@ impl ElephantDbTx<'_> {
         );
         let fenced = fences_canonical_extension_change(table_name, table.get(row_key), Some(&row));
         let previous = table.insert(row_key.to_string(), row);
+        self.state
+            .refresh_source_support_index(table_name, row_key, previous.as_ref());
         let old_space = previous
             .as_ref()
             .and_then(|row| row.get("space_id"))
@@ -1621,6 +1816,8 @@ impl ElephantDbTx<'_> {
         let visibility_changed =
             index_generation::control_visibility_changed(table_name, Some(previous), None);
         let previous = table.remove(row_key);
+        self.state
+            .refresh_source_support_index(table_name, row_key, previous.as_ref());
         self.undo_log.push(UndoEntry::ExtensionRow {
             table_name: table_name.to_owned(),
             row_key: row_key.to_owned(),
@@ -1669,14 +1866,11 @@ impl ElephantDbTx<'_> {
                         .extension_tables
                         .entry(table_name.clone())
                         .or_default();
-                    match previous {
-                        Some(previous) => {
-                            let _ = rows.insert(row_key.clone(), previous.clone());
-                        }
-                        None => {
-                            let _ = rows.remove(row_key);
-                        }
-                    }
+                    let current = match previous {
+                        Some(previous) => rows.insert(row_key.clone(), previous.clone()),
+                        None => rows.remove(row_key),
+                    };
+                    state.refresh_source_support_index(table_name, row_key, current.as_ref());
                 }
             }
         }
@@ -2645,6 +2839,7 @@ impl ElephantDbState {
     }
 
     fn rebuild_all_indexes_with_options(&mut self, rebuild_vector_indexes: bool) -> Result<()> {
+        self.rebuild_source_support_index();
         self.rebuild_unique_indexes()?;
         self.rebuild_graph_indexes()?;
         self.rebuild_doc_indexes()?;

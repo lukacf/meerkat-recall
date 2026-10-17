@@ -753,7 +753,6 @@ async fn list_sources(
 }
 
 #[expect(
-    clippy::large_futures,
     clippy::significant_drop_tightening,
     reason = "Retain the existing dispatch future layout and ownership across the original await; Retain guard, repository and runtime owners through the original response or state transition scope"
 )]
@@ -815,10 +814,6 @@ async fn mutate_source(
     Ok(accepted_response(&receipt))
 }
 
-#[expect(
-    clippy::large_futures,
-    reason = "Retain the existing dispatch future layout and ownership across the original await"
-)]
 async fn lifecycle_action(
     State(state): State<Arc<PublicSourcesState>>,
     Extension(principal): Extension<Principal>,

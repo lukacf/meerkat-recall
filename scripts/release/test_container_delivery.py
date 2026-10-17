@@ -41,9 +41,24 @@ class ComposeTests(unittest.TestCase):
             self.assertEqual(cfg['storage']['surreal_db']['password'],keys[1])
             self.assertEqual(cfg['extractor']['mcp_url'],'http://127.0.0.1:3000/mcp/agent')
             self.assertTrue(cfg['extractor']['required'])
+            self.assertEqual(cfg['extractor']['model'],'gpt-6.1-sol')
+            override=(output/'semantic.override.example.yaml').read_text()
+            self.assertIn('OPENAI_API_KEY_FILE:',override)
+            self.assertNotIn('ANTHROPIC_API_KEY_FILE:',override)
             self.assertNotIn(keys[0],json.dumps(result))
             with self.assertRaises(FileExistsError):compose.prepare(output,*self.images())
             self.assertEqual((output/'secrets/signing-key').read_text().strip(),keys[0])
+
+    def test_development_model_default_preserves_explicit_operator_selection(self):
+        assignment=next(line for line in (HERE.parents[1]/'dev.sh').read_text().splitlines()
+                        if line.startswith('export PIPELINE_AGENTIC_MODEL='))
+        for supplied, expected in ((None,'gpt-6.1-sol'),('claude-opus-4-8','claude-opus-4-8')):
+            env={} if supplied is None else {'PIPELINE_AGENTIC_MODEL':supplied}
+            result=subprocess.run(['/bin/sh','-c',assignment+'\nprintf %s "$PIPELINE_AGENTIC_MODEL"'],
+                                  env=env,capture_output=True,text=True,check=True)
+            self.assertEqual(result.stdout,expected)
+        root_compose=(HERE.parents[1]/'docker-compose.yml').read_text()
+        self.assertIn('PIPELINE_AGENTIC_MODEL=${PIPELINE_AGENTIC_MODEL:-gpt-6.1-sol}',root_compose)
 
     def test_wrong_role_mutable_image_and_symlink_refused(self):
         with tempfile.TemporaryDirectory() as temp:

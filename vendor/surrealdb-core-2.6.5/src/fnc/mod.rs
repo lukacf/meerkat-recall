@@ -26,6 +26,7 @@ pub mod operate;
 pub mod parse;
 pub mod rand;
 pub mod recall;
+mod completion_coverage_projection;
 pub mod record;
 pub mod script;
 pub mod search;
@@ -49,6 +50,7 @@ pub async fn run(
 ) -> Result<Value, Error> {
 	if name.eq("sleep")
 		|| name.eq("api::invoke")
+		|| name.eq("recall::hnsw_coverage")
 		|| name.eq("array::all")
 		|| name.eq("array::any")
 		|| name.eq("array::every")
@@ -122,6 +124,8 @@ pub fn synchronous(
 		"recall::reference_token_version" => recall::reference_token_version,
 		"recall::original_fields_match" => recall::original_fields_match,
 		"recall::original_row_matches" => recall::original_row_matches,
+		"recall::completion_coverage_only" => recall::completion_coverage_only,
+		"recall::completion_visibility_changed" => recall::completion_visibility_changed,
 		//
 		"array::add" => array::add,
 		"array::append" => array::append,
@@ -527,6 +531,7 @@ pub async fn asynchronous(
 		"http::delete" => http::delete(ctx).await,
 
 		"migration::diagnose" => migration::diagnose((ctx,opt)).await,
+		"recall::hnsw_coverage" => crate::idx::trees::hnsw::coverage::check((ctx,opt)).await,
 		//
 		"record::exists" => record::exists((stk, ctx, Some(opt), doc)).await,
 		"record::refs" => record::refs((stk, ctx, opt, doc)).await,

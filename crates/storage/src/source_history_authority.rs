@@ -260,6 +260,16 @@ fn independent_boundaries(
         {
             return Err(invalid("historical support identity or projection differs"));
         }
+        if support.historical_unknown.as_ref().is_some_and(|history| {
+            support.independent
+                || support.last_commit_id.as_deref() != Some(history.commit_id.as_str())
+                || history.snapshot_sha256.len() != 64
+                || history.plan_id.len() != 64
+        }) {
+            return Err(invalid(
+                "historical unknown support is not an independent baseline",
+            ));
+        }
         if support.independent
             && Some(&support.source_id) != source
             && support

@@ -425,7 +425,11 @@ mod tests {
     pub(super) async fn prepare_storage(storage: &StorageClient) {
         if !storage.is_embedded() {
             for schema in [
-                include_str!("../../migrations/sql/031_source_publication.surql"),
+                concat!(
+                    include_str!("../../migrations/sql/031_source_publication.surql"),
+                    "\n",
+                    include_str!("../../migrations/sql/046_source_support_index_fence.surql")
+                ),
                 include_str!("../../migrations/sql/032_work_recovery.surql"),
                 include_str!("../../migrations/sql/041_work_producer_origin.surql"),
             ] {

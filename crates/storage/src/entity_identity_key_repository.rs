@@ -17,7 +17,7 @@ use crate::client::StorageClient;
 use crate::error::{StorageError, StorageResult};
 use crate::repository::{PaginatedResult, Repository, SearchCriteria, SearchRepository};
 
-const ENTITY_IDENTITY_KEY_PROJECTION: &str = r"
+pub(crate) const ENTITY_IDENTITY_KEY_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -47,7 +47,7 @@ const ENTITY_IDENTITY_KEY_PROJECTION: &str = r"
 
 /// Database-only proxy for `EntityIdentityKey` to avoid flatten/native enum issues.
 #[derive(Deserialize)]
-struct EntityIdentityKeyDb {
+pub(crate) struct EntityIdentityKeyDb {
     id: surrealdb::sql::Thing,
     space_id: String,
     created_at: chrono::DateTime<Utc>,

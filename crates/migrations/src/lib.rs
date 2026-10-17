@@ -121,6 +121,15 @@ pub mod schema {
     /// Keep readiness/recovery read nonces outside canonical semantic epochs.
     pub const CANONICAL_READ_SEMANTIC_EPOCH: &str =
         include_str!("../sql/045_canonical_read_semantic_epoch.surql");
+    /// Fence validation of indexed source-support projections.
+    pub const SOURCE_SUPPORT_INDEX_FENCE: &str =
+        include_str!("../sql/046_source_support_index_fence.surql");
+    /// Keep evidence-only certification outside indexed content generations.
+    pub const HISTORICAL_COVERAGE_VISIBILITY: &str =
+        include_str!("../sql/048_historical_coverage_visibility.surql");
+    /// Indexed complete revision membership for historical vector coverage.
+    pub const HISTORICAL_NODE_REVISION_LOOKUP: &str =
+        include_str!("../sql/047_historical_node_revision_lookup.surql");
 }
 
 /// Applies all schema SQL to the database.
@@ -244,6 +253,18 @@ const fn schema_files() -> &'static [(&'static str, &'static str)] {
         (
             "canonical_read_semantic_epoch",
             schema::CANONICAL_READ_SEMANTIC_EPOCH,
+        ),
+        (
+            "source_support_index_fence",
+            schema::SOURCE_SUPPORT_INDEX_FENCE,
+        ),
+        (
+            "historical_node_revision_lookup",
+            schema::HISTORICAL_NODE_REVISION_LOOKUP,
+        ),
+        (
+            "historical_coverage_visibility",
+            schema::HISTORICAL_COVERAGE_VISIBILITY,
         ),
     ]
 }

@@ -30,6 +30,9 @@ use crate::authz::AuthzState;
 use crate::routes::entities::ApiError;
 use crate::routes::require_space_id;
 
+#[path = "source_action_disposition.rs"]
+mod action_disposition;
+
 /// Shared state for assertion handlers.
 pub struct AssertionsState {
     /// Current source authority; absent only in repository unit fixtures.
@@ -1281,6 +1284,14 @@ async fn restore_assertion(
 /// Returns assertion routes.
 pub fn assertion_routes() -> Router<Arc<AssertionsState>> {
     Router::new()
+        .route(
+            "/v1/assertions/{id}/disposition/proposals/{artifact_id}",
+            get(action_disposition::proposal),
+        )
+        .route(
+            "/v1/assertions/{id}/disposition",
+            post(action_disposition::close).get(action_disposition::get),
+        )
         .route("/v1/assertions/search", post(search_assertions))
         .route("/v1/assertions", post(create_assertion))
         .route(

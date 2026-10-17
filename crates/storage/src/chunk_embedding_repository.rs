@@ -1133,7 +1133,7 @@ struct RevisionDocLookupDb {
 
 /// Database-only proxy for `NodeEmbedding` to avoid flatten/native enum issues.
 #[derive(Deserialize)]
-struct NodeEmbeddingDb {
+pub(crate) struct NodeEmbeddingDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

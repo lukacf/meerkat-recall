@@ -59,6 +59,8 @@ struct MembershipIndex {
     history_intents: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     restore_origins_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operational_archive_registry_sha256: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -241,6 +243,7 @@ pub(super) fn open_key(root: &Path) -> StorageResult<(String, ReferenceKey)> {
                 intents: BTreeSet::new(),
                 history_intents: BTreeSet::new(),
                 restore_origins_required: false,
+                operational_archive_registry_sha256: None,
             },
         )?;
     }
@@ -287,6 +290,10 @@ fn validate_index(
     if index.version != FORMAT_VERSION
         || index.journal_identity != identity
         || index.key_fingerprint != fingerprint
+        || index
+            .operational_archive_registry_sha256
+            .as_ref()
+            .is_some_and(|hash| !valid_token(hash))
         || index
             .intents
             .iter()
@@ -349,6 +356,39 @@ impl ErasureJournal {
         operation()?;
         index.restore_origins_required = true;
         write_checked(&self.root.join(INDEX_FILE), index)
+    }
+
+    pub(super) fn operational_archive_registry_sha256(&self) -> StorageResult<Option<String>> {
+        Ok(
+            validate_index(&self.root, &self.identity, self.reference_key_fingerprint())?
+                .operational_archive_registry_sha256,
+        )
+    }
+
+    // Publish a complete immutable registry first, then atomically select its
+    // digest in the independently retained mandatory index. A crash before the
+    // index update leaves only an unselected payload-free orphan, never a torn
+    // acknowledged registry. All writers share the original reference lock.
+    pub(super) fn with_operational_archive_writer<T>(
+        &self,
+        operation: impl FnOnce() -> StorageResult<(T, String)>,
+    ) -> StorageResult<T> {
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| io_error("journal lock poisoned"))?;
+        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire(
+            &self.root.join("reference-membership"),
+        )?;
+        let mut index =
+            validate_index(&self.root, &self.identity, self.reference_key_fingerprint())?;
+        let (result, registry_sha256) = operation()?;
+        if !valid_token(&registry_sha256) {
+            return Err(io_error("archive registry digest differs"));
+        }
+        index.operational_archive_registry_sha256 = Some(registry_sha256);
+        write_checked(&self.root.join(INDEX_FILE), index)?;
+        Ok(result)
     }
 
     /// Trusted query custody only; never serialize into a database or receipt.
@@ -620,6 +660,7 @@ mod tests {
                         intents: BTreeSet::new(),
                         history_intents: BTreeSet::new(),
                         restore_origins_required: false,
+                        operational_archive_registry_sha256: None,
                     },
                 )
                 .unwrap();

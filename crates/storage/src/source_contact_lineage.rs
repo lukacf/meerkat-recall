@@ -1077,6 +1077,7 @@ pub async fn prepare_support_continuations(
                         roots: vec![root],
                     };
                     let receipt = CanonicalCommitReceipt {
+                        historical_import: None,
                         space_id: space.to_owned(),
                         commit_id: commit_id.clone(),
                         input_fingerprint: fingerprint.clone(),

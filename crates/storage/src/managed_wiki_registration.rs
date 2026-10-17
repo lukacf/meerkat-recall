@@ -1064,6 +1064,42 @@ mod tests {
         }
     }
 
+    async fn stage_done_registration_history(repo: &WorkItemRepository, id: &RecordId) {
+        let original = repo.get("space", id).await.unwrap().unwrap();
+        assert_eq!(original.kind, REGISTRATION_KIND);
+        assert_eq!(original.status, WorkItemStatus::Cancelled);
+        let lock_id = registration_state("space", None).base.id;
+        let original_lock = repo.get("space", &lock_id).await.unwrap().unwrap();
+        let mut historical = original.clone();
+        historical.status = WorkItemStatus::Done;
+        // Grant history has no queue producer. The generic scheduler transition
+        // must refuse it; this fixture deliberately stages stale terminal bytes.
+        assert!(matches!(
+            repo.update("space", id, historical.clone()).await,
+            Err(StorageError::NotFound(_))
+        ));
+        assert_eq!(repo.get("space", id).await.unwrap(), Some(original));
+        if let Some(store) = repo.client.embedded_store() {
+            store.replace(historical.clone()).await.unwrap();
+        } else {
+            repo.client
+                .query_bind_checked(
+                    "UPDATE $id SET status='done' WHERE space_id='space' AND kind=$kind;",
+                    crate::bindings! {
+                        "id" => crate::surreal::thing_from_record_id(id),
+                        "kind" => REGISTRATION_KIND,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(repo.get("space", id).await.unwrap(), Some(historical));
+        assert_eq!(
+            repo.get("space", &lock_id).await.unwrap(),
+            Some(original_lock)
+        );
+    }
+
     #[tokio::test]
     #[expect(
         clippy::significant_drop_in_scrutinee,
@@ -1092,9 +1128,7 @@ mod tests {
                 .create_managed_wiki_grant("space", "new")
                 .await
                 .unwrap();
-            let mut historical = repo.get("space", &old_grant).await.unwrap().unwrap();
-            historical.status = WorkItemStatus::Done;
-            repo.update("space", &old_grant, historical).await.unwrap();
+            stage_done_registration_history(&repo, &old_grant).await;
             assert!(!repo
                 .managed_wiki_grant_is_active("space", &old_grant)
                 .await
@@ -1111,9 +1145,7 @@ mod tests {
                 .await
                 .is_err());
             repo.revoke_managed_wiki_grants("space").await.unwrap();
-            let mut historical = repo.get("space", &new_grant).await.unwrap().unwrap();
-            historical.status = WorkItemStatus::Done;
-            repo.update("space", &new_grant, historical).await.unwrap();
+            stage_done_registration_history(&repo, &new_grant).await;
             assert!(!repo
                 .managed_wiki_grant_is_active("space", &new_grant)
                 .await

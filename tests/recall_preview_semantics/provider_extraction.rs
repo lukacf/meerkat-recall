@@ -62,7 +62,7 @@ const TEXT: &str = "The acquisition of Moss Ltd was discussed but never approved
 fn unsupported_output() -> serde_json::Value {
     // This exact source says the opposite. The separate scripted verifier has
     // one fixed false verdict for this counterexample, never blanket approval.
-    json!({"assertions":[{
+    json!({"action_disposition_proposals":[],"assertions":[{
         "subject_text":"The company", "predicate_text":"acquired", "object_text":"Moss Ltd",
         "object_literal":null, "evidence":{"start":0,"end":TEXT.len(),"quote":TEXT},
         "confidence":0.99,"source_event_time":null,"source_event_time_precision":null,

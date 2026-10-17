@@ -119,7 +119,7 @@ impl Default for WikiEditorialConfig {
     fn default() -> Self {
         let writer_model = std::env::var("ELEPHANT_WIKI_WRITER_MODEL")
             .or_else(|_| std::env::var("PIPELINE_AGENTIC_MODEL"))
-            .unwrap_or_else(|_| "gpt-5.6-sol".to_string());
+            .unwrap_or_else(|_| "gpt-6.1-sol".to_string());
         let verifier_model =
             std::env::var("ELEPHANT_WIKI_VERIFIER_MODEL").unwrap_or_else(|_| writer_model.clone());
         let max_context_chars = std::env::var("ELEPHANT_WIKI_MAX_CONTEXT_CHARS")

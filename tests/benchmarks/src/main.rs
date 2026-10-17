@@ -849,7 +849,7 @@ async fn main() -> Result<()> {
             cases.extend(run_compare_suite(config, cli.backend).await?);
         }
         BenchmarkSuite::Scenario => {
-            cases.extend(run_scenario_suite(config, cli.backend).await?);
+            cases.extend(Box::pin(run_scenario_suite(config, cli.backend)).await?);
         }
         BenchmarkSuite::Quality => {
             cases.extend(run_quality_suite(cli.backend).await?);
@@ -881,7 +881,7 @@ async fn main() -> Result<()> {
             cases.extend(run_concurrency_suite(config)?);
             cases.extend(run_pipeline_concurrency_suite(cli.backend).await?);
             cases.extend(run_compare_suite(config, cli.backend).await?);
-            cases.extend(run_scenario_suite(config, cli.backend).await?);
+            cases.extend(Box::pin(run_scenario_suite(config, cli.backend)).await?);
             cases.extend(run_quality_suite(cli.backend).await?);
             if include_local_transcripts_in_all() {
                 if !local_transcript_inputs_available() {
@@ -1516,7 +1516,7 @@ async fn run_scenario_suite(
 
     for backend in selected_storage_backends(selection) {
         let label = backend_label(backend);
-        let alice_total = benchmark_async_case(
+        let alice_total = Box::pin(benchmark_async_case(
             "scenario",
             format!("{label}_alice_pipeline_total"),
             config.alice_total_iters,
@@ -1529,7 +1529,7 @@ async fn run_scenario_suite(
                 let run = run_alice_pipeline_once(backend).await?;
                 Ok(run.total)
             },
-        )
+        ))
         .await?;
         cases.push(alice_total);
 
@@ -2210,7 +2210,7 @@ async fn run_oz_qa_suite(selection: BenchmarkBackend) -> Result<Vec<BenchmarkCas
 async fn run_elephant_session_qa_suite(selection: BenchmarkBackend) -> Result<Vec<BenchmarkCase>> {
     let mut cases = Vec::new();
     let started = Instant::now();
-    let artifact = extract_elephant_session_graph_artifact().await?;
+    let artifact = Box::pin(extract_elephant_session_graph_artifact()).await?;
     let extraction_duration = started.elapsed();
     cases.push(one_shot_case(
         "session-qa",
@@ -5395,7 +5395,7 @@ async fn extract_oz_graph_artifact() -> Result<AliceGraphArtifact> {
 }
 
 async fn extract_elephant_session_graph_artifact() -> Result<AliceGraphArtifact> {
-    let snapshot = extract_elephant_session_graph_snapshot().await?;
+    let snapshot = Box::pin(extract_elephant_session_graph_snapshot()).await?;
     Ok(AliceGraphArtifact {
         space_config: technical_transcript_space_config("default", 256),
         docs: snapshot.docs,

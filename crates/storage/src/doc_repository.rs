@@ -22,7 +22,7 @@ const ANGEL_PROTECTEES_METADATA_KEY: &str = "angel_protectees";
 /// Metadata key linking a doc to the Angel monitoring session that produced it.
 const ANGEL_SESSION_ID_METADATA_KEY: &str = "angel_session_id";
 
-const DOC_PROJECTION: &str = r"
+pub(crate) const DOC_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -52,7 +52,7 @@ const DOC_PROJECTION: &str = r"
 
 /// Database-only proxy for `Doc` to avoid flatten/native enum issues.
 #[derive(Deserialize)]
-struct DocDb {
+pub(crate) struct DocDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

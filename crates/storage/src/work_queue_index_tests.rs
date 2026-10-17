@@ -44,6 +44,19 @@ fn item(sequence: u128, status: WorkItemStatus) -> WorkItem {
 }
 
 async fn insert_items(client: &StorageClient, items: Vec<WorkItem>) {
+    // These fixtures represent ordinary scheduler work. Historical raw rows
+    // without producer evidence are intentionally held by separate controls.
+    let mut origin_sql = String::from("BEGIN TRANSACTION;");
+    let mut origin_bindings = std::collections::BTreeMap::new();
+    for (index, item) in items.iter().enumerate() {
+        crate::work_producer_repository::append_direct_sql(
+            &mut origin_sql,
+            &mut origin_bindings,
+            &format!("queue_{index}"),
+            item,
+        )
+        .expect("known fixture producer");
+    }
     let mut rows = Vec::with_capacity(items.len());
     for item in items {
         let surrealdb::sql::Value::Object(mut row) =
@@ -64,6 +77,11 @@ async fn insert_items(client: &StorageClient, items: Vec<WorkItem>) {
         )
         .await
         .expect("insert fixture");
+    origin_sql.push_str("COMMIT TRANSACTION;");
+    client
+        .query_bind_checked(&origin_sql, origin_bindings)
+        .await
+        .expect("fixture origins");
 }
 
 #[derive(Debug, Deserialize)]

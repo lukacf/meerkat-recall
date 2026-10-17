@@ -18,7 +18,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 use crate::require::required_field;
 
-const COST_LEDGER_DAILY_PROJECTION: &str = r"
+pub(crate) const COST_LEDGER_DAILY_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -99,7 +99,7 @@ fn date_to_surreal(date: NaiveDate) -> StorageResult<surrealdb::sql::Datetime> {
 
 /// Database-only proxy for CostLedgerDaily.
 #[derive(Deserialize)]
-struct CostLedgerDailyDb {
+pub(crate) struct CostLedgerDailyDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,
@@ -701,7 +701,9 @@ impl CostLedgerDailyRepository {
     }
 
     /// Converts a CostLedgerDaily to a SurrealDB value for insertion.
-    fn cost_ledger_daily_to_value(item: &CostLedgerDaily) -> StorageResult<surrealdb::sql::Value> {
+    pub(crate) fn cost_ledger_daily_to_value(
+        item: &CostLedgerDaily,
+    ) -> StorageResult<surrealdb::sql::Value> {
         use std::collections::BTreeMap;
         use surrealdb::sql::{Object, Value};
 

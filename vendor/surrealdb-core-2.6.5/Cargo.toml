@@ -394,6 +394,7 @@ version = "0.1.0"
 
 [dependencies.serde_json]
 version = "1.0.127"
+features = ["raw_value"]
 
 [dependencies.sha1]
 version = "0.10.6"
@@ -581,3 +582,7 @@ version = "0.7.4"
 level = "warn"
 priority = 0
 check-cfg = ["cfg(storage)"]
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies.tokio-util]
+version = "0.7.10"
+features = ["rt"]

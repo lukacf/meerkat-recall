@@ -60,7 +60,16 @@ pub async fn filter<T: CurrentRead + HasSecurity>(
                 authorized(ctx, base, scope)
             }
         };
-        if let Some(record) = reader.project(record, &authorize).await? {
+        if let Some(mut record) = reader.project(record, &authorize).await? {
+            record
+                .project_action_state(&reader, &|base| {
+                    authorized(
+                        ctx,
+                        base,
+                        elephant_storage::action_disposition::dependency_scope(base.id.table()),
+                    )
+                })
+                .await?;
             visible.push(record);
         }
     }

@@ -81,12 +81,12 @@ fn reasoning_effort_from_str(value: &str) -> Option<ReasoningEffort> {
 }
 
 /// Default reasoning effort for OpenAI extraction models when
-/// EXTRACTION_REASONING_EFFORT is unset. Measured 2026-08-01 on live A/B
+/// EXTRACTION_REASONING_EFFORT is unset. Historical 2026-08-01 live A/B
 /// (same docs, fresh stores): sol at default(medium) burned 76k tokens/60s on
 /// a trivial 3-sentence doc vs 19k/20s at low, and on a fact-dense board
 /// minutes doc low kept full assertion coverage (20 vs 21, including the
 /// decision facts gpt-5.6-terra dropped entirely) at 28.8k/69s vs 33.8k/99s.
-/// Reasoning above low buys nothing measurable for structured extraction.
+/// Keep that bounded default; this is not a GPT-6.1 quality measurement.
 const DEFAULT_EXTRACTION_REASONING_EFFORT: &str = "low";
 
 /// Effort override for extraction agents: the env var when set (operator's
@@ -170,7 +170,7 @@ impl AgenticExtractorConfig {
 
 impl Default for AgenticExtractorConfig {
     fn default() -> Self {
-        Self::new("http://localhost:3000/mcp/agent", "gpt-5.6-sol")
+        Self::new("http://localhost:3000/mcp/agent", "gpt-6.1-sol")
     }
 }
 
@@ -733,6 +733,14 @@ pub fn extraction_output_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
+            "action_disposition_proposals": {
+                "type":"array","maxItems":16,
+                "description":"Untrusted exact-action closure links. Use existing authorized list_assertions/search_assertions to resolve one target; ambiguous or absent exact identity means no proposal. Never authority to close.",
+                "items":{"type":"object","additionalProperties":false,"properties":{
+                    "target_action_id":{"type":"string"},"subject_entity_id":{"type":"string"},
+                    "reason":{"type":"string","maxLength":4096},"evidence_start":{"type":"integer"},"evidence_end":{"type":"integer"},"evidence_quote":{"type":"string","maxLength":32768}
+                },"required":["target_action_id","subject_entity_id","reason","evidence_start","evidence_end","evidence_quote"]}
+            },
             "assertions": {
                 "type": "array",
                 "description": "List of extracted factual assertions from the text",
@@ -843,7 +851,7 @@ pub fn extraction_output_schema() -> Value {
                 }
             }
         },
-        "required": ["assertions"]
+        "required": ["assertions", "action_disposition_proposals"]
     })
 }
 
@@ -2245,6 +2253,7 @@ impl AgenticExtractor {
             media_attachments: &ctx.media_attachments,
         });
         append_repair_context(&mut prompt, &ctx)?;
+        append_action_disposition_guidance(&mut prompt);
         let prompt_ms = prompt_started.elapsed().as_millis();
 
         // Wrap the dispatcher with a ReadTextRange tool for evidence verification
@@ -2283,6 +2292,7 @@ impl AgenticExtractor {
                 &ctx.known_entities,
             );
             append_repair_context(&mut direct_prompt, &ctx)?;
+            append_action_disposition_guidance(&mut direct_prompt);
             let mut direct_build = AgentBuildConfig::new(self.config.model.clone());
             #[cfg(test)]
             {
@@ -2337,6 +2347,10 @@ impl AgenticExtractor {
             require_completed_extraction_run(&direct_result)?;
 
             let parse_started = Instant::now();
+            let action_proposals = super::parse_action_disposition_proposals(
+                direct_result.structured_output.as_ref(),
+                &direct_result.text,
+            )?;
             let raw_assertions = parse_agent_run_output(
                 &self.config.model,
                 direct_result.structured_output.as_ref(),
@@ -2399,7 +2413,8 @@ impl AgenticExtractor {
                 raw_assertions,
                 u32::try_from(tokens_used).unwrap_or(u32::MAX),
                 self.config.model.clone(),
-            ));
+            )
+            .with_action_disposition_proposals(action_proposals));
         }
 
         // Let AgentFactory resolve the LLM client from model name + env API keys.
@@ -2480,6 +2495,10 @@ impl AgenticExtractor {
         // Use structured_output if available, otherwise fall back to parsing text
         let parse_started = Instant::now();
         let mut fallback_tokens: u64 = 0;
+        let mut action_proposals = super::parse_action_disposition_proposals(
+            run_result.structured_output.as_ref(),
+            &run_result.text,
+        )?;
         let raw_assertions = match parse_agent_run_output(
             &self.config.model,
             run_result.structured_output.as_ref(),
@@ -2500,6 +2519,7 @@ impl AgenticExtractor {
                     &ctx.known_entities,
                 );
                 append_repair_context(&mut fallback_prompt, &ctx)?;
+                append_action_disposition_guidance(&mut fallback_prompt);
                 let mut fallback_build = AgentBuildConfig::new(self.config.model.clone());
                 #[cfg(test)]
                 {
@@ -2573,6 +2593,10 @@ impl AgenticExtractor {
                 require_completed_extraction_run(&fallback_result)?;
                 fallback_tokens =
                     fallback_tokens.saturating_add(fallback_result.usage.total_tokens());
+                action_proposals = super::parse_action_disposition_proposals(
+                    fallback_result.structured_output.as_ref(),
+                    &fallback_result.text,
+                )?;
                 parse_agent_run_output(
                     &self.config.model,
                     fallback_result.structured_output.as_ref(),
@@ -2648,7 +2672,8 @@ impl AgenticExtractor {
             raw_assertions,
             u32::try_from(tokens_used).unwrap_or(u32::MAX),
             self.config.model.clone(),
-        ))
+        )
+        .with_action_disposition_proposals(action_proposals))
     }
 }
 
@@ -2891,6 +2916,10 @@ impl Extractor for AgenticExtractor {
     }
 }
 
+fn append_action_disposition_guidance(prompt: &mut String) {
+    prompt.push_str("\nAction disposition proposals are separate from facts and never owner permission. When source text explicitly states an owner decision to close an existing requires_action request, use authorized assertion search/list tools to locate exactly one matching action and its actual subject entity. Propose its exact assertion ID and subject ID only when unambiguous. Supply the exact contiguous owner-statement quote and node-local UTF-8 byte offsets. If tools are unavailable and the text lacks exact identities, return no proposal. Never close every action for the subject. recorded_by, source_kind and model confidence confer no authority. Preserve the original request as a historical fact; do not infer performed, submitted, withdrawn or false. Return action_disposition_proposals as a separate array (empty when absent/ambiguous), not factual assertions. A current authenticated manage:action operation must separately approve any proposal.\n");
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -2947,8 +2976,8 @@ mod tests {
     fn extraction_effort_defaults_low_for_openai_only() {
         use meerkat_core::lifecycle::run_primitive::{ProviderTag, ReasoningEffort};
 
-        // OpenAI models get the low default (the A/B-measured sweet spot).
-        let params = effort_params_for("gpt-5.6-sol", None).expect("openai default");
+        // OpenAI models retain Recall's low policy; GPT-6.1 supports it.
+        let params = effort_params_for("gpt-6.1-sol", None).expect("openai default");
         match params.provider_tag {
             Some(ProviderTag::OpenAi(tag)) => {
                 assert_eq!(tag.reasoning_effort, Some(ReasoningEffort::Low));
@@ -3395,6 +3424,7 @@ mod tests {
 
     #[test]
     fn test_config_new() {
+        assert_eq!(AgenticExtractorConfig::default().model, "gpt-6.1-sol");
         let config = AgenticExtractorConfig::new("http://localhost:3001/mcp", "gpt-4o");
         assert_eq!(config.mcp_url, "http://localhost:3001/mcp");
         assert_eq!(config.model, "gpt-4o");
@@ -4133,6 +4163,7 @@ mod tests {
             );
 
             let response_json = r#"{
+            "action_disposition_proposals": [],
             "assertions": [
                 {
                     "subject_text": "Alice",
@@ -4189,11 +4220,79 @@ mod tests {
                 .expect("extract");
 
             assert_eq!(result.assertion_count(), 1);
+            assert!(result.action_disposition_proposals.is_empty());
             assert_eq!(result.tokens_used, 30);
             assert_eq!(llm.call_count(), 3);
             assert!(result.raw_assertions[0].validate_support().is_ok());
             let recorded = calls.lock().expect("lock calls");
             assert_eq!(*recorded, ["search_entities"]);
+        });
+    }
+
+    #[test]
+    fn test_agentic_extractor_returns_untrusted_action_proposal_separate_from_facts() {
+        run_factory_test(|| async {
+            let mut config = make_config();
+            config.model = "mock-model".into();
+            let extractor = AgenticExtractor::new(config);
+            let mut ctx = make_context();
+            ctx.node_text = "I close this exact action.".into();
+            let action = RecordId::new_v4(elephant_types::TableName::Assertion);
+            let subject = RecordId::new_v4(elephant_types::TableName::Entity);
+            let output = json!({
+                "assertions": [],
+                "action_disposition_proposals": [{
+                    "target_action_id":action,
+                    "subject_entity_id":subject,
+                    "reason":"Explicit owner decision in original text",
+                    "evidence_start":0,
+                    "evidence_end":ctx.node_text.len(),
+                    "evidence_quote":ctx.node_text
+                }]
+            });
+            let response = LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: output.to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+                Usage {
+                    input_tokens: 5,
+                    output_tokens: 5,
+                    ..Usage::default()
+                },
+            );
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let dispatcher = Arc::new(RecordingDispatcher::new(calls.clone(), Vec::new()));
+            let llm = Arc::new(MockLlmClient::new(vec![response]));
+            let result = extractor
+                .run_agent(ctx, dispatcher, llm.clone())
+                .await
+                .expect("exact structured proposal");
+            assert!(
+                result.raw_assertions.is_empty(),
+                "proposal cannot manufacture a performed/false fact"
+            );
+            assert_eq!(result.action_disposition_proposals.len(), 1);
+            assert_eq!(
+                result.action_disposition_proposals[0].target_action_id,
+                action
+            );
+            assert_eq!(
+                result.action_disposition_proposals[0].subject_entity_id,
+                subject
+            );
+            assert_eq!(
+                result.action_disposition_proposals[0].evidence_quote,
+                "I close this exact action."
+            );
+            assert_eq!(result.tokens_used, 10);
+            assert_eq!(
+                llm.call_count(),
+                1,
+                "valid proposal does not add schema retries or support calls"
+            );
+            assert!(calls.lock().expect("recorded tools").is_empty());
         });
     }
 
@@ -4213,7 +4312,8 @@ mod tests {
                 Vec::new(),
             ));
 
-            let response_json = r#"{"assertions": []}"#;
+            let response_json = r#"{"action_disposition_proposals": [],
+            "assertions": []}"#;
 
             let response = LlmStreamResult::new(
                 vec![AssistantBlock::Text {
@@ -4271,7 +4371,8 @@ mod tests {
             // The legacy text parser accepts omitted nullable fields, while
             // the authoritative structured-output schema requires them.
             let primary_output = r#"{
-                "assertions": [{
+                "action_disposition_proposals": [],
+            "assertions": [{
                     "subject_text": "Alice",
                     "predicate_text": "works at",
                     "object_text": "Acme Corp",
@@ -4504,6 +4605,18 @@ mod tests {
             .unwrap()
             .contains(&json!("assertions")));
 
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("action_disposition_proposals")));
+        assert_eq!(
+            schema["properties"]["action_disposition_proposals"]["maxItems"],
+            16
+        );
+        assert_eq!(
+            schema["properties"]["action_disposition_proposals"]["items"]["additionalProperties"],
+            false
+        );
         // Verify assertions array structure
         let assertions_schema = &schema["properties"]["assertions"];
         assert_eq!(assertions_schema["type"], "array");

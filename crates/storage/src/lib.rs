@@ -15,6 +15,7 @@
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 // Core infrastructure
+pub mod action_disposition;
 pub mod backend;
 pub mod canonical_commit;
 pub mod canonical_definition;
@@ -28,6 +29,12 @@ pub mod erasure_journal;
 pub mod error;
 pub mod event_sequence;
 pub mod exclusive_store_lock;
+pub mod historical_catchup_ledger;
+pub mod historical_delta;
+mod historical_delta_operations;
+mod historical_delta_storage;
+mod historical_delta_vectors;
+pub mod historical_native_effects;
 pub mod initialization_diagnostic;
 pub mod outbox_checkpoint_repository;
 pub mod pool;
@@ -44,6 +51,8 @@ pub mod surreal;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 pub mod transaction;
+/// Bounded typed imports under exclusive fresh-target transfer custody.
+pub mod transfer_batch;
 
 // Core entity repositories
 pub mod audit_log_repository;
@@ -77,6 +86,9 @@ mod source_history_authority;
 mod source_history_controls;
 mod source_history_restore;
 pub use source_document_guards::standing_dispatch_inputs;
+pub mod historical_adoption;
+/// Actual current vector coverage for a retained historical publication.
+pub mod historical_embedding_coverage;
 pub mod source_ingest;
 pub mod source_intake;
 /// Read-only physical source inventory paging.
@@ -278,3 +290,9 @@ mod native_physical_history_rpc_tests;
 
 #[cfg(all(test, any(feature = "surrealkv", feature = "rocksdb")))]
 mod native_physical_index_tests;
+
+/// Independently retained operational archives under original journal custody.
+pub mod historical_archive_lifecycle;
+
+/// Exact original lexical operational history format, accessed through journal custody.
+pub mod historical_operational_archive;

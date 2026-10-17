@@ -36,7 +36,7 @@ export PIPELINE_EMBED_PROVIDER=openai
 export PIPELINE_EMBED_MODEL=text-embedding-3-large
 export PIPELINE_EMBED_DIMS=3072
 export PIPELINE_AGENTIC_MCP_URL=http://127.0.0.1:3000/mcp/agent
-export PIPELINE_AGENTIC_MODEL=claude-sonnet-4-5
+export PIPELINE_AGENTIC_MODEL="${PIPELINE_AGENTIC_MODEL:-gpt-6.1-sol}"
 
 # Ensure API keys are set
 if [ -z "${ANTHROPIC_API_KEY:-}" ]; then

@@ -1791,6 +1791,9 @@ async fn restore_source(
     }
 }
 
+#[path = "source_historical_noop.rs"]
+mod historical_noop;
+
 /// Returns source routes.
 pub fn source_routes() -> Router<Arc<SourcesState>> {
     Router::new()
@@ -1801,6 +1804,10 @@ pub fn source_routes() -> Router<Arc<SourcesState>> {
         .route("/v1/sources/{id}", put(update_source))
         .route("/v1/sources/{id}", delete(delete_source))
         .route("/v1/sources/{id}/restore", post(restore_source))
+        .route(
+            "/v1/sources/{id}/historical-unchanged",
+            post(historical_noop::verify),
+        )
 }
 
 #[cfg(test)]

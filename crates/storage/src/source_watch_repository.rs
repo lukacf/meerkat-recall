@@ -943,7 +943,7 @@ mod tests {
         let client = StorageClient::new_embedded()
             .await
             .expect("embedded storage");
-        exercise_repository(client).await;
+        Box::pin(exercise_repository(client)).await;
     }
 
     #[tokio::test]
@@ -959,6 +959,6 @@ mod tests {
             ))
             .await
             .expect("apply source-watch schema");
-        exercise_repository(client).await;
+        Box::pin(exercise_repository(client)).await;
     }
 }

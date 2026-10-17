@@ -20,7 +20,7 @@ use crate::client::StorageClient;
 use crate::error::{StorageError, StorageResult};
 use crate::repository::{PaginatedResult, Repository, SearchCriteria, SearchRepository};
 
-const ASSERTION_PROJECTION: &str = r"
+pub(crate) const ASSERTION_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -70,7 +70,7 @@ const ASSERTION_PROJECTION: &str = r"
 
 /// Database-only proxy for Assertion to avoid flatten/native enum issues.
 #[derive(Deserialize)]
-struct AssertionDb {
+pub(crate) struct AssertionDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

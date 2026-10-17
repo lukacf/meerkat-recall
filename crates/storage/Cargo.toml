@@ -26,6 +26,7 @@ sha2 = { workspace = true }
 num-traits = "0.2"
 hex = { workspace = true }
 getrandom = "0.2"
+rusqlite = "=0.37.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -46,7 +47,7 @@ rstest = { workspace = true }
 rocksdb = ["surrealdb/kv-rocksdb"]
 # Embedded versioned SurrealKV engine for retained history and physical checks.
 surrealkv = ["surrealdb/kv-surrealkv"]
-test-utils = []
+test-utils = ["surrealdb/recall-close-test-utils"]
 
 [lints]
 workspace = true

@@ -78,9 +78,13 @@ Because rel slot keys include the object, "Alice works_at ExampleCo" and "Alice 
 
 ## LLM Adjudication
 
+The Claude Sonnet 5.5 default below describes the current source checkout.
+Published 0.9.1 binaries retain their original adjudication default; the
+new default requires the newer source.
+
 With `ANTHROPIC_API_KEY` set, the pipeline binary constructs a slot adjudicator (`TmContext`) that is the primary resolution path for real conflicts:
 
-- **Model:** `PIPELINE_TM_MODEL` (default `claude-sonnet-4-5`)
+- **Model:** `PIPELINE_TM_MODEL` (default `claude-sonnet-5-5`)
 - **Prompt:** `crates/pipeline/prompts/tm_adjudication.txt`
 - **Contract:** meerkat structured output with a strict schema and retries; malformed output after retries falls back to the deterministic policy with a warning
 - **Input:** per-claim rendered values, confidences, evidence counts, source timestamps and time basis, plus predicate semantics when known

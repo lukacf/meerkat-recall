@@ -723,6 +723,7 @@ mod tests {
             "source_artifact_type": "source_metadata", "payload": { "kind": "source_metadata", "data": data },
         });
         let manifest = SourcePublicationManifest {
+            historical_adoption: None,
             space_id: "candidate-space".into(),
             publication,
             mode: IngestMode::Metadata,

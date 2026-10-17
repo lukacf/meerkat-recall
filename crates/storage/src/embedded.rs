@@ -300,6 +300,19 @@ impl EmbeddedStore {
             .await
     }
 
+    pub(crate) async fn historical_population(
+        &self,
+        table: elephant_types::TableName,
+        space: &str,
+        limit: usize,
+    ) -> StorageResult<Vec<(RecordId, RecordId, bool, bool)>> {
+        self.with_import_read_guard(|db| {
+            db.historical_population(table, space, limit)
+                .map_err(Into::into)
+        })
+        .await
+    }
+
     /// Read bounded physical typed IDs under normal admission and import guards.
     pub(crate) async fn physical_record_ids_page(
         &self,
@@ -326,6 +339,20 @@ impl EmbeddedStore {
     ) -> StorageResult<Vec<(String, serde_json::Value)>> {
         self.with_import_read_guard(|db| {
             db.extension_rows_page(table, space, after, limit)
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Exact derived support lookup under normal read/import admission.
+    pub(crate) async fn source_support_rows(
+        &self,
+        space: &str,
+        record: &str,
+        limit: usize,
+    ) -> StorageResult<Vec<(String, serde_json::Value)>> {
+        self.with_import_read_guard(|db| {
+            db.source_support_rows(space, record, limit)
                 .map_err(Into::into)
         })
         .await
@@ -732,6 +759,19 @@ impl EmbeddedStore {
     ) -> StorageResult<EntityRelations> {
         self.with_import_read_guard(|db| {
             db.entity_relations(space_id, entity_id).map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Bounded indexed node identities across tenant buckets for lineage validation.
+    pub async fn historical_node_ids_for_revision(
+        &self,
+        revision_id: &RecordId,
+        limit: usize,
+    ) -> StorageResult<Vec<(String, RecordId)>> {
+        self.with_import_read_guard(|db| {
+            db.historical_node_ids_for_revision(revision_id, limit)
+                .map_err(Into::into)
         })
         .await
     }

@@ -14,6 +14,13 @@ mod references;
 #[path = "erasure_history_journal.rs"]
 mod history;
 
+#[path = "erasure_operational_archives.rs"]
+mod operational_archives;
+pub use operational_archives::{
+    ArchiveGenerationState, ArchiveRedactionProof, ArchiveRegistration, ArchiveRegistryEntry,
+    ArchiveSealEvidence,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 /// Durable authority to purge one physical source incarnation, without its payload.
@@ -85,6 +92,7 @@ impl ErasureJournal {
         journal.transfer_marker()?;
         journal.validate_reference_memberships()?;
         journal.validate_history_commitments()?;
+        journal.validate_operational_archives()?;
         crate::source_history_restore::validate_restored_history(&journal)?;
         Ok(journal)
     }

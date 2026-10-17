@@ -16,7 +16,7 @@ use crate::client::StorageClient;
 use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 
-const PREDICATE_ALIAS_PROJECTION: &str = r"
+pub(crate) const PREDICATE_ALIAS_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -48,7 +48,7 @@ const PREDICATE_ALIAS_PROJECTION: &str = r"
 
 /// Database-only proxy for PredicateAlias.
 #[derive(Deserialize)]
-struct PredicateAliasDb {
+pub(crate) struct PredicateAliasDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

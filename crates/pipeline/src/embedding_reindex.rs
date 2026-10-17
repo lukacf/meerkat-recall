@@ -39,7 +39,7 @@ pub async fn process_embedding_reindex(
     space_id: &str,
     batch_size: usize,
 ) -> PipelineResult<ReindexProgress> {
-    process_embedding_reindex_inner(storage, space_id, batch_size, None, None).await
+    process_embedding_reindex_inner(storage, space_id, batch_size, None, None, None).await
 }
 
 /// Process one page under the original queue claim and payload target identity.
@@ -60,6 +60,31 @@ pub async fn process_embedding_reindex_with_attempt(
         batch_size,
         Some(expected_reindex_id),
         Some(attempt),
+        None,
+    )
+    .await
+}
+
+/// Process an explicitly accepted administrative target without queue delay.
+/// Every page retains the ordinary current model authorization, source reads,
+/// content generation checks and guarded vector/progress transactions.
+///
+/// # Errors
+/// Rejects a replaced configuration or reindex before provider dispatch.
+pub async fn process_embedding_reindex_for_target(
+    storage: &StorageClient,
+    space_id: &str,
+    batch_size: usize,
+    expected_reindex_id: &str,
+    expected_configuration_id: &RecordId,
+) -> PipelineResult<ReindexProgress> {
+    process_embedding_reindex_inner(
+        storage,
+        space_id,
+        batch_size,
+        Some(expected_reindex_id),
+        None,
+        Some(expected_configuration_id),
     )
     .await
 }
@@ -70,11 +95,19 @@ async fn process_embedding_reindex_inner(
     batch_size: usize,
     expected_reindex_id: Option<&str>,
     attempt: Option<&AttemptFence>,
+    expected_configuration_id: Option<&RecordId>,
 ) -> PipelineResult<ReindexProgress> {
     let configs = SpaceConfigRepository::new(storage.clone());
     let mut config = configs.get_by_space_id(space_id).await?.ok_or_else(|| {
         PipelineError::ConfigError("provider_authorization: space missing".into())
     })?;
+    if expected_configuration_id.is_some_and(|expected| expected != &config.base.id) {
+        return Err(PipelineError::StorageError(
+            elephant_storage::StorageError::Conflict(
+                "original reindex configuration was replaced".into(),
+            ),
+        ));
+    }
     let processing = config.processing.as_ref().ok_or_else(|| {
         PipelineError::ConfigError("provider_authorization: configuration missing".into())
     })?;
@@ -385,3 +418,60 @@ async fn record_page(
         }
     })
 }
+
+#[cfg(test)]
+mod administrative_target_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use elephant_storage::Repository;
+    use elephant_types::records::{BaseFields, SpaceConfig};
+    use elephant_types::TableName;
+
+    #[tokio::test]
+    async fn replaced_configuration_and_unstaged_target_refuse_before_provider_resolution() {
+        let storage = StorageClient::new_embedded().await.unwrap();
+        let id = RecordId::new_v4(TableName::SpaceConfig);
+        SpaceConfigRepository::new(storage.clone())
+            .create(SpaceConfig {
+                base: BaseFields::new(id.clone(), "admin-reindex".into(), "fixture".into()),
+                embedding_provider: "fixture".into(),
+                embedding_model: "never-resolve".into(),
+                embedding_dims: 3,
+                processing: None,
+                purpose: None,
+                skill: None,
+            })
+            .await
+            .unwrap();
+        let replaced = RecordId::new_v4(TableName::SpaceConfig);
+        let result = process_embedding_reindex_for_target(
+            &storage,
+            "admin-reindex",
+            128,
+            "original",
+            &replaced,
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("configuration was replaced"));
+        let result =
+            process_embedding_reindex_for_target(&storage, "admin-reindex", 128, "original", &id)
+                .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("configuration missing"));
+        let actual = SpaceConfigRepository::new(storage)
+            .get_by_space_id("admin-reindex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(actual.processing.is_none());
+    }
+}
+
+#[cfg(test)]
+#[path = "embedding_reindex_continuation_tests.rs"]
+mod continuation_tests;

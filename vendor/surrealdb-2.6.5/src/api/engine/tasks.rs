@@ -29,8 +29,12 @@ impl Tasks {
 	}
 	#[cfg(not(target_family = "wasm"))]
 	pub async fn resolve(self) -> Result<(), Error> {
+		let mut failed = false;
 		for task in self.0.into_iter() {
-			let _ = task.await;
+			failed |= task.await.is_err();
+		}
+		if failed {
+			return Err(Error::Ds("local background owner failed while draining".into()));
 		}
 		Ok(())
 	}

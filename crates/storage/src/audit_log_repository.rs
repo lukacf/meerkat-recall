@@ -16,7 +16,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::{PaginatedResult, Repository, SearchCriteria, SearchRepository};
 use crate::require::required_field;
 
-const AUDIT_LOG_PROJECTION: &str = r"
+pub(crate) const AUDIT_LOG_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -46,7 +46,7 @@ const AUDIT_LOG_PROJECTION: &str = r"
 
 /// Database-only proxy for `AuditLog` to avoid flatten/native enum issues.
 #[derive(Deserialize)]
-struct AuditLogDb {
+pub(crate) struct AuditLogDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

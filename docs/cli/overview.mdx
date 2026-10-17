@@ -26,6 +26,10 @@ command syntax.
 | `snapshot prune --journal-directory <directory>` | Enforce owned backup retention | Local original recovery journal |
 | `service-token bootstrap/issue` | Create signing material or issue explicit bounded credentials | Local private files; no API required |
 | `data-migrate --snapshot <path>` | Copy an embedded snapshot into an empty SurrealDB target | Local snapshot and target database |
+| `data-migrate --preservation-plan <path>` | Adopt a verified historical inventory | Offline plan, explicit configuration and fresh native target |
+| `data-migrate-delta` | Reconcile an exact historical successor snapshot | Original report, ledger, journal and complete S0/S1 plans |
+| `reindex-continue` | Continue an already accepted embedding reindex | Exclusive local native target and exact accepted IDs |
+| `certify-historical` | Certify the closed imported population after activation | Exact report, source bindings, activated configuration and local native custody |
 | `demo-wiki --processing-config <file> [--port <port>]` | Run an isolated Living Wiki demonstration | Embedded demo runtime; default port 3000 |
 
 See [deployment](/operations/deployment) for environment settings and
@@ -185,3 +189,239 @@ Discard requires a matching durable pending entry; it refuses completed targets,
 mismatched digests and pending restores. It never changes the input snapshot.
 After discard, rerun against the fresh target and verify representative evidence,
 graph and policy reads before any separately authorized application cutover.
+
+
+## Adopt a prepared historical snapshot
+
+The preservation path uses `data-migrate --preservation-plan` with a verified
+offline planner inventory and an explicit target-space configuration request.
+It requires a fresh native SurrealDB destination and a new report path. This
+source path and its follow-on commands require qualification before household
+use; the published 0.9.1 legacy transfer alone does not provide this workflow.
+
+```bash
+meerkat-recall data-migrate \
+  --preservation-plan /receipts/s0/plan.json \
+  --historical-config /receipts/space-create.json \
+  --url rocksdb:///isolated/target --namespace elephant --database imported \
+  --report /receipts/initial-transfer.json
+```
+
+`--preservation-plan` replaces `--snapshot`. The plan binds the original snapshot,
+closed lexical-row SQLite inventory, source identities and explicit source-to-target
+space mapping. Original text, evidence spans and graph payload remain preserved;
+adoption adds current migration receipts without inventing historical extraction
+runs. Imported work remains held, and historical events do not replay as new work.
+Unsupported authority, unresolved provenance and incomplete preservation evidence
+are refused. A plan does not relax the fresh-target or original-journal rules.
+
+For the example above, retain these outputs together:
+
+| File | Purpose |
+| --- | --- |
+| `initial-transfer.json` | `recall-legacy-transfer-v2` report and exact baseline hashes |
+| `initial-transfer.transfer.sqlite` | Closed expected destination row inventory for catch-up |
+| `initial-transfer.catchup-bindings.jsonl` | Original publication heads and canonical receipt bindings |
+| `initial-transfer.adoption.jsonl` | Per-group adoption receipts |
+| `initial-transfer.adoption.sqlite` | Prepared group membership index |
+
+The report state `initial_history_reconciled_vector_coverage_pending` does not
+certify current embedding coverage. Existing legacy vectors retain their original
+provenance; matching model names or dimensions alone do not establish a current
+profile. Keep all original snapshots, plans, reports and journal files unchanged.
+The original `--snapshot` path above emits the older v1 receipt and cannot serve
+as an adopted catch-up baseline.
+
+## Reconcile an adopted historical target
+
+The `data-migrate-delta` command applies a complete, offline S0/S1 preservation
+plan to a previously adopted native SurrealDB target. Full catch-up currently
+requires native storage; embedded targets are refused before a pending marker
+or a row mutation. This source path requires qualification before household use.
+
+```bash
+meerkat-recall data-migrate-delta \
+  --baseline-plan /receipts/s0/plan.json \
+  --baseline-report /receipts/initial-transfer.json \
+  --baseline-receipts /receipts/initial-transfer.catchup-bindings.jsonl \
+  --baseline-ledger /receipts/initial-transfer.transfer.sqlite \
+  --delta-plan /receipts/delta/delta.json \
+  --s1-plan /receipts/s1/plan.json \
+  --historical-config /receipts/space-create.json \
+  --scratch /receipts/catchup-attempt-1 \
+  --report /receipts/catchup-result-1.json \
+  --url rocksdb:///isolated/target --namespace elephant --database imported
+```
+
+The original transfer report binds the closed expected SQLite inventory,
+original journal, epoch, heads and canonical receipts. Keep those files and the
+original S0/S1 snapshots unchanged. Each attempt requires a new scratch path.
+Stop other clients; retain the same durability journal and destination.
+An interrupted operation remains unready. Repeat the identical declaration with
+new output paths to replay committed effects from durable database receipts
+before applying the remaining batches and source groups.
+
+Before restoring readiness, storage retains the completed inventory, source
+bindings, final epoch and report in the original journal. If the process stops
+before publishing the report, repeat the identical declaration with new scratch:
+completed recovery checks the retained receipt and current epoch, then exports
+the same bytes without applying rows again. Existing output files must match
+exactly. The report's `.catchup.sqlite` and `.catchup-bindings.jsonl` companions
+are the closed successor baseline. Use them with the S1 plan and report as the
+baseline for S1→S2; keep the earlier baseline files unchanged. An empty
+predecessor population requires its completed storage certificate, not an
+arbitrary empty source declaration.
+
+An identical-file no-op requires the same snapshot bytes, complete identity plan,
+configuration, original receipts, heads and epoch. It retains the closed
+inventory and epoch without applying changes. A fresh export with identical rows
+has a different snapshot identity and follows the full catch-up path: prepare its
+own S1 inventory and a complete zero-row delta, verify the exact destination
+inventory under maintenance custody, regenerate the S1 publication proofs and
+close a new successor baseline. Do not replace its snapshot hash with S0's or add
+a dummy change. A fresh empty-to-empty cut also requires the original storage
+completion certificate and full reconciliation.
+
+Unchanged historical work holds and event checkpoints retain their original
+snapshot attribution across those cuts. A later work or event change can inherit
+that attribution only through the exact predecessor completion certificate,
+retained inventory and full native control-row comparison. Changed or foreign
+control evidence refuses the operation. The actual work change links the new
+hold to its previous proof; historical work remains inert. Event advancement
+preserves the historical tail without acknowledging unrelated target events.
+
+A plan's deletion requirement does not grant deletion authority. Add
+`--accept-deletions` only when the exact bound S0/S1 removals and soft deletions
+are intended. This choice is recorded in the catch-up identity and must stay the
+same on resume. Removing a target row represents the supplied historical delta;
+it does not authorize physical erasure of retained snapshots or journal history.
+A complete empty S1 can retire all original groups. Initial transfer still
+requires a nonempty adoption population.
+
+Source-less graph rows with no document membership use bounded snapshot-evidence
+groups, separated by their original security, subjects and completeness. The
+adapter preserves original graph payload and authorship; the snapshot anchor
+records import evidence. It does not invent a document quote or an extraction
+run. Unresolved source provenance remains an explicit refusal.
+
+Success requires complete row and table reconciliation, source-group closure,
+original journal verification and durable marker removal. It preserves existing
+text, graph and vectors without bulk extraction. Current embedding coverage and
+activation remain separate guarded operations. Finish the final original-store
+cut and all catch-up deltas before reindexing or activating coverage. Those
+operations change destination configuration, epoch and vectors, invalidating the
+preceding historical baseline. This command does not advance a baseline across
+destination-owned changes; it refuses a stale one. This sequence still belongs
+inside the required full import clock, including fresh export, transfer,
+planning, load, reconciliation and embedding work. Its duration remains
+unqualified. Keep the original store stopped from the final cut through switch
+and preserve its store-file manifest as freeze evidence. New-document backlog
+stays outside the historical baseline and enters ordinary ingestion only after
+activation and certification; consumer writes remain stopped until certification.
+For a consuming host, W1 agent writes fail closed, W2 retains only new documents in
+`semantic_backlog.jsonl`, and W3-W6 stay stopped. Keeping Elephant stopped covers
+its own pipeline and other local writers. Retain store-file manifest equality
+from final S1 through switch; backlog replay is ordinary new ingestion afterward.
+Neither an identical-file no-op nor a fresh zero-row cut establishes the required
+one-hour import duration or a completed application cutover.
+
+## Continue an accepted embedding reindex
+
+`reindex-continue` processes bounded pages immediately after each successful
+page. It uses the existing per-page model approvals, current-content checks and
+guarded vector/progress writes. It does not extract documents, approve a model,
+stage a reindex or activate coverage. The normal queued worker keeps its existing
+attempt and retry rules.
+
+Complete the final historical delta first. Grant setup and reindex staging
+change the destination and make the preceding historical delta baseline stale.
+With consumers still disconnected, use an authenticated `serve --server-only`
+instance on the exact target to add an approved, unrevoked `reindex_embedding`
+binding for the selected profile. Preserve other processing fields and use the
+current configuration generation. This requires `read:space_config`,
+`write:space_config`, explicit `manage:provider` and current record authority.
+The import configuration's document/query grants do not imply a reindex grant.
+
+Read `GET /v1/spaces/{space}` to retain the actual configuration record ID, then
+read `GET /v1/spaces/{space}/processing/reindex` for its current
+`processing_generation`. Stage through
+`POST /v1/spaces/{space}/processing/reindex/start` with `target_profile_id` and
+`expected_processing_generation`. When rebuilding the already active profile,
+also supply `rebuild_current_profile: true`; ordinary start refuses an already
+active target. Retain the returned `pending_reindex.id`. Staging can enqueue
+normal work, so keep managed workers stopped during this administrative path.
+
+Stop that server and other clients before opening the same local RocksDB target
+with `reindex-continue`. Keep the exact namespace, database and original external
+durability journal across every command. If using `ELEPHANT_DURABILITY_PATH`,
+keep its value unchanged and outside the target store. Use the accepted
+configuration and reindex IDs:
+
+```bash
+meerkat-recall reindex-continue \
+  --url rocksdb:///isolated/target --namespace elephant --database imported \
+  --space household \
+  --configuration-id space_config:EXACT_UUID --reindex-id EXACT_ACCEPTED_ID \
+  --page-size 128 --max-elapsed-seconds 900 \
+  --progress /receipts/reindex-attempt-1.jsonl
+```
+
+The process retains the local native writer lock and does not start workers.
+Remote URLs are refused. Use a new progress file on resume; storage retains the
+completed page cursor. The elapsed limit stops admission of the next page; an
+already admitted provider request can finish later. A failed page stops the
+command. On `coverage_ready_activation_pending`, let the CLI exit and close its
+store handle. Start only the administrative server again, read the latest
+processing generation, and call
+`POST /v1/spaces/{space}/processing/reindex/activate` with the original reindex
+ID and that `expected_processing_generation`. Stop the server before local
+certification. Continuation, activation and certification cannot concurrently
+own the same RocksDB store. Removing queue delay alone does not establish the
+full import time.
+
+## Certify imported publications after activation
+
+After the final historical delta, complete the accepted embedding reindex and
+its guarded activation. `certify-historical` then verifies current physical
+coverage for every publication in the exact closed import population, including
+snapshot-evidence groups with no documents. It requires the final initial-transfer
+or catch-up report, its exact SHA256 and its report-bound source bindings.
+
+```bash
+meerkat-recall certify-historical \
+  --url rocksdb:///isolated/target --namespace elephant --database imported \
+  --space household \
+  --baseline-report /receipts/catchup-result-1.json \
+  --baseline-report-sha256 "$FINAL_REPORT_SHA256" \
+  --bindings /receipts/catchup-result-1.catchup-bindings.jsonl \
+  --configuration-id space_config:EXACT_UUID --reindex-id EXACT_ACTIVATED_ID \
+  --max-elapsed-seconds 300 --output /receipts/certification-1
+```
+
+Keep the service and other clients stopped. The command retains the local native
+writer lock; it refuses remote targets. It neither calls a provider nor performs
+activation. The current configuration, complete embedding partition, approvals,
+activated reindex and imported heads must still match. Completed counters alone
+do not substitute for physical vectors. A zero-source population requires the
+original storage-retained completion certificate as well as a currently empty
+imported population; an arbitrary empty report is refused.
+
+Keep the original report and bindings unchanged after activation. They identify
+the imported population and original receipts; certification checks current
+coverage separately. The report's pre-reindex epoch is not the current target
+epoch, and certification does not make that old all-row baseline reusable for
+another historical delta.
+
+The output directory contains immutable `binding.json`, per-source receipts,
+and separate attempt records. Retry with the same output directory and exact
+input to revalidate earlier successes against the same activation and evidence.
+A changed publication or activation cannot reuse those success receipts. Before
+a first successful completion, partial failure or expiration leaves no
+`complete.json`. A later failed recheck preserves any earlier completion as
+historical evidence; it does not report a new success. The elapsed limit bounds
+admission of the next source, while an admitted transaction may finish later.
+Successful completion writes `complete.json` with state
+`all_bound_current_imported_publications_certified`, the final configuration
+hash, activation and epoch. Retain that receipt before the separately coordinated
+consumer switch. These source commands remain under runtime qualification;
+synthetic success alone does not establish the full fresh one-hour requirement.

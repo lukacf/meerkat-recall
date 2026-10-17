@@ -41,6 +41,9 @@ async fn fixture_on(case: &str, embedded: bool) -> (ToolContext, RecordId) {
     } else {
         StorageClient::new_memory().await.unwrap()
     };
+    crate::retrieval_test_support::initialize_source_support(&storage)
+        .await
+        .unwrap();
     let mut source = Source::new(
         base(TableName::Source, case == "source"),
         SourceType::Manual,

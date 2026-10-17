@@ -12,6 +12,8 @@ use crate::recovery_barrier::{MaintenanceGuard, RecoveryBarrier, RecoveryPhase, 
 
 #[path = "client_erasure_reservation.rs"]
 mod erasure_reservation;
+#[path = "client_historical_catchup.rs"]
+pub(crate) mod historical_catchup;
 #[path = "client_native_restore.rs"]
 mod native_restore;
 #[path = "client_reference_custody.rs"]
@@ -21,6 +23,11 @@ mod source_acceptance;
 #[path = "client_source_acceptance_retry.rs"]
 mod source_acceptance_retry;
 pub(crate) use erasure_reservation::current_erasure_reservation;
+pub use historical_catchup::{
+    CompletedHistoricalCatchup, HistoricalArchiveCandidate, HistoricalCatchupInput,
+    HistoricalCatchupReport, HistoricalCatchupSource, PreparedHistoricalCatchupAuthority,
+    SealedHistoricalCatchupAuthority,
+};
 
 /// Additional attempts after the first try when a request fails with a
 /// retryable transaction conflict (4 tries total).
@@ -153,7 +160,7 @@ impl StorageConfig {
                 Ok(value) => *target = parse_database_timeout(name, &value)?,
                 Err(std::env::VarError::NotPresent) => {}
                 Err(error) => {
-                    return Err(StorageError::ConnectionError(format!("{name}: {error}")))
+                    return Err(StorageError::ConnectionError(format!("{name}: {error}")));
                 }
             }
         }
@@ -218,6 +225,7 @@ enum StorageClientInner {
 #[derive(Clone, Debug)]
 pub struct StorageClient {
     local_models: Arc<elephant_embeddings::local_model_cache::VerifiedLocalModelCache>,
+    pub(crate) support_validation: Arc<tokio::sync::Mutex<Option<String>>>,
     inner: StorageClientInner,
     config: StorageConfig,
     _store_writer: Option<Arc<crate::exclusive_store_lock::StoreWriterLock>>,
@@ -494,38 +502,52 @@ impl StorageClient {
                         )
                     })?;
 
-                // Embedded engines (in-process datastores) have no auth layer;
-                // signing in against them fails. Only remote protocol URLs
-                // (ws://, wss://, http://, https://) need root signin.
-                if !is_local_engine_url(&config.url) {
-                    tracing::warn!(
-                        "Remote SurrealDB ignores client execution timeout options; configure a finite server-side query timeout"
-                    );
-                    db.signin(surrealdb::opt::auth::Root {
-                        username: &config.username,
-                        password: &config.password,
-                    })
-                    .await
-                    .map_err(|e| {
-                        InitError::new(
-                            Phase::NativeAuthentication,
-                            StorageError::ConnectionError(e.to_string()),
-                        )
-                    })?;
-                }
+                let selected = async {
+                    // Embedded engines (in-process datastores) have no auth layer;
+                    // signing in against them fails. Only remote protocol URLs
+                    // (ws://, wss://, http://, https://) need root signin.
+                    if !is_local_engine_url(&config.url) {
+                        tracing::warn!(
+                            "Remote SurrealDB ignores client execution timeout options; configure a finite server-side query timeout"
+                        );
+                        db.signin(surrealdb::opt::auth::Root {
+                            username: &config.username,
+                            password: &config.password,
+                        })
+                        .await
+                        .map_err(|e| {
+                            InitError::new(
+                                Phase::NativeAuthentication,
+                                StorageError::ConnectionError(e.to_string()),
+                            )
+                        })?;
+                    }
 
-                db.use_ns(&config.namespace)
-                    .use_db(&config.database)
-                    .await
-                    .map_err(|e| {
-                        InitError::new(
-                            Phase::NativeNamespace,
-                            StorageError::ConnectionError(e.to_string()),
-                        )
-                    })?;
+                    db.use_ns(&config.namespace)
+                        .use_db(&config.database)
+                        .await
+                        .map_err(|e| {
+                            InitError::new(
+                                Phase::NativeNamespace,
+                                StorageError::ConnectionError(e.to_string()),
+                            )
+                        })?;
+
+                    Ok::<(), InitError>(())
+                }
+                .await;
+                if let Err(error) = selected {
+                    if is_local_engine_url(&config.url) {
+                        if let Err(close_error) = db.recall_close_local(60_000).await {
+                            tracing::error!(%close_error, "failed initialization local close incomplete");
+                        }
+                    }
+                    return Err(error);
+                }
 
                 Self {
                     local_models: Arc::default(),
+                    support_validation: Arc::default(),
                     inner: StorageClientInner::Surreal { db: Arc::new(db) },
                     config,
                     _store_writer: store_writer,
@@ -557,6 +579,7 @@ impl StorageClient {
 
                 Self {
                     local_models: Arc::default(),
+                    support_validation: Arc::default(),
                     inner: StorageClientInner::Embedded { store },
                     config,
                     _store_writer: store_writer,
@@ -571,14 +594,25 @@ impl StorageClient {
                 }
             }
         };
-        client
-            .maintenance_client()
-            .verify_reference_capability()
-            .await
-            .map_err(|error| InitError::new(Phase::ReferenceCapability, error))?;
-        Box::pin(client.initialize_recovery())
-            .await
-            .map_err(|error| InitError::new(Phase::Recovery, error))?;
+        let initialized = async {
+            client
+                .maintenance_client()
+                .verify_reference_capability()
+                .await
+                .map_err(|error| InitError::new(Phase::ReferenceCapability, error))?;
+            Box::pin(client.initialize_recovery())
+                .await
+                .map_err(|error| InitError::new(Phase::Recovery, error))?;
+            Ok::<(), InitError>(())
+        }
+        .await;
+        if let Err(error) = initialized {
+            // Preserve the original phase and cause even if cleanup also fails.
+            if let Err(close_error) = client.close_owned_command_connection(60_000).await {
+                tracing::error!(%close_error, "failed initialization local close incomplete");
+            }
+            return Err(error);
+        }
         client.start_retention_cleanup();
         Ok(client)
     }
@@ -610,6 +644,29 @@ impl StorageClient {
             ..StorageConfig::default()
         }))
         .await
+    }
+
+    /// Finish an isolated command connection before its Tokio runtime exits.
+    /// Native local engines reject further requests on every clone and await
+    /// their router, accepted requests, maintenance and datastore shutdown.
+    /// Remote server lifetime and embedded checkpoint ownership stay with their
+    /// existing owners; this method drops only this command's client handle.
+    ///
+    /// # Errors
+    /// Returns native close failures and deadline exhaustion. Closing does not
+    /// clear recovery markers or turn an incomplete transfer into a success.
+    pub async fn close_owned_command_connection(self, timeout_ms: u64) -> StorageResult<()> {
+        if !(1..=300_000).contains(&timeout_ms) {
+            return Err(StorageError::Conflict(
+                "command close deadline is outside 1..=300000 ms".into(),
+            ));
+        }
+        if is_local_engine_url(&self.config.url) {
+            if let Some(db) = self.db() {
+                db.recall_close_local(timeout_ms).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Returns a reference to the underlying database when using the
@@ -764,7 +821,7 @@ impl StorageClient {
                     let result = match self.run_query(self.trusted_query(db, sql, None)?).await {
                         Ok(response) => check_query_response(response),
                         Err(StorageError::ErasureInProgress) => {
-                            return Err(StorageError::ErasureInProgress)
+                            return Err(StorageError::ErasureInProgress);
                         }
                         Err(e) => Err(e.to_string()),
                     };
@@ -813,7 +870,7 @@ impl StorageClient {
                     {
                         Ok(response) => check_query_response(response),
                         Err(StorageError::ErasureInProgress) => {
-                            return Err(StorageError::ErasureInProgress)
+                            return Err(StorageError::ErasureInProgress);
                         }
                         Err(e) => Err(e.to_string()),
                     };
@@ -947,6 +1004,19 @@ impl StorageClient {
         Ok(&self.journal)
     }
 
+    /// Historical row import requires the live exclusive transfer lease.
+    pub(crate) fn require_transfer_custody(&self) -> StorageResult<()> {
+        if !self.maintenance
+            || self.maintenance_lease.is_none()
+            || self.journal.transfer_marker()?.is_none()
+        {
+            return Err(StorageError::Conflict(
+                "historical work import requires exclusive backend transfer".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn admit(&self) -> StorageResult<Option<crate::recovery_barrier::StorageAdmission>> {
         if self.maintenance {
             Ok(None)
@@ -1036,6 +1106,24 @@ impl StorageClient {
         .map_err(|error| {
             StorageError::QueryError(format!("erasure operation task failed: {error}"))
         })?
+    }
+
+    /// Require a live exclusive transfer owner and exact immutable source bytes.
+    pub(crate) fn require_historical_transfer(&self, snapshot_sha256: &str) -> StorageResult<()> {
+        if !self.maintenance
+            || self.maintenance_lease.is_none()
+            || self
+                .journal
+                .transfer_marker()?
+                .as_ref()
+                .map(|marker| marker.source_sha256.as_str())
+                != Some(snapshot_sha256)
+        {
+            return Err(StorageError::Conflict(
+                "historical adoption requires original transfer custody".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Run the bounded backend-transfer command on an empty target. The closure must
@@ -1137,6 +1225,9 @@ impl StorageClient {
                 .begin_maintenance(RecoveryPhase::Restoring, std::time::Duration::from_secs(60))
                 .await?;
             let privileged = client.maintenance_client_with_guard(&guard);
+            client
+                .journal
+                .discard_transfer_archive_payloads(&marker.source_sha256)?;
             if let Some(store) = privileged.embedded_store() {
                 store
                     .import_snapshot_bytes(&elephant_db::ElephantDb::new().export_snapshot_bytes()?)
@@ -1145,6 +1236,9 @@ impl StorageClient {
             } else {
                 privileged.clear_surreal_database().await?;
             }
+            client
+                .journal
+                .finish_transfer_archive_discard(&marker.source_sha256)?;
             client.journal.finish_transfer()?;
             drop(privileged);
             guard.finish();
@@ -1217,6 +1311,10 @@ impl StorageClient {
 
     async fn initialize_recovery(&self) -> StorageResult<()> {
         crate::snapshot::cleanup_expired(&self.journal)?;
+        if self.historical_catchup_pending()? {
+            self.recovery.set(RecoveryPhase::Failed, Some("interrupted historical catch-up; reconcile original delta receipts before serving".into()));
+            return Ok(());
+        }
         if self.journal.transfer_marker()?.is_some() {
             self.recovery.set(RecoveryPhase::Failed, Some("incomplete backend transfer; explicitly discard the partial target before retry".into()));
             return Ok(());
@@ -1262,6 +1360,18 @@ impl StorageClient {
     }
 
     async fn check_journal_identity(&self, required: bool) -> StorageResult<()> {
+        self.check_journal_anchor_identity(required).await?;
+        crate::historical_archive_lifecycle::verify_native_archive_heads(self).await
+    }
+
+    /// Original journal identity only, for exact pending catch-up recovery under
+    /// exclusive custody. The caller must close the native archive effect chain
+    /// and run the full identity check before admitting its callback or Ready.
+    pub(crate) async fn verify_journal_anchor_identity(&self) -> StorageResult<()> {
+        self.check_journal_anchor_identity(true).await
+    }
+
+    async fn check_journal_anchor_identity(&self, required: bool) -> StorageResult<()> {
         #[derive(serde::Deserialize)]
         struct Identity {
             journal_id: String,
@@ -1396,6 +1506,11 @@ impl StorageClient {
     }
 
     pub(crate) fn ensure_no_incomplete_transfer(&self) -> StorageResult<()> {
+        if self.historical_catchup_pending()? {
+            return Err(StorageError::Conflict(
+                "original catch-up must be reconciled before restore".into(),
+            ));
+        }
         if self.journal.transfer_marker()?.is_some() {
             return Err(StorageError::Conflict(
                 "explicitly discard the incomplete transfer before restoring".into(),

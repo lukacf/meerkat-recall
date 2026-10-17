@@ -17,7 +17,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 use crate::require::required_field;
 
-const INGEST_DECISION_PROJECTION: &str = r"
+pub(crate) const INGEST_DECISION_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -50,7 +50,7 @@ const INGEST_DECISION_PROJECTION: &str = r"
 
 /// Database-only proxy for IngestDecision.
 #[derive(Deserialize)]
-struct IngestDecisionDb {
+pub(crate) struct IngestDecisionDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

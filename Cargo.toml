@@ -70,8 +70,8 @@ meerkat-core = { version = "=0.9.0" }
 meerkat-mcp = { version = "=0.9.0" }
 meerkat-runtime = { version = "=0.9.0" }
 meerkat-skills = { version = "=0.9.0", default-features = false }
-# Test-only: pins the model-catalog regression test (gpt-5.6-sol resolution),
-# the reason this port exists. Version-unified with the meerkat facade above.
+# Test-only: checks current default capabilities and historical model resolution.
+# Version-unified with the meerkat facade above.
 meerkat-models = { version = "=0.9.0" }
 
 # Async runtime

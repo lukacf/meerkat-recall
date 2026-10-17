@@ -148,7 +148,7 @@ impl Default for DocTreeConfig {
             semantic_chunking: true,
             create_summaries: false,
             summary_threshold: 1000,
-            summarizer_model: "claude-sonnet-4-5".to_string(),
+            summarizer_model: "claude-sonnet-5-5".to_string(),
         }
     }
 }
@@ -1398,11 +1398,7 @@ async fn build_doc_tree_with_original_work(
                     let section_text = &text[section.start as usize..section.end as usize];
                     let ctx = SummarizationContext::new(
                         section_text.to_string(),
-                        SummarizationBudget {
-                            max_output_tokens: 300,
-                            max_summary_length: 500,
-                            tokens_per_char: 0.25,
-                        },
+                        SummarizationBudget::default(),
                         SummarizationOptions {
                             min_text_length: config.summary_threshold,
                             model: config.summarizer_model.clone(),

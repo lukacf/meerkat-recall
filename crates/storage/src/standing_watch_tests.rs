@@ -73,8 +73,10 @@ async fn fixture(embedded: bool) -> (StorageClient, SourceWatch, SpaceConfig, Sp
     .expect("storage");
     if !embedded {
         storage
-            .query_checked(include_str!(
-                "../../migrations/sql/031_source_publication.surql"
+            .query_checked(concat!(
+                include_str!("../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../migrations/sql/046_source_support_index_fence.surql")
             ))
             .await
             .expect("actual named space epoch schema");
@@ -806,7 +808,11 @@ async fn original_policy_survives_content_coverage(embedded: bool) {
     .expect("fresh storage");
     if !embedded {
         for schema in [
-            include_str!("../../migrations/sql/031_source_publication.surql"),
+            concat!(
+                include_str!("../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../migrations/sql/046_source_support_index_fence.surql")
+            ),
             include_str!("../../migrations/sql/033_space_processing.surql"),
         ] {
             storage
@@ -850,6 +856,7 @@ async fn original_policy_survives_content_coverage(embedded: bool) {
                 bindings: std::collections::BTreeMap::default(),
                 active_embedding_profile_id: None,
                 pending_reindex: None,
+                completed_embedding_reindex: None,
             }),
             purpose: None,
             skill: None,

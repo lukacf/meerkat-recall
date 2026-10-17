@@ -62,6 +62,43 @@ pub fn control_visibility_changed(
     let (Some(before), Some(after)) = (before, after) else {
         return true;
     };
+    if table == "source_publication_completion" {
+        // A transaction fence changes no visibility. Every other wrapper field
+        // stays exact, including unknown fields and the unchanged payload.
+        if completion_fence_only(before, after) {
+            return false;
+        }
+        // Only a proven coverage-only payload update may otherwise escape
+        // invalidation of a changed stored envelope.
+        let exact = serde_json::to_vec(before)
+            .ok()
+            .zip(serde_json::to_vec(after).ok())
+            .is_some_and(|(left, right)| left == right);
+        if exact {
+            return false;
+        }
+        if let (Some(left), Some(right), Some(before_fields), Some(after_fields)) = (
+            before.get("payload").and_then(serde_json::Value::as_str),
+            after.get("payload").and_then(serde_json::Value::as_str),
+            before.as_object(),
+            after.as_object(),
+        ) {
+            let same_wrapper = before_fields.len() == after_fields.len()
+                && before_fields.iter().all(|(key, value)| {
+                    key == "payload"
+                        || after_fields.get(key).is_some_and(|other| {
+                            serde_json::to_vec(value)
+                                .ok()
+                                .zip(serde_json::to_vec(other).ok())
+                                .is_some_and(|(left, right)| left == right)
+                        })
+                });
+            if same_wrapper && crate::completion_coverage_projection::coverage_only(left, right) {
+                return false;
+            }
+        }
+        return true;
+    }
     if before
         .get("payload")
         .is_some_and(serde_json::Value::is_string)
@@ -75,4 +112,38 @@ pub fn control_visibility_changed(
     } else {
         before != after
     }
+}
+
+// Ignore only the established transaction fence field, never arbitrary wrapper
+// changes. String payloads retain the existing nonce-only control contract.
+fn completion_fence_only(before: &serde_json::Value, after: &serde_json::Value) -> bool {
+    let (Some(before), Some(after)) = (before.as_object(), after.as_object()) else {
+        return false;
+    };
+    if !before
+        .get("payload")
+        .is_some_and(serde_json::Value::is_string)
+        || !after
+            .get("payload")
+            .is_some_and(serde_json::Value::is_string)
+    {
+        return false;
+    }
+    before
+        .keys()
+        .filter(|key| key.as_str() != "fence_nonce")
+        .count()
+        == after
+            .keys()
+            .filter(|key| key.as_str() != "fence_nonce")
+            .count()
+        && before.iter().all(|(key, value)| {
+            key == "fence_nonce"
+                || after.get(key).is_some_and(|other| {
+                    serde_json::to_vec(value)
+                        .ok()
+                        .zip(serde_json::to_vec(other).ok())
+                        .is_some_and(|(left, right)| left == right)
+                })
+        })
 }

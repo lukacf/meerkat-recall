@@ -30,8 +30,10 @@ async fn client(embedded: bool) -> StorageClient {
     .expect("backend");
     if !embedded {
         client
-            .query_checked(include_str!(
-                "../../migrations/sql/031_source_publication.surql"
+            .query_checked(concat!(
+                include_str!("../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../migrations/sql/046_source_support_index_fence.surql")
             ))
             .await
             .expect("schema");
@@ -337,10 +339,6 @@ async fn fault_boundaries_recover(embedded: bool) {
 }
 
 #[expect(
-    clippy::large_futures,
-    reason = "Preserve the original future construction and polling shape exercised by this regression."
-)]
-#[expect(
     clippy::significant_drop_tightening,
     reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."
 )]
@@ -462,6 +460,7 @@ async fn shared_support_scrub_keeps_baseline(embedded: bool) {
         source_id: accepted.source_id.clone(),
         source_revision: "r1".into(),
         record_id: baseline.base.id.clone(),
+        historical_unknown: None,
         independent: true,
         record_fingerprint: crate::canonical_commit::source_support_fingerprint(&baseline).unwrap(),
     };
@@ -542,6 +541,7 @@ async fn seed_two_source_audit_support(
             source_revision: "r1".into(),
             record_id: audit.base.id.clone(),
             // An independent flag cannot keep a ledger whose actual row is gone.
+            historical_unknown: None,
             independent: true,
             record_fingerprint: crate::canonical_commit::source_support_fingerprint(&audit)
                 .unwrap(),
@@ -1434,6 +1434,7 @@ async fn replacement_prefix_retires_support_without_publishing(embedded: bool) {
         source_id: accepted.source_id.clone(),
         source_revision: "r0".into(),
         record_id: derived.base.id.clone(),
+        historical_unknown: None,
         independent: false,
         record_fingerprint: crate::canonical_commit::source_support_fingerprint(&derived).unwrap(),
     };
@@ -1469,6 +1470,7 @@ async fn replacement_prefix_retires_support_without_publishing(embedded: bool) {
         source_id: accepted.source_id.clone(),
         source_revision: "r0".into(),
         record_id: artifact.base.id.clone(),
+        historical_unknown: None,
         independent: true,
         last_commit_id: None,
         record_fingerprint: crate::canonical_commit::source_support_fingerprint(&artifact).unwrap(),
@@ -1595,10 +1597,6 @@ both_backends!(
     replacement_prefix_retires_support_without_publishing
 );
 
-#[expect(
-    clippy::large_futures,
-    reason = "Preserve the original future construction and polling shape exercised by this regression."
-)]
 #[expect(
     clippy::significant_drop_tightening,
     reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."
@@ -2309,10 +2307,6 @@ async fn native_private_string_uuid_inventory_key_deletes_only_original_control(
     assert_eq!(quoted_row.native_value, before_quoted.native_value);
 }
 
-#[expect(
-    clippy::large_futures,
-    reason = "Preserve the original future construction and polling shape exercised by this regression."
-)]
 #[expect(
     clippy::significant_drop_tightening,
     reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."
@@ -3175,10 +3169,6 @@ async fn surreal_restore_purges_historical_declared_native_composite_reference()
 }
 
 #[expect(
-    clippy::large_futures,
-    reason = "Preserve the original future construction and polling shape exercised by this regression."
-)]
-#[expect(
     clippy::significant_drop_tightening,
     reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."
 )]
@@ -3314,10 +3304,6 @@ both_backends!(
     retraction_checks_all_original_document_observations
 );
 
-#[expect(
-    clippy::large_futures,
-    reason = "Preserve the original future construction and polling shape exercised by this regression."
-)]
 #[expect(
     clippy::significant_drop_tightening,
     reason = "Keep fixture resources and guards alive through the original assertions and scope cleanup."

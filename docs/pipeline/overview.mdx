@@ -133,6 +133,10 @@ Most top-level pipeline stages are modeled as work items with a specific `kind`.
 
 ## Configuration
 
+The model selections below are examples for the current source checkout.
+Published 0.9.1 binaries retain their original defaults; these examples do
+not upgrade an installed binary or an approved processing profile.
+
 <CodeGroup>
 ```bash Environment Variables
 # Work queue
@@ -142,11 +146,11 @@ PIPELINE_WORK_QUEUE_POLL_INTERVAL=5
 
 # Truth maintenance
 PIPELINE_TRUTH_MAINTENANCE_POLL_INTERVAL=5
-PIPELINE_TM_MODEL=claude-sonnet-4-5   # conflict adjudication (needs ANTHROPIC_API_KEY)
+PIPELINE_TM_MODEL=claude-sonnet-5-5   # conflict adjudication (needs ANTHROPIC_API_KEY)
 
 # Promotion / summarization
-PIPELINE_PROMOTION_DISAMBIGUATION_MODEL=claude-sonnet-4-5
-PIPELINE_SUMMARIZER_MODEL=claude-sonnet-4-5
+PIPELINE_PROMOTION_DISAMBIGUATION_MODEL=claude-sonnet-5-5
+PIPELINE_SUMMARIZER_MODEL=claude-sonnet-5-5
 
 # Embeddings
 PIPELINE_EMBED_ENABLED=true

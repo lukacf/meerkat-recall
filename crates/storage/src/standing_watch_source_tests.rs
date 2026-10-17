@@ -23,7 +23,11 @@ async fn convergent_original_references(embedded: bool) {
     .expect("actual storage");
     if !embedded {
         for schema in [
-            include_str!("../../migrations/sql/031_source_publication.surql"),
+            concat!(
+                include_str!("../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../migrations/sql/046_source_support_index_fence.surql")
+            ),
             include_str!("../../migrations/sql/032_work_recovery.surql"),
             include_str!("../../migrations/sql/041_work_producer_origin.surql"),
         ] {

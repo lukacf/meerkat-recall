@@ -26,7 +26,7 @@ ANTHROPIC_API_KEY=... ./scripts/repo-cargo test -p elephant-calibration -- --ign
 # One suite
 ANTHROPIC_API_KEY=... ./scripts/repo-cargo test -p elephant-calibration calibrate_tm_adjudication -- --ignored --nocapture
 
-# Different model (default: the production default, claude-sonnet-4-5)
+# Different model (historical calibration default: claude-sonnet-4-5; production default: claude-sonnet-5-5)
 CALIBRATION_MODEL=claude-opus-4-8 ANTHROPIC_API_KEY=... ./scripts/repo-cargo test -p elephant-calibration -- --ignored --nocapture
 
 # Offline tests only (case validation, scoring, serialization; no key needed)

@@ -14,6 +14,23 @@ use surrealdb::sql::{Thing, Value};
 /// Native database values retained by registry-aware merge preparation.
 pub use surrealdb::sql::Value as NativeExtensionValue;
 
+/// Native array retained without JSON conversion at the storage boundary.
+pub use surrealdb::sql::Array as NativeArray;
+/// Native record key, including exact scalar and complex key variants.
+pub use surrealdb::sql::Id as NativeRecordKey;
+/// Native record-key range with explicit inclusive or exclusive bounds.
+pub use surrealdb::sql::IdRange as NativeRecordKeyRange;
+/// Native number retaining integer, floating-point and decimal variants.
+pub use surrealdb::sql::Number as NativeNumber;
+/// Native object retaining all persisted field values.
+pub use surrealdb::sql::Object as NativeObject;
+/// Native record identity with its table and exact key.
+pub use surrealdb::sql::Thing as NativeRecordIdentity;
+
+/// Driver response wrapper preserving native record, datetime and numeric values.
+/// Decode this wrapper before inspecting its inner native value.
+pub use surrealdb::Value as NativeQueryValue;
+
 use crate::{EmbeddedMutation, StorageClient, StorageError, StorageResult};
 
 /// One declared extension row's complete native before/after image.

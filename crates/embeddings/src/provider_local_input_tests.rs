@@ -250,6 +250,7 @@ fn local_approval() -> std::sync::Arc<LocalApproval> {
                 model_version: format!("sha256:{}", "a".repeat(64)),
                 dimensions: Some(384),
                 preprocessing: "text-full-v2".into(),
+                summary: None,
             },
         },
         revoked: std::sync::atomic::AtomicBool::new(false),

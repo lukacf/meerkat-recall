@@ -40,6 +40,7 @@ async fn bge_retrieval_cache_shares_resources_across_roles_but_separates_recipe_
             model_version: format!("sha256:{}", "a".repeat(64)),
             dimensions: Some(384),
             preprocessing: BGE_EN_RETRIEVAL_V1.into(),
+            summary: None,
         },
     };
     let slot = ResourceSlot::default();

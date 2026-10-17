@@ -45,7 +45,11 @@ async fn fixture() -> TestResult<Fixture> {
     )
     .await?;
     for migration in [
-        include_str!("../../crates/migrations/sql/031_source_publication.surql"),
+        concat!(
+            include_str!("../../crates/migrations/sql/031_source_publication.surql"),
+            "\n",
+            include_str!("../../crates/migrations/sql/046_source_support_index_fence.surql")
+        ),
         include_str!("../../crates/migrations/sql/035_source_publication_manifest.surql"),
         include_str!("../../crates/migrations/sql/037_source_publication_manifest_history.surql"),
         include_str!("../../crates/migrations/sql/039_private_reference_fence.surql"),
@@ -70,6 +74,7 @@ async fn fixture() -> TestResult<Fixture> {
         bindings: BTreeMap::new(),
         active_embedding_profile_id: None,
         pending_reindex: None,
+        completed_embedding_reindex: None,
     });
     let config = SpaceConfigRepository::new(storage.clone())
         .create(config)
@@ -417,6 +422,7 @@ async fn native_original_manifest_guard_conflicts_with_actual_observed_payload_u
         // This is an observed private manifest row for storage guard testing.
         // It does NOT claim a valid completed extraction plan or a worker receipt.
         let manifest = SourcePublicationManifest {
+        historical_adoption: None,
             space_id: "business-a".into(), publication: publication.clone(), mode: IngestMode::Metadata,
             configuration: SpaceConfigToken { space_id: "business-a".into(),
                 config_id: fixture.config.base.id.to_string(), generation: processing.generation,

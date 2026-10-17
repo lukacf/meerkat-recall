@@ -31,7 +31,7 @@ use crate::media::load_media_input;
 mod input_guard;
 
 #[cfg(feature = "meerkat-extraction")]
-const DEFAULT_MULTIMODAL_RENDER_MODEL: &str = "gpt-5.6-sol";
+const DEFAULT_MULTIMODAL_RENDER_MODEL: &str = "gpt-6.1-sol";
 
 /// Result of analyzing a single media attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]

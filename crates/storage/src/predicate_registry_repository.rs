@@ -17,7 +17,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 use crate::require::required_field;
 
-const PREDICATE_REGISTRY_PROJECTION: &str = r"
+pub(crate) const PREDICATE_REGISTRY_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -48,7 +48,7 @@ const PREDICATE_REGISTRY_PROJECTION: &str = r"
 
 /// Database-only proxy for PredicateRegistry.
 #[derive(Deserialize)]
-struct PredicateRegistryDb {
+pub(crate) struct PredicateRegistryDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

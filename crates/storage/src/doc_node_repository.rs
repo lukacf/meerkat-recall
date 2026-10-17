@@ -17,7 +17,7 @@ use crate::client::StorageClient;
 use crate::error::{StorageError, StorageResult};
 use crate::repository::Repository;
 
-const DOC_NODE_PROJECTION: &str = r"
+pub(crate) const DOC_NODE_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -50,7 +50,7 @@ const DOC_NODE_PROJECTION: &str = r"
 
 /// Database-only proxy for DocNode to avoid flatten/native enum issues.
 #[derive(Deserialize)]
-struct DocNodeDb {
+pub(crate) struct DocNodeDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

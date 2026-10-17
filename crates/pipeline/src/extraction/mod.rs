@@ -8,6 +8,8 @@
 //! - Core provides the pipeline stage and storage
 //! - Extraction logic is implemented by extractor plugins
 
+mod action_disposition;
+pub use action_disposition::*;
 mod allowed_tools;
 mod extractor;
 mod plan;

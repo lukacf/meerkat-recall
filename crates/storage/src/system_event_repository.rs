@@ -15,7 +15,7 @@ use crate::repository::{PaginatedResult, Repository, SearchCriteria, SearchRepos
 use crate::require::required_field;
 use elephant_types::ids::TableName;
 
-const SYSTEM_EVENT_PROJECTION: &str = r"
+pub(crate) const SYSTEM_EVENT_PROJECTION: &str = r"
     id,
     space_id,
     created_at,
@@ -41,7 +41,7 @@ const SYSTEM_EVENT_PROJECTION: &str = r"
 
 /// Database-only proxy for `SystemEvent` to avoid flatten/native enum issues.
 #[derive(Deserialize)]
-struct SystemEventDb {
+pub(crate) struct SystemEventDb {
     id: surrealdb::sql::Thing,
     space_id: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,

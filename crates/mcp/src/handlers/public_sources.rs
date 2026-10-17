@@ -139,7 +139,6 @@ impl ToolHandler for SourceControlHandler {
         })
     }
     #[expect(
-        clippy::large_futures,
         clippy::significant_drop_tightening,
         clippy::too_many_lines,
         reason = "Preserve the original handler ownership, future shape, and call ordering."

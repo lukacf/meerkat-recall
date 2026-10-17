@@ -15,8 +15,10 @@ async fn client(embedded: bool) -> StorageClient {
     .expect("backend");
     if !embedded {
         client
-            .query_checked(include_str!(
-                "../../migrations/sql/031_source_publication.surql"
+            .query_checked(concat!(
+                include_str!("../../migrations/sql/031_source_publication.surql"),
+                "\n",
+                include_str!("../../migrations/sql/046_source_support_index_fence.surql")
             ))
             .await
             .expect("publication schema");
@@ -26,6 +28,12 @@ async fn client(embedded: bool) -> StorageClient {
             ))
             .await
             .expect("visibility schema");
+        client
+            .query_checked(include_str!(
+                "../../migrations/sql/048_historical_coverage_visibility.surql"
+            ))
+            .await
+            .expect("completion visibility schema");
     }
     let config:SpaceConfig=serde_json::from_value(serde_json::json!({
         "id":RecordId::new_v4(TableName::SpaceConfig),"space_id":"visibility-a","created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now(),"created_by":"test",

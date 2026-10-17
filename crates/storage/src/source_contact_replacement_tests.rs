@@ -46,6 +46,7 @@ async fn retained_receipts_do_not_skip_changed_support_preparation(embedded: boo
         source_id: surviving_source.clone(),
         source_revision: "original-unproved-legacy-revision".into(),
         record_id: before.base.id.clone(),
+        historical_unknown: None,
         independent: false,
         record_fingerprint: CanonicalRecord::Rel(Box::new(before.clone()))
             .fingerprint()

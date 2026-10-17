@@ -569,6 +569,7 @@ async fn router(
 	session: &Arc<RwLock<Session>>,
 	vars: &Arc<RwLock<BTreeMap<String, CoreValue>>>,
 	live_queries: &Arc<RwLock<LiveQueryMap>>,
+	#[cfg(not(target_family = "wasm"))] owners: &Arc<crate::api::conn::local_close::LocalClose>,
 ) -> Result<DbResponse> {
 	match command {
 		Command::Use {
@@ -946,9 +947,9 @@ async fn router(
 				}
 			});
 
-			tokio::spawn(fut);
+			owners.spawn(fut);
 
-			tokio::spawn(async move {
+			owners.spawn(async move {
 				while let Ok(b) = rx.recv().await {
 					if bytes.send(Ok(b)).await.is_err() {
 						break;
@@ -967,7 +968,7 @@ async fn router(
 
 			let kvs = kvs.clone();
 			let session = session.clone();
-			tokio::spawn(async move {
+			owners.spawn(async move {
 				let export = async {
 					if let Err(error) = export_ml(&kvs, &*session.read().await, tx, config).await {
 						let _ = bytes.send(Err(error)).await;

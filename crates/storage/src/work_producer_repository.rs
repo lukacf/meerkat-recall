@@ -13,6 +13,9 @@ use surrealdb::sql::{Thing, Value};
 
 const TABLE: &str = "work_producer_origin";
 
+// Bound native record targets avoid scanning every historical producer origin.
+const QUEUE_ORIGINS_QUERY: &str = "SELECT work_item_id, space_id, payload FROM $origins";
+
 /// Original private producer restriction; absent evidence is never direct work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -375,7 +378,7 @@ pub(crate) async fn schedulable_ids(
         .collect();
     let mut response = client
         .query_bind_checked(
-            "SELECT work_item_id, space_id, payload FROM work_producer_origin WHERE id IN $origins",
+            QUEUE_ORIGINS_QUERY,
             crate::bindings! { "origins" => Value::Array(ids.into()) },
         )
         .await?;
@@ -1132,6 +1135,10 @@ mod enqueue;
 #[cfg(test)]
 #[path = "work_producer_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "work_producer_queue_tests.rs"]
+mod queue_tests;
 
 #[cfg(test)]
 #[path = "historical_work_hold_tests.rs"]

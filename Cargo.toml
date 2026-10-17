@@ -125,7 +125,6 @@ reqwest = { version = "0.12", features = ["json"] }
 
 # OpenAPI
 utoipa = { version = "5.3", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "8.1", features = ["axum"] }
 
 # Async traits
 async-trait = "0.1"

@@ -4317,6 +4317,82 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn docx_zip(entries: &[(&str, &[u8])], compression: zip::CompressionMethod) -> Vec<u8> {
+        use std::io::{Cursor, Write};
+
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default().compression_method(compression);
+        for (name, bytes) in entries {
+            archive.start_file(*name, options).unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn test_docx_text_extraction_preserves_stored_and_deflated_content() {
+        let document =
+            "<w:document><w:p>Hello &amp; café</w:p> <w:p>second paragraph</w:p></w:document>";
+        for compression in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let bytes = docx_zip(
+                &[
+                    ("word/header1.xml", b"unrelated header"),
+                    ("../word/document.xml", b"unrelated path"),
+                    ("word/document.xml", document.as_bytes()),
+                ],
+                compression,
+            );
+            let text = extract_text_by_source_type(
+                &bytes,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            .unwrap();
+            assert_eq!(text, "Hello & café second paragraph");
+        }
+    }
+
+    #[test]
+    fn test_docx_text_extraction_requires_exact_document_member() {
+        let bytes = docx_zip(
+            &[
+                ("word/header1.xml", b"header"),
+                ("../word/document.xml", b"wrong path"),
+            ],
+            zip::CompressionMethod::Deflated,
+        );
+        let error = extract_text_from_docx(&bytes).unwrap_err();
+        assert!(error.to_string().contains("Missing word/document.xml:"));
+    }
+
+    #[test]
+    fn test_docx_text_extraction_refuses_invalid_archive_utf8_and_crc() {
+        let error = extract_text_from_docx(b"not a ZIP archive").unwrap_err();
+        assert!(error.to_string().contains("Failed to read docx zip:"));
+
+        let invalid_xml = docx_zip(
+            &[("word/document.xml", &[0xff, 0xfe])],
+            zip::CompressionMethod::Stored,
+        );
+        let error = extract_text_from_docx(&invalid_xml).unwrap_err();
+        assert!(error.to_string().contains("Failed to read docx XML:"));
+
+        let document = b"<w:p>original text</w:p>";
+        let mut corrupt = docx_zip(
+            &[("word/document.xml", document)],
+            zip::CompressionMethod::Stored,
+        );
+        let payload = corrupt
+            .windows(document.len())
+            .position(|bytes| bytes == document)
+            .unwrap();
+        corrupt[payload] = b'!';
+        let error = extract_text_from_docx(&corrupt).unwrap_err();
+        assert!(error.to_string().contains("Failed to read docx XML:"));
+    }
+
     fn pdf_with_catalog_value(value: &str) -> Vec<u8> {
         pdf_with_text_pages(
             value,

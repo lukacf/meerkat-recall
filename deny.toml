@@ -63,6 +63,13 @@ allow = [
     "CDLA-Permissive-2.0",    # webpki-root-certs Community Data License
 ]
 
+# Reviewed upstream Rust translation used by zip's retained bzip2 support.
+# Preserve its complete copyright and license in THIRD_PARTY_NOTICES.md.
+# Keep this permission scoped to the exact reviewed package version.
+[[licenses.exceptions]]
+crate = "libbz2-rs-sys@0.2.5"
+allow = ["bzip2-1.0.6"]
+
 # Clarify license for specific crates
 [[licenses.clarify]]
 name = "ring"

@@ -142,7 +142,7 @@ Exclusive store ownership is enforced when opening local persistent storage,
 through a stable sibling OS lock held by the shared store lifetime. Kubernetes
 volume exclusivity and `OnDelete` updates provide additional protection. Do not
 delete the lock inode or force a second writer while an old pod may still run.
-Remote SurrealDB and embedded ElephantDB remain available; these templates
+Remote SurrealDB and embedded `elephant-db` remain available; these templates
 select embedded RocksDB for a concrete independent deployment.
 
 ## Noninteractive authentication and rotation

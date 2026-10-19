@@ -24,7 +24,7 @@ flowchart TD
         Workers --> Views["Knowledge view materialization"]
         Views --> Repos
     end
-    Repos --> Store["SurrealDB or embedded ElephantDB"]
+    Repos --> Store["SurrealDB or embedded elephant-db"]
 ```
 
 The API accepts an ingest and records work. Workers then render evidence, plan
@@ -56,7 +56,7 @@ tool visibility also depends on runtime readiness and authorization.
 | Managed embedded server | `meerkat-recall serve` with `ELEPHANT_DB=elephant-db` | API and workers share one store; a configured persistent destination synchronizes acknowledged commits to its WAL |
 | Separate worker with SurrealDB | `meerkat-recall serve --server-only` and `meerkat-recall worker` against the same database | Advanced configuration; check readiness and coordinate schema and worker configuration |
 
-`meerkat-recall worker` rejects the embedded ElephantDB backend: a separate process
+`meerkat-recall worker` rejects the embedded `elephant-db` backend: a separate process
 would own a different in-memory store. The supplied configuration does not
 establish a tested multi-node scaling or high-availability contract. Treat
 such a topology as deployment work requiring its own acceptance tests.

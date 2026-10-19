@@ -17,7 +17,7 @@ command syntax.
 | --- | --- | --- |
 | `serve` | Start HTTP, MCP, and managed workers | Local runtime and provider configuration |
 | `serve --server-only` | Start HTTP and MCP without managed workers | Local runtime configuration |
-| `worker` | Run a standalone pipeline worker | Shared SurrealDB configuration; rejects ElephantDB |
+| `worker` | Run a standalone pipeline worker | Shared SurrealDB configuration; rejects `elephant-db` |
 | `migrate` | Apply SurrealDB schema migrations | Local SurrealDB configuration |
 | `status [--json] [--require-ready]` | Read health and optionally require semantic readiness | Running server API |
 | `snapshot export --output <directory>` | Export a quiescent named backup | Running server API; path is on the server |
@@ -128,7 +128,7 @@ explicitly ephemeral library/test stores remain volatile. See
 
 ## Migrate a snapshot to SurrealDB
 
-`data-migrate` retains a bounded, one-time copy of supported legacy ElephantDB
+`data-migrate` retains a bounded, one-time copy of supported legacy `elephant-db`
 JSON snapshots into a completely fresh SurrealDB target. Stop every other
 client of a remote target; local persistent destinations also enforce an OS
 writer lock. A completed transfer is not an application cutover.
@@ -319,7 +319,7 @@ and preserve its store-file manifest as freeze evidence. New-document backlog
 stays outside the historical baseline and enters ordinary ingestion only after
 activation and certification; consumer writes remain stopped until certification.
 For a consuming host, W1 agent writes fail closed, W2 retains only new documents in
-`semantic_backlog.jsonl`, and W3-W6 stay stopped. Keeping Elephant stopped covers
+`semantic_backlog.jsonl`, and W3-W6 stay stopped. Keeping Meerkat Recall stopped covers
 its own pipeline and other local writers. Retain store-file manifest equality
 from final S1 through switch; backlog replay is ordinary new ingestion afterward.
 Neither an identical-file no-op nor a fresh zero-row cut establishes the required

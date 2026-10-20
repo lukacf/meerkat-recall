@@ -42,6 +42,14 @@ const DEFAULT_EVENT_AUTO_APPROVE_THRESHOLD: f32 = 0.85;
 const CONTEXT_SNIPPET_MAX_CHARS: usize = 500;
 const EVENT_METADATA_LINEAGE_KEY: &str = "lineage_key";
 pub(crate) const ANGEL_PROTECTEES_METADATA_KEY: &str = "angel_protectees";
+/// Trusted document metadata key a host stamps to classify how its own
+/// projections may use the document. Elephant never writes it on documents;
+/// it only reads it and copies it onto the timeline events it derives.
+pub(crate) const HOST_PROJECTION_METADATA_KEY: &str = "homecore_projection";
+/// Host projection class for internal review bookkeeping. Such documents keep
+/// their assertions (history stays searchable) but never become household
+/// timeline events, so they cannot surface as upcoming or pending items.
+pub(crate) const HOST_PROJECTION_INTERNAL_REVIEW: &str = "internal_review";
 
 /// Result of inline promotion for a batch of assertions.
 #[derive(Debug, Clone, Default)]
@@ -369,6 +377,9 @@ async fn prepare_group(
     )))?;
     capture.dependency(CanonicalRecord::DocNode(Box::new(lineage.node.clone())))?;
     let doc_protectees = angel_protectees_from_metadata(&lineage.doc.metadata);
+    let doc_host_projection = host_projection_from_metadata(&lineage.doc.metadata).cloned();
+    let suppress_timeline_events =
+        host_projection_suppresses_timeline_events(&lineage.doc.metadata);
 
     let mut ordered: Vec<_> = assertions.iter().collect();
     ordered.sort_by(|left, right| {
@@ -530,114 +541,126 @@ async fn prepare_group(
             continue;
         }
 
-        // 5. Create a first-class domain event even when time is fuzzy or unknown.
-        let event_id = RecordId::new_v4(TableName::Event);
-        let mut event_base =
-            BaseFields::new(event_id.clone(), space_id.to_string(), actor.to_string());
-        event_base.subjects.push(subject_entity_link.clone());
-        if let Some(ref object_link) = object_entity_link {
-            if object_link.id() != subject_entity_link.id() {
-                event_base.subjects.push(object_link.clone());
+        // 5. Create a first-class domain event even when time is fuzzy or unknown,
+        // unless the document is internal review bookkeeping. That path neither
+        // creates nor refines an event, so reprocessing cannot resurrect one an
+        // operator rejected or retired.
+        if !suppress_timeline_events {
+            let event_id = RecordId::new_v4(TableName::Event);
+            let mut event_base =
+                BaseFields::new(event_id.clone(), space_id.to_string(), actor.to_string());
+            event_base.subjects.push(subject_entity_link.clone());
+            if let Some(ref object_link) = object_entity_link {
+                if object_link.id() != subject_entity_link.id() {
+                    event_base.subjects.push(object_link.clone());
+                }
             }
-        }
-        event_base.subjects_state = SubjectsState::Complete;
-        event_base.provenance.work_run_id = Some(work_run_id.clone());
-        event_base.provenance.run_id = Some(work_run_id.to_string());
-        lineage.inherit(&mut event_base);
+            event_base.subjects_state = SubjectsState::Complete;
+            event_base.provenance.work_run_id = Some(work_run_id.clone());
+            event_base.provenance.run_id = Some(work_run_id.to_string());
+            lineage.inherit(&mut event_base);
 
-        let assertion_link = Link::new(assertion_id.clone());
-        if let Some(mut existing_event) = Box::pin(find_event_for_lineage_refinement(
-            &event_repo,
-            space_id,
-            &event_lineage_key,
-            raw,
-            &event_base,
-        ))
-        .await?
-        {
-            let updated = apply_event_temporal_refinement(
-                &mut existing_event,
+            let assertion_link = Link::new(assertion_id.clone());
+            if let Some(mut existing_event) = Box::pin(find_event_for_lineage_refinement(
+                &event_repo,
+                space_id,
+                &event_lineage_key,
                 raw,
-                Some(assertion_link.clone()),
-                event_auto_approve_threshold,
-            );
-            if updated {
-                event_repo
-                    .update(space_id, &existing_event.base.id, existing_event.clone())
+                &event_base,
+            ))
+            .await?
+            {
+                let updated = apply_event_temporal_refinement(
+                    &mut existing_event,
+                    raw,
+                    Some(assertion_link.clone()),
+                    event_auto_approve_threshold,
+                );
+                if updated {
+                    event_repo
+                        .update(space_id, &existing_event.base.id, existing_event.clone())
+                        .await
+                        .map_err(PipelineError::StorageError)?;
+                    outbox_records.push(RecordRef {
+                        id: existing_event.base.id.clone(),
+                        table: "event".to_string(),
+                        op: EventOperation::Update,
+                    });
+                }
+                let event_evidence_times = [raw.source_event_time.unwrap_or(now)];
+                Box::pin(record_claim_freshness(
+                    &freshness_repo,
+                    &existing_event.base.id,
+                    "event",
+                    &existing_event.base,
+                    ClaimFreshnessObservation {
+                        evidence_times: &event_evidence_times,
+                        evidence_strength: existing_event.confidence,
+                        conflict_severity: flag_score(
+                            existing_event.status == EventStatus::Rejected,
+                        ),
+                        corroboration_count: existing_event.assertion_refs.len(),
+                    },
+                ))
+                .await?;
+            } else {
+                let mut event = Event {
+                    base: event_base,
+                    title: build_event_title(raw),
+                    summary: None,
+                    status: if confidence_f32 >= event_auto_approve_threshold {
+                        EventStatus::Approved
+                    } else {
+                        EventStatus::Candidate
+                    },
+                    time_start: raw.source_event_time,
+                    time_end: None,
+                    time_precision: event_time_precision(raw),
+                    confidence: confidence_f32,
+                    time_confidence: confidence_f32,
+                    assertion_refs: vec![assertion_link.clone()],
+                    source_refs: vec![Link::new(lineage.source.base.id.clone())],
+                    metadata: serde_json::json!({
+                        "origin": "inline_promotion",
+                        EVENT_METADATA_LINEAGE_KEY: event_lineage_key,
+                        "time_basis": if raw.source_event_time.is_some() {
+                            "source_event_time"
+                        } else {
+                            "unknown"
+                        },
+                    }),
+                };
+                if let (Some(projection), Some(metadata)) =
+                    (&doc_host_projection, event.metadata.as_object_mut())
+                {
+                    metadata.insert(HOST_PROJECTION_METADATA_KEY.into(), projection.clone());
+                }
+
+                let event = event_repo
+                    .create(event)
                     .await
                     .map_err(PipelineError::StorageError)?;
+                let event_evidence_times = [raw.source_event_time.unwrap_or(now)];
+                Box::pin(record_claim_freshness(
+                    &freshness_repo,
+                    &event.base.id,
+                    "event",
+                    &event.base,
+                    ClaimFreshnessObservation {
+                        evidence_times: &event_evidence_times,
+                        evidence_strength: event.confidence,
+                        conflict_severity: 0.0,
+                        corroboration_count: event.assertion_refs.len(),
+                    },
+                ))
+                .await?;
+                result.events_created += 1;
                 outbox_records.push(RecordRef {
-                    id: existing_event.base.id.clone(),
+                    id: event_id,
                     table: "event".to_string(),
-                    op: EventOperation::Update,
+                    op: EventOperation::Create,
                 });
             }
-            let event_evidence_times = [raw.source_event_time.unwrap_or(now)];
-            Box::pin(record_claim_freshness(
-                &freshness_repo,
-                &existing_event.base.id,
-                "event",
-                &existing_event.base,
-                ClaimFreshnessObservation {
-                    evidence_times: &event_evidence_times,
-                    evidence_strength: existing_event.confidence,
-                    conflict_severity: flag_score(existing_event.status == EventStatus::Rejected),
-                    corroboration_count: existing_event.assertion_refs.len(),
-                },
-            ))
-            .await?;
-        } else {
-            let event = Event {
-                base: event_base,
-                title: build_event_title(raw),
-                summary: None,
-                status: if confidence_f32 >= event_auto_approve_threshold {
-                    EventStatus::Approved
-                } else {
-                    EventStatus::Candidate
-                },
-                time_start: raw.source_event_time,
-                time_end: None,
-                time_precision: event_time_precision(raw),
-                confidence: confidence_f32,
-                time_confidence: confidence_f32,
-                assertion_refs: vec![assertion_link.clone()],
-                source_refs: vec![Link::new(lineage.source.base.id.clone())],
-                metadata: serde_json::json!({
-                    "origin": "inline_promotion",
-                    EVENT_METADATA_LINEAGE_KEY: event_lineage_key,
-                    "time_basis": if raw.source_event_time.is_some() {
-                        "source_event_time"
-                    } else {
-                        "unknown"
-                    },
-                }),
-            };
-
-            let event = event_repo
-                .create(event)
-                .await
-                .map_err(PipelineError::StorageError)?;
-            let event_evidence_times = [raw.source_event_time.unwrap_or(now)];
-            Box::pin(record_claim_freshness(
-                &freshness_repo,
-                &event.base.id,
-                "event",
-                &event.base,
-                ClaimFreshnessObservation {
-                    evidence_times: &event_evidence_times,
-                    evidence_strength: event.confidence,
-                    conflict_severity: 0.0,
-                    corroboration_count: event.assertion_refs.len(),
-                },
-            ))
-            .await?;
-            result.events_created += 1;
-            outbox_records.push(RecordRef {
-                id: event_id,
-                table: "event".to_string(),
-                op: EventOperation::Create,
-            });
         }
 
         // 6. Create rel or attribute
@@ -1364,6 +1387,23 @@ async fn follow_entity_redirect(
     Ok(entity)
 }
 
+/// Reads the host projection class (`metadata.homecore_projection`) of a
+/// document; JSON null counts as absent.
+pub(crate) fn host_projection_from_metadata(
+    metadata: &serde_json::Value,
+) -> Option<&serde_json::Value> {
+    metadata
+        .get(HOST_PROJECTION_METADATA_KEY)
+        .filter(|value| !value.is_null())
+}
+
+/// True when a document is internal review bookkeeping whose assertions must
+/// not become household timeline events.
+pub(crate) fn host_projection_suppresses_timeline_events(metadata: &serde_json::Value) -> bool {
+    host_projection_from_metadata(metadata).and_then(serde_json::Value::as_str)
+        == Some(HOST_PROJECTION_INTERNAL_REVIEW)
+}
+
 /// Reads `metadata.angel_protectees` as a list of string ids.
 ///
 /// Missing keys, non-array values, and non-string elements yield an empty /
@@ -1605,14 +1645,20 @@ fn apply_event_temporal_refinement(
         event.confidence = raw_confidence;
         changed = true;
     }
-    let desired_status = if event.confidence >= auto_approve_threshold {
-        EventStatus::Approved
-    } else {
-        EventStatus::Candidate
-    };
-    if event.status != desired_status {
-        event.status = desired_status;
-        changed = true;
+    // Refinement only ever matches events of the same source revision and the
+    // same claim content (see the lineage key), so it is never new evidence
+    // against a rejection. Keep a rejected event rejected; it still records the
+    // support and time refinements so the audit trail stays complete.
+    if event.status != EventStatus::Rejected {
+        let desired_status = if event.confidence >= auto_approve_threshold {
+            EventStatus::Approved
+        } else {
+            EventStatus::Candidate
+        };
+        if event.status != desired_status {
+            event.status = desired_status;
+            changed = true;
+        }
     }
 
     if let Some(source_event_time) = raw.source_event_time {

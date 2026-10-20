@@ -53,6 +53,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_doc_metadata(serde_json::json!({})).await
+    }
+    async fn with_doc_metadata(doc_metadata: serde_json::Value) -> Self {
         let storage = StorageClient::new_embedded()
             .await
             .expect("embedded fixture");
@@ -106,7 +109,7 @@ impl Fixture {
             source: Some(Link::new(source.base.id.clone())),
             media_attachments: vec![],
             rendition_key: "lab-rendition".into(),
-            metadata: serde_json::json!({}),
+            metadata: doc_metadata,
         };
         DocRepository::new(storage.clone())
             .create(doc.clone())
@@ -1161,5 +1164,231 @@ async fn promotion_phase_future_storage_is_bounded() {
             bytes <= 128 * 1024,
             "{phase} future uses {bytes} bytes before finalizer frames"
         );
+    }
+}
+
+/// Sanitized, metadata-only stand-in for an internal security-review document.
+fn internal_review_metadata() -> serde_json::Value {
+    serde_json::json!({
+        HOST_PROJECTION_METADATA_KEY: HOST_PROJECTION_INTERNAL_REVIEW,
+        "kind": "review_bookkeeping",
+    })
+}
+
+fn planned_events(prepared: &PreparedPromotion) -> Vec<(Option<Event>, Event)> {
+    prepared
+        .plan
+        .effects
+        .iter()
+        .filter_map(|effect| match effect.after.as_ref() {
+            Some(CanonicalRecord::Event(after)) => Some((
+                effect.before.as_ref().map(|before| match before {
+                    CanonicalRecord::Event(before) => (**before).clone(),
+                    _ => panic!("event effect has a foreign before-image"),
+                }),
+                (**after).clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Commit only the planned event, as an earlier processing run would have.
+async fn store_planned_event(fixture: &Fixture, status: EventStatus, deleted: bool) -> Event {
+    let prepared = fixture
+        .prepare(std::slice::from_ref(&fixture.raw))
+        .await
+        .unwrap();
+    let (_, mut event) = planned_events(&prepared).pop().expect("planned event");
+    event.status = status;
+    // Events may only reference stored entities: the source's subject and the
+    // participants the same run planned.
+    let entities = EntityRepository::new(fixture.storage.clone());
+    for subject in &fixture.lineage.source.base.subjects {
+        let mut base = BaseFields::new(subject.id().clone(), SPACE.into(), "fixture".into());
+        fixture.lineage.inherit(&mut base);
+        entities
+            .create(Entity::new(base, EntityType::new("person"), "Owner".into()))
+            .await
+            .unwrap();
+    }
+    for effect in &prepared.plan.effects {
+        if let Some(CanonicalRecord::Entity(entity)) = effect.after.as_ref() {
+            entities.create((**entity).clone()).await.unwrap();
+        }
+    }
+    let event = EventRepository::new(fixture.storage.clone())
+        .create(event)
+        .await
+        .unwrap();
+    if deleted {
+        EventRepository::new(fixture.storage.clone())
+            .delete(SPACE, &event.base.id)
+            .await
+            .unwrap();
+    }
+    event
+}
+
+async fn mark_doc(fixture: &Fixture, metadata: serde_json::Value) {
+    let mut doc = fixture.lineage.doc.clone();
+    doc.metadata = metadata;
+    DocRepository::new(fixture.storage.clone())
+        .update(SPACE, &doc.base.id, doc.clone())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn internal_review_doc_records_assertion_but_no_household_event() {
+    let fixture = Fixture::with_doc_metadata(internal_review_metadata()).await;
+    for _ in 0..2 {
+        // Reprocessing the same document plans the same thing every time.
+        let prepared = fixture
+            .prepare(std::slice::from_ref(&fixture.raw))
+            .await
+            .unwrap();
+        assert_eq!(prepared.result.assertions_recorded, 1);
+        assert_eq!(prepared.result.rels_created, 1);
+        assert_eq!(prepared.result.events_created, 0);
+        assert!(planned_events(&prepared).is_empty());
+        let assertions = prepared
+            .plan
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect.after, Some(CanonicalRecord::Assertion(_))))
+            .count();
+        assert_eq!(assertions, 1, "history stays searchable");
+    }
+    fixture.no_live_effects().await;
+}
+
+#[tokio::test]
+async fn internal_review_doc_never_refines_or_resurrects_an_earlier_event() {
+    for (status, deleted) in [
+        (EventStatus::Approved, false),
+        (EventStatus::Rejected, false),
+        (EventStatus::Approved, true),
+    ] {
+        let fixture = Fixture::new().await;
+        let stored = store_planned_event(&fixture, status, deleted).await;
+        mark_doc(&fixture, internal_review_metadata()).await;
+        for _ in 0..2 {
+            let prepared = fixture
+                .prepare(std::slice::from_ref(&fixture.raw))
+                .await
+                .unwrap();
+            assert_eq!(prepared.result.assertions_recorded, 1);
+            assert_eq!(prepared.result.events_created, 0);
+            assert!(
+                planned_events(&prepared).is_empty(),
+                "no create or refinement for {status:?} deleted={deleted}"
+            );
+        }
+        let live = EventRepository::new(fixture.storage.clone())
+            .get(SPACE, &stored.base.id)
+            .await
+            .unwrap();
+        if deleted {
+            assert!(live.is_none());
+        } else {
+            assert_eq!(live.map(|event| event.status), Some(status));
+        }
+    }
+}
+
+#[tokio::test]
+async fn household_doc_still_creates_event_without_or_with_copied_projection() {
+    for (metadata, projection) in [
+        (serde_json::json!({}), None),
+        (
+            serde_json::json!({ HOST_PROJECTION_METADATA_KEY: null }),
+            None,
+        ),
+        (
+            serde_json::json!({ HOST_PROJECTION_METADATA_KEY: "household" }),
+            Some(serde_json::json!("household")),
+        ),
+    ] {
+        let fixture = Fixture::with_doc_metadata(metadata).await;
+        let prepared = fixture
+            .prepare(std::slice::from_ref(&fixture.raw))
+            .await
+            .unwrap();
+        assert_eq!(prepared.result.events_created, 1);
+        let events = planned_events(&prepared);
+        assert_eq!(events.len(), 1);
+        let (before, event) = &events[0];
+        assert!(before.is_none());
+        assert_eq!(event.metadata["origin"], "inline_promotion");
+        assert_eq!(
+            event.metadata.get(HOST_PROJECTION_METADATA_KEY).cloned(),
+            projection
+        );
+        fixture.no_live_effects().await;
+    }
+}
+
+#[tokio::test]
+async fn operator_rejected_event_stays_rejected_after_reprocessing() {
+    let fixture = Fixture::new().await;
+    let rejected = store_planned_event(&fixture, EventStatus::Rejected, false).await;
+    for _ in 0..2 {
+        let prepared = fixture
+            .prepare(std::slice::from_ref(&fixture.raw))
+            .await
+            .unwrap();
+        assert_eq!(prepared.result.events_created, 0);
+        let events = planned_events(&prepared);
+        assert_eq!(events.len(), 1, "support is still refined");
+        let (before, after) = &events[0];
+        assert_eq!(
+            before.as_ref().map(|event| &event.base.id),
+            Some(&rejected.base.id)
+        );
+        assert_eq!(after.base.id, rejected.base.id);
+        assert_eq!(after.status, EventStatus::Rejected);
+        assert_eq!(
+            after.assertion_refs.len(),
+            rejected.assertion_refs.len() + 1
+        );
+    }
+    assert_eq!(
+        EventRepository::new(fixture.storage.clone())
+            .get(SPACE, &rejected.base.id)
+            .await
+            .unwrap()
+            .map(|event| event.status),
+        Some(EventStatus::Rejected)
+    );
+}
+
+#[tokio::test]
+async fn temporal_refinement_preserves_rejection_but_still_promotes_candidates() {
+    let raw = Fixture::new().await.raw;
+    let base = BaseFields::new(
+        RecordId::new_v4(TableName::Event),
+        SPACE.into(),
+        "fixture".into(),
+    );
+    for (status, expected) in [
+        (EventStatus::Candidate, EventStatus::Approved),
+        (EventStatus::Approved, EventStatus::Approved),
+        (EventStatus::Rejected, EventStatus::Rejected),
+    ] {
+        let mut event = Event::new(
+            base.clone(),
+            "Åsa works at",
+            vec![Link::new(RecordId::new_v4(TableName::Assertion))],
+            vec![],
+        )
+        .unwrap();
+        event.status = status;
+        event.confidence = 0.5;
+        assert!(apply_event_temporal_refinement(
+            &mut event, &raw, None, 0.85
+        ));
+        assert_eq!(event.status, expected);
+        assert!((event.confidence - 0.97).abs() < f32::EPSILON);
     }
 }

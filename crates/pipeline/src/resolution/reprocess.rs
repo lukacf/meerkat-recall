@@ -10,8 +10,9 @@ use std::sync::Arc;
 use chrono::Utc;
 use elephant_storage::read_eligibility::{CurrentEvidence, CurrentRead, ReadEligibility};
 use elephant_storage::{
-    AssertionRepository, AttributeRepository, EntityRepository, EventRepository,
-    FreshnessRepository, RelRepository, Repository, StorageClient, WorkArtifactRepository,
+    AssertionRepository, AttributeRepository, DocRepository, DocRevisionRepository,
+    EntityRepository, EventRepository, FreshnessRepository, RelRepository, Repository,
+    StorageClient, WorkArtifactRepository,
 };
 use elephant_types::records::assertion::{Assertion, ResolutionStatus};
 use elephant_types::records::attribute::{Attribute, Literal};
@@ -31,7 +32,11 @@ use crate::maintenance_commit::{
 };
 use crate::scheduler::extraction_work_kinds::ExtractionArtifactData;
 use crate::scheduler::grounding::same_support_partition;
-use crate::scheduler::inline_promotion::{entity_types_compatible, normalize_entity_type};
+use crate::scheduler::inline_promotion::{
+    entity_types_compatible, host_projection_from_metadata,
+    host_projection_suppresses_timeline_events, normalize_entity_type,
+    HOST_PROJECTION_METADATA_KEY,
+};
 use crate::scheduler::promotion_disambiguation::{
     CandidateEntity, DisambiguationRequest, PromotionDisambiguationDecision, PromotionDisambiguator,
 };
@@ -119,6 +124,37 @@ async fn require_current<T: PlanRecord + CurrentRead>(
         ));
     }
     Ok(row)
+}
+
+/// Metadata of the document whose revision grounds `assertion`, observed as a
+/// plan input and cached per revision. A missing revision or document yields
+/// `None` (no host projection), matching the behavior before projections.
+async fn evidence_doc_projection(
+    planning: &PlanningTruthMaintenanceStorage,
+    storage: &StorageClient,
+    space: &str,
+    assertion: &Assertion,
+    cache: &mut BTreeMap<RecordId, Option<serde_json::Value>>,
+) -> PipelineResult<Option<serde_json::Value>> {
+    let revision_id = assertion.evidence.revision.id();
+    if let Some(cached) = cache.get(revision_id) {
+        return Ok(cached.clone());
+    }
+    let mut metadata = None;
+    if let Some(revision) = DocRevisionRepository::new(storage.clone())
+        .get_by_id(revision_id)
+        .await?
+    {
+        if let Some(doc) = DocRepository::new(storage.clone())
+            .get(space, revision.doc.id())
+            .await?
+        {
+            planning.observe(&doc)?;
+            metadata = Some(doc.metadata);
+        }
+    }
+    cache.insert(revision_id.clone(), metadata.clone());
+    Ok(metadata)
 }
 
 fn evidence_ref(assertion: &Assertion) -> EvidenceRef {
@@ -880,7 +916,14 @@ pub(crate) async fn prepare_reprocess(
     // source time. Keep ALL original event support; never copy union-supported
     // temporal details into subsets which may not independently entail them.
     for row in all_rows(&EventRepository::new(storage.clone()), space).await? {
-        if matches!(row.status, EventStatus::Superseded | EventStatus::Rejected)
+        // A rejected event is a review decision about this support. Changed
+        // participant bindings are not new evidence, so neither rewrite it nor
+        // materialize a fresh twin for its assertions below.
+        if row.status == EventStatus::Rejected {
+            event_materialized.extend(row.assertion_refs.iter().map(|item| item.id().clone()));
+            continue;
+        }
+        if row.status == EventStatus::Superseded
             || !row
                 .assertion_refs
                 .iter()
@@ -992,12 +1035,24 @@ pub(crate) async fn prepare_reprocess(
             planning.stage(None, row)?;
         }
     }
+    let mut doc_projections = BTreeMap::new();
     for id in selected.difference(&event_materialized) {
         let assertion = assertions
             .after
             .get(id)
             .ok_or_else(|| invalid("selected event assertion missing"))?;
         if !resolved(assertion) || skipped(assertion) {
+            continue;
+        }
+        // Inline promotion keeps internal review bookkeeping out of the
+        // household timeline; re-resolution must not materialize it either.
+        let projection =
+            evidence_doc_projection(planning, storage, space, assertion, &mut doc_projections)
+                .await?;
+        if projection
+            .as_ref()
+            .is_some_and(host_projection_suppresses_timeline_events)
+        {
             continue;
         }
         let mut base = prepared_base(TableName::Event, &assertion.base, options);
@@ -1044,6 +1099,12 @@ pub(crate) async fn prepare_reprocess(
         event.confidence = assertion.confidence;
         event.time_confidence = assertion.confidence;
         event.metadata = serde_json::json!({"origin":"re_resolve", "time_basis": if event.time_start.is_some() {"source_event_time"} else {"unknown"}});
+        if let (Some(projection), Some(metadata)) = (
+            projection.as_ref().and_then(host_projection_from_metadata),
+            event.metadata.as_object_mut(),
+        ) {
+            metadata.insert(HOST_PROJECTION_METADATA_KEY.into(), projection.clone());
+        }
         stage_freshness(
             planning,
             &event.base,

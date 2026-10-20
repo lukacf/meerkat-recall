@@ -701,3 +701,95 @@ async fn attribute_reresolution_preserves_literal_type_and_rejects_incoherent_pr
             .is_err()
     );
 }
+
+async fn set_doc_metadata(f: &Fixture, metadata: serde_json::Value) {
+    let repo = DocRepository::new(f.storage.clone());
+    let mut doc = repo.get(SPACE, f.revision.doc.id()).await.unwrap().unwrap();
+    doc.metadata = metadata;
+    repo.update(SPACE, &doc.base.id, doc.clone()).await.unwrap();
+}
+
+async fn rerun_events(f: &Fixture) -> Vec<Event> {
+    let planning = PlanningTruthMaintenanceStorage::new(f.storage.clone(), SPACE, None)
+        .await
+        .unwrap();
+    prepare_reprocess(
+        &planning,
+        &f.storage,
+        SPACE,
+        std::slice::from_ref(&f.source),
+        &options(),
+    )
+    .await
+    .unwrap();
+    planning
+        .prepared_plan()
+        .unwrap()
+        .effects
+        .iter()
+        .filter_map(|effect| match effect.after.as_ref() {
+            Some(elephant_storage::canonical_commit::CanonicalRecord::Event(event)) => {
+                Some((**event).clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn rejected_event_is_neither_rewritten_nor_materialized_again() {
+    let f = fixture().await;
+    let mut rejected = f.event.clone();
+    rejected.status = EventStatus::Rejected;
+    let rejected = EventRepository::new(f.storage.clone())
+        .update(SPACE, &rejected.base.id, rejected.clone())
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert!(rerun_events(&f).await.is_empty());
+    }
+    assert_eq!(
+        EventRepository::new(f.storage.clone())
+            .get(SPACE, &f.event.base.id)
+            .await
+            .unwrap(),
+        Some(rejected)
+    );
+}
+
+#[tokio::test]
+async fn unmaterialized_assertion_gets_event_unless_doc_is_internal_review() {
+    for (metadata, expected) in [
+        (serde_json::json!({}), Some(None)),
+        (
+            serde_json::json!({ "homecore_projection": "household" }),
+            Some(Some(serde_json::json!("household"))),
+        ),
+        (
+            serde_json::json!({ "homecore_projection": "internal_review" }),
+            None,
+        ),
+    ] {
+        let f = fixture().await;
+        // A retired (soft-deleted) event leaves its assertion unmaterialized.
+        EventRepository::new(f.storage.clone())
+            .delete(SPACE, &f.event.base.id)
+            .await
+            .unwrap();
+        set_doc_metadata(&f, metadata).await;
+        for _ in 0..2 {
+            let events = rerun_events(&f).await;
+            match &expected {
+                None => assert!(events.is_empty(), "internal review stays off the timeline"),
+                Some(projection) => {
+                    assert_eq!(events.len(), 1);
+                    assert_eq!(events[0].metadata["origin"], "re_resolve");
+                    assert_eq!(
+                        events[0].metadata.get("homecore_projection").cloned(),
+                        *projection
+                    );
+                }
+            }
+        }
+    }
+}

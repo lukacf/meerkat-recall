@@ -42,13 +42,25 @@ const DEFAULT_EVENT_AUTO_APPROVE_THRESHOLD: f32 = 0.85;
 const CONTEXT_SNIPPET_MAX_CHARS: usize = 500;
 const EVENT_METADATA_LINEAGE_KEY: &str = "lineage_key";
 pub(crate) const ANGEL_PROTECTEES_METADATA_KEY: &str = "angel_protectees";
-/// Trusted document metadata key a host stamps to classify how its own
-/// projections may use the document. Elephant never writes it on documents;
-/// it only reads it and copies it onto the timeline events it derives.
+/// Document metadata key a host stamps to say how its own projections should
+/// use the document. Recall never writes it on documents; it only reads it and
+/// copies a non-null value verbatim (any JSON, not validated) onto the timeline
+/// events it derives.
+///
+/// Writer contract: this is a projection hint, NOT a confidentiality or
+/// authorization boundary. Document metadata is ordinary document content, so
+/// every writer already authorized to write the document may set or clear the
+/// key; Recall adds no host-only write admission for it and must not treat it
+/// as an authenticated host fact. A host that needs it to mean "the host said
+/// so" (HomeCore strips agent-supplied copies on its own KB bridge) enforces
+/// that on its side. The worst a writer can do with it is keep its own
+/// document's assertions off, or label, the household timeline; assertions,
+/// rels and attributes stay searchable either way.
 pub(crate) const HOST_PROJECTION_METADATA_KEY: &str = "homecore_projection";
-/// Host projection class for internal review bookkeeping. Such documents keep
-/// their assertions (history stays searchable) but never become household
-/// timeline events, so they cannot surface as upcoming or pending items.
+/// Host projection class for internal review bookkeeping (exact string match
+/// only). Such documents keep their assertions (history stays searchable) but
+/// never create or refine household timeline events, so they cannot surface as
+/// upcoming or pending items. Suppression is not hiding: existing events stay.
 pub(crate) const HOST_PROJECTION_INTERNAL_REVIEW: &str = "internal_review";
 
 /// Result of inline promotion for a batch of assertions.

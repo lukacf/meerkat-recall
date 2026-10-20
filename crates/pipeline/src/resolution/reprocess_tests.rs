@@ -769,6 +769,24 @@ async fn unmaterialized_assertion_gets_event_unless_doc_is_internal_review() {
             serde_json::json!({ "homecore_projection": "internal_review" }),
             None,
         ),
+        // Only the exact string suppresses; any other non-null JSON value is
+        // an unvalidated hint copied verbatim.
+        (
+            serde_json::json!({ "homecore_projection": "Internal_Review" }),
+            Some(Some(serde_json::json!("Internal_Review"))),
+        ),
+        (
+            serde_json::json!({ "homecore_projection": ["internal_review"] }),
+            Some(Some(serde_json::json!(["internal_review"]))),
+        ),
+        (
+            serde_json::json!({ "homecore_projection": {"class": "internal_review"} }),
+            Some(Some(serde_json::json!({"class": "internal_review"}))),
+        ),
+        (
+            serde_json::json!({ "homecore_projection": 7 }),
+            Some(Some(serde_json::json!(7))),
+        ),
     ] {
         let f = fixture().await;
         // A retired (soft-deleted) event leaves its assertion unmaterialized.
@@ -791,5 +809,353 @@ async fn unmaterialized_assertion_gets_event_unless_doc_is_internal_review() {
                 }
             }
         }
+    }
+}
+
+fn choosing(selected: &Entity) -> ReprocessResolutionOptions {
+    let mut options = options();
+    options.disambiguator = Some(Arc::new(Choose {
+        id: selected.base.id.clone(),
+        calls: AtomicUsize::new(0),
+    }));
+    options
+}
+
+async fn set_event_status(f: &Fixture, status: EventStatus) -> Event {
+    let mut event = f.event.clone();
+    event.status = status;
+    EventRepository::new(f.storage.clone())
+        .update(SPACE, &f.event.base.id, event)
+        .await
+        .unwrap()
+}
+
+/// Every Event effect of the prepared plan as (before, after).
+fn event_effects(
+    planning: &PlanningTruthMaintenanceStorage,
+) -> Vec<(Option<Event>, Option<Event>)> {
+    let event = |row: &elephant_storage::canonical_commit::CanonicalRecord| match row {
+        elephant_storage::canonical_commit::CanonicalRecord::Event(event) => {
+            Some((**event).clone())
+        }
+        _ => None,
+    };
+    planning
+        .prepared_plan()
+        .unwrap()
+        .effects
+        .iter()
+        .filter(|effect| {
+            effect
+                .after
+                .as_ref()
+                .or(effect.before.as_ref())
+                .is_some_and(|row| row.base().id.table() == TableName::Event)
+        })
+        .map(|effect| {
+            (
+                effect.before.as_ref().and_then(event),
+                effect.after.as_ref().and_then(event),
+            )
+        })
+        .collect()
+}
+
+/// The kept event is neither retired nor replaced nor twinned: at most one
+/// in-place effect on the same row that only joins subject requirements.
+fn assert_kept_in_place(effects: &[(Option<Event>, Option<Event>)], kept: &Event) {
+    assert!(effects.len() <= 1, "no replacement or twin: {effects:?}");
+    for (before, after) in effects {
+        assert_eq!(before.as_ref(), Some(kept));
+        let after = after.as_ref().expect("kept event is not removed");
+        assert_same_event_except_subjects(after, kept);
+    }
+}
+
+fn assert_same_event_except_subjects(after: &Event, kept: &Event) {
+    assert_eq!(after.base.id, kept.base.id);
+    assert!(after.base.deleted_at.is_none());
+    assert_eq!(after.status, kept.status);
+    assert_eq!(after.title, kept.title);
+    assert_eq!(after.time_start, kept.time_start);
+    assert_eq!(after.assertion_refs, kept.assertion_refs);
+    assert_eq!(after.source_refs, kept.source_refs);
+    assert_eq!(after.metadata, kept.metadata);
+    assert_eq!(after.base.security, kept.base.security);
+    assert!(kept
+        .base
+        .subjects
+        .iter()
+        .all(|subject| after.base.subjects.contains(subject)));
+}
+
+/// Prepare and actually commit one re-resolution run, as the maintenance owner
+/// does. Returns the run's result and its planned Event effects.
+async fn commit_rerun(
+    f: &Fixture,
+    options: &ReprocessResolutionOptions,
+) -> (
+    ReprocessResolutionResult,
+    Vec<(Option<Event>, Option<Event>)>,
+) {
+    let planning = PlanningTruthMaintenanceStorage::new(f.storage.clone(), SPACE, None)
+        .await
+        .unwrap();
+    let result = prepare_reprocess(
+        &planning,
+        &f.storage,
+        SPACE,
+        std::slice::from_ref(&f.source),
+        options,
+    )
+    .await
+    .unwrap();
+    let events = event_effects(&planning);
+    planning
+        .commit(
+            "re_resolve",
+            "internal-review-oracle",
+            &serde_json::json!({"work_run":options.work_run_id}),
+            &result,
+        )
+        .await
+        .unwrap();
+    (result, events)
+}
+
+/// Events still on the timeline: neither retired nor superseded.
+async fn live_events(f: &Fixture) -> Vec<Event> {
+    EventRepository::new(f.storage.clone())
+        .list(SPACE, 100, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.base.deleted_at.is_none() && row.status != EventStatus::Superseded)
+        .collect()
+}
+
+async fn live_rels(f: &Fixture) -> Vec<Rel> {
+    RelRepository::new(f.storage.clone())
+        .list(SPACE, 100, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.base.deleted_at.is_none() && row.status != ClaimStatus::Superseded)
+        .collect()
+}
+
+/// The single kept event, unchanged except for joined subject requirements,
+/// which now cover the re-resolved participant (it stays at least as
+/// restricted as its support), with its freshness on the same envelope.
+async fn assert_only_kept_event(f: &Fixture, kept: &Event, selected: &Entity) {
+    let events = live_events(f).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_same_event_except_subjects(&events[0], kept);
+    assert!(events[0]
+        .base
+        .subjects
+        .iter()
+        .any(|subject| subject.id() == &selected.base.id));
+    let assertion = AssertionRepository::new(f.storage.clone())
+        .get(SPACE, &f.assertion.base.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(contains_authorization(&events[0].base, &assertion.base).unwrap());
+    let freshness = FreshnessRepository::new(f.storage.clone())
+        .list(SPACE, 100, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.base.deleted_at.is_none() && row.target == kept.base.id.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(freshness.len(), 1);
+    assert_eq!(freshness[0].base.subjects, events[0].base.subjects);
+}
+
+#[tokio::test]
+async fn changed_participant_never_replaces_an_internal_review_event() {
+    for status in [EventStatus::Approved, EventStatus::Candidate] {
+        let f = fixture().await;
+        let stored = set_event_status(&f, status).await;
+        set_doc_metadata(
+            &f,
+            serde_json::json!({"homecore_projection": "internal_review"}),
+        )
+        .await;
+        let selected = competitor(&f).await;
+        let options = choosing(&selected);
+        let (result, effects) = commit_rerun(&f, &options).await;
+        assert_eq!(result.events_superseded, 0, "{status:?}");
+        assert_eq!(effects.len(), 1, "only the in-place subject join");
+        assert_kept_in_place(&effects, &stored);
+        // Assertion and rel re-resolution still happen.
+        assert_eq!(result.rels_superseded, 1);
+        let rels = live_rels(&f).await;
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].subject.id(), &selected.base.id);
+        assert_eq!(
+            AssertionRepository::new(f.storage.clone())
+                .get(SPACE, &f.assertion.base.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .subject_entity
+                .unwrap()
+                .id(),
+            &selected.base.id
+        );
+        assert_only_kept_event(&f, &stored, &selected).await;
+        // A committed second run leaves the timeline exactly as it is.
+        let (result, effects) = commit_rerun(&f, &options).await;
+        assert_eq!(result.events_superseded, 0);
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_only_kept_event(&f, &stored, &selected).await;
+    }
+}
+
+#[tokio::test]
+async fn changed_participant_still_replaces_a_household_event() {
+    for metadata in [
+        serde_json::json!({}),
+        serde_json::json!({"homecore_projection": "household"}),
+    ] {
+        for status in [EventStatus::Approved, EventStatus::Candidate] {
+            let f = fixture().await;
+            set_event_status(&f, status).await;
+            set_doc_metadata(&f, metadata.clone()).await;
+            let selected = competitor(&f).await;
+            let (result, effects) = commit_rerun(&f, &choosing(&selected)).await;
+            assert_eq!(result.events_superseded, 1, "{metadata} {status:?}");
+            assert_eq!(
+                effects.len(),
+                2,
+                "retire old event and stage its replacement"
+            );
+            assert_eq!(result.rels_superseded, 1);
+            let events = live_events(&f).await;
+            assert_eq!(events.len(), 1);
+            assert_ne!(events[0].base.id, f.event.base.id);
+            assert_eq!(events[0].status, EventStatus::Candidate);
+            assert_eq!(events[0].assertion_refs, f.event.assertion_refs);
+        }
+    }
+}
+
+#[tokio::test]
+async fn committed_internal_review_rerun_creates_no_event() {
+    let f = fixture().await;
+    // A retired (soft-deleted) event leaves its assertion unmaterialized.
+    EventRepository::new(f.storage.clone())
+        .delete(SPACE, &f.event.base.id)
+        .await
+        .unwrap();
+    set_doc_metadata(
+        &f,
+        serde_json::json!({"homecore_projection": "internal_review"}),
+    )
+    .await;
+    let selected = competitor(&f).await;
+    let options = choosing(&selected);
+    for _ in 0..2 {
+        let (result, effects) = commit_rerun(&f, &options).await;
+        assert_eq!(result.events_superseded, 0);
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(live_events(&f).await.is_empty());
+        let rels = live_rels(&f).await;
+        assert_eq!(rels.len(), 1, "rel/assertion behavior is retained");
+        assert_eq!(rels[0].subject.id(), &selected.base.id);
+    }
+}
+
+#[tokio::test]
+async fn committed_rerun_keeps_a_rejected_event_rejected() {
+    let f = fixture().await;
+    let rejected = set_event_status(&f, EventStatus::Rejected).await;
+    let selected = competitor(&f).await;
+    let options = choosing(&selected);
+    let (result, effects) = commit_rerun(&f, &options).await;
+    assert_eq!(result.events_superseded, 0);
+    assert_eq!(effects.len(), 1, "only the in-place subject join");
+    assert_kept_in_place(&effects, &rejected);
+    assert_only_kept_event(&f, &rejected, &selected).await;
+    assert_eq!(live_rels(&f).await[0].subject.id(), &selected.base.id);
+    let (result, effects) = commit_rerun(&f, &options).await;
+    assert_eq!(result.events_superseded, 0);
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_only_kept_event(&f, &rejected, &selected).await;
+}
+
+#[tokio::test]
+async fn rejected_event_decision_is_a_commit_dependency() {
+    // Without a binding change the skip is the plan's only use of the event;
+    // with one, the event is also an in-place effect. Both must be fenced.
+    for changed in [false, true] {
+        let f = fixture().await;
+        let rejected = set_event_status(&f, EventStatus::Rejected).await;
+        let options = if changed {
+            choosing(&competitor(&f).await)
+        } else {
+            options()
+        };
+        let planning = PlanningTruthMaintenanceStorage::new(f.storage.clone(), SPACE, None)
+            .await
+            .unwrap();
+        let result = prepare_reprocess(
+            &planning,
+            &f.storage,
+            SPACE,
+            std::slice::from_ref(&f.source),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_kept_in_place(&event_effects(&planning), &rejected);
+        let expected = serde_json::to_value(rejected.clone().record()).unwrap();
+        assert!(
+            planning
+                .prepared_plan()
+                .unwrap()
+                .dependencies
+                .iter()
+                .any(|row| serde_json::to_value(row).unwrap() == expected),
+            "the exact rejected event preimage is captured (changed={changed})"
+        );
+        // An operator reverses the rejection after the plan decided to skip it.
+        let mut reopened = rejected.clone();
+        reopened.status = EventStatus::Approved;
+        EventRepository::new(f.storage.clone())
+            .update(SPACE, &rejected.base.id, reopened)
+            .await
+            .unwrap();
+        let input = serde_json::json!({"work_run":options.work_run_id});
+        let mut request = planning
+            .prepare_request("re_resolve", "rejected-dependency-oracle", &input, &result)
+            .await
+            .unwrap();
+        // Refresh the predicate fence so only the captured row can refuse: the
+        // stale skip decision must not commit even when the epoch agrees.
+        let canonical =
+            elephant_storage::canonical_commit::CanonicalRepository::new(f.storage.clone());
+        request.plan.observed_epoch = canonical.epoch(SPACE).await.unwrap();
+        let refused = canonical.commit(request).await.unwrap_err();
+        assert!(
+            matches!(&refused, elephant_storage::StorageError::Conflict(code)
+                if code == "canonical_dependency_changed"),
+            "changed={changed}: {refused:?}"
+        );
+        // The ordinary commit path refuses as well, and nothing was written.
+        assert!(planning
+            .commit("re_resolve", "rejected-dependency-oracle", &input, &result)
+            .await
+            .is_err());
+        assert_eq!(
+            AssertionRepository::new(f.storage.clone())
+                .get(SPACE, &f.assertion.base.id)
+                .await
+                .unwrap(),
+            Some(f.assertion.clone())
+        );
+        assert_eq!(live_rels(&f).await, vec![f.rel.clone()]);
     }
 }

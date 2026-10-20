@@ -129,6 +129,8 @@ async fn require_current<T: PlanRecord + CurrentRead>(
 /// Metadata of the document whose revision grounds `assertion`, observed as a
 /// plan input and cached per revision. A missing revision or document yields
 /// `None` (no host projection), matching the behavior before projections.
+/// The projection is a hint any authorized document writer may set; see
+/// [`HOST_PROJECTION_METADATA_KEY`] for the writer contract.
 async fn evidence_doc_projection(
     planning: &PlanningTruthMaintenanceStorage,
     storage: &StorageClient,
@@ -707,6 +709,33 @@ async fn original_literal(
     Ok(value)
 }
 
+/// An event re-resolution keeps instead of replacing (operator rejected, or
+/// changed support from an internal review document) must stay at least as
+/// restricted as its re-resolved support, or readers could see it without
+/// access to that support. Join only the support's subject requirements; the
+/// event keeps its identity, status, title, time, support refs and metadata.
+/// `None` when the envelope already covers the support (nothing to stage).
+fn kept_event_envelope(row: &Event, support: &[Assertion]) -> PipelineResult<Option<Event>> {
+    let mut covered = true;
+    for assertion in support {
+        covered &= contains_authorization(&row.base, &assertion.base)?;
+    }
+    if covered {
+        return Ok(None);
+    }
+    let mut after = row.clone();
+    for assertion in support {
+        add_subjects(&mut after.base, &assertion.base);
+    }
+    for assertion in support {
+        if !contains_authorization(&after.base, &assertion.base)? {
+            return Err(invalid("event support crosses policy partitions"));
+        }
+    }
+    after.base.updated_at = Utc::now();
+    Ok(Some(after))
+}
+
 /// Stage re-resolution and every affected graph effect in the caller's overlay.
 /// Original epoch/attempt, current source support and the one commit belong to M.
 pub(crate) async fn prepare_reprocess(
@@ -912,17 +941,16 @@ pub(crate) async fn prepare_reprocess(
             planning.stage(None, replacement)?;
         }
     }
+    // Projection of each grounding document, observed once per revision and
+    // shared by the replacement and materialization decisions below.
+    let mut doc_projections = BTreeMap::new();
+    // Kept (not replaced) events whose subject requirements had to grow, so
+    // their freshness projection follows the same envelope.
+    let mut kept = BTreeMap::new();
     // A changed participant binding does not change what happened or its exact
     // source time. Keep ALL original event support; never copy union-supported
     // temporal details into subsets which may not independently entail them.
     for row in all_rows(&EventRepository::new(storage.clone()), space).await? {
-        // A rejected event is a review decision about this support. Changed
-        // participant bindings are not new evidence, so neither rewrite it nor
-        // materialize a fresh twin for its assertions below.
-        if row.status == EventStatus::Rejected {
-            event_materialized.extend(row.assertion_refs.iter().map(|item| item.id().clone()));
-            continue;
-        }
         if row.status == EventStatus::Superseded
             || !row
                 .assertion_refs
@@ -931,7 +959,19 @@ pub(crate) async fn prepare_reprocess(
         {
             continue;
         }
-        let row = require_current(planning, &reader, row).await?;
+        // A rejected event is a review decision about this support. Changed
+        // participant bindings are not new evidence, so neither replace it nor
+        // materialize a fresh twin for its assertions below. That decision
+        // reads this exact row (status and assertion refs), so it is a plan
+        // dependency: a concurrent status or support change fails the commit
+        // with canonical_dependency_changed and the plan is reprepared.
+        let rejected = row.status == EventStatus::Rejected;
+        let row = if rejected {
+            planning.observe(&row)?;
+            row
+        } else {
+            require_current(planning, &reader, row).await?
+        };
         event_materialized.extend(row.assertion_refs.iter().map(|item| item.id().clone()));
         if !row
             .assertion_refs
@@ -940,17 +980,52 @@ pub(crate) async fn prepare_reprocess(
         {
             continue;
         }
+        let mut support = Vec::with_capacity(row.assertion_refs.len());
+        for reference in &row.assertion_refs {
+            support.push(
+                if let Some(current) = assertions.after.get(reference.id()) {
+                    current.clone()
+                } else {
+                    planning
+                        .get_assertion(space, reference.id())
+                        .await?
+                        .ok_or_else(|| invalid("event support is no longer current"))?
+                },
+            );
+        }
+        // Replacing the event would retire it and publish a fresh Candidate
+        // twin, i.e. refine the household timeline from the changed support.
+        // Inline promotion never lets an internal review document create or
+        // refine an event, so when any changed supporting assertion grounds in
+        // one, keep the existing event (no retirement, no replacement). Its
+        // assertions stay materialized, so no twin either.
+        let mut keep = rejected;
+        for assertion in &support {
+            if keep {
+                break;
+            }
+            keep = assertions.changed.contains(&assertion.base.id)
+                && evidence_doc_projection(
+                    planning,
+                    storage,
+                    space,
+                    assertion,
+                    &mut doc_projections,
+                )
+                .await?
+                .as_ref()
+                .is_some_and(host_projection_suppresses_timeline_events);
+        }
+        if keep {
+            if let Some(after) = kept_event_envelope(&row, &support)? {
+                kept.insert(row.base.id.to_string(), after.base.clone());
+                planning.stage_restricted(Some(row), after)?;
+            }
+            continue;
+        }
         let mut after = row.clone();
         let mut evidence = Vec::new();
-        for reference in &row.assertion_refs {
-            let assertion = if let Some(current) = assertions.after.get(reference.id()) {
-                current.clone()
-            } else {
-                planning
-                    .get_assertion(space, reference.id())
-                    .await?
-                    .ok_or_else(|| invalid("event support is no longer current"))?
-            };
+        for assertion in support {
             if !resolved(&assertion) {
                 return Err(invalid(
                     "event re-resolution requires all original participants to remain resolved",
@@ -1035,7 +1110,6 @@ pub(crate) async fn prepare_reprocess(
             planning.stage(None, row)?;
         }
     }
-    let mut doc_projections = BTreeMap::new();
     for id in selected.difference(&event_materialized) {
         let assertion = assertions
             .after
@@ -1115,6 +1189,16 @@ pub(crate) async fn prepare_reprocess(
         planning.stage(None, event)?;
     }
     for row in all_rows::<Freshness, _>(&FreshnessRepository::new(storage.clone()), space).await? {
+        if let Some(envelope) = kept.get(&row.target) {
+            planning.observe(&row)?;
+            let mut after = row.clone();
+            after.base.security.clone_from(&envelope.security);
+            after.base.subjects.clone_from(&envelope.subjects);
+            after.base.subjects_state = envelope.subjects_state;
+            after.base.updated_at = Utc::now();
+            planning.stage_restricted(Some(row), after)?;
+            continue;
+        }
         if !retired.contains(&row.target) {
             continue;
         }

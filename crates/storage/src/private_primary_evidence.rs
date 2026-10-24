@@ -644,6 +644,13 @@ impl PrivatePrimaryEvidence {
         result.map_err(|error| StorageError::DataIntegrityError(error.to_string()))
     }
 
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            clippy::unused_async,
+            reason = "the only await is in the Linux-only capture block below"
+        )
+    )]
     async fn poll_inner(&mut self, client: &StorageClient) -> Result<()> {
         self.capability.verify(Utc::now())?;
         if client.backend().as_str() != self.capability.backend

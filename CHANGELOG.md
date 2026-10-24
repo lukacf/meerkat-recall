@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Timeline
+- Page `list_upcoming_events` past its 50-event limit: a truncated response returns
+  `next_cursor`, and passing it back as `cursor` continues the same window after the
+  last returned `(time_start, id)`. A page cut by the scan ceiling resumes after the
+  last scanned row even when filtering left none of it visible.
+
 ## [0.9.1] - 2026-10-15
 
 ### Deployment and diagnostics

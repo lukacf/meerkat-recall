@@ -99,6 +99,9 @@ pub struct ListUpcomingEventsInput {
     /// Maximum items to return; defaults to and is capped at `DEFAULT_UPCOMING_LIMIT`.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// `next_cursor` from a previous page of the same window; omit for the first page.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +115,28 @@ pub struct ListUpcomingEventsOutput {
     /// True when more visible upcoming events existed than were returned.
     #[serde(default)]
     pub truncated: bool,
+    /// Pass back as `cursor` to read the rest of the window; present only when `truncated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Encodes the `(time_start, id)` position of an upcoming row as an opaque cursor.
+fn upcoming_cursor(time_start: chrono::DateTime<chrono::Utc>, id: &RecordId) -> String {
+    format!(
+        "{}|{id}",
+        time_start.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    )
+}
+
+/// Decodes a cursor made by [`upcoming_cursor`].
+fn parse_upcoming_cursor(cursor: &str) -> McpResult<(chrono::DateTime<chrono::Utc>, RecordId)> {
+    let invalid = || McpError::InvalidParameters(format!("Invalid upcoming cursor: {cursor}"));
+    let (time_start, id) = cursor.split_once('|').ok_or_else(invalid)?;
+    let time_start = chrono::DateTime::parse_from_rfc3339(time_start)
+        .map_err(|_| invalid())?
+        .with_timezone(&chrono::Utc);
+    let id = parse_id(id, TableName::Event).map_err(|_| invalid())?;
+    Ok((time_start, id))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -832,7 +857,8 @@ impl ToolHandler for ListUpcomingEventsHandler {
             "Includes events still in progress and day-precision events dated today ",
             "(UTC-conservative: up to 24h back; filter the exact local day client-side). ",
             "Returns at most `limit` items (default and max 50); `truncated` is true when ",
-            "more visible events existed.\n\n",
+            "more visible events existed, and `next_cursor` then reads the rest of the ",
+            "window when passed back as `cursor`.\n\n",
             "Example:\n",
             r#"{ "days": 14, "include_candidates": false }"#,
         )
@@ -850,7 +876,8 @@ impl ToolHandler for ListUpcomingEventsHandler {
                     "default": DEFAULT_UPCOMING_LIMIT,
                     "minimum": 1,
                     "maximum": DEFAULT_UPCOMING_LIMIT
-                }
+                },
+                "cursor": { "type": "string" }
             }
         })
     }
@@ -875,18 +902,29 @@ impl ToolHandler for ListUpcomingEventsHandler {
             .limit
             .unwrap_or(DEFAULT_UPCOMING_LIMIT)
             .clamp(1, DEFAULT_UPCOMING_LIMIT);
+        let after = input
+            .cursor
+            .as_deref()
+            .map(parse_upcoming_cursor)
+            .transpose()?;
         let mut events = self
             .repo
-            .get_upcoming_at(
+            .get_upcoming_after(
                 &space_id,
                 input.days,
                 chrono::Utc::now(),
+                after.as_ref(),
                 UPCOMING_SCAN_LIMIT,
             )
             .await
             .map_err(|e| McpError::ExecutionError(e.to_string()))?;
         // Hitting the scan ceiling means more rows may exist beyond what was read.
         let scan_exhausted = events.len() >= UPCOMING_SCAN_LIMIT;
+        // Where the scan stopped: a page cut by the scan ceiling resumes after this row,
+        // even when filtering left nothing of it to return.
+        let last_scanned = events
+            .last()
+            .and_then(|event| Some((event.time_start?, event.base.id.clone())));
         if !input.include_candidates {
             events.retain(|event| event.status != EventStatus::Candidate);
         }
@@ -894,8 +932,21 @@ impl ToolHandler for ListUpcomingEventsHandler {
         // short page while more visible rows exist.
         let mut items = authorized_events(ctx, events).await?;
         let truncated = scan_exhausted || items.len() > limit;
-        items.truncate(limit);
-        let output = ListUpcomingEventsOutput { items, truncated };
+        let next_cursor = if items.len() > limit {
+            items.truncate(limit);
+            items
+                .last()
+                .and_then(|event| Some(upcoming_cursor(event.time_start?, &event.base.id)))
+        } else if truncated {
+            last_scanned.map(|(time_start, id)| upcoming_cursor(time_start, &id))
+        } else {
+            None
+        };
+        let output = ListUpcomingEventsOutput {
+            items,
+            truncated,
+            next_cursor,
+        };
         let response = ToolResponse::success(output);
         serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
     }
@@ -1408,11 +1459,25 @@ mod tests {
     /// Seeds `visible` events readable at clearance level 1 and `hidden` events at level 5,
     /// all starting in the next few hours. Hidden rows come first in time order so a
     /// cap-before-filter would starve the visible page.
+    async fn seed_upcoming(storage: &StorageClient, visible: usize, hidden: usize) {
+        seed_upcoming_with(storage, visible, hidden, |offset| {
+            chrono::Duration::minutes(offset)
+        })
+        .await;
+    }
+
+    /// Seeds `hidden` events the test principal cannot read, then `visible` ones, each
+    /// starting `start(n)` after now for its 1-based position `n`.
     #[expect(
         clippy::significant_drop_tightening,
         reason = "Keep fixture storage and repository owners alive through all authorization and pagination assertions"
     )]
-    async fn seed_upcoming(storage: &StorageClient, visible: usize, hidden: usize) {
+    async fn seed_upcoming_with(
+        storage: &StorageClient,
+        visible: usize,
+        hidden: usize,
+        start: impl Fn(i64) -> chrono::Duration,
+    ) {
         let repo = EventRepository::new(storage.clone());
         let source = SourceRepository::new(storage.clone())
             .create(Source::new(
@@ -1449,7 +1514,7 @@ mod tests {
             .expect("event");
             event.status = EventStatus::Approved;
             let offset = i64::try_from(index).expect("index") + 1;
-            event.time_start = Some(now + chrono::Duration::minutes(offset));
+            event.time_start = Some(now + start(offset));
             event.time_precision = TimePrecision::Minute;
             repo.create(event).await.expect("create event");
         }
@@ -1540,5 +1605,130 @@ mod tests {
         let output = list_upcoming(&storage, json!({ "limit": 12 })).await;
         assert_eq!(output.items.len(), 12);
         assert!(!output.truncated);
+    }
+
+    /// Reads a whole upcoming window by following `next_cursor`, returning every page.
+    async fn read_all_upcoming(
+        storage: &StorageClient,
+        limit: usize,
+    ) -> Vec<ListUpcomingEventsOutput> {
+        let mut pages = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..100 {
+            let mut params = json!({ "limit": limit });
+            if let Some(cursor) = cursor.take() {
+                params["cursor"] = json!(cursor);
+            }
+            let page = list_upcoming(storage, params).await;
+            cursor.clone_from(&page.next_cursor);
+            assert_eq!(page.truncated, page.next_cursor.is_some());
+            pages.push(page);
+            if cursor.is_none() {
+                return pages;
+            }
+        }
+        panic!("cursor never terminated");
+    }
+
+    fn titles(pages: &[ListUpcomingEventsOutput]) -> Vec<String> {
+        pages
+            .iter()
+            .flat_map(|page| page.items.iter().map(|event| event.title.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture storage and repository owners alive through all authorization and pagination assertions"
+    )]
+    async fn test_list_upcoming_cursor_reads_the_whole_window() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        seed_upcoming(&storage, 120, 5).await;
+
+        let pages = read_all_upcoming(&storage, DEFAULT_UPCOMING_LIMIT).await;
+
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page.items.len())
+                .collect::<Vec<_>>(),
+            vec![50, 50, 20]
+        );
+        let expected: Vec<String> = (5..125).map(|index| format!("Event {index}")).collect();
+        assert_eq!(titles(&pages), expected);
+        let last = pages.last().expect("last page");
+        assert!(!last.truncated);
+        assert!(last.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture storage and repository owners alive through all authorization and pagination assertions"
+    )]
+    async fn test_list_upcoming_cursor_splits_equal_start_times() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        // Every event starts at the same instant, so only the id orders them.
+        seed_upcoming_with(&storage, 25, 0, |_| chrono::Duration::minutes(5)).await;
+
+        let pages = read_all_upcoming(&storage, 10).await;
+
+        assert_eq!(pages.len(), 3);
+        let mut seen = titles(&pages);
+        assert_eq!(seen.len(), 25);
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 25, "a row repeated across pages");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture storage and repository owners alive through all authorization and pagination assertions"
+    )]
+    async fn test_list_upcoming_cursor_moves_past_a_scan_of_hidden_rows() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        // The earliest UPCOMING_SCAN_LIMIT rows are all unreadable to the caller.
+        seed_upcoming_with(&storage, 10, UPCOMING_SCAN_LIMIT, |offset| {
+            chrono::Duration::minutes(30) + chrono::Duration::seconds(offset)
+        })
+        .await;
+
+        let first = list_upcoming(&storage, json!({})).await;
+        assert!(first.items.is_empty());
+        assert!(first.truncated);
+        let cursor = first.next_cursor.expect("cursor past the scanned rows");
+
+        let second = list_upcoming(&storage, json!({ "cursor": cursor })).await;
+        let expected: Vec<String> = (UPCOMING_SCAN_LIMIT..UPCOMING_SCAN_LIMIT + 10)
+            .map(|index| format!("Event {index}"))
+            .collect();
+        assert_eq!(titles(std::slice::from_ref(&second)), expected);
+        assert!(!second.truncated);
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep fixture storage and repository owners alive through all authorization and pagination assertions"
+    )]
+    async fn test_list_upcoming_rejects_a_malformed_cursor() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        let handler = ListUpcomingEventsHandler::new(storage.clone());
+        for cursor in [
+            "no-separator",
+            "not-a-time|event:x",
+            "2026-10-24T06:00:00Z|not-an-id",
+        ] {
+            let result = handler
+                .execute(&upcoming_ctx(&storage), json!({ "cursor": cursor }))
+                .await;
+            assert!(
+                matches!(result, Err(McpError::InvalidParameters(_))),
+                "{cursor}: {result:?}"
+            );
+        }
     }
 }

@@ -8,10 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Timeline
-- Page `list_upcoming_events` past its 50-event limit: a truncated response returns
-  `next_cursor`, and passing it back as `cursor` continues the same window after the
-  last returned `(time_start, id)`. A page cut by the scan ceiling resumes after the
+- Page `list_upcoming_events` past its 50-event limit: a truncated response returns an
+  opaque `next_cursor`, and passing it back as `cursor` continues the same window after
+  the last returned `(time_start, id)`. A page cut by the scan ceiling resumes after the
   last scanned row even when filtering left none of it visible.
+- The cursor is sealed with ChaCha20-Poly1305 under a key derived from the server secret
+  (a per-process key without one), bound to the caller, space and `days` /
+  `include_candidates`, and valid for an hour. It carries the instant of the first page,
+  so later pages read the same window.
 
 ## [0.9.1] - 2026-10-15
 

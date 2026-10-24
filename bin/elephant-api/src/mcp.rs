@@ -724,9 +724,15 @@ async fn dispatcher_for(
 ) -> Option<elephant_mcp::ToolDispatcher> {
     let storage = state.runtime.current_storage().await?;
     let authz = Arc::new(McpAuthzService::new_with_skip_auth(state.auth.skip_auth));
-    let context = ToolContext::with_authz(storage, authz, caller.principal)
+    let mut context = ToolContext::with_authz(storage, authz, caller.principal)
         .with_verified_caller(caller.verified)
         .with_snapshot_coordinator(Arc::new(RuntimeSnapshotCoordinator(state.runtime.clone())));
+    if !state.auth.secret.trim().is_empty() {
+        // Continuation tokens open on every instance sharing the server secret.
+        context = context.with_continuation_key(Arc::new(
+            elephant_mcp::continuation::ContinuationKey::from_secret(state.auth.secret.as_bytes()),
+        ));
+    }
     Some(match profile {
         DispatcherProfile::Full => create_dispatcher_with_context(context),
         DispatcherProfile::Default => create_default_dispatcher_with_context(context),

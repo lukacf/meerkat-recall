@@ -1395,16 +1395,24 @@ local day on the client.
 
 The page is applied after candidate and authorization filtering. The response carries
 `items` and `truncated`, which is true when more visible events existed than were returned.
-A truncated response also carries `next_cursor`; pass it back as `cursor` with the same
-`days` to read the rest of the window. Pages are ordered by `time_start` and then by id,
-so events that share a start time are neither repeated nor skipped across pages.
+A truncated response also carries `next_cursor`, an opaque token; pass it back as `cursor`
+with the same `days` and `include_candidates` to read the rest of the window. Pages are
+ordered by `time_start` and then by id, so events that share a start time are neither
+repeated nor skipped across pages, and every page is read against the instant of the first
+page, so the window does not move while it is being read.
+
+The token is encrypted and authenticated with a server-side key derived from the server
+secret, and it is bound to the caller, the space and those parameters: another caller,
+another space or other parameters get an invalid-parameters error, as does a token that
+was altered or is more than an hour old. Each page is authorized afresh; start a new read
+without a cursor after an error.
 
 | Parameter | Type and requirement | Description |
 | --- | --- | --- |
 | `days` | integer; optional; default 7 | Look-ahead window in days (1-365) |
 | `include_candidates` | boolean; optional; default false | Include candidate-status events |
 | `limit` | integer; optional; default 50 | Maximum events to return (1-50) |
-| `cursor` | string; optional | `next_cursor` from the previous page of the same window |
+| `cursor` | string; optional | `next_cursor` from the previous page of the same read |
 
 ```json
 { "days": 14, "include_candidates": false }

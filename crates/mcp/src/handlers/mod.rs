@@ -99,6 +99,7 @@ pub struct ToolContext {
     /// Absent for explicitly trusted embedding and skip-auth development mode.
     verified_caller: Option<elephant_auth::VerifiedCallerContext>,
     snapshot_coordinator: Option<Arc<dyn crate::snapshot_control::SnapshotCoordinator>>,
+    continuation_key: Option<Arc<crate::continuation::ContinuationKey>>,
 }
 
 impl ToolContext {
@@ -111,6 +112,7 @@ impl ToolContext {
             principal,
             verified_caller: None,
             snapshot_coordinator: None,
+            continuation_key: None,
         }
     }
 
@@ -127,6 +129,7 @@ impl ToolContext {
             principal,
             verified_caller: None,
             snapshot_coordinator: None,
+            continuation_key: None,
         }
     }
     /// Carry an already verified ingress context. Raw public policy principals
@@ -149,6 +152,23 @@ impl ToolContext {
         self.snapshot_coordinator = Some(coordinator);
         self
     }
+    /// Seal continuation tokens with a key derived from the server's secret, so
+    /// they open on every instance that shares it. Without one, a random
+    /// per-process key is used (`ContinuationKey::process_local`).
+    #[must_use]
+    pub fn with_continuation_key(mut self, key: Arc<crate::continuation::ContinuationKey>) -> Self {
+        self.continuation_key = Some(key);
+        self
+    }
+
+    /// The key continuation tokens are sealed and opened with.
+    #[must_use]
+    pub fn continuation_key(&self) -> Arc<crate::continuation::ContinuationKey> {
+        self.continuation_key
+            .clone()
+            .unwrap_or_else(crate::continuation::ContinuationKey::process_local)
+    }
+
     /// Host drain coordinator, when this dispatcher runs inside a managed service.
     #[must_use]
     pub fn snapshot_coordinator(

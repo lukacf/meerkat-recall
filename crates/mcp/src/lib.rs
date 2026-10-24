@@ -8,6 +8,7 @@
 
 pub mod authz;
 pub mod coercion;
+pub mod continuation;
 pub mod current_read;
 pub mod error;
 pub mod evidence;

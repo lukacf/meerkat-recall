@@ -142,6 +142,9 @@ base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
 
+# Authenticated encryption (sealed continuation tokens)
+ring = "0.17"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

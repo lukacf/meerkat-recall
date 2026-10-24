@@ -663,15 +663,38 @@ impl EventRepository {
         now: DateTime<Utc>,
         max_rows: usize,
     ) -> StorageResult<Vec<Event>> {
+        self.get_upcoming_after(space_id, days, now, None, max_rows)
+            .await
+    }
+
+    /// Gets upcoming events like [`Self::get_upcoming_at`], strictly after `after`.
+    ///
+    /// Rows are ordered by `(time_start, id)`, and `after` is the `(time_start, id)` of the
+    /// last row a caller has already seen, so a listing can be read page by page without
+    /// repeating or skipping rows that share a `time_start`. `None` starts at the beginning.
+    pub async fn get_upcoming_after(
+        &self,
+        space_id: &str,
+        days: u32,
+        now: DateTime<Utc>,
+        after: Option<&(DateTime<Utc>, RecordId)>,
+        max_rows: usize,
+    ) -> StorageResult<Vec<Event>> {
         let horizon = now + Duration::days(i64::from(days));
         let day_floor = now - Duration::hours(UPCOMING_DAY_PRECISION_GRACE_HOURS);
 
         if let Some(store) = self.client.embedded_store() {
+            let after = after.map(|(time_start, id)| (*time_start, id.to_string()));
             let mut rows = store.scan::<Event>().await?;
             rows.retain(|row| {
                 row.base.space_id == space_id
                     && row.base.deleted_at.is_none()
                     && is_upcoming(row, now, horizon, day_floor)
+                    && after.as_ref().is_none_or(|(after_start, after_id)| {
+                        row.time_start.is_some_and(|time_start| {
+                            (time_start, row.base.id.to_string()) > (*after_start, after_id.clone())
+                        })
+                    })
             });
             rows.sort_by(|lhs, rhs| {
                 lhs.time_start
@@ -682,6 +705,11 @@ impl EventRepository {
             return Ok(rows);
         }
 
+        let after_clause = if after.is_some() {
+            "AND (time_start > $after_start OR (time_start = $after_start AND id > $after_id)) "
+        } else {
+            ""
+        };
         let mut response = self
             .client
             .query_bind(
@@ -692,13 +720,20 @@ impl EventRepository {
                      AND (time_start >= $now \
                           OR (time_end IS NOT NONE AND time_end >= $now) \
                           OR (time_precision = 'day' AND time_start >= $day_floor)) \
-                     ORDER BY time_start ASC LIMIT $max_rows"
+                     {after_clause}\
+                     ORDER BY time_start ASC, id ASC LIMIT $max_rows"
                 ),
                 crate::bindings! {
                     "space_id" => space_id,
                     "now" => now,
                     "horizon" => horizon,
                     "day_floor" => day_floor,
+                    "after_start" => after.map_or(surrealdb::sql::Value::None, |(time_start, _)| {
+                        crate::surreal::datetime_from_chrono(*time_start).into()
+                    }),
+                    "after_id" => after.map_or(surrealdb::sql::Value::None, |(_, id)| {
+                        surrealdb::sql::Value::from(crate::surreal::thing_from_record_id(id))
+                    }),
                     "max_rows" => i64::try_from(max_rows).unwrap_or(i64::MAX),
                 },
             )
@@ -1899,6 +1934,69 @@ mod tests {
             .unwrap();
         assert_eq!(capped.len(), 2);
         assert_eq!(capped[0].title, "Today (day)");
+    }
+
+    /// Reading an upcoming window page by page with `get_upcoming_after` returns exactly the
+    /// rows of one unpaged read, in the same order, including rows that share a `time_start`.
+    async fn assert_upcoming_after_pages(repo: &EventRepository) {
+        let space_id = "space_upcoming_pages";
+        let now = utc("2026-10-11T10:00:00Z");
+        for (index, start) in [
+            "2026-10-11T12:00:00Z",
+            "2026-10-11T12:00:00Z",
+            "2026-10-11T12:00:00Z",
+            "2026-10-12T08:00:00Z",
+            "2026-10-12T08:00:00Z",
+            "2026-10-13T09:30:00Z",
+            "2026-10-15T00:00:00Z",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = make_event(
+                space_id,
+                &format!("Item {index}"),
+                EventStatus::Approved,
+                Some(utc(start)),
+            );
+            repo.create(event).await.unwrap();
+        }
+
+        let whole: Vec<RecordId> = repo
+            .get_upcoming_at(space_id, 7, now, DEFAULT_UPCOMING_LIMIT)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.base.id)
+            .collect();
+        assert_eq!(whole.len(), 7);
+
+        let mut paged = Vec::new();
+        let mut after: Option<(DateTime<Utc>, RecordId)> = None;
+        for _ in 0..10 {
+            let page = repo
+                .get_upcoming_after(space_id, 7, now, after.as_ref(), 2)
+                .await
+                .unwrap();
+            let Some(last) = page.last() else {
+                break;
+            };
+            after = Some((last.time_start.unwrap(), last.base.id.clone()));
+            paged.extend(page.into_iter().map(|event| event.base.id));
+        }
+        assert_eq!(paged, whole);
+    }
+
+    #[tokio::test]
+    async fn test_upcoming_after_pages_through_ties_surreal() {
+        let repo = setup_test_repo().await;
+        assert_upcoming_after_pages(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn test_upcoming_after_pages_through_ties_embedded() {
+        let repo = EventRepository::new(StorageClient::new_embedded().await.unwrap());
+        assert_upcoming_after_pages(&repo).await;
     }
 
     #[tokio::test]

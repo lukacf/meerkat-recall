@@ -1923,7 +1923,8 @@ mod tests {
             subject_allowlist: None,
             purpose: Vec::new(),
         };
-        let secret = "upcoming-cursor-test-secret-of-32-bytes";
+        // Generated per run: no signing-key literal in the source.
+        let secret = uuid::Uuid::new_v4().to_string();
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),
             &claims,
@@ -1931,7 +1932,7 @@ mod tests {
         )
         .expect("token");
         let caller = elephant_auth::LegacyVerifier {
-            secret,
+            secret: &secret,
             algorithm: jsonwebtoken::Algorithm::HS256,
             audience: None,
             issuer: None,

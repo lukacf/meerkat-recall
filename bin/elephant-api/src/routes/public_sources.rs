@@ -1224,7 +1224,8 @@ mod tests {
     async fn route_fixture(
         configure: bool,
     ) -> Result<(Router, StorageClient), Box<dyn std::error::Error>> {
-        route_fixture_on(StorageClient::new_embedded().await?, configure).await
+        let storage = StorageClient::new_embedded().await?;
+        route_fixture_on(storage, configure).await
     }
     /// Both storage backends: the embedded store and SurrealDB (in memory).
     async fn backends() -> Result<Vec<StorageClient>, Box<dyn std::error::Error>> {
@@ -1315,7 +1316,8 @@ mod tests {
     #[tokio::test]
     async fn a_title_names_the_staged_document_and_no_title_keeps_the_external_id(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        for storage in backends().await? {
+        let clients = backends().await?;
+        for storage in clients {
             let (router, storage) = route_fixture_on(storage, true).await?;
             let (status, titled) = request_json(
                 router.clone(),
@@ -1343,7 +1345,8 @@ mod tests {
     #[tokio::test]
     async fn a_revision_accepted_without_a_title_replays_and_a_title_is_new_content(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        for storage in backends().await? {
+        let clients = backends().await?;
+        for storage in clients {
             let (router, storage) = route_fixture_on(storage, true).await?;
             let path = "/v1/spaces/alpha/sources/legacy";
             let untitled = json!({"revision":"r1","text":"source evidence","media_type":"text/plain",

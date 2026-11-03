@@ -1588,8 +1588,9 @@ mod tests {
     }
 
     /// A revision's staged document title is immutable content: the same revision
-    /// re-accepted (fresh intent, current generation) with another title is
-    /// refused, and the stored revision keeps its first title.
+    /// re-accepted with another title is refused (fresh key:
+    /// immutable_revision_conflict; the accepted key: idempotency_conflict, which
+    /// is checked first), and the stored revision keeps its first title.
     #[expect(
         clippy::significant_drop_tightening,
         reason = "Keep the repository owner alive through the whole check."
@@ -1608,7 +1609,7 @@ mod tests {
             .accept(titled("upstream-record", "first", SourcePrecondition::Absent))
             .await
             .expect("accept");
-        let refused = repo
+        let fresh_key = repo
             .accept(titled(
                 "Human title",
                 "retitled",
@@ -1616,8 +1617,21 @@ mod tests {
             ))
             .await;
         assert!(
-            matches!(&refused, Err(StorageError::Conflict(code)) if code == "immutable_revision_conflict"),
-            "{refused:?}"
+            matches!(&fresh_key, Err(StorageError::Conflict(code)) if code == "immutable_revision_conflict"),
+            "{fresh_key:?}"
+        );
+        // The accepted key with another title: the key's own check comes first, so
+        // the idempotency conflict wins over the immutable-revision one.
+        let same_key = repo
+            .accept(titled(
+                "Human title",
+                "first",
+                SourcePrecondition::Generation(first.source_generation.clone()),
+            ))
+            .await;
+        assert!(
+            matches!(&same_key, Err(StorageError::Conflict(code)) if code == "idempotency_conflict"),
+            "{same_key:?}"
         );
         let stored = repo
             .revision("business-a", &id, "r1")

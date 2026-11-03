@@ -1275,6 +1275,44 @@ mod tests {
             .ok_or("no staged document")?
             .title)
     }
+    /// Everything the store holds, to show a refused request wrote nothing: the
+    /// embedded store's complete snapshot (less its export time), or every
+    /// `SurrealDB` table's row count (sources, staging, publication control rows,
+    /// the work queue, ...).
+    async fn store_state(storage: &StorageClient) -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(store) = storage.embedded_store() {
+            // The export stamps its own time; everything else is the store.
+            let mut snapshot: Value = serde_json::from_slice(&store.export_snapshot_bytes().await?)?;
+            snapshot
+                .as_object_mut()
+                .ok_or("snapshot is not an object")?
+                .remove("exported_at");
+            return Ok(hex::encode(Sha256::digest(serde_json::to_vec(&sorted(snapshot))?)));
+        }
+        let mut counts = BTreeMap::new();
+        for table in storage.list_tables().await? {
+            let mut response = storage
+                .query_checked(&format!("SELECT count() AS n FROM `{table}` GROUP ALL"))
+                .await?;
+            let row: Option<Value> = response.take(0)?;
+            counts.insert(table, row.map_or(0, |row| row["n"].as_u64().unwrap_or(0)));
+        }
+        Ok(serde_json::to_string(&counts)?)
+    }
+    /// `value` with every object's keys in order: the export's map order is not stable.
+    fn sorted(value: Value) -> Value {
+        match value {
+            Value::Object(map) => Value::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, sorted(value)))
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.into_iter().map(sorted).collect()),
+            other => other,
+        }
+    }
     async fn route_fixture_on(
         storage: StorageClient,
         configure: bool,
@@ -1374,6 +1412,7 @@ mod tests {
             .await?;
             assert_eq!(status, StatusCode::ACCEPTED);
             assert_eq!(staged_title_of(&storage, &null_titled, "r1").await?, "null-titled");
+            let before = store_state(&storage).await?;
             for blank in ["", "   "] {
                 let (status, error) = request_json(
                     router.clone(),
@@ -1386,6 +1425,22 @@ mod tests {
                 assert_eq!(status, StatusCode::BAD_REQUEST, "{blank:?}");
                 assert_eq!(error["error_code"], "invalid_request");
             }
+            assert_eq!(
+                store_state(&storage).await?,
+                before,
+                "a refused title wrote nothing: no source, staging, control or queue row"
+            );
+            // The probe is not blind: an accepted PUT does change it.
+            let (status, _) = request_json(
+                router.clone(),
+                "PUT",
+                "/v1/spaces/alpha/sources/probe-check",
+                json!({"revision":"r1","text":"source evidence","media_type":"text/plain",
+                    "observed_at":"2026-10-06T20:11:00Z","expected_generation":null}),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_ne!(store_state(&storage).await?, before);
             let (status, _) = request_json(
                 router,
                 "GET",

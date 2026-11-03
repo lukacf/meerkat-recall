@@ -1227,7 +1227,7 @@ mod tests {
         let storage = StorageClient::new_embedded().await?;
         route_fixture_on(storage, configure).await
     }
-    /// Both storage backends: the embedded store and SurrealDB (in memory).
+    /// Both storage backends: the embedded store and `SurrealDB` (in memory).
     async fn backends() -> Result<Vec<StorageClient>, Box<dyn std::error::Error>> {
         Ok(vec![
             StorageClient::new_embedded().await?,

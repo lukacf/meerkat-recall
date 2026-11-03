@@ -85,9 +85,14 @@ pub enum SourceLabel {
 #[serde(deny_unknown_fields)]
 pub struct PutSourceRequest {
     pub revision: String,
-    /// The document's human title. Absent: the external source id, as before
-    /// this field existed, so a revision first accepted without a title replays
-    /// and re-accepts unchanged.
+    /// The document's human title. Omitted or `null`: the external source id,
+    /// exactly as before this field existed (and no `title` in the request
+    /// fingerprint), so a revision first accepted without one replays and
+    /// re-accepts unchanged. Present: it must be one trimmed, control-free line
+    /// of at most 1024 bytes; an empty or whitespace-only title is refused (400)
+    /// before anything is read or staged. It is used verbatim (never normalized)
+    /// for the request fingerprint, the staged document and so the immutable
+    /// revision content.
     #[serde(default)]
     pub title: Option<String>,
     pub text: String,
@@ -1206,9 +1211,29 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn a_null_title_is_an_absent_title() -> Result<(), Box<dyn std::error::Error>> {
+        let base = BaseFields::new(
+            RecordId::new_v4(TableName::Source),
+            "alpha".into(),
+            "service".into(),
+        );
+        let omitted: PutSourceRequest = serde_json::from_value(json!({"revision":"r1","text":"exact evidence",
+            "media_type":"text/plain","observed_at":"2026-10-06T20:11:00Z","expected_generation":null}))?;
+        let null: PutSourceRequest = serde_json::from_value(json!({"revision":"r1","title":null,"text":"exact evidence",
+            "media_type":"text/plain","observed_at":"2026-10-06T20:11:00Z","expected_generation":null}))?;
+        assert_eq!(null.title, None);
+        assert!(null.validate().is_ok());
+        assert_eq!(
+            source_fingerprint("alpha", "external", &null, &base)?,
+            source_fingerprint("alpha", "external", &omitted, &base)?
+        );
+        assert_eq!(staged_title(&null, "external"), "external");
+        Ok(())
+    }
+    #[test]
     fn a_title_is_a_bounded_trimmed_line() {
         let mut input = request("exact evidence".into());
-        for bad in ["", " leading", "trailing ", "two\nlines", &"x".repeat(1_025)] {
+        for bad in ["", "   ", "\t", " leading", "trailing ", "two\nlines", &"x".repeat(1_025)] {
             input.title = Some(bad.to_owned());
             assert!(input.validate().is_err(), "{bad:?}");
         }
@@ -1330,7 +1355,7 @@ mod tests {
             assert_eq!(status, StatusCode::ACCEPTED);
             assert_eq!(staged_title_of(&storage, &titled, "r1").await?, "Email: Synthetic subject");
             let (status, untitled) = request_json(
-                router,
+                router.clone(),
                 "PUT",
                 "/v1/spaces/alpha/sources/untitled",
                 json!({"revision":"r1","text":"source evidence","media_type":"text/plain",
@@ -1339,6 +1364,36 @@ mod tests {
             .await?;
             assert_eq!(status, StatusCode::ACCEPTED);
             assert_eq!(staged_title_of(&storage, &untitled, "r1").await?, "untitled");
+            let (status, null_titled) = request_json(
+                router.clone(),
+                "PUT",
+                "/v1/spaces/alpha/sources/null-titled",
+                json!({"revision":"r1","title":null,"text":"source evidence","media_type":"text/plain",
+                    "observed_at":"2026-10-06T20:11:00Z","expected_generation":null}),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(staged_title_of(&storage, &null_titled, "r1").await?, "null-titled");
+            for blank in ["", "   "] {
+                let (status, error) = request_json(
+                    router.clone(),
+                    "PUT",
+                    "/v1/spaces/alpha/sources/blank-titled",
+                    json!({"revision":"r1","title":blank,"text":"source evidence","media_type":"text/plain",
+                        "observed_at":"2026-10-06T20:11:00Z","expected_generation":null}),
+                )
+                .await?;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{blank:?}");
+                assert_eq!(error["error_code"], "invalid_request");
+            }
+            let (status, _) = request_json(
+                router,
+                "GET",
+                "/v1/spaces/alpha/sources/blank-titled/head",
+                Value::Null,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::NOT_FOUND, "a refused title staged nothing");
         }
         Ok(())
     }
@@ -1374,6 +1429,13 @@ mod tests {
                 request_json_with_key(router.clone(), "PUT", path, titled.clone(), Some("k3")).await?;
             assert_eq!(status, StatusCode::CONFLICT);
             assert_eq!(error["error_code"], "conflict_generation");
+            // Nothing moved: the head is the re-accepted one and the stored revision
+            // keeps the title it was accepted with (the storage layer's
+            // immutable_revision_conflict, pinned in source_publication's tests).
+            let (_, head) = request_json(router.clone(), "GET", &format!("{path}/head"), Value::Null).await?;
+            assert_eq!(head["generation"], reaccepted["generation"]);
+            assert_eq!(head["operation_id"], reaccepted["operation_id"]);
+            assert_eq!(staged_title_of(&storage, &first, "r1").await?, "legacy");
             let (status, _) =
                 request_json_with_key(router.clone(), "PUT", path, titled.clone(), Some("k1")).await?;
             assert_eq!(status, StatusCode::CONFLICT);

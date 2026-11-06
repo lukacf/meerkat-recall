@@ -5,7 +5,7 @@
 
 [toolchain]
 # Pin to specific stable version (matches rust-version in Cargo.toml)
-channel = "1.94.0"
+channel = "1.97.0"
 
 # Required components for development and CI
 components = [

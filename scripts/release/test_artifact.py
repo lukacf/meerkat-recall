@@ -193,7 +193,7 @@ class ArtifactTests(unittest.TestCase):
         installed = self.root / "operator-install"
         artifact.verify(archive, artifact.digest(archive), installed)
         for name in ("LICENSE-MIT", "LICENSE-APACHE"):
-            bundled = f"licenses/meerkat-0.9.0/{name}"
+            bundled = f"licenses/meerkat-0.9.10/{name}"
             self.assertIn(bundled, manifest["files"])
             self.assertEqual((installed / bundled).read_bytes(),
                              (source / "scripts/release/meerkat-notices" / name).read_bytes())

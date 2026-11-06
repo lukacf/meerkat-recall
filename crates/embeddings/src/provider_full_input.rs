@@ -259,6 +259,10 @@ impl Accumulator {
     }
 
     #[allow(clippy::cast_precision_loss)] // Inputs are already resident byte arrays.
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "Preserve existing accumulated embedding values"
+    )]
     pub(super) fn add(&mut self, segment: &Segment, vector: &[f32]) -> EmbeddingResult<()> {
         let input = segment.input;
         if input >= self.lengths.len()

@@ -6,7 +6,7 @@ obtain START from `codex-security-adr-mac` before any Cargo invocation; release
 that lane only after the build and its children have exited. Use one build at a
 time, including retries. Do not build on the live HomeCore service machine.
 
-The candidate uses Rust **1.94.0**, Python **3.12.12**, Apple CLT/SDK and libclang,
+The candidate uses Rust **1.97.0**, Python **3.12.12**, Apple CLT/SDK and libclang,
 package `meerkat-recall-bin`, defaults plus `rocksdb,fastembed`, and the existing
 `deploy` profile. The recipe defaults to four Cargo jobs and preserves all
 supported features. Neither a workspace build nor a `--release` build produces
@@ -90,14 +90,14 @@ recall_python="$("$recall_python" -c 'import pathlib,sys; print(pathlib.Path(sys
 shasum -a 256 "$recall_python" > "$recall_task/receipts/python.sha256"
 export RUSTUP_HOME="$recall_task/rustup"
 export CARGO_HOME="$recall_task/cargo-bootstrap"
-"$recall_rustup" toolchain install 1.94.0-aarch64-apple-darwin --profile minimal --no-self-update
-export RUSTUP_TOOLCHAIN=1.94.0-aarch64-apple-darwin
+"$recall_rustup" toolchain install 1.97.0-aarch64-apple-darwin --profile minimal --no-self-update
+export RUSTUP_TOOLCHAIN=1.97.0-aarch64-apple-darwin
 recall_toolchain="$RUSTUP_HOME/toolchains/$RUSTUP_TOOLCHAIN/bin"
 export PATH="$(dirname "$recall_python"):$recall_toolchain:/usr/bin:/bin:/usr/sbin:/sbin"
 python3 --version > "$recall_task/receipts/python-version.txt"
 rustc -vV > "$recall_task/receipts/rustc.txt"
 cargo -V > "$recall_task/receipts/cargo.txt"
-test "$(rustc --version | awk '{print $2}')" = 1.94.0
+test "$(rustc --version | awk '{print $2}')" = 1.97.0
 test "$(rustc -vV | sed -n 's/^host: //p')" = aarch64-apple-darwin
 ```
 
@@ -121,9 +121,9 @@ xcrun --sdk macosx --show-sdk-version > "$recall_task/receipts/sdk-version.txt"
 ```
 
 No `protoc`, audio SDK or ONNX source compiler is required by this locked selected
-graph. `LZMA_API_STATIC=1` compiles the bundled C source. ort-sys downloads its
-checksum-pinned native ARM64 ONNX Runtime distribution. Neither downloads model
-weights nor authorizes an external provider. Locked crates and native runtime
+graph. ort-sys downloads its checksum-pinned native ARM64 ONNX Runtime
+distribution. This build does not download model weights or authorize an
+external provider. Locked crates and native runtime
 downloads require access or exact verified warm caches.
 
 The source-only [dependency inventory](darwin-build-prerequisites.json) records
@@ -135,7 +135,7 @@ not an executed Cargo dependency report or a builder observation.
 | --- | --- |
 | Apple CLT clang/clang++, ar, linker, SDK, libclang | RocksDB `surrealdb-librocksdb-sys` 0.18.3+11.0.0-4 uses `cc` and runtime bindgen. Compression, regex and crypto crates compile bundled C/C++/assembly. Record actual CLT paths/versions; libclang must load on this host. |
 | Existing system tools | Bash, Git, shasum, sed, awk, cut, basename, dirname, find, mktemp, cmp, nice, uname, xcrun, xcode-select, otool, make and ordinary file utilities. The recipe needs no Homebrew tool substitution. |
-| Rust 1.94.0 native ARM64 | Exact minimal toolchain, invoked from task-local real compiler/Cargo binaries; the wrapper avoids rustup shims that could install the repository's optional development components. Retain rustup distribution verification and downloaded component receipts. |
+| Rust 1.97.0 native ARM64 | Exact minimal toolchain, invoked from task-local real compiler/Cargo binaries; the wrapper avoids rustup shims that could install the repository's optional development components. Retain rustup distribution verification and downloaded component receipts. |
 | Python 3.12.12 native ARM64 | Existing trusted uv must support the pinned request and `--no-bin`. Retain selected download URL/hash and actual interpreter SHA256; a version label alone is not a download identity. |
 | Locked Cargo crates | Existing Cargo registry access or exact warm cache; `--locked` and Cargo.lock checksums remain authoritative. No manifest or feature reductions. |
 | Native ONNX Runtime | `fastembed` 5.17.2 selects ort-sys 2.0.0-rc.12 download/native TLS. The exact 1.24.2 ARM64 URL/SHA below is required. Only the task-local ORT cache location changes. No model weights are fetched by the build. |

@@ -453,9 +453,7 @@ impl NormalizedIngestRequest {
 
         let space_id = require_space_id(principal).map_err(|(_, err)| err.0)?;
         let prepared_media = build_media_attachments(&space_id, &self.media)?;
-        let mut metadata = self
-            .metadata
-            .map_or_else(serde_json::Map::new, std::convert::identity);
+        let mut metadata = self.metadata.unwrap_or_default();
         if let Some(collection) = self.collection {
             metadata.insert(
                 "collection".to_string(),

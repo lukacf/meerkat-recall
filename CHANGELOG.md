@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Dependencies
+- Exact-pin the Meerkat SDK family to 0.9.10 and raise the Rust toolchain to
+  1.97.0 across development, CI, and release builds.
+- Remove the `unsafe-libyaml` maintenance exception after Meerkat replaced its
+  skill frontmatter parser with `serde-saphyr`.
+- Update `ctutils` to 0.4.4 and Tokio to 1.53.3 for their published security
+  fixes; document the retained Wasm timer's `pin-utils` maintenance exception.
+
+### Fixes
+- Reject provider refusals, content filtering and context-window exhaustion
+  before using buffered entity-resolution text or tool calls.
+
 ## [0.9.1] - 2026-10-15
 
 ### Deployment and diagnostics

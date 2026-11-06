@@ -371,7 +371,7 @@ class ContainerReceiptTests(unittest.TestCase):
         self.elf = {**artifact.elf_dependencies(HEADER, DYNAMIC, VERSIONS), "binary_sha256": self.sha}
         self.runtime_packages = "libc6:amd64\t2.36-9\nlibssl3:amd64\t3.0.17\nlibstdc++6:amd64\t12.2.0\nlibgomp1:amd64\t12.2.0\nca-certificates\t2025\ncurl\t7.88\n"
         self.provenance = {**self.identity, "format": "meerkat-recall-container/v1", "binary_sha256": self.sha,
-                           "version": "0.1.0", "version_output": "meerkat-recall 0.1.0", "rustc": "rustc 1.94.0 (fixture)",
+                           "version": "0.1.0", "version_output": "meerkat-recall 0.1.0", "rustc": "rustc 1.97.0 (fixture)",
                            "build_command": artifact.BUILD_COMMAND, "build_profile": "deploy",
                            "features": artifact.FEATURES, "default_features": True,
                            "native_reference_capability": {"test": "receipt"},

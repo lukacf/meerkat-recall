@@ -184,9 +184,7 @@ impl AuthConfig {
             .map_err(anyhow::Error::msg)?;
         let audience = std::env::var("JWT_AUDIENCE").ok();
         let issuer = std::env::var("JWT_ISSUER").ok();
-        let skip_auth = std::env::var("SKIP_AUTH")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+        let skip_auth = std::env::var("SKIP_AUTH").is_ok_and(|v| v == "true" || v == "1");
 
         Ok(Self {
             secret,

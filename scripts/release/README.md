@@ -1,6 +1,6 @@
 # Native artifact recipe v1
 
-Run from a clean reviewed checkout on the native target host with Rust 1.94,
+Run from a clean reviewed checkout on the native target host with Rust 1.97,
 Python 3.12+, native linker dependencies and sufficient local build disk. The default floor is
 32 GiB; set `RECALL_BUILD_MIN_FREE_GIB` to the allocated host requirement (250 on
 the shared implementation host). This is a preflight floor, not a measured peak
@@ -33,7 +33,7 @@ Linux uses the CPU static ONNX Runtime 1.24.2 / API 24 distribution recorded in
 [recorded manylinux 2014 / GCC 11 build](https://github.com/csukuangfj/onnxruntime-build/actions/runs/22630506217).
 The locked `ort-sys` GNU archive references glibc 2.38 C23 functions and cannot
 link on the supported Debian 12 builder. The release selects this compatible
-static input explicitly; it does not change Cargo.lock, Rust 1.94, default
+static input explicitly; it does not change Cargo.lock, Rust 1.97, default
 features plus `rocksdb,fastembed`, or the GLIBC 2.36 / GLIBCXX 3.4.30 /
 CXXABI 1.3.13 final ELF limits. Darwin still uses the locked `ort-sys` distribution.
 
@@ -67,10 +67,10 @@ runtime acceptance or change the minimum supported system from the filename.
 The `meerkat-recall-native/v1` manifest additionally hashes every bundled file
 and records the compatibility symlink. Packaging includes extraction skills,
 service templates, license texts and the six patched vendored dependency trees.
-Meerkat 0.9.0 supplies the provider HTTP defenses upstream;
+Meerkat 0.9.10 supplies the provider HTTP defenses upstream;
 `meerkat-provider-upstream.json` records the registry source/checksums that replace
 the historical HTTP backports, with exact published license texts retained under
-`licenses/meerkat-0.9.0` (container: `/usr/share/licenses/meerkat-recall/meerkat-0.9.0`). Native archives
+`licenses/meerkat-0.9.10` (container: `/usr/share/licenses/meerkat-recall/meerkat-0.9.10`). Native archives
 and container images carry the same patched source inventory. This includes the
 pinned SurrealDB core and SDK 2.6.5, their complete Business Source License 1.1
 texts, upstream checksums and `RECALL_SURREALDB_PATCH.md`. These component
@@ -250,7 +250,7 @@ then run offline `verify` and install into a fresh directory. A prebuilt archive
 needs extraction/model-cache space and no Rust toolchain or build target cache.
 It still requires acceptance on the recipient Mac before selecting it in launchd.
 
-For a local native build, use the exact reviewed source commit, Rust 1.94.0,
+For a local native build, use the exact reviewed source commit, Rust 1.97.0,
 Python 3.12+, and Apple command-line tools with a working SDK, C/C++ compiler,
 linker and `libclang` for RocksDB's bindgen step. Full Xcode is not inherently
 required; verify the selected command-line tools can supply these inputs. The
@@ -260,9 +260,8 @@ producing this artifact.
 
 The pinned graph does not require a `protoc` or audio-toolchain installation.
 FastEmbed uses ort-sys's checksum-pinned native ARM64 ONNX Runtime distribution;
-it does not compile ONNX Runtime or protobuf in this recipe. `LZMA_API_STATIC=1`
-builds vendored liblzma C sources with the C compiler. Package-config probes in
-other bundled compression libraries have source fallbacks; neither a missing
+it does not compile ONNX Runtime or protobuf in this recipe. Package-config probes
+in bundled compression libraries have source fallbacks; neither a missing
 `pkg-config` nor `cmake` alone establishes a missing requirement for this selected
 graph. Recheck these statements when updating the lockfile or enabled features.
 Build downloads still require network access or exact verified warm caches.
@@ -308,7 +307,7 @@ A container builder may pass `--cache-id` and `--cache-evidence` to
 BuildKit cache in current-capacity mode. The evidence must match the current
 compatibility contract and bind the retained build receipt, its cache identity,
 compiler/target/profile/features and installed native compiler package inventory.
-The cache ID has the exact `recall-bookworm-rust194-` plus 64 lowercase hexadecimal
+The cache ID has the exact `recall-bookworm-rust197-` plus 64 lowercase hexadecimal
 digest shape. Without this override the key is derived from the compatibility
 contract. The actual Docker argument and `container-build-metadata.json` retain
 the selection. Current source/archive identity and Cargo/native-input

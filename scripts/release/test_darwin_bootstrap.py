@@ -278,7 +278,7 @@ class BootstrapTests(unittest.TestCase):
 
         def command(name, argv, seconds, cap=None):
             path = prepared['paths']['receipt_directory'] / (name + '.log')
-            value = str(python) + '\n' if name == 'python-find' else 'release: 1.94.0\nhost: aarch64-apple-darwin\n'
+            value = str(python) + '\n' if name == 'python-find' else 'release: 1.97.0\nhost: aarch64-apple-darwin\n'
             path.write_text(value)
             return path
 

@@ -268,9 +268,7 @@ async fn physical_completion_contract(storage: StorageClient) {
             .unwrap();
         let guard = ModelHttpGuard::new(context, binding);
         let terminal = LlmEvent::Done {
-            outcome: meerkat::LlmDoneOutcome::Success {
-                stop_reason: meerkat::StopReason::EndTurn,
-            },
+            outcome: meerkat::LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
         };
         assert!(
             guard.observe_event(&terminal).await.is_err(),

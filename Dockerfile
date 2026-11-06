@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1@sha256:7b32114e84ca21aeb2d6f871a0b62b3a0762193f75d9afd048ee4cbe889f3148
 # Build with scripts/release/build-container from the exact committed source.
-ARG BUILDER_IMAGE=rust@sha256:4673f78db88b71f09d5451bbc404734807918161241215ba0a50bbbe9b448117
+ARG BUILDER_IMAGE=rust@sha256:b5a086f64ffecaa4e283063184770107915756739598173e1f5712d6b34b84d0
 ARG RUNTIME_IMAGE=debian@sha256:a4672c0cb26fbdde88e38fa2dfb6c681942306680e41e4378b28770b6e79ee91
 FROM ${BUILDER_IMAGE} AS builder
 WORKDIR /app
@@ -108,7 +108,7 @@ RUN ldd /usr/local/bin/meerkat-recall > /usr/share/meerkat-recall/runtime-depend
 COPY --from=builder /app/skills /usr/share/meerkat-recall/skills
 COPY LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md /usr/share/licenses/meerkat-recall/
 COPY scripts/release/onnxruntime-notices/ /usr/share/licenses/meerkat-recall/onnxruntime-1.24.2/
-COPY scripts/release/meerkat-notices/ /usr/share/licenses/meerkat-recall/meerkat-0.9.0/
+COPY scripts/release/meerkat-notices/ /usr/share/licenses/meerkat-recall/meerkat-0.9.10/
 COPY scripts/release/provision-fastembed /usr/share/meerkat-recall/provision-fastembed
 COPY scripts/release/ARTIFACT_README.md /usr/share/meerkat-recall/README.md
 COPY scripts/release/README.md scripts/release/DARWIN_BUILDER.md /usr/share/meerkat-recall/scripts/release/

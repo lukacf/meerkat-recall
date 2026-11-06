@@ -90,9 +90,7 @@ impl ApiConfig {
                 .ok()
                 .map(PathBuf::from),
             policy_registry: env::var("ELEPHANT_POLICY_REGISTRY").ok(),
-            strict_mode: env::var("ELEPHANT_STRICT_MODE")
-                .map(|s| s == "true" || s == "1")
-                .unwrap_or(false),
+            strict_mode: env::var("ELEPHANT_STRICT_MODE").is_ok_and(|s| s == "true" || s == "1"),
         })
     }
 

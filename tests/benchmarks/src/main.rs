@@ -684,14 +684,11 @@ fn include_llm_qa_in_all() -> bool {
 
 fn transcript_inputs_available_under(home: &Path) -> bool {
     collect_direct_paths(&home.join(".codex").join("sessions"), "json")
-        .map(|paths| !paths.is_empty())
-        .unwrap_or(false)
+        .is_ok_and(|paths| !paths.is_empty())
         || collect_direct_paths(&home.join(".codex").join("archived_sessions"), "jsonl")
-            .map(|paths| !paths.is_empty())
-            .unwrap_or(false)
+            .is_ok_and(|paths| !paths.is_empty())
         || collect_claude_project_paths(&home.join(".claude").join("projects"))
-            .map(|paths| !paths.is_empty())
-            .unwrap_or(false)
+            .is_ok_and(|paths| !paths.is_empty())
 }
 
 fn local_transcript_inputs_available() -> bool {

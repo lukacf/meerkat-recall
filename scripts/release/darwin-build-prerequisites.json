@@ -4,17 +4,17 @@
   "cargo_metadata_executed": false,
   "builder_observed": false,
   "source_sha256": {
-    "Cargo.toml": "69b3f802005b09d63a6749aa2828e72bfe5fce18e131235ea4a18421aafc3f82",
-    "Cargo.lock": "5d93e9fdd9005a35c6e5bec38d2a7e7a8c4af358496338f518eee56fd21d511e",
-    "rust-toolchain.toml": "b8cc9f68b8e047df92ff16f576b6886480a61e38900368f71d52115ced6ea2ca",
-    "bin/elephant/Cargo.toml": "0b58a72b5c56187c7d768d83a8ba8d06cd58f3b67d7442a9bf5b397a4a9ee858",
-    "crates/storage/Cargo.toml": "b330e261a07daf438c9daa6f2fc3d0249f574b43de474879c2a4f64cd02e580c",
+    "Cargo.toml": "f39deec1b4a6065a64511c07a8722ee6dbce0e81c379d5136b0bf250e74bb4a9",
+    "Cargo.lock": "a68dcdc137a169d7700aa12d6abdb9117b92f3bd7b8f15219dc4b15119b7897f",
+    "rust-toolchain.toml": "06b37c277bc08dc752d700f5ca66002563052844e9cc68f09dd7d1248d7e6e40",
+    "bin/elephant/Cargo.toml": "46076aac27caee281b7b7dbe2be873aec5a592eccf4c8106a39bd5e6553d33a6",
+    "crates/storage/Cargo.toml": "c1c804ae8b851d419422fef7c5ea103c4bb110b31288ad04f0f1b16c940fc787",
     "crates/embeddings/Cargo.toml": "0666efe1a015e1b5dab911cf9ca7d95fbd011f24b3598918f23f587e88810356",
     "scripts/repo-cargo": "8b2d74ebc81b3ff4c822fc9dd69b2382ca56b09d7d64cc93f2a81d3338f73fdc",
-    "scripts/release/build-native": "319b20d405bbbb3534a462a262065924771293b72f4f769d0b2a3e9217e7185f",
-    "scripts/release/static_ort_receipt.py": "563bc184cbd7f464d659bd9aa0989bc0d563b01750ac0a876abc067b093e8931",
-    "scripts/release/supervise_darwin_build.py": "07167f8af6a9e856578cb590e6b49d46b96aa6e2d2b6785e497d4b317f6efc72",
-    "scripts/release/darwin_bootstrap.py": "456dbf999fd09f37a6dc365bebf28774f2084eaf9b850d843d86ec76f485cfca",
+    "scripts/release/build-native": "11a451ed428a1095852939ebd7b8f7b11fc0ea93611ca13a01d457b9b4bcc40b",
+    "scripts/release/static_ort_receipt.py": "1036d2da8fd49d8ad0908aafd87ea230ced621b65fd8fad03612ce91e7e94bcd",
+    "scripts/release/supervise_darwin_build.py": "29f600c94660658480b607ef1f4b6e3f9f6c929f010e64e803ec42a7150d885e",
+    "scripts/release/darwin_bootstrap.py": "1a806e1925719cdbb45c842cb8c624f80f9a7974efcc19b3781e31a7af60fc05",
     "scripts/release/darwin_build_process.py": "103010c45487c8b46bb86bb0e7d69641fc7626f8c104aad95c191784851cf2dc"
   },
   "reviewed_locked_packages": {
@@ -50,10 +50,6 @@
       "version": "1.11.1+lz4-1.10.0",
       "cargo_checksum": "6bd8c0d6c6ed0cd30b3652886bb8711dc4bb01d637a68105a3d5158039b418e6"
     },
-    "lzma-sys": {
-      "version": "0.1.20",
-      "cargo_checksum": "5fda04ab3764e6cde78b9974eec4f779acaba7c4e84b36eca3cf77c581b85d27"
-    },
     "native-tls": {
       "version": "0.2.18",
       "cargo_checksum": "465500e14ea162429d264d44189adc38b199b62b1c21eea9f69e4b73cb03bbf2"
@@ -75,8 +71,8 @@
       "cargo_checksum": "25b82a18c7fa4b57206784a1a31e7b942ae1d3e24493e0c733019a409b2b4bea"
     },
     "zstd-sys": {
-      "version": "2.0.16+zstd.1.5.7",
-      "cargo_checksum": "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+      "version": "2.1.2+zstd.1.5.7",
+      "cargo_checksum": "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
     }
   },
   "cached_dependency_source_sha256": {
@@ -94,8 +90,6 @@
     "libz-sys/build.rs": "f45e6fb4838dc8cad1611ff1f1c2dde3b5d39fe33afb0f131448995fe9aa0dd5",
     "lz4-sys/Cargo.toml": "1acf81d8bef849aa6c9b814dba8063465f945ac600d32f31d56685ea90678be6",
     "lz4-sys/build.rs": "1592aae45eff1403059337a9e81eedd5e7d48114b4e296936db011441cf90382",
-    "lzma-sys/Cargo.toml": "218151aecd8cf5073863c32a5ac2382d2d69cdfbea5f92b7bc08441016ea608c",
-    "lzma-sys/build.rs": "052d600babd2f95d9549f2b846e6dcf1e39b1c15d4fa6a293797ce1c85199e24",
     "native-tls/Cargo.toml": "3cdcd2f06ca3cd71aac96d88f7048ce1dbd72440b5a76edc528054cdbb1db6dc",
     "native-tls/build.rs": "cced9508b412b57c2a53478cd8dcf9ef39a945bab314e85e825a0f3adda22f14",
     "onig_sys/Cargo.toml": "7915b8ec54838f11c7c66d26dfebe3d106e1ce5d8032690a45a5efe909062b85",
@@ -108,8 +102,8 @@
     "ring/build.rs": "9d1928ffb1d8e15766c1c1b9ead73e4b81a21703dd25f7c27b87842a2e6e9cee",
     "surrealdb-librocksdb-sys/Cargo.toml": "545ac957aa097c0070d373603a005965db7578bb1863d663ed8bca8b8c4a9933",
     "surrealdb-librocksdb-sys/build.rs": "ffa2814f774231384f8c348606a51af11e927e26c88dc53e8c430a90dfd5cb88",
-    "zstd-sys/Cargo.toml": "3f400eeb43f176bc78c2ec01d56125c1ccfea814f7c7ff81199573bdbd8d1f1a",
-    "zstd-sys/build.rs": "d92ade96b5f7c04496b1e928c564fcf52bb7d59439f56262407da77c5628458d"
+    "zstd-sys/Cargo.toml": "c7847f90b732a4a86edd51c87d4847f020e2689d26f8ea01aadd19d2b17f9569",
+    "zstd-sys/build.rs": "ff97fca52b72ba76c2c71f0d4ca3475d5fa746e184e7d01c6085f9efee360171"
   },
   "selected_recipe": {
     "target": "aarch64-apple-darwin",
@@ -120,7 +114,7 @@
       "fastembed"
     ],
     "profile": "deploy",
-    "rust": "1.94.0",
+    "rust": "1.97.0",
     "python": "3.12.12"
   },
   "onnx_download": {
@@ -129,7 +123,7 @@
     "sha256": "612739f75438dc0a075461e1fb454226b4a1eb175e60a7271ba966bbbb972cd4"
   },
   "not_installed_or_downloaded": [
-    "Rust1.94.0ARM64",
+    "Rust1.97.0ARM64",
     "Python3.12.12ARM64",
     "nativeONNX",
     "AppleCLT"

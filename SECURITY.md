@@ -51,18 +51,21 @@ review as well: names, household data, incident narratives and private project
 paths are often not credentials and are not detected by a secret scanner.
 Source archive exclusions do not hide files from Git history or GitHub PRs.
 
-## Tracked upstream maintenance exception
+## Upstream parser maintenance
 
-The pinned Meerkat 0.9.0 SDK uses `meerkat-skills` → `serde_yaml` →
-`unsafe-libyaml` 0.2.11 to parse and serialize skill frontmatter.
-[RUSTSEC-2024-0449](https://rustsec.org/advisories/RUSTSEC-2024-0449.html)
-classifies `unsafe-libyaml` as unmaintained and lists no patched version. The
-security audit permits this one advisory while that SDK remains pinned;
-this does not establish memory safety or suppress other vulnerability advisories.
+The pinned Meerkat 0.9.10 SDK uses `serde-saphyr` for skill frontmatter. The
+current lockfile no longer includes `serde_yaml` or `unsafe-libyaml`, and the
+previous `RUSTSEC-2024-0449` maintenance exception has been removed. Published
+Recall 0.9.1 archives retain their original dependency graph and audit scope.
 
-The Meerkat owner confirms that its 0.9 SDK also retains this dependency chain;
-the version upgrade alone will not resolve this maintenance advisory. The Recall
-release owner must re-evaluate this exception on SDK upgrades and remove it when
-Meerkat adopts a maintained safe Rust parser. Replacing the parser inside the
-pinned SDK requires a separate compatibility change; a lockfile upgrade cannot
-remove it.
+## Wasm timer maintenance
+
+`RUSTSEC-2026-0441` reports that `pin-utils` is unmaintained, without a specific
+vulnerability or patched version. The dependency is retained by SurrealDB's
+Wasm-only `wasmtimer` 0.2.1 integration, where `Interval` and `Timeout` use its
+pin-projection macros. Native builds use Tokio timers. Even `wasmtimer` 0.4.3
+retains this dependency, so upgrading it does not remove the maintenance issue.
+
+The audit exception is limited to this advisory. Revisit it when the upstream
+timer removes `pin-utils` or another advisory changes the security assessment.
+Replacing the pin-projection code requires separate Wasm validation.

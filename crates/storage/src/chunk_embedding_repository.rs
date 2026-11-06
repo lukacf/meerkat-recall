@@ -750,7 +750,7 @@ impl NodeEmbeddingRepository {
         }
 
         for (idx, (node_id, (embedding, embedding_id, vector_norm))) in
-            node_ids.iter().zip(prepared.into_iter()).enumerate()
+            node_ids.iter().zip(prepared).enumerate()
         {
             let prefix = format!("embedding_{idx}");
             let node_id_key = format!("node_id_{idx}");

@@ -95,6 +95,10 @@ impl IdentitySignals {
     /// Multiple signals of the same type provide diminishing returns via averaging,
     /// but multiple identity keys boost confidence toward 1.0 for auto-merge eligibility.
     #[must_use]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "Preserve existing confidence rounding and auto-merge thresholds."
+    )]
     pub fn compute_confidence(&self) -> f64 {
         let mut score = 0.0;
         let mut weight = 0.0;

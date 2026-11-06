@@ -2761,6 +2761,7 @@ impl AgentLlmClient for AnthropicLlmAdapter {
                     LlmEvent::Done { outcome } => match outcome {
                         LlmDoneOutcome::Success {
                             stop_reason: reason,
+                            ..
                         } => {
                             stop_reason = reason;
                         }
@@ -2853,9 +2854,11 @@ impl Extractor for AgenticExtractor {
         // mutation is rejected until a generated surface authority is bound).
         // The extractor drives the router as a standalone host, so bind an
         // ephemeral DSL authority — the same path meerkat's fixtures use.
-        let mut router = McpRouter::new_with_surface_handle(Arc::new(
-            meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
-        ));
+        // Preserve the existing host profile; this router connects only to HTTP.
+        let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
+            Arc::new(meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral()),
+            meerkat::McpStdioLaunchProfile::trusted_host(),
+        );
         let mut headers = mcp_headers_from_env();
         headers.insert("X-Space-Id".into(), ctx.space_id.clone());
         let server_config = McpServerConfig::streamable_http(

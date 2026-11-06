@@ -26,7 +26,7 @@ jobs:
           df -h / /mnt
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.97.0
       - name: Resolve repository Cargo paths
         id: cargo-paths
         run: |

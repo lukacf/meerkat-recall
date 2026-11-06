@@ -172,7 +172,7 @@ async fn spy_dispatch(
     headers: HeaderMap,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    let body = body.map(|Json(value)| value).unwrap_or(Value::Null);
+    let body = body.map_or(Value::Null, |Json(value)| value);
     let credential = headers
         .get("authorization")
         .or_else(|| headers.get("x-api-key"))

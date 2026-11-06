@@ -815,6 +815,12 @@ policy belongs to Recall's governed build seam; it does not change defaults for
 other Meerkat consumers or add a public configuration field. Direct single-turn
 model clients do not compose the SDK agent's hosted-search defaults.
 
+Entity disambiguation discards buffered candidate text and tool calls when the
+provider ends with `Refusal`, `ContentFilter` or `ContextWindowExceeded`, even
+when the SDK reports a successfully terminated stream. These outcomes cannot
+select an entity or dispatch the buffered tools; ordinary `EndTurn` and `ToolUse`
+handling remains unchanged.
+
 Multimodal rendering retains the exact managed asset row returned by the payload
 read, decoded-byte hash and length, attachment identity and complete policy
 partition. Source-backed input uses the existing immutable render-input selector

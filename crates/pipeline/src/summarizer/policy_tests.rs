@@ -53,9 +53,7 @@ impl LlmClient for ResponseClient {
                 meta: None,
             }),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: self.reason,
-                },
+                outcome: LlmDoneOutcome::success(self.reason),
             }),
         ]))
     }

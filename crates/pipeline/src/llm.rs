@@ -97,7 +97,7 @@ async fn collect_prompt_response(
                 usage = total.into_inner();
             }
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::Success { stop_reason, .. },
             } => {
                 return Ok(LlmRunResult {
                     text: content,
@@ -150,9 +150,7 @@ mod tests {
             }),
             Ok(usage_snapshot(5)),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             }),
         ]))
         .await?;

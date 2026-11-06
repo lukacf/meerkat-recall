@@ -1,18 +1,18 @@
 {
   "format": "meerkat-recall-container-inputs/v1",
-  "resolved_at": "2026-10-06T23:31:24.235658+00:00",
+  "resolved_at": "2026-11-05T16:09:48.562808+00:00",
   "registry": "https://registry-1.docker.io/v2/",
   "platform": "linux/amd64",
   "builder": {
     "repository": "library/rust",
-    "tag": "1.94.0-bookworm",
-    "index_digest": "sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f",
-    "manifest_digest": "sha256:4673f78db88b71f09d5451bbc404734807918161241215ba0a50bbbe9b448117",
-    "image": "library/rust@sha256:4673f78db88b71f09d5451bbc404734807918161241215ba0a50bbbe9b448117",
-    "config_digest": "sha256:fb7a58d0482a24e269ba85636ce46cb06aaaef3aea0e868154ed0ae7c18fa379",
+    "tag": "1.97.0-bookworm",
+    "index_digest": "sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073",
+    "manifest_digest": "sha256:b5a086f64ffecaa4e283063184770107915756739598173e1f5712d6b34b84d0",
+    "image": "library/rust@sha256:b5a086f64ffecaa4e283063184770107915756739598173e1f5712d6b34b84d0",
+    "config_digest": "sha256:7ea53b11a01d2d52b4af8fa073cd76ecbaf7dc385b88cc9d0ce8205a7c941ff1",
     "os": "linux",
     "architecture": "amd64",
-    "layer_bytes": 561475152
+    "layer_bytes": 566482973
   },
   "runtime": {
     "repository": "library/debian",

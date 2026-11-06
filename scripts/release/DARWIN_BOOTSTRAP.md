@@ -9,7 +9,7 @@ also retains the entry monotonic/wall sample through preparation; late phases
 consume the original remaining time, including fifteen seconds for cleanup.
 
 The normal build CLI continues to require the final detached source and pinned
-task-local Python 3.12.12/Rust 1.94.0. Bootstrap instead uses an existing trusted
+task-local Python 3.12.12/Rust 1.97.0. Bootstrap instead uses an existing trusted
 native ARM64 Python 3.11 or newer with its actual canonical path and SHA256. The
 bootstrap helper closure is `supervise_darwin_build.py`, `darwin_bootstrap.py`,
 `darwin_build_process.py`, `darwin_build_child.py`, `artifact.py`, and
@@ -65,7 +65,7 @@ lane or starting a process. Execution samples the original resource budget
 before every acquisition command and throughout each owned group at five-second
 intervals. Manager commands use fixed task-local destinations, `uv --no-config
 python install --no-bin cpython-3.12.12-macos-aarch64-none` and `rustup toolchain
-install 1.94.0-aarch64-apple-darwin --profile minimal --no-self-update`. They retain
+install 1.97.0-aarch64-apple-darwin --profile minimal --no-self-update`. They retain
 manager version/install logs and actual resulting interpreter/compiler hashes.
 These are observed installed identities; a version label does not independently
 prove a downloaded archive checksum. The manager origin receipts and retained

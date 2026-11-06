@@ -839,13 +839,12 @@ impl EmbeddedStore {
 
 fn snapshot_import_options_from_env() -> SnapshotImportOptions {
     let rebuild_vector_indexes = std::env::var("ELEPHANT_DB_REBUILD_VECTOR_INDEXES_ON_LOAD")
-        .map(|value| {
+        .map_or(true, |value| {
             !matches!(
                 value.as_str(),
                 "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
             )
-        })
-        .unwrap_or(true);
+        });
     SnapshotImportOptions {
         rebuild_vector_indexes,
     }

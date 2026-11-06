@@ -468,7 +468,7 @@ impl ToolHandler for UnifiedSearchHandler {
                             (lexical + semantic, entity)
                         })
                         .collect();
-                    ranked.sort_by(|lhs, rhs| rhs.0.cmp(&lhs.0));
+                    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
                     let mut items: Vec<Entity> =
                         ranked.into_iter().map(|(_, entity)| entity).collect();
                     items.truncate(input.limit);

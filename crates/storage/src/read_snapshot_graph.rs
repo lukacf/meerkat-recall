@@ -132,15 +132,14 @@ impl ReadEligibility {
                             return Ok(false);
                         }
                     }
-                    CanonicalRecord::Assertion(assertion) => {
+                    CanonicalRecord::Assertion(assertion)
                         if !(assertion.evidence.start == 0 && assertion.evidence.end == 0)
                             && self
                                 .evidence(&root.space_id, &assertion.evidence, authorize)
                                 .await?
-                                .is_none()
-                        {
-                            return Ok(false);
-                        }
+                                .is_none() =>
+                    {
+                        return Ok(false);
                     }
                     _ => (),
                 }

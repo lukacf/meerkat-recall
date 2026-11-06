@@ -61,18 +61,18 @@ edition = "2021"
 authors = ["Elephant Team"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lukacf/meerkat-recall"
-rust-version = "1.94.0"
+rust-version = "1.97.0"
 
 [workspace.dependencies]
 # Meerkat - keep the facade and direct family dependencies on one release.
-meerkat = { version = "=0.9.0", default-features = false, features = ["anthropic", "openai", "gemini", "memory-store", "mcp", "session-compaction", "comms"] }
-meerkat-core = { version = "=0.9.0" }
-meerkat-mcp = { version = "=0.9.0" }
-meerkat-runtime = { version = "=0.9.0" }
-meerkat-skills = { version = "=0.9.0", default-features = false }
+meerkat = { version = "=0.9.10", default-features = false, features = ["anthropic", "openai", "gemini", "memory-store", "mcp", "session-compaction", "comms"] }
+meerkat-core = { version = "=0.9.10" }
+meerkat-mcp = { version = "=0.9.10" }
+meerkat-runtime = { version = "=0.9.10" }
+meerkat-skills = { version = "=0.9.10", default-features = false }
 # Test-only: checks current default capabilities and historical model resolution.
 # Version-unified with the meerkat facade above.
-meerkat-models = { version = "=0.9.0" }
+meerkat-models = { version = "=0.9.10" }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
@@ -155,6 +155,8 @@ expect_used = "warn"
 panic = "warn"
 todo = "warn"
 unimplemented = "warn"
+# Keep timeout literals in the same units as configuration and runtime contracts.
+duration_suboptimal_units = "allow"
 
 [profile.dev]
 opt-level = 0

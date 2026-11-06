@@ -6,7 +6,7 @@ repo_root="$(cd "${script_dir}/.." && git rev-parse --show-toplevel)"
 git_common_dir="$(cd "${repo_root}" && git rev-parse --path-format=absolute --git-common-dir)"
 worktree_root="$(cd "${repo_root}" && git rev-parse --path-format=absolute --show-toplevel)"
 mode="${ELEPHANT_HOOK_RUNNER_MODE:-auto}"
-image_tag="${ELEPHANT_HOOK_DOCKER_IMAGE:-elephant-rust-hooks:1.94-noble-r2}"
+image_tag="${ELEPHANT_HOOK_DOCKER_IMAGE:-elephant-rust-hooks:1.97-noble-r2}"
 subcommand="${1:-}"
 
 if [[ -z "${RUST_LANE_ID:-}" ]]; then

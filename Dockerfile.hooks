@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     python3-pip \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-       sh -s -- -y --profile minimal --default-toolchain 1.94.0 \
+       sh -s -- -y --profile minimal --default-toolchain 1.97.0 \
     && rustup component add rustfmt clippy \
     && cargo install cargo-deny --locked \
     && cargo install cargo-audit --locked \

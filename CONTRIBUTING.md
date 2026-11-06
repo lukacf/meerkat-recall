@@ -4,7 +4,7 @@ Thanks for helping make Meerkat Recall better.
 
 ## Development Setup
 
-Install Rust 1.94 or newer. Docker Compose is optional for the persistent local
+Install Rust 1.97 or newer. Docker Compose is optional for the persistent local
 stack; the in-memory demo needs no database server or model credentials.
 
 Use the repository Cargo wrapper so local builds do not share lock state with

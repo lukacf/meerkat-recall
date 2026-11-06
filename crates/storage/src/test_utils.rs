@@ -207,7 +207,7 @@ impl Repository<Entity> for MockEntityRepository {
             .collect::<StorageResult<Vec<_>>>()?;
 
         entities.retain(|e| e.base.space_id == space_id && e.base.deleted_at.is_none());
-        entities.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        entities.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = cursor {
             entities.retain(|e| e.base.id.to_string() > cursor.to_string());
@@ -246,7 +246,7 @@ impl SearchRepository<Entity> for MockEntityRepository {
             entities.retain(|e| e.display_name.to_lowercase().contains(&q));
         }
 
-        entities.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        entities.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = &criteria.cursor {
             let cursor_full = if cursor.contains(':') {
@@ -412,7 +412,7 @@ impl Repository<Rel> for MockRelRepository {
             .collect::<StorageResult<Vec<_>>>()?;
 
         rels.retain(|r| r.base.space_id == space_id && r.base.deleted_at.is_none());
-        rels.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        rels.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = cursor {
             rels.retain(|r| r.base.id.to_string() > cursor.to_string());
@@ -448,7 +448,7 @@ impl SearchRepository<Rel> for MockRelRepository {
             rels.retain(|r| r.rel_type.to_lowercase().contains(&q));
         }
 
-        rels.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        rels.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = &criteria.cursor {
             let cursor_full = if cursor.contains(':') {
@@ -599,7 +599,7 @@ impl Repository<Doc> for MockDocRepository {
             .collect::<StorageResult<Vec<_>>>()?;
 
         docs.retain(|d| d.base.space_id == space_id && d.base.deleted_at.is_none());
-        docs.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        docs.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = cursor {
             docs.retain(|d| d.base.id.to_string() > cursor.to_string());
@@ -635,7 +635,7 @@ impl SearchRepository<Doc> for MockDocRepository {
             docs.retain(|d| d.title.to_lowercase().contains(&q));
         }
 
-        docs.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        docs.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = &criteria.cursor {
             let cursor_full = if cursor.contains(':') {
@@ -758,7 +758,7 @@ impl Repository<WorkItem> for MockWorkItemRepository {
             .collect::<StorageResult<Vec<_>>>()?;
 
         items.retain(|i| i.base.space_id == space_id && i.base.deleted_at.is_none());
-        items.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        items.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = cursor {
             items.retain(|i| i.base.id.to_string() > cursor.to_string());
@@ -790,7 +790,7 @@ impl SearchRepository<WorkItem> for MockWorkItemRepository {
             items.retain(|i| i.base.deleted_at.is_none());
         }
 
-        items.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        items.sort_by_key(|a| a.base.id.to_string());
 
         let total = items.len();
         if total > criteria.limit {
@@ -965,7 +965,7 @@ impl Repository<Source> for MockSourceRepository {
             .collect::<StorageResult<Vec<_>>>()?;
 
         sources.retain(|s| s.base.space_id == space_id && s.base.deleted_at.is_none());
-        sources.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        sources.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = cursor {
             sources.retain(|s| s.base.id.to_string() > cursor.to_string());
@@ -1011,7 +1011,7 @@ impl SearchRepository<Source> for MockSourceRepository {
             });
         }
 
-        sources.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        sources.sort_by_key(|a| a.base.id.to_string());
 
         let total = sources.len();
         if total > criteria.limit {
@@ -1093,7 +1093,7 @@ impl MockSystemEventRepository {
             .filter(|e| e.base.space_id == space_id && e.base.deleted_at.is_none())
             .filter(|e| e.seq > after_seq)
             .collect::<Vec<_>>();
-        events.sort_by(|a, b| a.seq.cmp(&b.seq));
+        events.sort_by_key(|a| a.seq);
         events.truncate(limit);
         Ok(events)
     }
@@ -1112,7 +1112,7 @@ impl MockSystemEventRepository {
             .filter(|e| e.base.space_id == space_id && e.base.deleted_at.is_none())
             .filter(|e| e.seq < before_seq)
             .collect::<Vec<_>>();
-        events.sort_by(|a, b| b.seq.cmp(&a.seq));
+        events.sort_by_key(|a| std::cmp::Reverse(a.seq));
         events.truncate(limit);
         Ok(events)
     }
@@ -1129,7 +1129,7 @@ impl MockSystemEventRepository {
             .into_iter()
             .filter(|e| e.base.space_id == space_id && e.base.deleted_at.is_none())
             .collect::<Vec<_>>();
-        events.sort_by(|a, b| b.seq.cmp(&a.seq));
+        events.sort_by_key(|a| std::cmp::Reverse(a.seq));
         events.truncate(limit);
         Ok(events)
     }
@@ -1235,7 +1235,7 @@ impl Repository<SystemEvent> for MockSystemEventRepository {
             .into_iter()
             .filter(|e| e.base.space_id == space_id && e.base.deleted_at.is_none())
             .collect::<Vec<_>>();
-        events.sort_by(|a, b| a.seq.cmp(&b.seq));
+        events.sort_by_key(|a| a.seq);
 
         if let Some(cursor) = cursor {
             events.retain(|e| e.base.id.to_string() > cursor.to_string());
@@ -1284,7 +1284,7 @@ impl SearchRepository<SystemEvent> for MockSystemEventRepository {
             });
         }
 
-        events.sort_by(|a, b| a.seq.cmp(&b.seq));
+        events.sort_by_key(|a| a.seq);
 
         let total = events.len();
         if total > criteria.limit {
@@ -1452,7 +1452,7 @@ impl Repository<Event> for MockEventRepository {
             .into_iter()
             .filter(|event| event.base.space_id == space_id && event.base.deleted_at.is_none())
             .collect::<Vec<_>>();
-        events.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        events.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = cursor {
             events.retain(|event| event.base.id.to_string() > cursor.to_string());
@@ -1511,7 +1511,7 @@ impl SearchRepository<Event> for MockEventRepository {
             events.retain(|event| event.base.id.to_string() > cursor_full);
         }
 
-        events.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        events.sort_by_key(|a| a.base.id.to_string());
 
         let total = events.len();
         let has_more = events.len() > criteria.limit;
@@ -1659,7 +1659,7 @@ impl Repository<Assertion> for MockAssertionRepository {
             .filter(|a| a.base.space_id == space_id && a.base.deleted_at.is_none())
             .collect::<Vec<_>>();
 
-        assertions.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        assertions.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = cursor {
             let cursor_s = cursor.to_string();
@@ -1797,7 +1797,7 @@ impl Repository<PredicateRegistry> for MockPredicateRegistryRepository {
             .filter(|p| p.base.space_id == space_id && p.base.deleted_at.is_none())
             .collect::<Vec<_>>();
 
-        preds.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        preds.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = cursor {
             let cursor_s = cursor.to_string();
@@ -1935,7 +1935,7 @@ impl Repository<PredicateAlias> for MockPredicateAliasRepository {
             .filter(|a| a.base.space_id == space_id && a.base.deleted_at.is_none())
             .collect::<Vec<_>>();
 
-        aliases.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        aliases.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = cursor {
             let cursor_s = cursor.to_string();
@@ -2065,7 +2065,7 @@ impl Repository<AuditLog> for MockAuditLogRepository {
             .filter(|l| l.base.space_id == space_id && l.base.deleted_at.is_none())
             .collect::<Vec<_>>();
 
-        logs.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        logs.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = cursor {
             let cursor_s = cursor.to_string();
@@ -2248,7 +2248,7 @@ impl Repository<IdentityCandidate> for MockIdentityCandidateRepository {
             .filter(|c| c.base.space_id == space_id && c.base.deleted_at.is_none())
             .collect::<Vec<_>>();
 
-        candidates.sort_by(|a, b| a.base.id.to_string().cmp(&b.base.id.to_string()));
+        candidates.sort_by_key(|a| a.base.id.to_string());
 
         if let Some(cursor) = cursor {
             let cursor_s = cursor.to_string();

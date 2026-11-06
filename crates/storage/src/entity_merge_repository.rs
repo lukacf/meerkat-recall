@@ -1161,11 +1161,9 @@ fn rewrite_core_identity(
             changed |= link(&mut row.entity_a, merged, survivor);
             changed |= link(&mut row.entity_b, merged, survivor);
         }
-        CanonicalRecord::IdMap(row) => {
-            if merged.contains(&row.record) {
-                row.record = survivor.clone();
-                changed = true;
-            }
+        CanonicalRecord::IdMap(row) if merged.contains(&row.record) => {
+            row.record = survivor.clone();
+            changed = true;
         }
         _ => {}
     }

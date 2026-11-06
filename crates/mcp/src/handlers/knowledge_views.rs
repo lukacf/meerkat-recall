@@ -1182,7 +1182,7 @@ impl MaterializeKnowledgeViewsHandler {
             .buffer_unordered(input.concurrency)
             .collect::<Vec<_>>()
             .await;
-        results.sort_by(|(left, _), (right, _)| left.to_string().cmp(&right.to_string()));
+        results.sort_by_key(|(id, _)| id.to_string());
         for (record_id, result) in results {
             match result {
                 Ok(compiled) => {
@@ -1266,7 +1266,7 @@ impl MaterializeKnowledgeViewsHandler {
             .buffer_unordered(input.concurrency)
             .collect::<Vec<_>>()
             .await;
-        results.sort_by(|(left, _), (right, _)| left.to_string().cmp(&right.to_string()));
+        results.sort_by_key(|(id, _)| id.to_string());
         for (record_id, result) in results {
             match result {
                 Ok(compiled) => {
@@ -1347,7 +1347,7 @@ impl MaterializeKnowledgeViewsHandler {
             .buffer_unordered(input.concurrency)
             .collect::<Vec<_>>()
             .await;
-        results.sort_by(|(left, _), (right, _)| left.to_string().cmp(&right.to_string()));
+        results.sort_by_key(|(id, _)| id.to_string());
         for (record_id, result) in results {
             match result {
                 Ok(compiled) => {

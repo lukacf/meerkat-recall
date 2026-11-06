@@ -54,7 +54,7 @@ def cache_contract(root: Path) -> dict:
     compiler_recipe = dockerfile.split('FROM ${BUILDER_IMAGE} AS builder\n', 1)[1].split('COPY Cargo.toml Cargo.lock', 1)[0]
     compiler_recipe = re.sub(r'ARG SOURCE_[A-Z0-9_]+=.*\n|ARG CARGO_BUILD_JOBS=.*\n|ARG RECALL_BUILD_CACHE_ID=.*\n', '', compiler_recipe)
     profiles = tomllib.loads((root / 'Cargo.toml').read_text())['profile']
-    return {'format': 'recall-build-cache-compatibility/v1', 'rustc': '1.94.0',
+    return {'format': 'recall-build-cache-compatibility/v1', 'rustc': '1.97.0',
             'target': TARGET, 'profile': 'deploy', 'features': artifact.FEATURES,
             'default_features': True, 'package': 'meerkat-recall-bin',
             'inputs': load_inputs(root), 'native_static_ort': artifact.digest(root / 'scripts/release/linux-static-ort.lock.json'),
@@ -67,11 +67,11 @@ def cache_contract(root: Path) -> dict:
 
 def cache_identity(root: Path, identity: dict) -> str:
     """Reuse retries of one reviewed build, isolating other checkout/feature graphs."""
-    graph = cache_contract(root) if resource_mode() == 'current-capacity' else {**identity, "checkout": str(root.resolve()), "rustc": "1.94.0",
+    graph = cache_contract(root) if resource_mode() == 'current-capacity' else {**identity, "checkout": str(root.resolve()), "rustc": "1.97.0",
              "target": TARGET, "profile": "deploy", "features": artifact.FEATURES,
              "default_features": True}
     digest = hashlib.sha256(json.dumps(graph, sort_keys=True).encode()).hexdigest()
-    return "recall-bookworm-rust194-" + digest
+    return "recall-bookworm-rust197-" + digest
 
 
 class CurrentCapacity:
@@ -300,7 +300,7 @@ def native_receipt(root: Path, identity: dict, image: dict, provenance: dict,
     version = artifact.tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
     if provenance.get("version") != version or provenance.get("version_output", "").split()[-1:] != [version]:
         raise ValueError("container executable version differs from reviewed workspace")
-    if not re.match(r"rustc 1\.94\.0(?:\s|$)", provenance.get("rustc", "")):
+    if not re.match(r"rustc 1\.97\.0(?:\s|$)", provenance.get("rustc", "")):
         raise ValueError("container compiler differs from the pinned Rust toolchain")
     artifact.validate_build(provenance, TARGET)
     actual_elf = artifact.inspect_elf(binary)
@@ -371,7 +371,7 @@ def build_image(root: Path, tag: str, output: Path, *, cache_id: str | None = No
     Cargo and the native-input fingerprints still determine required rebuilds.
     """
     if cache_id is not None and (not isinstance(cache_id, str) or
-                                 not re.fullmatch(r"recall-bookworm-rust194-[a-f0-9]{64}", cache_id)):
+                                 not re.fullmatch(r"recall-bookworm-rust197-[a-f0-9]{64}", cache_id)):
         raise ValueError("invalid reviewed Recall BuildKit cache identity")
     if cache_id is not None and resource_mode() == 'current-capacity':
         evidence = json.loads(cache_evidence.read_text()) if cache_evidence else {}
@@ -387,7 +387,7 @@ def build_image(root: Path, tag: str, output: Path, *, cache_id: str | None = No
                 or retained_build['features'] != artifact.FEATURES
                 or retained_build['build_profile'] != 'deploy'
                 or retained_build['default_features'] is not True
-                or not retained_build['rustc'].startswith('rustc 1.94.0 ')):
+                or not retained_build['rustc'].startswith('rustc 1.97.0 ')):
             raise ValueError('retained cache target/profile/compiler identity differs')
         packages = retained_build['builder_packages']
         package_inventory(packages, {'libc6', 'gcc', 'g++', 'clang', 'cmake', 'libssl-dev', 'liblzma-dev'})

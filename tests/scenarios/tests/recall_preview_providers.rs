@@ -99,9 +99,7 @@ async fn refusal_oracle_distinguishes_sdk_terminal_error_success_and_empty_strea
     for events in [
         Vec::new(),
         vec![Ok(LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: StopReason::EndTurn,
-            },
+            outcome: LlmDoneOutcome::success(StopReason::EndTurn),
         })],
         vec![
             Ok(LlmEvent::TextDelta {

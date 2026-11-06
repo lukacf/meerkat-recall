@@ -496,8 +496,8 @@ class Offline(unittest.TestCase):
         (task / "cargo-bootstrap").mkdir()
         (locations["libclang_directory"] / "libclang.dylib").write_bytes(b"reviewed libclang")
         python = task / "tools/python/bin/python3.12"
-        tools = {"rustc": task / "rustup/toolchains/1.94.0-aarch64-apple-darwin/bin/rustc",
-                 "cargo": task / "rustup/toolchains/1.94.0-aarch64-apple-darwin/bin/cargo",
+        tools = {"rustc": task / "rustup/toolchains/1.97.0-aarch64-apple-darwin/bin/rustc",
+                 "cargo": task / "rustup/toolchains/1.97.0-aarch64-apple-darwin/bin/cargo",
                  "clang": self.root / "CLT/usr/bin/clang", "clang++": self.root / "CLT/usr/bin/clang++"}
         for name,path in {**tools, "python": python}.items():
             path.parent.mkdir(parents=True, exist_ok=True)

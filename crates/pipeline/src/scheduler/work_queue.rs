@@ -368,7 +368,7 @@ impl WorkQueue {
             .filter(|item| item.run_after.map_or(true, |run_after| run_after <= *now))
             .collect();
 
-        runnable.sort_by(|a, b| b.priority.cmp(&a.priority));
+        runnable.sort_by_key(|item| std::cmp::Reverse(item.priority));
 
         Ok(runnable)
     }

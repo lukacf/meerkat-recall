@@ -21,7 +21,7 @@ FIELDS = {'format', 'execution_authorized', 'operation', 'target', 'cargo_jobs',
 PATHS = {'tmp_directory', 'receipt_directory', 'uv_cache', 'python_install',
          'rustup_home', 'cargo_bootstrap', 'acquisition_directory'}
 PYTHON_REQUEST = 'cpython-3.12.12-macos-aarch64-none'
-RUST_REQUEST = '1.94.0-aarch64-apple-darwin'
+RUST_REQUEST = '1.97.0-aarch64-apple-darwin'
 BUNDLE_BYTES = 128 * 1024**2
 
 
@@ -227,7 +227,7 @@ def run(api, supervisor):
         rustc = api.canonical(toolchain / 'rustc', False)
         cargo = api.canonical(toolchain / 'cargo', False)
         rust_log = supervisor.command('rustc-identity', [rustc, '-vV'], 30)
-        api.require('release: 1.94.0\n' in rust_log.read_text()
+        api.require('release: 1.97.0\n' in rust_log.read_text()
                     and 'host: aarch64-apple-darwin\n' in rust_log.read_text(), 'installed Rust target/version differs')
         supervisor.command('cargo-identity', [cargo, '-V'], 30)
         for name, executable in [('python', python), ('rustc', rustc), ('cargo', cargo)]:

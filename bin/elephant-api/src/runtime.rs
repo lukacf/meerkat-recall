@@ -30,7 +30,7 @@ use recipe::ManagedWorkerRecipe;
 const CONFIG_DIR: &str = ".elephant";
 const CONFIG_FILE: &str = "elephant_config.toml";
 const DEFAULT_SNAPSHOT_PATH: &str = ".elephant/state.snapshot";
-// The pinned Meerkat 0.9.0 catalog resolves this model and its text/image
+// The pinned Meerkat 0.9.10 catalog resolves this model and its text/image
 // capabilities. Its OpenAI client uses Responses, required for GPT-6.1 tools.
 // crates/pipeline/tests/model_catalog_pin.rs checks these default capabilities.
 // Approved per-space profiles remain authoritative for actual model calls.
@@ -1528,8 +1528,7 @@ impl ElephantConfig {
             runtime: RuntimeSection {
                 mode,
                 ingest_enabled: env::var("PIPELINE_DISABLED")
-                    .map(|v| !(v == "true" || v == "1"))
-                    .unwrap_or(true),
+                    .map_or(true, |v| !(v == "true" || v == "1")),
             },
             storage: StorageSection {
                 backend,

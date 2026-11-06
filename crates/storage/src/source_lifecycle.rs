@@ -914,10 +914,10 @@ fn contains_reference(value: &serde_json::Value, removed: &BTreeSet<Uuid>) -> bo
                             removed,
                         );
                     }
-                    _ if crate::canonical_extension::validate_extension_table(&id.tb).is_err() => {
-                        if uuid_from_key(value).is_some_and(|uuid| removed.contains(&uuid)) {
-                            return true;
-                        }
+                    _ if crate::canonical_extension::validate_extension_table(&id.tb).is_err()
+                        && uuid_from_key(value).is_some_and(|uuid| removed.contains(&uuid)) =>
+                    {
+                        return true;
                     }
                     _ => {}
                 }

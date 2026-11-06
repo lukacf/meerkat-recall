@@ -1,27 +1,27 @@
 {
   "format": "meerkat-recall-provider-upstream/v1",
-  "version": "0.9.0",
+  "version": "0.9.10",
   "source_repository": "https://github.com/lukacf/meerkat",
-  "source_commit": "a00bafaf1d862fb41112ff1f30312b350ad05246",
+  "source_commit": "133d11d1bbf16d302740ab999ab7224c45362a3a",
   "license": "MIT OR Apache-2.0",
   "replaces": "provider-http-backport.json (historical Recall 0.1.0 patched dependencies)",
   "packages": [
     {
       "name": "meerkat-llm-core",
-      "version": "0.9.0",
-      "registry_archive_sha256": "5cbeaf3557f99a4d70b23e660c3fcdea2a98c76bed654d592aed13cc8e6b1fe5",
+      "version": "0.9.10",
+      "registry_archive_sha256": "f122256e509b00b74e322f2b8ab0e9f50d23c5f0349755401197378d2a980588",
       "source_path": "crates/meerkat-llm-core"
     },
     {
       "name": "meerkat-openai",
-      "version": "0.9.0",
-      "registry_archive_sha256": "7ddc48536d12edb2055dc23f3b29d57351c324354af3d9ff11ad40e558c1c91d",
+      "version": "0.9.10",
+      "registry_archive_sha256": "ddf21fabd4c0f087cf23ca9543d7e15f90590018a499d6bfdc2d3a0d82bce245",
       "source_path": "crates/meerkat-openai"
     },
     {
       "name": "meerkat-gemini",
-      "version": "0.9.0",
-      "registry_archive_sha256": "91ea561a56c4d48b94ee7655de6505a7972f8bdd03ba3fbe070d9be7371ab3e9",
+      "version": "0.9.10",
+      "registry_archive_sha256": "764d5f0e796687eed09480d286f7ccae3b5b11a16170147a0cc65b737c594231",
       "source_path": "crates/meerkat-gemini"
     }
   ],
@@ -34,13 +34,13 @@
   "license_files": {
     "LICENSE-MIT": {
       "sha256": "b45d1f632f83aeb359da8e2b8716ad72591ec7267a489fdda39989c618d65a0f",
-      "source": "meerkat-0.9.0/LICENSE-MIT",
-      "native_path": "licenses/meerkat-0.9.0/LICENSE-MIT"
+      "source": "meerkat-0.9.10/LICENSE-MIT",
+      "native_path": "licenses/meerkat-0.9.10/LICENSE-MIT"
     },
     "LICENSE-APACHE": {
       "sha256": "3a0ffd02ca79c2a687921b0f5d8094f2f6a7058a4c01775d1351ea6514fcd180",
-      "source": "meerkat-0.9.0/LICENSE-APACHE",
-      "native_path": "licenses/meerkat-0.9.0/LICENSE-APACHE"
+      "source": "meerkat-0.9.10/LICENSE-APACHE",
+      "native_path": "licenses/meerkat-0.9.10/LICENSE-APACHE"
     }
   }
 }

@@ -2106,7 +2106,7 @@ pub async fn execute_embed_chunks<P: EmbeddingProvider>(
 
     // Store embeddings in NodeEmbeddingRepository
     let mut embedded_node_ids = Vec::with_capacity(chunk_nodes.len());
-    for (node, embedding) in chunk_nodes.iter().zip(embeddings.into_iter()) {
+    for (node, embedding) in chunk_nodes.iter().zip(embeddings) {
         let mut base = BaseFields::new(
             node.base.id.clone(),
             node.base.space_id.clone(),

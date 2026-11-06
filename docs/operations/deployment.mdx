@@ -79,7 +79,7 @@ workflow below prepares future candidates; it does not rebuild published assets.
 The **Build release candidates** workflow is started manually for a selected
 commit or ref. It validates the source, then builds native Linux x86-64 and
 macOS ARM64 binaries with the `rocksdb` feature and default Meerkat extraction
-support. Builds use Rust 1.94.0, the repository Cargo wrapper, `--locked`, and the
+support. Builds use Rust 1.97.0, the repository Cargo wrapper, `--locked`, and the
 `deploy` profile. Linux uses Ubuntu 22.04 for compatibility with Debian 12.
 
 Each candidate archive contains `meerkat-recall`, its `elephant` alias, both license texts, and

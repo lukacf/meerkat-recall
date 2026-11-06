@@ -141,7 +141,7 @@ def prepare(allocation):
     require(not (paths["cargo_home"] / "bin").exists(), "repository Cargo home must not override pinned toolchain")
     require(not any((paths["cargo_home"] / name).exists() for name in ("config", "config.toml", "credentials", "credentials.toml")),
             "task Cargo home must not contain ambient configuration or credentials")
-    toolchain = paths["rustup_home"] / "toolchains/1.94.0-aarch64-apple-darwin/bin"
+    toolchain = paths["rustup_home"] / "toolchains/1.97.0-aarch64-apple-darwin/bin"
     python = canonical(allocation["python"], False)
     require(python.is_relative_to(task / "tools") and artifact.digest(python) == allocation["python_sha256"],
             "pinned task-local interpreter differs")
@@ -175,7 +175,7 @@ def prepare(allocation):
     require(not (bootstrap / "bin").exists(), "bootstrap Cargo home must not override pinned toolchain")
     environment = {"HOME": str(home), "PATH": f"{python.parent}:{toolchain}:/usr/bin:/bin:/usr/sbin:/sbin",
         "LANG": "C", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1",
-        "RUSTUP_HOME": str(paths["rustup_home"]), "RUSTUP_TOOLCHAIN": "1.94.0-aarch64-apple-darwin",
+        "RUSTUP_HOME": str(paths["rustup_home"]), "RUSTUP_TOOLCHAIN": "1.97.0-aarch64-apple-darwin",
         "CARGO_HOME": str(bootstrap), "CARGO_BUILD_JOBS": "4", "CARGO_INCREMENTAL": "0",
         "RECALL_BUILD_MIN_FREE_GIB": str((allocation["minimum_free_bytes"] + GIB - 1) // GIB),
         "LZMA_API_STATIC": "1", "TMPDIR": str(paths["tmp_directory"]), "RUST_LANE_ID": lane,
@@ -311,7 +311,7 @@ class Supervisor:
         ):
             self.command(name, command, 30)
         rustc = (p["paths"]["receipt_directory"] / "rustc.log").read_text()
-        require("release: 1.94.0\n" in rustc and "host: aarch64-apple-darwin\n" in rustc,
+        require("release: 1.97.0\n" in rustc and "host: aarch64-apple-darwin\n" in rustc,
                 "actual compiler is not pinned Rust ARM64")
         actual = dict(line.split("=", 1) for line in
                       (p["paths"]["receipt_directory"] / "cargo-env.log").read_text().splitlines())

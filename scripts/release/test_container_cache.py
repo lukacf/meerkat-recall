@@ -12,8 +12,8 @@ import container_artifact as container
 
 class ContainerCacheTests(unittest.TestCase):
     def test_invalid_explicit_cache_refused_before_any_source_or_docker_operation(self):
-        for value in ('', '../cache', 'recall-bookworm-rust194-' + 'a' * 63,
-                      'recall-bookworm-rust194-' + 'A' * 64, 123):
+        for value in ('', '../cache', 'recall-bookworm-rust197-' + 'a' * 63,
+                      'recall-bookworm-rust197-' + 'A' * 64, 123):
             with self.subTest(value=value), mock.patch.object(container.artifact, 'source_identity') as source, \
                     mock.patch.object(container.subprocess, 'Popen') as docker:
                 with self.assertRaisesRegex(ValueError, 'cache identity'):
@@ -79,7 +79,7 @@ class ContainerCacheTests(unittest.TestCase):
         self.build(None)
 
     def test_explicit_cache_keeps_current_source_and_records_actual_build_selection(self):
-        self.build('recall-bookworm-rust194-' + 'a' * 64)
+        self.build('recall-bookworm-rust197-' + 'a' * 64)
 
 
 if __name__ == '__main__':

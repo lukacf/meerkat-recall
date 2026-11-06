@@ -110,7 +110,7 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.97.0
           components: rustfmt, clippy
 
       - name: Cache wrapper Cargo paths
@@ -169,7 +169,7 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.97.0
 
       - name: Cache wrapper Cargo paths
         if: needs.changes.outputs.docs_only != 'true'
@@ -213,7 +213,7 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.97.0
 
       - name: Cache wrapper Cargo paths
         if: needs.changes.outputs.docs_only != 'true'
@@ -267,7 +267,7 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.97.0
 
       - name: Cache wrapper Cargo paths
         if: needs.changes.outputs.docs_only != 'true'
@@ -297,7 +297,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.97.0
 
       - name: Cache wrapper Cargo paths
         uses: ./.github/actions/cargo-cache
@@ -346,7 +346,7 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.97.0
 
       - name: Cache wrapper Cargo paths
         if: needs.changes.outputs.docs_only != 'true'
@@ -385,7 +385,7 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.97.0
 
       - name: Add wasm32 target
         if: needs.changes.outputs.docs_only != 'true'

@@ -279,8 +279,7 @@ impl SearchRepository<AuditLog> for AuditLogRepository {
                     criteria.query.as_ref().is_none_or(|query| {
                         let query = query.to_ascii_lowercase();
                         let action_matches = serde_json::to_string(&log.action)
-                            .map(|action| action.to_ascii_lowercase().contains(&query))
-                            .unwrap_or(false);
+                            .is_ok_and(|action| action.to_ascii_lowercase().contains(&query));
                         action_matches || log.actor.to_ascii_lowercase().contains(&query)
                     })
                 })

@@ -298,7 +298,7 @@ def package(root: Path, binary: Path, target: str, output: Path, receipt: Path) 
             shutil.copyfile(root / "vendor" / name, bundle / "third-party" / name)
         (bundle / "licenses").mkdir()
         shutil.copytree(root / "scripts/release/meerkat-notices",
-                        bundle / "licenses/meerkat-0.9.0")
+                        bundle / "licenses/meerkat-0.9.10")
         if target == "x86_64-unknown-linux-gnu":
             shutil.copytree(root / "scripts/release/onnxruntime-notices",
                             bundle / "licenses/onnxruntime-1.24.2")

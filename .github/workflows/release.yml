@@ -40,7 +40,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.97.0
           components: rustfmt, clippy
 
       - name: Resolve repository Cargo paths
@@ -105,7 +105,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.97.0
 
       - name: Install Python for native artifact verification
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7

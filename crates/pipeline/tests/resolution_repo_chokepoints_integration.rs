@@ -179,7 +179,7 @@ async fn test_resolution_get_entities_within_n_hops_traverses_both_directions() 
         .filter(|n| n.distance == 1)
         .map(|n| (n.entity_id.clone(), n.rel_type.clone()))
         .collect();
-    distance_1.sort_by(|(a, _), (b, _)| a.to_string().cmp(&b.to_string()));
+    distance_1.sort_by_key(|(id, _)| id.to_string());
 
     assert_eq!(distance_1.len(), 2, "expected 2 neighbors at distance 1");
     assert!(distance_1.contains(&(b.base.id.clone(), "knows".to_string())));

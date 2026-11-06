@@ -213,7 +213,7 @@ impl<P: EmbeddingProvider> EmbedWorker<P> {
         let mut chunk_ids = Vec::with_capacity(nodes.len());
         let mut embedding_records = Vec::with_capacity(embeddings.len());
 
-        for (node, embedding) in nodes.into_iter().zip(embeddings.into_iter()) {
+        for (node, embedding) in nodes.into_iter().zip(embeddings) {
             let rid = node.base.id.clone();
             let dims = i32::try_from(embedding.len()).map_err(|_| {
                 PipelineError::InvalidInput(format!(

@@ -165,9 +165,7 @@ impl EmbedWorkerConfig {
     #[must_use]
     pub fn from_env() -> Self {
         Self {
-            enabled: env::var("PIPELINE_EMBED_ENABLED")
-                .map(|s| s == "true" || s == "1")
-                .unwrap_or(true),
+            enabled: env::var("PIPELINE_EMBED_ENABLED").map_or(true, |s| s == "true" || s == "1"),
             poll_interval_secs: env::var("PIPELINE_EMBED_POLL_INTERVAL")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -223,9 +221,7 @@ impl PromoteWorkerConfig {
     #[must_use]
     pub fn from_env() -> Self {
         Self {
-            enabled: env::var("PIPELINE_PROMOTE_ENABLED")
-                .map(|s| s == "true" || s == "1")
-                .unwrap_or(true),
+            enabled: env::var("PIPELINE_PROMOTE_ENABLED").map_or(true, |s| s == "true" || s == "1"),
             poll_interval_secs: env::var("PIPELINE_PROMOTE_POLL_INTERVAL")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -282,8 +278,7 @@ impl RetentionWorkerConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: env::var("PIPELINE_RETENTION_ENABLED")
-                .map(|s| s == "true" || s == "1")
-                .unwrap_or(true),
+                .map_or(true, |s| s == "true" || s == "1"),
             poll_interval_secs: env::var("PIPELINE_RETENTION_POLL_INTERVAL")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -433,8 +428,7 @@ impl WorkQueueWorkerConfig {
         Self {
             doc_tree,
             enabled: env::var("PIPELINE_WORK_QUEUE_ENABLED")
-                .map(|s| s == "true" || s == "1")
-                .unwrap_or(true),
+                .map_or(true, |s| s == "true" || s == "1"),
             poll_interval_secs: env::var("PIPELINE_WORK_QUEUE_POLL_INTERVAL")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -482,8 +476,7 @@ impl WorkQueueWorkerConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(default_transient_retry_max_delay_secs),
             disambiguation_enabled: env::var("PIPELINE_RESOLUTION_DISAMBIGUATION_ENABLED")
-                .map(|s| s == "true" || s == "1")
-                .unwrap_or(true),
+                .map_or(true, |s| s == "true" || s == "1"),
             disambiguation_model: env::var("PIPELINE_RESOLUTION_DISAMBIGUATION_MODEL")
                 .unwrap_or_else(|_| default_disambiguation_model()),
             disambiguation_max_tokens: env::var("PIPELINE_RESOLUTION_DISAMBIGUATION_MAX_TOKENS")
@@ -550,8 +543,7 @@ impl TruthMaintenanceWorkerConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: env::var("PIPELINE_TRUTH_MAINTENANCE_ENABLED")
-                .map(|s| s == "true" || s == "1")
-                .unwrap_or(true),
+                .map_or(true, |s| s == "true" || s == "1"),
             poll_interval_secs: env::var("PIPELINE_TRUTH_MAINTENANCE_POLL_INTERVAL")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -840,8 +832,7 @@ impl MaintenanceWorkerConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: env::var("PIPELINE_MAINTENANCE_ENABLED")
-                .map(|s| s == "true" || s == "1")
-                .unwrap_or(true),
+                .map_or(true, |s| s == "true" || s == "1"),
             poll_interval_secs: env::var("PIPELINE_MAINTENANCE_POLL_INTERVAL")
                 .ok()
                 .and_then(|s| s.parse().ok())

@@ -545,7 +545,7 @@ async fn collect_disambiguation_turn(
     mut stream: impl futures::Stream<Item = Result<meerkat::LlmEvent, meerkat::LlmError>> + Unpin,
 ) -> Result<(String, Vec<meerkat::ToolCall>), PipelineError> {
     use futures::StreamExt;
-    use meerkat::{LlmDoneOutcome, LlmEvent};
+    use meerkat::{LlmDoneOutcome, LlmEvent, StopReason};
 
     let mut content = String::new();
     let mut tool_calls = Vec::new();
@@ -558,8 +558,20 @@ async fn collect_disambiguation_turn(
                 tool_calls.push(meerkat::ToolCall::new(id, name, args));
             }
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { .. },
+                outcome: LlmDoneOutcome::Success { stop_reason, .. },
             } => {
+                // Success describes the stream, not permission to consume a
+                // refused response's buffered candidate text or tool calls.
+                if matches!(
+                    stop_reason,
+                    StopReason::Refusal
+                        | StopReason::ContentFilter
+                        | StopReason::ContextWindowExceeded
+                ) {
+                    return Err(PipelineError::ExtractionError(format!(
+                        "LLM disambiguation response rejected: {stop_reason:?}"
+                    )));
+                }
                 return Ok((content, tool_calls));
             }
             LlmEvent::Done {
@@ -2563,14 +2575,81 @@ mod agentic_resolution_tests {
         let (content, calls) = collect_disambiguation_turn(futures::stream::iter([
             text(),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             }),
         ]))
         .await
         .unwrap();
         assert_eq!(content, "entity:chosen");
         assert!(calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disambiguation_discards_refused_candidate_text_and_tools() {
+        use meerkat::{LlmDoneOutcome, LlmEvent, StopReason};
+
+        let candidate = RecordId::new_v4(TableName::Entity);
+        let events = |stop_reason, with_tool| {
+            let mut events = vec![Ok(LlmEvent::TextDelta {
+                delta: candidate.to_string(),
+                meta: None,
+            })];
+            if with_tool {
+                events.push(Ok(LlmEvent::ToolCallComplete {
+                    id: "candidate-context".into(),
+                    name: "get_entity".into(),
+                    args: serde_json::json!({"id": candidate.to_string()}),
+                    meta: None,
+                }));
+            }
+            events.push(Ok(LlmEvent::Done {
+                outcome: LlmDoneOutcome::success(stop_reason),
+            }));
+            events
+        };
+
+        for stop_reason in [
+            StopReason::Refusal,
+            StopReason::ContentFilter,
+            StopReason::ContextWindowExceeded,
+        ] {
+            for with_tool in [false, true] {
+                // The SDK omits an incomplete tool call when a refusal cuts
+                // its input, but may already have emitted candidate text and
+                // earlier complete calls. Neither may escape the turn gate.
+                // disambiguate propagates this error before parsing a choice
+                // or dispatching any of the buffered calls.
+                assert!(matches!(
+                    collect_disambiguation_turn(futures::stream::iter(events(
+                        stop_reason,
+                        with_tool,
+                    )))
+                    .await,
+                    Err(PipelineError::ExtractionError(_))
+                ));
+            }
+        }
+
+        // The same candidate and complete call remain usable on ordinary
+        // successful turns, so an unconditional refusal cannot pass.
+        for (stop_reason, with_tool) in [(StopReason::EndTurn, false), (StopReason::ToolUse, true)]
+        {
+            let (content, calls) =
+                collect_disambiguation_turn(futures::stream::iter(events(stop_reason, with_tool)))
+                    .await
+                    .expect("ordinary successful turn");
+            assert_eq!(
+                extract_entity_id(&content, std::slice::from_ref(&candidate)),
+                Some(candidate.clone())
+            );
+            assert_eq!(calls.len(), usize::from(with_tool));
+            if with_tool {
+                assert_eq!(calls[0].name, "get_entity");
+                assert_eq!(
+                    calls[0].args,
+                    serde_json::json!({"id": candidate.to_string()})
+                );
+            }
+        }
     }
 }

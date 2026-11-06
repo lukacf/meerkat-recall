@@ -1932,8 +1932,7 @@ impl ElephantDbState {
     /// it, so both sides of the next deploy compact alike.
     fn compact_vector_export_enabled() -> bool {
         std::env::var("ELEPHANT_DB_COMPACT_VECTOR_EXPORT")
-            .map(|value| value == "1" || value == "true")
-            .unwrap_or(false)
+            .is_ok_and(|value| value == "1" || value == "true")
     }
 
     /// Quantizes a row's `vector` components to their shortest f32 decimal form.
@@ -3748,6 +3747,10 @@ pub fn tokenize(text: &str) -> Vec<String> {
 
 /// Scores a haystack against query tokens using a simple deterministic lexical heuristic.
 #[must_use]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve existing score rounding and ranking"
+)]
 pub fn lexical_score(query: &str, haystacks: &[(&str, f32)]) -> f32 {
     let query_tokens = tokenize(query);
     if query_tokens.is_empty() {
@@ -3887,6 +3890,10 @@ pub fn hashed_text_embedding(text: &str, dims: usize) -> Vec<f32> {
     vector
 }
 
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve existing vector similarity rounding"
+)]
 fn dot_similarity(lhs: &[f32], rhs: &[f32]) -> f32 {
     if lhs.len() != rhs.len() {
         return 0.0;
@@ -3942,6 +3949,10 @@ fn normalize_vector_in_place(values: &mut [f32]) {
     }
 }
 
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve existing normalized vector values"
+)]
 fn squared_norm(values: &[f32]) -> f32 {
     let mut sum0 = 0.0_f32;
     let mut sum1 = 0.0_f32;

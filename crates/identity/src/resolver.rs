@@ -651,8 +651,7 @@ async fn ensure_declared_extension_tables(
     storage: &StorageClient,
     registry: &ReferenceRegistry,
 ) -> IdentityResult<()> {
-    let undeclared =
-        find_undeclared_extension_table(storage.list_tables().await?.into_iter(), registry);
+    let undeclared = find_undeclared_extension_table(storage.list_tables().await?, registry);
 
     if let Some(table_name) = undeclared {
         return Err(IdentityError::MergeConflict(format!(

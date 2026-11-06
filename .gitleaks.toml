@@ -192,3 +192,12 @@ targetRules = ["generic-api-key"]
 paths = ['''^tests/recall_preview_semantics/gateway/test_cache_metadata\.py$''']
 regexTarget = "match"
 regexes = ["""^BOUNDED_CACHE_KEY = '1bbf41cec50f7a9f8f1a7c27e5df82ff209dc65810be759e77ba7095f0e5a76b'$"""]
+
+# The cfg(test) verified_ctx helper signs and verifies a synthetic token locally.
+[[allowlists]]
+description = "Synthetic HS256 key for upcoming-cursor caller regression tests"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^crates/mcp/src/handlers/events\.rs$''']
+regexTarget = "match"
+regexes = ['''^secret = "upcoming-cursor-test-secret-of-32-bytes"$''']

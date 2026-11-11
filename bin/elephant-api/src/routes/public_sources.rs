@@ -43,6 +43,7 @@ use elephant_types::{publication::SourceVisibility, publication_wire::head_lifec
 /// Allows the maximum decoded text even when every byte uses a JSON escape.
 pub const MAX_SOURCE_JSON_BYTES: usize = 12_100_000;
 const MAX_METADATA_BYTES: usize = 32_768;
+const MAX_SOURCE_TITLE_BYTES: usize = 1_024;
 const MAX_LABEL_BYTES: usize = 16_384;
 
 #[derive(Clone)]
@@ -84,6 +85,16 @@ pub enum SourceLabel {
 #[serde(deny_unknown_fields)]
 pub struct PutSourceRequest {
     pub revision: String,
+    /// The document's human title. Omitted or `null`: the external source id,
+    /// exactly as before this field existed (and no `title` in the request
+    /// fingerprint), so a revision first accepted without one replays and
+    /// re-accepts unchanged. Present: it must be one trimmed, control-free line
+    /// of at most 1024 bytes; an empty or whitespace-only title is refused (400)
+    /// before anything is read or staged. It is used verbatim (never normalized)
+    /// for the request fingerprint, the staged document and so the immutable
+    /// revision content.
+    #[serde(default)]
+    pub title: Option<String>,
     pub text: String,
     pub media_type: String,
     pub source_url: Option<String>,
@@ -124,6 +135,10 @@ impl PutSourceRequest {
             ));
         }
         if !valid_identifier(&self.revision, 256)
+            || self
+                .title
+                .as_ref()
+                .is_some_and(|title| !valid_identifier(title, MAX_SOURCE_TITLE_BYTES))
             || self.text.is_empty()
             || !matches!(self.media_type.as_str(), "text/plain" | "text/markdown")
             || self
@@ -140,7 +155,7 @@ impl PutSourceRequest {
         {
             return Err(ApiFailure::new(
                 ErrorCode::InvalidRequest,
-                "Invalid source revision, text, media type, URL or lifecycle precondition",
+                "Invalid source revision, title, text, media type, URL or lifecycle precondition",
             ));
         }
         if self.labels.len() > 128
@@ -208,9 +223,21 @@ fn source_fingerprint(
     input: &PutSourceRequest,
     base: &BaseFields,
 ) -> Result<String, ApiFailure> {
-    fingerprint(
-        &json!({"space":space,"external_source_id":external_id,"revision":input.revision,"text":input.text,"media_type":input.media_type,"source_url":input.source_url,"labels":input.labels,"metadata":input.metadata,"security":base.security,"subjects":base.subjects,"subjects_state":base.subjects_state,"reactivate":input.reactivate,"recreate_after_erasure":input.recreate_after_erasure}),
-    )
+    let mut request = json!({"space":space,"external_source_id":external_id,"revision":input.revision,"text":input.text,"media_type":input.media_type,"source_url":input.source_url,"labels":input.labels,"metadata":input.metadata,"security":base.security,"subjects":base.subjects,"subjects_state":base.subjects_state,"reactivate":input.reactivate,"recreate_after_erasure":input.recreate_after_erasure});
+    // Only a present title is part of the request: a request without one keeps
+    // the fingerprint it had before the field existed, so its key still replays.
+    if let Some(title) = &input.title {
+        request["title"] = json!(title);
+    }
+    fingerprint(&request)
+}
+
+/// The staged document's title: the caller's, else the external source id.
+fn staged_title(input: &PutSourceRequest, external_id: &str) -> String {
+    input
+        .title
+        .clone()
+        .unwrap_or_else(|| external_id.to_owned())
 }
 
 fn request_key(headers: &HeaderMap, fallback: &str) -> Result<String, ApiFailure> {
@@ -376,7 +403,7 @@ async fn put_source(
     source
         .set_manual_doc_template(&ManualDocTemplate {
             doc_id: doc_id.to_string(),
-            title: external_id.clone(),
+            title: staged_title(&input, &external_id),
             text: input.text.clone(),
             sidecar_text: None,
             media_attachments: vec![],
@@ -904,6 +931,7 @@ mod tests {
     fn request(text: String) -> PutSourceRequest {
         PutSourceRequest {
             revision: "r1".into(),
+            title: None,
             text,
             media_type: "text/plain".into(),
             source_url: None,
@@ -1164,6 +1192,55 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn an_absent_title_keeps_the_fingerprint_and_the_staged_title_of_before() -> Result<(), ApiFailure> {
+        let base = BaseFields::new(
+            RecordId::new_v4(TableName::Source),
+            "alpha".into(),
+            "service".into(),
+        );
+        let mut input = request("exact evidence".into());
+        // The request fingerprint exactly as it was computed before `title` existed.
+        let before = fingerprint(
+            &json!({"space":"alpha","external_source_id":"external","revision":input.revision,"text":input.text,"media_type":input.media_type,"source_url":input.source_url,"labels":input.labels,"metadata":input.metadata,"security":base.security,"subjects":base.subjects,"subjects_state":base.subjects_state,"reactivate":input.reactivate,"recreate_after_erasure":input.recreate_after_erasure}),
+        )?;
+        assert_eq!(before, source_fingerprint("alpha", "external", &input, &base)?);
+        assert_eq!(staged_title(&input, "external"), "external");
+        input.title = Some("Email: Synthetic subject".into());
+        assert_ne!(before, source_fingerprint("alpha", "external", &input, &base)?);
+        assert_eq!(staged_title(&input, "external"), "Email: Synthetic subject");
+        Ok(())
+    }
+    #[test]
+    fn a_null_title_is_an_absent_title() -> Result<(), Box<dyn std::error::Error>> {
+        let base = BaseFields::new(
+            RecordId::new_v4(TableName::Source),
+            "alpha".into(),
+            "service".into(),
+        );
+        let omitted: PutSourceRequest = serde_json::from_value(json!({"revision":"r1","text":"exact evidence",
+            "media_type":"text/plain","observed_at":"2026-10-06T20:11:00Z","expected_generation":null}))?;
+        let null: PutSourceRequest = serde_json::from_value(json!({"revision":"r1","title":null,"text":"exact evidence",
+            "media_type":"text/plain","observed_at":"2026-10-06T20:11:00Z","expected_generation":null}))?;
+        assert_eq!(null.title, None);
+        assert!(null.validate().is_ok());
+        assert_eq!(
+            source_fingerprint("alpha", "external", &null, &base)?,
+            source_fingerprint("alpha", "external", &omitted, &base)?
+        );
+        assert_eq!(staged_title(&null, "external"), "external");
+        Ok(())
+    }
+    #[test]
+    fn a_title_is_a_bounded_trimmed_line() {
+        let mut input = request("exact evidence".into());
+        for bad in ["", "   ", "\t", " leading", "trailing ", "two\nlines", &"x".repeat(1_025)] {
+            input.title = Some(bad.to_owned());
+            assert!(input.validate().is_err(), "{bad:?}");
+        }
+        input.title = Some("Email: Ämne med åäö".into());
+        assert!(input.validate().is_ok());
+    }
+    #[test]
     fn internal_erasing_never_leaks_as_a_public_lifecycle() {
         assert_eq!(head_lifecycle(SourceVisibility::Erasing), "erased");
         assert_eq!(head_lifecycle(SourceVisibility::Erased), "erased");
@@ -1172,8 +1249,75 @@ mod tests {
     async fn route_fixture(
         configure: bool,
     ) -> Result<(Router, StorageClient), Box<dyn std::error::Error>> {
-        use elephant_storage::Repository;
         let storage = StorageClient::new_embedded().await?;
+        route_fixture_on(storage, configure).await
+    }
+    /// Both storage backends: the embedded store and `SurrealDB` (in memory).
+    async fn backends() -> Result<Vec<StorageClient>, Box<dyn std::error::Error>> {
+        Ok(vec![
+            StorageClient::new_embedded().await?,
+            StorageClient::new_memory().await?,
+        ])
+    }
+    async fn staged_title_of(
+        storage: &StorageClient,
+        receipt: &Value,
+        revision: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let source_id: RecordId = serde_json::from_value(receipt["internal_source_id"].clone())?;
+        let stored = SourcePublicationRepository::new(storage.clone())
+            .revision("alpha", &source_id, revision)
+            .await?
+            .ok_or("revision not stored")?;
+        Ok(stored
+            .source
+            .manual_doc_template()?
+            .ok_or("no staged document")?
+            .title)
+    }
+    /// Everything the store holds, to show a refused request wrote nothing: the
+    /// embedded store's complete snapshot (less its export time), or every
+    /// `SurrealDB` table's row count (sources, staging, publication control rows,
+    /// the work queue, ...).
+    async fn store_state(storage: &StorageClient) -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(store) = storage.embedded_store() {
+            // The export stamps its own time; everything else is the store.
+            let mut snapshot: Value = serde_json::from_slice(&store.export_snapshot_bytes().await?)?;
+            snapshot
+                .as_object_mut()
+                .ok_or("snapshot is not an object")?
+                .remove("exported_at");
+            return Ok(hex::encode(Sha256::digest(serde_json::to_vec(&sorted(snapshot))?)));
+        }
+        let mut counts = BTreeMap::new();
+        for table in storage.list_tables().await? {
+            let mut response = storage
+                .query_checked(&format!("SELECT count() AS n FROM `{table}` GROUP ALL"))
+                .await?;
+            let row: Option<Value> = response.take(0)?;
+            counts.insert(table, row.map_or(0, |row| row["n"].as_u64().unwrap_or(0)));
+        }
+        Ok(serde_json::to_string(&counts)?)
+    }
+    /// `value` with every object's keys in order: the export's map order is not stable.
+    fn sorted(value: Value) -> Value {
+        match value {
+            Value::Object(map) => Value::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, sorted(value)))
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.into_iter().map(sorted).collect()),
+            other => other,
+        }
+    }
+    async fn route_fixture_on(
+        storage: StorageClient,
+        configure: bool,
+    ) -> Result<(Router, StorageClient), Box<dyn std::error::Error>> {
+        use elephant_storage::Repository;
         if configure {
             let config: elephant_types::records::SpaceConfig = serde_json::from_value(
                 json!({"id":RecordId::new_v4(TableName::SpaceConfig),"space_id":"alpha","created_at":Utc::now(),"updated_at":Utc::now(),"created_by":"operator","security":{"policy_id":"default","level":0,"labels":[],"handling":[]},"provenance":{},"subjects":[],"subjects_state":"complete","embedding_provider":"fake","embedding_model":"fixture","embedding_dims":3,"purpose":null,"skill":null,"processing":null}),
@@ -1232,6 +1376,134 @@ mod tests {
         Ok((status, serde_json::from_slice(&bytes)?))
     }
 
+    #[tokio::test]
+    async fn a_title_names_the_staged_document_and_no_title_keeps_the_external_id(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let clients = backends().await?;
+        for storage in clients {
+            let (router, storage) = route_fixture_on(storage, true).await?;
+            let (status, titled) = request_json(
+                router.clone(),
+                "PUT",
+                "/v1/spaces/alpha/sources/titled",
+                json!({"revision":"r1","title":"Email: Synthetic subject","text":"source evidence",
+                    "media_type":"text/plain","observed_at":"2026-10-06T20:11:00Z","expected_generation":null}),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(staged_title_of(&storage, &titled, "r1").await?, "Email: Synthetic subject");
+            let (status, untitled) = request_json(
+                router.clone(),
+                "PUT",
+                "/v1/spaces/alpha/sources/untitled",
+                json!({"revision":"r1","text":"source evidence","media_type":"text/plain",
+                    "observed_at":"2026-10-06T20:11:00Z","expected_generation":null}),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(staged_title_of(&storage, &untitled, "r1").await?, "untitled");
+            let (status, null_titled) = request_json(
+                router.clone(),
+                "PUT",
+                "/v1/spaces/alpha/sources/null-titled",
+                json!({"revision":"r1","title":null,"text":"source evidence","media_type":"text/plain",
+                    "observed_at":"2026-10-06T20:11:00Z","expected_generation":null}),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(staged_title_of(&storage, &null_titled, "r1").await?, "null-titled");
+            let before = store_state(&storage).await?;
+            for blank in ["", "   "] {
+                let (status, error) = request_json(
+                    router.clone(),
+                    "PUT",
+                    "/v1/spaces/alpha/sources/blank-titled",
+                    json!({"revision":"r1","title":blank,"text":"source evidence","media_type":"text/plain",
+                        "observed_at":"2026-10-06T20:11:00Z","expected_generation":null}),
+                )
+                .await?;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{blank:?}");
+                assert_eq!(error["error_code"], "invalid_request");
+            }
+            assert_eq!(
+                store_state(&storage).await?,
+                before,
+                "a refused title wrote nothing: no source, staging, control or queue row"
+            );
+            // The probe is not blind: an accepted PUT does change it.
+            let (status, _) = request_json(
+                router.clone(),
+                "PUT",
+                "/v1/spaces/alpha/sources/probe-check",
+                json!({"revision":"r1","text":"source evidence","media_type":"text/plain",
+                    "observed_at":"2026-10-06T20:11:00Z","expected_generation":null}),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_ne!(store_state(&storage).await?, before);
+            let (status, _) = request_json(
+                router,
+                "GET",
+                "/v1/spaces/alpha/sources/blank-titled/head",
+                Value::Null,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::NOT_FOUND, "a refused title staged nothing");
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn a_revision_accepted_without_a_title_replays_and_a_title_is_new_content(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let clients = backends().await?;
+        for storage in clients {
+            let (router, storage) = route_fixture_on(storage, true).await?;
+            let path = "/v1/spaces/alpha/sources/legacy";
+            let untitled = json!({"revision":"r1","text":"source evidence","media_type":"text/plain",
+                "observed_at":"2026-10-06T20:11:00Z","expected_generation":null});
+            let (status, first) =
+                request_json_with_key(router.clone(), "PUT", path, untitled.clone(), Some("k1")).await?;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            // The same request under its key: the same operation, as before.
+            let (status, replay) =
+                request_json_with_key(router.clone(), "PUT", path, untitled.clone(), Some("k1")).await?;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(replay["operation_id"], first["operation_id"]);
+            // A fresh intent for the same revision, still without a title, re-accepts.
+            let mut again = untitled.clone();
+            again["expected_generation"] = first["generation"].clone();
+            let (status, reaccepted) =
+                request_json_with_key(router.clone(), "PUT", path, again.clone(), Some("k2")).await?;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_ne!(reaccepted["operation_id"], first["operation_id"]);
+            // A title is content: the same revision with one is a different request.
+            let mut titled = again;
+            titled["title"] = json!("Email: Synthetic subject");
+            titled["expected_generation"] = reaccepted["generation"].clone();
+            let (status, error) =
+                request_json_with_key(router.clone(), "PUT", path, titled.clone(), Some("k3")).await?;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(error["error_code"], "conflict_generation");
+            // Nothing moved: the head is the re-accepted one and the stored revision
+            // keeps the title it was accepted with (the storage layer's
+            // immutable_revision_conflict, pinned in source_publication's tests).
+            let (_, head) = request_json(router.clone(), "GET", &format!("{path}/head"), Value::Null).await?;
+            assert_eq!(head["generation"], reaccepted["generation"]);
+            assert_eq!(head["operation_id"], reaccepted["operation_id"]);
+            assert_eq!(staged_title_of(&storage, &first, "r1").await?, "legacy");
+            let (status, _) =
+                request_json_with_key(router.clone(), "PUT", path, titled.clone(), Some("k1")).await?;
+            assert_eq!(status, StatusCode::CONFLICT);
+            // A new revision carries its title.
+            titled["revision"] = json!("r2");
+            let (status, second) =
+                request_json_with_key(router.clone(), "PUT", path, titled, Some("k4")).await?;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(staged_title_of(&storage, &second, "r2").await?, "Email: Synthetic subject");
+            assert_eq!(staged_title_of(&storage, &first, "r1").await?, "legacy");
+        }
+        Ok(())
+    }
     #[tokio::test]
     async fn fresh_intent_and_current_generation_reaccept_a_historical_revision(
     ) -> Result<(), Box<dyn std::error::Error>> {

@@ -18,6 +18,16 @@ regexes = [
 # synthetic; SHA-256 values are public integrity digests, not credentials.
 
 [[allowlists]]
+description = "Synthetic HMAC key of a list_upcoming_events test, generated at runtime since; kept for history"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^crates/mcp/src/handlers/events\.rs$''']
+regexTarget = "match"
+regexes = [
+  '''^secret = "upcoming-cursor-test-secret-of-32-bytes"$''',
+]
+
+[[allowlists]]
 description = "Example idempotency labels, not authentication credentials"
 condition = "AND"
 targetRules = ["generic-api-key"]

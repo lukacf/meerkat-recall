@@ -1,0 +1,2880 @@
+diff --git a/bin/elephant-api/src/authorization_surface_tests.rs b/bin/elephant-api/src/authorization_surface_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..851bc58368079f552fe4abf488123c70a5e285a1
+--- /dev/null
++++ b/bin/elephant-api/src/authorization_surface_tests.rs
+@@ -0,0 +1,756 @@
++//! Regression tests for the retained public authorization boundaries.
++#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
++
++use std::sync::Arc;
++
++use axum::{
++    body::{to_bytes, Body},
++    http::{Request, StatusCode},
++    middleware,
++    response::Response,
++    Extension, Router,
++};
++use elephant_storage::{
++    DocRepository, RelRepository, Repository, SpaceConfigRepository, StorageClient,
++    WorkItemRepository,
++};
++use elephant_types::records::base::{BaseFields, SubjectsState};
++use elephant_types::records::rel::ClaimStatus;
++use elephant_types::records::{Doc, Rel, SpaceConfig, WorkItem, WorkItemStatus};
++use elephant_types::{Link, RecordId, TableName};
++use serde_json::{json, Value};
++use tower::ServiceExt;
++
++use crate::{AuthzService, Principal};
++
++fn principal() -> Principal {
++    Principal {
++        subject: "operator".into(),
++        space_id: Some("alpha".into()),
++        scopes: vec!["*".into()],
++        security_level: 5,
++        ..Principal::default()
++    }
++}
++
++fn base(table: TableName) -> BaseFields {
++    let mut base = BaseFields::new(RecordId::new_v4(table), "alpha".into(), "fixture".into());
++    base.subjects_state = SubjectsState::Complete;
++    base
++}
++
++fn doc() -> Doc {
++    Doc {
++        base: base(TableName::Doc),
++        title: "Fixture".into(),
++        text: "private body".into(),
++        sidecar_text: Some("private sidecar".into()),
++        source: None,
++        media_attachments: vec![elephant_types::records::doc::DocMediaAttachment {
++            attachment_id: "attachment".into(),
++            kind: elephant_types::records::doc::DocMediaKind::Image,
++            media_type: "image/png".into(),
++            location: elephant_types::records::doc::DocMediaLocation::Uri {
++                uri: "https://example.invalid/private.png".into(),
++            },
++            label: None,
++            size_bytes: None,
++            duration_ms: None,
++            sha256: None,
++        }],
++        rendition_key: "fixture".into(),
++        metadata: json!({}),
++    }
++}
++
++fn rel() -> Rel {
++    Rel {
++        base: base(TableName::Rel),
++        subject: Link::new(RecordId::new_v4(TableName::Entity)),
++        object: Link::new(RecordId::new_v4(TableName::Entity)),
++        rel_type: "related_to".into(),
++        status: ClaimStatus::Candidate,
++        confidence: 0.8,
++        validity_window: None,
++        evidence: vec![],
++        temporal_audit: None,
++    }
++}
++
++fn work() -> WorkItem {
++    WorkItem {
++        base: base(TableName::WorkItem),
++        kind: "fixture".into(),
++        payload: json!({"private": "payload"}),
++        status: WorkItemStatus::Failed,
++        priority: 0,
++        idempotency_key: uuid::Uuid::new_v4().to_string(),
++        attempts: 1,
++        lease_expires_at: None,
++        leased_by: None,
++        run_after: None,
++        last_error: None,
++    }
++}
++
++fn app(storage: &StorageClient, principal: Principal) -> Router {
++    let authz = Arc::new(AuthzService::new());
++    Router::new()
++        .merge(crate::routes::space_routes().with_state(Arc::new(
++            crate::routes::spaces::SpaceApiState::new(storage.clone(), authz.clone()),
++        )))
++        .merge(crate::routes::doc_routes().with_state(Arc::new(
++            crate::routes::docs::DocsState::new(storage, authz.clone()),
++        )))
++        .merge(crate::routes::rel_routes().with_state(Arc::new(
++            crate::routes::relationships::RelationshipsState::new(storage.clone(), authz.clone()),
++        )))
++        .merge(crate::routes::work_item_routes().with_state(Arc::new(
++            crate::routes::work_items::WorkItemsState::new(storage.clone(), authz.clone()),
++        )))
++        .merge(crate::routes::entity_routes().with_state(Arc::new(
++            crate::routes::entities::AppState::new(storage.clone(), authz.clone()),
++        )))
++        .merge(crate::routes::timeline_routes().with_state(Arc::new(
++            crate::routes::timeline::TimelineState::new(storage.clone(), authz.clone()),
++        )))
++        .merge(crate::routes::identity_routes().with_state(Arc::new(
++            crate::routes::identity::IdentityState::new(storage.clone(), authz.clone()),
++        )))
++        .merge(crate::routes::system_routes().with_state(Arc::new(
++            crate::routes::system::SystemState::new(storage.clone(), authz.clone()),
++        )))
++        .merge(crate::routes::events_routes().with_state(Arc::new(
++            crate::routes::events::EventsState::new(storage.clone(), authz.clone()),
++        )))
++        .merge(crate::routes::assertion_routes().with_state(Arc::new(
++            crate::routes::assertions::AssertionsState::new(storage.clone(), authz.clone()),
++        )))
++        .merge(crate::routes::predicate_routes().with_state(Arc::new(
++            crate::routes::predicates::PredicatesState::new(storage.clone(), authz.clone()),
++        )))
++        .merge(crate::routes::truth_slot_routes().with_state(Arc::new(
++            crate::routes::truth_slots::TruthSlotsState::new(storage.clone(), authz.clone()),
++        )))
++        .merge(crate::routes::knowledge_view_routes().with_state(Arc::new(
++            crate::routes::knowledge_views::KnowledgeViewsState::new(
++                storage.clone(),
++                authz.clone(),
++            ),
++        )))
++        .merge(crate::routes::source_routes().with_state(Arc::new(
++            crate::routes::sources::SourcesState::new(storage.clone(), authz.clone()),
++        )))
++        .layer(Extension(principal))
++}
++
++async fn request(app: Router, method: &str, path: &str, body: Value) -> Response {
++    app.oneshot(
++        Request::builder()
++            .method(method)
++            .uri(path)
++            .header("content-type", "application/json")
++            .body(Body::from(serde_json::to_vec(&body).unwrap()))
++            .unwrap(),
++    )
++    .await
++    .unwrap()
++}
++
++async fn json_body(response: Response) -> Value {
++    serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap()).unwrap()
++}
++
++#[tokio::test]
++async fn space_admin_requires_scope_tenant_and_record_authority() {
++    let storage = StorageClient::new_embedded().await.unwrap();
++    let repo = SpaceConfigRepository::new(storage.clone());
++    for name in ["alpha", "beta"] {
++        let mut fields = base(TableName::SpaceConfig);
++        fields.space_id = name.into();
++        repo.create(SpaceConfig {
++            base: fields,
++            embedding_provider: "fake".into(),
++            embedding_model: "fixture".into(),
++            embedding_dims: 3,
++            purpose: None,
++            skill: None,
++        })
++        .await
++        .unwrap();
++    }
++    let allowed = app(&storage, principal());
++    let rows = json_body(request(allowed.clone(), "GET", "/v1/spaces", Value::Null).await).await;
++    assert_eq!(rows.as_array().unwrap().len(), 1);
++    assert_eq!(rows[0]["space_id"], "alpha");
++    for method in ["GET", "PUT"] {
++        assert_eq!(
++            request(
++                allowed.clone(),
++                method,
++                "/v1/spaces/beta",
++                json!({"purpose":"changed"})
++            )
++            .await
++            .status(),
++            StatusCode::FORBIDDEN
++        );
++    }
++    assert_eq!(
++        request(
++            allowed.clone(),
++            "POST",
++            "/v1/spaces",
++            json!({"name":"gamma"})
++        )
++        .await
++        .status(),
++        StatusCode::FORBIDDEN
++    );
++    assert!(repo.get_by_space_id("gamma").await.unwrap().is_none());
++    let mut no_admin = principal();
++    no_admin.scopes = vec!["read:entity".into()];
++    assert_eq!(
++        request(
++            app(&storage, no_admin),
++            "PUT",
++            "/v1/spaces/alpha",
++            json!({"purpose":"changed"})
++        )
++        .await
++        .status(),
++        StatusCode::FORBIDDEN
++    );
++    let response = request(
++        allowed.clone(),
++        "PUT",
++        "/v1/spaces/alpha",
++        json!({"purpose":"authorized"}),
++    )
++    .await;
++    assert_eq!(response.status(), StatusCode::OK);
++    assert_eq!(
++        repo.get_by_space_id("alpha")
++            .await
++            .unwrap()
++            .unwrap()
++            .purpose
++            .as_deref(),
++        Some("authorized")
++    );
++    let mut config = repo.get_by_space_id("alpha").await.unwrap().unwrap();
++    config.base.security.level = 8;
++    repo.update("alpha", &config.base.id.clone(), config)
++        .await
++        .unwrap();
++    assert_eq!(
++        request(allowed.clone(), "GET", "/v1/spaces/alpha", Value::Null)
++            .await
++            .status(),
++        StatusCode::FORBIDDEN
++    );
++    let rows = json_body(request(allowed, "GET", "/v1/spaces", Value::Null).await).await;
++    assert!(rows.as_array().unwrap().is_empty());
++    let mut restricted = principal();
++    restricted.space_id = Some("gamma".into());
++    restricted.subject_allowlist = Some(vec![]);
++    assert_eq!(
++        request(
++            app(&storage, restricted),
++            "POST",
++            "/v1/spaces",
++            json!({"name":"gamma"})
++        )
++        .await
++        .status(),
++        StatusCode::FORBIDDEN
++    );
++    let mut creator = principal();
++    creator.space_id = Some("gamma".into());
++    assert_eq!(request(app(&storage, creator), "POST", "/v1/spaces", json!({"name":"gamma", "embedding_provider":"fake", "embedding_model":"fixture", "embedding_dims":3})).await.status(), StatusCode::CREATED);
++}
++
++#[tokio::test]
++async fn relationship_replacements_preserve_protected_live_and_deleted_records() {
++    for mode in [
++        "update",
++        "upsert",
++        "batch",
++        "deleted_batch",
++        "deleted_upsert",
++    ] {
++        let storage = StorageClient::new_embedded().await.unwrap();
++        let repo = RelRepository::new(storage.clone());
++        let mut original = rel();
++        original.base.security.level = 4;
++        repo.create(original.clone()).await.unwrap();
++        if mode.starts_with("deleted") {
++            repo.delete("alpha", &original.base.id).await.unwrap();
++        }
++        let before = repo
++            .get_with_deleted("alpha", &original.base.id)
++            .await
++            .unwrap()
++            .unwrap();
++        let mut replacement = original.clone();
++        replacement.base.security.level = 0;
++        let (method, path, payload) = if mode.ends_with("batch") {
++            (
++                "POST",
++                "/v1/relationships/batch".into(),
++                json!({"items":[replacement]}),
++            )
++        } else if mode.ends_with("upsert") {
++            (
++                "POST",
++                "/v1/relationships/upsert".into(),
++                json!(replacement),
++            )
++        } else {
++            (
++                "PUT",
++                format!("/v1/relationships/{}", original.base.id),
++                json!(replacement),
++            )
++        };
++        let response = request(app(&storage, principal()), method, &path, payload).await;
++        if mode.ends_with("batch") {
++            let body = json_body(response).await;
++            assert!(body["succeeded"].as_array().unwrap().is_empty());
++            assert_eq!(body["failed"].as_array().unwrap().len(), 1);
++        } else {
++            assert_eq!(response.status(), StatusCode::FORBIDDEN);
++        }
++        assert_eq!(
++            repo.get_with_deleted("alpha", &original.base.id)
++                .await
++                .unwrap()
++                .unwrap(),
++            before
++        );
++    }
++}
++
++#[tokio::test]
++async fn authorized_relationship_content_edit_succeeds() {
++    let storage = StorageClient::new_embedded().await.unwrap();
++    let repo = RelRepository::new(storage.clone());
++    let mut original = repo.create(rel()).await.unwrap();
++    original.confidence = 0.5;
++    let response = request(
++        app(&storage, principal()),
++        "POST",
++        "/v1/relationships/upsert",
++        json!(original),
++    )
++    .await;
++    assert_eq!(response.status(), StatusCode::OK);
++    assert_eq!(
++        repo.get("alpha", &original.base.id)
++            .await
++            .unwrap()
++            .unwrap()
++            .confidence
++            .to_bits(),
++        0.5_f32.to_bits()
++    );
++}
++
++#[tokio::test]
++async fn document_metadata_routes_do_not_return_raw_payloads() {
++    let storage = StorageClient::new_embedded().await.unwrap();
++    let doc = DocRepository::new(storage.clone())
++        .create(doc())
++        .await
++        .unwrap();
++    let mut metadata = principal();
++    metadata.scopes = vec!["read:doc:metadata".into()];
++    let paths = [
++        format!("/v1/docs/{}", doc.base.id),
++        format!("/api/v1/spaces/alpha/documents/{}", doc.base.id),
++        "/api/v1/spaces/alpha/documents".into(),
++        "/v1/docs/search".into(),
++    ];
++    for path in &paths {
++        let response = request(
++            app(&storage, metadata.clone()),
++            if path.ends_with("search") {
++                "POST"
++            } else {
++                "GET"
++            },
++            path,
++            json!({}),
++        )
++        .await;
++        assert_eq!(response.status(), StatusCode::OK);
++        let body = json_body(response).await.to_string();
++        assert!(!body.contains("private body"));
++        assert!(!body.contains("private sidecar"));
++        assert!(!body.contains("private.png"));
++    }
++    let response = request(app(&storage, principal()), "GET", &paths[0], Value::Null).await;
++    let body = json_body(response).await;
++    assert_eq!(body["text"], "private body");
++    assert_eq!(body["sidecar_text"], "private sidecar");
++    assert_eq!(
++        request(
++            app(&storage, metadata),
++            "GET",
++            &format!("/v1/docs/{}/chunks", doc.base.id),
++            Value::Null
++        )
++        .await
++        .status(),
++        StatusCode::FORBIDDEN
++    );
++}
++
++#[tokio::test]
++async fn retry_requires_work_scope_clearance_and_returns_authorized_result() {
++    let storage = StorageClient::new_embedded().await.unwrap();
++    let repo = WorkItemRepository::new(storage.clone());
++    let item = repo.create(work()).await.unwrap();
++    let path = format!("/v1/work-items/{}/retry", item.base.id);
++    for scopes in [
++        vec!["read:work_item".into()],
++        vec!["write:work_item".into()],
++        vec!["read:entity".into(), "write:entity".into()],
++    ] {
++        let mut caller = principal();
++        caller.scopes = scopes;
++        assert_eq!(
++            request(app(&storage, caller), "POST", &path, Value::Null)
++                .await
++                .status(),
++            StatusCode::FORBIDDEN
++        );
++        assert_eq!(
++            repo.get("alpha", &item.base.id)
++                .await
++                .unwrap()
++                .unwrap()
++                .status,
++            WorkItemStatus::Failed
++        );
++    }
++    let mut protected = item.clone();
++    protected.base.security.level = 8;
++    repo.update("alpha", &item.base.id, protected)
++        .await
++        .unwrap();
++    assert_eq!(
++        request(app(&storage, principal()), "POST", &path, Value::Null)
++            .await
++            .status(),
++        StatusCode::FORBIDDEN
++    );
++    assert!(repo.retry_authorized(&item).await.is_err());
++    let mut cleared = principal();
++    cleared.security_level = 10;
++    let response = request(app(&storage, cleared), "POST", &path, Value::Null).await;
++    assert_eq!(response.status(), StatusCode::OK);
++    assert_eq!(json_body(response).await["status"], "runnable");
++}
++
++#[tokio::test]
++async fn read_only_runtime_rejects_mutations_even_for_bypass_principals() {
++    let storage = StorageClient::new_embedded().await.unwrap();
++    let runtime = Arc::new(crate::runtime::RuntimeManager::new_preconfigured(
++        storage.clone(),
++    ));
++    runtime
++        .set_mode_for_tests(crate::runtime::RuntimeMode::ReadOnly)
++        .await;
++    let mut caller = principal();
++    caller.bypass_abac = true;
++    let router = app(&storage, caller).layer(middleware::from_fn_with_state(
++        runtime.clone(),
++        crate::runtime_access::enforce_runtime_access,
++    ));
++    for (method, path) in [
++        ("POST", "/v1/entities"),
++        ("POST", "/v1/entities/upsert"),
++        ("POST", "/v1/entities/batch"),
++        ("PUT", "/v1/entities/missing"),
++        ("DELETE", "/v1/entities/missing"),
++        ("POST", "/v1/entities/missing/restore"),
++        ("POST", "/v1/relationships"),
++        ("POST", "/v1/relationships/upsert"),
++        ("POST", "/v1/relationships/batch"),
++        ("PUT", "/v1/relationships/missing"),
++        ("DELETE", "/v1/relationships/missing"),
++        ("POST", "/v1/relationships/missing/restore"),
++        ("POST", "/v1/timeline"),
++        ("POST", "/v1/timeline/batch"),
++        ("PUT", "/v1/timeline/missing"),
++        ("DELETE", "/v1/timeline/missing"),
++        ("POST", "/v1/timeline/missing/restore"),
++        ("POST", "/v1/docs/ingest"),
++        ("PUT", "/v1/docs/missing"),
++        ("DELETE", "/v1/docs/missing"),
++        ("POST", "/v1/docs/missing/restore"),
++        ("POST", "/v1/sources/ingest"),
++        ("PUT", "/v1/sources/missing"),
++        ("DELETE", "/v1/sources/missing"),
++        ("POST", "/v1/sources/missing/restore"),
++        ("POST", "/v1/docs/batch"),
++        ("POST", "/v1/sources"),
++        ("POST", "/v1/identity/candidates"),
++        ("POST", "/v1/identity/merge"),
++        ("POST", "/v1/assertions"),
++        ("DELETE", "/v1/assertions/missing"),
++        ("POST", "/v1/assertions/missing/restore"),
++        ("PATCH", "/v1/assertions/missing/resolution"),
++        ("POST", "/v1/predicates"),
++        ("POST", "/v1/predicates/aliases/deactivate-hygiene"),
++        ("POST", "/v1/predicates/missing/aliases"),
++        ("PATCH", "/v1/predicates/missing/aliases/missing"),
++        ("POST", "/v1/spaces"),
++        ("PUT", "/v1/spaces/alpha"),
++        ("POST", "/api/v1/spaces/alpha/sources"),
++        ("POST", "/api/v1/spaces/alpha/entities"),
++        ("POST", "/api/v1/spaces/alpha/documents"),
++        ("POST", "/api/v1/predicates/proposals/missing/approve"),
++        ("POST", "/v1/work-items/missing/retry"),
++        ("POST", "/v1/audit/revert/missing"),
++        ("POST", "/v1/system/snapshot/import"),
++    ] {
++        let response = request(router.clone(), method, path, json!({})).await;
++        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
++        assert_eq!(
++            json_body(response).await["code"],
++            "RUNTIME_READ_ONLY",
++            "{method} {path}"
++        );
++    }
++    assert_eq!(
++        request(router.clone(), "POST", "/v1/entities/search", json!({}))
++            .await
++            .status(),
++        StatusCode::OK
++    );
++    assert_eq!(
++        request(router.clone(), "GET", "/v1/spaces", Value::Null)
++            .await
++            .status(),
++        StatusCode::OK
++    );
++    assert_eq!(request(router.clone(), "POST", "/v1/spaces", json!({"name":"alpha", "embedding_provider":"fake", "embedding_model":"fixture", "embedding_dims":3})).await.status(), StatusCode::FORBIDDEN);
++    assert!(SpaceConfigRepository::new(storage.clone())
++        .get_by_space_id("alpha")
++        .await
++        .unwrap()
++        .is_none());
++    runtime
++        .set_mode_for_tests(crate::runtime::RuntimeMode::LocalMemory)
++        .await;
++    assert_eq!(request(router, "POST", "/v1/spaces", json!({"name":"alpha", "embedding_provider":"fake", "embedding_model":"fixture", "embedding_dims":3})).await.status(), StatusCode::CREATED);
++}
++
++#[tokio::test]
++async fn document_chunks_authorize_revision_and_individual_nodes() {
++    use elephant_storage::{DocNodeRepository, DocRevisionRepository};
++    use elephant_types::records::doc_node::{DocNode, NodeRole, TextSpan};
++    use elephant_types::records::doc_revision::{DocRevision, RendererMetadata, RevisionStatus};
++    for protected in ["none", "revision", "node"] {
++        let storage = StorageClient::new_embedded().await.unwrap();
++        let doc = DocRepository::new(storage.clone())
++            .create(doc())
++            .await
++            .unwrap();
++        let mut revision_base = base(TableName::DocRevision);
++        if protected == "revision" {
++            revision_base.security.level = 8;
++        }
++        let revision = DocRevision {
++            base: revision_base,
++            doc: Link::new(doc.base.id.clone()),
++            text: "node text".into(),
++            text_hash: "fixture".into(),
++            renderer: RendererMetadata {
++                name: "fixture".into(),
++                version: "1".into(),
++                config_hash: None,
++            },
++            manifest: None,
++            supersedes: None,
++            status: RevisionStatus::Active,
++            rendered_at: chrono::Utc::now(),
++        };
++        DocRevisionRepository::new(storage.clone())
++            .create(revision.clone())
++            .await
++            .unwrap();
++        let mut node_base = base(TableName::DocNode);
++        if protected == "node" {
++            node_base.security.level = 8;
++        }
++        let node = DocNode {
++            base: node_base,
++            revision: Link::new(revision.base.id),
++            role: NodeRole::Paragraph,
++            span: TextSpan { start: 0, end: 9 },
++            node_key: "fixture".into(),
++            text: Some("private node".into()),
++            parent: None,
++            position: 0,
++            depth: 0,
++            embedding_model: None,
++            collection: None,
++        };
++        DocNodeRepository::new(storage.clone())
++            .create(node)
++            .await
++            .unwrap();
++        let response = request(
++            app(&storage, principal()),
++            "GET",
++            &format!("/v1/docs/{}/chunks", doc.base.id),
++            Value::Null,
++        )
++        .await;
++        if protected == "revision" {
++            assert_eq!(response.status(), StatusCode::FORBIDDEN);
++        } else {
++            assert_eq!(response.status(), StatusCode::OK);
++            let body = json_body(response).await;
++            assert_eq!(
++                body.as_array().unwrap().len(),
++                usize::from(protected == "none")
++            );
++        }
++    }
++}
++
++#[tokio::test]
++async fn work_item_lists_filter_scope_and_classification_in_hot_and_cold_storage() {
++    for cold in [false, true] {
++        let storage = StorageClient::new_embedded().await.unwrap();
++        let repo = WorkItemRepository::new(storage.clone());
++        for protected in [false, true] {
++            let mut item = work();
++            item.base.security.level = if protected { 8 } else { 0 };
++            item.base.updated_at = chrono::Utc::now() - chrono::Duration::days(40);
++            repo.create(item).await.unwrap();
++        }
++        if cold {
++            let moved = elephant_storage::work_retention::archive_terminal_work(
++                &storage,
++                chrono::Utc::now() - chrono::Duration::days(30),
++                10,
++            )
++            .await
++            .unwrap();
++            assert_eq!(moved.items_archived, 2);
++        }
++        for path in [
++            "/api/v1/work_items",
++            "/api/v1/work_items?status=failed",
++            "/api/v1/work_items?status=failed&kind=fixture",
++            "/v1/work-items",
++        ] {
++            for (scopes, level, visible) in [
++                (vec!["read:entity"], 10, 0),
++                (vec!["read:work_item"], 5, 1),
++                (vec!["read:work_item"], 10, 2),
++            ] {
++                let mut caller = principal();
++                caller.scopes = scopes.into_iter().map(str::to_owned).collect();
++                caller.security_level = level;
++                let response = request(app(&storage, caller), "GET", path, Value::Null).await;
++                assert_eq!(response.status(), StatusCode::OK);
++                let body = json_body(response).await;
++                assert_eq!(
++                    body["results"].as_array().unwrap().len(),
++                    visible,
++                    "{path}, cold={cold}"
++                );
++            }
++        }
++    }
++}
++
++#[tokio::test]
++async fn relationship_replacement_requires_both_scopes_and_existing_record_clearance() {
++    let storage = StorageClient::new_embedded().await.unwrap();
++    let repo = RelRepository::new(storage.clone());
++    let mut original = rel();
++    original.base.security.level = 4;
++    let original = repo.create(original).await.unwrap();
++    for (scopes, level) in [
++        (vec!["read:relationship"], 5),
++        (vec!["write:relationship"], 5),
++        (vec!["read:relationship", "write:relationship"], 3),
++    ] {
++        let mut caller = principal();
++        caller.scopes = scopes.into_iter().map(str::to_owned).collect();
++        caller.security_level = level;
++        for (method, path, payload) in [
++            (
++                "PUT",
++                format!("/v1/relationships/{}", original.base.id),
++                json!(original),
++            ),
++            ("POST", "/v1/relationships/upsert".into(), json!(original)),
++            (
++                "POST",
++                "/v1/relationships/batch".into(),
++                json!({"items":[original]}),
++            ),
++        ] {
++            let response = request(app(&storage, caller.clone()), method, &path, payload).await;
++            if path.ends_with("batch") {
++                let body = json_body(response).await;
++                assert!(body["succeeded"].as_array().unwrap().is_empty());
++                assert_eq!(body["failed"].as_array().unwrap().len(), 1);
++            } else {
++                assert_eq!(response.status(), StatusCode::FORBIDDEN);
++            }
++            assert_eq!(
++                repo.get("alpha", &original.base.id).await.unwrap(),
++                Some(original.clone())
++            );
++        }
++    }
++}
++
++#[tokio::test]
++async fn equivalent_relationship_envelopes_are_accepted_on_both_backends() {
++    for storage in [
++        StorageClient::new_embedded().await.unwrap(),
++        StorageClient::new_memory().await.unwrap(),
++    ] {
++        let repo = RelRepository::new(storage.clone());
++        let mut original = rel();
++        original.base.security.labels = vec!["first".into(), "second".into()];
++        original.base.subjects = vec![
++            Link::new(RecordId::new_v4(TableName::Entity)),
++            Link::new(RecordId::new_v4(TableName::Entity)),
++        ];
++        let original = repo.create(original).await.unwrap();
++        let mut replacement = original.clone();
++        replacement.base.security.labels.reverse();
++        replacement.base.security.labels.push("first".into());
++        replacement.base.subjects.reverse();
++        replacement
++            .base
++            .subjects
++            .push(original.base.subjects[0].clone());
++        replacement.confidence = 0.5;
++        let mut caller = principal();
++        caller.security_labels = vec!["first".into(), "second".into()];
++        let response = request(
++            app(&storage, caller),
++            "PUT",
++            &format!("/v1/relationships/{}", original.base.id),
++            json!(replacement),
++        )
++        .await;
++        assert_eq!(response.status(), StatusCode::OK);
++        let saved = repo.get("alpha", &original.base.id).await.unwrap().unwrap();
++        assert_eq!(saved.base.security, original.base.security);
++        assert_eq!(saved.base.subjects, original.base.subjects);
++        assert_eq!(saved.confidence.to_bits(), 0.5_f32.to_bits());
++    }
++}
+diff --git a/bin/elephant-api/src/authz.rs b/bin/elephant-api/src/authz.rs
+index 43c4abd9020c0c64a7ce221ffc7de0acd069f508..2bdd2724d0f0b759a4954e67c4d68ea814a0e7e2 100644
+--- a/bin/elephant-api/src/authz.rs
++++ b/bin/elephant-api/src/authz.rs
+@@ -255,6 +255,35 @@ impl AuthzService {
+         self.evaluate(auth_principal, &record_attrs, required_scope)
+     }
+ 
++    /// Checks operation and tenant authority before looking up an administrative
++    /// record. Record clearance and subject checks are still required afterward.
++    ///
++    /// # Errors
++    ///
++    /// Returns an error when the scope or target space is not granted.
++    #[allow(clippy::unused_self)]
++    pub fn authorize_space_scope(
++        &self,
++        principal: &AuthPrincipal,
++        space_id: &str,
++        scope: &str,
++    ) -> Result<(), AuthzError> {
++        if principal.bypass_abac {
++            return Ok(());
++        }
++        if space_id.is_empty() || principal.space_id.as_deref() != Some(space_id) {
++            return Err(AuthzError::access_denied("space_id mismatch"));
++        }
++        if !principal
++            .scopes
++            .iter()
++            .any(|value| value == scope || value == "*")
++        {
++            return Err(AuthzError::access_denied("missing operation scope"));
++        }
++        Ok(())
++    }
++
+     /// Generic record list filtering.
+     #[must_use]
+     pub fn filter_records<T: HasSecurity>(
+diff --git a/bin/elephant-api/src/lib.rs b/bin/elephant-api/src/lib.rs
+index e68947d9d075bcd302a01540928a0d2f9a3a23fb..31cdd21cb5f3a9befa816d864d11cbe1c0041298 100644
+--- a/bin/elephant-api/src/lib.rs
++++ b/bin/elephant-api/src/lib.rs
+@@ -24,6 +24,10 @@ pub mod mcp;
+ pub mod redaction;
+ pub mod routes;
+ pub mod runtime;
++mod runtime_access;
++
++#[cfg(test)]
++mod authorization_surface_tests;
+ 
+ pub use auth::{jwt_auth, AuthConfig, AuthState, Principal};
+ pub use authz::{AuthzService, AuthzState};
+@@ -227,8 +231,12 @@ pub async fn run_api_with_managed_runtime(
+             );
+         }
+ 
+-        authenticated_routes =
+-            authenticated_routes.layer(middleware::from_fn_with_state(auth_state, jwt_auth));
++        authenticated_routes = authenticated_routes
++            .layer(middleware::from_fn_with_state(
++                runtime.clone(),
++                runtime_access::enforce_runtime_access,
++            ))
++            .layer(middleware::from_fn_with_state(auth_state, jwt_auth));
+ 
+         app = app
+             .merge(routes::health_routes().with_state(health_state))
+@@ -345,8 +353,11 @@ pub async fn run_api_with_client_and_shutdown(
+         storage_client.clone(),
+         authz_service.clone(),
+     ));
+-    let mcp_state = Arc::new(mcp::McpState::new(
++    let runtime = Arc::new(runtime::RuntimeManager::new_preconfigured(
+         storage_client.clone(),
++    ));
++    let mcp_state = Arc::new(mcp::McpState::new_managed(
++        runtime.clone(),
+         auth_config.clone(),
+     ));
+     let mcp_agent_state = mcp_state.clone();
+@@ -382,6 +393,10 @@ pub async fn run_api_with_client_and_shutdown(
+         .merge(routes::truth_slot_routes().with_state(truth_slots_state))
+         .merge(routes::knowledge_view_routes().with_state(knowledge_views_state))
+         .merge(routes::work_item_routes().with_state(work_items_state))
++        .layer(middleware::from_fn_with_state(
++            runtime,
++            runtime_access::enforce_runtime_access,
++        ))
+         .layer(middleware::from_fn_with_state(auth_state, jwt_auth));
+ 
+     let app = Router::new()
+diff --git a/bin/elephant-api/src/redaction.rs b/bin/elephant-api/src/redaction.rs
+index deff7bf648c22c6604dd4c8e9e312250b64f7232..35a8f8bb276ae01870a69b372a3f4cf7ca094732 100644
+--- a/bin/elephant-api/src/redaction.rs
++++ b/bin/elephant-api/src/redaction.rs
+@@ -9,20 +9,29 @@ use crate::auth::Principal as AuthPrincipal;
+ 
+ #[allow(dead_code)]
+ fn has_scope(principal: &AuthPrincipal, scope: &str) -> bool {
+-    principal.scopes.iter().any(|s| s == scope || s == "*")
++    principal.bypass_abac || principal.scopes.iter().any(|s| s == scope || s == "*")
+ }
+ 
+ /// Redacts a doc for the given principal.
+ ///
+-/// If `read:doc:raw` is missing, `doc.text` is redacted.
++/// Without `read:doc:raw`, remove text, sidecar text and attachment locations.
+ #[must_use]
+ #[allow(dead_code)]
+ pub fn redact_doc(principal: &AuthPrincipal, mut doc: Doc) -> RedactionEnvelope<Doc> {
+     let mut redactions: Vec<String> = Vec::new();
+ 
+-    if !has_scope(principal, "read:doc:raw") && !doc.text.is_empty() {
+-        doc.text.clear();
+-        redactions.push("doc.text".to_string());
++    if !has_scope(principal, "read:doc:raw") {
++        if !doc.text.is_empty() {
++            doc.text.clear();
++            redactions.push("doc.text".to_string());
++        }
++        if doc.sidecar_text.take().is_some() {
++            redactions.push("doc.sidecar_text".to_string());
++        }
++        if !doc.media_attachments.is_empty() {
++            doc.media_attachments.clear();
++            redactions.push("doc.media_attachments".to_string());
++        }
+     }
+ 
+     RedactionEnvelope::with_redactions(doc, redactions)
+diff --git a/bin/elephant-api/src/routes/docs.rs b/bin/elephant-api/src/routes/docs.rs
+index 2e30805b3f473ff3045e57156ec0a1ab7d0a37f8..693435228093b657a03ad6be0e81fc82f17cd3c2 100644
+--- a/bin/elephant-api/src/routes/docs.rs
++++ b/bin/elephant-api/src/routes/docs.rs
+@@ -1063,9 +1063,25 @@ fn graph_ingest_is_still_pending(source: Option<&Source>, assertions_count: usiz
+     )
+ }
+ 
++/// POST /v1/docs/search - Search authorized document metadata and content.
++async fn search_docs(
++    State(state): State<Arc<DocsState>>,
++    axum::Extension(principal): axum::Extension<AuthPrincipal>,
++    Json(req): Json<DocSearchRequest>,
++) -> ApiResult<DocSearchResponse> {
++    let Json(mut response) =
++        search_docs_unredacted(State(state), axum::Extension(principal.clone()), Json(req)).await?;
++    response.results = response
++        .results
++        .into_iter()
++        .map(|doc| crate::redact_doc(&principal, doc).data)
++        .collect();
++    Ok(Json(response))
++}
++
+ /// POST /v1/docs/search - Search documents.
+ #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+-async fn search_docs(
++async fn search_docs_unredacted(
+     State(state): State<Arc<DocsState>>,
+     axum::Extension(principal): axum::Extension<AuthPrincipal>,
+     Json(req): Json<DocSearchRequest>,
+@@ -1965,7 +1981,7 @@ async fn get_doc(
+                         }),
+                     )
+                 })?;
+-            Ok(Json(doc))
++            Ok(Json(crate::redact_doc(&principal, doc).data))
+         }
+         Ok(None) => Err((StatusCode::NOT_FOUND, Json(ApiError::not_found("Doc", &id)))),
+         Err(e) => Err((
+@@ -2019,7 +2035,7 @@ async fn update_doc(
+                 })?;
+ 
+             match state.doc_repo.update(&space_id, &rid, doc).await {
+-                Ok(updated) => Ok(Json(updated)),
++                Ok(updated) => Ok(Json(crate::redact_doc(&principal, updated).data)),
+                 Err(e) => Err((
+                     StatusCode::INTERNAL_SERVER_ERROR,
+                     Json(ApiError::internal(e.to_string())),
+@@ -2127,7 +2143,7 @@ async fn restore_doc(
+                 .restore_guarded(&space_id, &rid, &existing)
+                 .await
+             {
+-                Ok(restored) => Ok(Json(restored)),
++                Ok(restored) => Ok(Json(crate::redact_doc(&principal, restored).data)),
+                 Err(elephant_storage::StorageError::Conflict(_)) => Err((
+                     StatusCode::CONFLICT,
+                     Json(ApiError {
+@@ -2204,7 +2220,7 @@ async fn batch_docs(
+         };
+         match result {
+             Ok(doc) => {
+-                succeeded.push(doc);
++                succeeded.push(crate::redact_doc(&principal, doc).data);
+             }
+             Err(e) => {
+                 rollback_prepared_media_assets(&state.storage, &pending_assets).await;
+@@ -2248,7 +2264,7 @@ async fn get_doc_chunks(
+ 
+     state
+         .authz
+-        .authorize_record_read(&principal, &doc, "read:doc")
++        .authorize_record_read(&principal, &doc, "read:doc:raw")
+         .map_err(|e| {
+             (
+                 StatusCode::FORBIDDEN,
+@@ -2270,8 +2286,16 @@ async fn get_doc_chunks(
+     let Some(revision) = revisions.first() else {
+         return Ok(Json(vec![]));
+     };
++    state
++        .authz
++        .authorize_record_read(&principal, revision, "read:doc:raw")
++        .map_err(|e| (StatusCode::FORBIDDEN, Json(ApiError::validation(e.message))))?;
+     match state.node_repo.find_by_revision(&revision.base.id).await {
+-        Ok(nodes) => Ok(Json(nodes)),
++        Ok(nodes) => Ok(Json(state.authz.filter_records(
++            &principal,
++            nodes,
++            "read:doc:raw",
++        ))),
+         Err(e) => Err((
+             StatusCode::INTERNAL_SERVER_ERROR,
+             Json(ApiError::internal(e.to_string())),
+diff --git a/bin/elephant-api/src/routes/relationships.rs b/bin/elephant-api/src/routes/relationships.rs
+index 203bec957f423c3be90112b5544ad024a8daadc4..b9124dd0fb3297644fcb693a3d0d53d5afec7cc7 100644
+--- a/bin/elephant-api/src/routes/relationships.rs
++++ b/bin/elephant-api/src/routes/relationships.rs
+@@ -50,6 +50,12 @@ pub trait RelRepo: Send + Sync {
+         id: &elephant_types::RecordId,
+         authorized: &Rel,
+     ) -> StorageResult<Rel>;
++    async fn replace_authorized(
++        &self,
++        observed: &Rel,
++        proposed: Rel,
++        restore: bool,
++    ) -> StorageResult<Rel>;
+     async fn create(&self, record: Rel) -> StorageResult<Rel>;
+     async fn get(
+         &self,
+@@ -85,6 +91,15 @@ impl RelRepo for RelRepository {
+         Self::restore_guarded(self, space_id, id, authorized).await
+     }
+ 
++    async fn replace_authorized(
++        &self,
++        observed: &Rel,
++        proposed: Rel,
++        restore: bool,
++    ) -> StorageResult<Rel> {
++        Self::replace_authorized(self, observed, proposed, restore).await
++    }
++
+     async fn create(&self, record: Rel) -> StorageResult<Rel> {
+         elephant_storage::Repository::create(self, record).await
+     }
+@@ -154,6 +169,36 @@ impl RelRepo for elephant_storage::MockRelRepository {
+         Self::restore(self, space_id, id).await
+     }
+ 
++    async fn replace_authorized(
++        &self,
++        observed: &Rel,
++        proposed: Rel,
++        restore: bool,
++    ) -> StorageResult<Rel> {
++        let current =
++            Self::get_with_deleted(self, &observed.base.space_id, &observed.base.id).await?;
++        if !current.is_some_and(|current| {
++            current.base.updated_at == observed.base.updated_at
++                && elephant_storage::base_envelope_unchanged(&current.base, &observed.base)
++                && current.subject == observed.subject
++                && current.object == observed.object
++        }) {
++            return Err(StorageError::Conflict(
++                "relationship changed since authorization".into(),
++            ));
++        }
++        if restore {
++            Self::restore(self, &observed.base.space_id, &observed.base.id).await?;
++        }
++        elephant_storage::Repository::update(
++            self,
++            &observed.base.space_id,
++            &observed.base.id,
++            proposed,
++        )
++        .await
++    }
++
+     async fn create(&self, record: Rel) -> StorageResult<Rel> {
+         elephant_storage::Repository::create(self, record).await
+     }
+@@ -589,6 +634,69 @@ async fn get_relationship(
+     }
+ }
+ 
++fn relationship_storage_error(error: StorageError) -> (StatusCode, Json<ApiError>) {
++    if let StorageError::Conflict(message) = error {
++        (
++            StatusCode::CONFLICT,
++            Json(ApiError {
++                code: "CONFLICT".into(),
++                message,
++                details: None,
++            }),
++        )
++    } else {
++        (
++            StatusCode::INTERNAL_SERVER_ERROR,
++            Json(ApiError::internal(error.to_string())),
++        )
++    }
++}
++
++async fn save_authorized_relationship(
++    state: &RelationshipsState,
++    principal: &AuthPrincipal,
++    mut proposed: Rel,
++    observed: Option<&Rel>,
++    restore: bool,
++) -> ApiResult<Rel> {
++    let denied = |message: String| {
++        (
++            StatusCode::FORBIDDEN,
++            Json(ApiError {
++                code: "ACCESS_DENIED".into(),
++                message,
++                details: None,
++            }),
++        )
++    };
++    for record in observed.into_iter().chain(std::iter::once(&proposed)) {
++        state
++            .authz
++            .authorize_record_read(principal, record, "read:relationship")
++            .map_err(|e| denied(e.message))?;
++        state
++            .authz
++            .authorize_record_write(principal, record, "write:relationship")
++            .map_err(|e| denied(e.message))?;
++    }
++    let result = if let Some(existing) = observed {
++        elephant_policy::authorize_ordinary_update(&existing.base, &proposed.base)
++            .map_err(|e| denied(e.to_string()))?;
++        // Equivalent label/subject sets are accepted by the policy. Keep the
++        // authorized representation so storage can compare the envelope exactly.
++        proposed.base.security.clone_from(&existing.base.security);
++        proposed.base.subjects.clone_from(&existing.base.subjects);
++        proposed.base.subjects_state = existing.base.subjects_state;
++        state
++            .rel_repo
++            .replace_authorized(existing, proposed, restore)
++            .await
++    } else {
++        state.rel_repo.create(proposed).await
++    };
++    result.map(Json).map_err(relationship_storage_error)
++}
++
+ /// PUT /v1/relationships/{id} - Update relationship.
+ async fn update_relationship(
+     State(state): State<Arc<RelationshipsState>>,
+@@ -603,52 +711,18 @@ async fn update_relationship(
+             Json(ApiError::validation(e.to_string())),
+         )
+     })?;
+-    match state.rel_repo.get(&space_id, &rid).await {
+-        Ok(Some(existing)) => {
+-            state
+-                .authz
+-                .authorize_record_write(&principal, &existing, "write:relationship")
+-                .map_err(|e| {
+-                    (
+-                        StatusCode::FORBIDDEN,
+-                        Json(ApiError {
+-                            code: e.code,
+-                            message: e.message,
+-                            details: None,
+-                        }),
+-                    )
+-                })?;
+-            state
+-                .authz
+-                .authorize_record_write(&principal, &rel, "write:relationship")
+-                .map_err(|e| {
+-                    (
+-                        StatusCode::FORBIDDEN,
+-                        Json(ApiError {
+-                            code: e.code,
+-                            message: e.message,
+-                            details: None,
+-                        }),
+-                    )
+-                })?;
+-
+-            match state.rel_repo.update(&space_id, &rid, rel).await {
+-                Ok(updated) => Ok(Json(updated)),
+-                Err(e) => Err((
+-                    StatusCode::INTERNAL_SERVER_ERROR,
+-                    Json(ApiError::internal(e.to_string())),
+-                )),
+-            }
+-        }
+-        Ok(None) => Err((
+-            StatusCode::NOT_FOUND,
+-            Json(ApiError::not_found("Relationship", &id)),
+-        )),
+-        Err(e) => Err((
+-            StatusCode::INTERNAL_SERVER_ERROR,
+-            Json(ApiError::internal(e.to_string())),
+-        )),
+-    }
++    let existing = state
++        .rel_repo
++        .get(&space_id, &rid)
++        .await
++        .map_err(relationship_storage_error)?
++        .ok_or_else(|| {
++            (
++                StatusCode::NOT_FOUND,
++                Json(ApiError::not_found("Relationship", &id)),
++            )
++        })?;
++    save_authorized_relationship(&state, &principal, rel, Some(&existing), false).await
+ }
+ 
+ /// DELETE /v1/relationships/{id} - Soft delete relationship.
+@@ -780,35 +854,18 @@ async fn upsert_relationship(
+     Json(rel): Json<Rel>,
+ ) -> ApiResult<Rel> {
+     let space_id = require_space_id(&principal)?;
+-
+     if rel.base.space_id != space_id {
+         return Err((
+             StatusCode::BAD_REQUEST,
+             Json(ApiError::validation("Space ID mismatch")),
+         ));
+     }
+-
+-    state
+-        .authz
+-        .authorize_record_write(&principal, &rel, "write:relationship")
+-        .map_err(|e| {
+-            (
+-                StatusCode::FORBIDDEN,
+-                Json(ApiError {
+-                    code: e.code,
+-                    message: e.message,
+-                    details: None,
+-                }),
+-            )
+-        })?;
+-
+-    match state.rel_repo.upsert(rel).await {
+-        Ok(updated) => Ok(Json(updated)),
+-        Err(e) => Err((
+-            StatusCode::INTERNAL_SERVER_ERROR,
+-            Json(ApiError::internal(e.to_string())),
+-        )),
+-    }
++    let existing = state
++        .rel_repo
++        .get_with_deleted(&space_id, &rel.base.id)
++        .await
++        .map_err(relationship_storage_error)?;
++    save_authorized_relationship(&state, &principal, rel, existing.as_ref(), true).await
+ }
+ 
+ /// POST /v1/relationships/batch - Batch operations.
+@@ -820,65 +877,25 @@ async fn batch_relationships(
+     let space_id = require_space_id(&principal)?;
+     let mut succeeded = Vec::new();
+     let mut failed = Vec::new();
+-
+     for (index, rel) in req.items.into_iter().enumerate() {
+-        let rid = rel.base.id.clone();
+-
+-        let result = match state.rel_repo.get_with_deleted(&space_id, &rid).await {
+-            Ok(Some(existing)) => {
+-                if let Err(e) =
+-                    state
+-                        .authz
+-                        .authorize_record_write(&principal, &existing, "write:relationship")
+-                {
+-                    failed.push(BatchError {
+-                        index,
+-                        error: e.message,
+-                    });
+-                    continue;
+-                }
+-                if let Err(e) =
+-                    state
+-                        .authz
+-                        .authorize_record_write(&principal, &rel, "write:relationship")
+-                {
+-                    failed.push(BatchError {
+-                        index,
+-                        error: e.message,
+-                    });
+-                    continue;
+-                }
+-                if existing.base.deleted_at.is_some() {
+-                    let _ = state.rel_repo.restore(&space_id, &rid).await;
+-                }
+-                state.rel_repo.update(&space_id, &rid, rel).await
+-            }
+-            Ok(None) => {
+-                if let Err(e) =
+-                    state
+-                        .authz
+-                        .authorize_record_write(&principal, &rel, "write:relationship")
+-                {
+-                    failed.push(BatchError {
+-                        index,
+-                        error: e.message,
+-                    });
+-                    continue;
+-                }
+-                state.rel_repo.create(rel).await
++        let result = match state
++            .rel_repo
++            .get_with_deleted(&space_id, &rel.base.id)
++            .await
++        {
++            Ok(existing) => {
++                save_authorized_relationship(&state, &principal, rel, existing.as_ref(), true).await
+             }
+-            Err(e) => Err(e),
++            Err(error) => Err(relationship_storage_error(error)),
+         };
+-
+         match result {
+-            Ok(d) => succeeded.push(d),
+-            Err(e) => failed.push(BatchError {
++            Ok(Json(record)) => succeeded.push(record),
++            Err((_, Json(error))) => failed.push(BatchError {
+                 index,
+-                error: e.to_string(),
++                error: error.message,
+             }),
+         }
+     }
+-
+     Ok(Json(BatchResponse { succeeded, failed }))
+ }
+ 
+diff --git a/bin/elephant-api/src/routes/spaces.rs b/bin/elephant-api/src/routes/spaces.rs
+index 0abfa05ff7ce61ca1612eb39a70f5f5e319f8a0d..b5d1b671d2146f2b646535a1167602974ca28dc5 100644
+--- a/bin/elephant-api/src/routes/spaces.rs
++++ b/bin/elephant-api/src/routes/spaces.rs
+@@ -340,6 +340,9 @@ async fn list_work_items(
+             })?
+     };
+ 
++    let items = state
++        .authz
++        .filter_records(&principal, items, "read:work_item");
+     Ok(Json(WorkItemListResponse {
+         total: items.len(),
+         results: items,
+@@ -481,7 +484,12 @@ async fn list_documents(
+ 
+     let filtered = state.authz.filter_records(&principal, docs, "read:doc");
+ 
+-    Ok(Json(filtered))
++    Ok(Json(
++        filtered
++            .into_iter()
++            .map(|doc| crate::redact_doc(&principal, doc).data)
++            .collect(),
++    ))
+ }
+ 
+ async fn get_document(
+@@ -503,7 +511,7 @@ async fn get_document(
+                 .authz
+                 .authorize_record_read(&principal, &doc, "read:doc")
+                 .map_err(|e| (StatusCode::FORBIDDEN, Json(ApiError::validation(e.message))))?;
+-            Ok(Json(doc))
++            Ok(Json(crate::redact_doc(&principal, doc).data))
+         }
+         Ok(None) => Err((StatusCode::NOT_FOUND, Json(ApiError::not_found("Doc", &id)))),
+         Err(e) => Err((
+@@ -1430,28 +1438,56 @@ struct UpdateSpaceRequest {
+ /// GET /v1/spaces - List all space configs.
+ async fn list_spaces_v1(
+     State(state): State<Arc<SpaceApiState>>,
+-    axum::Extension(_principal): axum::Extension<AuthPrincipal>,
++    axum::Extension(principal): axum::Extension<AuthPrincipal>,
+ ) -> ApiResult<Vec<SpaceConfig>> {
+-    let configs = state
+-        .space_config_repo
+-        .list_all(100, None)
+-        .await
+-        .map_err(|e| {
+-            (
+-                StatusCode::INTERNAL_SERVER_ERROR,
+-                Json(ApiError::internal(e.to_string())),
+-            )
+-        })?;
++    let configs = if principal.bypass_abac {
++        state.space_config_repo.list_all(100, None).await
++    } else {
++        let space_id = require_space_id(&principal)?;
++        state
++            .authz
++            .authorize_space_scope(&principal, &space_id, "read:space_config")
++            .map_err(space_authorization_error)?;
++        state
++            .space_config_repo
++            .get_by_space_id(&space_id)
++            .await
++            .map(|config| config.into_iter().collect())
++    }
++    .map_err(|e| {
++        (
++            StatusCode::INTERNAL_SERVER_ERROR,
++            Json(ApiError::internal(e.to_string())),
++        )
++    })?;
++    Ok(Json(state.authz.filter_records(
++        &principal,
++        configs,
++        "read:space_config",
++    )))
++}
+ 
+-    Ok(Json(configs))
++fn space_authorization_error(error: crate::authz::AuthzError) -> (StatusCode, Json<ApiError>) {
++    (
++        StatusCode::FORBIDDEN,
++        Json(ApiError {
++            code: error.code,
++            message: error.message,
++            details: None,
++        }),
++    )
+ }
+ 
+ /// `GET /v1/spaces/{space_id}` - Get a space config by space ID.
+ async fn get_space_v1(
+     State(state): State<Arc<SpaceApiState>>,
+-    axum::Extension(_principal): axum::Extension<AuthPrincipal>,
++    axum::Extension(principal): axum::Extension<AuthPrincipal>,
+     Path(space_id): Path<String>,
+ ) -> ApiResult<SpaceConfig> {
++    state
++        .authz
++        .authorize_space_scope(&principal, &space_id, "read:space_config")
++        .map_err(space_authorization_error)?;
+     let config = state
+         .space_config_repo
+         .get_by_space_id(&space_id)
+@@ -1469,6 +1505,10 @@ async fn get_space_v1(
+             )
+         })?;
+ 
++    state
++        .authz
++        .authorize_record_read(&principal, &config, "read:space_config")
++        .map_err(space_authorization_error)?;
+     Ok(Json(config))
+ }
+ 
+@@ -1478,6 +1518,10 @@ async fn create_space_v1(
+     axum::Extension(principal): axum::Extension<AuthPrincipal>,
+     Json(req): Json<CreateSpaceRequest>,
+ ) -> Result<(StatusCode, Json<SpaceConfig>), (StatusCode, Json<ApiError>)> {
++    state
++        .authz
++        .authorize_space_scope(&principal, &req.name, "write:space_config")
++        .map_err(space_authorization_error)?;
+     // Check if space already exists
+     if state
+         .space_config_repo
+@@ -1524,6 +1568,14 @@ async fn create_space_v1(
+         skill: req.skill,
+     };
+ 
++    state
++        .authz
++        .authorize_record_write(&principal, &config, "write:space_config")
++        .map_err(space_authorization_error)?;
++    state
++        .authz
++        .authorize_record_read(&principal, &config, "read:space_config")
++        .map_err(space_authorization_error)?;
+     let created = state.space_config_repo.create(config).await.map_err(|e| {
+         (
+             StatusCode::INTERNAL_SERVER_ERROR,
+@@ -1537,10 +1589,14 @@ async fn create_space_v1(
+ /// `PUT /v1/spaces/{space_id}` - Update a space config.
+ async fn update_space_v1(
+     State(state): State<Arc<SpaceApiState>>,
+-    axum::Extension(_principal): axum::Extension<AuthPrincipal>,
++    axum::Extension(principal): axum::Extension<AuthPrincipal>,
+     Path(space_id): Path<String>,
+     Json(req): Json<UpdateSpaceRequest>,
+ ) -> ApiResult<SpaceConfig> {
++    state
++        .authz
++        .authorize_space_scope(&principal, &space_id, "write:space_config")
++        .map_err(space_authorization_error)?;
+     let existing = state
+         .space_config_repo
+         .get_by_space_id(&space_id)
+@@ -1558,6 +1614,14 @@ async fn update_space_v1(
+             )
+         })?;
+ 
++    state
++        .authz
++        .authorize_record_write(&principal, &existing, "write:space_config")
++        .map_err(space_authorization_error)?;
++    state
++        .authz
++        .authorize_record_read(&principal, &existing, "read:space_config")
++        .map_err(space_authorization_error)?;
+     let updated = SpaceConfig {
+         base: existing.base.clone(),
+         embedding_provider: req
+@@ -1573,13 +1637,21 @@ async fn update_space_v1(
+ 
+     let result = state
+         .space_config_repo
+-        .update(&space_id, &existing.base.id, updated)
++        .replace_authorized(&existing, updated)
+         .await
+-        .map_err(|e| {
+-            (
++        .map_err(|e| match e {
++            elephant_storage::StorageError::Conflict(message) => (
++                StatusCode::CONFLICT,
++                Json(ApiError {
++                    code: "CONFLICT".into(),
++                    message,
++                    details: None,
++                }),
++            ),
++            error => (
+                 StatusCode::INTERNAL_SERVER_ERROR,
+-                Json(ApiError::internal(e.to_string())),
+-            )
++                Json(ApiError::internal(error.to_string())),
++            ),
+         })?;
+ 
+     Ok(Json(result))
+diff --git a/bin/elephant-api/src/routes/work_items.rs b/bin/elephant-api/src/routes/work_items.rs
+index 936a893e14c942994e66289b7fc7958f7dad56a4..34d0701ab4b883ee9f6ec7e0abcea4dd1aebbe87 100644
+--- a/bin/elephant-api/src/routes/work_items.rs
++++ b/bin/elephant-api/src/routes/work_items.rs
+@@ -150,7 +150,9 @@ async fn list_work_items(
+         items
+     };
+ 
+-    let filtered = state.authz.filter_records(&principal, items, "read:entity");
++    let filtered = state
++        .authz
++        .filter_records(&principal, items, "read:work_item");
+ 
+     Ok(Json(WorkItemListResponse {
+         total: filtered.len(),
+@@ -198,7 +200,7 @@ async fn get_work_item(
+ 
+     state
+         .authz
+-        .authorize_record_read(&principal, &item, "read:entity")
++        .authorize_record_read(&principal, &item, "read:work_item")
+         .map_err(|e| {
+             (
+                 StatusCode::FORBIDDEN,
+@@ -250,46 +252,62 @@ async fn retry_work_item(
+             )
+         })?;
+ 
+-    if item.status != WorkItemStatus::Failed {
+-        return Err((
+-            StatusCode::BAD_REQUEST,
+-            Json(ApiError::validation(format!(
+-                "Work item status is {:?}, only failed items can be retried",
+-                item.status
+-            ))),
+-        ));
+-    }
+-
+     state
+-        .work_item_repo
+-        .update_status(&space_id, &rid, WorkItemStatus::Runnable)
+-        .await
++        .authz
++        .authorize_record_read(&principal, &item, "read:work_item")
+         .map_err(|e| {
+             (
+-                StatusCode::INTERNAL_SERVER_ERROR,
+-                Json(ApiError::internal(e.to_string())),
++                StatusCode::FORBIDDEN,
++                Json(ApiError {
++                    code: e.code,
++                    message: e.message,
++                    details: None,
++                }),
+             )
+         })?;
+-
+-    let updated = state
+-        .work_item_repo
+-        .get(&space_id, &rid)
+-        .await
++    state
++        .authz
++        .authorize_record_write(&principal, &item, "write:work_item")
+         .map_err(|e| {
+             (
+-                StatusCode::INTERNAL_SERVER_ERROR,
+-                Json(ApiError::internal(e.to_string())),
+-            )
+-        })?
+-        .ok_or_else(|| {
+-            (
+-                StatusCode::INTERNAL_SERVER_ERROR,
+-                Json(ApiError::internal(
+-                    "Work item not found after retry".to_string(),
+-                )),
++                StatusCode::FORBIDDEN,
++                Json(ApiError {
++                    code: e.code,
++                    message: e.message,
++                    details: None,
++                }),
+             )
+         })?;
+ 
++    if item.status != WorkItemStatus::Failed {
++        return Err((
++            StatusCode::BAD_REQUEST,
++            Json(ApiError::validation(format!(
++                "Work item status is {:?}, only failed items can be retried",
++                item.status
++            ))),
++        ));
++    }
++
++    let updated =
++        state
++            .work_item_repo
++            .retry_authorized(&item)
++            .await
++            .map_err(|error| match error {
++                elephant_storage::StorageError::Conflict(message) => (
++                    StatusCode::CONFLICT,
++                    Json(ApiError {
++                        code: "CONFLICT".into(),
++                        message,
++                        details: None,
++                    }),
++                ),
++                error => (
++                    StatusCode::INTERNAL_SERVER_ERROR,
++                    Json(ApiError::internal(error.to_string())),
++                ),
++            })?;
+     Ok(Json(updated))
+ }
+ 
+diff --git a/bin/elephant-api/src/runtime.rs b/bin/elephant-api/src/runtime.rs
+index 82af08a27ba281a0709232b9a13d2a8a897c5446..5faddac163a35a35c495948a2a7182558efb0018 100644
+--- a/bin/elephant-api/src/runtime.rs
++++ b/bin/elephant-api/src/runtime.rs
+@@ -576,6 +576,15 @@ impl RuntimeManager {
+         self.inner.read().await.status.clone()
+     }
+ 
++    #[cfg(test)]
++    pub(crate) async fn set_mode_for_tests(&self, mode: RuntimeMode) {
++        let mut inner = self.inner.write().await;
++        inner.status.runtime_mode = mode;
++        if let Some(config) = &mut inner.config {
++            config.runtime.mode = mode;
++        }
++    }
++
+     /// Full status: readiness plus the conveyor diagnostic (cached, see
+     /// `CONVEYOR_STATUS_TTL`). For status endpoints and startup, never for
+     /// per-request gating.
+diff --git a/bin/elephant-api/src/runtime_access.rs b/bin/elephant-api/src/runtime_access.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..727fd3ef6214aee7c22d28552e28768d6ac67067
+--- /dev/null
++++ b/bin/elephant-api/src/runtime_access.rs
+@@ -0,0 +1,59 @@
++//! Runtime capability enforcement shared by the REST data routes.
++
++use std::sync::Arc;
++
++use axum::{
++    extract::{MatchedPath, Request, State},
++    http::{Method, StatusCode},
++    middleware::Next,
++    response::{IntoResponse, Response},
++    Json,
++};
++
++use crate::routes::entities::ApiError;
++use crate::runtime::{RuntimeManager, RuntimeMode};
++
++fn is_query(method: &Method, path: Option<&str>) -> bool {
++    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
++        return true;
++    }
++    *method == Method::POST
++        && matches!(
++            path,
++            Some(
++                "/v1/entities/search"
++                    | "/v1/entities/batch-get"
++                    | "/v1/relationships/search"
++                    | "/v1/timeline/search"
++                    | "/v1/assertions/search"
++                    | "/v1/docs/search"
++                    | "/v1/sources/search"
++                    | "/v1/system/snapshot/export"
++            )
++        )
++}
++
++pub(crate) async fn enforce_runtime_access(
++    State(runtime): State<Arc<RuntimeManager>>,
++    request: Request,
++    next: Next,
++) -> Response {
++    let path = request
++        .extensions()
++        .get::<MatchedPath>()
++        .map(MatchedPath::as_str);
++    if !is_query(request.method(), path)
++        && runtime.get_readiness().await.runtime_mode == RuntimeMode::ReadOnly
++    {
++        return (
++            StatusCode::FORBIDDEN,
++            Json(ApiError {
++                code: "RUNTIME_READ_ONLY".into(),
++                message: "This runtime permits queries only".into(),
++                details: None,
++            }),
++        )
++            .into_response();
++    }
++    next.run(request).await
++}
+diff --git a/crates/mcp/src/handlers/provenance_tests.rs b/crates/mcp/src/handlers/provenance_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..4e8209db48aedfd78c8077561ea127654bb0de07
+--- /dev/null
++++ b/crates/mcp/src/handlers/provenance_tests.rs
+@@ -0,0 +1,219 @@
++#![allow(clippy::unwrap_used, clippy::too_many_lines)]
++
++use super::{GetProvenanceHandler, ToolContext, ToolHandler};
++use chrono::Utc;
++use elephant_policy::{Clearance, Principal};
++use elephant_storage::{
++    AssertionRepository, AttributeRepository, DocNodeRepository, DocRepository,
++    DocRevisionRepository, RelRepository, Repository, StorageClient,
++};
++use elephant_types::records::assertion::EvidenceSpan;
++use elephant_types::records::attribute::Literal;
++use elephant_types::records::base::{BaseFields, SubjectsState};
++use elephant_types::records::doc_node::{NodeRole, TextSpan};
++use elephant_types::records::doc_revision::{RendererMetadata, RevisionStatus};
++use elephant_types::records::rel::{ClaimStatus, EvidenceRef, TimeBasis};
++use elephant_types::records::{Assertion, Attribute, Doc, DocNode, DocRevision, Rel};
++use elephant_types::{Link, RecordId, TableName};
++use serde_json::json;
++use std::collections::HashSet;
++
++fn base(table: TableName, protected: bool) -> BaseFields {
++    let mut fields = BaseFields::new(RecordId::new_v4(table), "alpha".into(), "fixture".into());
++    fields.subjects_state = SubjectsState::Complete;
++    fields.security.level = if protected { 8 } else { 0 };
++    fields
++}
++
++async fn fixture(case: &str) -> (ToolContext, RecordId) {
++    let storage = StorageClient::new_embedded().await.unwrap();
++    let mut doc = Doc {
++        base: base(TableName::Doc, case == "doc"),
++        title: "Fixture document".into(),
++        text: "évidence".into(),
++        sidecar_text: None,
++        source: None,
++        media_attachments: vec![],
++        rendition_key: "fixture".into(),
++        metadata: json!({}),
++    };
++    if case == "foreign_doc" {
++        doc.base.space_id = "other".into();
++    }
++    if case == "deleted_doc" {
++        doc.base.deleted_at = Some(Utc::now());
++    }
++    DocRepository::new(storage.clone())
++        .create(doc.clone())
++        .await
++        .unwrap();
++    let revision = DocRevision {
++        base: base(TableName::DocRevision, case == "revision"),
++        doc: Link::new(doc.base.id.clone()),
++        text: doc.text,
++        text_hash: "fixture".into(),
++        renderer: RendererMetadata {
++            name: "fixture".into(),
++            version: "1".into(),
++            config_hash: None,
++        },
++        manifest: None,
++        supersedes: None,
++        status: RevisionStatus::Active,
++        rendered_at: Utc::now(),
++    };
++    DocRevisionRepository::new(storage.clone())
++        .create(revision.clone())
++        .await
++        .unwrap();
++    let mut node = DocNode {
++        base: base(TableName::DocNode, case == "node"),
++        revision: Link::new(revision.base.id.clone()),
++        role: NodeRole::Paragraph,
++        span: TextSpan { start: 0, end: 9 },
++        node_key: "fixture".into(),
++        text: Some("private node".into()),
++        parent: None,
++        position: 0,
++        depth: 0,
++        embedding_model: None,
++        collection: None,
++    };
++    if case == "mixed_node_parent" {
++        node.revision = Link::new(RecordId::new_v4(TableName::DocRevision));
++    }
++    if case != "missing_node" {
++        DocNodeRepository::new(storage.clone())
++            .create(node.clone())
++            .await
++            .unwrap();
++    }
++    let span = EvidenceSpan {
++        revision: Link::new(revision.base.id.clone()),
++        node: Some(Link::new(node.base.id.clone())),
++        start: if case == "bad_span" { 1 } else { 0 },
++        end: 9,
++        quote_hash: "fixture".into(),
++    };
++    let mut assertion_value =
++        serde_json::to_value(base(TableName::Assertion, case == "assertion")).unwrap();
++    assertion_value.as_object_mut().unwrap().extend(json!({
++        "subject_text":"fixture subject", "predicate_raw":"related_to", "evidence":span,
++        "observed_at":Utc::now(), "asserted_at":Utc::now(), "assertion_key":"fixture", "confidence":0.8,
++    }).as_object().unwrap().clone());
++    let mut assertion: Assertion = serde_json::from_value(assertion_value).unwrap();
++    if case == "mixed_assertion_parent" {
++        assertion.evidence.revision = Link::new(RecordId::new_v4(TableName::DocRevision));
++    }
++    AssertionRepository::new(storage.clone())
++        .create(assertion.clone())
++        .await
++        .unwrap();
++    let evidence = vec![EvidenceRef {
++        assertion: Link::new(assertion.base.id),
++        span,
++        time_basis: TimeBasis::ObservedAt,
++        time_value: Utc::now(),
++    }];
++    let id = if case.starts_with("attribute") {
++        let attribute = Attribute {
++            base: base(TableName::Attribute, case == "attribute_protected"),
++            subject: Link::new(RecordId::new_v4(TableName::Entity)),
++            attr_type: "fixture".into(),
++            value: Literal::String("private attribute".into()),
++            status: ClaimStatus::Candidate,
++            confidence: 0.8,
++            validity_window: None,
++            evidence,
++            temporal_audit: None,
++        };
++        let id = attribute.base.id.clone();
++        AttributeRepository::new(storage.clone())
++            .create(attribute)
++            .await
++            .unwrap();
++        id
++    } else {
++        let rel = Rel {
++            base: base(TableName::Rel, case == "claim"),
++            subject: Link::new(RecordId::new_v4(TableName::Entity)),
++            object: Link::new(RecordId::new_v4(TableName::Entity)),
++            rel_type: "related_to".into(),
++            status: ClaimStatus::Candidate,
++            confidence: 0.8,
++            validity_window: None,
++            evidence,
++            temporal_audit: None,
++        };
++        let id = rel.base.id.clone();
++        RelRepository::new(storage.clone())
++            .create(rel)
++            .await
++            .unwrap();
++        id
++    };
++    let principal = Principal {
++        space_id: "alpha".into(),
++        scopes: HashSet::from(["*".into()]),
++        clearances: vec![Clearance {
++            policy_id: "default".into(),
++            max_level: 5,
++            labels: HashSet::new(),
++            handling_allow: HashSet::new(),
++        }],
++        subject_allowlist: None,
++        purpose: HashSet::new(),
++    };
++    (ToolContext::new(storage, principal), id)
++}
++
++#[tokio::test]
++async fn provenance_authorizes_each_record_before_returning_the_chain() {
++    for case in [
++        "claim",
++        "assertion",
++        "revision",
++        "node",
++        "doc",
++        "foreign_doc",
++        "deleted_doc",
++        "missing_node",
++        "attribute_protected",
++        "mixed_node_parent",
++        "mixed_assertion_parent",
++    ] {
++        let (ctx, id) = fixture(case).await;
++        let result = GetProvenanceHandler::new(ctx.storage.clone())
++            .execute(&ctx, json!({"id":id.to_string()}))
++            .await;
++        assert!(
++            result.is_err(),
++            "protected or missing {case} cannot yield evidence"
++        );
++    }
++}
++
++#[tokio::test]
++async fn provenance_returns_authorized_rel_and_attribute_evidence() {
++    for case in ["allowed", "attribute_allowed"] {
++        let (ctx, id) = fixture(case).await;
++        let result = GetProvenanceHandler::new(ctx.storage.clone())
++            .execute(&ctx, json!({"id":id.to_string()}))
++            .await
++            .unwrap();
++        assert_eq!(result["ok"], true);
++        assert_eq!(result["data"]["chain"][0]["quote"], "évidence");
++        assert_eq!(result["data"]["evidence_count"], 1);
++    }
++}
++
++#[tokio::test]
++async fn provenance_does_not_slice_inside_a_utf8_character() {
++    let (ctx, id) = fixture("bad_span").await;
++    let result = GetProvenanceHandler::new(ctx.storage.clone())
++        .execute(&ctx, json!({"id":id.to_string()}))
++        .await
++        .unwrap();
++    assert_eq!(result["ok"], true);
++    assert!(result["data"]["chain"][0].get("quote").is_none());
++}
+diff --git a/crates/mcp/src/handlers/spaces.rs b/crates/mcp/src/handlers/spaces.rs
+index 4e7cc2da1322a093df580720a9826b6c3f54e3c2..13de595d4b4d65510e0414f0a690c6473dae1c17 100644
+--- a/crates/mcp/src/handlers/spaces.rs
++++ b/crates/mcp/src/handlers/spaces.rs
+@@ -204,6 +204,16 @@ impl ToolHandler for CreateSpaceHandler {
+                 .map_err(|e| McpError::ExecutionError(e.to_string()));
+         }
+ 
++        if let Err(reason) =
++            ctx.authz
++                .authorize_record_read(&ctx.principal, &config, "read:space_config")
++        {
++            let response: ToolResponse<()> =
++                ToolResponse::error(format!("Access denied: {reason}"));
++            return serde_json::to_value(response)
++                .map_err(|e| McpError::ExecutionError(e.to_string()));
++        }
++
+         match self.repo.get_by_space_id(&input.name).await {
+             Ok(Some(_)) => {
+                 let response: ToolResponse<()> =
+@@ -480,22 +490,30 @@ impl ToolHandler for UpdateSpaceHandler {
+                 .map_err(|e| McpError::ExecutionError(e.to_string()));
+         }
+ 
++        if let Err(reason) =
++            ctx.authz
++                .authorize_record_read(&ctx.principal, &existing, "read:space_config")
++        {
++            let response: ToolResponse<()> =
++                ToolResponse::error(format!("Access denied: {reason}"));
++            return serde_json::to_value(response)
++                .map_err(|e| McpError::ExecutionError(e.to_string()));
++        }
+         let policy = policy_from_input(&input.config)?;
+         let dims = i32::try_from(policy.dims)
+             .map_err(|_| McpError::InvalidParameters("embedding_dims out of range".to_string()))?;
+ 
+         let updated = SpaceConfig {
+-            base: existing.base,
++            base: existing.base.clone(),
+             embedding_provider: policy.provider,
+             embedding_model: policy.model,
+             embedding_dims: dims,
+-            purpose: existing.purpose,
+-            skill: existing.skill,
++            purpose: existing.purpose.clone(),
++            skill: existing.skill.clone(),
+         };
+-        let id = updated.base.id.clone();
+         let saved = self
+             .repo
+-            .update(&input.space_id, &id, updated)
++            .replace_authorized(&existing, updated)
+             .await
+             .map_err(|e| McpError::ExecutionError(e.to_string()))?;
+ 
+@@ -503,3 +521,48 @@ impl ToolHandler for UpdateSpaceHandler {
+         serde_json::to_value(response).map_err(|e| McpError::ExecutionError(e.to_string()))
+     }
+ }
++
++#[cfg(test)]
++mod authorization_tests {
++    #![allow(clippy::unwrap_used)]
++    use super::*;
++    use elephant_policy::{Clearance, Principal};
++    use std::collections::HashSet;
++
++    #[tokio::test]
++    async fn create_space_requires_read_and_write_before_mutation() {
++        for scopes in [
++            vec!["write:space_config"],
++            vec!["read:space_config"],
++            vec!["read:space_config", "write:space_config"],
++        ] {
++            let allowed = scopes.len() == 2;
++            let storage = StorageClient::new_embedded().await.unwrap();
++            let principal = Principal {
++                space_id: "alpha".into(),
++                scopes: scopes.into_iter().map(str::to_owned).collect(),
++                clearances: vec![Clearance {
++                    policy_id: "default".into(),
++                    max_level: 5,
++                    labels: HashSet::new(),
++                    handling_allow: HashSet::new(),
++                }],
++                subject_allowlist: None,
++                purpose: HashSet::new(),
++            };
++            let ctx = ToolContext::new(storage.clone(), principal);
++            let result = CreateSpaceHandler::new(storage.clone()).execute(&ctx, json!({
++                "name":"alpha", "config": {"embedding_provider":"fake", "embedding_model":"fixture", "embedding_dims":3}
++            })).await.unwrap();
++            assert_eq!(result["ok"], allowed);
++            assert_eq!(
++                SpaceConfigRepository::new(storage)
++                    .get_by_space_id("alpha")
++                    .await
++                    .unwrap()
++                    .is_some(),
++                allowed
++            );
++        }
++    }
++}
+diff --git a/crates/mcp/src/handlers/system.rs b/crates/mcp/src/handlers/system.rs
+index fae1122e1c1fe6b7c6ee6266f3e868d68f8ff794..86324ff30962dbadcc770fe055bfc36bdc810cad 100644
+--- a/crates/mcp/src/handlers/system.rs
++++ b/crates/mcp/src/handlers/system.rs
+@@ -1916,6 +1916,9 @@ impl ToolHandler for GetProvenanceHandler {
+                 .await
+                 .map_err(|e| McpError::ExecutionError(format!("Failed to get rel: {e}")))?
+                 .ok_or_else(|| McpError::ExecutionError(format!("Rel not found: {id_str}")))?;
++            ctx.authz
++                .authorize_record_read(&ctx.principal, &rel, "read:relationship")
++                .map_err(McpError::ExecutionError)?;
+             (
+                 json!({
+                     "type": "rel",
+@@ -1939,6 +1942,9 @@ impl ToolHandler for GetProvenanceHandler {
+                 .ok_or_else(|| {
+                     McpError::ExecutionError(format!("Attribute not found: {id_str}"))
+                 })?;
++            ctx.authz
++                .authorize_record_read(&ctx.principal, &attr, "read:entity")
++                .map_err(McpError::ExecutionError)?;
+             (
+                 json!({
+                     "type": "attribute",
+@@ -1965,6 +1971,54 @@ impl ToolHandler for GetProvenanceHandler {
+ 
+         let mut chain = Vec::new();
+         for evidence_ref in &evidence_refs {
++            // Resolve and authorize the complete chain before emitting even its
++            // reference metadata. Missing or protected lineage is not partial success.
++            let assertion = assertion_repo
++                .get(&space_id, evidence_ref.assertion.id())
++                .await
++                .map_err(|e| McpError::ExecutionError(e.to_string()))?
++                .ok_or_else(|| McpError::ExecutionError("Evidence unavailable".into()))?;
++            ctx.authz
++                .authorize_record_read(&ctx.principal, &assertion, "read:assertion")
++                .map_err(McpError::ExecutionError)?;
++            let revision = revision_repo
++                .get(&space_id, evidence_ref.span.revision.id())
++                .await
++                .map_err(|e| McpError::ExecutionError(e.to_string()))?
++                .ok_or_else(|| McpError::ExecutionError("Evidence unavailable".into()))?;
++            ctx.authz
++                .authorize_record_read(&ctx.principal, &revision, "read:doc:raw")
++                .map_err(McpError::ExecutionError)?;
++            if assertion.evidence.revision.id() != &revision.base.id {
++                return Err(McpError::ExecutionError("Evidence lineage mismatch".into()));
++            }
++            let doc = doc_repo
++                .get(&space_id, revision.doc.id())
++                .await
++                .map_err(|e| McpError::ExecutionError(e.to_string()))?
++                .ok_or_else(|| McpError::ExecutionError("Evidence unavailable".into()))?;
++            ctx.authz
++                .authorize_record_read(&ctx.principal, &doc, "read:doc:metadata")
++                .map_err(McpError::ExecutionError)?;
++            ctx.authz
++                .authorize_record_read(&ctx.principal, &doc, "read:doc:raw")
++                .map_err(McpError::ExecutionError)?;
++            let node = if let Some(node_link) = &evidence_ref.span.node {
++                let node = node_repo
++                    .get(&space_id, node_link.id())
++                    .await
++                    .map_err(|e| McpError::ExecutionError(e.to_string()))?
++                    .ok_or_else(|| McpError::ExecutionError("Evidence unavailable".into()))?;
++                ctx.authz
++                    .authorize_record_read(&ctx.principal, &node, "read:doc:raw")
++                    .map_err(McpError::ExecutionError)?;
++                if node.revision.id() != &revision.base.id {
++                    return Err(McpError::ExecutionError("Evidence lineage mismatch".into()));
++                }
++                Some(node)
++            } else {
++                None
++            };
+             let mut link = json!({
+                 "assertion_id": evidence_ref.assertion.id().to_string(),
+                 "time_basis": format!("{:?}", evidence_ref.time_basis),
+@@ -1974,74 +2028,37 @@ impl ToolHandler for GetProvenanceHandler {
+                     "start": evidence_ref.span.start,
+                     "end": evidence_ref.span.end,
+                     "quote_hash": evidence_ref.span.quote_hash,
+-                }
+-            });
+-
+-            // Get the assertion
+-            if let Ok(Some(assertion)) = assertion_repo
+-                .get(&space_id, evidence_ref.assertion.id())
+-                .await
+-            {
+-                link["assertion"] = json!({
++                },
++                "assertion": {
+                     "subject_text": assertion.subject_text,
+                     "predicate_raw": assertion.predicate_raw,
+                     "object_text": assertion.object_text,
+                     "confidence": assertion.confidence,
+                     "resolution_status": format!("{:?}", assertion.resolution_status),
+                     "observed_at": assertion.observed_at.to_rfc3339(),
+-                });
+-            }
+-
+-            // Get the doc_node if present
+-            if let Some(ref node_link) = evidence_ref.span.node {
+-                if let Ok(Some(node)) = node_repo.get(&space_id, node_link.id()).await {
+-                    link["node"] = json!({
+-                        "id": node.base.id.to_string(),
+-                        "role": node.role.to_string(),
+-                        "node_key": node.node_key,
+-                        "text": node.text,
+-                    });
+-                }
+-            }
+-
+-            // Get the revision and the source document
+-            if let Ok(Some(revision)) = revision_repo
+-                .get(&space_id, evidence_ref.span.revision.id())
+-                .await
+-            {
+-                // Extract the quote from revision text using span offsets
+-                let start = evidence_ref.span.start as usize;
+-                let end = evidence_ref.span.end as usize;
+-                let quote = if end <= revision.text.len() && start <= end {
+-                    Some(revision.text[start..end].to_string())
+-                } else {
+-                    None
+-                };
+-
+-                link["revision"] = json!({
++                },
++                "revision": {
+                     "id": revision.base.id.to_string(),
+                     "renderer": revision.renderer.name,
+                     "renderer_version": revision.renderer.version,
+                     "status": format!("{:?}", revision.status),
+                     "rendered_at": revision.rendered_at.to_rfc3339(),
+-                });
+-
+-                if let Some(q) = quote {
+-                    link["quote"] = json!(q);
+-                }
+-
+-                // Get the parent doc
+-                if let Ok(Some(doc)) = doc_repo.get(&space_id, revision.doc.id()).await {
+-                    link["doc"] = json!({
+-                        "id": doc.base.id.to_string(),
+-                        "title": doc.title,
+-                    });
+-                    if let Some(ref source) = doc.source {
+-                        link["doc"]["source_id"] = json!(source.id().to_string());
+-                    }
+-                }
++                },
++                "doc": { "id": doc.base.id.to_string(), "title": doc.title },
++            });
++            if let Some(node) = node {
++                link["node"] = json!({ "id": node.base.id.to_string(), "role": node.role.to_string(),
++                    "node_key": node.node_key, "text": node.text });
++            }
++            // str::get also validates UTF-8 boundaries without panicking.
++            let start = evidence_ref.span.start as usize;
++            let end = evidence_ref.span.end as usize;
++            if let Some(quote) = revision.text.get(start..end) {
++                link["quote"] = json!(quote);
++            }
++            if let Some(source) = doc.source {
++                link["doc"]["source_id"] = json!(source.id().to_string());
+             }
+-
+             chain.push(link);
+         }
+ 
+@@ -2054,6 +2071,10 @@ impl ToolHandler for GetProvenanceHandler {
+     }
+ }
+ 
++#[cfg(test)]
++#[path = "provenance_tests.rs"]
++mod provenance_tests;
++
+ #[cfg(test)]
+ mod tests {
+     #![allow(
+diff --git a/crates/storage/src/rel_repository.rs b/crates/storage/src/rel_repository.rs
+index 276f1970b259ade61cb7f50d1a98748a3367b3f2..b08b74da6c0925aa3bb415121452e697fc81d8ff 100644
+--- a/crates/storage/src/rel_repository.rs
++++ b/crates/storage/src/rel_repository.rs
+@@ -183,6 +183,78 @@ pub struct RelRepository {
+ }
+ 
+ impl RelRepository {
++    /// Replaces or restores a relationship under the authorized pre-state.
++    /// Both endpoint and envelope comparisons occur in the same mutation.
++    ///
++    /// # Errors
++    ///
++    /// Returns a conflict when the observed relationship is no longer current.
++    pub async fn replace_authorized(
++        &self,
++        observed: &Rel,
++        mut proposed: Rel,
++        restore: bool,
++    ) -> StorageResult<Rel> {
++        let conflict = || crate::lifecycle_guard::guard_conflict("Rel", &observed.base.id);
++        if observed.base.id != proposed.base.id
++            || observed.base.space_id != proposed.base.space_id
++            || observed.base.security != proposed.base.security
++            || observed.base.subjects != proposed.base.subjects
++            || observed.base.subjects_state != proposed.base.subjects_state
++            || (!restore && observed.base.deleted_at.is_some())
++        {
++            return Err(conflict());
++        }
++        proposed.base.deleted_at = if restore {
++            None
++        } else {
++            observed.base.deleted_at
++        };
++        proposed.base.updated_at = Utc::now();
++        if let Some(store) = self.client.embedded_store() {
++            return store
++                .mutate(|tx| {
++                    let current = tx
++                        .get::<Rel>(&observed.base.space_id, &observed.base.id, true)?
++                        .ok_or_else(conflict)?;
++                    if current.base.updated_at != observed.base.updated_at
++                        || !crate::lifecycle_guard::base_envelope_unchanged(
++                            &current.base,
++                            &observed.base,
++                        )
++                        || current.subject != observed.subject
++                        || current.object != observed.object
++                    {
++                        return Err(conflict());
++                    }
++                    Ok(tx.replace(proposed)?)
++                })
++                .await;
++        }
++        let (condition, mut bindings) =
++            crate::lifecycle_guard::base_envelope_condition(&observed.base)?;
++        bindings.extend(crate::bindings! {
++            "id" => crate::surreal::thing_from_record_id(&observed.base.id),
++            "space" => observed.base.space_id.clone(),
++            "version" => crate::surreal::datetime_from_chrono(observed.base.updated_at),
++            "old_subject" => crate::surreal::thing_from_record_id(observed.subject.id()),
++            "old_object" => crate::surreal::thing_from_record_id(observed.object.id()),
++            "subject" => crate::surreal::thing_from_record_id(proposed.subject.id()),
++            "object" => crate::surreal::thing_from_record_id(proposed.object.id()),
++            "record" => crate::surreal::rel_to_value(&proposed)?,
++        });
++        // The second statement runs only when the guarded replacement matched.
++        // A failed guard cannot repoint endpoints or restore a tombstone.
++        let mut response = self.client.query_bind_checked(
++            &format!("BEGIN TRANSACTION; LET $changed = (UPDATE $id MERGE $record WHERE space_id = $space AND updated_at = $version AND {condition} AND `in` = $old_subject AND `out` = $old_object RETURN id); IF array::len($changed) > 0 {{ UPDATE $id SET `in` = $subject, `out` = $object RETURN {REL_PROJECTION}; }} ELSE {{ RETURN []; }}; COMMIT TRANSACTION;"),
++            bindings,
++        ).await?;
++        let rows: Vec<RelDb> = response
++            .take(1)
++            .map_err(|error| StorageError::QueryError(error.to_string()))?;
++        Rel::try_from(rows.into_iter().next().ok_or_else(conflict)?)
++    }
++
+     /// Restores a relationship only if it is unchanged since `authorized`, the row
+     /// the caller's authorization was decided on.
+     ///
+@@ -422,14 +494,16 @@ impl Repository<Rel> for RelRepository {
+         }
+ 
+         let query = r"
+-            RELATE $subject->$rel_id->$object
+-            CONTENT $record;
++            BEGIN TRANSACTION;
++            LET $existing = SELECT VALUE id FROM ONLY $rel_id;
++            IF $existing != NONE { THROW 'relationship_identity_exists'; };
++            RELATE $subject->$rel_id->$object CONTENT $record;
++            COMMIT TRANSACTION;
+         ";
+ 
+         let record_value = crate::surreal::rel_to_value(&record)?;
+-        let mut create_response = self
+-            .client
+-            .query_bind(
++        self.client
++            .query_bind_checked(
+                 query,
+                 crate::bindings! {
+                     "record" => record_value,
+@@ -438,11 +512,14 @@ impl Repository<Rel> for RelRepository {
+                     "rel_id" => crate::surreal::thing_from_record_id(&record.base.id),
+                 },
+             )
+-            .await?;
+-
+-        let _: surrealdb::Value = create_response.take(0).map_err(|e| {
+-            StorageError::classify_query_error(format!("Failed to create rel: {e}"))
+-        })?;
++            .await
++            .map_err(|error| {
++                if error.to_string().contains("relationship_identity_exists") {
++                    StorageError::Conflict("Relationship identity already exists".into())
++                } else {
++                    error
++                }
++            })?;
+ 
+         Ok(record)
+     }
+@@ -1945,4 +2022,94 @@ mod tests {
+         let repo = RelRepository::new(StorageClient::new_embedded().await.unwrap());
+         assert_restore_guarded_lifecycle(&repo, "test_space", create_test_rel("works_at")).await;
+     }
++    async fn exercise_authorized_replacement(repo: &RelRepository) {
++        let original = repo.create(create_test_rel("guarded")).await.unwrap();
++        let mut proposed = original.clone();
++        proposed.confidence = 0.5;
++        let updated = repo
++            .replace_authorized(&original, proposed.clone(), false)
++            .await
++            .unwrap();
++        assert_eq!(updated.confidence.to_bits(), 0.5_f32.to_bits());
++        assert!(matches!(
++            repo.replace_authorized(&original, proposed, false).await,
++            Err(StorageError::Conflict(_))
++        ));
++        let mut classified = updated.clone();
++        classified.base.security.level = 5;
++        let classified = repo
++            .update("test_space", &updated.base.id, classified)
++            .await
++            .unwrap();
++        assert!(matches!(
++            repo.replace_authorized(&updated, updated.clone(), false)
++                .await,
++            Err(StorageError::Conflict(_))
++        ));
++        repo.delete("test_space", &classified.base.id)
++            .await
++            .unwrap();
++        let tombstone = repo
++            .get_with_deleted("test_space", &classified.base.id)
++            .await
++            .unwrap()
++            .unwrap();
++        let mut lower = tombstone.clone();
++        lower.base.security.level = 0;
++        assert!(matches!(
++            repo.replace_authorized(&tombstone, lower, true).await,
++            Err(StorageError::Conflict(_))
++        ));
++        assert!(repo
++            .get_with_deleted("test_space", &classified.base.id)
++            .await
++            .unwrap()
++            .unwrap()
++            .base
++            .deleted_at
++            .is_some());
++        let restored = repo
++            .replace_authorized(&tombstone, tombstone.clone(), true)
++            .await
++            .unwrap();
++        assert!(restored.base.deleted_at.is_none());
++        let mut repointed = restored.clone();
++        repointed.object = Link::new(RecordId::new_v4(TableName::Entity));
++        repo.update("test_space", &repointed.base.id.clone(), repointed)
++            .await
++            .unwrap();
++        assert!(matches!(
++            repo.replace_authorized(&restored, restored.clone(), false)
++                .await,
++            Err(StorageError::Conflict(_))
++        ));
++        let before = repo
++            .get("test_space", &restored.base.id)
++            .await
++            .unwrap()
++            .unwrap();
++        let mut collision = before.clone();
++        collision.base.space_id = "foreign".into();
++        assert!(repo.create(collision).await.is_err());
++        assert_eq!(
++            repo.get("test_space", &restored.base.id)
++                .await
++                .unwrap()
++                .unwrap(),
++            before
++        );
++    }
++
++    #[tokio::test]
++    async fn authorized_replacement_embedded() {
++        exercise_authorized_replacement(&RelRepository::new(
++            StorageClient::new_embedded().await.unwrap(),
++        ))
++        .await;
++    }
++
++    #[tokio::test]
++    async fn authorized_replacement_surreal() {
++        exercise_authorized_replacement(&setup_test_repo().await).await;
++    }
+ }
+diff --git a/crates/storage/src/space_config_repository.rs b/crates/storage/src/space_config_repository.rs
+index d1d9cb69b83f84a2a2f467ce35961e1f0f4b61b6..e93ad5db0f8df8aac69734cafc721f6365e68264 100644
+--- a/crates/storage/src/space_config_repository.rs
++++ b/crates/storage/src/space_config_repository.rs
+@@ -115,6 +115,61 @@ pub struct SpaceConfigRepository {
+ }
+ 
+ impl SpaceConfigRepository {
++    /// Replaces a configuration while its authorized envelope is still current.
++    ///
++    /// # Errors
++    ///
++    /// Returns a conflict if identity, envelope, lifecycle or version changed.
++    pub async fn replace_authorized(
++        &self,
++        observed: &SpaceConfig,
++        mut proposed: SpaceConfig,
++    ) -> StorageResult<SpaceConfig> {
++        let conflict = || crate::lifecycle_guard::guard_conflict("SpaceConfig", &observed.base.id);
++        if observed.base.id != proposed.base.id
++            || observed.base.space_id != proposed.base.space_id
++            || observed.base.deleted_at.is_some()
++            || !crate::lifecycle_guard::base_envelope_unchanged(&observed.base, &proposed.base)
++        {
++            return Err(conflict());
++        }
++        proposed.base.updated_at = Utc::now();
++        if let Some(store) = self.client.embedded_store() {
++            return store
++                .mutate(|tx| {
++                    let current = tx
++                        .get::<SpaceConfig>(&observed.base.space_id, &observed.base.id, false)?
++                        .ok_or_else(conflict)?;
++                    if current.base.updated_at != observed.base.updated_at
++                        || !crate::lifecycle_guard::base_envelope_unchanged(
++                            &current.base,
++                            &observed.base,
++                        )
++                    {
++                        return Err(conflict());
++                    }
++                    Ok(tx.replace(proposed)?)
++                })
++                .await;
++        }
++        let (condition, mut bindings) =
++            crate::lifecycle_guard::base_envelope_condition(&observed.base)?;
++        bindings.extend(crate::bindings! {
++            "id" => crate::surreal::thing_from_record_id(&observed.base.id),
++            "space" => observed.base.space_id.clone(),
++            "version" => crate::surreal::datetime_from_chrono(observed.base.updated_at),
++            "record" => crate::surreal::space_config_to_value(&proposed)?,
++        });
++        let mut response = self.client.query_bind_checked(
++            &format!("UPDATE $id CONTENT $record WHERE space_id = $space AND updated_at = $version AND {condition} RETURN {SPACE_CONFIG_PROJECTION}"),
++            bindings,
++        ).await?;
++        let rows: Vec<SpaceConfigDb> = response
++            .take(0)
++            .map_err(|error| StorageError::QueryError(error.to_string()))?;
++        SpaceConfig::try_from(rows.into_iter().next().ok_or_else(conflict)?)
++    }
++
+     /// Creates a new space config repository.
+     #[must_use]
+     pub const fn new(client: StorageClient) -> Self {
+@@ -546,4 +601,50 @@ mod tests {
+             matches!(err, StorageError::Conflict(msg) if msg.contains("Duplicate space_config"))
+         );
+     }
++    async fn exercise_authorized_space_replacement(client: StorageClient) {
++        let repo = SpaceConfigRepository::new(client);
++        let initial = repo
++            .create(create_test_space_config("alpha"))
++            .await
++            .unwrap();
++        let mut proposed = initial.clone();
++        proposed.purpose = Some("new purpose".into());
++        let saved = repo
++            .replace_authorized(&initial, proposed.clone())
++            .await
++            .unwrap();
++        assert_eq!(saved.purpose, proposed.purpose);
++        assert!(matches!(
++            repo.replace_authorized(&initial, proposed).await,
++            Err(StorageError::Conflict(_))
++        ));
++        let mut protected = saved.clone();
++        protected.base.security.level = 5;
++        repo.update("alpha", &saved.base.id, protected.clone())
++            .await
++            .unwrap();
++        assert!(matches!(
++            repo.replace_authorized(&saved, saved.clone()).await,
++            Err(StorageError::Conflict(_))
++        ));
++        assert_eq!(
++            repo.get("alpha", &saved.base.id)
++                .await
++                .unwrap()
++                .unwrap()
++                .base
++                .security,
++            protected.base.security
++        );
++    }
++
++    #[tokio::test]
++    async fn authorized_space_replacement_embedded() {
++        exercise_authorized_space_replacement(StorageClient::new_embedded().await.unwrap()).await;
++    }
++
++    #[tokio::test]
++    async fn authorized_space_replacement_surreal() {
++        exercise_authorized_space_replacement(StorageClient::new_memory().await.unwrap()).await;
++    }
+ }
+diff --git a/crates/storage/src/work_item_repository.rs b/crates/storage/src/work_item_repository.rs
+index aeb5820a5416251ddf061e3534a62783a7265446..e6102ea3c84f0a69a500b8e07582a9784f8d00e0 100644
+--- a/crates/storage/src/work_item_repository.rs
++++ b/crates/storage/src/work_item_repository.rs
+@@ -357,6 +357,34 @@ impl WorkItemRepository {
+         Ok(())
+     }
+ 
++    /// Retries exactly the failed work item authorized by a request boundary.
++    /// The guard and hot/cold reactivation are one transaction.
++    ///
++    /// # Errors
++    ///
++    /// Returns a conflict if the authorized pre-state changed or is not failed.
++    pub async fn retry_authorized(&self, observed: &WorkItem) -> StorageResult<WorkItem> {
++        let conflict = || crate::lifecycle_guard::guard_conflict("WorkItem", &observed.base.id);
++        if observed.status != WorkItemStatus::Failed || observed.base.deleted_at.is_some() {
++            return Err(conflict());
++        }
++        let mut retry = observed.clone();
++        retry.status = WorkItemStatus::Runnable;
++        retry.leased_by = None;
++        retry.lease_expires_at = None;
++        retry.run_after = None;
++        crate::work_retention::update_item_guarded(
++            &self.client,
++            &observed.base.space_id,
++            &observed.base.id,
++            retry,
++            Some(WorkItemStatus::Failed),
++            Some(observed),
++        )
++        .await?
++        .ok_or_else(conflict)
++    }
++
+     /// Finds a work item by idempotency key.
+     ///
+     /// # Errors
+diff --git a/crates/storage/src/work_retention.rs b/crates/storage/src/work_retention.rs
+index 5dd2a1c99c6dd2539c06157c86721d42b0d37235..0369162efeb9a8819b258c9c9e0c73ec1fab8bfb 100644
+--- a/crates/storage/src/work_retention.rs
++++ b/crates/storage/src/work_retention.rs
+@@ -150,11 +150,22 @@ pub(crate) const RETIRE_ARCHIVE_SQL: &str =
+ 
+ /// Restore and replace in the same transaction, including conditional retries.
+ pub(crate) async fn update_item(
++    client: &StorageClient,
++    space: &str,
++    id: &RecordId,
++    record: WorkItem,
++    expected: Option<WorkItemStatus>,
++) -> StorageResult<Option<WorkItem>> {
++    update_item_guarded(client, space, id, record, expected, None).await
++}
++
++pub(crate) async fn update_item_guarded(
+     client: &StorageClient,
+     space: &str,
+     id: &RecordId,
+     mut record: WorkItem,
+     expected: Option<WorkItemStatus>,
++    observed: Option<&WorkItem>,
+ ) -> StorageResult<Option<WorkItem>> {
+     record.base.id = id.clone();
+     record.base.space_id = space.to_string();
+@@ -170,6 +181,16 @@ pub(crate) async fn update_item(
+                 };
+                 if existing.base.deleted_at.is_some()
+                     || expected.is_some_and(|status| existing.status != status)
++                    || observed.is_some_and(|old| {
++                        old.base.updated_at != existing.base.updated_at
++                            || !crate::lifecycle_guard::base_envelope_unchanged(
++                                &old.base,
++                                &existing.base,
++                            )
++                            || old.kind != existing.kind
++                            || old.payload != existing.payload
++                            || old.idempotency_key != existing.idempotency_key
++                    })
+                 {
+                     return Ok(None);
+                 }
+@@ -186,8 +207,8 @@ pub(crate) async fn update_item(
+             .await;
+     }
+     let mut response = client.query_bind_checked(
+-        &format!("BEGIN TRANSACTION; LET $hot = (SELECT * FROM ONLY $id WHERE space_id = $space); LET $cold = (SELECT * FROM ONLY $archive WHERE space_id = $space); LET $old = IF $hot != NONE {{ $hot }} ELSE {{ $cold.record }}; LET $changed = IF $old != NONE AND $old.deleted_at IS NONE AND ($expected = NONE OR $old.status = $expected) {{ UPSERT $id CONTENT $record; {RETIRE_ARCHIVE_SQL} RETURN true; }} ELSE {{ RETURN false; }}; RETURN $changed; COMMIT TRANSACTION;"),
+-        crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "archive" => crate::surreal::thing_from_record_id(&archive_id(id)), "space" => space, "expected" => expected.map_or(surrealdb::sql::Value::None, |v| v.to_string().into()), "record" => WorkItemRepository::work_item_to_value(&record)? }
++        &format!("BEGIN TRANSACTION; LET $hot = (SELECT * FROM ONLY $id WHERE space_id = $space); LET $cold = (SELECT * FROM ONLY $archive WHERE space_id = $space); LET $old = IF $hot != NONE {{ $hot }} ELSE {{ $cold.record }}; LET $changed = IF $old != NONE AND $old.deleted_at IS NONE AND ($expected = NONE OR $old.status = $expected) AND ($observed = NONE OR ($old.updated_at = $observed.updated_at AND $old.security = $observed.security AND $old.subjects = $observed.subjects AND $old.subjects_state = $observed.subjects_state AND $old.kind = $observed.kind AND $old.payload = $observed.payload AND $old.idempotency_key = $observed.idempotency_key)) {{ UPSERT $id CONTENT $record; {RETIRE_ARCHIVE_SQL} RETURN true; }} ELSE {{ RETURN false; }}; RETURN $changed; COMMIT TRANSACTION;"),
++        crate::bindings! { "id" => crate::surreal::thing_from_record_id(id), "archive" => crate::surreal::thing_from_record_id(&archive_id(id)), "space" => space, "expected" => expected.map_or(surrealdb::sql::Value::None, |v| v.to_string().into()), "record" => WorkItemRepository::work_item_to_value(&record)?, "observed" => observed.map(WorkItemRepository::work_item_to_value).transpose()?.unwrap_or(surrealdb::sql::Value::None) }
+     ).await?;
+     let changed: Option<bool> = response
+         .take(response.num_statements() - 1)
+@@ -1350,4 +1371,53 @@ mod tests {
+             .unwrap()
+             .is_none());
+     }
++    async fn exercise_authorized_retry(client: StorageClient) {
++        indexes(&client).await;
++        let repo = WorkItemRepository::new(client.clone());
++        for archive in [false, true] {
++            let mut record = item(WorkItemStatus::Failed, "authorization_fixture");
++            record.base.security.level = 5;
++            let original = repo.create(record).await.unwrap();
++            if archive {
++                assert_eq!(
++                    archive_terminal_work(&client, Utc::now(), 100)
++                        .await
++                        .unwrap()
++                        .items_archived,
++                    1
++                );
++            }
++            let mut stale = original.clone();
++            stale.base.security.level = 0;
++            assert!(matches!(
++                repo.retry_authorized(&stale).await,
++                Err(StorageError::Conflict(_))
++            ));
++            assert_eq!(
++                repo.get("space", &original.base.id).await.unwrap().unwrap(),
++                original
++            );
++            let retried = repo.retry_authorized(&original).await.unwrap();
++            assert_eq!(retried.status, WorkItemStatus::Runnable);
++            assert_eq!(retried.base.security, original.base.security);
++            assert_eq!(
++                repo.get("space", &original.base.id).await.unwrap().unwrap(),
++                retried
++            );
++            assert!(matches!(
++                repo.retry_authorized(&original).await,
++                Err(StorageError::Conflict(_))
++            ));
++        }
++    }
++
++    #[tokio::test]
++    async fn authorized_retry_hot_and_cold_embedded() {
++        exercise_authorized_retry(StorageClient::new_embedded().await.unwrap()).await;
++    }
++
++    #[tokio::test]
++    async fn authorized_retry_hot_and_cold_surreal() {
++        exercise_authorized_retry(StorageClient::new_memory().await.unwrap()).await;
++    }
+ }
+diff --git a/docs/active-architecture.md b/docs/active-architecture.md
+index a01697b8f0560a79bfbac1497e11fb4b733710f1..40636ddf106ae10ae507af1707d30822de06aea5 100644
+--- a/docs/active-architecture.md
++++ b/docs/active-architecture.md
+@@ -55,6 +55,22 @@ envelope at that same commit, including restoration. Stale edits cannot revert
+ a newer classification or subject change. Trusted internal maintenance retains the low-level update API
+ for intentional security changes.
+ 
++## Public authorization boundaries
++
++REST space administration uses the existing `read:space_config` and
++`write:space_config` scopes with tenant and record checks. Relationship
++replacement, upsert and batch mutations preserve the ordinary security envelope
++and compare the authorized pre-state at the storage write. Work retry requires
++`read:work_item` and `write:work_item` and retains its guard across hot/cold
++reactivation.
++
++MCP provenance resolves and authorizes the complete evidence chain before
++returning references or content. REST metadata-only document projections remove
++text, sidecar text and media attachments; chunk reads authorize their document,
++revision and each node. Shared REST middleware consults current runtime readiness
++and blocks mutations in read-only mode. Query POST routes and authorized snapshot
++export are explicit exceptions.
++
+ ## Active Source, Extraction, and Commit Path
+ 
+ Active path:
+diff --git a/docs/api/system.mdx b/docs/api/system.mdx
+index a3f8d7c0acf2d7bd086efa63710173b3c2f6594a..af6deb0d0d8ac4579f9b1b2c61a018d52041182d 100644
+--- a/docs/api/system.mdx
++++ b/docs/api/system.mdx
+@@ -205,16 +205,15 @@ Request body:
+ Space configuration stores embedding policy and optional extraction guidance.
+ These routes use space names in their paths, not `space_config:` record IDs.
+ 
+-<Warning>
+-The current REST space configuration handlers authenticate callers but do not
+-perform per-record space, scope, or clearance authorization. Restrict these
+-administrative routes to trusted operators. Do not expose them as tenant-level
+-self-service configuration. MCP space tools apply their own record checks.
+-</Warning>
++Space reads require `read:space_config`; create and update require both
++`write:space_config` and read authority for the returned configuration. The
++principal must match the target space and pass the record's clearance and subject
++checks. Lists contain only authorized configurations. Configuration updates
++compare the authorized state at the storage write; a stale update returns `409`.
+ 
+ | Method | Path | Result |
+ | --- | --- | --- |
+-| GET | `/v1/spaces` | Array of up to 100 space configurations |
++| GET | `/v1/spaces` | Authorized configurations for the caller's space |
+ | POST | `/v1/spaces` | Create configuration, returning `201` or `409` if the name exists |
+ | GET | `/v1/spaces/{space_id}` | Configuration for the named space, or `404` |
+ | PUT | `/v1/spaces/{space_id}` | Update supplied configuration fields |
+@@ -321,13 +320,11 @@ curl http://localhost:3000/v1/work-items/work_item:550e8400-e29b-41d4-a716-44665
+ 
+ ### Retry Work Item
+ 
+-<Warning>
+-This REST handler scopes lookups to the authenticated space but currently does
+-not check operation scopes or record read/write authorization before changing
+-and returning a known failed item. Restrict it to trusted operators entitled
+-to all work records in that space. It is not a tenant-level retry permission
+-boundary.
+-</Warning>
++Work-item reads require `read:work_item`; retry additionally requires
++`write:work_item`. Both operation scopes and record authorization apply before
++retrying or returning a record. A concurrent status, security, or payload change
++returns `409`, without reactivating stale work. Archived retries use the same
++atomic guard.
+ 
+ `POST /v1/work-items/{id}/retry`
+ 
+diff --git a/docs/concepts/security.mdx b/docs/concepts/security.mdx
+index faa6ffbd7b542cf02df4b452b7ea8150d92515d0..99b0dfce7bda84baecb23c2d9838095ea616abc6 100644
+--- a/docs/concepts/security.mdx
++++ b/docs/concepts/security.mdx
+@@ -18,23 +18,26 @@ Most HTTP and MCP record handlers invoke the policy engine. Lower-level Rust
+ storage repositories do not carry a request principal; an embedding
+ application must authorize their use at its own boundary.
+ 
+-Administrative routes require particular care. The current REST space
+-configuration handlers authenticate requests but do not perform per-record
+-space or clearance checks. Keep that administrative surface restricted by
+-the deployment boundary rather than treating every authenticated caller as
+-an ordinary tenant. The MCP space tools do perform record authorization.
+-
+-The Default MCP `get_provenance` handler is another exception: it performs
+-scope preflight and space-scoped lookups, but does not authorize each returned
+-relationship, attribute, assertion, revision, node, or document. A caller can
+-therefore receive evidence outside their record clearance by known ID. Restrict
+-this tool to trusted callers authorized for all content in the selected space;
+-it is not suitable for serving readers with different record clearances.
+-
+-REST `POST /v1/work-items/{id}/retry` likewise checks the authenticated space
+-and failed status, but currently omits operation-scope and record read/write
+-checks. Restrict it to trusted operators entitled to all work records in the
+-space. Authentication alone must not authorize a reader to invoke retries.
++REST and MCP space configuration operations require `read:space_config` or
++`write:space_config`, as appropriate, plus record authorization. A tenant token
++can manage only its own named space. Wildcard operation scopes do not grant
++access to another space. Updates that return a configuration also require read
++access, and compare the authorized envelope at the storage write.
++
++The Default MCP `get_provenance` handler authorizes the claim, each assertion,
++revision, node and parent document before returning the chain. Missing, deleted,
++foreign-space or inaccessible evidence fails the request without returning a
++partial chain. Raw document authority is required for excerpts and node text.
++
++REST work-item reads use `read:work_item`. Retrying a failed item additionally
++requires `write:work_item` and record authorization. The retry compares the
++observed state at the atomic write and preserves that check when reactivating
++archived work. A concurrent status or security change returns a conflict.
++
++Managed REST data routes enforce the current runtime mode in shared middleware.
++In `read_only`, mutations are rejected even for wildcard and development bypass
++principals. Existing searches, batch entity reads and authorized snapshot export
++remain available. Runtime capabilities are separate from caller permissions.
+ 
+ The explicit local-development bypass disables record ABAC. Use it only with
+ isolated development data and loopback access.
+@@ -138,8 +141,11 @@ complete security/subject envelope at the atomic storage write, so a stale
+ content edit cannot undo a concurrent classification or subject change. A rejected update does not restore a
+ deleted entity. These ordinary interfaces expose no declassification permission;
+ trusted internal maintenance remains responsible for intentional security changes.
+-Other domain mutations and trusted pipeline writers retain their own contracts;
+-this boundary does not claim universal release enforcement.
++REST relationship replacement, upsert and batch writes use the same ordinary
++security-envelope rule, requiring read/write authority on both versions. The
++atomic write also compares the observed endpoints, lifecycle and timestamp.
++Rejected replacements cannot revive protected tombstones. Trusted pipeline
++writers retain their own contracts.
+ 
+ The REST timeline update, `PUT /v1/timeline/{id}`, also preserves the existing
+ `security` fields. A payload that changes them returns `403`, even when the
+@@ -150,16 +156,17 @@ a content edit.
+ ## Raw content and redaction
+ 
+ The policy vocabulary separates document metadata access from raw-text access.
+-MCP document response helpers clear `doc.text` when `read:doc:raw` is missing
+-and return a `RedactionEnvelope` listing the affected field in `redactions`.
+-The current REST document handlers return authorized records directly and do
+-not apply that helper. Treat REST document access as access to the returned
+-text; a metadata scope alone does not guarantee a text-free REST response.
+-
+-A redaction receipt describes that response path. It is not a general
+-scrubber for arbitrary `metadata`, sidecar fields, or application-defined
+-content. Classify the whole record appropriately when those fields contain
+-sensitive information.
++Without `read:doc:raw`, REST document projections clear `text`, `sidecar_text`
++and `media_attachments`. This applies to get/search and legacy space document
++routes, as well as returned mutation records. The existing REST response shape
++is preserved. Document chunks require raw access to the parent document and
++revision, and authorize each returned node.
++
++MCP document response helpers clear `doc.text` without raw authority and return
++a `RedactionEnvelope` listing affected fields. These receipts describe that
++specific projection. Neither helper is a general scrubber for arbitrary
++application-defined `metadata`; classify the whole record appropriately when
++those fields contain sensitive information.
+ 
+ The current source handlers return authorized source records directly. Do not
+ assume the `read:source:raw` scope automatically hides `source.uri` or

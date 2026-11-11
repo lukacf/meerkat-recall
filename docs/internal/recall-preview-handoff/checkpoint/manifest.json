@@ -1,0 +1,44 @@
+{
+  "checkpoint_at_utc": "2026-10-06T19:26:03.093570+00:00",
+  "status": "stopped_for_transfer_by_direct_human_instruction",
+  "destination": "pending human selection",
+  "base_commit": "f59e6f5c99ed095a015656626f4d32c106c13075",
+  "staged_tree": "bb4d3d563301f489871825daf1097b20ff4e3d87",
+  "original_local_branch": "codex/recall-authorization-surface",
+  "source_commit_push_pr": "none",
+  "files": [
+    "bin/elephant-api/src/authorization_surface_tests.rs",
+    "bin/elephant-api/src/authz.rs",
+    "bin/elephant-api/src/lib.rs",
+    "bin/elephant-api/src/redaction.rs",
+    "bin/elephant-api/src/routes/docs.rs",
+    "bin/elephant-api/src/routes/relationships.rs",
+    "bin/elephant-api/src/routes/spaces.rs",
+    "bin/elephant-api/src/routes/work_items.rs",
+    "bin/elephant-api/src/runtime.rs",
+    "bin/elephant-api/src/runtime_access.rs",
+    "crates/mcp/src/handlers/provenance_tests.rs",
+    "crates/mcp/src/handlers/spaces.rs",
+    "crates/mcp/src/handlers/system.rs",
+    "crates/storage/src/rel_repository.rs",
+    "crates/storage/src/space_config_repository.rs",
+    "crates/storage/src/work_item_repository.rs",
+    "crates/storage/src/work_retention.rs",
+    "docs/active-architecture.md",
+    "docs/api/system.mdx",
+    "docs/concepts/security.mdx"
+  ],
+  "patch": {
+    "path": "f01-unqualified.patch",
+    "bytes": 114057,
+    "sha256": "dcf393c5047fb7f85347229207233c8fda7855ef8bbc5e9eaed2ba3bdbaaff76"
+  },
+  "qualification": {
+    "status": "compile_failed",
+    "exit_code": 101,
+    "tests_executed": false,
+    "failure": "DocRevision missing HasSecurity at MCP system.rs:1990",
+    "process_state_reported": "exited naturally; no F01 process running"
+  },
+  "evidence_level": "Source-owner checkpoint and reports; patch bytes/hash independently preserved, no product execution by handoff publisher."
+}

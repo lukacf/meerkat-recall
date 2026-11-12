@@ -686,6 +686,16 @@ query-plan constraints, operator settings, and acceptance criteria.
 
 ## Preview transport and runtime boundary
 
+Built-in outbound MCP HTTP clients reject non-streaming JSON responses larger
+than 16 MiB and error bodies larger than 64 KiB. They count streamed bytes
+before retention, after any reqwest decompression, and reject declared
+oversizes before reading the body. Oversized replies return a transport error;
+they are not truncated or treated as accepted notifications. Authentication,
+session handling and bounded error-text decoding retain the shared SDK's
+existing behavior. SSE handling is unchanged, and these byte limits do not
+introduce a timeout for a server that stalls below the bound. See the
+[HTTP-client backport](../vendor/rmcp-1.8.0-backport.md).
+
 `/v1/health` reports process liveness only. Authenticated `/v1/readiness` reports
 storage, managed-worker, semantic-ingest and restore-barrier readiness without a
 model call. `read:status`, `read:system` or `read:space_config` permits this bounded

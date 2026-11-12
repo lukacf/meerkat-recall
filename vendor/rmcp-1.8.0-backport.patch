@@ -1,0 +1,1127 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -465,6 +465,12 @@
+ checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
+ 
+ [[package]]
++name = "futures-timer"
++version = "3.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
++
++[[package]]
+ name = "futures-util"
+ version = "0.3.32"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -529,6 +535,12 @@
+  "r-efi 6.0.0",
+  "rand_core 0.10.1",
+ ]
++
++[[package]]
++name = "glob"
++version = "0.3.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+ 
+ [[package]]
+ name = "hashbrown"
+@@ -1203,6 +1215,15 @@
+ ]
+ 
+ [[package]]
++name = "proc-macro-crate"
++version = "3.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
++dependencies = [
++ "toml_edit",
++]
++
++[[package]]
+ name = "proc-macro2"
+ version = "1.0.106"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -1408,10 +1429,22 @@
+ ]
+ 
+ [[package]]
++name = "regex"
++version = "1.13.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
++dependencies = [
++ "aho-corasick",
++ "memchr",
++ "regex-automata",
++ "regex-syntax",
++]
++
++[[package]]
+ name = "regex-automata"
+-version = "0.4.14"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
++version = "0.4.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
+ dependencies = [
+  "aho-corasick",
+  "memchr",
+@@ -1423,6 +1456,12 @@
+ version = "0.8.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
++
++[[package]]
++name = "relative-path"
++version = "1.9.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ba39f3699c378cd8970968dcbff9c43159ea4cfbd88d43c00b22f2ef10a435d2"
+ 
+ [[package]]
+ name = "reqwest"
+@@ -1505,6 +1544,7 @@
+  "rand 0.10.1",
+  "reqwest",
+  "rmcp-macros",
++ "rstest",
+  "schemars",
+  "serde",
+  "serde_json",
+@@ -1535,6 +1575,35 @@
+ ]
+ 
+ [[package]]
++name = "rstest"
++version = "0.26.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f5a3193c063baaa2a95a33f03035c8a72b83d97a54916055ba22d35ed3839d49"
++dependencies = [
++ "futures-timer",
++ "futures-util",
++ "rstest_macros",
++]
++
++[[package]]
++name = "rstest_macros"
++version = "0.26.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9c845311f0ff7951c5506121a9ad75aec44d083c31583b2ea5a30bcb0b0abba0"
++dependencies = [
++ "cfg-if",
++ "glob",
++ "proc-macro-crate",
++ "proc-macro2",
++ "quote",
++ "regex",
++ "relative-path",
++ "rustc_version",
++ "syn",
++ "unicode-ident",
++]
++
++[[package]]
+ name = "rustc-hash"
+ version = "2.1.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -2134,6 +2203,36 @@
+ ]
+ 
+ [[package]]
++name = "toml_datetime"
++version = "1.1.3+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "173f25c883cd2176a2d8212155638c0a60d484a9d84546d270866f40f56b6e49"
++dependencies = [
++ "serde_core",
++]
++
++[[package]]
++name = "toml_edit"
++version = "0.25.19+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dd43688c4858d7264ae1cf9a9f874a67c3feb74a883b1cd7bebd6a4ea8307218"
++dependencies = [
++ "indexmap",
++ "toml_datetime",
++ "toml_parser",
++ "winnow",
++]
++
++[[package]]
++name = "toml_parser"
++version = "1.1.5+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
++dependencies = [
++ "winnow",
++]
++
++[[package]]
+ name = "tower"
+ version = "0.5.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -2727,6 +2826,15 @@
+ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
+ 
+ [[package]]
++name = "winnow"
++version = "1.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
++dependencies = [
++ "memchr",
++]
++
++[[package]]
+ name = "wit-bindgen"
+ version = "0.57.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -712,3 +712,16 @@
+ [lints.clippy]
+ exhaustive_enums = "warn"
+ exhaustive_structs = "warn"
++
++[dev-dependencies.rstest]
++version = "0.26.1"
++
++[[test]]
++name = "test_unix_socket_response_limits"
++path = "tests/test_unix_socket_response_limits.rs"
++required-features = ["transport-streamable-http-client-unix-socket"]
++
++[[test]]
++name = "test_recall_http_response_limits"
++path = "tests/test_recall_http_response_limits.rs"
++required-features = ["transport-streamable-http-client-reqwest"]
+diff --git a/src/transport/common.rs b/src/transport/common.rs
+--- a/src/transport/common.rs
++++ b/src/transport/common.rs
+@@ -2,6 +2,12 @@
+ pub mod server_side_http;
+ 
+ pub mod http_header;
++
++#[cfg(any(
++    feature = "transport-streamable-http-client-reqwest",
++    all(unix, feature = "transport-streamable-http-client-unix-socket")
++))]
++mod client_side_http;
+ 
+ #[cfg(feature = "__reqwest")]
+ mod reqwest;
+diff --git a/src/transport/common/client_side_http.rs b/src/transport/common/client_side_http.rs
+new file mode 100644
+--- /dev/null
++++ b/src/transport/common/client_side_http.rs
+@@ -0,0 +1,123 @@
++//! Bounded collection of non-streaming HTTP responses.
++
++use bytes::Bytes;
++use futures::{Stream, TryStreamExt};
++
++use crate::transport::streamable_http_client::StreamableHttpError;
++
++pub(super) const MAX_JSON_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
++pub(super) const MAX_ERROR_RESPONSE_SIZE: usize = 64 * 1024;
++
++/// Count bytes before retaining them; a length hint can reject a body early,
++/// but never replaces the streamed check or determines allocation size.
++pub(super) async fn read_bounded_body<S, E>(
++    stream: S,
++    content_length: Option<u64>,
++    max_size: usize,
++) -> Result<Vec<u8>, StreamableHttpError<E>>
++where
++    S: Stream<Item = Result<Bytes, E>>,
++    E: std::error::Error + Send + Sync + 'static,
++{
++    if content_length.is_some_and(|length| length > max_size as u64) {
++        return Err(StreamableHttpError::ResponseBodyTooLarge { max_size });
++    }
++
++    futures::pin_mut!(stream);
++    let mut body = Vec::new();
++    while let Some(chunk) = stream
++        .try_next()
++        .await
++        .map_err(StreamableHttpError::Client)?
++    {
++        if chunk.len() > max_size - body.len() {
++            return Err(StreamableHttpError::ResponseBodyTooLarge { max_size });
++        }
++        body.extend_from_slice(&chunk);
++    }
++    Ok(body)
++}
++
++#[cfg(test)]
++mod tests {
++    use std::io;
++
++    use futures::stream;
++    use rstest::rstest;
++
++    use super::*;
++
++    #[rstest]
++    #[case(None)]
++    #[case(Some(8))]
++    #[tokio::test]
++    async fn accepts_exact_limit_across_chunks(#[case] length: Option<u64>) {
++        let chunks = ["abcd", "", "efgh"].map(|chunk| Ok::<_, io::Error>(Bytes::from(chunk)));
++        let body = read_bounded_body(stream::iter(chunks), length, 8)
++            .await
++            .unwrap();
++        assert_eq!(body, b"abcdefgh");
++    }
++
++    #[rstest]
++    #[case(None)]
++    #[case(Some(1))]
++    #[tokio::test]
++    async fn counts_bytes_even_with_a_small_length_hint(#[case] length: Option<u64>) {
++        let chunks = ["abcd", "efgh"].map(|chunk| Ok::<_, io::Error>(Bytes::from(chunk)));
++        let error = read_bounded_body(stream::iter(chunks), length, 7)
++            .await
++            .unwrap_err();
++        assert!(matches!(
++            error,
++            StreamableHttpError::ResponseBodyTooLarge { max_size: 7 }
++        ));
++    }
++
++    #[tokio::test]
++    async fn oversized_length_does_not_poll_the_body() {
++        let stream = stream::poll_fn::<Result<Bytes, io::Error>, _>(|_| {
++            panic!("an oversized Content-Length must be rejected before polling")
++        });
++        let error = read_bounded_body(stream, Some(u64::MAX), 8)
++            .await
++            .unwrap_err();
++        assert!(matches!(
++            error,
++            StreamableHttpError::ResponseBodyTooLarge { max_size: 8 }
++        ));
++    }
++
++    #[tokio::test]
++    async fn overflowing_chunk_does_not_poll_again() {
++        let first = stream::once(async { Ok::<_, io::Error>(Bytes::from_static(b"too large")) });
++        let rest = stream::poll_fn::<Result<Bytes, io::Error>, _>(|_| {
++            panic!("must stop reading as soon as the limit is crossed")
++        });
++        let error = read_bounded_body(futures::StreamExt::chain(first, rest), None, 8)
++            .await
++            .unwrap_err();
++        assert!(matches!(
++            error,
++            StreamableHttpError::ResponseBodyTooLarge { max_size: 8 }
++        ));
++    }
++
++    #[tokio::test]
++    async fn preserves_body_read_errors() {
++        let stream = stream::iter([Err::<Bytes, _>(io::Error::other("body read failed"))]);
++        let error = read_bounded_body(stream, None, 8).await.unwrap_err();
++        assert!(matches!(error, StreamableHttpError::Client(_)));
++    }
++
++    #[tokio::test]
++    async fn accepts_empty_body_with_zero_limit() {
++        let stream = stream::empty::<Result<Bytes, io::Error>>();
++        assert!(
++            read_bounded_body(stream, Some(0), 0)
++                .await
++                .unwrap()
++                .is_empty()
++        );
++    }
++}
+diff --git a/src/transport/common/reqwest/streamable_http_client.rs b/src/transport/common/reqwest/streamable_http_client.rs
+--- a/src/transport/common/reqwest/streamable_http_client.rs
++++ b/src/transport/common/reqwest/streamable_http_client.rs
+@@ -8,6 +8,9 @@
+ use crate::{
+     model::{ClientJsonRpcMessage, JsonRpcMessage, ServerJsonRpcMessage},
+     transport::{
++        common::client_side_http::{
++            MAX_ERROR_RESPONSE_SIZE, MAX_JSON_RESPONSE_SIZE, read_bounded_body,
++        },
+         common::http_header::{
+             EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
+             extract_scope_from_header, validate_custom_header,
+@@ -200,10 +203,34 @@
+         // Non-success responses may carry valid JSON-RPC error payloads that
+         // should be surfaced as McpError rather than lost in TransportSend.
+         if !status.is_success() {
+-            let body = response
+-                .text()
+-                .await
+-                .unwrap_or_else(|_| "<failed to read response body>".to_owned());
++            let content_type_header = response
++                .headers()
++                .get(reqwest::header::CONTENT_TYPE)
++                .cloned();
++            let body = match read_bounded_body(
++                response.bytes_stream(),
++                content_length,
++                MAX_ERROR_RESPONSE_SIZE,
++            )
++            .await
++            {
++                Ok(body) => {
++                    // Preserve reqwest's feature-dependent charset/BOM decoding
++                    // using only the bounded, already decompressed body.
++                    let mut buffered = http::Response::new(body);
++                    if let Some(content_type) = content_type_header {
++                        buffered
++                            .headers_mut()
++                            .insert(reqwest::header::CONTENT_TYPE, content_type);
++                    }
++                    reqwest::Response::from(buffered)
++                        .text()
++                        .await
++                        .unwrap_or_else(|_| "<failed to read response body>".to_owned())
++                }
++                Err(error @ StreamableHttpError::ResponseBodyTooLarge { .. }) => return Err(error),
++                Err(_) => "<failed to read response body>".to_owned(),
++            };
+             if content_type
+                 .as_deref()
+                 .is_some_and(|ct| ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()))
+@@ -230,7 +257,26 @@
+                 // Try to parse as a valid JSON-RPC message. If the body is
+                 // malformed (e.g. a 200 response to a notification that lacks
+                 // an `id` field), treat it as accepted rather than failing.
+-                match response.json::<ServerJsonRpcMessage>().await {
++                let body = match read_bounded_body(
++                    response.bytes_stream(),
++                    content_length,
++                    MAX_JSON_RESPONSE_SIZE,
++                )
++                .await
++                {
++                    Ok(body) => body,
++                    Err(error @ StreamableHttpError::ResponseBodyTooLarge { .. }) => {
++                        return Err(error);
++                    }
++                    Err(error) => {
++                        // Retain 1.8's existing fallback for ordinary body-read errors.
++                        tracing::warn!(
++                            "could not read JSON response, treating as accepted: {error}"
++                        );
++                        return Ok(StreamableHttpPostResponse::Accepted);
++                    }
++                };
++                match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
+                     Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
+                     Err(e) => {
+                         tracing::warn!(
+diff --git a/src/transport/common/unix_socket.rs b/src/transport/common/unix_socket.rs
+--- a/src/transport/common/unix_socket.rs
++++ b/src/transport/common/unix_socket.rs
+@@ -1,7 +1,7 @@
+ use std::{borrow::Cow, collections::HashMap, sync::Arc};
+ 
+ use bytes::Bytes;
+-use futures::{StreamExt, stream::BoxStream};
++use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+ use http::{HeaderName, HeaderValue, Method, Request, StatusCode, header::WWW_AUTHENTICATE};
+ use http_body_util::{BodyExt, Full};
+ use hyper::body::Incoming;
+@@ -12,6 +12,9 @@
+ use crate::{
+     model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
+     transport::{
++        common::client_side_http::{
++            MAX_ERROR_RESPONSE_SIZE, MAX_JSON_RESPONSE_SIZE, read_bounded_body,
++        },
+         common::http_header::{
+             EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
+             extract_scope_from_header, validate_custom_header,
+@@ -244,24 +247,32 @@
+             return Err(StreamableHttpError::SessionExpired);
+         }
+ 
+-        if !status.is_success() {
+-            let body = response
+-                .into_body()
+-                .collect()
+-                .await
+-                .map(|c| String::from_utf8_lossy(&c.to_bytes()).into_owned())
+-                .unwrap_or_else(|_| "<failed to read response body>".to_owned());
+-            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+-                format!("HTTP {status}: {body}"),
+-            )));
+-        }
+-
+-        let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
+         let content_length = response
+             .headers()
+             .get(http::header::CONTENT_LENGTH)
+             .and_then(|v| v.to_str().ok())
+             .and_then(|v| v.parse::<u64>().ok());
++        if !status.is_success() {
++            let body = match read_bounded_body(
++                response
++                    .into_body()
++                    .into_data_stream()
++                    .map_err(UnixSocketError::Hyper),
++                content_length,
++                MAX_ERROR_RESPONSE_SIZE,
++            )
++            .await
++            {
++                Ok(body) => String::from_utf8_lossy(&body).into_owned(),
++                Err(error @ StreamableHttpError::ResponseBodyTooLarge { .. }) => return Err(error),
++                Err(_) => "<failed to read response body>".to_owned(),
++            };
++            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
++                format!("HTTP {status}: {body}"),
++            )));
++        }
++
++        let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
+         let session_id = response
+             .headers()
+             .get(HEADER_SESSION_ID)
+@@ -286,12 +297,15 @@
+                 Ok(StreamableHttpPostResponse::Sse(sse_stream, session_id))
+             }
+             Some(ref ct) if ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {
+-                let body = response
+-                    .into_body()
+-                    .collect()
+-                    .await
+-                    .map_err(|e| StreamableHttpError::Client(UnixSocketError::Hyper(e)))?
+-                    .to_bytes();
++                let body = read_bounded_body(
++                    response
++                        .into_body()
++                        .into_data_stream()
++                        .map_err(UnixSocketError::Hyper),
++                    content_length,
++                    MAX_JSON_RESPONSE_SIZE,
++                )
++                .await?;
+                 match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
+                     Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
+                     Err(e) => {
+diff --git a/src/transport/streamable_http_client.rs b/src/transport/streamable_http_client.rs
+--- a/src/transport/streamable_http_client.rs
++++ b/src/transport/streamable_http_client.rs
+@@ -78,6 +78,9 @@
+     UnexpectedEndOfStream,
+     #[error("unexpected server response: {0}")]
+     UnexpectedServerResponse(Cow<'static, str>),
++    /// A non-streaming HTTP response exceeded the client's byte limit.
++    #[error("HTTP response body exceeded the maximum size of {max_size} bytes")]
++    ResponseBodyTooLarge { max_size: usize },
+     #[error("Unexpected content type: {0:?}")]
+     UnexpectedContentType(Option<String>),
+     #[error("Server does not support SSE")]
+diff --git a/tests/test_recall_http_response_limits.rs b/tests/test_recall_http_response_limits.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/test_recall_http_response_limits.rs
+@@ -0,0 +1,476 @@
++#![cfg(all(
++    feature = "transport-streamable-http-client",
++    feature = "transport-streamable-http-client-reqwest",
++    not(feature = "local")
++))]
++//! The reqwest backend reads non-SSE POST bodies only up to a fixed size: JSON
++//! success bodies up to 16 MiB, error bodies up to 64 KiB. An oversized body
++//! fails closed: no prefix is parsed and a notification is not reported as
++//! accepted. The client must also stop reading a body that is still open
++//! once the limit is exceeded.
++//!
++//! A raw TCP fixture controls the framing exactly, including `Content-Length`
++//! values that do not match the bytes sent, chunked bodies without a final
++//! chunk, and connections kept open after the body.
++
++use std::{collections::HashMap, fmt::Debug, io, sync::Arc, time::Duration};
++
++use rmcp::{
++    model::{
++        ClientJsonRpcMessage, ClientNotification, ClientRequest, InitializedNotification,
++        JsonRpcMessage, PingRequest, RequestId,
++    },
++    transport::streamable_http_client::{
++        StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
++    },
++};
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::{TcpListener, TcpStream},
++    task::{JoinHandle, JoinSet},
++};
++
++/// Must match the private limits in the reqwest backend.
++const MAX_JSON_BODY: usize = 16 * 1024 * 1024;
++const MAX_ERROR_BODY: usize = 64 * 1024;
++/// Far above any limit; never sent, only declared.
++const HUGE_DECLARED: u64 = 1 << 40;
++/// Generous; a bounded read finishes in well under a second.
++const DEADLINE: Duration = Duration::from_secs(10);
++const WRITE_CHUNK: usize = 64 * 1024;
++
++const RESULT_JSON: &str = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
++const ERROR_JSON: &str =
++    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"bounded-error"}}"#;
++const TEXT: &str = "private-error-body";
++const CHALLENGE: &str = "Bearer realm=\"test\"";
++
++type PostResult = Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>>;
++
++#[derive(Clone, Copy, Debug)]
++enum Framing {
++    /// `Content-Length` equal to the bytes sent.
++    Length,
++    /// `Content-Length` with this value, whatever is sent.
++    Declared(u64),
++    /// Chunked; the final chunk is sent only with [`End::Close`].
++    Chunked,
++}
++
++#[derive(Clone, Copy, Debug)]
++enum End {
++    /// Finish the framing and close the connection.
++    Close,
++    /// Keep the connection open without finishing the body.
++    Hold,
++}
++
++#[derive(Clone, Copy, Debug)]
++enum Payload {
++    /// Valid JSON-RPC response, padded with trailing whitespace.
++    Result,
++    /// Valid JSON-RPC error, padded with trailing whitespace.
++    Error,
++    /// Plain text.
++    Text,
++}
++
++impl Payload {
++    /// `len` bytes: a valid document followed by padding, so any prefix that
++    /// covers the document still parses. A length of 0 sends nothing.
++    fn bytes(self, len: usize) -> Arc<[u8]> {
++        if len == 0 {
++            return Arc::from(Vec::new());
++        }
++        let (prefix, fill) = match self {
++            Payload::Result => (RESULT_JSON, b' '),
++            Payload::Error => (ERROR_JSON, b' '),
++            Payload::Text => (TEXT, b'x'),
++        };
++        assert!(prefix.len() <= len);
++        let mut body = Vec::with_capacity(len);
++        body.extend_from_slice(prefix.as_bytes());
++        body.resize(len, fill);
++        body.into()
++    }
++}
++
++#[derive(Clone, Copy, Debug)]
++enum Message {
++    Request,
++    Notification,
++}
++
++impl Message {
++    fn build(self) -> ClientJsonRpcMessage {
++        match self {
++            Message::Request => ClientJsonRpcMessage::request(
++                ClientRequest::PingRequest(PingRequest::default()),
++                RequestId::Number(1),
++            ),
++            Message::Notification => ClientJsonRpcMessage::notification(
++                ClientNotification::InitializedNotification(InitializedNotification::default()),
++            ),
++        }
++    }
++}
++
++struct Reply {
++    status: u16,
++    content_type: &'static str,
++    challenge: Option<&'static str>,
++    body: Arc<[u8]>,
++    framing: Framing,
++    end: End,
++}
++
++impl Reply {
++    fn new(status: u16, content_type: &'static str, body: Arc<[u8]>) -> Self {
++        Self {
++            status,
++            content_type,
++            challenge: None,
++            body,
++            framing: Framing::Length,
++            end: End::Close,
++        }
++    }
++
++    fn framed(mut self, framing: Framing, end: End) -> Self {
++        self.framing = framing;
++        self.end = end;
++        self
++    }
++}
++
++struct RawServer {
++    uri: Arc<str>,
++    task: JoinHandle<()>,
++}
++
++impl Drop for RawServer {
++    fn drop(&mut self) {
++        // Dropping the JoinSet inside the task aborts every connection.
++        self.task.abort();
++    }
++}
++
++async fn serve(reply: Reply) -> RawServer {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++    let reply = Arc::new(reply);
++    let task = tokio::spawn(async move {
++        let mut connections = JoinSet::new();
++        while let Ok((stream, _)) = listener.accept().await {
++            connections.spawn(respond(stream, reply.clone()));
++        }
++    });
++    RawServer {
++        uri: Arc::from(format!("http://{address}/mcp")),
++        task,
++    }
++}
++
++async fn respond(mut stream: TcpStream, reply: Arc<Reply>) {
++    if read_request(&mut stream).await.is_err() {
++        return;
++    }
++    // A client that stops reading may reset the connection mid-write.
++    let _ = write_reply(&mut stream, &reply).await;
++    if matches!(reply.end, End::Hold) {
++        std::future::pending::<()>().await;
++    }
++}
++
++/// Reads one request head and its `Content-Length` body.
++async fn read_request(stream: &mut TcpStream) -> io::Result<()> {
++    let mut buffer = Vec::new();
++    let mut chunk = [0u8; 4096];
++    let head_end = loop {
++        let read = stream.read(&mut chunk).await?;
++        if read == 0 {
++            return Err(io::ErrorKind::UnexpectedEof.into());
++        }
++        buffer.extend_from_slice(&chunk[..read]);
++        if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
++            break index + 4;
++        }
++    };
++    let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
++    let body_len = head
++        .lines()
++        .find_map(|line| line.strip_prefix("content-length:"))
++        .and_then(|value| value.trim().parse::<usize>().ok())
++        .unwrap_or(0);
++    while buffer.len() < head_end + body_len {
++        let read = stream.read(&mut chunk).await?;
++        if read == 0 {
++            return Err(io::ErrorKind::UnexpectedEof.into());
++        }
++        buffer.extend_from_slice(&chunk[..read]);
++    }
++    Ok(())
++}
++
++async fn write_reply(stream: &mut TcpStream, reply: &Reply) -> io::Result<()> {
++    let mut head = format!(
++        "HTTP/1.1 {} Test\r\ncontent-type: {}\r\nretry-after: 17\r\n",
++        reply.status, reply.content_type
++    );
++    if let Some(challenge) = reply.challenge {
++        head.push_str(&format!("www-authenticate: {challenge}\r\n"));
++    }
++    match reply.framing {
++        Framing::Length => head.push_str(&format!("content-length: {}\r\n", reply.body.len())),
++        Framing::Declared(len) => head.push_str(&format!("content-length: {len}\r\n")),
++        Framing::Chunked => head.push_str("transfer-encoding: chunked\r\n"),
++    }
++    head.push_str("\r\n");
++    stream.write_all(head.as_bytes()).await?;
++    let chunked = matches!(reply.framing, Framing::Chunked);
++    for piece in reply.body.chunks(WRITE_CHUNK) {
++        if chunked {
++            stream
++                .write_all(format!("{:x}\r\n", piece.len()).as_bytes())
++                .await?;
++            stream.write_all(piece).await?;
++            stream.write_all(b"\r\n").await?;
++        } else {
++            stream.write_all(piece).await?;
++        }
++    }
++    if chunked && matches!(reply.end, End::Close) {
++        stream.write_all(b"0\r\n\r\n").await?;
++    }
++    stream.flush().await
++}
++
++async fn post(server: &RawServer, message: Message, session: Option<&str>) -> PostResult {
++    tokio::time::timeout(
++        DEADLINE,
++        reqwest::Client::new().post_message(
++            server.uri.clone(),
++            message.build(),
++            session.map(Arc::from),
++            None,
++            HashMap::new(),
++        ),
++    )
++    .await
++    .expect("the POST must finish without reading past the body limit")
++}
++
++/// Bounded `Debug` output, so a failure never dumps a large body.
++fn summary(value: &impl Debug) -> String {
++    const MAX: usize = 300;
++    let rendered = format!("{value:?}");
++    if rendered.len() <= MAX {
++        return rendered;
++    }
++    let mut end = MAX;
++    while !rendered.is_char_boundary(end) {
++        end -= 1;
++    }
++    format!("{}... ({} bytes)", &rendered[..end], rendered.len())
++}
++
++#[tokio::test]
++async fn oversized_bodies_reject_without_eof_or_parsing_a_valid_prefix() {
++    for (status, content_type, limit, payload) in [
++        (200, "application/json", MAX_JSON_BODY, Payload::Result),
++        (400, "application/json", MAX_ERROR_BODY, Payload::Error),
++        (500, "application/json", MAX_ERROR_BODY, Payload::Error),
++        (400, "text/plain", MAX_ERROR_BODY, Payload::Text),
++        (500, "text/plain", MAX_ERROR_BODY, Payload::Text),
++    ] {
++        for message in [Message::Request, Message::Notification] {
++            for (framing, end, size) in [
++                (Framing::Length, End::Close, limit + 1),
++                (Framing::Chunked, End::Hold, limit + 1),
++                (Framing::Declared(HUGE_DECLARED), End::Hold, 0),
++            ] {
++                let server = serve(
++                    Reply::new(status, content_type, payload.bytes(size)).framed(framing, end),
++                )
++                .await;
++                let result = post(&server, message, None).await;
++                assert!(
++                    matches!(result, Err(StreamableHttpError::ResponseBodyTooLarge { max_size }) if max_size == limit),
++                    "{status} {message:?} {framing:?}: {}",
++                    summary(&result)
++                );
++            }
++        }
++    }
++}
++
++#[tokio::test]
++async fn bodies_at_the_limit_preserve_json_and_error_results() {
++    for framing in [Framing::Length, Framing::Chunked] {
++        for message in [Message::Request, Message::Notification] {
++            let server = serve(
++                Reply::new(
++                    200,
++                    "application/json",
++                    Payload::Result.bytes(MAX_JSON_BODY),
++                )
++                .framed(framing, End::Close),
++            )
++            .await;
++            let result = post(&server, message, None).await;
++            assert!(
++                matches!(
++                    result,
++                    Ok(StreamableHttpPostResponse::Json(
++                        JsonRpcMessage::Response(_),
++                        _
++                    ))
++                ),
++                "{}",
++                summary(&result)
++            );
++            for status in [400, 500] {
++                let server = serve(
++                    Reply::new(
++                        status,
++                        "application/json",
++                        Payload::Error.bytes(MAX_ERROR_BODY),
++                    )
++                    .framed(framing, End::Close),
++                )
++                .await;
++                let result = post(&server, message, None).await;
++                assert!(
++                    matches!(
++                        result,
++                        Ok(StreamableHttpPostResponse::Json(
++                            JsonRpcMessage::Error(_),
++                            _
++                        ))
++                    ),
++                    "{}",
++                    summary(&result)
++                );
++            }
++        }
++    }
++}
++
++#[tokio::test]
++async fn body_free_status_and_auth_paths_keep_existing_behavior() {
++    for status in [202, 204, 404, 401] {
++        let mut reply = Reply::new(status, "application/json", Payload::Text.bytes(0))
++            .framed(Framing::Declared(HUGE_DECLARED), End::Hold);
++        if status == 401 {
++            reply.challenge = Some(CHALLENGE);
++        }
++        let server = serve(reply).await;
++        let result = post(&server, Message::Request, Some("existing-session")).await;
++        assert!(
++            match (status, &result) {
++                (202 | 204, Ok(StreamableHttpPostResponse::Accepted)) => true,
++                (404, Err(StreamableHttpError::SessionExpired)) => true,
++                (401, Err(StreamableHttpError::AuthRequired(_))) => true,
++                _ => false,
++            },
++            "{status}: {}",
++            summary(&result)
++        );
++    }
++}
++
++#[tokio::test]
++async fn bounded_error_decoding_matches_reqwest_charset_and_bom_handling() {
++    for (content_type, bytes) in [
++        (
++            "text/plain; charset=windows-1252",
++            b"caf\xe9 \x80".as_slice(),
++        ),
++        (
++            "text/plain; charset=shift_jis",
++            b"\x82\xb1\x82\xf1\x82\xc9\x82\xbf\x82\xcd".as_slice(),
++        ),
++        (
++            "text/plain; charset=windows-1252",
++            b"\xff\xfec\0a\0f\0\xe9\0".as_slice(),
++        ),
++        ("text/plain", b"\xef\xbb\xbfcaf\xc3\xa9".as_slice()),
++        ("text/plain; charset=utf-8", b"bad \xff".as_slice()),
++        (
++            "application/json; charset=windows-1252",
++            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"caf\xe9\"}}"
++                .as_slice(),
++        ),
++    ] {
++        let server = serve(Reply::new(400, content_type, Arc::from(bytes))).await;
++        let expected = reqwest::Client::new()
++            .post(server.uri.as_ref())
++            .json(&Message::Request.build())
++            .send()
++            .await
++            .unwrap()
++            .text()
++            .await
++            .unwrap();
++        let result = post(&server, Message::Request, None).await;
++        if content_type.starts_with("application/json")
++            && let Ok(JsonRpcMessage::Error(error)) =
++                serde_json::from_str::<rmcp::model::ServerJsonRpcMessage>(&expected)
++        {
++            match result {
++                Ok(StreamableHttpPostResponse::Json(JsonRpcMessage::Error(actual), _)) => {
++                    assert_eq!(actual.error, error.error)
++                }
++                other => panic!("expected decoded JSON error, got {}", summary(&other)),
++            }
++        } else {
++            match result {
++                Err(StreamableHttpError::UnexpectedServerResponse(actual)) => {
++                    assert_eq!(actual, format!("HTTP 400 Bad Request: {expected}"))
++                }
++                other => panic!("expected decoded HTTP error, got {}", summary(&other)),
++            }
++        }
++    }
++}
++
++#[tokio::test]
++async fn charset_limits_count_wire_bytes_before_text_expansion() {
++    for size in [MAX_ERROR_BODY, MAX_ERROR_BODY + 1] {
++        let server = serve(Reply::new(
++            400,
++            "text/plain; charset=windows-1252",
++            vec![0x80; size].into(),
++        ))
++        .await;
++        let result = post(&server, Message::Request, None).await;
++        if size > MAX_ERROR_BODY {
++            assert!(
++                matches!(
++                    result,
++                    Err(StreamableHttpError::ResponseBodyTooLarge {
++                        max_size: MAX_ERROR_BODY
++                    })
++                ),
++                "{}",
++                summary(&result)
++            );
++        } else {
++            let expected = reqwest::Client::new()
++                .post(server.uri.as_ref())
++                .json(&Message::Request.build())
++                .send()
++                .await
++                .unwrap()
++                .text()
++                .await
++                .unwrap();
++            match result {
++                Err(StreamableHttpError::UnexpectedServerResponse(actual)) => {
++                    assert_eq!(actual, format!("HTTP 400 Bad Request: {expected}"))
++                }
++                other => panic!("expected bounded decoded error, got {}", summary(&other)),
++            }
++        }
++    }
++}
+diff --git a/tests/test_unix_socket_response_limits.rs b/tests/test_unix_socket_response_limits.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/test_unix_socket_response_limits.rs
+@@ -0,0 +1,113 @@
++#![cfg(all(
++    unix,
++    feature = "transport-streamable-http-client-unix-socket",
++    not(feature = "local")
++))]
++
++use std::{
++    path::PathBuf,
++    sync::{
++        Arc,
++        atomic::{AtomicUsize, Ordering},
++    },
++    time::Duration,
++};
++
++use rmcp::{
++    model::{ClientJsonRpcMessage, ClientRequest, PingRequest, RequestId},
++    transport::{
++        UnixSocketHttpClient,
++        streamable_http_client::{StreamableHttpClient, StreamableHttpError},
++    },
++};
++use rstest::rstest;
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::UnixListener,
++    task::JoinHandle,
++};
++
++struct Server {
++    path: PathBuf,
++    task: JoinHandle<()>,
++}
++
++impl Drop for Server {
++    fn drop(&mut self) {
++        self.task.abort();
++        let _ = std::fs::remove_file(&self.path);
++    }
++}
++
++async fn oversized_response(status: u16, limit: usize, known_length: bool) -> Server {
++    static NEXT: AtomicUsize = AtomicUsize::new(0);
++    let path = std::env::temp_dir().join(format!(
++        "rmcp-body-limit-{}-{}.sock",
++        std::process::id(),
++        NEXT.fetch_add(1, Ordering::Relaxed)
++    ));
++    let listener = UnixListener::bind(&path).unwrap();
++    let task = tokio::spawn(async move {
++        let (mut socket, _) = listener.accept().await.unwrap();
++        let mut request = Vec::new();
++        let mut buffer = [0; 1024];
++        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
++            let size = socket.read(&mut buffer).await.unwrap();
++            assert!(size > 0 && request.len() + size <= 8192);
++            request.extend_from_slice(&buffer[..size]);
++        }
++        let framing = if known_length {
++            format!("Content-Length: {}\r\n", limit + 1)
++        } else {
++            "Transfer-Encoding: chunked\r\n".to_owned()
++        };
++        let headers =
++            format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\n{framing}\r\n");
++        socket.write_all(headers.as_bytes()).await.unwrap();
++        if !known_length {
++            let chunk = vec![b' '; 4096];
++            for _ in 0..limit / chunk.len() {
++                socket.write_all(b"1000\r\n").await.unwrap();
++                socket.write_all(&chunk).await.unwrap();
++                socket.write_all(b"\r\n").await.unwrap();
++            }
++            socket.write_all(b"1\r\n \r\n").await.unwrap();
++        }
++        // No body at all for a declared oversize; no terminating chunk otherwise.
++        // The client must reject without waiting for EOF in either case.
++        std::future::pending::<()>().await;
++        drop(socket);
++    });
++    Server { path, task }
++}
++
++#[rstest]
++#[case::json_declared(200, 16 * 1024 * 1024, true)]
++#[case::json_streamed(200, 16 * 1024 * 1024, false)]
++#[case::error_declared(400, 64 * 1024, true)]
++#[case::error_streamed(400, 64 * 1024, false)]
++#[case::server_error_streamed(500, 64 * 1024, false)]
++#[tokio::test]
++async fn unix_socket_rejects_oversized_response_before_eof(
++    #[case] status: u16,
++    #[case] limit: usize,
++    #[case] known_length: bool,
++) {
++    let server = oversized_response(status, limit, known_length).await;
++    let uri: Arc<str> = Arc::from("http://localhost/mcp");
++    let client = UnixSocketHttpClient::new(server.path.to_str().unwrap(), &uri);
++    let message = ClientJsonRpcMessage::request(
++        ClientRequest::PingRequest(PingRequest::default()),
++        RequestId::Number(1),
++    );
++    let result = tokio::time::timeout(
++        Duration::from_secs(10),
++        client.post_message(uri, message, None, None, Default::default()),
++    )
++    .await
++    .expect("oversized response must be rejected before EOF");
++    assert!(
++        matches!(result, Err(StreamableHttpError::ResponseBodyTooLarge { max_size }) if max_size == limit),
++        "expected response size error, got {result:?}"
++    );
++}

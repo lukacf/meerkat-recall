@@ -10,6 +10,8 @@ exclude = [
     "vendor/surrealdb-core-2.6.5",
     "vendor/surrealdb-2.6.5",
     "vendor/reblessive-0.4.3",
+    "vendor/rmcp-1.8.0",
+    "vendor/rusqlite-0.37.0",
     "vendor/tokenizers-0.22.2",
     "vendor/rav1e-0.8.1",
 ]
@@ -211,6 +213,13 @@ surrealdb = { path = "vendor/surrealdb-2.6.5" }
 # Retain the tree runner's cleanup owner across cancellation of finish().
 # Scope, upstream checksums and regression evidence are recorded beside the copy.
 reblessive = { path = "vendor/reblessive-0.4.3" }
+
+# Backport bounded non-streaming HTTP bodies while preserving the shared SDK API.
+# See the adjacent provenance, security scope and transport regression evidence.
+rmcp = { path = "vendor/rmcp-1.8.0" }
+
+# Keep the shared rusqlite API while selecting patched bundled SQLite.
+rusqlite = { path = "vendor/rusqlite-0.37.0" }
 
 # Retain tokenizer/image behavior while replacing abandoned paste (RUSTSEC-2024-0436).
 # Exact source/license provenance and manifest-only deltas live beside each copy.

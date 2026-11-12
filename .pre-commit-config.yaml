@@ -27,12 +27,12 @@ repos:
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
-        # Preserve exact published notices, source metadata, and storage backport bytes.
-        exclude: ^vendor/(?:pdf-inspector/external/bcmaps/LICENSE$|surrealkv-0\.9\.3(?:/|-backport\.patch$))
+        # Preserve exact published notices, source metadata, and dependency backport bytes.
+        exclude: ^vendor/(?:pdf-inspector/external/bcmaps/LICENSE$|(?:surrealkv-0\.9\.3|reblessive-0\.4\.3|rmcp-1\.8\.0|rusqlite-0\.37\.0)(?:/|-backport\.patch$))
         args: [--markdown-linebreak-ext=md]
         stages: [pre-push]
       - id: end-of-file-fixer
-        exclude: ^vendor/(?:pdf-inspector/\.cargo_vcs_info\.json$|surrealkv-0\.9\.3(?:/|-backport\.patch$))
+        exclude: ^vendor/(?:pdf-inspector/\.cargo_vcs_info\.json$|(?:surrealkv-0\.9\.3|reblessive-0\.4\.3|rmcp-1\.8\.0|rusqlite-0\.37\.0)(?:/|-backport\.patch$))
         stages: [pre-push]
       - id: check-yaml
         stages: [pre-push]

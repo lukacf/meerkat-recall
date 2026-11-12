@@ -1,0 +1,421 @@
+--- /dev/null
++++ b/src/tree/cancellation_diagnostics.rs
+@@ -0,0 +1,74 @@
++//! Payload-free evidence that a runner began cleaning up pending root tasks.
++#![forbid(unsafe_code)]
++
++use std::{
++    io::{self, Write},
++    sync::atomic::{AtomicUsize, Ordering},
++    time::{SystemTime, UNIX_EPOCH},
++};
++
++static CLEANUP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
++
++pub(super) fn record_pending_drop(pending_root_tasks: usize) {
++    if pending_root_tasks == 0 {
++        return;
++    }
++    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH);
++    let unix_ms = elapsed.as_ref().map_or(0, |time| time.as_millis());
++    record(
++        &mut io::stderr().lock(),
++        &CLEANUP_SEQUENCE,
++        pending_root_tasks,
++        unix_ms,
++        elapsed.is_ok(),
++        std::process::id(),
++        std::thread::panicking(),
++    );
++}
++
++// A failed diagnostic write must not turn cancellation into a panic. This
++// record precedes cleanup; it does not claim that cleanup completed.
++fn record(
++    output: &mut impl Write,
++    sequence: &AtomicUsize,
++    pending_root_tasks: usize,
++    unix_ms: u128,
++    clock_ok: bool,
++    pid: u32,
++    unwinding: bool,
++) {
++    if pending_root_tasks == 0 {
++        return;
++    }
++    let seq = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
++    let _ = writeln!(output, "event=recall_tree_cleanup phase=begin unix_ms={unix_ms} clock_ok={clock_ok} pid={pid} seq={seq} pending_root_tasks={pending_root_tasks} unwinding={unwinding}");
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn records_pending_cleanup_and_unwinding_but_not_completed_runs() {
++        let sequence = AtomicUsize::new(0);
++        let mut output = Vec::new();
++        record(&mut output, &sequence, 0, 123, true, 7, false);
++        assert!(output.is_empty());
++        assert_eq!(sequence.load(Ordering::Relaxed), 0);
++        record(&mut output, &sequence, 2, 123, true, 7, false);
++        record(&mut output, &sequence, 1, 0, false, 7, true);
++        assert_eq!(String::from_utf8(output).unwrap(), concat!(
++            "event=recall_tree_cleanup phase=begin unix_ms=123 clock_ok=true pid=7 seq=1 pending_root_tasks=2 unwinding=false\n",
++            "event=recall_tree_cleanup phase=begin unix_ms=0 clock_ok=false pid=7 seq=2 pending_root_tasks=1 unwinding=true\n",
++        ));
++    }
++
++    #[test]
++    fn failed_output_and_counter_wrap_do_not_panic() {
++        // A full fixed buffer returns WriteZero. Diagnostics are best effort.
++        let mut full: &mut [u8] = &mut [];
++        let sequence = AtomicUsize::new(usize::MAX);
++        record(&mut full, &sequence, 1, 123, true, 7, false);
++        assert_eq!(sequence.load(Ordering::Relaxed), 0);
++    }
++}
+--- /dev/null
++++ b/src/tree/cancellation_tests.rs
+@@ -0,0 +1,262 @@
++//! Regression tests for the cleanup ownership transferred by `Runner::finish`.
++#![forbid(unsafe_code)]
++
++use super::TreeStack;
++use std::{
++    future::{pending, Future},
++    panic::{catch_unwind, AssertUnwindSafe},
++    pin::Pin,
++    sync::{
++        atomic::{AtomicUsize, Ordering},
++        Arc, Mutex,
++    },
++    task::{Context, Poll, Wake, Waker},
++};
++
++struct Noop;
++impl Wake for Noop {
++    fn wake(self: Arc<Self>) {}
++}
++
++fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
++    let waker = Waker::from(Arc::new(Noop));
++    future.poll(&mut Context::from_waker(&waker))
++}
++
++struct Probe(Arc<AtomicUsize>);
++impl Drop for Probe {
++    fn drop(&mut self) {
++        self.0.fetch_add(1, Ordering::SeqCst);
++    }
++}
++
++fn assert_reusable(stack: &mut TreeStack) {
++    let mut next = Box::pin(
++        stack
++            .enter(|_| async { String::from("next query") })
++            .finish(),
++    );
++    assert_eq!(poll(next.as_mut()), Poll::Ready(String::from("next query")));
++}
++
++#[test]
++fn dropping_unpolled_finish_releases_captures() {
++    let drops = Arc::new(AtomicUsize::new(0));
++    let probe = Probe(drops.clone());
++    let mut stack = TreeStack::new();
++    drop(stack.enter(|_| async move { drop(probe) }).finish());
++    assert_eq!(drops.load(Ordering::SeqCst), 1);
++    assert_reusable(&mut stack);
++    drop(stack);
++    assert_eq!(drops.load(Ordering::SeqCst), 1);
++}
++
++#[test]
++fn cancelling_nested_finish_drops_each_task_once_and_allows_reuse() {
++    let drops = Arc::new(AtomicUsize::new(0));
++    let root = Probe(drops.clone());
++    let child = Probe(drops.clone());
++    let mut stack = TreeStack::new();
++    let mut finish = Box::pin(
++        stack
++            .enter(|stk| async move {
++                let _root = root;
++                stk.run(|_| async move {
++                    let _child = child;
++                    pending::<()>().await;
++                })
++                .await;
++            })
++            .finish(),
++    );
++    assert!(poll(finish.as_mut()).is_pending());
++    assert_eq!(drops.load(Ordering::SeqCst), 0);
++    drop(finish);
++    assert_eq!(drops.load(Ordering::SeqCst), 2);
++    assert_reusable(&mut stack);
++    drop(stack);
++    assert_eq!(drops.load(Ordering::SeqCst), 2);
++}
++
++#[test]
++fn cancelling_scoped_finish_releases_scheduler_children() {
++    let drops = Arc::new(AtomicUsize::new(0));
++    let first = Probe(drops.clone());
++    let second = Probe(drops.clone());
++    let mut stack = TreeStack::new();
++    let mut finish = Box::pin(
++        stack
++            .enter(|stk| async move {
++                stk.scope(|scope| async move {
++                    let a = scope.run(|_| async move {
++                        let _first = first;
++                        pending::<()>().await;
++                    });
++                    let b = scope.run(|_| async move {
++                        let _second = second;
++                        pending::<()>().await;
++                    });
++                    futures_util::future::join(a, b).await;
++                })
++                .await;
++            })
++            .finish(),
++    );
++    assert!(poll(finish.as_mut()).is_pending());
++    drop(finish);
++    assert_eq!(drops.load(Ordering::SeqCst), 2);
++    assert_reusable(&mut stack);
++    drop(stack);
++    assert_eq!(drops.load(Ordering::SeqCst), 2);
++}
++
++#[test]
++fn cancelled_borrowed_future_drops_before_its_input() {
++    struct Borrowed<'a>(&'a [String], Arc<AtomicUsize>);
++    impl Drop for Borrowed<'_> {
++        fn drop(&mut self) {
++            assert_eq!(self.0[0], "live until cancelled");
++            self.1.fetch_add(1, Ordering::SeqCst);
++        }
++    }
++    let drops = Arc::new(AtomicUsize::new(0));
++    // On assertion failure the stack is destroyed before input, keeping the
++    // native red regression safe. The Miri-only test below checks UAF.
++    let input = vec![String::from("live until cancelled")];
++    let mut stack = TreeStack::new();
++    {
++        let borrowed = Borrowed(&input, drops.clone());
++        let mut finish = Box::pin(
++            stack
++                .enter(|_| async move {
++                    let _borrowed = borrowed;
++                    pending::<()>().await;
++                })
++                .finish(),
++        );
++        assert!(poll(finish.as_mut()).is_pending());
++        drop(finish);
++        // Assert while input is still live, so an unfixed native test fails
++        // without deliberately executing the later dangling destructor.
++        assert_eq!(drops.load(Ordering::SeqCst), 1);
++    }
++    drop(input);
++    drop(stack);
++    assert_eq!(drops.load(Ordering::SeqCst), 1);
++}
++
++#[test]
++fn finished_result_has_one_owner_and_stack_is_reusable() {
++    let drops = Arc::new(AtomicUsize::new(0));
++    let result = Probe(drops.clone());
++    let mut stack = TreeStack::new();
++    let mut finish = Box::pin(stack.enter(|_| async { result }).finish());
++    let Poll::Ready(result) = poll(finish.as_mut()) else {
++        panic!("result was not ready")
++    };
++    drop(finish);
++    assert_eq!(drops.load(Ordering::SeqCst), 0);
++    assert_reusable(&mut stack);
++    drop(stack);
++    assert_eq!(drops.load(Ordering::SeqCst), 0);
++    drop(result);
++    assert_eq!(drops.load(Ordering::SeqCst), 1);
++}
++
++#[test]
++fn panicking_finish_releases_nested_tasks() {
++    let drops = Arc::new(AtomicUsize::new(0));
++    let probe = Probe(drops.clone());
++    let mut stack = TreeStack::new();
++    assert!(catch_unwind(AssertUnwindSafe(|| {
++        let mut finish = Box::pin(
++            stack
++                .enter(|stk| async move {
++                    let _probe = probe;
++                    stk.run(|_| async { panic!("synthetic query panic") }).await;
++                })
++                .finish(),
++        );
++        poll(finish.as_mut())
++    }))
++    .is_err());
++    assert_eq!(drops.load(Ordering::SeqCst), 1);
++    assert_reusable(&mut stack);
++}
++
++// With the upstream implementation this safe-Rust input produces a dangling
++// destructor when the stack is dropped. Keep it Miri-only so a native red run
++// does not deliberately execute undefined behavior.
++#[cfg(miri)]
++#[test]
++fn cancelled_finish_cannot_outlive_borrowed_data() {
++    struct Borrowed<'a>(&'a [String]);
++    impl Drop for Borrowed<'_> {
++        fn drop(&mut self) {
++            assert_eq!(self.0[0], "live until cancelled");
++        }
++    }
++    let mut stack = TreeStack::new();
++    {
++        let source = vec![String::from("live until cancelled")];
++        let borrowed = Borrowed(&source);
++        let mut finish = Box::pin(
++            stack
++                .enter(|_| async move {
++                    let _borrowed = borrowed;
++                    pending::<()>().await;
++                })
++                .finish(),
++        );
++        assert!(poll(finish.as_mut()).is_pending());
++        drop(finish);
++    }
++    drop(stack);
++}
++
++#[test]
++fn cross_thread_cancellation_tolerates_stale_scheduler_wakers() {
++    struct CaptureWaker(Arc<Mutex<Option<Waker>>>);
++    impl Future for CaptureWaker {
++        type Output = ();
++        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
++            *self.0.lock().unwrap() = Some(cx.waker().clone());
++            Poll::Pending
++        }
++    }
++    let mut stack = TreeStack::new();
++    let rounds = if cfg!(miri) { 8 } else { 200 };
++    for _ in 0..rounds {
++        let drops = Arc::new(AtomicUsize::new(0));
++        let root = Probe(drops.clone());
++        let child = Probe(drops.clone());
++        let captured = Arc::new(Mutex::new(None));
++        let capture = CaptureWaker(captured.clone());
++        let mut finish = Box::pin(
++            stack
++                .enter(|stk| async move {
++                    let _root = root;
++                    stk.scope(|scope| async move {
++                        scope
++                            .run(|_| async move {
++                                let _child = child;
++                                capture.await;
++                            })
++                            .await;
++                    })
++                    .await;
++                })
++                .finish(),
++        );
++        assert!(poll(finish.as_mut()).is_pending());
++        let stale = captured.lock().unwrap().take().expect("child was polled");
++        std::thread::scope(|scope| {
++            scope.spawn(move || drop(finish)).join().unwrap();
++        });
++        assert_eq!(drops.load(Ordering::SeqCst), 2);
++        stale.wake_by_ref();
++        stale.wake();
++        assert_reusable(&mut stack);
++        assert_eq!(drops.load(Ordering::SeqCst), 2);
++    }
++}
+--- a/src/tree/mod.rs
++++ b/src/tree/mod.rs
+@@ -7,6 +7,7 @@
+     task::{Context, Poll},
+ };
+ 
++mod cancellation_diagnostics;
+ mod future;
+ mod runner;
+ mod schedular;
+@@ -14,6 +15,9 @@
+ 
+ #[cfg(test)]
+ mod test;
++
++#[cfg(test)]
++mod cancellation_tests;
+ 
+ pub use future::{ScopeFuture, StkFuture};
+ use runner::Runner;
+--- a/src/tree/runner.rs
++++ b/src/tree/runner.rs
+@@ -9,7 +9,9 @@
+ 
+ #[must_use = "futures do nothing unless you `.await` or poll them"]
+ pub struct FinishFuture<'a, R> {
+-    stack: &'a TreeStack,
++    // Keep the cleanup owner alive until this future completes or is cancelled.
++    // A bare stack reference would let borrowed tasks outlive their inputs.
++    runner: Runner<'a, R>,
+     _marker: PhantomData<R>,
+ }
+ 
+@@ -17,15 +19,16 @@
+     type Output = R;
+ 
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+-        let addr = self.stack.root.set_rebless_context(cx);
++        let stack = self.runner.stack;
++        let addr = stack.root.set_rebless_context(cx);
+         loop {
+-            if let Some(x) = unsafe { self.stack.root.try_get_result() } {
+-                self.stack.root.set_rebless_context_addr(addr);
++            if let Some(x) = unsafe { stack.root.try_get_result() } {
++                stack.root.set_rebless_context_addr(addr);
+                 return Poll::Ready(x);
+             }
+ 
+-            let Poll::Ready(_) = (unsafe { self.stack.drive_top_task(cx) }) else {
+-                self.stack.root.set_rebless_context_addr(addr);
++            let Poll::Ready(_) = (unsafe { stack.drive_top_task(cx) }) else {
++                stack.root.set_rebless_context_addr(addr);
+                 return Poll::Pending;
+             };
+         }
+@@ -73,12 +76,10 @@
+     }
+ 
+     pub fn finish(self) -> FinishFuture<'a, R> {
+-        let res = FinishFuture {
+-            stack: self.stack,
++        FinishFuture {
++            runner: self,
+             _marker: PhantomData,
+-        };
+-        std::mem::forget(self);
+-        res
++        }
+     }
+ 
+     pub fn step(&mut self) -> StepFuture<R> {
+@@ -91,6 +92,7 @@
+ 
+ impl<R> Drop for Runner<'_, R> {
+     fn drop(&mut self) {
++        super::cancellation_diagnostics::record_pending_drop(self.stack.root.pending_tasks());
+         self.stack.schedular.clear();
+         unsafe {
+             self.stack.root.clear::<R>();

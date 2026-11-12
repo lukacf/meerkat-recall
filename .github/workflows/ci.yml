@@ -185,6 +185,14 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         run: make test-unit NEXTEST_ARGS=--no-fail-fast
 
+      - name: Validate vendored dependency repairs
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          ./scripts/repo-cargo test --manifest-path vendor/reblessive-0.4.3/Cargo.toml --locked --features tree --lib
+          ./scripts/repo-cargo test --manifest-path vendor/rusqlite-0.37.0/Cargo.toml --locked --features bundled --lib --test bundled_sqlite_patch
+          ./scripts/repo-cargo test --manifest-path vendor/rmcp-1.8.0/Cargo.toml --locked --features client,transport-streamable-http-client-reqwest,transport-streamable-http-client-unix-socket,transport-streamable-http-server,reqwest/charset --lib --test test_recall_http_response_limits --test test_unix_socket_response_limits --test test_streamable_http_empty_2xx_notification --test test_streamable_http_4xx_error_body --test test_streamable_http_json_response --test test_unix_socket_transport
+          ./scripts/repo-cargo test --manifest-path vendor/rmcp-1.8.0/Cargo.toml --locked --features client,transport-streamable-http-client-reqwest,transport-streamable-http-client-unix-socket --test test_recall_http_response_limits --test test_unix_socket_response_limits
+
   test-all:
     name: Full test suite (all features)
     needs: changes

@@ -69,3 +69,23 @@ retains this dependency, so upgrading it does not remove the maintenance issue.
 The audit exception is limited to this advisory. Revisit it when the upstream
 timer removes `pin-utils` or another advisory changes the security assessment.
 Replacing the pin-projection code requires separate Wasm validation.
+
+## Dependency repair scope
+
+The root lockfile selects `rustix` 1.1.6 for the zero-length extended-attribute
+buffer repair in `RUSTSEC-2026-0486`. The shared `rusqlite` 0.37 API is retained
+with a local dependency update to `libsqlite3-sys` 0.39.1, which bundles SQLite
+3.54.1 and includes the WAL page-size fix for `RUSTSEC-2026-0459`. System-linked
+SQLite and SQLCipher need their own version assessment. See the
+[SQLite provenance and validation](vendor/rusqlite-0.37.0-backport.md).
+
+The local RMCP 1.8 backport caps built-in non-streaming HTTP response bodies
+for `RUSTSEC-2026-0462` while preserving the shared Meerkat SDK API. Its
+[repair record](vendor/rmcp-1.8.0-backport.md) describes limits and tests.
+
+The separate [reblessive cleanup repair](vendor/reblessive-0.4.3-backport.md)
+does not resolve all of that dependency's memory-safety defects. In particular,
+the independent `RUSTSEC-2026-0454` issues and explicitly forgotten drivers
+remain outside its scope. A successful dependency audit is not proof that a
+vendored crate is generally memory-safe; retain the source review and explicit
+regression tests. No new advisory exception is added for these repairs.

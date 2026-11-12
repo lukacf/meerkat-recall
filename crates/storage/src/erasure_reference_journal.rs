@@ -348,7 +348,7 @@ impl ErasureJournal {
             .writer
             .lock()
             .map_err(|_| io_error("journal lock poisoned"))?;
-        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire(
+        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
             &self.root.join("reference-membership"),
         )?;
         let mut index =
@@ -377,7 +377,7 @@ impl ErasureJournal {
             .writer
             .lock()
             .map_err(|_| io_error("journal lock poisoned"))?;
-        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire(
+        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
             &self.root.join("reference-membership"),
         )?;
         let mut index =
@@ -413,7 +413,7 @@ impl ErasureJournal {
             .lock()
             .map_err(|_| io_error("journal lock poisoned"))?;
         // Separate opens must not lose concurrent union updates either.
-        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire(
+        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
             &self.root.join("reference-membership"),
         )?;
         self.validate_intent(intent)?;
@@ -477,7 +477,7 @@ impl ErasureJournal {
     }
 
     pub(super) fn validate_reference_memberships(&self) -> StorageResult<()> {
-        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire(
+        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
             &self.root.join("reference-membership"),
         )?;
         let index = validate_index(&self.root, &self.identity, self.reference_key_fingerprint())?;

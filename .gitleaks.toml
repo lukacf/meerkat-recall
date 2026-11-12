@@ -1,5 +1,17 @@
 title = "Elephant secret scanning"
 
+[[allowlists]]
+description = "Verified public RMCP source SHA-256 integrity fingerprints"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^vendor/rmcp-1\.8\.0-upstream-sha256\.json$''']
+regexTarget = "match"
+regexes = [
+  '''^auth\.rs": "a254f08a7d657f30bec0167e203cfd1b311a69e3bd52a28a64d1a47ced5bb138"$''',
+  '''^auth\.rs": "7e0e1e85ec7f8836dd2295c7608eb8e2cf05e5b72306277dfe2598fa538e9ea4"$''',
+  '''^test_client_credentials\.rs": "fe481e7223af035074478157fe33d8d3e7ecb78b0d77b601e3210361b9632f61"$''',
+]
+
 # A custom config replaces defaults unless it explicitly extends them.
 [extend]
 useDefault = true

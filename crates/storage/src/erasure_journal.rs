@@ -68,7 +68,7 @@ impl ErasureJournal {
             private_directory(&root.join(name))?;
         }
         let (identity, reference_key) = {
-            let _initialization = crate::exclusive_store_lock::StoreWriterLock::acquire(
+            let _initialization = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
                 &root.join("journal-initialization"),
             )?;
             references::open_key(root)?
@@ -193,7 +193,7 @@ impl ErasureJournal {
             .writer
             .lock()
             .map_err(|_| io_error("journal lock poisoned"))?;
-        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire(
+        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
             &self.root.join("reference-membership"),
         )?;
         if let Some(original) = self.restore_marker()? {
@@ -225,7 +225,7 @@ impl ErasureJournal {
             .writer
             .lock()
             .map_err(|_| io_error("journal lock poisoned"))?;
-        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire(
+        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
             &self.root.join("reference-membership"),
         )?;
         if self.restore_marker()?.as_ref() != Some(expected) {
@@ -370,7 +370,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let journal = ErasureJournal::open(directory.path()).unwrap();
         let marker = restore_marker_fixture(1);
-        let lock = crate::exclusive_store_lock::StoreWriterLock::acquire(
+        let lock = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
             &directory.path().join("reference-membership"),
         )
         .unwrap();
@@ -378,7 +378,7 @@ mod tests {
         assert!(journal.restore_marker().unwrap().is_none());
         drop(lock);
         journal.begin_restore(&marker).unwrap();
-        let lock = crate::exclusive_store_lock::StoreWriterLock::acquire(
+        let lock = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
             &directory.path().join("reference-membership"),
         )
         .unwrap();

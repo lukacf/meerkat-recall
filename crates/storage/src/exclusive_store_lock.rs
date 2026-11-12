@@ -12,11 +12,31 @@ use crate::{StorageBackendKind, StorageConfig, StorageError, StorageResult};
 /// Exclusive operating-system lock held until the last owning client drops.
 #[derive(Debug)]
 pub struct StoreWriterLock {
-    _file: File,
+    file: File,
     path: PathBuf,
 }
 
+/// A journal operation's lock, released at the operation boundary even if a
+/// concurrently forked child temporarily retains an inherited descriptor.
+#[derive(Debug)]
+pub(crate) struct JournalWriterLock(StoreWriterLock);
+
+impl Drop for JournalWriterLock {
+    fn drop(&mut self) {
+        // Closing alone retains a flock while a forked child still holds the
+        // inherited descriptor before exec. The journal operation has ended;
+        // persistent store ownership retains its independent lifetime guard.
+        if let Err(error) = self.0.file.unlock() {
+            tracing::error!(%error, "journal writer lock release failed");
+        }
+    }
+}
+
 impl StoreWriterLock {
+    pub(crate) fn acquire_journal(store_path: &Path) -> StorageResult<JournalWriterLock> {
+        Self::acquire(store_path).map(JournalWriterLock)
+    }
+
     /// Acquire a nonblocking exclusive lock before opening a persistent store.
     pub fn acquire(store_path: &Path) -> StorageResult<Self> {
         Self::acquire_diagnosed(store_path, InitializationPhase::WriterLock)
@@ -52,7 +72,7 @@ impl StoreWriterLock {
                 }
             }
         })?;
-        Ok(Self { _file: file, path })
+        Ok(Self { file, path })
     }
 
     /// Stable ownership file for diagnostics. It contains no stored payload.
@@ -150,6 +170,25 @@ mod tests {
         drop(first);
         assert!(StoreWriterLock::acquire(&store).is_err());
         drop(clone);
+        assert!(StoreWriterLock::acquire(&store).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_drop_releases_lock_with_a_duplicated_descriptor_still_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join("store");
+        let owner = StoreWriterLock::acquire_journal(&store).unwrap();
+        // dup and fork retain the same open file description on Unix. This
+        // deterministically models a child between fork and close-on-exec.
+        let inherited = owner.0.file.try_clone().unwrap();
+        assert!(StoreWriterLock::acquire(&store).is_err());
+        drop(owner);
+        let next = StoreWriterLock::acquire(&store).unwrap();
+        drop(inherited);
+        // Closing the old descriptor must not release the new owner's lock.
+        assert!(StoreWriterLock::acquire(&store).is_err());
+        drop(next);
         assert!(StoreWriterLock::acquire(&store).is_ok());
     }
 

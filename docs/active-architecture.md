@@ -629,6 +629,19 @@ CI enforces this file and related docs with:
 
 ## Scheduler capacity and cold history
 
+The embedded SurrealDB tree executor retains the runner that owns its pending
+futures until `finish()` completes or is dropped. Cancellation destroys those
+futures while their borrowed inputs are still alive and leaves the stack reusable.
+The pinned dependency repair changes cleanup ownership; query deadlines, detached
+SDK request ownership and transaction outcomes retain their existing behavior.
+Before clearing pending root tasks, the runner emits a payload-free
+`event=recall_tree_cleanup phase=begin` stderr record with time, process-local
+sequence, PID, pending root count and unwind state. It records cleanup beginning,
+not success or crash causality. Completed runs emit no record; failed diagnostic
+writes are ignored. Explicitly forgotten drivers bypass both cleanup and logging
+and retain the dependency's residual lifetime risk.
+See the [dependency repair and validation limits](../vendor/reblessive-0.4.3-backport.md).
+
 Scheduler selection and counts read the active `work_item` table through the
 queue indexes introduced in migration 028. Runnable counts are exact aggregates,
 independent of the selector's candidate limit. Embedded SurrealDB connections
@@ -741,6 +754,12 @@ target mutation; this path does not convert that authority into a new journal.
 Online snapshot export uses the configured RuntimeManager to pause new data requests, signal worker shutdown, and wait at most the requested 1-60 seconds for worker drain and the storage activity barrier. Already admitted HTTP/MCP operations retain a shared activity guard through publication; snapshot and source-erasure operations own their exclusive barriers. A drain timeout leaves data admission closed and cannot count as a successful snapshot. The export task survives caller disconnects and returns a checked manifest with bounded retention (default seven days, maximum thirty days). `/v1/system/snapshot/restore` (and retained `/import`) remains available to explicitly global operators when a durable recovery marker blocks ordinary data access. Successful restore replays erasure intent and rotates epochs before workers or data admission resume.
 
 Storage startup takes exclusive writer ownership for the effective embedded snapshot destination even when no snapshot exists yet. Normal serve only verifies schema receipts; explicit runtime initialization and the migrate command apply schema. Readiness does not become healthy while restoration, erasure replay, worker drain, or snapshot quiescence remains active.
+
+Journal operation guards explicitly unlock before closing their ownership
+files. A descriptor inherited by a concurrently spawned child must not keep a
+completed journal operation locked until that child executes. Persistent store
+writer ownership retains its independent client lifetime guard. Competing
+journal writers remain nonblocking failures while the operation guard is alive.
 
 Schema verification also recognizes the exact optional fake-embedding repair
 receipt written by `migrate` when a real embedding provider is selected. That

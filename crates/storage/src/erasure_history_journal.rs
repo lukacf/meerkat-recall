@@ -221,7 +221,7 @@ impl ErasureJournal {
             .writer
             .lock()
             .map_err(|_| io_error("journal lock poisoned"))?;
-        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire(
+        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
             &self.root.join("reference-membership"),
         )?;
         let mut proof = self.load_history_proof(intent)?;
@@ -259,7 +259,7 @@ impl ErasureJournal {
     }
 
     pub(super) fn validate_history_commitments(&self) -> StorageResult<()> {
-        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire(
+        let _disk_writer = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
             &self.root.join("reference-membership"),
         )?;
         let acknowledged = self.acknowledged_history_intents()?;

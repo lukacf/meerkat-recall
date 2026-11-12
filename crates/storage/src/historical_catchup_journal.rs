@@ -103,7 +103,7 @@ pub(super) fn begin(journal: &ErasureJournal, marker: &CatchupMarker) -> Storage
             "verified no-op must not create a pending marker".into(),
         ));
     }
-    let _writer = crate::exclusive_store_lock::StoreWriterLock::acquire(
+    let _writer = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
         &journal.path().join("historical-catchup-writer"),
     )?;
     if read(journal)?.is_some()
@@ -121,7 +121,7 @@ pub(super) fn begin(journal: &ErasureJournal, marker: &CatchupMarker) -> Storage
 }
 
 pub(super) fn finish(journal: &ErasureJournal, expected: &CatchupMarker) -> StorageResult<()> {
-    let _writer = crate::exclusive_store_lock::StoreWriterLock::acquire(
+    let _writer = crate::exclusive_store_lock::StoreWriterLock::acquire_journal(
         &journal.path().join("historical-catchup-writer"),
     )?;
     if read(journal)?.as_ref() != Some(expected) {

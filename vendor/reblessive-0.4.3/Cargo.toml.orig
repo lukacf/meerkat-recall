@@ -1,0 +1,39 @@
+[package]
+name = "reblessive"
+version = "0.4.3"
+edition = "2021"
+rust-version = "1.84"
+license = "MIT"
+readme = "README.md"
+description = "A small runtime for running deeply nested recursive functions"
+keywords = ["stack","call","async","memory","runtime"]
+repository = "https://github.com/DelSkayn/reblessive.git"
+
+[dev-dependencies]
+criterion = "0.5.1"
+futures-util = "0.3.30"
+pollster = "0.3.0"
+tokio = { version = "1.36.0", features = ["full"] }
+# Pinned so that criterion compiles when minimal version is used.
+ciborium = "0.2.2"
+regex = "1.5.3"
+
+[features]
+tree = []
+nightly = []
+
+[package.metadata.docs.rs]
+# document all features
+all-features = true
+# defines the configuration attribute `docsrs`
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+name = "calc"
+harness = false
+[[bench]]
+name = "fibbo"
+harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(docrs)'] }

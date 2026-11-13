@@ -442,15 +442,16 @@ actually inherited by the process or use the managed runtime configuration.
 | `JWT_SECRET` | _(required for HS256 unless using `JWT_SECRET_FILE`)_ | Random secret with at least 32 bytes for HS256 token validation |
 | `JWT_ALGORITHM` | `HS256` | Explicit `HS256` shared-secret or `RS256` public-key verifier |
 | `JWT_JWKS_FILE` | _(unset)_ | Public-only RSA JWKS snapshot for RS256; requires `JWT_ISSUER` and `JWT_AUDIENCE` |
-| `JWT_ISSUER` | _(none)_ | Required token issuer (optional) |
-| `JWT_AUDIENCE` | _(none)_ | Required token audience (optional) |
+| `JWT_ISSUER` | _(none)_ | Exact token issuer; required for RS256, optional for legacy HS256 |
+| `JWT_AUDIENCE` | _(none)_ | Exact token audience; required for RS256, optional for legacy HS256 |
 | `SKIP_AUTH` | `false` | Skip authentication entirely |
 
 <Warning>
   Use `SKIP_AUTH=true` only for isolated local development. With authentication
-  enabled, startup rejects a missing/development/short secret or an unsupported
-  algorithm. Generate a random secret, pass it through your secret manager,
-  and do not commit it.
+  enabled, HS256 startup requires a random secret of at least 32 bytes. RS256
+  requires its public keyset and exact issuer/audience without a shared secret.
+  Startup rejects unsupported algorithms and mixed key sources. Keep signing
+  secrets in your secret manager, outside Git.
 </Warning>
 
 ### SurrealDB Connection

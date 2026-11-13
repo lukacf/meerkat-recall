@@ -536,7 +536,21 @@ node. Provenance reads authorize the entire document/revision/assertion/node
 chain before returning reference metadata or excerpts. REST space creation checks
 both read and write operation scopes before checking whether the space exists.
 
-HTTP and MCP use `elephant-auth` as the single legacy bearer-token verifier.
+HTTP and MCP use `elephant-auth` as the single bearer-token verifier. The stock
+server selects either the compatible HS256 secret or explicitly configured RS256
+public keys (`JWT_ALGORITHM=RS256`, `JWT_JWKS_FILE`). RS256 requires exact
+operator-configured issuer and audience, a named public key, expiry and subject;
+not-before is checked without clock leeway. Only the existing bearer claims are
+accepted, including all exchange-hybrid and bootstrap restrictions. Public keys
+are a bounded immutable startup snapshot with unique key IDs; token headers cannot
+supply remote keys, discovery URLs or critical extensions. Rotating the configured
+snapshot requires restart. The service-token CLI remains an HS256 issuer.
+
+This adds verification, not an identity provider or governed exchange dispatch.
+Local current grants, space binding and ABAC are unchanged. Legacy single-space
+claims remain compatible; removing an asymmetric key rejects its tokens after
+restart but does not cancel already-admitted operations. There is no per-token
+revocation list or automatic OIDC discovery.
 Authenticated requests retain an opaque verified caller context, including
 issuer, audience and expiry, alongside the existing public Principal/ABAC
 projections. Those projections remain policy input, not authentication proof.

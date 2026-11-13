@@ -83,9 +83,9 @@ The local RMCP 1.8 backport caps built-in non-streaming HTTP response bodies
 for `RUSTSEC-2026-0462` while preserving the shared Meerkat SDK API. Its
 [repair record](vendor/rmcp-1.8.0-backport.md) describes limits and tests.
 
-The separate [reblessive cleanup repair](vendor/reblessive-0.4.3-backport.md)
-does not resolve all of that dependency's memory-safety defects. In particular,
-the independent `RUSTSEC-2026-0454` issues and explicitly forgotten drivers
-remain outside its scope. A successful dependency audit is not proof that a
+The [reblessive repairs](vendor/reblessive-0.4.3-backport.md) cover cancellation
+cleanup and ordinary async-driver ownership, but not all of the dependency's
+memory-safety defects. Unsound erased-future Send/Sync behavior reported under
+`RUSTSEC-2026-0454` and explicitly forgotten drivers remain outside their scope. A successful dependency audit is not proof that a
 vendored crate is generally memory-safe; retain the source review and explicit
 regression tests. No new advisory exception is added for these repairs.

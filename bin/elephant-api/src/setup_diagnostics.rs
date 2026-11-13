@@ -138,6 +138,7 @@ mod tests {
     fn auth() -> AuthConfig {
         AuthConfig {
             secret: "synthetic-worker-diagnostic-test-key-only".into(),
+            verification_keys: None,
             algorithm: jsonwebtoken::Algorithm::HS256,
             audience: None,
             issuer: None,

@@ -55,3 +55,14 @@ continuing memory growth or a new abort keeps that acceptance criterion open.
 Every stage includes code review, focused regressions, the applicable repository
 gates, documentation updates, and a distinct consumer handoff when behavior
 changes. No new production feature is enabled merely by adding it to this plan.
+
+## Credential implementation slice
+
+The first credential change adds operator-managed RS256 verification to both
+stock network surfaces, with a bounded public-only JWKS startup snapshot and
+explicit issuer/audience checks. Key overlap/removal is applied by restart;
+legacy HS256 remains available as a separate configured mode. The same profile
+checks and local grant/ABAC owners process verified claims. JWT configuration
+Debug output is redacted. This slice does not add online discovery, individual
+JWT revocation, governed exchange execution, or identity-provider claim mapping.
+Those remain distinct acceptance items in stage 4.

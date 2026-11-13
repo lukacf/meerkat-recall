@@ -57,11 +57,17 @@ does not grant access. Configured issuer and audience restrictions also apply.
 | `scopes` | Array of permission scopes (e.g., `read:entity`, `write:doc`) |
 | `clearances` | ABAC policy clearances for the principal |
 
-Issue credentials with the local `service-token` CLI and create current local
+For HS256, issue credentials with the local `service-token` CLI and create current local
 service grants separately. Path-selected space and `X-Space-Id` must agree;
 MCP and operation polling use the header. A signed multi-space ceiling does not
 select a default or override a revoked grant. Global management tokens cannot
 perform ordinary data access. See [service setup](/operations/service-setup).
+
+RS256 verification is also available with an operator-managed public JWKS file.
+It uses the same Recall claims and local authorization checks. The issuer supplies
+these custom claims; an arbitrary identity-provider login token is not sufficient.
+See [asymmetric verification](/operations/deployment#asymmetric-token-verification)
+for configuration, key rotation and compatibility limits.
 
 <Note>
   In development mode, set the environment variable `SKIP_AUTH=true` to bypass JWT validation entirely. Never use this in production.
@@ -223,7 +229,9 @@ accept an explicit `space_id` reject a mismatch with the token's space. In
 local `SKIP_AUTH` mode, `X-Space-Id` selects the development principal's space
 (default `default`).
 
-The REST space-configuration administration routes have a different boundary:
-they currently authenticate callers without per-record authorization. Restrict
-those routes to trusted operators. See [security boundaries](/concepts/security)
+Space-configuration administration also enforces operation scopes and record
+authorization. Reads require `read:space_config`; creates and updates require
+`write:space_config` plus read authority for the returned configuration. Tenant
+tokens remain restricted to their own named space, and updates compare the
+authorized state at the storage write. See [security boundaries](/concepts/security)
 and [space administration](/api/system#spaces).

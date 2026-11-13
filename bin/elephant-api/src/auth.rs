@@ -16,7 +16,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 pub use elephant_auth::Claims;
-use elephant_auth::{IssuerMappings, LegacyVerifier, VerifiedCallerContext};
+use elephant_auth::{
+    asymmetric::TrustedJwks, IssuerMappings, LegacyVerifier, VerifiedCallerContext,
+};
 use jsonwebtoken::Algorithm;
 use serde::Serialize;
 
@@ -153,10 +155,12 @@ impl Principal {
 }
 
 /// JWT authentication configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthConfig {
     /// Secret key for HS256 validation.
     pub secret: String,
+    /// Operator-managed public verification keys for RS256, loaded at startup.
+    pub verification_keys: Option<Arc<TrustedJwks>>,
     /// Algorithm to use for validation.
     pub algorithm: Algorithm,
     /// Required audience.
@@ -165,6 +169,16 @@ pub struct AuthConfig {
     pub issuer: Option<String>,
     /// Skip authentication (for development).
     pub skip_auth: bool,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("algorithm", &self.algorithm)
+            .field("skip_auth", &self.skip_auth)
+            .field("protected_configuration", &"redacted")
+            .finish_non_exhaustive()
+    }
 }
 
 impl AuthConfig {
@@ -182,12 +196,16 @@ impl AuthConfig {
         )?;
         let algorithm = Self::configured_algorithm(std::env::var("JWT_ALGORITHM").ok().as_deref())
             .map_err(anyhow::Error::msg)?;
+        let verification_keys = std::env::var_os("JWT_JWKS_FILE")
+            .map(|path| TrustedJwks::from_file(std::path::Path::new(&path)).map(Arc::new))
+            .transpose()?;
         let audience = std::env::var("JWT_AUDIENCE").ok();
         let issuer = std::env::var("JWT_ISSUER").ok();
         let skip_auth = std::env::var("SKIP_AUTH").is_ok_and(|v| v == "true" || v == "1");
 
         Ok(Self {
             secret,
+            verification_keys,
             algorithm,
             audience,
             issuer,
@@ -198,7 +216,8 @@ impl AuthConfig {
     fn configured_algorithm(value: Option<&str>) -> Result<Algorithm, &'static str> {
         match value {
             None | Some("HS256") => Ok(Algorithm::HS256),
-            Some(_) => Err("JWT_ALGORITHM must be HS256; other algorithms are not supported"),
+            Some("RS256") => Ok(Algorithm::RS256),
+            Some(_) => Err("JWT_ALGORITHM must be HS256 or RS256"),
         }
     }
 
@@ -207,13 +226,24 @@ impl AuthConfig {
     /// # Errors
     ///
     /// Returns a configuration error for a missing or short shared secret, or
-    /// an algorithm unsupported by the shared-secret decoder.
+    /// ambiguous key sources, or incomplete asymmetric issuer/audience configuration.
     pub fn validate_server_config(&self) -> Result<(), &'static str> {
         if self.skip_auth {
             return Ok(());
         }
-        if self.algorithm != Algorithm::HS256 {
-            return Err("JWT_ALGORITHM must be HS256; asymmetric keys are not supported");
+        if self.algorithm == Algorithm::RS256 {
+            if self.verification_keys.is_none() || !self.secret.is_empty() {
+                return Err("RS256 requires JWT_JWKS_FILE and no JWT_SECRET or JWT_SECRET_FILE");
+            }
+            for value in [self.issuer.as_deref(), self.audience.as_deref()] {
+                if value.is_none_or(|value| elephant_auth::ExactId::new(value).is_err()) {
+                    return Err("RS256 requires nonempty JWT_ISSUER and JWT_AUDIENCE");
+                }
+            }
+            return Ok(());
+        }
+        if self.algorithm != Algorithm::HS256 || self.verification_keys.is_some() {
+            return Err("HS256 cannot use JWT_JWKS_FILE; choose one explicit verifier");
         }
         if self.secret.trim().len() < 32 {
             return Err("Set JWT_SECRET to a random secret of at least 32 bytes, or explicitly set SKIP_AUTH=true for local development");
@@ -228,6 +258,25 @@ impl AuthConfig {
         token: &str,
         mappings: Option<&IssuerMappings>,
     ) -> Result<VerifiedCallerContext, AuthError> {
+        if self.algorithm == Algorithm::RS256 {
+            self.validate_server_config().map_err(|_| {
+                AuthError::from(elephant_auth::AuthError::InvalidTrustConfiguration)
+            })?;
+            let keys = self.verification_keys.as_ref().ok_or_else(|| {
+                AuthError::from(elephant_auth::AuthError::InvalidTrustConfiguration)
+            })?;
+            return keys
+                .verify(
+                    token,
+                    self.issuer.as_deref().unwrap_or_default(),
+                    self.audience.as_deref().unwrap_or_default(),
+                    mappings,
+                )
+                .map_err(AuthError::from);
+        }
+        if self.verification_keys.is_some() {
+            return Err(elephant_auth::AuthError::InvalidTrustConfiguration.into());
+        }
         LegacyVerifier {
             secret: &self.secret,
             algorithm: self.algorithm,
@@ -244,6 +293,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             secret: String::new(),
+            verification_keys: None,
             algorithm: Algorithm::HS256,
             audience: None,
             issuer: None,
@@ -619,7 +669,7 @@ mod tests {
             AuthConfig::configured_algorithm(Some("HS256")),
             Ok(Algorithm::HS256)
         );
-        for value in ["", "HS384", "HS512", "RS256", "ES256", "EdDSA", "HS265"] {
+        for value in ["", "HS384", "HS512", "RS512", "ES256", "EdDSA", "HS265"] {
             assert!(AuthConfig::configured_algorithm(Some(value)).is_err());
         }
     }
@@ -782,6 +832,7 @@ mod tests {
         assert!(result.is_err());
     }
     include!("auth_context_tests.rs");
+    include!("asymmetric_auth_tests.rs");
 }
 
 #[cfg(test)]

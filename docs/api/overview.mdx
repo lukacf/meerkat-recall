@@ -229,7 +229,9 @@ accept an explicit `space_id` reject a mismatch with the token's space. In
 local `SKIP_AUTH` mode, `X-Space-Id` selects the development principal's space
 (default `default`).
 
-The REST space-configuration administration routes have a different boundary:
-they currently authenticate callers without per-record authorization. Restrict
-those routes to trusted operators. See [security boundaries](/concepts/security)
+Space-configuration administration also enforces operation scopes and record
+authorization. Reads require `read:space_config`; creates and updates require
+`write:space_config` plus read authority for the returned configuration. Tenant
+tokens remain restricted to their own named space, and updates compare the
+authorized state at the storage write. See [security boundaries](/concepts/security)
 and [space administration](/api/system#spaces).

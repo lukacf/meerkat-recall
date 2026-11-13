@@ -735,7 +735,7 @@ Unset `JWT_SECRET` and `JWT_SECRET_FILE`. Mount the public file read-only and
 protect its integrity: replacing a trusted public key changes who can issue
 credentials. Keep TLS on the ingress and authentication enabled.
 
-The file is a JSON object with a `keys` array of 1–16 RSA public JWKs (2048–8192
+The file is a JSON object with a `keys` array of 1-16 RSA public JWKs (2048-8192
 bits), at most 64 KiB total. Each key requires a unique nonempty ASCII `kid`,
 `kty: "RSA"`, `alg: "RS256"`, and base64url unsigned `n` and `e`. Optional `use`
 must be `"sig"` and optional `key_ops` must be `["verify"]`. Private parameters,

@@ -201,6 +201,15 @@ struct Extractor<'a> {
 }
 
 impl Extractor<'_> {
+	// Visit the exact virtual [Thing(identity), row] without cloning the row.
+	// Both children share the original array's depth and resource budgets.
+	fn row(&mut self, identity: &Thing, row: &Value) -> Result<(), Error> {
+		self.consume(0)?;
+		self.consume(1)?;
+		self.reference(identity, 2)?;
+		self.native(row, 1)
+	}
+
 	fn consume(&mut self, depth: usize) -> Result<(), Error> {
 		depth_guard(depth)?;
 		self.remaining_nodes = self
@@ -493,6 +502,21 @@ pub fn recall_reference_tokens(
 	Ok(extractor.tokens.into_iter().collect())
 }
 
+/// Tokenize the virtual `[Thing(identity), row]` while borrowing both inputs.
+/// Equivalent tokens, limits and errors to the owned array representation.
+pub fn recall_reference_row_tokens(
+	journal_identity: &str,
+	space: &str,
+	key: &[u8; 32],
+	typed_uuid_tables: &[String],
+	identity: &Thing,
+	row: &Value,
+) -> Result<Vec<String>, Error> {
+	let mut extractor = extractor(journal_identity, space, key, typed_uuid_tables)?;
+	extractor.row(identity, row)?;
+	Ok(extractor.tokens.into_iter().collect())
+}
+
 // Manual, non-coercing argument inspection avoids upstream type-conversion
 // errors formatting the supplied private key as part of an error message.
 pub fn reference_tokens(arguments: Vec<Value>) -> Result<Value, Error> {
@@ -572,6 +596,10 @@ pub fn original_row_matches(arguments: Vec<Value>) -> Result<Value, Error> {
 #[cfg(test)]
 #[path = "recall_hmac_tests.rs"]
 mod hmac_tests;
+
+#[cfg(test)]
+#[path = "recall_row_tests.rs"]
+mod row_tests;
 
 /// Pure exact completion-envelope comparison for coverage-only invalidation.
 /// Malformed rows conservatively retain ordinary index invalidation.

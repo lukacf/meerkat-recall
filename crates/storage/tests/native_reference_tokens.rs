@@ -843,3 +843,58 @@ async fn native_reference_parser_filter_preserves_encoded_forms_and_errors() {
         surrealdb::Error::Db(expected_error).to_string()
     );
 }
+
+#[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "Synthetic reference fixtures must tokenize successfully."
+)]
+fn borrowed_native_row_matches_owned_array_and_keeps_physical_identity() {
+    let identity = Thing::from(("recall_probe", Id::String("42".into())));
+    let row = object([
+        (
+            "nested",
+            Value::from(vec![
+                reference("recall_probe", Id::Number(42)),
+                Value::from(r#"{"tb":"other","id":"row"}"#),
+            ]),
+        ),
+        ("raw", Value::from("synthetic body".repeat(1024))),
+    ]);
+    let expected = tokens(&Value::from(vec![
+        Value::Thing(identity.clone()),
+        row.clone(),
+    ]));
+    let actual =
+        surrealdb::recall_reference_row_tokens(JOURNAL, SPACE, &key(), &[], &identity, &row)
+            .unwrap();
+    assert_eq!(actual, expected);
+    assert!(actual.iter().any(|token| token == STRING_TOKEN));
+    assert!(actual.iter().any(|token| token == NUMBER_TOKEN));
+}
+
+#[test]
+fn borrowed_native_row_preserves_depth_and_unevaluated_value_refusals() {
+    let identity = Thing::from(("recall_probe", "42"));
+    let mut row = Value::None;
+    for _ in 0..130 {
+        let owned = Value::from(vec![Value::Thing(identity.clone()), row.clone()]);
+        let expected = recall_reference_tokens(JOURNAL, SPACE, &key(), &[], &owned)
+            .map_err(|error| error.to_string());
+        let actual =
+            surrealdb::recall_reference_row_tokens(JOURNAL, SPACE, &key(), &[], &identity, &row)
+                .map_err(|error| error.to_string());
+        assert_eq!(actual, expected);
+        row = Value::from(vec![row]);
+    }
+    let expression = Value::Param(surrealdb::sql::Param::from("not_evaluated"));
+    assert!(surrealdb::recall_reference_row_tokens(
+        JOURNAL,
+        SPACE,
+        &key(),
+        &[],
+        &identity,
+        &expression
+    )
+    .is_err());
+}

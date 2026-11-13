@@ -122,6 +122,11 @@ and compare the authorized pre-state at the storage write. Work retry requires
 `read:work_item` and `write:work_item` and retains its guard across hot/cold
 reactivation.
 
+MCP document projections remove text, sidecar text and media attachments without
+raw-document authority, including returned mutation records. Source projections
+hide locations without raw-source authority and always remove private replay
+templates. Arbitrary application metadata retains its record-level protection.
+
 MCP provenance resolves and authorizes the complete evidence chain before
 returning references or content. REST metadata-only document projections remove
 text, sidecar text and media attachments; chunk reads authorize their document,
@@ -628,6 +633,14 @@ CI enforces this file and related docs with:
 - `scripts/verify_legacy_terms.sh`
 
 ## Scheduler capacity and cold history
+
+Native lifecycle membership borrows the original native row while normalizing its physical identity and contents. They retain
+the virtual array's exact combined depth/node/decoded-byte budgets and token
+format, without constructing a cloned temporary native tree. Source authority,
+closure, erasure membership and commit fences are unchanged. Ordinary stack
+async drivers exclusively borrow their cleanup owner. Neither change establishes
+production crash causality or resolves all remaining unsafe dependency behavior.
+
 
 The embedded SurrealDB tree executor retains the runner that owns its pending
 futures until `finish()` completes or is dropped. Cancellation destroys those

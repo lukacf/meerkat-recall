@@ -162,16 +162,18 @@ routes, as well as returned mutation records. The existing REST response shape
 is preserved. Document chunks require raw access to the parent document and
 revision, and authorize each returned node.
 
-MCP document response helpers clear `doc.text` without raw authority and return
-a `RedactionEnvelope` listing affected fields. These receipts describe that
+MCP document response helpers clear `text`, `sidecar_text` and
+`media_attachments` without raw authority and return a `RedactionEnvelope`
+listing affected fields, including when the main text is empty. These receipts describe that
 specific projection. Neither helper is a general scrubber for arbitrary
 application-defined `metadata`; classify the whole record appropriately when
 those fields contain sensitive information.
 
-The current source handlers return authorized source records directly. Do not
-assume the `read:source:raw` scope automatically hides `source.uri` or
-`source.path` on every source API or MCP response. Protect sensitive source
-locations through the record envelope and deployment access policy.
+REST and MCP source record responses remove `uri` and `path` without
+`read:source:raw` (or wildcard scope). The internal `_manual_doc` replay
+template is removed even from raw-authorized source responses; document content
+uses document authorization. Arbitrary application metadata is not scrubbed,
+so sensitive metadata still requires the appropriate record envelope.
 
 ## Derived answers retain restrictions
 

@@ -27,7 +27,7 @@ mod exe;
 mod fnc;
 
 /// Recall exact typed erasure-reference capability, versioned independently of SQL.
-pub use fnc::recall::{recall_reference_identity_token, recall_reference_tokens, RECALL_REFERENCE_TOKEN_VERSION};
+pub use fnc::recall::{recall_reference_identity_token, recall_reference_row_tokens, recall_reference_tokens, RECALL_REFERENCE_TOKEN_VERSION};
 
 pub mod api;
 pub mod cnf;

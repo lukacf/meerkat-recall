@@ -81,6 +81,23 @@ pub fn reference_tokens(
         .map_err(|_| integrity("private reference normalization failed"))
 }
 
+/// Exact virtual `[Thing(identity), row]` normalization without cloning the row.
+pub(crate) fn reference_row_tokens(
+    journal_id: &str,
+    space: &str,
+    key: &[u8; 32],
+    identity: &Thing,
+    row: &Value,
+) -> StorageResult<BTreeSet<String>> {
+    let tables = TYPED_UUID_TABLES
+        .iter()
+        .map(|table| (*table).to_owned())
+        .collect::<Vec<_>>();
+    surrealdb::recall_reference_row_tokens(journal_id, space, key, &tables, identity, row)
+        .map(|tokens| tokens.into_iter().collect())
+        .map_err(|_| integrity("private reference normalization failed"))
+}
+
 /// Tokenize only the deleted physical identity, never independent identities
 /// referenced inside a composite key.
 pub fn reference_identity_token(

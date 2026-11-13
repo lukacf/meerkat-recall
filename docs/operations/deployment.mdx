@@ -744,9 +744,13 @@ certificate fields, unsupported fields, ambiguous IDs and other algorithms are
 rejected before startup. Never copy the signing key onto the Recall server.
 
 Tokens require `alg: "RS256"`, the trusted `kid`, and optionally `typ: "JWT"` in
-the header; other header fields are refused. The issuer and audience are fixed by
-server configuration, never selected from the token. Claims use Recall's bearer
-schema: `sub`, `exp`, `iss`, an `aud` array, space ceiling, scopes and clearances.
+the header; other header fields are refused. The expected issuer and audience are
+fixed by server configuration. The issuer must match exactly, and `aud` must
+contain the configured audience. A trusted qualified issuer mapping additionally
+requires exactly that one audience; extra audiences never create permissions or
+identity mappings. Use a single Recall audience for the deployment profile.
+Claims use Recall's bearer schema: `sub`, `exp`, `iss`, an `aud` array, space
+ceiling, scopes and clearances.
 `exp` is required and `nbf`, when present, is enforced with no clock leeway.
 Configure synchronized clocks. Exchange/delegation hybrid profiles remain refused.
 An identity-provider login token does not automatically confer Recall permissions.

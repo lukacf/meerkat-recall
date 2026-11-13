@@ -1,4 +1,4 @@
-# Reblessive 0.4.3 cancellation cleanup
+# Reblessive 0.4.3 cancellation cleanup and driver borrowing
 
 Recall pins this copy through the root `[patch.crates-io]` table. It preserves
 the cleanup owner when converting a tree `Runner` into its finishing future.
@@ -13,7 +13,8 @@ the cleanup owner when converting a tree `Runner` into its finishing future.
 - The original MIT [LICENSE](reblessive-0.4.3/LICENSE) and all 42 archive files
   are retained. Original file digests are recorded in
   [the checksum manifest](reblessive-0.4.3-upstream-sha256.json).
-- Changed upstream files: `src/tree/runner.rs` and `src/tree/mod.rs`.
+- Changed upstream files: `src/tree/runner.rs`, `src/tree/mod.rs` and
+  `src/stack/runner.rs`.
   Added modules: `src/tree/cancellation_tests.rs` and
   `src/tree/cancellation_diagnostics.rs`.
 - The complete source delta is recorded in
@@ -75,10 +76,25 @@ passes all 46 native library tests and the 10 focused cancellation/diagnostic
 tests under Miri. Full workspace and target-platform release checks remain
 separate gates.
 
+## Ordinary stack driver borrowing
+
+`Runner::step_async` and `Runner::finish_async` now return futures tied to the
+exclusive borrow of the runner, rather than its longer-lived stack reference.
+This prevents a driver from surviving runner cleanup or coexisting with another
+driver (including a synchronous step). Four compile-negative examples covering
+both methods compiled on the baseline and are rejected after this change; all
+46 existing native tests still pass. Run them with the vendor command above
+without `--lib` so Rustdoc checks are included.
+
+The synchronous parser's `finish()` call does not use these async methods. This
+repair therefore does not establish the cause of an allocator abort during
+reference normalization. It also does not make non-Send captured state safe to
+move between threads.
+
 ## Limits
 
-This repair addresses cancellation cleanup only. It does **not** resolve the
-independent unsound `Send`/`Sync` and duplicated-driver API defects described in
+These repairs address ordinary cancellation cleanup and exclusive async-driver
+borrowing. They do **not** resolve the independent unsound `Send`/`Sync` defect described in
 [RUSTSEC-2026-0454](https://rustsec.org/advisories/RUSTSEC-2026-0454) and the
 [upstream advisory](https://github.com/surrealdb/surrealdb/security/advisories/GHSA-m9qr-4rcq-3jhc).
 Do not suppress that advisory on the strength of this patch. The related

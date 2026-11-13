@@ -21,7 +21,27 @@ impl<'a, R> Runner<'a, R> {
     ///
     /// This function supports sleeping or taking ownership of the waker allowing it to be used
     /// with external async runtimes.
-    pub fn step_async(&mut self) -> StepFuture<'a, R> {
+    ///
+    /// The driver must not outlive the runner that owns task cleanup.
+    ///
+    /// ```compile_fail
+    /// let mut stack = reblessive::Stack::new();
+    /// let mut runner = stack.enter(|_| async { String::from("owned") });
+    /// let driver = runner.step_async();
+    /// drop(runner);
+    /// pollster::block_on(driver);
+    /// ```
+    ///
+    /// Only one driver may borrow the runner at a time.
+    ///
+    /// ```compile_fail
+    /// let mut stack = reblessive::Stack::new();
+    /// let mut runner = stack.enter(|_| async { 42 });
+    /// let first = runner.step_async();
+    /// let second = runner.step_async();
+    /// pollster::block_on(async { futures_util::join!(first, second) });
+    /// ```
+    pub fn step_async(&mut self) -> StepFuture<'_, R> {
         StepFuture {
             stack: self.stack,
             _marker: PhantomData,
@@ -32,7 +52,25 @@ impl<'a, R> Runner<'a, R> {
     ///
     /// This function supports cloning and awakening allowing it to be used with external async
     /// runtimes
-    pub fn finish_async(&mut self) -> FinishFuture<'a, R> {
+    ///
+    /// The driver borrows the cleanup owner, not merely its underlying stack.
+    ///
+    /// ```compile_fail
+    /// let mut stack = reblessive::Stack::new();
+    /// let mut runner = stack.enter(|_| async { String::from("owned") });
+    /// let driver = runner.finish_async();
+    /// drop(runner);
+    /// pollster::block_on(driver);
+    /// ```
+    ///
+    /// ```compile_fail
+    /// let mut stack = reblessive::Stack::new();
+    /// let mut runner = stack.enter(|_| async { 42 });
+    /// let first = runner.finish_async();
+    /// let second = runner.step_async();
+    /// pollster::block_on(async { futures_util::join!(first, second) });
+    /// ```
+    pub fn finish_async(&mut self) -> FinishFuture<'_, R> {
         FinishFuture {
             stack: self.stack,
             _marker: PhantomData,

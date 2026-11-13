@@ -83,6 +83,7 @@ ADDED = {
         'src/fnc/completion_coverage_projection.rs',
         'src/fnc/recall.rs',
         'src/fnc/recall_hmac_tests.rs',
+        'src/fnc/recall_row_tests.rs',
         'src/kvs/physical_generation.rs',
         'src/kvs/recall_history.rs',
         'src/kvs/recall_history_inventory.rs',

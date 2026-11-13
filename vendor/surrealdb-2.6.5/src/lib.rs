@@ -120,7 +120,7 @@ extern crate tracing;
 pub use surrealdb_core::*;
 
 /// Shared Recall reference normalizer used by the native engine and storage kernel.
-pub use surrealdb_core::{recall_reference_identity_token, recall_reference_tokens, RECALL_REFERENCE_TOKEN_VERSION};
+pub use surrealdb_core::{recall_reference_identity_token, recall_reference_row_tokens, recall_reference_tokens, RECALL_REFERENCE_TOKEN_VERSION};
 
 #[deprecated(since = "2.3.0")]
 pub use uuid::Uuid;

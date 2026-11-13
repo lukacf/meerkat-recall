@@ -629,3 +629,20 @@ source provenance; it does not claim compilation or runtime qualification.
 | `vendor/surrealdb-core-2.6.5/src/syn/parser/builtin.rs` | `b3597a5ef162bbea9ef8a5f9f7375109ea4f08b6ae0a7a9bcd86f7e5005fab20` |
 | `vendor/surrealkv-0.9.3-backport.md` | `13504c8694478246abc92a8789a37b593831b72ac1e51372f2efbe92efd5a9bb` |
 | `vendor/surrealkv-0.9.3-backport.patch` | `45d6c66b1fc6664902fb376bde47e0bb1d18d19b73e7ad69b3816aa556647464` |
+
+
+## Borrowed native row references
+
+The Rust-only `recall_reference_row_tokens` entry point accepts a borrowed
+physical `Thing` and native `Value`. It visits the virtual two-element array
+without allocating or recursively cloning that array's row. It preserves the
+same HMAC encoding and shared depth, node and decoded-byte limits, including
+references nested inside composite physical keys. SQL and wire contracts and
+the capability version remain unchanged.
+
+Native lifecycle membership uses this helper. This removes
+a full temporary native tree and its destruction on those paths; the original
+inventory, token caches, parser and allocator remain. It is an allocation
+reduction, not evidence that existing heap corruption is repaired. Differential
+regressions cover native/encoded references, composite IDs, invalid values,
+exact budget consumption, nesting boundaries and concurrent borrowed reads.

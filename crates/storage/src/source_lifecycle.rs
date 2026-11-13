@@ -181,21 +181,19 @@ impl InventoryRow {
         if memberships.is_empty() {
             return Ok(false);
         }
-        let value = Value::Array(
-            vec![
-                Value::Thing(self.physical_identity()?),
-                match &self.native_value {
-                    Some(value) => value.clone(),
-                    None => crate::surreal::json_to_surreal(self.value.clone())?,
-                },
-            ]
-            .into(),
-        );
-        let references = crate::reference_fence::reference_tokens(
+        let converted;
+        let value = if let Some(value) = &self.native_value {
+            value
+        } else {
+            converted = crate::surreal::json_to_surreal(self.value.clone())?;
+            &converted
+        };
+        let references = crate::reference_fence::reference_row_tokens(
             journal.identity(),
             space,
             journal.reference_key_bytes(),
-            &value,
+            &self.physical_identity()?,
+            value,
         )?;
         Ok(!references.is_disjoint(memberships))
     }

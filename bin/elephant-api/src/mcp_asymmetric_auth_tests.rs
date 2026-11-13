@@ -38,9 +38,11 @@ async fn asymmetric_mcp_keeps_real_body_and_current_grant_checks() -> Result<(),
         ..AuthConfig::default()
     };
     auth.validate_server_config()?;
-    let state = Arc::new(McpState::new_with_defaults(storage, auth, "default".into(), vec!["default".into()]));
-    let router = mcp_routes(state.clone()).merge(mcp_full_routes(state.clone()))
-        .merge(mcp_agent_routes(state.clone())).merge(mcp_maintenance_routes(state));
+    let router = {
+        let state = Arc::new(McpState::new_with_defaults(storage, auth, "default".into(), vec!["default".into()]));
+        mcp_routes(state.clone()).merge(mcp_full_routes(state.clone()))
+            .merge(mcp_agent_routes(state.clone())).merge(mcp_maintenance_routes(state))
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, router).await });
@@ -85,6 +87,7 @@ async fn asymmetric_mcp_keeps_real_body_and_current_grant_checks() -> Result<(),
             }
         }
     }
+    drop(grants);
     server.abort();
     let _ = server.await;
     Ok(())

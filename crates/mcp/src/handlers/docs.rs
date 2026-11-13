@@ -5134,9 +5134,16 @@ mod tests {
 
         assert_eq!(doc.text, "");
         assert_eq!(doc.sidecar_text, None);
-        assert_eq!(doc.media_attachments.len(), 1);
+        // Acceptance preserves the media, but the response requires raw scope.
+        assert!(doc.media_attachments.is_empty());
+        let persisted = DocRepository::new(storage)
+            .get("test_space", &doc.base.id)
+            .await
+            .expect("load doc")
+            .expect("persisted doc");
+        assert_eq!(persisted.media_attachments.len(), 1);
         assert!(matches!(
-            &doc.media_attachments[0].location,
+            &persisted.media_attachments[0].location,
             DocMediaLocation::ManagedAsset { .. }
         ));
     }
@@ -5149,7 +5156,8 @@ mod tests {
     async fn test_ingest_doc_simple_persists_inline_image_as_managed_asset() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
-        let principal = make_test_principal("test_space");
+        let mut principal = make_test_principal("test_space");
+        principal.scopes.insert("read:doc:raw".into());
         let authz = Arc::new(AuthzService::new_with_skip_auth(true));
         let ctx = ToolContext::with_authz(storage.clone(), authz, principal);
         let handler = IngestDocSimpleHandler::new(storage.clone());
@@ -5207,7 +5215,8 @@ mod tests {
     async fn test_ingest_doc_simple_multi_image_creates_ordered_assets() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
-        let principal = make_test_principal("test_space");
+        let mut principal = make_test_principal("test_space");
+        principal.scopes.insert("read:doc:raw".into());
         let authz = Arc::new(AuthzService::new_with_skip_auth(true));
         let ctx = ToolContext::with_authz(storage.clone(), authz, principal);
         let handler = IngestDocSimpleHandler::new(storage.clone());
@@ -5349,7 +5358,8 @@ mod tests {
     async fn test_ingest_doc_simple_persists_inline_video_as_managed_asset() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
-        let principal = make_test_principal("test_space");
+        let mut principal = make_test_principal("test_space");
+        principal.scopes.insert("read:doc:raw".into());
         let authz = Arc::new(AuthzService::new_with_skip_auth(true));
         let ctx = ToolContext::with_authz(storage.clone(), authz, principal);
         let handler = IngestDocSimpleHandler::new(storage.clone());
@@ -5881,7 +5891,8 @@ mod tests {
     async fn test_ingest_file_image_creates_media_backed_doc() {
         let _guard = env_lock().lock().await;
         let storage = setup_test_storage().await;
-        let principal = make_test_principal("test_space");
+        let mut principal = make_test_principal("test_space");
+        principal.scopes.insert("read:doc:raw".into());
         let authz = Arc::new(AuthzService::new_with_skip_auth(true));
         let ctx = ToolContext::with_authz(storage.clone(), authz, principal);
         let handler = IngestFileHandler::new(storage.clone());
@@ -6381,7 +6392,8 @@ mod tests {
         let _guard = env_lock().lock().await;
 
         let storage = setup_test_storage().await;
-        let principal = make_test_principal("test_space");
+        let mut principal = make_test_principal("test_space");
+        principal.scopes.insert("read:doc:raw".into());
         let authz = Arc::new(AuthzService::new_with_skip_auth(true));
         let ctx = ToolContext::with_authz(storage.clone(), authz, principal);
         let handler = IngestUrlHandler::with_fetch_policy(

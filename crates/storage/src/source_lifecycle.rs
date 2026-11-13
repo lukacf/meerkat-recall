@@ -182,12 +182,11 @@ impl InventoryRow {
             return Ok(false);
         }
         let converted;
-        let value = match &self.native_value {
-            Some(value) => value,
-            None => {
-                converted = crate::surreal::json_to_surreal(self.value.clone())?;
-                &converted
-            }
+        let value = if let Some(value) = &self.native_value {
+            value
+        } else {
+            converted = crate::surreal::json_to_surreal(self.value.clone())?;
+            &converted
         };
         let references = crate::reference_fence::reference_row_tokens(
             journal.identity(),

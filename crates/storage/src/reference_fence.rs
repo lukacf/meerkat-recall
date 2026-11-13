@@ -82,7 +82,7 @@ pub fn reference_tokens(
 }
 
 /// Exact virtual `[Thing(identity), row]` normalization without cloning the row.
-pub(crate) fn reference_row_tokens(
+pub fn reference_row_tokens(
     journal_id: &str,
     space: &str,
     key: &[u8; 32],

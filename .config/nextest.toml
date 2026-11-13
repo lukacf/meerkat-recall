@@ -16,3 +16,10 @@ threads-required = "num-test-threads"
 [[profile.default.overrides]]
 filter = 'package(elephant-scenarios) & test(=embedded_elephant_db::scenario_embedded_elephant_db_ingests_alice_and_searches_semantically)'
 threads-required = "num-test-threads"
+
+# This control applies its real 100ms engine deadline during database setup too.
+# Concurrent database fixtures exhausted that deadline before the assertion ran.
+# Reserve this runner's slots; keep the engine deadline and 1s wall bound intact.
+[[profile.default.overrides]]
+filter = 'package(elephant-storage) & test(=client::tests::query_deadline_stops_engine_before_later_statements)'
+threads-required = "num-test-threads"

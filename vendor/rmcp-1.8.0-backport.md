@@ -12,9 +12,14 @@ It preserves the shared 1.8 API instead of requiring an unrelated SDK migration.
 - Archive SHA-256: `1d1f571c72940a19d9532fe52dbea8bc9912bf1d766c2970bb824056b86f3f59`.
 - Original upstream revision: `25220361d5540715294c501c289d79de4bec2bfc`.
 - Upstream repair: `3e0156c1eaf1573a1b878e2a8998d2fa2d0b1439`.
-- All 138 original archive files and the [MIT license](rmcp-1.8.0/LICENSE)
-  are retained. [Original file checksums](rmcp-1.8.0-upstream-sha256.json) and
-  the [complete local delta](rmcp-1.8.0-backport.patch) permit reconstruction.
+- All 138 original archive files are retained. [Original file checksums](rmcp-1.8.0-upstream-sha256.json)
+  and the [implementation delta](rmcp-1.8.0-backport.patch) permit reconstruction.
+- The registry archive omits a license file. The [supplemental upstream notice](rmcp-1.8.0/LICENSE)
+  is copied verbatim from the repository at the original revision above:
+  [source](https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/25220361d5540715294c501c289d79de4bec2bfc/LICENSE),
+  SHA-256 `0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a`. It includes upstream's license-transition notice and
+  Apache-2.0/MIT texts. The package's published `license = "MIT"` metadata is
+  preserved; this supplemental file is not part of the original archive manifest.
 - The test manifest adds `rstest` and two test targets. The dependency's own
   lockfile records this standalone test resolution; Recall uses its root lockfile.
 

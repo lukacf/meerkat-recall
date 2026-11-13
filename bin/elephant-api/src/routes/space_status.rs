@@ -313,6 +313,7 @@ mod tests {
             .await?;
         let auth = crate::auth::AuthConfig {
             secret: "synthetic-space-status-test-secret-value".into(),
+            verification_keys: None,
             algorithm: jsonwebtoken::Algorithm::HS256,
             audience: None,
             issuer: None,

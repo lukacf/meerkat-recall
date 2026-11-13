@@ -1742,6 +1742,7 @@ mod tests {
             storage,
             AuthConfig {
                 secret: "test-secret".to_string(),
+                verification_keys: None,
                 algorithm: Algorithm::HS256,
                 audience: None,
                 issuer: None,
@@ -1816,6 +1817,7 @@ mod tests {
             storage,
             AuthConfig {
                 secret: "test-secret".to_string(),
+                verification_keys: None,
                 algorithm: Algorithm::HS256,
                 audience: None,
                 issuer: None,
@@ -1859,6 +1861,7 @@ mod tests {
         let storage = StorageClient::new_memory().await.expect("storage");
         let auth = AuthConfig {
             secret: "test-secret".to_string(),
+            verification_keys: None,
             algorithm: Algorithm::HS256,
             audience: None,
             issuer: None,
@@ -1894,6 +1897,7 @@ mod tests {
         let storage = StorageClient::new_memory().await.expect("storage");
         let auth = AuthConfig {
             secret: "test-secret".to_string(),
+            verification_keys: None,
             algorithm: Algorithm::HS256,
             audience: None,
             issuer: None,
@@ -1928,6 +1932,7 @@ mod tests {
         let storage = StorageClient::new_memory().await?;
         let auth = AuthConfig {
             secret: "test-secret".to_string(),
+            verification_keys: None,
             algorithm: Algorithm::HS256,
             audience: None,
             issuer: None,
@@ -2016,6 +2021,7 @@ mod tests {
         let storage = StorageClient::new_memory().await?;
         let auth = AuthConfig {
             secret: "test-secret".to_string(),
+            verification_keys: None,
             algorithm: Algorithm::HS256,
             audience: None,
             issuer: None,
@@ -2078,6 +2084,7 @@ mod tests {
             storage.clone(),
             AuthConfig {
                 secret: "test-secret".to_string(),
+                verification_keys: None,
                 algorithm: Algorithm::HS256,
                 audience: None,
                 issuer: None,
@@ -2176,6 +2183,7 @@ mod tests {
         let storage = StorageClient::new_memory().await?;
         let auth = AuthConfig {
             secret: "test-secret".to_string(),
+            verification_keys: None,
             algorithm: Algorithm::HS256,
             audience: None,
             issuer: None,
@@ -2373,6 +2381,7 @@ mod tests {
         );
         let auth = AuthConfig {
             secret: "test-secret".to_string(),
+            verification_keys: None,
             algorithm: Algorithm::HS256,
             audience: None,
             issuer: None,
@@ -2780,6 +2789,7 @@ mod tests {
         let storage = StorageClient::new_memory().await?;
         let auth = AuthConfig {
             secret: "test-secret".to_string(),
+            verification_keys: None,
             algorithm: Algorithm::HS256,
             audience: None,
             issuer: None,
@@ -2915,6 +2925,7 @@ mod tests {
         Ok(())
     }
     include!("mcp_auth_context_tests.rs");
+    include!("mcp_asymmetric_auth_tests.rs");
 }
 
 #[cfg(test)]

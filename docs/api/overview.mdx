@@ -57,11 +57,17 @@ does not grant access. Configured issuer and audience restrictions also apply.
 | `scopes` | Array of permission scopes (e.g., `read:entity`, `write:doc`) |
 | `clearances` | ABAC policy clearances for the principal |
 
-Issue credentials with the local `service-token` CLI and create current local
+For HS256, issue credentials with the local `service-token` CLI and create current local
 service grants separately. Path-selected space and `X-Space-Id` must agree;
 MCP and operation polling use the header. A signed multi-space ceiling does not
 select a default or override a revoked grant. Global management tokens cannot
 perform ordinary data access. See [service setup](/operations/service-setup).
+
+RS256 verification is also available with an operator-managed public JWKS file.
+It uses the same Recall claims and local authorization checks. The issuer supplies
+these custom claims; an arbitrary identity-provider login token is not sufficient.
+See [asymmetric verification](/operations/deployment#asymmetric-token-verification)
+for configuration, key rotation and compatibility limits.
 
 <Note>
   In development mode, set the environment variable `SKIP_AUTH=true` to bypass JWT validation entirely. Never use this in production.

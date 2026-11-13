@@ -498,3 +498,7 @@ for the selected profile (`/mcp`, `/mcp/agent`, `/mcp/maintenance`, `/mcp/full`)
 Retained ingest, graph, events and wiki tools keep their own argument and result
 contracts. Use typed `{error_code,message,retryable}` errors rather than parsing
 message text; a bare routing 404 is not a typed unknown-source response.
+
+The `service-token` CLI issues HS256 tokens. Deployments using [RS256 public-key
+verification](/operations/deployment#asymmetric-token-verification) need an external
+signer that issues the same Recall claims; current local grants still apply.

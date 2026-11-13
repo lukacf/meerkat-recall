@@ -18,6 +18,7 @@ macro_rules! redacted_debug {
     )+};
 }
 
+pub mod asymmetric;
 pub mod bootstrap;
 mod claims;
 pub mod contract;
@@ -159,71 +160,85 @@ impl LegacyVerifier<'_> {
             &DecodingKey::from_secret(self.secret.as_bytes()),
             &validation,
         )?;
-        if data.claims.bootstrap_space.is_some() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-                .ok_or(AuthError::InvalidFreshness)?;
-            bootstrap::validate(&data.claims, now)?;
-        }
-        // Preserve unrelated legacy extension claims, but never silently drop
-        // the restrictions of a signed exchange hybrid. This inspection only
-        // rejects reserved profile fields; authenticated identity still comes
-        // solely from the signature-verified Claims above.
-        let payload = URL_SAFE_NO_PAD
-            .decode(token.split('.').nth(1).ok_or(AuthError::InvalidToken)?)
-            .map_err(|_| AuthError::InvalidToken)?;
-        let fields: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_slice(&payload).map_err(|_| AuthError::InvalidToken)?;
-        if fields.contains_key("bootstrap_space") && data.claims.bootstrap_space.is_none() {
-            return Err(AuthError::UnsupportedProfile);
-        }
-        if [
-            "version",
-            "profile",
-            "actor",
-            "requester",
-            "delegation",
-            "operation",
-            "revocation",
-        ]
-        .iter()
-        .any(|field| fields.contains_key(*field))
-        {
-            return Err(AuthError::UnsupportedProfile);
-        }
-        let mapped_identity = self
-            .mappings
-            .map(|mappings| {
-                // A qualified mapping requires both independently configured exact
-                // verifier requirements, not an audience chosen out of token data.
-                let issuer = self.issuer.ok_or(AuthError::InvalidTrustConfiguration)?;
-                let audience = self.audience.ok_or(AuthError::InvalidTrustConfiguration)?;
-                if data.claims.iss.as_deref() != Some(issuer)
-                    || data
-                        .claims
-                        .aud
-                        .as_ref()
-                        .is_none_or(|values| values.as_slice() != [audience])
-                {
-                    return Err(AuthError::UnmappedIssuer);
-                }
-                let mapping = mappings.resolve(issuer, audience)?;
-                Ok(PrincipalClaim {
-                    kind: mapping.legacy_kind,
-                    id: ExactId::new(data.claims.sub.clone())?,
-                    qualification: QualifiedDomain::Qualified {
-                        trust_domain_id: mapping.trust_domain.clone(),
-                    },
-                })
-            })
-            .transpose()?;
-        Ok(VerifiedCallerContext {
-            claims: data.claims,
-            mapped_identity,
-        })
+        verified_context(
+            token,
+            data.claims,
+            self.issuer,
+            self.audience,
+            self.mappings,
+        )
     }
+}
+
+fn verified_context(
+    token: &str,
+    claims: Claims,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    mappings: Option<&IssuerMappings>,
+) -> Result<VerifiedCallerContext, AuthError> {
+    if claims.bootstrap_space.is_some() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+            .ok_or(AuthError::InvalidFreshness)?;
+        bootstrap::validate(&claims, now)?;
+    }
+    // Preserve unrelated legacy extension claims, but never silently drop
+    // the restrictions of a signed exchange hybrid. This inspection only
+    // rejects reserved profile fields; authenticated identity still comes
+    // solely from the signature-verified Claims above.
+    let payload = URL_SAFE_NO_PAD
+        .decode(token.split('.').nth(1).ok_or(AuthError::InvalidToken)?)
+        .map_err(|_| AuthError::InvalidToken)?;
+    let fields: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&payload).map_err(|_| AuthError::InvalidToken)?;
+    if fields.contains_key("bootstrap_space") && claims.bootstrap_space.is_none() {
+        return Err(AuthError::UnsupportedProfile);
+    }
+    if [
+        "version",
+        "profile",
+        "actor",
+        "requester",
+        "delegation",
+        "operation",
+        "revocation",
+    ]
+    .iter()
+    .any(|field| fields.contains_key(*field))
+    {
+        return Err(AuthError::UnsupportedProfile);
+    }
+    let mapped_identity = mappings
+        .map(|mappings| {
+            // A qualified mapping requires both independently configured exact
+            // verifier requirements, not an audience chosen out of token data.
+            let issuer = issuer.ok_or(AuthError::InvalidTrustConfiguration)?;
+            let audience = audience.ok_or(AuthError::InvalidTrustConfiguration)?;
+            if claims.iss.as_deref() != Some(issuer)
+                || claims
+                    .aud
+                    .as_ref()
+                    .is_none_or(|values| values.as_slice() != [audience])
+            {
+                return Err(AuthError::UnmappedIssuer);
+            }
+            let mapping = mappings.resolve(issuer, audience)?;
+            Ok(PrincipalClaim {
+                kind: mapping.legacy_kind,
+                id: ExactId::new(claims.sub.clone())?,
+                qualification: QualifiedDomain::Qualified {
+                    trust_domain_id: mapping.trust_domain.clone(),
+                },
+            })
+        })
+        .transpose()?;
+    Ok(VerifiedCallerContext {
+        claims,
+        mapped_identity,
+    })
 }
 
 #[cfg(test)]

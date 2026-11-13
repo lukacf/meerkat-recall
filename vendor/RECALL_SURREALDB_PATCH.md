@@ -536,12 +536,14 @@ holds the exclusive gate while cancelling all five periodic workers. These
 source tests require runtime qualification; source provenance alone is not a
 passing test result. Original upstream manifests and archive hashes stay intact.
 
-## Physical source checkpoint hashes
+## Historical physical source checkpoint hashes
 
 The explicit allowlist covers 866 original upstream files. The following
-SHA-256 values bind every patched or added core/SDK file and the separately
-owned final SurrealKV packaging metadata at this source checkpoint. Original
-archive manifests remain the authority for unchanged upstream bytes. This is
+SHA-256 values were recorded at an earlier source checkpoint; later changes
+mean they are not a checksum manifest of the current tree. Use the exact Git
+commit and recomputed file hashes for a release receipt, and run the verifier
+above for upstream-file/patch-location auditing. Original archive manifests
+remain the authority for unchanged upstream bytes. This is
 source provenance; it does not claim compilation or runtime qualification.
 
 | Path | SHA-256 |

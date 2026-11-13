@@ -283,7 +283,8 @@ source .envrc
 This example sets `SKIP_AUTH=true` and binds to loopback for local development.
 Use MCP `get_runtime_status` (or `GET /v1/runtime/status`) to inspect readiness.
 Without storage environment variables or persisted configuration, Meerkat Recall starts
-in bootstrap mode. Authenticated startup still requires a valid `JWT_SECRET`.
+in bootstrap mode. Authenticated startup still requires valid HS256 secret configuration or explicit
+RS256 public-key, issuer and audience configuration.
 The preferred local project config lives at `.elephant/elephant_config.toml`.
 
 For an isolated embedded demo:

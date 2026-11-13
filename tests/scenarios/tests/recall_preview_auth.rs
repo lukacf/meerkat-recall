@@ -41,6 +41,7 @@ fn auth() -> anyhow::Result<AuthConfig> {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("synthetic key missing"))?
             .into(),
+        verification_keys: None,
         algorithm: "HS256".parse()?,
         audience: Some("qualification-api".into()),
         issuer: Some("qualification-only".into()),

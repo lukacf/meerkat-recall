@@ -439,8 +439,9 @@ actually inherited by the process or use the managed runtime configuration.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JWT_SECRET` | _(required with authentication)_ | Random secret with at least 32 bytes for HS256 token validation |
-| `JWT_ALGORITHM` | `HS256` | Only HS256 is supported by the current shared-secret decoder |
+| `JWT_SECRET` | _(required for HS256 unless using `JWT_SECRET_FILE`)_ | Random secret with at least 32 bytes for HS256 token validation |
+| `JWT_ALGORITHM` | `HS256` | Explicit `HS256` shared-secret or `RS256` public-key verifier |
+| `JWT_JWKS_FILE` | _(unset)_ | Public-only RSA JWKS snapshot for RS256; requires `JWT_ISSUER` and `JWT_AUDIENCE` |
 | `JWT_ISSUER` | _(none)_ | Required token issuer (optional) |
 | `JWT_AUDIENCE` | _(none)_ | Required token audience (optional) |
 | `SKIP_AUTH` | `false` | Skip authentication entirely |
@@ -725,3 +726,43 @@ prevents a second live owner. Normal Compose shutdown retains both volumes.
 Deleting the recovery volume while retaining a database or backup is not a
 schema repair and prevents safe replay of erased sources. Backup retention is
 managed by Recall's snapshot coordinator, not by deleting that original journal.
+
+## Asymmetric token verification
+
+To keep signing authority outside Recall, set `JWT_ALGORITHM=RS256`,
+`JWT_JWKS_FILE=/run/config/recall-public.jwks.json`, `JWT_ISSUER` and `JWT_AUDIENCE`.
+Unset `JWT_SECRET` and `JWT_SECRET_FILE`. Mount the public file read-only and
+protect its integrity: replacing a trusted public key changes who can issue
+credentials. Keep TLS on the ingress and authentication enabled.
+
+The file is a JSON object with a `keys` array of 1–16 RSA public JWKs (2048–8192
+bits), at most 64 KiB total. Each key requires a unique nonempty ASCII `kid`,
+`kty: "RSA"`, `alg: "RS256"`, and base64url unsigned `n` and `e`. Optional `use`
+must be `"sig"` and optional `key_ops` must be `["verify"]`. Private parameters,
+certificate fields, unsupported fields, ambiguous IDs and other algorithms are
+rejected before startup. Never copy the signing key onto the Recall server.
+
+Tokens require `alg: "RS256"`, the trusted `kid`, and optionally `typ: "JWT"` in
+the header; other header fields are refused. The issuer and audience are fixed by
+server configuration, never selected from the token. Claims use Recall's bearer
+schema: `sub`, `exp`, `iss`, an `aud` array, space ceiling, scopes and clearances.
+`exp` is required and `nbf`, when present, is enforced with no clock leeway.
+Configure synchronized clocks. Exchange/delegation hybrid profiles remain refused.
+An identity-provider login token does not automatically confer Recall permissions.
+
+For planned rotation, publish old and new public keys together and restart Recall;
+then switch the signer to the new `kid`. After old tokens expire, remove the old
+key and restart again. To reject a compromised key's tokens, remove it and restart
+immediately under the deployment's normal availability/rollback procedure. File
+edits alone do not change the running verifier. A rollback must retain the current
+trusted key set; restoring a removed key would restore its signing authority.
+Already-admitted operations are not cancelled by rotating keys.
+
+The local `service-token` CLI still issues HS256 credentials and is not an RS256
+signer. An external signer must issue Recall's claims. The existing `spaces`
+ceiling triggers current local service-grant checks; a revoked grant refuses
+future dispatch independently of signature validity. Compatibility single-space
+tokens without `spaces` retain their existing behavior until expiry or signing-key
+retirement. There is no per-token denylist, remote JWKS fetch, OIDC discovery or
+automatic key refresh in this release. Use short token lifetimes and current grants
+for services that need prompt authorization revocation.

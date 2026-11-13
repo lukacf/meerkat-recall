@@ -1,3 +1,9 @@
+[profile.default]
+# Native database fixtures may each create a Tokio pool sized to this host.
+# Bound simultaneous fixtures on large shared hosts instead of multiplying
+# machine-wide worker pools by the machine-wide default test count.
+test-threads = 8
+
 # This real 256-Work / 257-Source native boundary retains its original 240s
 # deadline. Give it the full test scheduler budget, as in its retained isolated
 # qualification, instead of competing with unrelated database constructors.

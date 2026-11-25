@@ -355,13 +355,16 @@ async fn seed(storage: &StorageClient) -> Result<SeededDemo> {
             time_basis: TimeBasis::ObservedAt,
             time_value: now,
         };
+        // A curated claim retains the complete authority of its exact support.
+        let mut relation_base = assertion.base.clone();
+        relation_base.id = demo_id(TableName::Rel, claim.key);
         assertion_repository
             .create(assertion)
             .await
             .context("failed to seed demo assertion")?;
         relation_repository
             .create(Rel {
-                base: demo_base(demo_id(TableName::Rel, claim.key)),
+                base: relation_base,
                 subject: Link::new(claim.subject.clone()),
                 object: Link::new(claim.object.clone()),
                 rel_type: claim.predicate.to_string(),
@@ -410,13 +413,15 @@ async fn seed(storage: &StorageClient) -> Result<SeededDemo> {
         time_basis: TimeBasis::ObservedAt,
         time_value: now,
     };
+    let mut attribute_base = policy_assertion.base.clone();
+    attribute_base.id = demo_id(TableName::Attribute, "factual-prose-policy");
     assertion_repository
         .create(policy_assertion)
         .await
         .context("failed to seed demo policy assertion")?;
     AttributeRepository::new(storage.clone())
         .create(Attribute {
-            base: demo_base(demo_id(TableName::Attribute, "factual-prose-policy")),
+            base: attribute_base,
             subject: Link::new(wiki_id.clone()),
             attr_type: "factual_prose_policy".to_string(),
             value: Literal::String(
@@ -510,7 +515,9 @@ fn demo_assertion(
     base.subjects = std::iter::once(Link::new(subject.clone()))
         .chain(object.map(|id| Link::new(id.clone())))
         .collect();
-    base.subjects_state = SubjectsState::Complete;
+    // The curated entity links do not prove the source's subject set complete.
+    // Source, Doc and DocRevision deliberately retain Unknown in this fixture.
+    base.subjects_state = SubjectsState::Unknown;
     Ok(Assertion {
         base,
         subject_text: subject_text.to_string(),
@@ -576,7 +583,8 @@ fn demo_id(table: TableName, key: &str) -> RecordId {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+    // Match the immutable evidence digest encoding produced by extraction.
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[cfg(test)]
@@ -584,6 +592,143 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+    use elephant_pipeline::wiki_editorial::{
+        EditorialDraft, EditorialVerification, PlannedWikiArticle, PlannedWikiSection,
+        WikiCreationConfig, WikiEditorialConfig, WikiEditorialLlm, WikiGraphPlanner,
+        WikiOrganization, WikiPlan,
+    };
+    use elephant_pipeline::{PipelineError, PipelineResult};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[derive(Default)]
+    struct DefinitionProbe {
+        planner_calls: AtomicUsize,
+        writer_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl WikiEditorialLlm for DefinitionProbe {
+        async fn plan_wiki(&self, _prompt: String) -> PipelineResult<WikiPlan> {
+            self.planner_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(WikiPlan {
+                language: "en".into(),
+                articles: [
+                    ("living-wiki", "Meerkat Recall Living Wiki"),
+                    ("canonical-graph", "Canonical Meerkat Recall graph"),
+                    ("immutable-evidence", "Immutable source evidence"),
+                    ("view-revision", "Knowledge view revision"),
+                ]
+                .into_iter()
+                .map(|(key, title)| PlannedWikiArticle {
+                    entity_id: demo_id(TableName::Entity, key).to_string(),
+                    title: title.into(),
+                    editorial_reason: "An evidence-backed subject of this demo".into(),
+                    supporting_entity_ids: Vec::new(),
+                    importance: 5,
+                    page_role: "core".into(),
+                    temporal_relevance: "enduring".into(),
+                    related_entity_ids: Vec::new(),
+                })
+                .collect(),
+            })
+        }
+
+        async fn organize_wiki(&self, _prompt: String) -> PipelineResult<WikiOrganization> {
+            let root = demo_id(TableName::Entity, "living-wiki").to_string();
+            Ok(WikiOrganization {
+                language: "en".into(),
+                title: "Living Wiki".into(),
+                purpose: "Explain the evidence-backed Recall wiki architecture".into(),
+                featured_entity_ids: vec![root.clone()],
+                sections: vec![PlannedWikiSection {
+                    id: "architecture".into(),
+                    title: "Architecture".into(),
+                    description: "How the living wiki preserves its evidence".into(),
+                    article_entity_ids: vec![
+                        root,
+                        demo_id(TableName::Entity, "canonical-graph").to_string(),
+                        demo_id(TableName::Entity, "immutable-evidence").to_string(),
+                        demo_id(TableName::Entity, "view-revision").to_string(),
+                    ],
+                }],
+            })
+        }
+
+        async fn write_article(&self, _prompt: String) -> PipelineResult<EditorialDraft> {
+            self.writer_calls.fetch_add(1, Ordering::SeqCst);
+            Err(PipelineError::ConfigError("editorial probe reached".into()))
+        }
+
+        async fn verify_article(&self, _prompt: String) -> PipelineResult<EditorialVerification> {
+            Err(PipelineError::ConfigError("unexpected verifier".into()))
+        }
+
+        fn writer_model(&self) -> &str {
+            "offline-inventory-probe"
+        }
+
+        fn verifier_model(&self) -> &str {
+            "offline-inventory-probe"
+        }
+    }
+
+    #[tokio::test]
+    async fn demo_seed_passes_guarded_definition_commit_before_article_generation() {
+        let storage = StorageClient::new_embedded().await.expect("storage");
+        Box::pin(seed(&storage)).await.expect("seed demo");
+        let candidates = EntityRepository::new(storage.clone())
+            .list(SPACE_ID, 250, None)
+            .await
+            .expect("candidates");
+        let probe = Arc::new(DefinitionProbe::default());
+        let planner = WikiGraphPlanner::new(
+            storage.clone(),
+            probe.clone(),
+            WikiEditorialConfig::default(),
+        );
+        let result = Box::pin(planner.create_from_entities(
+            SPACE_ID,
+            candidates.clone(),
+            WikiCreationConfig::default(),
+        ))
+        .await;
+        assert!(
+            probe.writer_calls.load(Ordering::SeqCst) > 0,
+            "the guarded definition commit must finish before article generation: {result:?}"
+        );
+
+        let sources = SourceRepository::new(storage);
+        let source_id = demo_id(TableName::Source, "living-wiki-architecture-source");
+        let mut source = sources
+            .get(SPACE_ID, &source_id)
+            .await
+            .expect("load")
+            .expect("source");
+        source.base.security.level = 1;
+        source.base.updated_at = Utc::now();
+        sources
+            .update(SPACE_ID, &source_id, source)
+            .await
+            .expect("restrict source");
+        probe.planner_calls.store(0, Ordering::SeqCst);
+        probe.writer_calls.store(0, Ordering::SeqCst);
+        assert!(Box::pin(planner.create_from_entities(
+            SPACE_ID,
+            candidates,
+            WikiCreationConfig::default(),
+        ))
+        .await
+        .is_err());
+        assert_eq!(
+            probe.planner_calls.load(Ordering::SeqCst),
+            0,
+            "restricted evidence must not reach a provider"
+        );
+        assert_eq!(probe.writer_calls.load(Ordering::SeqCst), 0);
+    }
 
     #[cfg(feature = "meerkat-extraction")]
     #[tokio::test]

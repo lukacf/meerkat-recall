@@ -66,7 +66,7 @@ runtime acceptance or change the minimum supported system from the filename.
 
 The `meerkat-recall-native/v1` manifest additionally hashes every bundled file
 and records the compatibility symlink. Packaging includes extraction skills,
-service templates, license texts and the six patched vendored dependency trees.
+service templates, license texts and the nine patched vendored dependency trees.
 Meerkat 0.9.18 supplies the provider HTTP defenses upstream;
 `meerkat-provider-upstream.json` records the registry source/checksums that replace
 the historical HTTP backports, with exact published license texts retained under

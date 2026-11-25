@@ -252,12 +252,14 @@ async fn native_physical_rpc_rejects_expired_missing_changed_and_empty_scope() {
         }
     }
     ctx.set_session(Arc::new(owner()));
+    // This is an authorization success control, not a one-millisecond engine
+    // timing test. Retain the ordinary bounded checkpoint budget under CI load.
     assert_eq!(
         invoke(
             &ctx,
             2,
             "recall_physical_checkpoint",
-            checkpoint(1_i64.into())
+            checkpoint(60_000_i64.into())
         )
         .await
         .expect("restored original scope"),

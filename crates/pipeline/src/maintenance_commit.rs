@@ -27,6 +27,19 @@ fn invalid(message: impl Into<String>) -> PipelineError {
     PipelineError::InvalidState(message.into())
 }
 
+/// A replacement trigger can observe an already-retired claim whose supporting
+/// assertions were retired with it. Its original row remains a canonical read
+/// dependency (including the tombstone), but supplies no live evidence. This
+/// exemption applies only to dependencies, never to an effect's before/after
+/// image, so restoring or changing a retired claim still requires full proof.
+fn retired_claim_dependency(record: &CanonicalRecord) -> bool {
+    record.base().deleted_at.is_some()
+        && matches!(
+            record,
+            CanonicalRecord::Rel(_) | CanonicalRecord::Attribute(_) | CanonicalRecord::Event(_)
+        )
+}
+
 // Keep nested evidence branches out of their caller's async state machine.
 // Future size alone does not bound the stack used while polling descendants;
 // these static phases also distinguish preparation from transaction entry.
@@ -2412,7 +2425,11 @@ impl PlanningTruthMaintenanceStorage {
         )
         .await?;
         let plan = self.prepared_plan()?;
-        let mut records = plan.dependencies;
+        let mut records = plan
+            .dependencies
+            .into_iter()
+            .filter(|record| !retired_claim_dependency(record))
+            .collect::<Vec<_>>();
         for effect in plan.effects {
             records.extend(effect.before);
         }
@@ -2487,6 +2504,7 @@ impl PlanningTruthMaintenanceStorage {
         let mut records = plan
             .dependencies
             .into_iter()
+            .filter(|record| !retired_claim_dependency(record))
             .map(|record| (record, false))
             .collect::<Vec<_>>();
         for effect in plan.effects {

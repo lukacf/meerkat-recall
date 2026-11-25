@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-25
+
 - Native archives include the patched reblessive, RMCP and rusqlite sources,
   licenses, exact backport patches and upstream checksum records.
 
@@ -22,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fixes; document the retained Wasm timer's `pin-utils` maintenance exception.
 
 ### Fixes
+- Preserve supporting assertion authority and source provenance in the curated
+  wiki demo claims, including unknown source subjects, and use the canonical
+  evidence hash encoding before guarded planning.
+- Allow truth maintenance to settle live replacement claims when the same batch
+  includes already-retired claims whose assertions were also retired. Retain
+  exact tombstone transaction guards and full evidence checks for live effects.
 - Reject provider refusals, content filtering and context-window exhaustion
   before using buffered entity-resolution text or tool calls.
 - Enable the bounded HTTP collector's byte-buffer dependency for client-only

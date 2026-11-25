@@ -15,6 +15,9 @@ mod audit_authority;
 #[path = "maintenance_empty_slot_tests.rs"]
 mod empty_slots;
 
+#[path = "maintenance_retired_dependency_tests.rs"]
+mod retired_dependencies;
+
 const SPACE: &str = "maintenance-oracle";
 
 #[test]

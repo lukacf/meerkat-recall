@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fixes; document the retained Wasm timer's `pin-utils` maintenance exception.
 
 ### Fixes
+- Keep all eligible semantic subjects in wiki plans, including topics about
+  storage or evidence. Return the rejected plan and validation failure to the
+  planner within its existing eight-attempt limit; incomplete plans still fail.
 - Preserve supporting assertion authority and source provenance in the curated
   wiki demo claims, including unknown source subjects, and use the canonical
   evidence hash encoding before guarded planning.

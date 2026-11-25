@@ -369,6 +369,15 @@ that featured hierarchy and section counts; each section remains browsable in
 full without placing hundreds of reference pages on the front page. Navigation
 is derived metadata and never becomes a graph fact or source.
 
+Planner prompts distinguish semantic subjects about storage or evidence from
+raw storage rows: a supplied eligible subject must not be omitted just because
+its name describes an implementation concept. After plan validation fails, the
+next existing attempt receives the latest rejected plan, the validation error
+and the complete original inventory. Feedback replaces the previous rejection
+rather than accumulating. The eight-attempt ceiling, original publication
+authority and complete-plan validation remain unchanged; exhausting correction
+attempts still refuses publication.
+
 Meerkat Recall fills omitted related-article links from explicitly governed graph
 edges and resolved source-evidence co-mentions, then uses separate writer and
 verifier calls for every article. Writer contexts include governed current

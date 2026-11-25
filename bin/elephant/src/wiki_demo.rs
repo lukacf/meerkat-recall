@@ -666,16 +666,20 @@ mod tests {
             Err(PipelineError::ConfigError("unexpected verifier".into()))
         }
 
-        fn writer_model(&self) -> &str {
+        fn writer_model(&self) -> &'static str {
             "offline-inventory-probe"
         }
 
-        fn verifier_model(&self) -> &str {
+        fn verifier_model(&self) -> &'static str {
             "offline-inventory-probe"
         }
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Shared storage and planner handles span both authority checks; these are not held locks"
+    )]
     async fn demo_seed_passes_guarded_definition_commit_before_article_generation() {
         let storage = StorageClient::new_embedded().await.expect("storage");
         Box::pin(seed(&storage)).await.expect("seed demo");

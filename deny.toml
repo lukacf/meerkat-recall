@@ -33,6 +33,14 @@ ignore = [
     # Interval/Timeout pin projection; native timers use Tokio. Revisit when
     # wasmtimer removes it (0.4.3 still depends on it), or on a new advisory.
     "RUSTSEC-2026-0441",  # pin-utils; see SECURITY.md
+    # Maintenance-only advisories, with no patched versions. Recall and
+    # SurrealDB expose chrono types; Meerkat retains chrono-tz for schedules
+    # and humantime through configuration. Replacing these requires an API /
+    # timestamp compatibility migration, not a dependency patch. Reassess at
+    # the next SDK/SurrealDB upgrade or by 2027-01-01; see SECURITY.md.
+    "RUSTSEC-2026-0543",  # chrono
+    "RUSTSEC-2026-0555",  # chrono-tz
+    "RUSTSEC-2026-0542",  # humantime
 ]
 
 # ============================================================================

@@ -67,10 +67,10 @@ runtime acceptance or change the minimum supported system from the filename.
 The `meerkat-recall-native/v1` manifest additionally hashes every bundled file
 and records the compatibility symlink. Packaging includes extraction skills,
 service templates, license texts and the six patched vendored dependency trees.
-Meerkat 0.9.10 supplies the provider HTTP defenses upstream;
+Meerkat 0.9.18 supplies the provider HTTP defenses upstream;
 `meerkat-provider-upstream.json` records the registry source/checksums that replace
 the historical HTTP backports, with exact published license texts retained under
-`licenses/meerkat-0.9.10` (container: `/usr/share/licenses/meerkat-recall/meerkat-0.9.10`). Native archives
+`licenses/meerkat-0.9.18` (container: `/usr/share/licenses/meerkat-recall/meerkat-0.9.18`). Native archives
 and container images carry the same patched source inventory. This includes the
 pinned SurrealDB core and SDK 2.6.5, their complete Business Source License 1.1
 texts, upstream checksums and `RECALL_SURREALDB_PATCH.md`. These component

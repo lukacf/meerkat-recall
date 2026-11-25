@@ -53,7 +53,7 @@ Source archive exclusions do not hide files from Git history or GitHub PRs.
 
 ## Upstream parser maintenance
 
-The pinned Meerkat 0.9.10 SDK uses `serde-saphyr` for skill frontmatter. The
+The pinned Meerkat 0.9.18 SDK uses `serde-saphyr` for skill frontmatter. The
 current lockfile no longer includes `serde_yaml` or `unsafe-libyaml`, and the
 previous `RUSTSEC-2024-0449` maintenance exception has been removed. Published
 Recall 0.9.1 archives retain their original dependency graph and audit scope.
@@ -72,8 +72,17 @@ Replacing the pin-projection code requires separate Wasm validation.
 
 ## Dependency repair scope
 
+The lockfile selects `url` 2.5.9 for the nested `blob:` origin stack overflow
+in [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592.html)
+and `zip` 9.0.5 for
+[RUSTSEC-2026-0548](https://rustsec.org/advisories/RUSTSEC-2026-0548.html).
+Recall's DOCX reader reads `word/document.xml` directly through `ZipArchive`;
+it does not inspect with one ZIP reader and extract with `ZipStreamReader`.
+The upstream header-consistency check is opt-in. Any future streaming extraction
+of untrusted archives must enable it; the version bump alone does not do so.
+
 The root lockfile selects `rustix` 1.1.6 for the zero-length extended-attribute
-buffer repair in `RUSTSEC-2026-0486`. The shared `rusqlite` 0.37 API is retained
+buffer repair in `RUSTSEC-2026-0486`. Recall's `rusqlite` 0.37 API is retained
 with a local dependency update to `libsqlite3-sys` 0.39.1, which bundles SQLite
 3.54.1 and includes the WAL page-size fix for `RUSTSEC-2026-0459`. System-linked
 SQLite and SQLCipher need their own version assessment. See the
@@ -89,3 +98,19 @@ memory-safety defects. Unsound erased-future Send/Sync behavior reported under
 `RUSTSEC-2026-0454` and explicitly forgotten drivers remain outside their scope. A successful dependency audit is not proof that a
 vendored crate is generally memory-safe; retain the source review and explicit
 regression tests. No new advisory exception is added for these repairs.
+
+## Time dependency maintenance
+
+The 2026-11-25 dependency review adds narrowly scoped maintenance exceptions
+for [chrono (RUSTSEC-2026-0543)](https://rustsec.org/advisories/RUSTSEC-2026-0543.html),
+[chrono-tz (RUSTSEC-2026-0555)](https://rustsec.org/advisories/RUSTSEC-2026-0555.html)
+and [humantime (RUSTSEC-2026-0542)](https://rustsec.org/advisories/RUSTSEC-2026-0542.html).
+These advisories report unmaintained packages, with no specific vulnerability or
+patched version. All three were already present before the Meerkat 0.9.18 upgrade.
+
+Recall's public and persisted timestamp types use `chrono`, which SurrealDB also
+depends on. Meerkat's schedule implementation uses `chrono-tz`; its configuration
+uses `humantime` through `humantime-serde`. Removing these requires coordinated
+API, serialization and time-zone compatibility work. Reassess the exceptions at
+the next Meerkat or SurrealDB upgrade, or by 2027-01-01, and immediately if a
+vulnerability advisory appears. Other advisories remain enforced.

@@ -4,8 +4,8 @@
   "cargo_metadata_executed": false,
   "builder_observed": false,
   "source_sha256": {
-    "Cargo.toml": "f39deec1b4a6065a64511c07a8722ee6dbce0e81c379d5136b0bf250e74bb4a9",
-    "Cargo.lock": "a68dcdc137a169d7700aa12d6abdb9117b92f3bd7b8f15219dc4b15119b7897f",
+    "Cargo.toml": "a464c2f49f2bd8b0d58620c730697e63d18a5c8451107a25094ef0eb614d19c4",
+    "Cargo.lock": "afcec0bdc5137c76fe83c39ca2450a83a7549bc9b32ec37262cce70650296f43",
     "rust-toolchain.toml": "06b37c277bc08dc752d700f5ca66002563052844e9cc68f09dd7d1248d7e6e40",
     "bin/elephant/Cargo.toml": "46076aac27caee281b7b7dbe2be873aec5a592eccf4c8106a39bd5e6553d33a6",
     "crates/storage/Cargo.toml": "c1c804ae8b851d419422fef7c5ea103c4bb110b31288ad04f0f1b16c940fc787",
@@ -39,8 +39,8 @@
       "cargo_checksum": "545e4fb17fc48768ff36c2a3854aa5b0b809d0ed595ab5530fa8ac94f31bd0ea"
     },
     "libsqlite3-sys": {
-      "version": "0.35.0",
-      "cargo_checksum": "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
+      "version": "0.39.1",
+      "cargo_checksum": "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
     },
     "libz-sys": {
       "version": "1.1.25",
@@ -84,8 +84,8 @@
     "clang-sys/Cargo.toml": "db6730e270afa1f936b6f14264be0b0aaa506b88d91ab4805cf270595f3b568b",
     "clang-sys/build.rs": "321ac62c88932a3831be9c96f526a21f65ea22df01639946bd0033d1bcf8900e",
     "fastembed/Cargo.toml": "340bab21cafbbdfb4b4f1b107e18719b34be706ba86ed14e5d283108990db14a",
-    "libsqlite3-sys/Cargo.toml": "54d98d6bef7f15016cb6ffcf64fe7ab239e609d5ead0d8fdfa05384c57dcce29",
-    "libsqlite3-sys/build.rs": "5f1984827787b3e4777d89fb6626a4a0a3889fac875443cd074ebe5141ed7259",
+    "libsqlite3-sys/Cargo.toml": "3fb7e11b7b71251e7e360511000befe692e5aee8d31415d477774f060577bb15",
+    "libsqlite3-sys/build.rs": "769b31370a41aa722e1d5a530012432c985bb142eab34d095481ffd1a3436e1b",
     "libz-sys/Cargo.toml": "c8487afe8697b099f2f96564b240c670fd3f501ab03e6727f053f828ea97e79f",
     "libz-sys/build.rs": "f45e6fb4838dc8cad1611ff1f1c2dde3b5d39fe33afb0f131448995fe9aa0dd5",
     "lz4-sys/Cargo.toml": "1acf81d8bef849aa6c9b814dba8063465f945ac600d32f31d56685ea90678be6",

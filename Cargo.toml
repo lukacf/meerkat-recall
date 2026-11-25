@@ -68,14 +68,14 @@ rust-version = "1.97.0"
 
 [workspace.dependencies]
 # Meerkat - keep the facade and direct family dependencies on one release.
-meerkat = { version = "=0.9.10", default-features = false, features = ["anthropic", "openai", "gemini", "memory-store", "mcp", "session-compaction", "comms"] }
-meerkat-core = { version = "=0.9.10" }
-meerkat-mcp = { version = "=0.9.10" }
-meerkat-runtime = { version = "=0.9.10" }
-meerkat-skills = { version = "=0.9.10", default-features = false }
+meerkat = { version = "=0.9.18", default-features = false, features = ["anthropic", "openai", "gemini", "memory-store", "mcp", "session-compaction", "comms"] }
+meerkat-core = { version = "=0.9.18" }
+meerkat-mcp = { version = "=0.9.18" }
+meerkat-runtime = { version = "=0.9.18" }
+meerkat-skills = { version = "=0.9.18", default-features = false }
 # Test-only: checks current default capabilities and historical model resolution.
 # Version-unified with the meerkat facade above.
-meerkat-models = { version = "=0.9.10" }
+meerkat-models = { version = "=0.9.18" }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
@@ -218,7 +218,7 @@ reblessive = { path = "vendor/reblessive-0.4.3" }
 # See the adjacent provenance, security scope and transport regression evidence.
 rmcp = { path = "vendor/rmcp-1.8.0" }
 
-# Keep the shared rusqlite API while selecting patched bundled SQLite.
+# Keep Recall's rusqlite 0.37 API on the same patched SQLite as Meerkat's 0.41.
 rusqlite = { path = "vendor/rusqlite-0.37.0" }
 
 # Retain tokenizer/image behavior while replacing abandoned paste (RUSTSEC-2024-0436).

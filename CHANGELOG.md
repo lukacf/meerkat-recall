@@ -21,6 +21,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixes
 - Reject provider refusals, content filtering and context-window exhaustion
   before using buffered entity-resolution text or tool calls.
+- Enable the bounded HTTP collector's byte-buffer dependency for client-only
+  MCP builds, including the provisioned-model release test configuration.
+
+### Authentication and data protection
+- Add operator-managed RS256 bearer verification with a bounded public-only
+  keyset, fixed issuer and audience, and shared HTTP/MCP verification. Existing
+  grants and ABAC remain in force. Key rotation requires an explicit restart;
+  this does not add OIDC discovery, hot reload or individual-token revocation.
+- Redact MCP document sidecar text and media attachments without raw-read
+  authority, consistently with the REST response policy.
+- Bound non-streaming RMCP JSON and error response bodies, update bundled
+  SQLite while retaining Recall's rusqlite API, and refresh HTML sanitizer,
+  Rustix, ZIP and certificate-root security fixes.
+
+### Runtime and ingestion
+- Retain the pending-tree cleanup owner when an unfinished tree is cancelled,
+  tie async drivers to the exclusive runner borrow, release operation-scoped
+  journal locks explicitly, and avoid cloning complete rows in native reference
+  checks. These repairs do not establish the cause of reported allocator aborts;
+  the documented independent reblessive safety limits remain.
+- Preserve native rows, vectors, lexical values and archive evidence during
+  historical import and catch-up without historical model re-extraction.
+  Bound queue producer lookups and retain strict public literal validation.
+- Add immutable summary output/thinking policies, bounded incomplete-output
+  fallbacks and updated model defaults while preserving explicit overrides.
+- Suppress new timeline events from documents marked as internal review and
+  preserve operator-rejected events during reprocessing. The projection hint
+  grants no authority and does not remove existing events.
 
 ## [0.9.1] - 2026-10-15
 

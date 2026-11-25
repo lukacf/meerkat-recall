@@ -26,7 +26,7 @@ committed, removing it from the latest tree does not remove it from history.
 
 ## Distribution contract
 
-The current source declares Meerkat Recall `0.9.1` and exact-pins its six direct
+The current source declares Meerkat Recall `0.9.2` and exact-pins its six direct
 Meerkat family dependencies to the published `0.9.18` release. It has no direct
 Meta dependency. Record this integration's exact versions and live acceptance
 separately; matching versions do not establish acceptance of external Meta or

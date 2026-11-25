@@ -22,6 +22,9 @@ It preserves the shared 1.8 API instead of requiring an unrelated SDK migration.
   preserved; this supplemental file is not part of the original archive manifest.
 - The test manifest adds `rstest` and two test targets. The dependency's own
   lockfile records this standalone test resolution; Recall uses its root lockfile.
+- The reqwest streamable-client feature explicitly enables `bytes`, which the
+  bounded body collector imports. This keeps client-only consumers buildable
+  without relying on server or Unix-socket feature unification.
 
 ## Behavior
 
@@ -63,6 +66,8 @@ Unix-socket handshake regressions also pass.
 Vendor crates are excluded from the workspace gate. Run their tests explicitly:
 
 ```sh
+./scripts/repo-cargo check --manifest-path vendor/rmcp-1.8.0/Cargo.toml --locked \
+  --no-default-features --features client,transport-streamable-http-client-reqwest --lib
 ./scripts/repo-cargo test --manifest-path vendor/rmcp-1.8.0/Cargo.toml --locked \
   --features client,transport-streamable-http-client-reqwest,transport-streamable-http-client-unix-socket,reqwest/charset \
   --lib --test test_recall_http_response_limits --test test_unix_socket_response_limits
@@ -71,3 +76,7 @@ Vendor crates are excluded from the workspace gate. Run their tests explicitly:
 Also run the response-limit tests without `reqwest/charset`; a consumer can
 enable that dependency feature independently. The focused tests use synthetic
 loopback responses and do not contact an external MCP server.
+
+The client-only compile check reproduces the release model-test dependency graph
+that previously failed with an unresolved `bytes` import. It deliberately omits
+server and Unix-socket features, which otherwise mask the missing dependency.

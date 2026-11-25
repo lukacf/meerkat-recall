@@ -148,7 +148,7 @@ client-side-sse = ["dep:sse-stream", "dep:http"]
 
 # Streamable HTTP client
 transport-streamable-http-client = ["client-side-sse", "transport-worker"]
-transport-streamable-http-client-reqwest = ["transport-streamable-http-client", "__reqwest"]
+transport-streamable-http-client-reqwest = ["transport-streamable-http-client", "__reqwest", "dep:bytes"]
 transport-streamable-http-client-unix-socket = [
   "transport-streamable-http-client",
   "dep:hyper",

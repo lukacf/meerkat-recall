@@ -148,19 +148,20 @@ async fn retired_dependencies_still_fence_changes_and_cannot_be_restored_without
             .await
             .is_err());
 
-        // A repository mutation does not advance the canonical epoch: the exact
-        // retained before-image itself must prevent the prepared commit.
+        // The original prepared request must refuse after restoration, whether
+        // this backend observes the epoch change or the changed row first.
         RelRepository::new(client.clone())
             .restore(SPACE, &old.base.id)
             .await
             .unwrap();
         let canonical = CanonicalRepository::new(client.clone());
-        assert_eq!(
-            canonical.epoch(SPACE).await.unwrap(),
-            request.plan.observed_epoch
-        );
+        assert!(canonical.commit(request.clone()).await.is_err());
+        // Test-only isolation of the row guard: present a current epoch with
+        // the retained stale dependency. Production never refreshes its epoch.
+        let mut row_guard_request = request;
+        row_guard_request.plan.observed_epoch = canonical.epoch(SPACE).await.unwrap();
         let error = canonical
-            .commit(request)
+            .commit(row_guard_request)
             .await
             .expect_err("changed tombstone must invalidate the whole transaction");
         assert!(

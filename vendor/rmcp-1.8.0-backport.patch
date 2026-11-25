@@ -182,7 +182,15 @@ diff --git a/Cargo.lock b/Cargo.lock
 diff --git a/Cargo.toml b/Cargo.toml
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -712,3 +712,16 @@
+@@ -137,6 +137,7 @@
+ transport-streamable-http-client-reqwest = [
+     "transport-streamable-http-client",
+     "__reqwest",
++    "dep:bytes",
+ ]
+ transport-streamable-http-client-unix-socket = [
+     "transport-streamable-http-client",
+@@ -712,3 +713,16 @@
  [lints.clippy]
  exhaustive_enums = "warn"
  exhaustive_structs = "warn"
@@ -199,6 +207,14 @@ diff --git a/Cargo.toml b/Cargo.toml
 +name = "test_recall_http_response_limits"
 +path = "tests/test_recall_http_response_limits.rs"
 +required-features = ["transport-streamable-http-client-reqwest"]
+diff --git a/Cargo.toml.orig b/Cargo.toml.orig
+--- a/Cargo.toml.orig
++++ b/Cargo.toml.orig
+@@ -150,3 +150,3 @@
+ transport-streamable-http-client = ["client-side-sse", "transport-worker"]
+-transport-streamable-http-client-reqwest = ["transport-streamable-http-client", "__reqwest"]
++transport-streamable-http-client-reqwest = ["transport-streamable-http-client", "__reqwest", "dep:bytes"]
+ transport-streamable-http-client-unix-socket = [
 diff --git a/src/transport/common.rs b/src/transport/common.rs
 --- a/src/transport/common.rs
 +++ b/src/transport/common.rs

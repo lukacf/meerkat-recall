@@ -12,9 +12,10 @@ lifecycle; Recall adds shared, evidence-backed knowledge. It is an optional,
 independently released component. See the
 [Meerkat introduction](https://docs.rkat.ai/introduction) to choose your starting point.
 
-The current checkout exact-pins the Meerkat 0.9.18 SDK and requires Rust 1.97.
+The current checkout declares Recall 0.9.2, exact-pins the Meerkat 0.9.18 SDK
+and requires Rust 1.97.
 Published Recall 0.9.1 archives use Meerkat 0.9.0.
-Download the [v0.9.1 release](https://github.com/lukacf/meerkat-recall/releases/tag/v0.9.1).
+Download the [latest published release](https://github.com/lukacf/meerkat-recall/releases/latest).
 Find source, native downloads, supported platforms and known limits in the
 [release notes](https://github.com/lukacf/meerkat-recall/releases).
 

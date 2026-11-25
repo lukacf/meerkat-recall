@@ -1,6 +1,6 @@
 {
   "name": "elephant-local-helper",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "Local MCP helper for Elephant knowledge system. Bridges local filesystem with a remote Elephant server - enables file and directory ingestion via MCP stdio transport.",
   "bin": {
     "elephant-local-helper": "index.js"

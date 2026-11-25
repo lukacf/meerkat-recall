@@ -165,6 +165,18 @@ class ArtifactTests(unittest.TestCase):
             directory.mkdir(parents=True)
             (directory / "LICENSE").write_text("upstream license fixture")
             (directory / "patched.rs").write_text("exact patched source fixture")
+        # Enumerate release-critical repairs independently of the packager list.
+        repair_records = []
+        for name in ("reblessive-0.4.3", "rmcp-1.8.0", "rusqlite-0.37.0"):
+            directory = source / "vendor" / name
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "LICENSE").write_text("repair license: " + name)
+            (directory / "patched.rs").write_text("repair source: " + name)
+            repair_records.extend((name + "/LICENSE", name + "/patched.rs"))
+            for suffix in ("-backport.md", "-backport.patch", "-upstream-sha256.json"):
+                record = name + suffix
+                (source / "vendor" / record).write_text("exact repair record: " + record)
+                repair_records.append(record)
         (source / "vendor/meerkat-provider-upstream.json").write_text('{"fixture":true}')
         (source / "scripts/release/meerkat-notices").mkdir()
         for name in ("LICENSE-MIT", "LICENSE-APACHE"):
@@ -192,6 +204,9 @@ class ArtifactTests(unittest.TestCase):
                            ("homecore-operations.md", "examples.json", "operator-template.json"))]
         installed = self.root / "operator-install"
         artifact.verify(archive, artifact.digest(archive), installed)
+        for record in repair_records:
+            self.assertEqual((installed / "third-party" / record).read_bytes(),
+                             (source / "vendor" / record).read_bytes())
         for name in ("LICENSE-MIT", "LICENSE-APACHE"):
             bundled = f"licenses/meerkat-0.9.18/{name}"
             self.assertIn(bundled, manifest["files"])

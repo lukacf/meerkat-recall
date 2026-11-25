@@ -8,6 +8,11 @@ used by this release candidate, including upstream copyright/license texts:
   backport notes, patch and upstream archive checksum record.
 - tokenizers 0.22.2: Apache-2.0; rav1e 0.8.1: BSD-2-Clause. Each tree retains
   its licenses and RECALL_PATCH.md describing its paste dependency replacement.
+- reblessive 0.4.3: MIT; rmcp 1.8.0: Apache-2.0 with its retained MIT
+  transition notice; rusqlite 0.37.0: MIT.
+  Their complete patched source trees, LICENSE files, backport descriptions,
+  exact patches and upstream checksum inventories accompany this archive.
+  The backport descriptions state the repair scope and remaining limitations.
 - Meerkat 0.9.18 provider crates are unmodified registry dependencies under
   MIT OR Apache-2.0. meerkat-provider-upstream.json records the published source
   and package checksums whose defensive transport behavior replaces the three

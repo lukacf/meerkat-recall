@@ -8,8 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Dependencies
-- Exact-pin the Meerkat SDK family to 0.9.10 and raise the Rust toolchain to
-  1.97.0 across development, CI, and release builds.
+- Exact-pin the Meerkat SDK family to 0.9.18 and retain Rust 1.97.0 across
+  development, CI, and release builds. Refresh provider provenance and bundled
+  license paths for the selected SDK release.
+- Select patched `url` 2.5.9 and `zip` 9.0.5; document the retained `chrono`,
+  `chrono-tz` and `humantime` maintenance advisories and their review deadline.
 - Remove the `unsafe-libyaml` maintenance exception after Meerkat replaced its
   skill frontmatter parser with `serde-saphyr`.
 - Update `ctutils` to 0.4.4 and Tokio to 1.53.3 for their published security

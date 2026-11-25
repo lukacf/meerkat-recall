@@ -12,7 +12,7 @@ lifecycle; Recall adds shared, evidence-backed knowledge. It is an optional,
 independently released component. See the
 [Meerkat introduction](https://docs.rkat.ai/introduction) to choose your starting point.
 
-The current checkout exact-pins the Meerkat 0.9.10 SDK and requires Rust 1.97.
+The current checkout exact-pins the Meerkat 0.9.18 SDK and requires Rust 1.97.
 Published Recall 0.9.1 archives use Meerkat 0.9.0.
 Download the [v0.9.1 release](https://github.com/lukacf/meerkat-recall/releases/tag/v0.9.1).
 Find source, native downloads, supported platforms and known limits in the
@@ -42,7 +42,7 @@ For a persistent native service, follow [service setup](docs/operations/service-
 Select its TOML explicitly with `serve --config /absolute/runtime.toml` and use
 the same file for `migrate`; `ELEPHANT_CONFIG` provides the service environment
 equivalent. Missing or malformed selected files fail without fallback.
-The current checkout exact-pins the published Meerkat 0.9.10 family. The SDK includes
+The current checkout exact-pins the published Meerkat 0.9.18 family. The SDK includes
 the native provider transport protections previously carried as Recall patches.
 The v0.1.0 artifacts continue using their original Meerkat 0.8.51 dependencies.
 Consult the release notes for tested behavior and remaining limits.

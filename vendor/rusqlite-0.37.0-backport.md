@@ -1,7 +1,8 @@
 # Rusqlite 0.37 with patched bundled SQLite
 
-Recall and Meerkat 0.9.10 share the `rusqlite` 0.37 API. Their native `sqlite3`
-link must resolve to one library. This copy retains the wrapper's Rust source
+Recall retains the `rusqlite` 0.37 API; Meerkat 0.9.18 uses 0.41.1. Both
+resolve their native `sqlite3` link through the same patched `libsqlite3-sys`
+0.39.1. This copy retains the 0.37 wrapper's Rust source
 and updates its `libsqlite3-sys` requirement from 0.35.0 to 0.39.1. The root
 lockfile selects 0.39.1, bundling SQLite 3.54.1 with the WAL page-size repair in
 [RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459).

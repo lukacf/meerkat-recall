@@ -108,7 +108,7 @@ RUN ldd /usr/local/bin/meerkat-recall > /usr/share/meerkat-recall/runtime-depend
 COPY --from=builder /app/skills /usr/share/meerkat-recall/skills
 COPY LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md /usr/share/licenses/meerkat-recall/
 COPY scripts/release/onnxruntime-notices/ /usr/share/licenses/meerkat-recall/onnxruntime-1.24.2/
-COPY scripts/release/meerkat-notices/ /usr/share/licenses/meerkat-recall/meerkat-0.9.10/
+COPY scripts/release/meerkat-notices/ /usr/share/licenses/meerkat-recall/meerkat-0.9.18/
 COPY scripts/release/provision-fastembed /usr/share/meerkat-recall/provision-fastembed
 COPY scripts/release/ARTIFACT_README.md /usr/share/meerkat-recall/README.md
 COPY scripts/release/README.md scripts/release/DARWIN_BUILDER.md /usr/share/meerkat-recall/scripts/release/

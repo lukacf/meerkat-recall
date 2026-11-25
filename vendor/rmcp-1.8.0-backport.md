@@ -1,6 +1,6 @@
 # RMCP 1.8.0 bounded HTTP responses
 
-Recall and Meerkat 0.9.10 share RMCP 1.8.0. This local crate backports the
+Recall and Meerkat 0.9.18 share RMCP 1.8.0. This local crate backports the
 non-streaming HTTP response limit from the upstream
 [response-body repair](https://github.com/modelcontextprotocol/rust-sdk/commit/3e0156c1eaf1573a1b878e2a8998d2fa2d0b1439)
 for [RUSTSEC-2026-0462](https://rustsec.org/advisories/RUSTSEC-2026-0462).

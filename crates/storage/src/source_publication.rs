@@ -1587,6 +1587,78 @@ mod tests {
             .is_none());
     }
 
+    /// A revision's staged document title is immutable content: the same revision
+    /// re-accepted with another title is refused (fresh key:
+    /// immutable_revision_conflict; the accepted key: idempotency_conflict, which
+    /// is checked first), and the stored revision keeps its first title.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "Keep the repository owner alive through the whole check."
+    )]
+    async fn staged_title_is_immutable_revision_content(embedded: bool) {
+        let repo = SourcePublicationRepository::new(client(embedded).await);
+        let id = RecordId::new_v4(TableName::Source);
+        let titled = |title: &str, key: &str, expected: SourcePrecondition| {
+            let mut request = request(&id, "r1", expected);
+            request.source.metadata["_manual_doc"]["title"] = serde_json::json!(title);
+            request.idempotency_key = key.into();
+            request.request_fingerprint = format!("fingerprint-{key}");
+            request
+        };
+        let first = repo
+            .accept(titled("upstream-record", "first", SourcePrecondition::Absent))
+            .await
+            .expect("accept");
+        let fresh_key = repo
+            .accept(titled(
+                "Human title",
+                "retitled",
+                SourcePrecondition::Generation(first.source_generation.clone()),
+            ))
+            .await;
+        assert!(
+            matches!(&fresh_key, Err(StorageError::Conflict(code)) if code == "immutable_revision_conflict"),
+            "{fresh_key:?}"
+        );
+        // The accepted key with another title: the key's own check comes first, so
+        // the idempotency conflict wins over the immutable-revision one.
+        let same_key = repo
+            .accept(titled(
+                "Human title",
+                "first",
+                SourcePrecondition::Generation(first.source_generation.clone()),
+            ))
+            .await;
+        assert!(
+            matches!(&same_key, Err(StorageError::Conflict(code)) if code == "idempotency_conflict"),
+            "{same_key:?}"
+        );
+        let stored = repo
+            .revision("business-a", &id, "r1")
+            .await
+            .expect("revision")
+            .expect("stored");
+        assert_eq!(stored.source.metadata["_manual_doc"]["title"], "upstream-record");
+        let head = repo.head("business-a", &id).await.expect("head").expect("present");
+        assert_eq!(head.operation_id, first.operation_id);
+        assert_eq!(head.generation, first.source_generation);
+    }
+    #[tokio::test]
+    #[expect(
+        clippy::large_futures,
+        reason = "Keep the conformance helper's original await and allocation shape."
+    )]
+    async fn embedded_staged_title_is_immutable_revision_content() {
+        staged_title_is_immutable_revision_content(true).await;
+    }
+    #[tokio::test]
+    #[expect(
+        clippy::large_futures,
+        reason = "Keep the conformance helper's original await and allocation shape."
+    )]
+    async fn surreal_staged_title_is_immutable_revision_content() {
+        staged_title_is_immutable_revision_content(false).await;
+    }
     #[tokio::test]
     #[expect(
         clippy::large_futures,

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Native archives include the patched reblessive, RMCP and rusqlite sources,
+  licenses, exact backport patches and upstream checksum records.
+
 ### Dependencies
 - Exact-pin the Meerkat SDK family to 0.9.18 and retain Rust 1.97.0 across
   development, CI, and release builds. Refresh provider provenance and bundled

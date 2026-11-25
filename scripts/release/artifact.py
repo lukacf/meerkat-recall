@@ -27,6 +27,10 @@ PATCHED_SOURCE_TREES = (
     "pdf-inspector", "surrealkv-0.9.3",
     "surrealdb-core-2.6.5", "surrealdb-2.6.5",
     "tokenizers-0.22.2", "rav1e-0.8.1",
+    "reblessive-0.4.3", "rmcp-1.8.0", "rusqlite-0.37.0",
+)
+BACKPORT_RECORD_TREES = (
+    "reblessive-0.4.3", "rmcp-1.8.0", "rusqlite-0.37.0",
 )
 OPERATIONAL_DOCUMENTS = (
     "docs/snapshot-durability.md", "docs/embedded-durable-commits.md",
@@ -293,6 +297,10 @@ def package(root: Path, binary: Path, target: str, output: Path, receipt: Path) 
         for path in sorted((root / "vendor").glob("surrealkv-0.9.3-*")):
             if path.is_file():
                 shutil.copyfile(path, bundle / "third-party" / path.name)
+        for name in BACKPORT_RECORD_TREES:
+            for suffix in ("-backport.md", "-backport.patch", "-upstream-sha256.json"):
+                filename = name + suffix
+                shutil.copyfile(root / "vendor" / filename, bundle / "third-party" / filename)
         shutil.copyfile(root / "vendor" / "meerkat-provider-upstream.json", bundle / "third-party" / "meerkat-provider-upstream.json")
         for name in REFERENCE_SOURCE_RECORDS:
             shutil.copyfile(root / "vendor" / name, bundle / "third-party" / name)

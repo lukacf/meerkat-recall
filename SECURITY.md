@@ -36,8 +36,13 @@ test artifacts.
 
 ## Deployment defaults
 
-Authenticated servers require `JWT_SECRET` with at least 32 random bytes and
-`JWT_ALGORITHM=HS256`. Startup rejects missing or short secrets. Setting
+The default `JWT_ALGORITHM=HS256` verifier requires `JWT_SECRET` with at least
+32 random bytes. Startup rejects missing or short secrets. Operators may instead
+select `JWT_ALGORITHM=RS256` with a public-only `JWT_JWKS_FILE` and fixed
+`JWT_ISSUER` and `JWT_AUDIENCE`; Recall does not receive the signing key. See
+[public-key authentication](docs/operations/deployment.mdx#asymmetric-token-verification)
+for the accepted key and claim profile. Key rotation requires a restart; this
+does not provide OIDC discovery or individual-token revocation. Setting
 `SKIP_AUTH=true` explicitly bypasses authentication and ABAC for local development.
 The Compose examples bind published ports to loopback and use development
 database credentials; they require a separate production configuration.

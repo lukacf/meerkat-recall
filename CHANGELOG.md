@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.9.2] - 2026-11-25
+## [0.9.2] - 2026-11-26
 
 - Native archives include the patched reblessive, RMCP and rusqlite sources,
   licenses, exact backport patches and upstream checksum records.
